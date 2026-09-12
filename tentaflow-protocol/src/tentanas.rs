@@ -1291,15 +1291,19 @@ pub struct NasElasticFolder {
 pub struct NasMoverRun {
     pub started_at: String,
     pub finished_at: Option<String>,
-    /// 'running' | 'ok' | 'partial' | 'failed' | 'cancelled'. 'partial' is
-    /// the normal outcome when files were open: the run did its job and left
-    /// some behind on purpose.
+    /// 'running' | 'ok' | 'partial' | 'needs_attention' | 'failed' |
+    /// 'cancelled'. 'partial' is the normal outcome when files were open or
+    /// refused: the run did its job and left some behind on purpose.
+    /// 'needs_attention' is a run that stopped and still holds the array
+    /// until the same operation is resumed; 'failed' is such a run that was
+    /// closed without finishing.
     pub outcome: String,
     pub moved_bytes: u64,
     pub moved_files: u64,
-    /// Files another process held open. The mover NEVER moves one out from
-    /// under its writer (§5.3), so this is the honest half of every run and
-    /// the UI shows it next to what was moved.
+    /// Files another process held open, or that did not fit the target data
+    /// branch above its minfreespace this run. The mover NEVER moves one out
+    /// from under its writer (§5.3), so this is the honest half of every run
+    /// and the UI shows it next to what was moved.
     pub skipped_files: u64,
     pub skipped_bytes: u64,
     /// Whether the four counters above were actually measured. A run that
@@ -1308,6 +1312,11 @@ pub struct NasMoverRun {
     /// "nothing was left behind" about a walk that never happened.
     #[serde(default)]
     pub counts_known: bool,
+    /// Free text. It also carries what has no field of its own: the first
+    /// refused or skipped paths, and the stuck records the helper keeps
+    /// (path and the operation that left it) — files the mover could neither
+    /// finish nor withdraw, which later runs leave alone until an admin
+    /// acknowledges them.
     pub detail: String,
     /// The `snapraid sync` that ran as part of the SAME job, when the
     /// coupling is on. Its absence in a coupled configuration is a fault, not
@@ -1371,8 +1380,8 @@ pub struct NasMoverSettings {
     pub schedule: Option<NasSchedule>,
     /// Move nothing younger than this. 0 = no age limit.
     pub min_age_secs: u64,
-    /// Keep the cache at least this empty. Falling below it starts a run
-    /// outside the schedule.
+    /// A trigger only: falling below this much free cache starts a run
+    /// outside the schedule. Every run moves each aged file regardless.
     pub cache_min_free_pct: u8,
     /// Run `snapraid sync` in the SAME job, immediately after the move.
     /// Default on, and §5.3 explains why in one sentence: without it the

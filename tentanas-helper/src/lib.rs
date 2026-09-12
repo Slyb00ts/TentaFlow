@@ -39,6 +39,7 @@ pub mod actions;
 pub mod block;
 pub mod elastic;
 mod elastic_namespace;
+mod elastic_transfer;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
 /// a wrapper built from a different catalog. Bumps with the crate version.
@@ -293,6 +294,7 @@ pub enum HelperCommand {
     ElasticRestore { array_id: String, owner: elastic::ElasticOwner },
     ElasticEnterService { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticResume { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    ElasticMover { array_id: String, owner: elastic::ElasticOwner, operation_id: String, resume_operation_id: String, rules: elastic::MoverRules, coupled_sync: bool },
     ElasticSync { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticScrub { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticInspect { array_id: String, owner: elastic::ElasticOwner },
@@ -1928,6 +1930,7 @@ impl HelperCommand {
             Self::ElasticRestore { .. } => Some("elastic_restore"),
             Self::ElasticEnterService { .. } => Some("elastic_enter_service"),
             Self::ElasticResume { .. } => Some("elastic_resume"),
+            Self::ElasticMover { .. } => Some("elastic_mover"),
             Self::ElasticSync { .. } => Some("elastic_sync"),
             Self::ElasticScrub { .. } => Some("elastic_scrub"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
@@ -1989,6 +1992,14 @@ impl HelperCommand {
             | Self::ElasticResume { array_id, owner, operation_id } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 elastic::validate_elastic_uuid(operation_id)?;
+                owner.validate()
+            }
+            Self::ElasticMover { array_id, owner, operation_id, resume_operation_id, rules, .. } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                elastic::validate_elastic_uuid(resume_operation_id)?;
+                if operation_id == resume_operation_id { return Err(CatalogError::InvalidArgument("mover UUID i resume UUID muszą być różne".into())); }
+                rules.validate()?;
                 owner.validate()
             }
             Self::ElasticRestore { array_id, owner } | Self::ElasticInspect { array_id, owner } => {
@@ -2645,6 +2656,7 @@ impl HelperCommand {
             Self::ElasticRestore { .. } => ("builtin", "Odtwarza potwierdzone montowania Elastic bez formatowania."),
             Self::ElasticEnterService { .. } => ("builtin", "Trwale zatrzymuje publikację Elastic przed przejściem unii w RO."),
             Self::ElasticResume { .. } => ("builtin", "Wznawia autoryzowaną publikację Elastic po potwierdzeniu RW."),
+            Self::ElasticMover { .. } => ("builtin", "Przenosi pliki cache do data z trwałym dziennikiem i synchronizacją parity."),
             Self::ElasticSync { .. } => ("builtin", "Synchronizuje parity własnej macierzy Elastic z trwałym wynikiem."),
             Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
@@ -2826,6 +2838,7 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ElasticRestore { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::ElasticEnterService { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticResume { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticMover { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), resume_operation_id: s(), rules: elastic::MoverRules::default(), coupled_sync: true },
         HelperCommand::ElasticSync { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticScrub { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },

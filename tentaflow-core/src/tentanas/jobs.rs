@@ -230,7 +230,8 @@ fn command_label(command: &HelperCommand) -> &'static str {
         HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. }
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
-        | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. } => "Elastic Array",
+        | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. }
+        | HelperCommand::ElasticMover { .. } => "Elastic Array",
     }
 }
 

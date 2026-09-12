@@ -43,8 +43,8 @@ use std::time::{Duration, Instant};
 use tentaflow_protocol::features::FeatureState;
 use tentaflow_protocol::tentanas::{
     NasDisk, NasElasticArray, NasElasticBranch, NasElasticCapabilities, NasElasticFolder,
-    NasElasticParity, NasElasticPlan, NasElasticProtection, NasElasticRefusal, NasMoverSettings,
-    NasSchedule, NasSnapraidState,
+    NasElasticParity, NasElasticPlan, NasElasticProtection, NasElasticRefusal, NasMoverRun,
+    NasMoverSettings, NasSchedule, NasSnapraidRun, NasSnapraidState,
 };
 use tentanas_helper::elastic::{
     cache_branch_path, config_path, data_branch_path, parity_file_path, parity_mount_path,
@@ -53,7 +53,7 @@ use tentanas_helper::elastic::{
 };
 use anyhow::{anyhow, ensure, Result};
 use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult, ElasticServiceMode};
-use tentanas_helper::elastic::{ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
+use tentanas_helper::elastic::{ElasticMoverIssueKind, ElasticMoverPhase, ElasticMoverRun, ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
 use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -409,6 +409,10 @@ pub struct ArrayObservation {
     /// measured it (`snapraid diff` is the only thing that can, and it is
     /// expensive, so this is usually `None`).
     pub moved_unsynced_bytes: Option<u64>,
+    /// The helper's explicit verdict that parity does not cover what the
+    /// mover moved. It alone decides; a byte count never reads as protected.
+    pub parity_stale: bool,
+    pub last_mover: Option<ElasticMoverRun>,
 }
 
 impl ArrayObservation {
@@ -818,6 +822,11 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
             "on the cache without parity — protected after the next sync, which the mover \
              runs immediately after it moves"
                 .to_string(),
+        )
+    } else if observed.parity_stale {
+        (
+            "window_open",
+            "Parity nie obejmuje plików przeniesionych przez mover po ostatnim udanym sync".to_string(),
         )
     } else if observed.moved_unsynced_bytes.is_some_and(|bytes| bytes > 0) {
         (
@@ -1650,6 +1659,105 @@ fn branch_to_protocol(
     }
 }
 
+fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
+    let outcome = match run.phase {
+        ElasticMoverPhase::Holding | ElasticMoverPhase::Moving | ElasticMoverPhase::Syncing => "running",
+        // Stopped, and still holding the array until the same operation resumes.
+        ElasticMoverPhase::NeedsAttention if run.finished_at.is_none() => "needs_attention",
+        // Closed by its Resume without ever finishing.
+        ElasticMoverPhase::NeedsAttention => "failed",
+        ElasticMoverPhase::Complete
+            if run.skipped_files > 0
+                || run.refused_files > 0
+                || run.issues.iter().any(|issue| issue.kind == ElasticMoverIssueKind::Attention) =>
+        {
+            "partial"
+        }
+        ElasticMoverPhase::Complete => "ok",
+    };
+    // The wire has no per-file list: refusals and the first reported paths
+    // travel in the detail, so a partial run says what it left behind.
+    let mut detail = run.detail.clone().unwrap_or_default();
+    if run.refused_files > 0 || !run.issues.is_empty() {
+        let issues = run
+            .issues
+            .iter()
+            .take(3)
+            .map(|issue| format!("{}: {}", issue.path, issue.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let summary = format!(
+            "pominięto {}, odmówiono {}: {issues}",
+            run.skipped_files, run.refused_files
+        );
+        detail = if detail.is_empty() { summary } else { format!("{detail}; {summary}") };
+    }
+    // Records the helper could neither finish nor withdraw stay listed until
+    // an admin acknowledges them; the wire carries them in the detail.
+    if !run.stuck_records.is_empty() || run.stuck_hidden > 0 {
+        let records = run
+            .stuck_records
+            .iter()
+            .take(3)
+            .map(|record| format!("{} (operacja {})", record.path, record.operation_id))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // Paths whose full record the helper no longer shows are still skipped.
+        let hidden = if run.stuck_hidden > 0 {
+            format!(" (+{} bez pełnego rekordu)", run.stuck_hidden)
+        } else {
+            String::new()
+        };
+        let summary = format!("utknięte rekordy: {}{hidden}: {records}", run.stuck_records.len());
+        detail = if detail.is_empty() { summary } else { format!("{detail}; {summary}") };
+    }
+    NasMoverRun {
+        started_at: run.started_at.clone(),
+        finished_at: run.finished_at.clone(),
+        outcome: outcome.to_string(),
+        moved_bytes: run.moved_bytes,
+        moved_files: run.moved_files,
+        skipped_files: run.skipped_files,
+        skipped_bytes: run.skipped_bytes,
+        counts_known: run.counts_known,
+        detail,
+        coupled_sync: run.coupled_sync.as_ref().map(|sync| NasSnapraidRun {
+            operation_id: Some(sync.operation_id.clone()),
+            kind: snapraid_kind_to_protocol(sync.kind),
+            started_at: sync.started_at.clone(),
+            finished_at: sync.finished_at.clone(),
+            outcome: snapraid_outcome_to_protocol(sync.outcome),
+            detail: sync.detail.clone().unwrap_or_default(),
+            errors: None,
+            exit_code: sync.exit_code,
+            total_blocks: sync.total_blocks,
+            checked_blocks: sync.checked_blocks,
+            accessed_mb: sync.accessed_mb,
+            errors_file: sync.errors_file,
+            errors_io: sync.errors_io,
+            errors_data: sync.errors_data,
+            ..Default::default()
+        }),
+    }
+}
+
+fn snapraid_kind_to_protocol(kind: ElasticSnapraidKind) -> String {
+    match kind {
+        ElasticSnapraidKind::Sync => "sync",
+        ElasticSnapraidKind::Scrub => "scrub",
+    }.to_string()
+}
+
+fn snapraid_outcome_to_protocol(outcome: ElasticSnapraidOutcome) -> String {
+    match outcome {
+        ElasticSnapraidOutcome::Running => "running",
+        ElasticSnapraidOutcome::Succeeded => "ok",
+        ElasticSnapraidOutcome::Failed => "failed",
+        ElasticSnapraidOutcome::NeedsAttention => "needs_attention",
+        ElasticSnapraidOutcome::Refused => "refused",
+    }.to_string()
+}
+
 /// One array as the wire carries it.
 pub fn to_protocol(
     array: &ElasticArrayRow,
@@ -1748,7 +1856,7 @@ pub fn to_protocol(
             min_age_secs: array.mover.min_age_secs,
             cache_min_free_pct: array.mover.cache_min_free_pct,
             coupled_sync: array.mover.coupled_sync,
-            last_run: None,
+            last_run: observed.last_mover.as_ref().map(mover_to_protocol),
             history: Vec::new(),
         },
         snapraid: NasSnapraidState {
@@ -1908,6 +2016,60 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
     if let Some(at) = &result.sync_completed_at {
         chrono::DateTime::parse_from_rfc3339(at)?;
         ensure!(!spec.parity.is_empty(), "Sync bez parity");
+    }
+    if let Some(run) = &result.last_mover {
+        tentanas_helper::elastic::validate_elastic_uuid(&run.operation_id)?;
+        tentanas_helper::elastic::validate_elastic_uuid(&run.resume_operation_id)?;
+        ensure!(run.operation_id != spec.operation_id, "Mover nie może zastępować Create");
+        ensure!(run.resume_operation_id != run.operation_id && run.resume_operation_id != spec.operation_id,
+            "Resume movera musi mieć osobną operację");
+        let mover_started = chrono::DateTime::parse_from_rfc3339(&run.started_at)?;
+        let mover_finished = run.finished_at.as_ref().map(|at| chrono::DateTime::parse_from_rfc3339(at)).transpose()?;
+        ensure!(mover_finished.is_none_or(|finished| finished >= mover_started),
+            "Mover ma odwrócony czas");
+        // A run ends at Complete, or as NeedsAttention once its Resume closed it.
+        ensure!(matches!(run.phase, ElasticMoverPhase::Complete | ElasticMoverPhase::NeedsAttention)
+            || run.finished_at.is_none(),
+            "Nieukończony mover nie może mieć czasu końca");
+        if run.phase == ElasticMoverPhase::Complete {
+            ensure!(run.finished_at.is_some(), "Ukończony mover bez czasu końca");
+        }
+        let reported = |kind| run.issues.iter().filter(|issue| issue.kind == kind).count() as u64;
+        ensure!(reported(ElasticMoverIssueKind::Skipped) <= run.skipped_files
+            && reported(ElasticMoverIssueKind::Refused) <= run.refused_files,
+            "Mover raportuje więcej plików niż jego liczniki");
+        if let Some(sync) = &run.coupled_sync {
+            ensure!(sync.kind == ElasticSnapraidKind::Sync, "Mover ma nieprawidłowy typ sync");
+            ensure!(sync.operation_id == run.operation_id, "Sync movera należy do innej operacji");
+            tentanas_helper::elastic::validate_elastic_uuid(&sync.operation_id)?;
+            let sync_started = chrono::DateTime::parse_from_rfc3339(&sync.started_at)?;
+            let sync_finished = sync.finished_at.as_ref().map(|at| chrono::DateTime::parse_from_rfc3339(at)).transpose()?;
+            ensure!(sync_started >= mover_started, "Sync movera rozpoczyna się przed moverem");
+            ensure!(sync_finished.is_none_or(|finished| finished >= sync_started), "Sync ma odwrócony czas");
+            ensure!(mover_finished.is_none_or(|finished| sync_finished.is_some_and(|sync_end| sync_end <= finished)),
+                "Sync kończy się poza moverem");
+            if run.phase == ElasticMoverPhase::Complete {
+                ensure!(sync.outcome == ElasticSnapraidOutcome::Succeeded
+                    && sync_finished.is_some()
+                    && sync.exit_code == Some(0)
+                    && sync.errors_file.is_none_or(|n| n == 0)
+                    && sync.errors_io.is_none_or(|n| n == 0)
+                    && sync.errors_data.is_none_or(|n| n == 0),
+                    "Mover ukończony bez udanego sync");
+            }
+        }
+    }
+    ensure!(result.parity_stale == result.stale_parity_bytes.is_some(),
+        "Niespójny znacznik nieaktualnej parity");
+    ensure!(!result.restart_required || result.stage != ElasticStage::Ready,
+        "Macierz czekająca na restart nie jest gotowa");
+    for record in result.stuck_records.iter()
+        .chain(result.last_mover.iter().flat_map(|run| run.stuck_records.iter()))
+    {
+        tentanas_helper::elastic::validate_elastic_uuid(&record.operation_id)?;
+    }
+    if result.parity_stale {
+        ensure!(!spec.parity.is_empty(), "Nieaktualna parity macierzy bez parity");
     }
     if result.stage == ElasticStage::Ready {
         if let Some(service) = &result.service {
@@ -2218,7 +2380,7 @@ async fn observe_array(db: &DbPool, array: &ElasticArrayRow) -> Result<ElasticRe
 fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
     result: Result<ElasticResult>, features: &[FeatureState]) -> NasElasticArray {
     let mut observed = ArrayObservation::default();
-    let failure;
+    let mut failure;
     let mut root_stage = None;
     match result {
         Ok(result) => {
@@ -2226,6 +2388,9 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
                 && result.disks.iter().all(|d| d.mounted.is_some());
             observed.union_mounted = result.union_mounted;
             observed.last_sync_at = result.sync_completed_at;
+            observed.parity_stale = result.parity_stale;
+            observed.moved_unsynced_bytes = if result.parity_stale { result.stale_parity_bytes } else { None };
+            observed.last_mover = result.last_mover.clone();
             root_stage = Some(result.stage);
             failure = result.detail.or_else(|| {
                 if result.stage == ElasticStage::Ready
@@ -2240,6 +2405,14 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
                     None
                 }
             });
+            // A recovery after a boot stopped part-way: only a reboot retries it.
+            if result.restart_required {
+                failure = Some(match failure {
+                    Some(detail) if detail.contains("restart") => detail,
+                    Some(detail) => format!("Wymagany restart węzła: {detail}"),
+                    None => "Wymagany restart węzła".to_string(),
+                });
+            }
             let service_safe = result.service.as_ref().is_none_or(|service| {
                 service.mode == ElasticServiceMode::Online
                     && !service.pending
@@ -2372,14 +2545,476 @@ pub(crate) mod tests {
 
     pub(crate) fn ready_result(spec: &ElasticCreateSpec) -> ElasticResult {
         ElasticResult { array_id:spec.array_id.clone(),operation_id:spec.operation_id.clone(),owner:spec.owner.clone(),
-            stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,
+            stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,last_mover:None,stale_parity_bytes:None,parity_stale:false,stuck_records:Vec::new(),stuck_hidden:0,restart_required:false,
             disks:spec.data.iter().enumerate().map(|(i,d)| (ElasticRole::Data((i+1) as u16),d))
                 .chain(spec.cache.iter().map(|d| (ElasticRole::Cache,d)))
                 .chain(spec.parity.iter().enumerate().map(|(i,d)| (ElasticRole::Parity((i+1) as u8),d)))
                 .map(|(role,d)| tentanas_helper::elastic::ElasticDiskObservation { role,
                     kernel_name:Some("sdz".into()),device:Some("/dev/sdz".into()),observed_uuid:Some(d.expected_uuid.clone()),
                     filesystem:Some(spec.filesystem.as_str().into()),device_present:Some(true),mounted:Some(true),
-                    size_bytes:Some(d.bytes),used_bytes:Some(4096),free_bytes:Some(d.bytes-4096),detail:None }).collect() }
+                size_bytes:Some(d.bytes),used_bytes:Some(4096),free_bytes:Some(d.bytes-4096),detail:None }).collect() }
+    }
+
+    #[test]
+    fn observed_protocol_maps_last_mover_without_creating_history() {
+        let spec = create_spec("mover-observation");
+        let mut result = ready_result(&spec);
+        result.last_mover = Some(ElasticMoverRun {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase: ElasticMoverPhase::NeedsAttention,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: None,
+            moved_files: 2,
+            moved_bytes: 128,
+            skipped_files: 1,
+            skipped_bytes: 64,
+            refused_files: 0,
+            issues: Vec::new(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: false,
+            detail: Some("częściowy transfer".into()),
+            coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
+                operation_id: MOVER_TEST_OPERATION.into(),
+                kind: ElasticSnapraidKind::Sync,
+                started_at: "2026-09-08T01:00:01Z".into(),
+                finished_at: Some("2026-09-08T01:00:02Z".into()),
+                outcome: ElasticSnapraidOutcome::Failed,
+                exit_code: Some(1),
+                total_blocks: None,
+                checked_blocks: None,
+                accessed_mb: None,
+                errors_file: Some(0),
+                errors_io: Some(0),
+                errors_data: Some(1),
+                detail: Some("sync failed".into()),
+            }),
+        });
+        result.stage = ElasticStage::NeedsAttention;
+        validate_observation(&spec, &result).expect("typed mover observation");
+        let mut row = array();
+        row.create_spec = Some(spec);
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        let run = wire.mover.last_run.expect("ostatni wynik movera");
+        assert_eq!(run.outcome, "needs_attention");
+        assert_eq!(run.moved_files, 2);
+        assert_eq!(run.moved_bytes, 128);
+        assert_eq!(run.skipped_files, 1);
+        assert_eq!(run.skipped_bytes, 64);
+        assert!(!run.counts_known);
+        assert_eq!(run.detail, "częściowy transfer");
+        let sync = run.coupled_sync.expect("wynik sprzężonego sync");
+        assert_eq!(sync.kind, "sync");
+        assert_eq!(sync.outcome, "failed");
+        assert_eq!(sync.errors_data, Some(1));
+        assert!(wire.mover.history.is_empty());
+    }
+
+    #[test]
+    fn restart_required_reaches_the_array_state_and_is_never_ready() {
+        let spec = create_spec("restart-required");
+        let mut result = ready_result(&spec);
+        result.restart_required = true;
+        assert!(validate_observation(&spec, &result).is_err(), "Ready nie czeka na restart");
+        result.stage = ElasticStage::NeedsAttention;
+        result.detail = Some("mount: Input/output error".into());
+        validate_observation(&spec, &result).expect("stan oczekujący na restart");
+        let mut row = array();
+        row.create_spec = Some(spec);
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(wire.state, "needs_attention");
+        assert_eq!(wire.state_detail, "Wymagany restart węzła: mount: Input/output error");
+    }
+
+    #[test]
+    fn stuck_records_travel_in_the_mover_detail() {
+        let record = tentanas_helper::elastic::ElasticStuckRecord {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            path: "foto/a.jpg".into(),
+            path_sha256: "0".repeat(64),
+            target: Some("d1".into()),
+            temporary: None,
+            source: tentanas_helper::elastic::ElasticFilePin { device: 1, inode: 2, size: Some(3), sha256: None },
+            temporary_copy: None,
+            destination: None,
+            reason: "rekord nierozwiązany: EIO".into(),
+        };
+        let run = ElasticMoverRun {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase: ElasticMoverPhase::Complete,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: Some("2026-09-08T01:10:00Z".into()),
+            moved_files: 0,
+            moved_bytes: 0,
+            skipped_files: 0,
+            skipped_bytes: 0,
+            refused_files: 1,
+            issues: Vec::new(),
+            stuck_records: vec![record],
+            stuck_hidden: 0,
+            counts_known: true,
+            detail: None,
+            coupled_sync: None,
+        };
+        let wire = mover_to_protocol(&run);
+        assert_eq!(wire.outcome, "partial");
+        assert!(wire.detail.contains("utknięte rekordy: 1: foto/a.jpg"), "{}", wire.detail);
+        let mut summarised = run.clone();
+        summarised.stuck_hidden = 2;
+        assert!(
+            mover_to_protocol(&summarised).detail.contains("utknięte rekordy: 1 (+2 bez pełnego rekordu)"),
+            "{}",
+            mover_to_protocol(&summarised).detail
+        );
+        assert!(wire.detail.contains(MOVER_TEST_OPERATION), "{}", wire.detail);
+    }
+
+    #[test]
+    fn observed_protocol_reads_mover_from_persisted_array_spec() {
+        let conn = rusqlite::Connection::open_in_memory().expect("połączenie testowe");
+        store::migrate(&conn).expect("migracje testowe");
+        let db = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let spec = create_spec("mover-db");
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::new_v4().to_string(),
+            kind: "elastic_create".into(),
+            subject: spec.name.clone(),
+            status: "queued".into(),
+            started_by: "test".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&db, &job, Some(&jobs::ElasticJobIntent::Create(spec.clone())))
+            .expect("rezerwacja testowa");
+        let row = store::elastic_array(&db, &spec.owner, &spec.name)
+            .expect("odczyt macierzy")
+            .expect("utrwalona macierz");
+        let persisted = row.persisted_spec().expect("utrwalona specyfikacja");
+        assert_eq!(persisted, &spec);
+        let mut result = ready_result(persisted);
+        result.last_mover = Some(ElasticMoverRun {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase: ElasticMoverPhase::Complete,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: Some("2026-09-08T01:01:00Z".into()),
+            moved_files: 1,
+            moved_bytes: 64,
+            skipped_files: 0,
+            skipped_bytes: 0,
+            refused_files: 0,
+            issues: Vec::new(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: true,
+            detail: None,
+            coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
+                operation_id: MOVER_TEST_OPERATION.into(),
+                kind: ElasticSnapraidKind::Sync,
+                started_at: "2026-09-08T01:00:30Z".into(),
+                finished_at: Some("2026-09-08T01:00:31Z".into()),
+                outcome: ElasticSnapraidOutcome::Succeeded,
+                exit_code: Some(0),
+                total_blocks: Some(0),
+                checked_blocks: None,
+                accessed_mb: None,
+                errors_file: None,
+                errors_io: None,
+                errors_data: None,
+                detail: None,
+            }),
+        });
+        validate_observation(persisted, &result).expect("poprawny wynik z DB");
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(wire.mover.last_run.expect("wynik movera").outcome, "ok");
+    }
+
+    #[test]
+    fn observation_rejects_complete_mover_with_reported_sync_error() {
+        let spec = create_spec("mover-error-count");
+        let mut result = ready_result(&spec);
+        result.last_mover = Some(ElasticMoverRun {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase: ElasticMoverPhase::Complete,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: Some("2026-09-08T01:01:00Z".into()),
+            moved_files: 1,
+            moved_bytes: 64,
+            skipped_files: 0,
+            skipped_bytes: 0,
+            refused_files: 0,
+            issues: Vec::new(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: true,
+            detail: None,
+            coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
+                operation_id: MOVER_TEST_OPERATION.into(),
+                kind: ElasticSnapraidKind::Sync,
+                started_at: "2026-09-08T01:00:30Z".into(),
+                finished_at: Some("2026-09-08T01:00:31Z".into()),
+                outcome: ElasticSnapraidOutcome::Succeeded,
+                exit_code: Some(0),
+                total_blocks: Some(1),
+                checked_blocks: None,
+                accessed_mb: None,
+                errors_file: Some(0),
+                errors_io: Some(0),
+                errors_data: Some(1),
+                detail: None,
+            }),
+        });
+        assert!(validate_observation(&spec, &result).is_err());
+    }
+
+    #[test]
+    fn observation_rejects_mover_with_malformed_operation_uuid() {
+        let spec = create_spec("mover-invalid");
+        let mut result = ready_result(&spec);
+        result.last_mover = Some(ElasticMoverRun {
+            operation_id: "not-an-uuid".into(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase: ElasticMoverPhase::Moving,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: None,
+            moved_files: 0,
+            moved_bytes: 0,
+            skipped_files: 0,
+            skipped_bytes: 0,
+            refused_files: 0,
+            issues: Vec::new(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: false,
+            detail: None,
+            coupled_sync: None,
+        });
+        assert!(validate_observation(&spec, &result).is_err());
+    }
+
+    #[test]
+    fn observation_rejects_mover_resume_uuid_equal_to_create() {
+        let spec = create_spec("mover-foreign");
+        let mut result = ready_result(&spec);
+        result.last_mover = Some(ElasticMoverRun {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            resume_operation_id: spec.operation_id.clone(),
+            phase: ElasticMoverPhase::Moving,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: None,
+            moved_files: 0,
+            moved_bytes: 0,
+            skipped_files: 0,
+            skipped_bytes: 0,
+            refused_files: 0,
+            issues: Vec::new(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: false,
+            detail: None,
+            coupled_sync: None,
+        });
+        assert!(validate_observation(&spec, &result).is_err());
+    }
+
+    #[test]
+    fn observation_accepts_distinct_mover_operation_uuid() {
+        let spec = create_spec("mover-foreign-operation");
+        let mut result = ready_result(&spec);
+        result.last_mover = Some(ElasticMoverRun {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase: ElasticMoverPhase::Moving,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: None,
+            moved_files: 0,
+            moved_bytes: 0,
+            skipped_files: 0,
+            skipped_bytes: 0,
+            refused_files: 0,
+            issues: Vec::new(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: false,
+            detail: None,
+            coupled_sync: None,
+        });
+        validate_observation(&spec, &result).expect("odrębna operacja movera jest legalna");
+    }
+
+    const MOVER_TEST_OPERATION: &str = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
+
+    #[test]
+    fn observation_requires_the_coupled_sync_of_the_same_operation() {
+        let spec = create_spec("mover-foreign-sync");
+        let mut result = ready_result(&spec);
+        result.stage = ElasticStage::NeedsAttention;
+        result.last_mover = Some(ElasticMoverRun {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase: ElasticMoverPhase::NeedsAttention,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: None,
+            moved_files: 1,
+            moved_bytes: 64,
+            skipped_files: 0,
+            skipped_bytes: 0,
+            refused_files: 0,
+            issues: Vec::new(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: true,
+            detail: None,
+            coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                kind: ElasticSnapraidKind::Sync,
+                started_at: "2026-09-08T01:00:30Z".into(),
+                finished_at: Some("2026-09-08T01:00:31Z".into()),
+                outcome: ElasticSnapraidOutcome::Failed,
+                exit_code: Some(1),
+                total_blocks: None,
+                checked_blocks: None,
+                accessed_mb: None,
+                errors_file: None,
+                errors_io: None,
+                errors_data: None,
+                detail: Some("sync failed".into()),
+            }),
+        });
+        assert!(validate_observation(&spec, &result).is_err(), "Sync obcej operacji");
+        result.last_mover.as_mut().unwrap().coupled_sync.as_mut().unwrap().operation_id =
+            MOVER_TEST_OPERATION.into();
+        validate_observation(&spec, &result).expect("Sync tej samej operacji");
+    }
+
+    #[test]
+    fn stale_parity_from_the_helper_reaches_protection_as_unsynced_bytes() {
+        let spec = create_spec("mover-stale");
+        let mut row = array();
+        row.create_spec = Some(spec.clone());
+        // Moving only empty files leaves zero bytes, yet parity is still stale.
+        for bytes in [4096, 0] {
+            let mut result = ready_result(&spec);
+            result.stale_parity_bytes = Some(bytes);
+            result.parity_stale = true;
+            validate_observation(&spec, &result).expect("nieaktualna parity");
+            let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result.clone()), &[]);
+            assert_eq!(wire.protection.moved_unsynced_bytes, Some(bytes));
+            assert_ne!(wire.protection.status, "protected", "{bytes} B");
+            let mut without_parity = spec.clone();
+            without_parity.parity.clear();
+            assert!(validate_observation(&without_parity, &result).is_err());
+        }
+        // Where every other measurement is complete, the verdict alone decides:
+        // zero unsynced bytes read as protected only while parity is current.
+        let a = array();
+        let mut verified = all_mounted(&a, 0);
+        verified.moved_unsynced_bytes = Some(0);
+        assert_eq!(protection(&a, &verified).status, "protected");
+        verified.parity_stale = true;
+        assert_eq!(protection(&a, &verified).status, "window_open");
+        // A count without the verdict is inconsistent, never "protected".
+        let mut unflagged = ready_result(&spec);
+        unflagged.stale_parity_bytes = Some(0);
+        assert!(validate_observation(&spec, &unflagged).is_err());
+    }
+
+    #[test]
+    fn mover_outcome_separates_partial_held_and_closed_runs() {
+        let spec = create_spec("mover-outcomes");
+        let run = |phase, finished: Option<&str>, skipped, refused| ElasticMoverRun {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: finished.map(str::to_string),
+            moved_files: 3,
+            moved_bytes: 96,
+            skipped_files: skipped,
+            skipped_bytes: skipped * 8,
+            refused_files: refused,
+            issues: (0..refused)
+                .map(|index| tentanas_helper::elastic::ElasticMoverIssue {
+                    path: format!("foto/link-{index}.jpg"),
+                    kind: ElasticMoverIssueKind::Refused,
+                    reason: "mover odmawia symlinku".into(),
+                })
+                .collect(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: true,
+            detail: None,
+            coupled_sync: None,
+        };
+        let cases = [
+            (run(ElasticMoverPhase::Moving, None, 0, 0), "running"),
+            (run(ElasticMoverPhase::NeedsAttention, None, 0, 0), "needs_attention"),
+            (run(ElasticMoverPhase::NeedsAttention, Some("2026-09-08T01:05:00Z"), 0, 0), "failed"),
+            (run(ElasticMoverPhase::Complete, Some("2026-09-08T01:05:00Z"), 0, 0), "ok"),
+            (run(ElasticMoverPhase::Complete, Some("2026-09-08T01:05:00Z"), 1, 0), "partial"),
+            (run(ElasticMoverPhase::Complete, Some("2026-09-08T01:05:00Z"), 0, 2), "partial"),
+        ];
+        for (mover, outcome) in cases {
+            let mut result = ready_result(&spec);
+            result.stage = ElasticStage::NeedsAttention;
+            result.last_mover = Some(mover.clone());
+            validate_observation(&spec, &result).expect("typed mover outcome");
+            let wire = mover_to_protocol(&mover);
+            assert_eq!(wire.outcome, outcome, "{:?}", mover.phase);
+            if mover.refused_files > 0 {
+                assert!(wire.detail.contains("odmówiono 2"), "{}", wire.detail);
+                assert!(wire.detail.contains("foto/link-0.jpg: mover odmawia symlinku"), "{}", wire.detail);
+            } else {
+                assert!(wire.detail.is_empty(), "{}", wire.detail);
+            }
+        }
+        let mut overreported = run(ElasticMoverPhase::Complete, Some("2026-09-08T01:05:00Z"), 0, 1);
+        overreported.refused_files = 0;
+        let mut result = ready_result(&spec);
+        result.last_mover = Some(overreported);
+        assert!(validate_observation(&spec, &result).is_err());
+    }
+
+    #[test]
+    fn observation_rejects_complete_mover_after_failed_sync() {
+        let spec = create_spec("mover-sync-failure");
+        let mut result = ready_result(&spec);
+        result.last_mover = Some(ElasticMoverRun {
+            operation_id: MOVER_TEST_OPERATION.into(),
+            resume_operation_id: uuid::Uuid::new_v4().to_string(),
+            phase: ElasticMoverPhase::Complete,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: Some("2026-09-08T01:01:00Z".into()),
+            moved_files: 1,
+            moved_bytes: 64,
+            skipped_files: 0,
+            skipped_bytes: 0,
+            refused_files: 0,
+            issues: Vec::new(),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            counts_known: true,
+            detail: None,
+            coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
+                operation_id: MOVER_TEST_OPERATION.into(),
+                kind: ElasticSnapraidKind::Sync,
+                started_at: "2026-09-08T01:00:30Z".into(),
+                finished_at: Some("2026-09-08T01:00:31Z".into()),
+                outcome: ElasticSnapraidOutcome::Failed,
+                exit_code: Some(1),
+                total_blocks: None,
+                checked_blocks: None,
+                accessed_mb: None,
+                errors_file: None,
+                errors_io: None,
+                errors_data: None,
+                detail: Some("sync failed".into()),
+            }),
+        });
+        assert!(validate_observation(&spec, &result).is_err());
     }
 
     pub(crate) fn snapraid_result(
@@ -3272,6 +3907,8 @@ pub(crate) mod tests {
             last_sync_at: Some("2026-09-06T14:06:00Z".to_string()),
             parity_errors: Some(0),
             moved_unsynced_bytes: None,
+            parity_stale: false,
+            last_mover: None,
         }
     }
 

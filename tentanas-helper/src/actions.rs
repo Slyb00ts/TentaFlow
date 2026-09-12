@@ -51,6 +51,7 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
     match command {
         HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
         | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. }
+        | HelperCommand::ElasticMover { .. }
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. } => {
             crate::elastic::execution::execute(command)
