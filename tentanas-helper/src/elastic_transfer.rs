@@ -105,6 +105,13 @@ fn pin_of(identity: &TransferIdentity) -> TransferPin {
     }
 }
 
+/// POLICY: the helper is FORWARD-ONLY. `deny_unknown_fields` is what catches a
+/// journal this helper did not write, and it stays — which also means a journal
+/// written by a NEWER helper is deliberately rejected by an older binary, field
+/// by field. That is the intended behaviour, not an oversight: there is no
+/// schema versioning here and no migration path. Rolling the helper back to an
+/// older build therefore requires stopping the array first, so nothing is left
+/// holding a journal the older binary will refuse to read.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TransferFile {
@@ -127,6 +134,15 @@ pub(crate) struct TransferFile {
     /// reports how the source was removed.
     #[serde(default)]
     pub unread_source: Option<String>,
+    /// The orphaned temporary of this record was VERIFIED as ours and deleted
+    /// from the branch. `temporary` itself stays: the journal validator
+    /// requires an in-flight record to name one, and a name that no longer
+    /// resolves is still how a reader recognises which copy was removed. What
+    /// this flag governs is what the record CLAIMS downstream — a stuck record
+    /// built from it reports no temporary at all, so nothing reports an orphan
+    /// this helper already cleaned up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub temporary_removed: bool,
     pub phase: TransferFilePhase,
 }
 
@@ -336,6 +352,9 @@ pub(crate) fn worst_case_record(file: &TransferFile) -> TransferFile {
     pinned.destination_identity = Some(pin_of(&file.source_identity));
     pinned.temporary_pin = Some((u64::MAX, u64::MAX));
     pinned.directory_intent = Some(file.destination.clone());
+    // A stuck record may set this before the closing write, and it only ever
+    // costs bytes when true.
+    pinned.temporary_removed = true;
     pinned.phase = TransferFilePhase::UnlinkConfirmed;
     pinned
 }
@@ -409,11 +428,18 @@ thread_local! {
     static UNLISTABLE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
     /// An entry name whose `fstatat` fails with EIO in this test thread.
     static UNSTATABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// Whether the directory fsync AFTER an orphan unlink fails in this thread.
+    static UNSYNCABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn fail_listing_of(identity: Option<(u64, u64)>) {
     UNLISTABLE.with(|cell| cell.set(identity));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn fail_directory_fsync(on: bool) {
+    UNSYNCABLE.with(|cell| cell.set(on));
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1061,6 +1087,8 @@ pub(crate) fn plan_file(
         temporary: Some(temporary.into()),
         temporary_identity: None,
         temporary_pin: None,
+        // A record being planned has a temporary that exists, or is about to.
+        temporary_removed: false,
         source_identity,
         destination_identity: None,
         directory_intent: None,
@@ -1279,6 +1307,112 @@ fn fresh_temporary(stat: &libc::stat) -> bool {
         && (stat.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32
         && stat.st_uid == unsafe { libc::geteuid() }
         && stat.st_mode as u32 & 0o077 == 0
+}
+
+/// What removing an orphaned temporary did.
+// Not `Copy`: `Removed` carries the text of a directory fsync that failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrphanCleanup {
+    /// The file was verified as this record's own and unlinked. `fsync` carries
+    /// a DIRECTORY fsync that failed AFTER the unlink: the file is gone either
+    /// way, so that is a notice, never a reversal of the outcome.
+    Removed { fsync: Option<String> },
+    /// Nothing was there. An earlier crash, an earlier run or an admin already
+    /// cleaned it up, and that is a clean outcome, not a failure.
+    Absent,
+}
+
+/// Deletes the temporary a record is about to be STUCK on, and only when this
+/// helper can prove the file is its own.
+///
+/// The proof is the record's own pins re-read from the branch: the pinned
+/// (device, inode) must still be what lies under the temporary name, it must
+/// be a regular file with exactly one link, and where the record pinned a size
+/// that size must match. An unpinned copy is accepted only in the fresh,
+/// private state `fresh_temporary` describes — the same standard `roll_back`
+/// applies, and for the same reason.
+///
+/// The content hash is NOT re-read. Re-hashing would mean reading the whole
+/// copy back off a branch whose I/O has just failed, which is when it is least
+/// trustworthy; (device, inode) under `RESOLVE_NO_SYMLINKS` is the identity the
+/// transfer path itself trusts to unlink a source.
+///
+/// Anything that cannot be proved deletes NOTHING and says why. A missing file
+/// is `Absent`: the caller must treat it as success, because an orphan that is
+/// already gone is exactly the state this function exists to reach.
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_orphan_temporary(
+    destination_root: &Path,
+    file: &TransferFile,
+) -> Result<OrphanCleanup, String> {
+    let temporary = file
+        .temporary
+        .as_deref()
+        .ok_or("brak trwałej ścieżki tymczasowej")?;
+    // One component, validated when the record was planned, so `unlinkat`
+    // relative to the branch FD cannot reach outside it. `stat_at_io` refuses
+    // a name with a separator or a special component and never follows a
+    // symlink; the branch itself is opened with RESOLVE_NO_SYMLINKS.
+    let destination_root = open_root_directory(destination_root)?;
+    let stat = match stat_at_io(destination_root.as_raw_fd(), temporary) {
+        Ok(stat) => stat,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            return Ok(OrphanCleanup::Absent)
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if (stat.st_mode as u32 & libc::S_IFMT as u32) != libc::S_IFREG as u32 || stat.st_nlink != 1 {
+        return Err("pod nazwą tymczasową nie leży zwykły plik tej operacji".into());
+    }
+    let ours = match file.temporary_pin {
+        Some(pin) => (stat.st_dev as u64, stat.st_ino as u64) == pin,
+        None => fresh_temporary(&stat),
+    };
+    if !ours {
+        return Err("pod nazwą tymczasową leży obcy plik".into());
+    }
+    if let Some(pinned) = file.temporary_identity.as_ref() {
+        if pinned.size != stat.st_size as u64 {
+            return Err("kopia tymczasowa ma inny rozmiar niż przypięty".into());
+        }
+    }
+    let name = CString::new(temporary).map_err(|_| "nazwa zawiera NUL".to_string())?;
+    if unsafe { libc::unlinkat(destination_root.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // Lost a race with another cleanup: the orphan is gone either way.
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(OrphanCleanup::Absent);
+        }
+        return Err(error.to_string());
+    }
+    // THE OUTCOME IS DECIDED HERE: `unlinkat` returned 0, so the orphan is
+    // gone. Durability of the directory entry is a separate question, and it
+    // must not be able to rewrite this into "not deleted" — a branch failing
+    // I/O is precisely WHY a record sticks, so EIO here is the expected case,
+    // not an exotic one. Reporting a phantom orphan would send an operator
+    // hunting for a file that does not exist, while the stuck record, the skip
+    // set and the syslog line all went on naming it. The worst case of an
+    // un-fsynced unlink is a crash resurrecting the name, which the
+    // ENOENT-tolerant cleanup already treats as clean.
+    let fsync = fsync_after_unlink(destination_root.as_raw_fd()).err();
+    Ok(OrphanCleanup::Removed { fsync })
+}
+
+/// The directory fsync that follows a successful unlink. Split out so a test
+/// can fail it while the unlink still succeeds — hooking `fsync_fd` itself
+/// would also fire on the transfer path's own fsyncs of the same directory.
+#[cfg(target_os = "linux")]
+fn fsync_after_unlink(fd: i32) -> Result<(), String> {
+    #[cfg(test)]
+    if UNSYNCABLE.with(|cell| cell.get()) {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO).to_string());
+    }
+    fsync_fd(fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn remove_orphan_temporary(_: &Path, _: &TransferFile) -> Result<OrphanCleanup, String> {
+    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
 }
 
 /// Withdraws a record whose source was never touched (CopyIntent up to

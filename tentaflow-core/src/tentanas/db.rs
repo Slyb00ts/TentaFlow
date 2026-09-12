@@ -1362,12 +1362,22 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
         .query_map(params![owner.org_id,owner.addon_id], |r| Ok((r.get::<_,String>(0)?,
             r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The parity-errors count is read from a DATE window, never from the tail
+    // of the short display history: a run with errors that is still inside the
+    // window must not be able to rotate out behind newer clean runs. One day of
+    // slack below the advertised window keeps a record whose stored timestamp
+    // trails the helper's own from being dropped before the producer judges it.
+    let parity_since = (chrono::Utc::now()
+        - chrono::Duration::days(i64::from(super::elastic::PARITY_ERRORS_WINDOW_DAYS) + 1))
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     headers.into_iter().map(|(array_id,state,state_detail,created_at,updated_at)| {
         let spec = elastic_spec(&conn, owner, &array_id)?;
         Ok(super::elastic::ElasticArrayRow {
-            snapraid_history: elastic_runs(&conn, &spec, None, false, 20)?,
-            last_sync_run: elastic_runs(&conn, &spec, Some("sync"), true, 1)?.into_iter().next(),
-            last_scrub_run: elastic_runs(&conn, &spec, Some("scrub"), false, 1)?.into_iter().next(),
+            snapraid_history: elastic_runs(&conn, &spec, None, false, 20, None)?,
+            parity_window_runs: elastic_runs(&conn, &spec, None, false,
+                super::elastic::PARITY_ERRORS_MAX_ROWS, Some(&parity_since))?,
+            last_sync_run: elastic_runs(&conn, &spec, Some("sync"), true, 1, None)?.into_iter().next(),
+            last_scrub_run: elastic_runs(&conn, &spec, Some("scrub"), false, 1, None)?.into_iter().next(),
             name: spec.name.clone(), enabled: true, filesystem: spec.filesystem.as_str().to_string(),
             create_policy: "mfs".to_string(),
             branches: spec.data.iter().enumerate().map(|(i,d)| super::elastic::BranchRow {
@@ -1388,12 +1398,24 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
     }).collect()
 }
 
+/// Reads an array's sync and scrub history.
+///
+/// `since` bounds the STORED `finished_at` from below, RFC3339 in UTC like
+/// `now()` writes it, so a caller can ask for a WINDOW instead of a row count.
+///
+/// A windowed query also drops rows that carry NO finish time. They hold no
+/// measurement the caller could use — an unfinished run is not evidence either
+/// way — and keeping them would let a burst of stuck operations fill the row
+/// cap with rows that say nothing, wedging a card to `unknown` with no visible
+/// cause. Callers that ask by count (`since` = None) still see them, because
+/// the display history is where an unfinished run belongs.
 fn elastic_runs(
     conn: &Connection,
     spec: &ElasticCreateSpec,
     kind: Option<&str>,
     succeeded: bool,
     limit: u32,
+    since: Option<&str>,
 ) -> Result<Vec<tentaflow_protocol::tentanas::NasSnapraidRun>> {
     use tentanas_helper::elastic::{
         ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult,
@@ -1403,6 +1425,7 @@ fn elastic_runs(
         FROM nas_elastic_operations WHERE array_id=?1 AND kind IN ('sync','scrub')
         AND (?2 IS NULL OR kind=?2) AND (?3=0 OR state='succeeded')
         AND (?2 IS NULL OR ?3!=0 OR state NOT IN ('running','failed'))
+        AND (?5 IS NULL OR finished_at >= ?5)
         ORDER BY created_at DESC,operation_id DESC LIMIT ?4",
     )?;
     let rows = statement.query_map(
@@ -1410,7 +1433,8 @@ fn elastic_runs(
             spec.array_id,
             kind,
             succeeded,
-            if kind.is_some() { -1 } else { i64::from(limit) }
+            if kind.is_some() { -1 } else { i64::from(limit) },
+            since
         ],
         |r| {
             Ok((
@@ -1429,6 +1453,7 @@ fn elastic_runs(
     let mut history = Vec::new();
     for row in rows {
         let (operation_id, job_id, kind, state, started_at, finished_at, detail, json) = row?;
+        let stored_finished_at = finished_at.clone();
         let mut terminal_run = false;
         let mut value = tentaflow_protocol::tentanas::NasSnapraidRun {
             job_id: Some(job_id),
@@ -1507,6 +1532,19 @@ fn elastic_runs(
                     value.finished_at = None;
                 }
             }
+        }
+        // MIN-3: a WINDOW must be judged on the same timestamp it was filtered
+        // on. The SQL bound above reads the stored `finished_at`, written by
+        // THIS node's clock; the decoding above then overwrites the value with
+        // the finish time the HELPER reported, from another machine's clock.
+        // Comparing one against the other is a skew hole: a helper running far
+        // enough ahead puts a run inside the window that the query had already
+        // dropped, and the rows that remain would answer a confident zero. So a
+        // windowed row carries the stored time — one clock, one comparison, and
+        // no slack to buy. The display history is untouched: it shows the run's
+        // own reported finish, which is what an operator asked to see.
+        if since.is_some() {
+            value.finished_at = stored_finished_at.clone();
         }
         if terminal_only && !terminal_run {
             continue;
@@ -3564,6 +3602,163 @@ mod tests {
         );
         let (row, intent, _) = maintenance(&spec, Kind::Sync);
         insert_job(&p, &row, Some(&intent)).unwrap();
+    }
+
+    /// MIN-3: the window judges the STORED finish time — the one the query
+    /// filtered on — not the finish the helper reported from its own clock.
+    /// Two clocks in one comparison is a skew hole: a helper running far enough
+    /// ahead would put a run inside the window that the query had already
+    /// dropped, and the rows left behind would answer a confident zero.
+    #[test]
+    fn a_window_row_carries_the_timestamp_the_query_filtered_on() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let p = pool();
+        let spec = completed_array(&p, "clock-skew");
+        let (row, intent, id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+        // The helper reports a finish far OUTSIDE the window; this node stores
+        // the row now, INSIDE it.
+        let reported = (chrono::Utc::now() - chrono::Duration::days(60))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut result =
+            super::super::elastic::tests::snapraid_result(&spec, &id, Kind::Sync, Outcome::Succeeded);
+        result.run.started_at = reported.clone();
+        result.run.finished_at = Some(reported.clone());
+        // `validate_snapraid_result` requires the state's `last_run` to BE this
+        // run, and a succeeded Sync to carry it as the sync checkpoint too, so
+        // all three move together — only the node's own stored column stays at
+        // `now()`, which is the whole point of the case.
+        result.state.last_run = Some(result.run.clone());
+        result.state.sync_completed_at = Some(reported.clone());
+        record_snapraid_result(&p, &spec.owner, &id, &result).unwrap();
+        finish_job(&p, &row.job_id, "succeeded", None).unwrap();
+
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(
+            array.snapraid_history[0].finished_at.as_deref(),
+            Some(reported.as_str()),
+            "the display history shows the finish the run itself reported"
+        );
+        let windowed = array
+            .parity_window_runs
+            .iter()
+            .find(|r| r.operation_id.as_deref() == Some(id.as_str()))
+            .expect("the run is inside the stored window the query selected");
+        assert_ne!(
+            windowed.finished_at.as_deref(),
+            Some(reported.as_str()),
+            "the window row must not be judged on a clock the query never read"
+        );
+        let stored = chrono::DateTime::parse_from_rfc3339(
+            windowed.finished_at.as_deref().expect("stored finish"),
+        )
+        .expect("RFC3339");
+        assert!(
+            (chrono::Utc::now() - stored.with_timezone(&chrono::Utc)).num_minutes() < 5,
+            "the window row carries this node's stored finish: {:?}",
+            windowed.finished_at
+        );
+    }
+
+    /// The parity window is a DATE query, not the tail of the display history:
+    /// it still carries runs the 20-row display list has already rotated away,
+    /// and a run leaves it because it aged out — never because newer runs
+    /// pushed it past a row count.
+    #[test]
+    fn the_parity_window_is_selected_by_date_and_not_by_the_history_row_count() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let p = pool();
+        let spec = completed_array(&p, "parity-window");
+        // More completed runs than the display history retains.
+        let ids: Vec<String> = (0..22)
+            .map(|_| {
+                let (row, intent, id) = maintenance(&spec, Kind::Sync);
+                insert_job(&p, &row, Some(&intent)).unwrap();
+                record_snapraid_result(
+                    &p,
+                    &spec.owner,
+                    &id,
+                    &super::super::elastic::tests::snapraid_result(
+                        &spec,
+                        &id,
+                        Kind::Sync,
+                        Outcome::Succeeded,
+                    ),
+                )
+                .unwrap();
+                finish_job(&p, &row.job_id, "succeeded", None).unwrap();
+                id
+            })
+            .collect();
+        let carries = |runs: &[tentaflow_protocol::tentanas::NasSnapraidRun], id: &str| {
+            runs.iter().any(|r| r.operation_id.as_deref() == Some(id))
+        };
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(
+            array.snapraid_history.len(),
+            20,
+            "the display list keeps its own retention, unchanged"
+        );
+        assert_eq!(
+            array.parity_window_runs.len(),
+            ids.len(),
+            "the window is bounded by date, so it holds every run inside it"
+        );
+        // MIN-5: an unfinished run is in the display history and NOT in the
+        // window — it measures nothing, and 200 of them would otherwise fill
+        // the cap and wedge the card to `unknown` with no visible cause.
+        let (running_row, running_intent, running_id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &running_row, Some(&running_intent)).unwrap();
+        let with_running = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert!(
+            with_running
+                .snapraid_history
+                .iter()
+                .any(|r| r.operation_id.as_deref() == Some(running_id.as_str())),
+            "a running operation belongs in the display history"
+        );
+        assert!(
+            !with_running
+                .parity_window_runs
+                .iter()
+                .any(|r| r.operation_id.as_deref() == Some(running_id.as_str())),
+            "a run with no finish time carries no measurement and must not cost a window row"
+        );
+        // It stays running on purpose: a row with no finish time is exactly
+        // what must not cost a window slot.
+
+        let oldest = ids.first().unwrap().clone();
+        assert!(
+            !carries(&array.snapraid_history, &oldest),
+            "the oldest run has rotated out of the display list"
+        );
+        assert!(
+            carries(&array.parity_window_runs, &oldest),
+            "and is still in the parity window, where an error in it cannot hide"
+        );
+        // Age that run's stored finish past the window: now it leaves — by date.
+        let old = (chrono::Utc::now()
+            - chrono::Duration::days(
+                i64::from(super::super::elastic::PARITY_ERRORS_WINDOW_DAYS) + 5,
+            ))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        p.write()
+            .unwrap()
+            .execute(
+                "UPDATE nas_elastic_operations SET finished_at=?1 WHERE operation_id=?2",
+                params![old, oldest],
+            )
+            .unwrap();
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert!(
+            !carries(&array.parity_window_runs, &oldest),
+            "a run that finished outside the window must not be queried"
+        );
+        assert_eq!(array.parity_window_runs.len(), ids.len() - 1);
     }
 
     #[test]

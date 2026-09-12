@@ -35,6 +35,36 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// One line to the system log from anywhere in this library. The wrapper
+/// binary logs every command the same way; facts that no bounded journal field
+/// may drop — an evicted skip-set entry, say — are written here as well, where
+/// nothing rotates them away but the system's own log policy.
+#[cfg(target_os = "linux")]
+pub(crate) fn syslog_notice(message: &str) {
+    // The identifier outlives the process, so a static C string is correct.
+    static IDENT: &[u8] = b"tentanas-helper\0";
+    let Ok(text) = std::ffi::CString::new(message.replace('\0', " ")) else {
+        return;
+    };
+    unsafe {
+        // Mover bookkeeping, not the privilege channel's own audit trail:
+        // AUTHPRIV belongs to the wrapper binary, this belongs to DAEMON.
+        libc::openlog(
+            IDENT.as_ptr() as *const libc::c_char,
+            libc::LOG_PID,
+            libc::LOG_DAEMON,
+        );
+        libc::syslog(
+            libc::LOG_NOTICE,
+            b"%s\0".as_ptr() as *const libc::c_char,
+            text.as_ptr(),
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn syslog_notice(_message: &str) {}
+
 pub mod actions;
 pub mod block;
 pub mod elastic;

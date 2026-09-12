@@ -82,6 +82,27 @@ pub const SNAPRAID_FEATURE_ID: &str = "snapraid";
 /// the period the array is under pressure.
 pub const MOVER_RETRIGGER_COOLDOWN: Duration = Duration::from_secs(20 * 60);
 
+/// The window the card promises. n11 renders the row „Błędy parity (30 dni)"
+/// and the wire carries this number beside the count, so the sum below and the
+/// label the UI reads come from ONE place and can never drift apart.
+pub const PARITY_ERRORS_WINDOW_DAYS: u32 = 30;
+
+/// The most rows the parity window may return. The window itself is selected
+/// BY DATE (`db::elastic_arrays`), so this is only a guard against a
+/// pathological array pulling an unbounded result set — it never decides the
+/// window, and it is not the display history's retention.
+///
+/// Why it cannot cut into the window: the fastest cadence the product
+/// schedules is a nightly sync plus a weekly scrub, about 1.14 runs a day, so
+/// 30 days holds roughly 34 runs. 200 rows is about 5.8x that — some 175 days
+/// at the same cadence — so an array would have to run maintenance nearly six
+/// times faster than the fastest supported schedule before the cap could reach
+/// the far edge of a 30-day window.
+///
+/// And if it ever did, nothing green is invented: a result AT the cap is read
+/// as a possibly truncated window and answers unknown, never zero.
+pub const PARITY_ERRORS_MAX_ROWS: u32 = 200;
+
 // =============================================================================
 // The model
 // =============================================================================
@@ -195,6 +216,12 @@ pub struct SnapraidConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ElasticArrayRow {
     pub snapraid_history: Vec<tentaflow_protocol::tentanas::NasSnapraidRun>,
+    /// The sync and scrub runs that finished inside `PARITY_ERRORS_WINDOW_DAYS`,
+    /// selected BY DATE rather than by count, so rotation of the display
+    /// history above can never hide an error that is still inside the window.
+    /// Bounded by `PARITY_ERRORS_MAX_ROWS`; at that bound the window is read as
+    /// truncated and the count answers unknown.
+    pub parity_window_runs: Vec<tentaflow_protocol::tentanas::NasSnapraidRun>,
     pub last_sync_run: Option<tentaflow_protocol::tentanas::NasSnapraidRun>,
     pub last_scrub_run: Option<tentaflow_protocol::tentanas::NasSnapraidRun>,
     pub create_spec: Option<tentanas_helper::elastic::ElasticCreateSpec>,
@@ -786,62 +813,157 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
         }
     };
 
+    // The open-window clause is built BEFORE the status chain, because the
+    // arms below that report an UNMEASURED fault tolerance must be able to
+    // carry it too. 18 GiB measured on cache is a certain figure; "parity
+    // availability could not be measured" is an uncertain one, and letting
+    // the uncertain one silence the certain one is the same mistake this
+    // model refuses everywhere else. The status still says `unknown` there —
+    // nothing confirmed parity, and that stands — but the sentence no longer
+    // drops what this node does know.
+    let window_clause: Option<String> =
+        if cache_bytes.is_some_and(|bytes| bytes > 0) || observed.parity_stale {
+        // Both halves can be open at once, and either may be open while the
+        // other is merely unmeasured. A known-bad fact outranks an unmeasured
+        // one, so this arm sits ABOVE the unknown cache: saying only "the
+        // cache could not be measured" would drop what this node does know,
+        // next to a byte figure the card already shows.
+        //
+        // Wording canon (plan §5.3b), verbatim and in Polish: a size and a
+        // mechanism, never a duration. Naming only the cache half would promise
+        // the next sync closes the window, which is false for files whose
+        // coupled sync already failed.
+        //
+        // BOTH halves are chosen by their own FIGURE, never by the flag or by
+        // "was it measured": a half measured as ZERO has nothing sitting in it,
+        // and a sentence that claims otherwise beside a 0 B figure is exactly
+        // the confident-zero this model exists to refuse (protocol: a confident
+        // 0 next to "unprotected bytes" is worse than no answer). `parity_stale`
+        // still guards the arm — an unconfirmed sync is not "protected" — but
+        // it no longer selects a sentence that asserts a quantity.
+        let waiting = "na cache bez parity (czeka na mover): ochronę domyka najbliższy sync, \
+             który mover uruchamia zaraz po przenosinach";
+        let unmeasured = "ten węzeł nie zmierzył, ile czeka na cache";
+        let moved = "pliki już przeniesione przez mover także są poza parity: ich sprzężony sync \
+             nie potwierdził ochrony, domknie ją dopiero kolejny udany sync";
+        let unconfirmed = "sprzężony sync nie potwierdził ochrony; domknie ją dopiero kolejny udany sync";
+        let cache_clause = if cache_bytes.is_some_and(|bytes| bytes > 0) {
+            Some(waiting)
+        } else if cache_bytes.is_none() {
+            Some(unmeasured)
+        } else {
+            // Measured empty: nothing waits there.
+            None
+        };
+        let moved_clause = observed.parity_stale.then(|| {
+            match observed.moved_unsynced_bytes.filter(|bytes| *bytes > 0) {
+                // Bytes are known to sit outside parity.
+                Some(_) => moved,
+                // Stale, but nothing measured as moved: say only that.
+                None => unconfirmed,
+            }
+        });
+        let detail = match (cache_clause, moved_clause) {
+            (Some(cache), Some(moved)) => format!("{cache}; {moved}"),
+            (Some(cache), None) => cache.to_string(),
+            (None, Some(moved)) => moved.to_string(),
+            (None, None) => {
+                // Unreachable: the arm is entered only when a half is open. A
+                // future guard edit must degrade the wording of one card, never
+                // panic the whole array listing.
+                debug_assert!(false, "okno bez otwartej połowy");
+                unconfirmed.to_string()
+            }
+        };
+            Some(detail)
+        } else {
+            None
+        };
+    // PLACEMENT IS DELIBERATE AND OWNER-APPROVED (2026-09-12). This arm is
+    // tested BEFORE `cache_bytes.is_none()` below, so an array whose cache
+    // could not be measured but whose parity the helper confirms is STALE
+    // renders `window_open` — a confirmed open window — rather than `unknown`.
+    // A known bad fact outranks an unmeasured one, and hiding a confirmed open
+    // window behind "unknown" is less honest to the operator, not more.
+    //
+    // This DIFFERS from the last committed behaviour, where `cache_bytes
+    // .is_none()` sat above both halves and won. The change came with merging
+    // the two halves into one arm, it was accepted knowingly, and
+    // `a_confirmed_stale_parity_outranks_an_unmeasured_cache` pins it so it
+    // cannot drift back unnoticed in either direction.
+    //
+    // Appended, never prepended: the arm's own sentence names the reason the
+    // card is in that state, and the window clause qualifies it.
+    let with_window = |base: &str| match window_clause.as_deref() {
+        Some(clause) => format!("{base}; {clause}"),
+        None => base.to_string(),
+    };
     let (status, detail) = if !parity_present {
         (
             "unprotected",
-            "this array has no parity disk: a disk failure loses that disk's files".to_string(),
+            "ta macierz nie ma dysku parity: awaria dysku traci jego pliki".to_string(),
         )
     } else if observed.last_sync_at.is_none() {
         (
             "window_open",
-            "Brak potwierdzonego sync: ochrona parity nie została potwierdzona".to_string(),
+            "brak potwierdzonego sync: ochrona parity nie została potwierdzona".to_string(),
         )
     } else if observed.parity_errors.is_some_and(|errors| errors > 0) {
         (
             "unknown",
-            "Wykryto błędy parity; nie można potwierdzić ochrony danych".to_string(),
+            "wykryto błędy parity; nie można potwierdzić ochrony danych".to_string(),
         )
     } else if fault_tolerance.is_none() {
         (
             "unknown",
-            "Brak pełnego pomiaru dostępności i poprawności parity".to_string(),
+            with_window("brak pełnego pomiaru dostępności i poprawności parity"),
         )
     } else if fault_tolerance.map(usize::from) != Some(array.parity.len()) {
         (
             "unknown",
-            "Brakuje dysku parity; pełna skonfigurowana ochrona nie jest dostępna".to_string(),
+            with_window("brakuje dysku parity; pełna skonfigurowana ochrona nie jest dostępna"),
         )
+    } else if let Some(detail) = window_clause.clone() {
+        ("window_open", detail)
     } else if cache_bytes.is_none() {
         (
             "unknown",
-            "this node could not measure how much is waiting on the cache".to_string(),
-        )
-    } else if cache_bytes.is_some_and(|bytes| bytes > 0) {
-        (
-            "window_open",
-            "on the cache without parity — protected after the next sync, which the mover \
-             runs immediately after it moves"
-                .to_string(),
-        )
-    } else if observed.parity_stale {
-        (
-            "window_open",
-            "Parity nie obejmuje plików przeniesionych przez mover po ostatnim udanym sync".to_string(),
+            "ten węzeł nie zmierzył, ile czeka na cache".to_string(),
         )
     } else if observed.moved_unsynced_bytes.is_some_and(|bytes| bytes > 0) {
         (
             "window_open",
-            "Dane na dyskach danych nie są objęte ostatnim sync; opróżnienie cache nie zamyka okna bez ochrony".to_string(),
+            "dane na dyskach danych nie są objęte ostatnim sync; opróżnienie cache nie zamyka okna bez ochrony".to_string(),
         )
     } else if observed.moved_unsynced_bytes.is_none() {
+        // NOT a live path in production: the producer sets this from
+        // `parity_stale`, and the helper keeps `parity_stale` true exactly when
+        // `stale_parity_bytes` is `Some`, so a `None` here cannot arrive from a
+        // real observation. It is reachable only from a directly-constructed
+        // `ArrayObservation` — kept so a hand-built one degrades to "unknown"
+        // rather than borrowing the sentence below.
         (
             "unknown",
-            "Nie zmierzono zmian na dyskach danych od ostatniego sync".to_string(),
+            "nie zmierzono zmian na dyskach danych od ostatniego sync".to_string(),
         )
     } else {
         (
+            // THE HONEST FLOOR. `moved_unsynced_bytes == Some(0)` means exactly
+            // one thing: the MOVER left nothing outside the last sync — it is
+            // derived from `!parity_stale`, and `stale_parity_bytes` is written
+            // by the mover and by nobody else. It is NOT a measurement of the
+            // array's contents. mergerfs `create` is mount-wide MFS (§5.3
+            // SPROSTOWANIE), so a share write lands straight on a data branch,
+            // outside parity, and NOTHING in `ArrayObservation` sees it: the
+            // measurement recorded at the top of this function (12 MiB written
+            // to a data disk, `snapraid status` byte-identical afterwards) is
+            // that same blindness from the other side. So the sentence says
+            // what was measured and stops there, and names the vintage of the
+            // protection instead of implying it covers this moment.
             "protected",
-            "Pomiar nie wykazał danych poza ostatnim sync; cache jest pusty, a parity dostępna bez zgłoszonych błędów".to_string(),
+            "mover nie zostawił danych poza ostatnim sync, cache jest pusty, a parity dostępna \
+             bez zgłoszonych błędów; ochrona obejmuje stan z ostatniego sync"
+                .to_string(),
         )
     };
 
@@ -1708,7 +1830,17 @@ fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
         } else {
             String::new()
         };
-        let summary = format!("utknięte rekordy: {}{hidden}: {records}", run.stuck_records.len());
+        // What THIS run evicted: a path that left the skip set is no longer
+        // skipped at all. The array's lifetime figure lives on the state, not
+        // here, so a later clean run says nothing.
+        let evicted = if run.stuck_evicted > 0 {
+            format!("; wyparto z listy pominięć: {}", run.stuck_evicted)
+        } else {
+            String::new()
+        };
+        let listed = if records.is_empty() { String::new() } else { format!(": {records}") };
+        let summary =
+            format!("utknięte rekordy: {}{hidden}{listed}{evicted}", run.stuck_records.len());
         detail = if detail.is_empty() { summary } else { format!("{detail}; {summary}") };
     }
     NasMoverRun {
@@ -1876,12 +2008,67 @@ pub fn to_protocol(
             scrub_percent: array.snapraid.scrub_percent,
             scrub_older_than_days: array.snapraid.scrub_older_than_days,
             parity_errors: observed.parity_errors,
-            parity_errors_window_days: 30,
+            parity_errors_window_days: PARITY_ERRORS_WINDOW_DAYS,
         },
         protection,
         created_at: array.created_at.clone(),
         updated_at: array.updated_at.clone(),
     }
+}
+
+/// Parity errors over the COMPLETED sync and scrub runs that finished inside
+/// `PARITY_ERRORS_WINDOW_DAYS` — the same window the wire advertises.
+///
+/// All three counters are summed. The helper parses the same three keys for
+/// both kinds (`summary:error_file|error_io|error_data`) and already treats any
+/// of them being non-zero as a failed run (`coupled_sync_success`), so counting
+/// only one of them would hide errors the helper itself calls disqualifying.
+///
+/// `None` when no completed run falls inside the window: an array nothing has
+/// checked lately has not been measured, and an absent measurement is unknown
+/// here, never a confident zero. A run still going, or one cancelled or refused
+/// before it read a block, is not evidence either way; nor is one that finished
+/// without reporting any counter at all.
+///
+/// The runs come from `parity_window_runs`, which the store selects by DATE —
+/// `snapraid_history` is the short display list and would let an error that is
+/// still inside the window rotate out behind newer clean runs, turning this
+/// into a green zero that nothing measured. If that date query ever comes back
+/// AT `PARITY_ERRORS_MAX_ROWS` its oldest rows may have been cut off, and a
+/// window that may be incomplete cannot prove a zero: the answer is `None`.
+fn parity_errors_in_window(
+    array: &ElasticArrayRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    if array.parity_window_runs.len() >= PARITY_ERRORS_MAX_ROWS as usize {
+        return None;
+    }
+    let since = now - chrono::Duration::days(i64::from(PARITY_ERRORS_WINDOW_DAYS));
+    let mut total: Option<u64> = None;
+    for run in &array.parity_window_runs {
+        if !matches!(run.kind.as_str(), "sync" | "scrub") {
+            continue;
+        }
+        if matches!(run.outcome.as_str(), "running" | "cancelled" | "refused") {
+            continue;
+        }
+        let Some(finished) = run.finished_at.as_deref() else {
+            continue;
+        };
+        let Ok(finished) = chrono::DateTime::parse_from_rfc3339(finished) else {
+            continue;
+        };
+        if finished.with_timezone(&chrono::Utc) < since {
+            continue;
+        }
+        let counted = [run.errors_file, run.errors_io, run.errors_data];
+        if counted.iter().all(Option::is_none) {
+            continue;
+        }
+        let found = counted.into_iter().flatten().fold(0u64, u64::saturating_add);
+        total = Some(total.unwrap_or(0).saturating_add(found));
+    }
+    total
 }
 
 /// The one status of the array card, with its reason.
@@ -2389,7 +2576,14 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             observed.union_mounted = result.union_mounted;
             observed.last_sync_at = result.sync_completed_at;
             observed.parity_stale = result.parity_stale;
-            observed.moved_unsynced_bytes = if result.parity_stale { result.stale_parity_bytes } else { None };
+            // Not stale is the helper AFFIRMING that no mover-moved bytes are
+            // outstanding — a measurement, not a gap. `None` here would make
+            // every healthy array read "unknown" and the protected arm dead.
+            observed.moved_unsynced_bytes =
+                if result.parity_stale { result.stale_parity_bytes } else { Some(0) };
+            // Parity errors come from the runs themselves, over the window the
+            // wire advertises — see `parity_errors_in_window`.
+            observed.parity_errors = parity_errors_in_window(array, chrono::Utc::now());
             observed.last_mover = result.last_mover.clone();
             root_stage = Some(result.stage);
             failure = result.detail.or_else(|| {
@@ -2408,7 +2602,6 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             // A recovery after a boot stopped part-way: only a reboot retries it.
             if result.restart_required {
                 failure = Some(match failure {
-                    Some(detail) if detail.contains("restart") => detail,
                     Some(detail) => format!("Wymagany restart węzła: {detail}"),
                     None => "Wymagany restart węzła".to_string(),
                 });
@@ -2545,7 +2738,7 @@ pub(crate) mod tests {
 
     pub(crate) fn ready_result(spec: &ElasticCreateSpec) -> ElasticResult {
         ElasticResult { array_id:spec.array_id.clone(),operation_id:spec.operation_id.clone(),owner:spec.owner.clone(),
-            stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,last_mover:None,stale_parity_bytes:None,parity_stale:false,stuck_records:Vec::new(),stuck_hidden:0,restart_required:false,
+            stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,last_mover:None,stale_parity_bytes:None,parity_stale:false,stuck_records:Vec::new(),stuck_hidden:0,stuck_evicted:0,restart_required:false,
             disks:spec.data.iter().enumerate().map(|(i,d)| (ElasticRole::Data((i+1) as u16),d))
                 .chain(spec.cache.iter().map(|d| (ElasticRole::Cache,d)))
                 .chain(spec.parity.iter().enumerate().map(|(i,d)| (ElasticRole::Parity((i+1) as u8),d)))
@@ -2573,6 +2766,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: false,
             detail: Some("częściowy transfer".into()),
             coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
@@ -2612,6 +2806,381 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_open_window_names_both_halves_when_both_are_open() {
+        let array = array();
+        let eighteen_gib = 18 * 1024 * 1024 * 1024;
+        // Only the cache half: the canonical clause, verbatim.
+        let canon = "na cache bez parity (czeka na mover)";
+        let cache_only = protection(&array, &all_mounted(&array, eighteen_gib));
+        assert_eq!(cache_only.status, "window_open");
+        assert!(cache_only.detail.contains(canon), "{}", cache_only.detail);
+        assert!(!cache_only.detail.contains("przeniesione przez mover"), "{}", cache_only.detail);
+        // Only the moved half — and the cache is MEASURED as empty, so nothing
+        // may claim files are waiting on it.
+        let mut moved = all_mounted(&array, 0);
+        moved.parity_stale = true;
+        moved.moved_unsynced_bytes = Some(4096);
+        let moved_only = protection(&array, &moved);
+        assert_eq!(moved_only.status, "window_open");
+        assert_eq!(moved_only.cache_unprotected_bytes, Some(0));
+        assert!(moved_only.detail.contains("przeniesione przez mover"), "{}", moved_only.detail);
+        assert!(!moved_only.detail.contains("na cache"), "pusty cache nie czeka: {}", moved_only.detail);
+        // Both halves: the cache half must not promise the window closes for
+        // files whose coupled sync already failed.
+        let mut both = all_mounted(&array, eighteen_gib);
+        both.parity_stale = true;
+        both.moved_unsynced_bytes = Some(4096);
+        let open = protection(&array, &both);
+        assert_eq!(open.status, "window_open");
+        assert_eq!(open.cache_unprotected_bytes, Some(eighteen_gib));
+        assert_eq!(open.moved_unsynced_bytes, Some(4096));
+        assert!(open.detail.contains(canon), "{}", open.detail);
+        assert!(open.detail.contains("przeniesione przez mover"), "{}", open.detail);
+        // The fourth combination: the cache figure is unknown AND the moved
+        // half is known bad. The known fact must survive, beside the bytes the
+        // card shows for it.
+        let mut blind = all_mounted(&array, 0);
+        blind.parity_stale = true;
+        blind.moved_unsynced_bytes = Some(4096);
+        blind.probes.insert(
+            cache_branch_path("media", "nvme2n1"),
+            BranchProbe {
+                mounted: Some(true),
+                device_present: Some(true),
+                size_bytes: None,
+                used_bytes: None,
+                free_bytes: None,
+            },
+        );
+        let unmeasured = protection(&array, &blind);
+        assert_eq!(unmeasured.cache_unprotected_bytes, None, "figura cache pozostaje nieznana");
+        assert_eq!(unmeasured.moved_unsynced_bytes, Some(4096));
+        assert_eq!(unmeasured.status, "window_open", "znany zły fakt bije niezmierzony");
+        assert!(unmeasured.detail.contains("przeniesione przez mover"), "{}", unmeasured.detail);
+        assert!(unmeasured.detail.contains("nie zmierzył"), "{}", unmeasured.detail);
+        assert!(!unmeasured.detail.contains(canon), "nie wiadomo, ile czeka: {}", unmeasured.detail);
+        // A stale sync with NOTHING measured as moved must not claim moved
+        // files, whatever the cache half says.
+        let quantity = "przeniesione przez mover";
+        let mut nothing_moved = all_mounted(&array, eighteen_gib);
+        nothing_moved.parity_stale = true;
+        nothing_moved.moved_unsynced_bytes = Some(0);
+        let waiting_only = protection(&array, &nothing_moved);
+        assert_eq!(waiting_only.status, "window_open");
+        assert_eq!(waiting_only.moved_unsynced_bytes, Some(0));
+        assert!(waiting_only.detail.contains(canon), "{}", waiting_only.detail);
+        assert!(!waiting_only.detail.contains(quantity), "zero nie jest ilością: {}", waiting_only.detail);
+        assert!(waiting_only.detail.contains("nie potwierdził ochrony"), "{}", waiting_only.detail);
+        // Both halves at zero: an empty cache and a stale sync that moved
+        // nothing. Neither sentence may assert a quantity.
+        let mut both_zero = all_mounted(&array, 0);
+        both_zero.parity_stale = true;
+        both_zero.moved_unsynced_bytes = Some(0);
+        let silent = protection(&array, &both_zero);
+        assert_eq!(silent.status, "window_open");
+        assert_eq!((silent.cache_unprotected_bytes, silent.moved_unsynced_bytes), (Some(0), Some(0)));
+        assert!(!silent.detail.contains("na cache"), "{}", silent.detail);
+        assert!(!silent.detail.contains(quantity), "{}", silent.detail);
+        assert!(silent.detail.contains("nie potwierdził ochrony"), "{}", silent.detail);
+        // An unmeasured cache beside a stale sync that moved nothing says both
+        // of those things and claims neither figure.
+        let mut blind_zero = both_zero.clone();
+        blind_zero.probes.insert(
+            cache_branch_path("media", "nvme2n1"),
+            BranchProbe {
+                mounted: Some(true),
+                device_present: Some(true),
+                size_bytes: None,
+                used_bytes: None,
+                free_bytes: None,
+            },
+        );
+        let blind_silent = protection(&array, &blind_zero);
+        // The closed window belongs in the sweep below too: its wording changed
+        // this round, and it is subject to the same rules as the open ones.
+        let mut clean = all_mounted(&array, 0);
+        clean.moved_unsynced_bytes = Some(0);
+        let protected = protection(&array, &clean);
+        assert_eq!(protected.status, "protected", "{}", protected.detail);
+        assert!(!protected.detail.contains("pomiar nie wykazał"), "{}", protected.detail);
+        assert_eq!(blind_silent.cache_unprotected_bytes, None);
+        assert!(blind_silent.detail.contains("nie zmierzył"), "{}", blind_silent.detail);
+        assert!(!blind_silent.detail.contains(quantity), "{}", blind_silent.detail);
+        // The banned phrasing stays banned in every combination, every sentence
+        // on this card is in one language, and all of them read as fragments
+        // that follow a figure.
+        for detail in [
+            cache_only.detail,
+            moved_only.detail,
+            open.detail,
+            unmeasured.detail,
+            waiting_only.detail,
+            silent.detail,
+            blind_silent.detail,
+            protected.detail,
+        ] {
+            assert!(!detail.contains("godz") && !detail.contains("niezsynchronizowan"), "{detail}");
+            assert!(!detail.contains("the cache") && !detail.contains("parity disk"), "{detail}");
+            assert!(
+                detail.chars().next().is_some_and(|first| !first.is_uppercase()),
+                "zdania tej karty zaczynają się małą literą: {detail}"
+            );
+        }
+    }
+
+    /// Every arm of this card, not only the open window, follows one
+    /// convention: a Polish fragment that reads after a figure.
+    #[test]
+    fn every_protection_sentence_is_a_lowercase_polish_fragment() {
+        let array = array();
+        let mut cases = vec![all_mounted(&array, 0), all_mounted(&array, 4096)];
+        let mut stale = all_mounted(&array, 0);
+        stale.parity_stale = true;
+        stale.moved_unsynced_bytes = Some(0);
+        cases.push(stale);
+        let mut unknown_moved = all_mounted(&array, 0);
+        unknown_moved.moved_unsynced_bytes = None;
+        cases.push(unknown_moved);
+        let mut errors = all_mounted(&array, 0);
+        errors.parity_errors = Some(3);
+        cases.push(errors);
+        let mut unsynced = all_mounted(&array, 0);
+        unsynced.last_sync_at = None;
+        cases.push(unsynced);
+        let mut no_parity = array.clone();
+        no_parity.parity.clear();
+        for observed in &cases {
+            for row in [&array, &no_parity] {
+                let detail = protection(row, observed).detail;
+                assert!(
+                    detail.chars().next().is_some_and(|first| !first.is_uppercase()),
+                    "{detail}"
+                );
+                assert!(!detail.contains("godz") && !detail.contains("niezsynchronizowan"), "{detail}");
+            }
+        }
+    }
+
+    /// A row and a helper result that agree about the same array: one data
+    /// disk, one parity disk and no cache, which is the shape `create_spec`
+    /// and `ready_result` produce, so the probe keys the producer writes line
+    /// up with the names the card reads.
+    fn healthy_pair(name: &str) -> (ElasticArrayRow, ElasticResult) {
+        let spec = create_spec(name);
+        let result = ready_result(&spec);
+        let mut row = array();
+        row.name = name.to_string();
+        row.branches = vec![BranchRow {
+            disk_id: "id-d1".to_string(),
+            name: "d1".to_string(),
+            device: "/dev/sdg".to_string(),
+            role: "data".to_string(),
+        }];
+        row.parity = vec![ParityRow {
+            disk_id: "id-sdj".to_string(),
+            name: "sdj".to_string(),
+            device: "/dev/sdj".to_string(),
+            index: 1,
+        }];
+        row.create_spec = Some(spec);
+        (row, result)
+    }
+
+    fn snapraid_run(
+        kind: &str,
+        outcome: &str,
+        finished: Option<chrono::DateTime<chrono::Utc>>,
+        errors: (Option<u64>, Option<u64>, Option<u64>),
+    ) -> tentaflow_protocol::tentanas::NasSnapraidRun {
+        tentaflow_protocol::tentanas::NasSnapraidRun {
+            kind: kind.to_string(),
+            started_at: "2026-09-01T00:00:00Z".to_string(),
+            finished_at: finished.map(|at| at.to_rfc3339()),
+            outcome: outcome.to_string(),
+            errors_file: errors.0,
+            errors_io: errors.1,
+            errors_data: errors.2,
+            ..Default::default()
+        }
+    }
+
+    /// THE end-to-end case: a clean completed check inside the window is what
+    /// finally makes `"protected"` reachable in production.
+    #[test]
+    fn a_clean_run_inside_the_window_renders_protected_through_the_producer() {
+        let (mut row, result) = healthy_pair("protected-window");
+        row.parity_window_runs = vec![snapraid_run(
+            "scrub",
+            "ok",
+            Some(chrono::Utc::now() - chrono::Duration::days(1)),
+            (Some(0), Some(0), Some(0)),
+        )];
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(wire.snapraid.parity_errors, Some(0));
+        assert_eq!(wire.snapraid.parity_errors_window_days, PARITY_ERRORS_WINDOW_DAYS);
+        assert_eq!(wire.protection.status, "protected", "{}", wire.protection.detail);
+        assert_eq!(wire.protection.fault_tolerance, Some(1));
+    }
+
+    #[test]
+    fn errors_inside_the_window_reach_the_card_through_the_producer() {
+        let (mut row, result) = healthy_pair("errors-window");
+        // Two file errors and one data error: all three counters are summed,
+        // because the helper disqualifies a run on any of them.
+        row.parity_window_runs = vec![snapraid_run(
+            "sync",
+            "failed",
+            Some(chrono::Utc::now() - chrono::Duration::days(2)),
+            (Some(2), Some(0), Some(1)),
+        )];
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(wire.snapraid.parity_errors, Some(3));
+        assert_eq!(wire.protection.status, "unknown");
+        assert!(
+            wire.protection.detail.contains("wykryto błędy parity"),
+            "{}",
+            wire.protection.detail
+        );
+    }
+
+    #[test]
+    fn nothing_completed_inside_the_window_stays_unknown_through_the_producer() {
+        let older = Some(chrono::Utc::now() - chrono::Duration::days(60));
+        let inside = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        for (case, history) in [
+            ("nic nie sprawdzało", Vec::new()),
+            (
+                "tylko przebieg starszy niż okno",
+                vec![snapraid_run("scrub", "ok", older, (Some(0), Some(0), Some(0)))],
+            ),
+            (
+                "przebieg wciąż trwa",
+                vec![snapraid_run("scrub", "running", None, (None, None, None))],
+            ),
+            // A terminal timestamp is not enough: a run that was cancelled or
+            // refused before it read a block says nothing, even with counters.
+            // MIN-4: the store cannot emit "cancelled" — `elastic_runs` writes
+            // only ok / refused / failed / needs_attention / running — so this
+            // case is a GUARD on the outcome filter for whoever adds an outcome
+            // later, NOT end-to-end coverage of a state production can reach.
+            // The "refused" case below is the reachable one.
+            (
+                "przebieg anulowany (strażnik filtru, nieosiągalny ze store)",
+                vec![snapraid_run("scrub", "cancelled", inside, (Some(0), Some(0), Some(0)))],
+            ),
+            (
+                "przebieg odrzucony",
+                vec![snapraid_run("sync", "refused", inside, (Some(0), Some(0), Some(0)))],
+            ),
+            (
+                "przebieg skończył się bez liczników",
+                vec![snapraid_run("scrub", "ok", inside, (None, None, None))],
+            ),
+        ] {
+            let (mut row, result) = healthy_pair("unknown-window");
+            row.parity_window_runs = history;
+            let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+            assert_eq!(wire.snapraid.parity_errors, None, "{case}");
+            assert_eq!(wire.protection.status, "unknown", "{case}");
+            assert!(
+                wire.protection.detail.contains("brak pełnego pomiaru"),
+                "{case}: {}",
+                wire.protection.detail
+            );
+        }
+    }
+
+    /// THE false-zero this round exists to kill: a run WITH errors near the far
+    /// edge of the window, buried behind far more newer clean runs than the
+    /// display history retains. Driven through the producer.
+    #[test]
+    fn an_error_at_the_far_edge_of_the_window_outlives_many_newer_clean_runs() {
+        let (mut row, result) = healthy_pair("far-edge-window");
+        let now = chrono::Utc::now();
+        let edge = now - chrono::Duration::days(i64::from(PARITY_ERRORS_WINDOW_DAYS))
+            + chrono::Duration::hours(2);
+        let mut history: Vec<_> = (1..=40)
+            .map(|hours| {
+                snapraid_run(
+                    "sync",
+                    "ok",
+                    Some(now - chrono::Duration::hours(hours)),
+                    (Some(0), Some(0), Some(0)),
+                )
+            })
+            .collect();
+        history.push(snapraid_run("scrub", "failed", Some(edge), (Some(0), Some(0), Some(4))));
+        assert!(
+            history.len() > 20,
+            "the fixture must be longer than the display history's retention"
+        );
+        row.parity_window_runs = history;
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(wire.snapraid.parity_errors, Some(4));
+        assert_eq!(wire.protection.status, "unknown");
+        assert!(
+            wire.protection.detail.contains("wykryto błędy parity"),
+            "{}",
+            wire.protection.detail
+        );
+    }
+
+    /// A window that came back at the cap may be missing its oldest rows, so it
+    /// cannot prove a zero — it answers unknown instead.
+    #[test]
+    fn a_window_at_the_row_cap_is_unknown_rather_than_a_confident_zero() {
+        let clean: Vec<_> = (1..=i64::from(PARITY_ERRORS_MAX_ROWS))
+            .map(|hours| {
+                snapraid_run(
+                    "sync",
+                    "ok",
+                    Some(chrono::Utc::now() - chrono::Duration::hours(hours)),
+                    (Some(0), Some(0), Some(0)),
+                )
+            })
+            .collect();
+        let (mut row, result) = healthy_pair("under-the-cap");
+        row.parity_window_runs = clean[1..].to_vec();
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(
+            wire.snapraid.parity_errors,
+            Some(0),
+            "one row below the cap the window is whole and still measures"
+        );
+        assert_eq!(wire.protection.status, "protected", "{}", wire.protection.detail);
+
+        let (mut row, result) = healthy_pair("at-the-cap");
+        row.parity_window_runs = clean;
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(wire.snapraid.parity_errors, None);
+        assert_eq!(wire.protection.status, "unknown");
+        assert!(
+            wire.protection.detail.contains("brak pełnego pomiaru"),
+            "{}",
+            wire.protection.detail
+        );
+    }
+
+    /// Goes through the real producer (`observed_protocol`), not a hand-built
+    /// `ArrayObservation`: a helper that reports parity as current is
+    /// AFFIRMING that no mover-moved bytes are outstanding.
+    #[test]
+    fn a_healthy_array_reports_a_measured_zero_through_the_producer() {
+        let spec = create_spec("healthy-producer");
+        let result = ready_result(&spec);
+        assert!(!result.parity_stale && result.stale_parity_bytes.is_none());
+        validate_observation(&spec, &result).expect("zdrowa macierz");
+        let mut row = array();
+        row.create_spec = Some(spec);
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(
+            wire.protection.moved_unsynced_bytes,
+            Some(0),
+            "brak nieaktualnej parity to zmierzone zero, nie brak pomiaru"
+        );
+    }
+
+    #[test]
     fn restart_required_reaches_the_array_state_and_is_never_ready() {
         let spec = create_spec("restart-required");
         let mut result = ready_result(&spec);
@@ -2622,9 +3191,19 @@ pub(crate) mod tests {
         validate_observation(&spec, &result).expect("stan oczekujący na restart");
         let mut row = array();
         row.create_spec = Some(spec);
-        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &[]);
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result.clone()), &[]);
         assert_eq!(wire.state, "needs_attention");
         assert_eq!(wire.state_detail, "Wymagany restart węzła: mount: Input/output error");
+        // The prefix comes from the flag, never from recognising a word in the
+        // helper's own sentence: a cause that happens to mention a restart is
+        // still prefixed exactly once.
+        let mut mentions = result;
+        mentions.detail = Some("restart demona mergerfs nie powiódł się".into());
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(mentions), &[]);
+        assert_eq!(
+            wire.state_detail,
+            "Wymagany restart węzła: restart demona mergerfs nie powiódł się"
+        );
     }
 
     #[test]
@@ -2639,6 +3218,7 @@ pub(crate) mod tests {
             temporary_copy: None,
             destination: None,
             reason: "rekord nierozwiązany: EIO".into(),
+            skipped: true,
         };
         let run = ElasticMoverRun {
             operation_id: uuid::Uuid::new_v4().to_string(),
@@ -2654,6 +3234,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: vec![record],
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: true,
             detail: None,
             coupled_sync: None,
@@ -2661,6 +3242,26 @@ pub(crate) mod tests {
         let wire = mover_to_protocol(&run);
         assert_eq!(wire.outcome, "partial");
         assert!(wire.detail.contains("utknięte rekordy: 1: foto/a.jpg"), "{}", wire.detail);
+        let mut evicted = run.clone();
+        evicted.stuck_evicted = 3;
+        assert!(
+            mover_to_protocol(&evicted).detail.contains("wyparto z listy pominięć: 3"),
+            "{}",
+            mover_to_protocol(&evicted).detail
+        );
+        // A later run that stuck nothing says nothing, whatever this array
+        // evicted in the past: the count on a run is that run's own.
+        let mut clean = run.clone();
+        clean.stuck_records = Vec::new();
+        clean.stuck_hidden = 0;
+        // Even carrying a count: the summary is entered by this run's own stuck
+        // facts, never by an eviction figure on its own.
+        clean.stuck_evicted = 5;
+        clean.refused_files = 0;
+        clean.phase = ElasticMoverPhase::Complete;
+        let detail = mover_to_protocol(&clean).detail;
+        assert!(!detail.contains("utknięte rekordy"), "{detail}");
+        assert!(!detail.contains("wyparto"), "{detail}");
         let mut summarised = run.clone();
         summarised.stuck_hidden = 2;
         assert!(
@@ -2708,6 +3309,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: true,
             detail: None,
             coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
@@ -2749,6 +3351,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: true,
             detail: None,
             coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
@@ -2788,6 +3391,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: false,
             detail: None,
             coupled_sync: None,
@@ -2813,6 +3417,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: false,
             detail: None,
             coupled_sync: None,
@@ -2838,6 +3443,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: false,
             detail: None,
             coupled_sync: None,
@@ -2866,6 +3472,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: true,
             detail: None,
             coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
@@ -2945,6 +3552,7 @@ pub(crate) mod tests {
                 .collect(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: true,
             detail: None,
             coupled_sync: None,
@@ -2996,6 +3604,7 @@ pub(crate) mod tests {
             issues: Vec::new(),
             stuck_records: Vec::new(),
             stuck_hidden: 0,
+            stuck_evicted: 0,
             counts_known: true,
             detail: None,
             coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
@@ -3752,7 +4361,11 @@ pub(crate) mod tests {
                     wire.snapraid.last_sync.as_ref().unwrap().job_id.as_deref(),
                     Some(job.job_id.as_str())
                 );
-                assert_eq!(wire.protection.status, "unknown");
+                // A real, completed, clean sync inside the window IS the
+                // measurement — this is the production path by which an array
+                // becomes "protected", through a job rather than a fixture.
+                assert_eq!(wire.snapraid.parity_errors, Some(0));
+                assert_eq!(wire.protection.status, "protected", "{}", wire.protection.detail);
             }
             if case == "persist" {
                 db.write()
@@ -4131,12 +4744,12 @@ pub(crate) mod tests {
         assert_eq!(p.fault_tolerance, Some(1));
         assert_eq!(p.protected_as_of.as_deref(), Some("2026-09-06T14:06:00Z"));
         assert!(
-            p.detail.contains("on the cache without parity"),
+            p.detail.contains("na cache bez parity (czeka na mover)"),
             "the sentence the UI builds has to come from here: {}",
             p.detail
         );
         assert!(
-            !p.detail.contains("hour") && !p.detail.contains("unsynced for"),
+            !p.detail.contains("godz") && !p.detail.contains("niezsynchronizowan"),
             "the banned phrasing must not reappear: {}",
             p.detail
         );
@@ -4147,6 +4760,25 @@ pub(crate) mod tests {
         let p = protection(&a, &verified);
         assert_eq!(p.cache_unprotected_bytes, Some(0));
         assert_eq!(p.status, "protected");
+        // BLK-1: the sentence may claim only what was actually measured.
+        // `moved_unsynced_bytes == Some(0)` says the MOVER left nothing behind;
+        // it is not a scan of the array, and an MFS write landing straight on a
+        // data branch is invisible to every probe this node has.
+        assert!(
+            p.detail.contains("mover nie zostawił danych poza ostatnim sync"),
+            "{}",
+            p.detail
+        );
+        assert!(
+            p.detail.contains("ochrona obejmuje stan z ostatniego sync"),
+            "the sentence has to name the vintage of what is protected: {}",
+            p.detail
+        );
+        assert!(
+            !p.detail.contains("pomiar nie wykazał"),
+            "a measurement nobody took must not be claimed: {}",
+            p.detail
+        );
 
         // An unreadable cache disk makes the figure unknown — NOT a partial
         // sum, which would understate the risk.
@@ -4197,6 +4829,135 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(protection(&two, &observed).fault_tolerance, None);
+    }
+
+    /// MAJ-2: a MEASURED open window must not be silenced by an UNMEASURED
+    /// fault tolerance. The status stays `unknown` — nothing confirmed parity,
+    /// and that is the more serious fact — but the sentence still carries the
+    /// 18 GiB the card is already showing beside it.
+    #[test]
+    fn a_measured_open_window_survives_an_unmeasured_fault_tolerance() {
+        let a = array();
+        let eighteen_gib = 18 * 1024 * 1024 * 1024;
+        let canon = "na cache bez parity (czeka na mover)";
+        for case in ["parity_errors_unknown", "mounts_unknown", "parity_unreadable"] {
+            let mut observed = all_mounted(&a, eighteen_gib);
+            match case {
+                "parity_errors_unknown" => observed.parity_errors = None,
+                "mounts_unknown" => observed.mount_table_known = false,
+                _ => {
+                    observed.probes.insert(
+                        parity_mount_path("media", 1),
+                        BranchProbe {
+                            mounted: None,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            let p = protection(&a, &observed);
+            assert_eq!(p.fault_tolerance, None, "{case}");
+            assert_eq!(p.status, "unknown", "{case}");
+            assert_eq!(p.cache_unprotected_bytes, Some(eighteen_gib), "{case}");
+            assert!(
+                p.detail.contains("brak pełnego pomiaru"),
+                "{case}: {}",
+                p.detail
+            );
+            assert!(
+                p.detail.contains(canon),
+                "a measured figure must not vanish behind an unmeasured one, {case}: {}",
+                p.detail
+            );
+        }
+        // The missing-parity arm is reachable with an open window too: two
+        // parity disks, one gone, is a MEASURED tolerance of 1 against 2
+        // configured — and the cache figure beside it must survive that.
+        let mut two = array();
+        two.parity.push(ParityRow {
+            disk_id: "id-sdk".to_string(),
+            name: "sdk".to_string(),
+            device: "/dev/sdk".to_string(),
+            index: 2,
+        });
+        let mut gone = all_mounted(&two, eighteen_gib);
+        gone.probes
+            .insert(parity_mount_path("media", 2), BranchProbe::device_gone());
+        let p = protection(&two, &gone);
+        assert_eq!(p.fault_tolerance, Some(1));
+        assert_eq!(p.status, "unknown");
+        assert!(p.detail.contains("brakuje dysku parity"), "{}", p.detail);
+        assert!(
+            p.detail.contains(canon),
+            "a measured window must survive a missing parity disk: {}",
+            p.detail
+        );
+
+        // A stale sync reaches those arms the same way, and says so.
+        let mut stale = all_mounted(&a, 0);
+        stale.parity_errors = None;
+        stale.parity_stale = true;
+        stale.moved_unsynced_bytes = Some(4096);
+        let p = protection(&a, &stale);
+        assert_eq!(p.status, "unknown");
+        assert!(p.detail.contains("brak pełnego pomiaru"), "{}", p.detail);
+        assert!(p.detail.contains("przeniesione przez mover"), "{}", p.detail);
+        // And with nothing open, the arm keeps exactly the sentence it had.
+        let mut closed = all_mounted(&a, 0);
+        closed.parity_errors = None;
+        let p = protection(&a, &closed);
+        assert_eq!(p.detail, "brak pełnego pomiaru dostępności i poprawności parity");
+    }
+
+    /// OWNER DECISION (2026-09-12), pinned: a cache this node could NOT measure,
+    /// beside parity the helper confirms is stale, is a `window_open` — not an
+    /// `unknown`. The confirmed fact outranks the missing measurement, and the
+    /// sentence carries both. This differs from the last committed behaviour,
+    /// where the unmeasured-cache arm won; it is accepted, and this test is what
+    /// stops it drifting back.
+    #[test]
+    fn a_confirmed_stale_parity_outranks_an_unmeasured_cache() {
+        let a = array();
+        let unreadable = BranchProbe {
+            mounted: Some(true),
+            device_present: Some(true),
+            size_bytes: None,
+            used_bytes: None,
+            free_bytes: None,
+        };
+        for (case, moved) in [
+            ("nic nie zmierzono jako przeniesione", None),
+            ("zmierzone zero przeniesionych bajtów", Some(0)),
+            ("zmierzone bajty poza parity", Some(4096)),
+        ] {
+            let mut blind = all_mounted(&a, 0);
+            blind.parity_stale = true;
+            blind.moved_unsynced_bytes = moved;
+            blind
+                .probes
+                .insert(cache_branch_path("media", "nvme2n1"), unreadable.clone());
+            let p = protection(&a, &blind);
+            assert_eq!(p.cache_unprotected_bytes, None, "{case}");
+            assert_eq!(
+                p.status, "window_open",
+                "{case}: potwierdzony fakt bije niezmierzony, {}",
+                p.detail
+            );
+            // Both halves are said: the cache is unmeasured AND parity is stale.
+            assert!(p.detail.contains("nie zmierzył"), "{case}: {}", p.detail);
+            assert!(
+                p.detail.contains("nie potwierdził ochrony")
+                    || p.detail.contains("przeniesione przez mover"),
+                "{case}: {}",
+                p.detail
+            );
+            // The drift guard: falling through to the unmeasured-cache arm
+            // below would drop the confirmed half entirely.
+            assert_ne!(
+                p.detail, "ten węzeł nie zmierzył, ile czeka na cache",
+                "{case}: potwierdzona nieaktualna parity nie może zniknąć"
+            );
+        }
     }
 
     /// Brak cache oznacza zero danych na cache, ale nie potwierdza stanu dysków danych.
