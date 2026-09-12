@@ -1287,7 +1287,10 @@ pub struct NasElasticFolder {
 }
 
 /// One mover run, as the Tasks tab lists it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+///
+/// `Eq` like its sibling `NasSnapraidRun`: every field is a String, a u64 or a
+/// bool, and the store row that now carries a Vec of these compares by value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasMoverRun {
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -1388,6 +1391,12 @@ pub struct NasMoverSettings {
     /// files the mover just moved leave one unprotected window and enter
     /// another.
     pub coupled_sync: bool,
+    /// Whether these settings were ever CHOSEN for this array, as opposed to
+    /// being the built-in defaults a run falls back on. Nothing persists mover
+    /// settings yet (E2-10 owns n15's dialog), so this is false today — and the
+    /// panel says so instead of presenting a default as somebody's decision.
+    #[serde(default)]
+    pub configured: bool,
     pub last_run: Option<NasMoverRun>,
     /// Recent runs, newest first — n11's "Historia".
     #[serde(default)]
@@ -1462,6 +1471,13 @@ pub struct NasElasticArray {
     pub used_bytes: Option<u64>,
     pub cache_size_bytes: Option<u64>,
     pub cache_used_bytes: Option<u64>,
+    /// An operation of this array closed as `needs_attention` and nothing has
+    /// resolved it. Maintenance stays refused while it stands (clearing one is
+    /// E2-13), and it SURVIVES a later operation returning the array to
+    /// `active` — a Restore does exactly that. Without this on the wire the UI
+    /// would offer a button whose only possible answer is an error.
+    #[serde(default)]
+    pub unresolved_operation: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2459,6 +2475,13 @@ pub enum TentaNasPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
     },
+    /// "Uruchom mover teraz" (n11): moves aged cache files down onto the data
+    /// disks and runs the coupled `snapraid sync` in the SAME job.
+    ElasticArrayMoverRequest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
 }
 
 #[cfg(test)]
@@ -2569,6 +2592,26 @@ mod tests {
         );
         // The release request grew the direct red path's fields in N2.5; its
         // minimal decode is pinned in `the_access_audit_and_trim_wire_decodes_from_minimal_json`.
+
+        // The mover request (E2-09) joins the Elastic family: the tag is frozen
+        // like its siblings' and the password decodes from the minimal JSON the
+        // encoders send, because the browser never fills a field it has no value for.
+        let json = serde_json::json!({ "ElasticArrayMoverRequest": { "name": "media" } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ElasticArrayMoverRequest {
+                name: "media".to_string(),
+                sudo_password: None,
+            }
+        );
+        assert_eq!(
+            crate::cbor::encode(&decoded).expect("encode"),
+            hex_bytes(
+                "a17818456c617374696341727261794d6f76657252657175657374a1646e616d65656d65646961"
+            ),
+            "ElasticArrayMoverRequest wire drift"
+        );
     }
 
     /// The approval answers travel through the same CBOR the browser decodes,

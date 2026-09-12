@@ -294,6 +294,9 @@
 .nas-root .nas-snapraid-history summary:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
 .nas-root .nas-snapraid-history .stat-rows .k { flex: 1; }
 .nas-root .nas-snapraid-history .stat-rows .v { flex: 0 1 auto; }
+.nas-root .nas-mover > .section-card-head, .nas-root .nas-mover .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.nas-root .mover-hist { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; font-size: 11px; color: var(--text-2); }
+.nas-root .mover-hist span { padding: 2px 8px; border-radius: 999px; background: var(--bg-3); white-space: nowrap; }
 .nas-elastic-wizard { max-width: min(760px, calc(100vw - 24px)); }
 .nas-elastic-wizard .nas-elastic-preview { overflow-wrap: anywhere; }
 .nas-elastic-wizard .install-header, .nas-elastic-wizard .install-progress { margin-bottom: 12px; }

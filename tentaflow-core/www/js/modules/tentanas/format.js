@@ -91,7 +91,7 @@ export function fmtOptionalBytes(n) {
 }
 
 export function jobCanCancel(job) {
-  return !['elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub'].includes(job.kind);
+  return !['elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover'].includes(job.kind);
 }
 
 export function fmtMBps(bps) {

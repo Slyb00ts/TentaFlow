@@ -421,6 +421,33 @@ const MIGRATIONS: &[(i64, &str)] = &[(
     ALTER TABLE nas_elastic_disks_new RENAME TO nas_elastic_disks;
     ALTER TABLE nas_elastic_disk_aliases_new RENAME TO nas_elastic_disk_aliases;
     CREATE INDEX nas_elastic_alias_disk ON nas_elastic_disk_aliases(array_id, role, slot);",
+), (
+    12,
+    // The mover becomes an operation kind of its own (E2-09). It is a rebuild
+    // and not an ALTER because the kind is a CHECK constraint, and SQLite has
+    // no way to widen one in place.
+    "CREATE TABLE nas_elastic_operations_new (
+        operation_id TEXT PRIMARY KEY,
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        job_id TEXT NOT NULL UNIQUE REFERENCES nas_jobs(job_id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK(kind IN ('create','restore','sync','scrub','mover')),
+        state TEXT NOT NULL CHECK(state IN ('running','succeeded','failed','needs_attention')),
+        request_json TEXT NOT NULL,
+        result_json TEXT,
+        error TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    );
+    INSERT INTO nas_elastic_operations_new
+        SELECT operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at
+        FROM nas_elastic_operations;
+    DROP TABLE nas_elastic_operations;
+    ALTER TABLE nas_elastic_operations_new RENAME TO nas_elastic_operations;
+    CREATE INDEX nas_elastic_operation_array ON nas_elastic_operations(array_id, created_at);
+    CREATE UNIQUE INDEX nas_elastic_operation_running
+        ON nas_elastic_operations(array_id) WHERE state = 'running';
+    CREATE UNIQUE INDEX nas_elastic_operation_create
+        ON nas_elastic_operations(array_id) WHERE kind = 'create';",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -1033,6 +1060,35 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                 let command = super::elastic::snapraid_command(owner, array_id, operation_id, *kind);
                 (array_id, operation_id, action, serde_json::to_string(&command)?)
             }
+            ElasticJobIntent::Mover { owner, array_id, operation_id, resume_operation_id, rules, coupled_sync } => {
+                let spec = elastic_spec(&tx, owner, array_id)?;
+                anyhow::ensure!(job.kind == "elastic_mover" && job.subject == spec.name,
+                    "Zadanie nie odpowiada intencji movera");
+                // DELIBERATELY no parity guard, unlike SnapRAID: moving files
+                // off the cache is worth doing on an array with no parity at
+                // all, and the helper simply skips the coupled sync there.
+                let active: bool = tx.query_row("SELECT state='active' FROM nas_elastic_arrays WHERE array_id=?1",
+                    params![array_id], |r| r.get(0))?;
+                // A stuck sync or scrub blocks a mover too, not just another
+                // mover: an unresolved parity operation means nothing knows
+                // what parity currently covers, and a run would move more
+                // bytes out of the cache and then sync on top of that unknown.
+                let unresolved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_operations
+                    WHERE array_id=?1 AND kind IN ('sync','scrub','mover') AND state='needs_attention')",
+                    params![array_id], |r| r.get(0))?;
+                anyhow::ensure!(active && !unresolved, "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
+                tentanas_helper::elastic::validate_elastic_uuid(resume_operation_id)?;
+                // The same distinctness `validate_observation` demands of the
+                // answer, enforced on the INTENT: a row that could only ever
+                // produce a refused answer never reaches the journal.
+                anyhow::ensure!(resume_operation_id != operation_id
+                    && *resume_operation_id != spec.operation_id && *operation_id != spec.operation_id,
+                    "Resume movera musi mieć osobną operację");
+                let command = super::elastic::mover_command(owner, array_id, operation_id,
+                    resume_operation_id, rules, *coupled_sync);
+                (array_id, operation_id, "mover", serde_json::to_string(&command)?)
+            }
         };
         anyhow::ensure!(request.len() < 16 * 1024, "Intencja Elastic przekracza limit");
         tx.execute("INSERT INTO nas_elastic_operations
@@ -1068,7 +1124,12 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let at = now();
     let maintenance = snapraid_operation(&tx, job_id)?;
-    let requires_row = maintenance.is_some();
+    // A mover job closes its own operation row here, from the result its body
+    // recorded — without this the row would stay 'running' forever and the
+    // unique running-operation index would lock the array out of every later
+    // operation.
+    let mover = if maintenance.is_none() { mover_operation(&tx, job_id)? } else { None };
+    let requires_row = maintenance.is_some() || mover.is_some();
     let mut final_status = status.to_string();
     let mut final_error = error.map(str::to_string);
     if let Some((operation_id, spec, kind, candidate)) = maintenance {
@@ -1138,6 +1199,68 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                 "Utracono macierz operacji SnapRAID"
             );
         }
+    }
+    if let Some((operation_id, spec, candidate)) = mover {
+        let validated = candidate
+            .as_deref()
+            .ok_or_else(|| anyhow!("Brak wyniku operacji movera"))
+            .and_then(|json| {
+                anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik movera");
+                let result: tentanas_helper::elastic::ElasticMoverResult =
+                    serde_json::from_str(json)?;
+                super::elastic::validate_mover_result(&spec, &operation_id, &result)?;
+                Ok(result)
+            });
+        // Only a Complete run leaves the array serving. A run that stopped
+        // part-way still HOLDS it — both copies of every unfinished file are on
+        // disk — so it closes as needs_attention and the array says so.
+        let (operation_state, array_state) = match validated {
+            Ok(result)
+                if status == "succeeded"
+                    && result.run.phase
+                        == tentanas_helper::elastic::ElasticMoverPhase::Complete =>
+            {
+                ("succeeded", "active")
+            }
+            other => {
+                final_status = "failed".into();
+                if let Err(cause) = other {
+                    final_error = Some(format!("Niepotwierdzony wynik movera: {cause}"));
+                } else if final_error.is_none() {
+                    final_error = Some("Niezgodny terminalny wynik movera".into());
+                }
+                ("needs_attention", "needs_attention")
+            }
+        };
+        anyhow::ensure!(
+            tx.execute(
+                "UPDATE nas_elastic_operations SET state=?2,error=?3,finished_at=?4
+            WHERE operation_id=?1 AND job_id=?5 AND state='running'",
+                params![
+                    operation_id,
+                    operation_state,
+                    final_error.as_deref().unwrap_or(""),
+                    at,
+                    job_id
+                ]
+            )? == 1,
+            "Utracono running operację movera"
+        );
+        anyhow::ensure!(
+            tx.execute(
+                "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4
+            WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                params![
+                    spec.array_id,
+                    array_state,
+                    final_error.as_deref().unwrap_or(""),
+                    at,
+                    spec.owner.org_id,
+                    spec.owner.addon_id
+                ]
+            )? == 1,
+            "Utracono macierz operacji movera"
+        );
     }
     let changed = tx.execute(
         "UPDATE nas_jobs SET status = ?2, error = ?3, finished_at = ?4,
@@ -1246,6 +1369,84 @@ pub fn record_snapraid_result(
     anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
     anyhow::ensure!(tx.execute("UPDATE nas_elastic_operations SET result_json=?2 WHERE operation_id=?1 AND state='running' AND result_json IS NULL",
         params![operation_id,json])? == 1, "Nie zapisano kandydata SnapRAID");
+    tx.commit()?;
+    Ok(())
+}
+
+type MoverOperation = (String, ElasticCreateSpec, Option<String>);
+
+/// The running mover operation of one job, with the result candidate its body
+/// recorded. `None` for every job that is not a mover — but a job whose KIND
+/// says mover and that has no such row is a contradiction, not a no-op.
+fn mover_operation(conn: &Connection, job_id: &str) -> Result<Option<MoverOperation>> {
+    let header: Option<(String, String, String, String, String, Option<String>, String, String)> = conn.query_row(
+        "SELECT o.operation_id,o.array_id,a.org_id,a.addon_id,o.request_json,o.result_json,j.kind,j.subject
+         FROM nas_elastic_operations o JOIN nas_elastic_arrays a ON a.array_id=o.array_id
+         JOIN nas_jobs j ON j.job_id=o.job_id
+         WHERE o.job_id=?1 AND o.kind='mover' AND o.state='running'
+         AND j.status IN ('queued','running')", params![job_id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?;
+    let Some((operation_id, array_id, org_id, addon_id, request, candidate, job_kind, subject)) =
+        header
+    else {
+        let is_mover: bool = conn
+            .query_row(
+                "SELECT kind='elastic_mover' FROM nas_jobs WHERE job_id=?1",
+                params![job_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        anyhow::ensure!(!is_mover, "Brak dokładnie jednej running operacji movera");
+        return Ok(None);
+    };
+    let owner = ElasticOwner { org_id, addon_id };
+    let spec = elastic_spec(conn, &owner, &array_id)?;
+    tentanas_helper::elastic::validate_elastic_uuid(&operation_id)?;
+    anyhow::ensure!(
+        job_kind == "elastic_mover" && subject == spec.name && request.len() < 16 * 1024,
+        "Niezgodna intencja zadania movera"
+    );
+    // The stored request is the command the body ran. Its rules come from the
+    // array row and cannot be re-derived from the spec, so what is checked here
+    // is IDENTITY: a rewritten row must not be able to attach a foreign array
+    // or a foreign operation to this job.
+    let command: tentanas_helper::HelperCommand = serde_json::from_str(&request)?;
+    anyhow::ensure!(
+        matches!(&command, tentanas_helper::HelperCommand::ElasticMover {
+            array_id: stored_array, owner: stored_owner, operation_id: stored_operation, ..
+        } if *stored_array == array_id && *stored_owner == owner && *stored_operation == operation_id),
+        "Zmienione żądanie operacji movera"
+    );
+    Ok(Some((operation_id, spec, candidate)))
+}
+
+pub fn record_mover_result(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    operation_id: &str,
+    result: &tentanas_helper::elastic::ElasticMoverResult,
+) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let job_id: String = tx.query_row(
+        "SELECT o.job_id FROM nas_elastic_operations o
+        JOIN nas_elastic_arrays a ON a.array_id=o.array_id
+        WHERE o.operation_id=?1 AND o.state='running' AND a.org_id=?2 AND a.addon_id=?3",
+        params![operation_id, owner.org_id, owner.addon_id],
+        |r| r.get(0),
+    )?;
+    let (stored_id, spec, candidate) =
+        mover_operation(&tx, &job_id)?.ok_or_else(|| anyhow!("Brak intencji movera"))?;
+    anyhow::ensure!(
+        stored_id == operation_id && candidate.is_none(),
+        "Wynik operacji już zapisano"
+    );
+    super::elastic::validate_mover_result(&spec, operation_id, result)?;
+    let json = serde_json::to_string(result)?;
+    anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik movera");
+    anyhow::ensure!(tx.execute("UPDATE nas_elastic_operations SET result_json=?2 WHERE operation_id=?1 AND state='running' AND result_json IS NULL",
+        params![operation_id,json])? == 1, "Nie zapisano kandydata movera");
     tx.commit()?;
     Ok(())
 }
@@ -1392,6 +1593,15 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
                 device: format!("/dev/disk/by-uuid/{}",d.expected_uuid), index: (i+1) as u8,
             }).collect(),
             mover: super::elastic::MoverConfig { enabled: false, ..Default::default() },
+            mover_history: mover_runs(&conn, &spec, super::elastic::MOVER_HISTORY_ROWS)?,
+            // Survives a later operation returning the array to 'active' —
+            // `finish_elastic_operation` only ever touches its OWN row, so a
+            // Restore after a failed sync leaves this standing. It is the
+            // reason the mover is refused, so the wire has to carry it.
+            unresolved_operation: conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nas_elastic_operations
+                 WHERE array_id=?1 AND kind IN ('sync','scrub','mover') AND state='needs_attention')",
+                params![array_id], |r| r.get(0))?,
             create_spec: Some(spec), state, state_detail, created_at, updated_at,
             ..Default::default()
         })
@@ -1552,6 +1762,62 @@ fn elastic_runs(
         history.push(value);
         if history.len() >= limit as usize {
             break;
+        }
+    }
+    Ok(history)
+}
+
+/// One array's RECORDED mover runs, newest first — n11's history strip.
+///
+/// Only rows whose stored result decodes and validates are listed. A run with
+/// no trustworthy measurement has no byte count to show, and this strip exists
+/// to say how much each run moved; emitting it with zeroed counters would print
+/// exactly the fabricated zero this feature is shaped against. Such a run is
+/// still visible as the array's state and as `last_run`, so nothing is hidden —
+/// only the number nobody measured. A row that fails to decode while NOT closed
+/// as needs_attention is a contradiction and fails the read, the same way
+/// `elastic_runs` treats an inconsistent SnapRAID row.
+fn mover_runs(
+    conn: &Connection,
+    spec: &ElasticCreateSpec,
+    limit: u32,
+) -> Result<Vec<tentaflow_protocol::tentanas::NasMoverRun>> {
+    let mut statement = conn.prepare(
+        "SELECT operation_id,state,result_json FROM nas_elastic_operations
+        WHERE array_id=?1 AND kind='mover' AND result_json IS NOT NULL
+        ORDER BY created_at DESC,operation_id DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![spec.array_id, i64::from(limit)], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut history = Vec::new();
+    for row in rows {
+        let (operation_id, state, json) = row?;
+        anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik movera");
+        let decoded = serde_json::from_str::<tentanas_helper::elastic::ElasticMoverResult>(&json)
+            .map_err(anyhow::Error::from)
+            .and_then(|result| {
+                super::elastic::validate_mover_result(spec, &operation_id, &result)?;
+                Ok(result)
+            });
+        match decoded {
+            Ok(result) => history.push(super::elastic::mover_to_protocol(&result.run)),
+            // A row nothing can read is dropped from the strip rather than
+            // fabricated into a zero — but it must not take the whole array
+            // read down with it either. Failing here made ONE unreadable row
+            // render the entire detail screen unloadable, which is strictly
+            // worse than showing a shorter history: the two honest options are
+            // "skip it" and "brick the view", and only the first keeps the rest
+            // of the array's measured state visible. The drop is logged so an
+            // operator can see it even though the strip cannot say it.
+            Err(error) => tracing::warn!(
+                "tentanas mover history: pominięto nieczytelną operację {operation_id} \
+                 (stan {state}): {error}"
+            ),
         }
     }
     Ok(history)
@@ -3415,6 +3681,393 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn schema_twelve_widens_the_operation_kind_and_keeps_every_row_and_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..11]).unwrap();
+        let array_id = "11111111-1111-4111-8111-111111111111";
+        conn.execute(
+            "INSERT INTO nas_elastic_arrays
+             (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+             VALUES (?1,'org','addon','legacy','xfs','active','','now','now')",
+            params![array_id],
+        )
+        .unwrap();
+        // A v11 database with real history, including a row closed as
+        // needs_attention — the state a rebuild would be most likely to drop.
+        for (job, kind, state) in [
+            ("job-create", "create", "succeeded"),
+            ("job-sync", "sync", "needs_attention"),
+            ("job-scrub", "scrub", "succeeded"),
+        ] {
+            conn.execute(
+                "INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log)
+                 VALUES (?1,?2,'legacy','succeeded','test','now','')",
+                params![job, format!("elastic_{kind}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO nas_elastic_operations
+                 (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+                 VALUES (?1,?2,?3,?4,?5,'{}','','2026-09-01T00:00:00Z')",
+                params![format!("op-{kind}"), array_id, job, kind, state],
+            )
+            .unwrap();
+        }
+        let before: Vec<(String, String, String)> = conn
+            .prepare("SELECT operation_id,kind,state FROM nas_elastic_operations ORDER BY operation_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let indexes = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='index'
+                 AND tbl_name='nas_elastic_operations' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let indexes_before = indexes(&conn);
+
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+
+        let after: Vec<(String, String, String)> = conn
+            .prepare("SELECT operation_id,kind,state FROM nas_elastic_operations ORDER BY operation_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(after, before, "rebuild zgubił lub zmienił wiersz");
+        assert_eq!(indexes(&conn), indexes_before, "rebuild zgubił indeks");
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+        // The point of the rebuild: 'mover' is now a legal kind, and the unique
+        // running index still refuses a second running operation per array.
+        conn.execute(
+            "INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log)
+             VALUES ('job-mover','elastic_mover','legacy','running','test','now','')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_operations
+             (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+             VALUES ('op-mover',?1,'job-mover','mover','running','{}','','2026-09-02T00:00:00Z')",
+            params![array_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log)
+             VALUES ('job-mover-2','elastic_mover','legacy','running','test','now','')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO nas_elastic_operations
+                 (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+                 VALUES ('op-mover-2',?1,'job-mover-2','mover','running','{}','','2026-09-03T00:00:00Z')",
+                params![array_id],
+            )
+            .is_err(),
+            "druga running operacja musi pozostać niemożliwa"
+        );
+        // An unknown kind is still refused: the CHECK was widened, not dropped.
+        assert!(
+            conn.execute(
+                "INSERT INTO nas_elastic_operations
+                 (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+                 VALUES ('op-bogus',?1,'job-mover-2','wat','succeeded','{}','','2026-09-04T00:00:00Z')",
+                params![array_id],
+            )
+            .is_err()
+        );
+    }
+
+    fn mover_intent(spec: &ElasticCreateSpec, operation_id: &str, resume: &str) -> ElasticJobIntent {
+        ElasticJobIntent::Mover {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: operation_id.to_string(),
+            resume_operation_id: resume.to_string(),
+            rules: tentanas_helper::elastic::MoverRules {
+                min_age_secs: 7200,
+                min_free_pct: 20,
+                pinned_folders: Vec::new(),
+                eager_folders: Vec::new(),
+                skip_open_files: true,
+            },
+            coupled_sync: true,
+        }
+    }
+
+    fn mover_job(spec: &ElasticCreateSpec) -> NasJob {
+        let mut row = elastic_job(spec);
+        row.kind = "elastic_mover".into();
+        row
+    }
+
+    #[test]
+    fn a_mover_intent_needs_its_own_resume_a_matching_job_kind_and_a_settled_array() {
+        let p = pool();
+        let spec = completed_array(&p, "mover-intent");
+        let id = uuid::Uuid::now_v7().to_string();
+        // The resume is a SEPARATE reservation: reusing the run's own operation
+        // or Create's produces a command the helper refuses outright.
+        assert!(insert_job(&p, &mover_job(&spec), Some(&mover_intent(&spec, &id, &id))).is_err());
+        assert!(
+            insert_job(&p, &mover_job(&spec), Some(&mover_intent(&spec, &id, &spec.operation_id)))
+                .is_err()
+        );
+        let resume = uuid::Uuid::now_v7().to_string();
+        assert!(
+            insert_job(&p, &mover_job(&spec), Some(&mover_intent(&spec, &spec.operation_id, &resume)))
+                .is_err()
+        );
+        // A mover intent may not ride on a job of another kind.
+        let mut wrong_kind = elastic_job(&spec);
+        wrong_kind.kind = "elastic_sync".into();
+        assert!(insert_job(&p, &wrong_kind, Some(&mover_intent(&spec, &id, &resume))).is_err());
+        // Nothing above wrote a row.
+        assert_eq!(list_jobs(&p, 100).unwrap().len(), 1);
+
+        let row = mover_job(&spec);
+        insert_job(&p, &row, Some(&mover_intent(&spec, &id, &resume))).unwrap();
+        let (kind, state): (String, String) = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT kind,state FROM nas_elastic_operations WHERE operation_id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), state.as_str()), ("mover", "running"));
+    }
+
+    /// Records one completed mover run that moved `bytes` and left
+    /// `skipped_files` behind, and returns its id. The skip count is what
+    /// decides `partial` versus `ok`, so it is a parameter rather than a
+    /// constant of the fixture.
+    fn recorded_mover_run(
+        p: &DbPool,
+        spec: &ElasticCreateSpec,
+        bytes: u64,
+        created_at: &str,
+        skipped_files: u64,
+    ) -> String {
+        let id = uuid::Uuid::now_v7().to_string();
+        let resume = uuid::Uuid::now_v7().to_string();
+        let row = mover_job(spec);
+        insert_job(p, &row, Some(&mover_intent(spec, &id, &resume))).unwrap();
+        let mut result = super::super::elastic::tests::mover_result(
+            spec,
+            &id,
+            &resume,
+            tentanas_helper::elastic::ElasticMoverPhase::Complete,
+            true,
+        );
+        result.run.moved_bytes = bytes;
+        result.run.skipped_files = skipped_files;
+        result.run.skipped_bytes = if skipped_files > 0 { 64 } else { 0 };
+        result.state.last_mover = Some(result.run.clone());
+        record_mover_result(p, &spec.owner, &id, &result).unwrap();
+        finish_job(p, &row.job_id, "succeeded", None).unwrap();
+        // `now()` has second resolution, so the ordering the strip depends on is
+        // pinned explicitly rather than left to two writes in the same second.
+        p.write()
+            .unwrap()
+            .execute(
+                "UPDATE nas_elastic_operations SET created_at=?2 WHERE operation_id=?1",
+                params![id, created_at],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn the_mover_strip_shows_recorded_runs_newest_first_and_never_contradicts_the_last_run() {
+        let p = pool();
+        let spec = completed_array(&p, "mover-strip");
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert!(array.mover_history.is_empty(), "nic nie zapisano — nic nie pokazujemy");
+
+        // The older run left two files behind; the newer one left nothing.
+        recorded_mover_run(&p, &spec, 12 * 1024 * 1024 * 1024, "2026-09-01T00:00:00Z", 2);
+        recorded_mover_run(&p, &spec, 42 * 1024 * 1024 * 1024, "2026-09-02T00:00:00Z", 0);
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        // The defect this guards: a populated last run beside a strip that
+        // asserts no run ever happened.
+        assert_eq!(array.mover_history.len(), 2);
+        assert_eq!(array.mover_history[0].moved_bytes, 42 * 1024 * 1024 * 1024);
+        assert_eq!(array.mover_history[1].moved_bytes, 12 * 1024 * 1024 * 1024);
+        // BOTH arms of the distinction, pinned: `ok` is reserved for a run that
+        // left nothing behind, and a run that skipped files is `partial`. A
+        // mapping that answered `ok` for the second would be calling an
+        // incomplete run clean — the exact lie this feature exists to prevent.
+        assert_eq!(array.mover_history[0].outcome, "ok");
+        assert_eq!(array.mover_history[1].outcome, "partial");
+        assert_eq!(array.mover_history[1].skipped_files, 2);
+        assert_eq!(array.mover_history[0].skipped_files, 0);
+        assert!(array.mover_history.iter().all(|r| r.counts_known));
+        // A mover run is still not a SnapRAID run.
+        assert!(array.snapraid_history.is_empty());
+        assert!(!array.unresolved_operation);
+    }
+
+    #[test]
+    fn a_mover_row_without_a_trustworthy_result_is_skipped_rather_than_shown_as_zero() {
+        let p = pool();
+        let spec = completed_array(&p, "mover-untrusted");
+        let id = uuid::Uuid::now_v7().to_string();
+        let resume = uuid::Uuid::now_v7().to_string();
+        let row = mover_job(&spec);
+        insert_job(&p, &row, Some(&mover_intent(&spec, &id, &resume))).unwrap();
+        let result = super::super::elastic::tests::mover_result(
+            &spec,
+            &id,
+            &resume,
+            tentanas_helper::elastic::ElasticMoverPhase::Complete,
+            true,
+        );
+        record_mover_result(&p, &spec.owner, &id, &result).unwrap();
+        // The stored result stops being trustworthy — the state `finish_job`
+        // closes as needs_attention when validation fails.
+        p.write()
+            .unwrap()
+            .execute(
+                "UPDATE nas_elastic_operations SET result_json='{\"state\":1}' WHERE operation_id=?1",
+                params![id],
+            )
+            .unwrap();
+        finish_job(&p, &row.job_id, "failed", Some("uszkodzony wynik")).unwrap();
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        // No invented "0 B" run on the strip...
+        assert!(array.mover_history.is_empty());
+        // ...and the array says the true thing instead.
+        assert_eq!(array.state, "needs_attention");
+        assert!(array.unresolved_operation);
+    }
+
+    #[test]
+    fn an_unresolved_operation_outlives_the_array_returning_to_active() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let p = pool();
+        let spec = completed_array(&p, "mover-stale");
+        let (row, intent, id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &id,
+            &super::super::elastic::tests::snapraid_result(&spec, &id, Kind::Sync, Outcome::Failed),
+        )
+        .unwrap();
+        finish_job(&p, &row.job_id, "failed", Some("data_error")).unwrap();
+        let blocked = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(blocked.state, "needs_attention");
+        assert!(blocked.unresolved_operation);
+
+        // A successful Restore writes state='active' on the ARRAY and touches
+        // only its own operation row — so the stale one survives, and the state
+        // alone stops being enough to tell whether maintenance may run.
+        p.write()
+            .unwrap()
+            .execute(
+                "UPDATE nas_elastic_arrays SET state='active' WHERE array_id=?1",
+                params![spec.array_id],
+            )
+            .unwrap();
+        let restored = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(restored.state, "active");
+        assert!(
+            restored.unresolved_operation,
+            "nierozwiązana operacja przeżywa powrót macierzy do active"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_sync_blocks_a_new_mover() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let p = pool();
+        let spec = completed_array(&p, "mover-blocked");
+        let (row, intent, id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &id,
+            &super::super::elastic::tests::snapraid_result(&spec, &id, Kind::Sync, Outcome::Failed),
+        )
+        .unwrap();
+        finish_job(&p, &row.job_id, "failed", Some("data_error")).unwrap();
+        // The sync is unresolved: nothing can say what parity currently covers,
+        // so the mover must not move more bytes on top of that unknown.
+        let mover = uuid::Uuid::now_v7().to_string();
+        let resume = uuid::Uuid::now_v7().to_string();
+        assert!(
+            insert_job(&p, &mover_job(&spec), Some(&mover_intent(&spec, &mover, &resume))).is_err()
+        );
+    }
+
+    #[test]
+    fn a_mover_result_is_recorded_once_and_is_invisible_to_every_snapraid_query() {
+        let p = pool();
+        let spec = completed_array(&p, "mover-history");
+        let id = uuid::Uuid::now_v7().to_string();
+        let resume = uuid::Uuid::now_v7().to_string();
+        let row = mover_job(&spec);
+        insert_job(&p, &row, Some(&mover_intent(&spec, &id, &resume))).unwrap();
+        let result = super::super::elastic::tests::mover_result(
+            &spec,
+            &id,
+            &resume,
+            tentanas_helper::elastic::ElasticMoverPhase::Complete,
+            true,
+        );
+        record_mover_result(&p, &spec.owner, &id, &result).unwrap();
+        assert!(
+            record_mover_result(&p, &spec.owner, &id, &result).is_err(),
+            "wynik operacji zapisuje się dokładnie raz"
+        );
+        finish_job(&p, &row.job_id, "succeeded", None).unwrap();
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(array.state, "active");
+        // The mover row is not a SnapRAID run anywhere it could be mistaken for one.
+        assert!(array.snapraid_history.is_empty());
+        assert!(array.parity_window_runs.is_empty());
+        assert!(array.last_sync_run.is_none());
+        assert!(array.last_scrub_run.is_none());
+        let state: String = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM nas_elastic_operations WHERE kind='mover'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "succeeded");
     }
 
     #[test]

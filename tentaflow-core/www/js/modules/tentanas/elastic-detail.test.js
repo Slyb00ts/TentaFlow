@@ -88,7 +88,11 @@ test('detal ma prawdziwe role, ścieżki, null ochrony oraz działający link dy
   assert.match(body.querySelector('.kpi').textContent, /Cache/);
   assert.equal(body.querySelector('[data-act="restore"]'), null);
   for (const act of ['sync', 'scrub']) assert.equal(body.querySelector(`.nas-snapraid > .section-card-head [data-act="${act}"]`).hasAttribute('disabled'), false);
-  for (const act of ['fix', 'destroy', 'mover', 'add-disk']) assert.equal(body.querySelector(`[data-act="${act}"]`), null);
+  for (const act of ['fix', 'destroy', 'add-disk']) assert.equal(body.querySelector(`[data-act="${act}"]`), null);
+  // The mover panel always renders. This fixture has no cache disk, so the run
+  // must be REFUSED with a reason rather than quietly hidden.
+  assert.ok(body.querySelector('[data-act="mover"]').hasAttribute('disabled'));
+  assert.match(body.querySelector('.nas-mover').textContent, /nie ma czego przenosić/);
   click(body.querySelector('[data-act="disk"]'));
   assert.deepEqual(screen.openedDisks, ['serial-1']);
   click(body.querySelector('[data-act="back"]'));
@@ -377,6 +381,176 @@ test('Restore nie obchodzi rozpoczętej maintenance, lecz samo Refused nie bloku
     assert.equal(Boolean(body.querySelector('[data-act="restore"]')), outcome === 'refused', `${kind}/${outcome}`);
     screen.dispose();
   }
+});
+
+const cacheDisk = { ...disk, diskId: 'serial-3', name: 'c1', kind: 'nvme', mountpoint: '/mnt/tentanas-branches/media/cache/c1' };
+const moverArray = (overrides = {}, mover = {}) => array({
+  cacheDisks: [cacheDisk],
+  mover: { enabled: true, schedule: null, minAgeSecs: 7200, cacheMinFreePct: 20, coupledSync: true, lastRun: null, history: [], ...mover },
+  ...overrides,
+});
+const moverRow = (panel, label) => [...panel.querySelectorAll('.sr')].find((r) => r.textContent.startsWith(label));
+
+test('panel movera pokazuje reguły i sprzężony sync, a niezmierzone liczniki nie stają się zerem', async () => {
+  const { screen, body } = await mount(moverArray({}, {
+    lastRun: {
+      startedAt: '2026-09-08T12:00:00Z', finishedAt: '2026-09-08T12:06:00Z', outcome: 'partial',
+      movedBytes: 42 * GiB, movedFiles: 7, skippedBytes: 0, skippedFiles: 0, countsKnown: false,
+      detail: '', coupledSync: { kind: 'sync', outcome: 'ok' },
+    },
+    history: [{ startedAt: '2026-09-08T11:00:00Z', finishedAt: '2026-09-08T11:02:00Z', movedBytes: 12 * GiB }],
+  }));
+  const panel = body.querySelector('.nas-mover');
+  // The cache rule is shown as a FILL level; the setting is the minimum free %.
+  assert.match(panel.textContent, /LUB cache > 80%/);
+  assert.match(moverRow(panel, 'Pliki otwarte').textContent, /pomijane/);
+  assert.match(moverRow(panel, 'Ostatni przebieg').textContent, /42 GiB/);
+  assert.match(moverRow(panel, 'Ostatni przebieg').textContent, /sync OK/);
+  assert.match(moverRow(panel, 'Przeniesiono').textContent, /42 GiB · 7/);
+  // countsKnown:false — the skipped half was never walked and must not read 0.
+  const skipped = moverRow(panel, 'Pominięto');
+  assert.match(skipped.textContent, /nie zmierzono/);
+  assert.doesNotMatch(skipped.textContent, /0/);
+  assert.match(panel.querySelector('.mover-hist').textContent, /12 GiB/);
+  assert.match(panel.querySelector('.explain-box').textContent, /dopiero po najbliższym sync/);
+  assert.equal(body.querySelector('[data-act="mover"]').hasAttribute('disabled'), false);
+  screen.dispose();
+});
+
+test('bez przebiegu i bez ustawień mover pokazuje kreski, nie zera', async () => {
+  const { screen, body } = await mount(array({ cacheDisks: [cacheDisk] }));
+  const panel = body.querySelector('.nas-mover');
+  for (const label of ['Reguły', 'Ostatni przebieg', 'Przeniesiono', 'Pominięto']) {
+    assert.match(moverRow(panel, label).textContent, /—/, label);
+    assert.doesNotMatch(moverRow(panel, label).textContent, /0 B/, label);
+  }
+  assert.match(panel.querySelector('.mover-hist').textContent, /Brak zarejestrowanych przebiegów/);
+  screen.dispose();
+});
+
+test('mover: nieadministrator i macierz bez cache nie mogą uruchomić przebiegu', async (t) => {
+  for (const [label, value, options] of [
+    ['reader', moverArray(), { admin: false }],
+    ['bez cache', array()],
+    ['pending', moverArray({ state: 'pending' })],
+    ['wyłączona', moverArray({ enabled: false })],
+    ['sync w toku', moverArray({ snapraid: { history: [{ kind: 'sync', outcome: 'running' }] } })],
+  ]) await t.test(label, async () => {
+    const { screen, body } = await mount(value, {}, options);
+    const button = body.querySelector('[data-act="mover"]');
+    assert.ok(button.hasAttribute('disabled'));
+    button.dispatchEvent(new Event('click'));
+    await flush();
+    assert.deepEqual(screen.calls.map((call) => call.kind), ['tentaNasElasticArrayGetRequest']);
+    screen.dispose();
+  });
+});
+
+test('mover wysyła dokładnie jedno żądanie z nazwą macierzy i śledzi job', async () => {
+  const { screen, body } = await mount(moverArray(), {
+    tentaNasElasticArrayMoverRequest: { job: { jobId: 'mover-1', kind: 'elastic_mover', status: 'running' } },
+  });
+  const button = body.querySelector('[data-act="mover"]');
+  click(button); click(button);
+  await flush(); await flush();
+  assert.deepEqual(
+    screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayMoverRequest').map((c) => c.payload),
+    [{ name: 'media', sudoPassword: 'hunter2' }],
+  );
+  assert.equal(screen.jobLogs[0].jobId, 'mover-1');
+  assert.match(body.textContent, /Przyjęto zadanie movera/);
+  assert.equal(jobCanCancel({ kind: 'elastic_mover' }), false);
+  screen.dispose();
+});
+
+test('mover: anulowane sudo nie wysyła nic, a approval i utracona odpowiedź nie udają joba', async (t) => {
+  const cancelled = await mount(moverArray(), {}, { sudo: null });
+  click(cancelled.body.querySelector('[data-act="mover"]'));
+  await flush();
+  assert.equal(cancelled.screen.calls.length, 1);
+  assert.equal(cancelled.body.querySelector('[data-act="mover"]').hasAttribute('disabled'), false);
+  cancelled.screen.dispose();
+  for (const mode of ['approval', 'lost']) await t.test(mode, async () => {
+    const { screen, body } = await mount(moverArray(), {
+      tentaNasElasticArrayMoverRequest: () => {
+        if (mode === 'lost') throw new Error('secret must not render');
+        return { approval: { requestId: 'approval-mover' } };
+      },
+    });
+    click(body.querySelector('[data-act="mover"]'));
+    await flush(); await flush();
+    assert.match(body.textContent, mode === 'approval' ? /drugiego administratora/ : /Wynik żądania jest nieznany/);
+    assert.doesNotMatch(body.textContent, /secret must/);
+    assert.equal(screen.jobLogs.length, 0);
+    assert.ok(body.querySelector('[data-act="mover"]').hasAttribute('disabled'));
+    screen.dispose();
+  });
+});
+
+test('nierozwiązana operacja blokuje mover i mówi dlaczego, zamiast zgłaszać błąd wewnętrzny', async () => {
+  const { screen, body } = await mount(moverArray({ unresolvedOperation: true }));
+  const button = body.querySelector('[data-act="mover"]');
+  assert.ok(button.hasAttribute('disabled'));
+  assert.match(body.querySelector('.nas-mover').textContent, /niepotwierdzoną operację/);
+  button.dispatchEvent(new Event('click'));
+  await flush();
+  assert.deepEqual(screen.calls.map((c) => c.kind), ['tentaNasElasticArrayGetRequest']);
+  screen.dispose();
+});
+
+test('nieskonfigurowany mover nie przedstawia domyślnych liczb jako ustawień', async () => {
+  const unset = await mount(moverArray());
+  const panel = unset.body.querySelector('.nas-mover');
+  assert.match(moverRow(panel, 'Harmonogram').textContent, /nie skonfigurowano/);
+  assert.match(moverRow(panel, 'Reguły').textContent, /domyślne:/);
+  unset.screen.dispose();
+  const set = await mount(moverArray({}, { configured: true, schedule: { every: '1h' } }));
+  const configured = set.body.querySelector('.nas-mover');
+  assert.doesNotMatch(moverRow(configured, 'Harmonogram').textContent, /nie skonfigurowano/);
+  assert.doesNotMatch(moverRow(configured, 'Reguły').textContent, /domyślne:/);
+  assert.match(moverRow(configured, 'Reguły').textContent, /LUB cache > 80%/);
+  set.screen.dispose();
+});
+
+test('pasek historii nie zaprzecza ostatniemu przebiegowi', async () => {
+  const run = {
+    startedAt: '2026-09-08T12:00:00Z', finishedAt: '2026-09-08T12:06:00Z', outcome: 'ok',
+    movedBytes: 42 * GiB, movedFiles: 7, skippedBytes: 0, skippedFiles: 0, countsKnown: true,
+    detail: '', coupledSync: { kind: 'sync', outcome: 'ok' },
+  };
+  const { screen, body } = await mount(moverArray({}, { lastRun: run, history: [run] }));
+  const strip = body.querySelector('.mover-hist');
+  assert.match(strip.textContent, /42 GiB/);
+  assert.doesNotMatch(strip.textContent, /Brak zarejestrowanych/);
+  screen.dispose();
+});
+
+test('wyłączony automatyczny mover mówi o tym, lecz ręczny przebieg pozostaje dostępny', async () => {
+  const { screen, body } = await mount(moverArray({}, { enabled: false }));
+  assert.match(body.querySelector('.nas-mover').textContent, /Automatyczny mover jest wyłączony/);
+  assert.equal(body.querySelector('[data-act="mover"]').hasAttribute('disabled'), false);
+  screen.dispose();
+});
+
+test('wyłączony sprzężony sync ostrzega, że przeniesione pliki zostają poza parity', async () => {
+  const { screen, body } = await mount(moverArray({}, { coupledSync: false }));
+  const explain = body.querySelector('.nas-mover .explain-box').textContent;
+  assert.match(explain, /pozostaną poza parity/);
+  assert.doesNotMatch(explain, /sprzężony krok/);
+  screen.dispose();
+});
+
+test('etykiety movera są tłumaczone w pięciu locale', async () => {
+  try {
+    for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      assert.ok(!I18n.t('tentanas.approvals.op_elastic_mover').startsWith('tentanas.'));
+      assert.ok(!I18n.t('tentanas.jobs.kind_elastic_mover').startsWith('tentanas.'));
+      const { screen, body } = await mount(moverArray({}, { enabled: false }));
+      assert.doesNotMatch(body.querySelector('.nas-mover').textContent, /tentanas\./);
+      screen.dispose();
+    }
+  } finally { await I18n.setLanguage('pl'); }
 });
 
 test('Restore ponownie sprawdza historię maintenance po oczekiwaniu na sudo', async () => {

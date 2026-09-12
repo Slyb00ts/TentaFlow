@@ -3040,6 +3040,7 @@ async fn execute_approved(
             tentanas_helper::elastic::ElasticSnapraidKind::Sync).await,
         P::ElasticArrayScrubRequest {name,..} => elastic_snapraid(ctx,name,secret,Origin::Approved,
             tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
+        P::ElasticArrayMoverRequest {name,..} => elastic_mover(ctx,name,secret,Origin::Approved).await,
         P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,..} =>
             elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,secret,Origin::Approved).await,
         P::PoolDestroyRequest {
@@ -3206,6 +3207,73 @@ async fn elastic_snapraid(
     }
     let job = tentanas::elastic::spawn_snapraid(&g.db, &array, &g.user_id, secret.map(token), kind)
         .map_err(|e| internal("elastic snapraid", e))?;
+    Ok(job_response(job))
+}
+
+/// "Uruchom mover teraz" (n11): one mover run, started by hand.
+async fn elastic_mover(
+    ctx: &HandlerContext,
+    name: &str,
+    secret: Option<&SudoSecret>,
+    origin: Origin,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_destructive(ctx)?;
+    super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_READ)?;
+    tentanas_helper::elastic::validate_array_name(name)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
+        .map_err(|e| internal("elastic array", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    if array.state != "active" {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            "Mover wymaga zakończonej aktywnej macierzy",
+        ));
+    }
+    // Nothing to move. Without a cache branch every write already lands on the
+    // data disks, so a run would walk an empty source and report having moved
+    // nothing — a job whose success says nothing about anything.
+    if array.cache().next().is_none() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            "Macierz bez dysku cache nie ma czego przenosić",
+        ));
+    }
+    // An unresolved operation blocks the mover in the store. Without this the
+    // refusal would surface as a generic internal error from `insert_job`, and
+    // the one sentence that explains it would never reach the admin. It
+    // OUTLIVES the array returning to 'active': a Restore after a failed sync
+    // does exactly that, which is how an enabled button used to meet an opaque
+    // error. Clearing such an operation is E2-13, not this path.
+    if array.unresolved_operation {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            "Macierz ma niepotwierdzoną operację; rozwiąż ją przed uruchomieniem movera",
+        ));
+    }
+    if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
+        // What is recorded in the approval must be what will actually run: with
+        // the coupling off the moved files stay outside parity, and promising a
+        // sync that will not happen would be a lie preserved in the audit row.
+        let description = if array.mover.coupled_sync {
+            "Przenosi pliki z cache na dyski danych i uruchamia sprzężony sync parity"
+        } else {
+            "Przenosi pliki z cache na dyski danych BEZ sprzężonego sync parity"
+        };
+        return park(
+            ctx,
+            &g,
+            tentanas::approvals::OP_ELASTIC_MOVER,
+            name,
+            description,
+            &P::ElasticArrayMoverRequest {
+                name: name.into(),
+                sudo_password: None,
+            },
+        );
+    }
+    let job = tentanas::elastic::spawn_mover(&g.db, &array, &g.user_id, secret.map(token))
+        .map_err(|e| internal("elastic mover", e))?;
     Ok(job_response(job))
 }
 
@@ -3748,6 +3816,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             tentanas_helper::elastic::ElasticSnapraidKind::Sync).await,
         P::ElasticArrayScrubRequest {name,sudo_password} => elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
             tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
+        P::ElasticArrayMoverRequest {name,sudo_password} => elastic_mover(ctx,name,sudo_password.as_ref(),Origin::Direct).await,
         P::ElasticArraysListRequest {} => {
             let g = gate(ctx,PERM_READ)?;
             let arrays = tentanas::elastic::list(&g.db,&elastic_owner(&g)).await.map_err(|e| internal("elastic list",e))?;
@@ -4083,6 +4152,7 @@ register_tentanas_variant!("TentaNasElasticArrayGetRequest", "tentaflow_ws_handl
 register_tentanas_variant!("TentaNasElasticArrayRestoreRequest", "tentaflow_ws_handler_nas_elastic_restore");
 register_tentanas_variant!("TentaNasElasticArraySyncRequest", "tentaflow_ws_handler_nas_elastic_sync");
 register_tentanas_variant!("TentaNasElasticArrayScrubRequest", "tentaflow_ws_handler_nas_elastic_scrub");
+register_tentanas_variant!("TentaNasElasticArrayMoverRequest", "tentaflow_ws_handler_nas_elastic_mover");
 
 #[cfg(test)]
 mod registration_tests {
@@ -4352,6 +4422,195 @@ mod registration_tests {
                 );
             }
         }
+    }
+
+    /// Creates a completed Elastic array from `spec` in the fixture's store.
+    async fn settled_array(g: &Gate, spec: &ElasticCreateSpec) {
+        let created = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_create".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &g.db,
+            &created,
+            Some(&tentanas::jobs::ElasticJobIntent::Create(spec.clone())),
+        )
+        .unwrap();
+        store::finish_elastic_operation(
+            &g.db,
+            &spec.owner,
+            &spec.operation_id,
+            Ok(&tentanas::elastic::tests::ready_result(spec)),
+        )
+        .unwrap();
+        store::finish_job(&g.db, &created.job_id, "succeeded", None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn elastic_mover_refuses_a_cacheless_array_and_parks_before_moving_anything() {
+        let mut fixture = dispatch_fixture();
+        let denied = elastic_mover(&fixture.ctx, "media", None, Origin::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        elastic_admin(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+
+        let missing = elastic_mover(&fixture.ctx, "media", None, Origin::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, ProtocolErrorCode::NotFound);
+
+        // An array with no cache branch has nothing to move: the run is refused
+        // rather than started and reported as a successful move of nothing.
+        let mut cacheless = tentanas::elastic::tests::create_spec("media");
+        cacheless.owner = elastic_owner(&g);
+        settled_array(&g, &cacheless).await;
+        let refused = elastic_mover(&fixture.ctx, "media", None, Origin::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::NotAvailable);
+
+        // The same request on an array WITH a cache parks under four eyes, and
+        // parks without the password and without starting any work.
+        let mut cached = tentanas::elastic::tests::mover_spec("cached");
+        cached.owner = elastic_owner(&g);
+        settled_array(&g, &cached).await;
+        tentanas::approvals::set_settings(&actor(&fixture.ctx, &g).unwrap(), true, 24).unwrap();
+        let before = store::list_jobs(&g.db, 100).unwrap().len();
+        let (response, error) = crate::dispatch::dispatch(
+            &tn(P::ElasticArrayMoverRequest {
+                name: "cached".into(),
+                sudo_password: Some(SudoSecret("never-store-mover-secret".into())),
+            }),
+            &fixture.ctx,
+        )
+        .await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else {
+            panic!("Brak approval movera")
+        };
+        let stored = store::approval(&g.db, &approval.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.approval.operation, tentanas::approvals::OP_ELASTIC_MOVER);
+        assert!(!stored.payload_json.contains("never-store-mover-secret"));
+        assert!(!stored.payload_json.contains("sudo_password"));
+        assert_eq!(store::list_jobs(&g.db, 100).unwrap().len(), before);
+        assert_eq!(tentanas::elevation::audit_entries(&g.db), 0);
+        assert!(matches!(
+            tentanas::approvals::claim(&actor(&fixture.ctx, &g).unwrap(), &approval.request_id),
+            Err(tentanas::approvals::ApprovalError::OwnRequest)
+        ));
+
+        // Every app permission is load-bearing on this path.
+        for permission in [PERM_READ, PERM_ADMIN, PERM_POOLS] {
+            crate::dispatch::app_gate::test_support::set_permission(
+                &fixture.ctx.state,
+                &fixture.addon_id,
+                "user",
+                &fixture.ctx.org_context.as_ref().unwrap().user_id,
+                permission,
+                "deny",
+            );
+            assert_eq!(
+                elastic_mover(&fixture.ctx, "cached", None, Origin::Direct)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ProtocolErrorCode::PolicyDenied
+            );
+            crate::dispatch::app_gate::test_support::set_permission(
+                &fixture.ctx.state,
+                &fixture.addon_id,
+                "user",
+                &fixture.ctx.org_context.as_ref().unwrap().user_id,
+                permission,
+                "allow",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn elastic_mover_names_an_unresolved_operation_instead_of_failing_opaquely() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+        let mut spec = tentanas::elastic::tests::mover_spec("cached");
+        spec.owner = elastic_owner(&g);
+        settled_array(&g, &spec).await;
+
+        // A nightly sync fails: array and operation both close needs_attention.
+        let sync_id = uuid::Uuid::now_v7().to_string();
+        let sync_job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_sync".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &g.db,
+            &sync_job,
+            Some(&tentanas::jobs::ElasticJobIntent::Snapraid {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: sync_id.clone(),
+                kind: Kind::Sync,
+            }),
+        )
+        .unwrap();
+        store::record_snapraid_result(
+            &g.db,
+            &spec.owner,
+            &sync_id,
+            &tentanas::elastic::tests::snapraid_result(&spec, &sync_id, Kind::Sync, Outcome::Failed),
+        )
+        .unwrap();
+        store::finish_job(&g.db, &sync_job.job_id, "failed", Some("data_error")).unwrap();
+
+        // The admin then runs Restore — which the detail view invites precisely
+        // in `needs_attention` — and it succeeds, returning the array to
+        // 'active' while the stale sync row stands. This is the state in which
+        // the button was enabled and the refusal arrived as an internal error.
+        g.db.write()
+            .unwrap()
+            .execute(
+                "UPDATE nas_elastic_arrays SET state='active' WHERE array_id=?1",
+                rusqlite::params![spec.array_id],
+            )
+            .unwrap();
+        assert!(
+            store::elastic_array(&g.db, &spec.owner, "cached")
+                .unwrap()
+                .unwrap()
+                .unresolved_operation
+        );
+
+        let refused = elastic_mover(&fixture.ctx, "cached", None, Origin::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::NotAvailable, "{refused:?}");
+        assert!(
+            refused.message.contains("niepotwierdzoną operację"),
+            "odmowa musi nazwać powód: {}",
+            refused.message
+        );
+        assert!(
+            !store::list_jobs(&g.db, 100)
+                .unwrap()
+                .iter()
+                .any(|j| j.kind == "elastic_mover"),
+            "odmowa nie uruchamia zadania"
+        );
     }
 
     #[tokio::test]

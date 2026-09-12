@@ -38,6 +38,9 @@ pub const OP_CONFIG_IMPORT: &str = "config_import";
 pub const OP_ELASTIC_CREATE: &str = "elastic_create";
 pub const OP_ELASTIC_SYNC: &str = "elastic_sync";
 pub const OP_ELASTIC_SCRUB: &str = "elastic_scrub";
+/// Running the mover by hand. It moves files off the cache and then syncs
+/// parity, so it is a red path for the same reason a sync is.
+pub const OP_ELASTIC_MOVER: &str = "elastic_mover";
 
 /// How long a parked operation stays approvable when nobody configured it.
 /// A day is long enough for a colleague in another timezone and short enough

@@ -2531,6 +2531,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElasticArrayRestoreRequest { .. } => "TentaNasElasticArrayRestoreRequest",
                 Tn::ElasticArraySyncRequest { .. } => "TentaNasElasticArraySyncRequest",
                 Tn::ElasticArrayScrubRequest { .. } => "TentaNasElasticArrayScrubRequest",
+                Tn::ElasticArrayMoverRequest { .. } => "TentaNasElasticArrayMoverRequest",
             }
         }
         MessageBody::TentaVmBody(p) => {

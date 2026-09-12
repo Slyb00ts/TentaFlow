@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, fmtOptionalBytes, fmtDate, errMessage, healthClass, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-alert.js';
@@ -16,6 +16,13 @@ import '/js/components/tf-breadcrumb.js';
 const knownBytes = (value) => value != null && Number.isFinite(Number(value)) && Number(value) >= 0;
 const row = (label, value) => `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v">${escapeHtml(value)}</span></div>`;
 const triState = (value) => value === true ? T('elastic.yes') : value === false ? T('elastic.no') : T('elastic.unknown');
+
+// One entry per mutation the detail can send, so a new action cannot reach the
+// transport without also naming the sentence the admin sees for it.
+const ACTION_REQUEST = { restore: 'tentaNasElasticArrayRestoreRequest', sync: 'tentaNasElasticArraySyncRequest', scrub: 'tentaNasElasticArrayScrubRequest', mover: 'tentaNasElasticArrayMoverRequest' };
+const ACTION_TITLE = { restore: 'elastic.restore', sync: 'elastic.sync_now', scrub: 'elastic.scrub_now', mover: 'elastic.mover_run_now' };
+const ACTION_ACCEPTED = { restore: 'elastic.job_running', sync: 'elastic.maintenance_accepted', scrub: 'elastic.maintenance_accepted', mover: 'elastic.mover_accepted' };
+const ACTION_APPROVAL = { restore: 'elastic.approval', sync: 'elastic.maintenance_approval', scrub: 'elastic.maintenance_approval', mover: 'elastic.mover_approval' };
 
 export function elasticState(array) {
   const labels = { active: T('elastic.active'), pending: T('elastic.pending'), creating: T('elastic.creating'), needs_attention: T('elastic.error'), error: T('elastic.error'), disabled: T('elastic.disabled'), unknown: T('elastic.unknown') };
@@ -92,6 +99,51 @@ function snapraidHistoryHtml(history, expanded) {
   }).join('')}</ol>` : `<div class="hint mt-sm">${escapeHtml(T('elastic.history_empty'))}</div>`}</div>`;
 }
 
+const moverMoved = (run) => !run ? '—' : `${fmtOptionalBytes(run.movedBytes)} · ${Number(run.movedFiles) || 0}`;
+
+// `countsKnown: false` means the walk never finished: such a run knows what it
+// MOVED and NOT what it left behind. A `0` here would say "nothing was skipped",
+// which is the one thing that run cannot say — so it reads "nie zmierzono".
+const moverSkipped = (run) => !run ? '—'
+  : run.countsKnown ? `${fmtOptionalBytes(run.skippedBytes)} · ${Number(run.skippedFiles) || 0}`
+    : T('elastic.mover_counts_unmeasured');
+
+const moverSync = (run) => !run.coupledSync ? T('elastic.mover_sync_none')
+  : run.coupledSync.outcome === 'ok' ? T('elastic.mover_sync_ok') : T('elastic.mover_sync_failed');
+
+const moverLastRun = (run) => !run ? '—'
+  : `${fmtDate(run.finishedAt || run.startedAt)} · ${fmtOptionalBytes(run.movedBytes)} → ${moverSync(run)}`;
+
+// The age rule is a duration and the cache rule a FILL level, while the setting
+// is the minimum FREE percentage — so the sentence n11 shows is its complement.
+// Absent settings render as `—`; neither half is invented.
+// With nothing configured these numbers are the built-in defaults a run falls
+// back on — real, but nobody's decision. They are shown (a manual run WILL
+// apply them) and labelled as defaults, rather than presented as settings.
+const moverRulesValue = (m) => {
+  const age = Number(m.minAgeSecs);
+  const free = Number(m.cacheMinFreePct);
+  if (m.minAgeSecs == null || m.cacheMinFreePct == null || !Number.isFinite(age) || !Number.isFinite(free)) return '—';
+  const params = { age: fmtDuration(age), pct: 100 - free };
+  return m.configured ? T('elastic.mover_rules_value', params) : T('elastic.mover_rules_default', params);
+};
+
+const moverScheduleValue = (m) => (m.configured ? fmtSchedule(m.schedule) : T('elastic.mover_not_configured'));
+
+function moverPanelHtml(array, disabled, reason) {
+  const m = array.mover || {};
+  const last = m.lastRun || null;
+  const history = m.history || [];
+  return `<div class="section-card nas-mover"><div class="section-card-head"><div class="title">${sprite('transform')} ${escapeHtml(T('elastic.mover'))}</div><div class="actions">
+    <tf-button variant="primary" size="sm" icon="play" data-act="mover" ${disabled ? 'disabled' : ''}>${escapeHtml(T('elastic.mover_run_now'))}</tf-button></div></div>
+    ${reason ? `<div class="hint mb-sm">${escapeHtml(reason)}</div>` : ''}
+    ${m.enabled === false ? `<div class="hint mb-sm">${escapeHtml(T('elastic.mover_disabled'))}</div>` : ''}
+    <div class="stat-rows">${row(T('elastic.mover_schedule'), moverScheduleValue(m))}${row(T('elastic.mover_rules'), moverRulesValue(m))}${row(T('elastic.mover_open_files'), T('elastic.mover_open_files_skipped'))}${row(T('elastic.mover_last_run'), moverLastRun(last))}${row(T('elastic.mover_moved'), moverMoved(last))}${row(T('elastic.mover_skipped'), moverSkipped(last))}</div>
+    <div class="mover-hist">${escapeHtml(T('elastic.mover_history'))}: ${history.length ? history.map((run) => `<span>${escapeHtml(fmtDate(run.finishedAt || run.startedAt))} · ${escapeHtml(fmtOptionalBytes(run.movedBytes))}</span>`).join('') : `<span>${escapeHtml(T('elastic.mover_history_empty'))}</span>`}</div>
+    <div class="explain-box mt-md">${escapeHtml(m.coupledSync === false ? T('elastic.mover_coupled_off') : T('elastic.mover_coupled_warning'))}</div>
+  </div>`;
+}
+
 export async function drawElasticDetail(screen, body) {
   const name = screen.array;
   const sourceNodeId = screen.currentNode()?.nodeId;
@@ -112,11 +164,25 @@ export async function drawElasticDetail(screen, body) {
     : !(array?.parityDisks || []).length ? T('elastic.no_parity')
       : !array.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
         : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running') : '';
+  // The mover needs no parity — the helper skips the coupled sync on an array
+  // without one — but it does need something to move, so a cacheless array is
+  // refused outright rather than offered a run that would walk nothing.
+  // `unresolvedOperation` is its own fact and NOT derivable from the SnapRAID
+  // history: the blocking row may be a mover's, and it outlives the array
+  // returning to 'active' after a Restore. Without it the button would be
+  // offered for a request the node can only refuse.
+  const moverReason = () => !screen.isAdmin ? T('elevation.admin_only')
+    : !(array?.cacheDisks || []).length ? T('elastic.mover_no_cache')
+      : !array.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
+        : array.unresolvedOperation ? T('elastic.mover_unresolved')
+          : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running')
+            : array.mover?.lastRun?.outcome === 'running' ? T('elastic.mover_running') : '';
 
   const draw = (error = '') => {
     if (!isCurrent()) return;
     const status = array && elasticState(array);
     const maintenanceDisabled = busy || submitted || Boolean(maintenanceReason());
+    const moverDisabled = busy || submitted || Boolean(moverReason());
     view.innerHTML = `<tf-breadcrumb class="nas-crumbs"><tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item><tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item></tf-breadcrumb><div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
       <tf-button variant="ghost" data-act="back">${escapeHtml(T('elastic.back'))}</tf-button><tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
       ${error ? `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(error)}"></tf-alert>` : ''}
@@ -142,7 +208,7 @@ export async function drawElasticDetail(screen, body) {
         <tf-button variant="secondary" size="sm" icon="refresh" data-act="sync" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.sync_now'))}</tf-button><tf-button variant="ghost" size="sm" icon="search" data-act="scrub" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.scrub_now'))}</tf-button></div></div>
         ${maintenanceReason() ? `<div class="hint mb-sm">${escapeHtml(maintenanceReason())}</div>` : ''}<div class="stat-rows">
         ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.last_scrub'), fmtDate(array.snapraid?.lastScrub?.finishedAt))}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
-      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div></div>` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
+      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div>${moverPanelHtml(array, moverDisabled, moverReason())}</div>` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
     view.querySelector('[data-act="back"]').addEventListener('click', () => { if (isCurrent()) screen.openArray(null); });
     view.querySelector('.nas-crumbs').addEventListener('click', (event) => {
       if (!event.target.closest('a')) return;
@@ -155,7 +221,7 @@ export async function drawElasticDetail(screen, body) {
       button.querySelector('button')?.setAttribute('aria-label', button.title);
       button.addEventListener('click', () => { if (isCurrent()) screen.openDisk(button.closest('[data-disk]').dataset.disk); });
     });
-    for (const action of ['restore', 'sync', 'scrub']) view.querySelector(`[data-act="${action}"]`)?.addEventListener('click', () => execute(action));
+    for (const action of ['restore', 'sync', 'scrub', 'mover']) view.querySelector(`[data-act="${action}"]`)?.addEventListener('click', () => execute(action));
     view.querySelectorAll('[data-act="history-job"]').forEach((button) => button.addEventListener('click', () => {
       if (isCurrent()) screen.openJobLog(button.dataset.job, finishJob);
     }));
@@ -194,8 +260,8 @@ export async function drawElasticDetail(screen, body) {
 
   const execute = async (action) => {
     if (!isCurrent() || !screen.isAdmin || busy || submitted) return;
-    const maintenance = action !== 'restore';
-    const allowed = () => isCurrent() && screen.isAdmin && (maintenance ? !maintenanceReason() : canRestore());
+    const blocked = action === 'restore' ? () => !canRestore() : action === 'mover' ? moverReason : maintenanceReason;
+    const allowed = () => isCurrent() && screen.isAdmin && !blocked();
     if (!allowed()) return;
     busy = true;
     draw();
@@ -205,15 +271,14 @@ export async function drawElasticDetail(screen, body) {
         if (!allowed()) return null;
         sent = true;
         submitted = true;
-        const request = { restore: 'tentaNasElasticArrayRestoreRequest', sync: 'tentaNasElasticArraySyncRequest', scrub: 'tentaNasElasticArrayScrubRequest' }[action];
-        return screen.nas(request, { name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS });
-      }, T(`elastic.${maintenance ? action + '_now' : 'restore'}`), allowed);
+        return screen.nas(ACTION_REQUEST[action], { name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS });
+      }, T(ACTION_TITLE[action]), allowed);
       if (!isCurrent()) return;
       if (result?.job?.jobId) {
-        message = T(`elastic.${maintenance ? 'maintenance_accepted' : 'job_running'}`);
-        if (maintenance) submittedJobId = result.job.jobId;
+        message = T(ACTION_ACCEPTED[action]);
+        if (action !== 'restore') submittedJobId = result.job.jobId;
         screen.openJobLog(result.job.jobId, finishJob);
-      } else if (result?.approval?.requestId) message = T(`elastic.${maintenance ? 'maintenance_approval' : 'approval'}`);
+      } else if (result?.approval?.requestId) message = T(ACTION_APPROVAL[action]);
       else if (sent) message = T('elastic.request_unknown');
     } catch (error) {
       if (isCurrent()) message = sent ? T('elastic.request_unknown') : errMessage(error);

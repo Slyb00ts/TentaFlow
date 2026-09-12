@@ -26,6 +26,17 @@ pub enum ElasticJobIntent {
     Create(ElasticCreateSpec),
     Restore { owner: ElasticOwner, array_id: String, operation_id: String },
     Snapraid { owner: ElasticOwner, array_id: String, operation_id: String, kind: ElasticSnapraidKind },
+    /// One mover run. `resume_operation_id` is reserved up front because the
+    /// helper needs a SEPARATE operation to close a run that stopped
+    /// part-way, and `validate_observation` refuses a resume that reuses the
+    /// run's own operation or the array's create.
+    /// `rules` and `coupled_sync` travel WITH the intent because they are
+    /// derived from the array row (its mover settings and its folders' cache
+    /// policies) and cannot be rebuilt from the persisted `ElasticCreateSpec`
+    /// alone, which is all the store has. The row therefore records the exact
+    /// command the body will run.
+    Mover { owner: ElasticOwner, array_id: String, operation_id: String, resume_operation_id: String,
+        rules: tentanas_helper::elastic::MoverRules, coupled_sync: bool },
 }
 
 pub(crate) struct RunningJob {
@@ -257,7 +268,14 @@ where
         log: Vec::new(),
     };
     let cancellable = intent.is_none();
-    let snapraid = matches!(intent, Some(ElasticJobIntent::Snapraid { .. }));
+    // Maintenance closes its own operation row inside `finish_job`, from the
+    // result the body recorded. The blanket `fail_elastic_job` below would put
+    // the ARRAY into needs_attention for a run that merely reported a failure
+    // it already persisted, so maintenance is excluded from it.
+    let maintenance = matches!(
+        intent,
+        Some(ElasticJobIntent::Snapraid { .. } | ElasticJobIntent::Mover { .. })
+    );
     let mut registry = running().lock().unwrap_or_else(|p| p.into_inner());
     store::insert_job(db, &job, intent.as_ref())?;
     let cancel = CancellationToken::new();
@@ -281,7 +299,7 @@ where
             body(handle).await
           }
         }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow!("Przerwanie wykonawcy zadania; stan I/O niepotwierdzony")));
-        if !cancellable && !snapraid {
+        if !cancellable && !maintenance {
             if let Err(error) = &outcome {
                 if let Err(persist) = store::fail_elastic_job(&db,&job_id,&error.to_string()) {
                     tracing::error!("tentanas job {job_id}: nie utrwalono needs_attention: {persist}");

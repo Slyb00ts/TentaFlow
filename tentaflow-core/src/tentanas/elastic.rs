@@ -53,7 +53,7 @@ use tentanas_helper::elastic::{
 };
 use anyhow::{anyhow, ensure, Result};
 use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult, ElasticServiceMode};
-use tentanas_helper::elastic::{ElasticMoverIssueKind, ElasticMoverPhase, ElasticMoverRun, ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
+use tentanas_helper::elastic::{ElasticMoverIssueKind, ElasticMoverPhase, ElasticMoverResult, ElasticMoverRun, ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
 use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -102,6 +102,9 @@ pub const PARITY_ERRORS_WINDOW_DAYS: u32 = 30;
 /// And if it ever did, nothing green is invented: a result AT the cap is read
 /// as a possibly truncated window and answers unknown, never zero.
 pub const PARITY_ERRORS_MAX_ROWS: u32 = 200;
+
+/// How many recorded mover runs n11's history strip carries.
+pub const MOVER_HISTORY_ROWS: u32 = 20;
 
 // =============================================================================
 // The model
@@ -187,6 +190,9 @@ pub struct MoverConfig {
     pub min_age_secs: u64,
     pub cache_min_free_pct: u8,
     pub coupled_sync: bool,
+    /// Whether these values were chosen for this array or are the defaults
+    /// below. Nothing writes mover settings yet, so the store leaves it false.
+    pub configured: bool,
 }
 
 impl Default for MoverConfig {
@@ -200,6 +206,7 @@ impl Default for MoverConfig {
             // the coupling the mover moves bytes out of one unprotected
             // window and into another.
             coupled_sync: true,
+            configured: false,
         }
     }
 }
@@ -234,6 +241,12 @@ pub struct ElasticArrayRow {
     pub parity: Vec<ParityRow>,
     pub folders: Vec<FolderRow>,
     pub mover: MoverConfig,
+    /// The mover runs this node has RECORDED, newest first — n11's history
+    /// strip. Empty means "nothing recorded", which is why the strip says that
+    /// in words rather than printing a zero beside a populated last run.
+    pub mover_history: Vec<NasMoverRun>,
+    /// An operation of this array is closed `needs_attention` and unresolved.
+    pub unresolved_operation: bool,
     pub snapraid: SnapraidConfig,
     /// The last state this node persisted, and why — carried the way
     /// `TargetRow::state`/`state_detail` are, so an array switched off by an
@@ -1781,7 +1794,7 @@ fn branch_to_protocol(
     }
 }
 
-fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
+pub(crate) fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
     let outcome = match run.phase {
         ElasticMoverPhase::Holding | ElasticMoverPhase::Moving | ElasticMoverPhase::Syncing => "running",
         // Stopped, and still holding the array until the same operation resumes.
@@ -1988,8 +2001,12 @@ pub fn to_protocol(
             min_age_secs: array.mover.min_age_secs,
             cache_min_free_pct: array.mover.cache_min_free_pct,
             coupled_sync: array.mover.coupled_sync,
+            configured: array.mover.configured,
             last_run: observed.last_mover.as_ref().map(mover_to_protocol),
-            history: Vec::new(),
+            // The RECORDED runs. Observation never invents one: what the
+            // helper reports live is `last_run` above, and the strip below it
+            // shows only what this node persisted.
+            history: array.mover_history.clone(),
         },
         snapraid: NasSnapraidState {
             installed: snapraid_installed,
@@ -2011,6 +2028,7 @@ pub fn to_protocol(
             parity_errors_window_days: PARITY_ERRORS_WINDOW_DAYS,
         },
         protection,
+        unresolved_operation: array.unresolved_operation,
         created_at: array.created_at.clone(),
         updated_at: array.updated_at.clone(),
     }
@@ -2498,6 +2516,145 @@ async fn execute_snapraid_job(
     Ok(())
 }
 
+pub fn mover_command(
+    owner: &ElasticOwner,
+    array_id: &str,
+    operation_id: &str,
+    resume_operation_id: &str,
+    rules: &MoverRules,
+    coupled_sync: bool,
+) -> HelperCommand {
+    HelperCommand::ElasticMover {
+        array_id: array_id.into(),
+        owner: owner.clone(),
+        operation_id: operation_id.into(),
+        resume_operation_id: resume_operation_id.into(),
+        rules: rules.clone(),
+        coupled_sync,
+    }
+}
+
+/// The mover's answer, against the intent that asked for it.
+///
+/// The SHAPE of `last_mover` — both uuids canonical, the resume distinct from
+/// the run and from Create, the times in order, an unfinished run without a
+/// finish time, and the coupled sync belonging to this operation and sitting
+/// inside the mover's own window — is already enforced by
+/// `validate_observation`, which every Elastic answer passes through. This
+/// routes the mover result through that same validator instead of growing a
+/// second one that could drift from it.
+pub fn validate_mover_result(
+    spec: &ElasticCreateSpec,
+    operation_id: &str,
+    result: &ElasticMoverResult,
+) -> Result<()> {
+    // A completed run leaves the array serving, so it is held to the full
+    // `Ready` contract; one that stopped part-way is only an observation.
+    if result.run.phase == ElasticMoverPhase::Complete {
+        validate_result(spec, &result.state)?;
+    } else {
+        validate_observation(spec, &result.state)?;
+    }
+    let run = &result.run;
+    // THE ONE CHECK `validate_observation` CANNOT MAKE: it never sees the job's
+    // operation id, so it cannot tell this answer apart from an older run the
+    // helper still reports as `last_mover`. Without it a mover job could be
+    // closed by the result of the previous one.
+    ensure!(run.operation_id == operation_id, "Obca operacja movera");
+    ensure!(
+        result.state.last_mover.as_ref() == Some(run),
+        "Wynik movera nie jest stanem macierzy"
+    );
+    ensure!(
+        run.detail.as_ref().is_none_or(|d| d.len() < 8192),
+        "Zbyt długi opis wyniku movera"
+    );
+    // A terminal answer is Complete, or NeedsAttention closed by its Resume.
+    // Anything still moving is the helper failing to deliver a verdict.
+    ensure!(
+        matches!(run.phase, ElasticMoverPhase::Complete | ElasticMoverPhase::NeedsAttention),
+        "Helper nie dostarczył terminalnego wyniku movera"
+    );
+    Ok(())
+}
+
+async fn execute_mover_job(
+    h: &jobs::JobHandle,
+    spec: &ElasticCreateSpec,
+    operation_id: &str,
+    run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
+) -> Result<()> {
+    let output = run.await?;
+    ensure!(
+        output.success() && output.stdout.len() < 64 * 1024,
+        "Brak wiarygodnego wyniku movera"
+    );
+    let result: ElasticMoverResult = serde_json::from_str(&output.stdout)?;
+    validate_mover_result(spec, operation_id, &result)?;
+    store::record_mover_result(h.db(), &spec.owner, operation_id, &result)?;
+    ensure!(
+        result.run.phase == ElasticMoverPhase::Complete,
+        "{}",
+        result
+            .run
+            .detail
+            .as_deref()
+            .unwrap_or("Mover nie zakończył przenoszenia")
+    );
+    Ok(())
+}
+
+pub fn spawn_mover(
+    db: &DbPool,
+    array: &ElasticArrayRow,
+    started_by: &str,
+    explicit: Option<Arc<ElevationToken>>,
+) -> Result<tentaflow_protocol::tentanas::NasJob> {
+    let spec = array.persisted_spec()?.clone();
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    // A SECOND reservation, distinct from the run's own and from Create: the
+    // helper refuses a command whose resume repeats its operation, and
+    // `validate_observation` refuses such an answer. Reserving it up front is
+    // what lets a run that stops part-way be closed later without inventing
+    // an identifier nothing agreed on.
+    let resume_operation_id = uuid::Uuid::now_v7().to_string();
+    let rules = array.mover_rules();
+    let coupled_sync = array.mover.coupled_sync;
+    let intent = jobs::ElasticJobIntent::Mover {
+        owner: spec.owner.clone(),
+        array_id: spec.array_id.clone(),
+        operation_id: operation_id.clone(),
+        resume_operation_id: resume_operation_id.clone(),
+        rules: rules.clone(),
+        coupled_sync,
+    };
+    jobs::spawn(
+        db,
+        "elastic_mover",
+        &array.name,
+        started_by,
+        Some(intent),
+        None,
+        move |h| async move {
+            let command = mover_command(
+                &spec.owner,
+                &spec.array_id,
+                &operation_id,
+                &resume_operation_id,
+                &rules,
+                coupled_sync,
+            );
+            let run = jobs::run_step(
+                &h,
+                &command,
+                explicit.as_deref(),
+                Duration::from_secs(24 * 60 * 60),
+            );
+            execute_mover_job(&h, &spec, &operation_id, run).await
+        },
+    )
+}
+
 pub fn spawn_snapraid(
     db: &DbPool,
     array: &ElasticArrayRow,
@@ -2749,7 +2906,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn observed_protocol_maps_last_mover_without_creating_history() {
+    fn observed_protocol_maps_last_mover_and_carries_only_recorded_history() {
         let spec = create_spec("mover-observation");
         let mut result = ready_result(&spec);
         result.last_mover = Some(ElasticMoverRun {
@@ -2802,7 +2959,29 @@ pub(crate) mod tests {
         assert_eq!(sync.kind, "sync");
         assert_eq!(sync.outcome, "failed");
         assert_eq!(sync.errors_data, Some(1));
+        // Observation never SYNTHESISES history: what the helper reports live is
+        // `last_run`, and the strip carries only what this node recorded. The
+        // row under test has recorded nothing, so the strip is empty — and the
+        // panel says "brak przebiegów" in words rather than printing a zero.
         assert!(wire.mover.history.is_empty());
+
+        // ...but a row that HAS recorded runs reaches the wire unchanged. This
+        // half is what stops the panel claiming no runs happened directly under
+        // a populated "Ostatni przebieg" (round-2 MAJ-1).
+        let mut recorded = array();
+        recorded.create_spec = row.create_spec.clone();
+        recorded.mover_history = vec![NasMoverRun {
+            started_at: "2026-09-08T11:00:00Z".into(),
+            finished_at: Some("2026-09-08T11:02:00Z".into()),
+            outcome: "ok".into(),
+            moved_bytes: 12 * 1024 * 1024 * 1024,
+            moved_files: 3,
+            counts_known: true,
+            ..Default::default()
+        }];
+        let wire = observed_protocol(&recorded, &BTreeMap::new(), Err(anyhow!("brak pomiaru")), &[]);
+        assert_eq!(wire.mover.history.len(), 1);
+        assert_eq!(wire.mover.history[0].moved_bytes, 12 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -3668,6 +3847,316 @@ pub(crate) mod tests {
             state.sync_completed_at = run.finished_at.clone();
         }
         ElasticSnapraidResult { state, run }
+    }
+
+    /// A spec with a cache branch — the only shape a mover run makes sense on.
+    pub(crate) fn mover_spec(name: &str) -> ElasticCreateSpec {
+        let mut spec = create_spec(name);
+        spec.cache = Some(tentanas_helper::elastic::ElasticDiskSpec {
+            disk_id: format!("{name}-cache"),
+            wwn: Some(format!("wwn-{name}-cache")),
+            serial: Some(format!("serial-{name}-cache")),
+            bytes: 32 * 1024 * 1024 * 1024,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        });
+        spec.validate().expect("specyfikacja z cache");
+        spec
+    }
+
+    pub(crate) fn mover_result(
+        spec: &ElasticCreateSpec,
+        operation_id: &str,
+        resume_operation_id: &str,
+        phase: ElasticMoverPhase,
+        counts_known: bool,
+    ) -> ElasticMoverResult {
+        let mut state = ready_result(spec);
+        let complete = phase == ElasticMoverPhase::Complete;
+        let run = ElasticMoverRun {
+            operation_id: operation_id.into(),
+            resume_operation_id: resume_operation_id.into(),
+            phase,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: Some("2026-09-08T01:06:00Z".into()),
+            moved_files: 7,
+            moved_bytes: 42 * 1024 * 1024 * 1024,
+            skipped_files: if counts_known { 2 } else { 0 },
+            skipped_bytes: if counts_known { 64 } else { 0 },
+            refused_files: 0,
+            issues: Vec::new(),
+            counts_known,
+            detail: (!complete).then(|| "przerwany transfer".to_string()),
+            coupled_sync: Some(tentanas_helper::elastic::ElasticSnapraidRun {
+                operation_id: operation_id.into(),
+                kind: ElasticSnapraidKind::Sync,
+                started_at: "2026-09-08T01:00:01Z".into(),
+                finished_at: Some("2026-09-08T01:05:00Z".into()),
+                outcome: if complete {
+                    ElasticSnapraidOutcome::Succeeded
+                } else {
+                    ElasticSnapraidOutcome::Failed
+                },
+                exit_code: Some(i32::from(!complete)),
+                total_blocks: None,
+                checked_blocks: None,
+                accessed_mb: None,
+                errors_file: Some(0),
+                errors_io: Some(0),
+                errors_data: Some(u64::from(!complete)),
+                detail: None,
+            }),
+            stuck_records: Vec::new(),
+            stuck_hidden: 0,
+            stuck_evicted: 0,
+        };
+        if !complete {
+            state.stage = ElasticStage::NeedsAttention;
+        }
+        state.last_mover = Some(run.clone());
+        ElasticMoverResult { state, run }
+    }
+
+    #[test]
+    fn mover_validator_binds_the_answer_to_its_job_and_still_applies_the_shared_rules() {
+        let spec = mover_spec("mover-validate");
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let resume_id = uuid::Uuid::new_v4().to_string();
+        let good = mover_result(
+            &spec,
+            &operation_id,
+            &resume_id,
+            ElasticMoverPhase::Complete,
+            true,
+        );
+        validate_mover_result(&spec, &operation_id, &good).expect("poprawny wynik movera");
+
+        // The job's own operation is what binds the answer: the PREVIOUS run's
+        // result, which the helper still reports as `last_mover`, must not be
+        // able to close this job.
+        let foreign = uuid::Uuid::new_v4().to_string();
+        assert!(validate_mover_result(&spec, &foreign, &good).is_err());
+
+        // The run must BE the array's last mover, not merely resemble it.
+        let mut detached = good.clone();
+        detached.state.last_mover = None;
+        assert!(validate_mover_result(&spec, &operation_id, &detached).is_err());
+
+        // The shared observation rules, reached through this entry point.
+        let mut shared_resume = good.clone();
+        shared_resume.run.resume_operation_id = operation_id.clone();
+        shared_resume.state.last_mover = Some(shared_resume.run.clone());
+        assert!(validate_mover_result(&spec, &operation_id, &shared_resume).is_err());
+
+        let mut create_resume = good.clone();
+        create_resume.run.resume_operation_id = spec.operation_id.clone();
+        create_resume.state.last_mover = Some(create_resume.run.clone());
+        assert!(validate_mover_result(&spec, &operation_id, &create_resume).is_err());
+
+        let mut inverted = good.clone();
+        inverted.run.finished_at = Some("2026-09-08T00:00:00Z".into());
+        inverted.state.last_mover = Some(inverted.run.clone());
+        assert!(validate_mover_result(&spec, &operation_id, &inverted).is_err());
+
+        // A completed run whose coupled sync failed did not complete.
+        let mut bad_sync = good.clone();
+        bad_sync.run.coupled_sync.as_mut().unwrap().outcome = ElasticSnapraidOutcome::Failed;
+        bad_sync.state.last_mover = Some(bad_sync.run.clone());
+        assert!(validate_mover_result(&spec, &operation_id, &bad_sync).is_err());
+
+        // Still moving is not a verdict.
+        let mut moving = good.clone();
+        moving.run.phase = ElasticMoverPhase::Moving;
+        moving.run.finished_at = None;
+        moving.state.last_mover = Some(moving.run.clone());
+        assert!(validate_mover_result(&spec, &operation_id, &moving).is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_mover_reserves_a_separate_resume_and_persists_the_rules_it_will_run() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db = Arc::new(crate::db::Db::from_connection(conn));
+        let spec = mover_spec("mover-spawn");
+        let create = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_create".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&db, &create, Some(&jobs::ElasticJobIntent::Create(spec.clone()))).unwrap();
+        store::finish_elastic_operation(&db, &spec.owner, &spec.operation_id, Ok(&ready_result(&spec)))
+            .unwrap();
+        store::finish_job(&db, &create.job_id, "succeeded", None).unwrap();
+
+        let mut row = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        row.folders = vec![
+            FolderRow { name: "foto".into(), cache_policy: "only".into(), ..Default::default() },
+            FolderRow { name: "backup".into(), cache_policy: "no".into(), ..Default::default() },
+            FolderRow { name: "filmy".into(), cache_policy: "yes".into(), ..Default::default() },
+        ];
+        row.mover = MoverConfig {
+            min_age_secs: 3600,
+            cache_min_free_pct: 25,
+            coupled_sync: true,
+            ..Default::default()
+        };
+        let job = spawn_mover(&db, &row, "test", None).unwrap();
+        assert_eq!(job.kind, "elastic_mover");
+        // The row is written before the body runs, so the reservation is
+        // readable without waiting for a helper that is not there.
+        let request: String = db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT request_json FROM nas_elastic_operations WHERE kind='mover'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let HelperCommand::ElasticMover {
+            operation_id, resume_operation_id, rules, coupled_sync, array_id, ..
+        } = serde_json::from_str(&request).unwrap() else {
+            panic!("zapisano inną intencję niż mover")
+        };
+        assert_eq!(array_id, spec.array_id);
+        // Three distinct reservations: the run, its resume, and Create.
+        assert_ne!(operation_id, resume_operation_id);
+        assert_ne!(resume_operation_id, spec.operation_id);
+        assert_ne!(operation_id, spec.operation_id);
+        // The folders' cache policies ARE the rules — nothing rebuilds them later.
+        assert_eq!(rules.pinned_folders, vec!["foto".to_string()]);
+        assert_eq!(rules.eager_folders, vec!["backup".to_string()]);
+        assert_eq!(rules.min_age_secs, 3600);
+        assert_eq!(rules.min_free_pct, 25);
+        assert!(rules.skip_open_files, "§5.3: otwarte pliki zawsze pomijane");
+        assert!(coupled_sync);
+    }
+
+    #[tokio::test]
+    async fn mover_job_closes_its_operation_and_stays_out_of_every_snapraid_query() {
+        for case in ["complete", "attention", "malformed"] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            store::migrate(&conn).unwrap();
+            let db = Arc::new(crate::db::Db::from_connection(conn));
+            let spec = mover_spec("mover-job");
+            let create = tentaflow_protocol::tentanas::NasJob {
+                job_id: uuid::Uuid::now_v7().to_string(),
+                kind: "elastic_create".into(),
+                subject: spec.name.clone(),
+                status: "running".into(),
+                started_at: store::now(),
+                ..Default::default()
+            };
+            store::insert_job(&db, &create, Some(&jobs::ElasticJobIntent::Create(spec.clone())))
+                .unwrap();
+            store::finish_elastic_operation(
+                &db,
+                &spec.owner,
+                &spec.operation_id,
+                Ok(&ready_result(&spec)),
+            )
+            .unwrap();
+            store::finish_job(&db, &create.job_id, "succeeded", None).unwrap();
+
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let resume_id = uuid::Uuid::now_v7().to_string();
+            let (completion, finished) = tokio::sync::oneshot::channel();
+            let work_spec = spec.clone();
+            let work_id = operation_id.clone();
+            let work_resume = resume_id.clone();
+            let job = jobs::spawn(
+                &db,
+                "elastic_mover",
+                &spec.name,
+                "test",
+                Some(jobs::ElasticJobIntent::Mover {
+                    owner: spec.owner.clone(),
+                    array_id: spec.array_id.clone(),
+                    operation_id: operation_id.clone(),
+                    resume_operation_id: resume_id.clone(),
+                    rules: MoverRules {
+                        min_age_secs: 7200,
+                        min_free_pct: 20,
+                        pinned_folders: Vec::new(),
+                        eager_folders: Vec::new(),
+                        skip_open_files: true,
+                    },
+                    coupled_sync: true,
+                }),
+                Some(completion),
+                move |h| async move {
+                    let phase = if case == "attention" {
+                        ElasticMoverPhase::NeedsAttention
+                    } else {
+                        ElasticMoverPhase::Complete
+                    };
+                    let result = mover_result(
+                        &work_spec,
+                        &work_id,
+                        &work_resume,
+                        phase,
+                        case != "attention",
+                    );
+                    execute_mover_job(&h, &work_spec, &work_id, async {
+                        Ok(super::super::broker::CommandOutput {
+                            code: 0,
+                            stdout: if case == "malformed" {
+                                "{".into()
+                            } else {
+                                serde_json::to_string(&result).unwrap()
+                            },
+                            stderr: String::new(),
+                        })
+                    })
+                    .await
+                },
+            )
+            .unwrap();
+            // A mover carries an intent, so it is not cancellable.
+            assert!(!jobs::cancel(&job.job_id), "{case}");
+            let outcome = tokio::time::timeout(Duration::from_secs(2), finished)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(outcome.is_ok(), case == "complete", "{case}");
+            let terminal = store::job(&db, &job.job_id).unwrap().unwrap();
+            assert_eq!(
+                terminal.status,
+                if case == "complete" { "succeeded" } else { "failed" },
+                "{case}"
+            );
+            let array = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+            assert_eq!(
+                array.state,
+                if case == "complete" { "active" } else { "needs_attention" },
+                "{case}"
+            );
+            let state: String = db
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM nas_elastic_operations WHERE kind='mover'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                if case == "complete" { "succeeded" } else { "needs_attention" },
+                "{case}"
+            );
+            // THE LEAK THIS GUARDS: a 'mover' row must never be read as a
+            // SnapRAID run — not in the display history, not as the last sync
+            // or scrub, and not inside the parity-error window, where it would
+            // turn an unmeasured window into a confident green zero.
+            assert!(array.snapraid_history.is_empty(), "{case}");
+            assert!(array.parity_window_runs.is_empty(), "{case}");
+            assert!(array.last_sync_run.is_none(), "{case}");
+            assert!(array.last_scrub_run.is_none(), "{case}");
+            assert_eq!(parity_errors_in_window(&array, chrono::Utc::now()), None, "{case}");
+        }
     }
 
     #[test]
