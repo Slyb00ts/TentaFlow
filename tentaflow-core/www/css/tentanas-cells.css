@@ -1,0 +1,129 @@
+/* =============================================================================
+ * TentaNas cell styles for Shadow DOM, `.nas-root` scope — a DELIBERATE,
+ * prefix-less copy of the `.nas-root ...` rules in css/tentanas.css that can
+ * reach a table cell. Keep the two in sync.
+ *
+ * Why the duplication: tf-table renders `renderer="html"` cells with
+ * `td.innerHTML` INSIDE its shadow root. A document stylesheet never reaches
+ * there, so the sparkline `<polyline>` fell back to the UA default
+ * (fill: black, stroke: none) and painted a filled blob instead of a line.
+ *
+ * Why NO `.nas-root` prefix: a selector cannot cross the shadow boundary, so
+ * there is no `.nas-root` ancestor to match inside a shadow tree — adopting
+ * css/tentanas.css verbatim has literally zero effect (measured). Custom
+ * properties DO inherit through the boundary, so `var(--accent-1)` and friends
+ * still resolve from the host's cascade and the colours stay identical.
+ *
+ * Dialogs get their OWN sheet (css/tentanas-modal-cells.css): a `.nas-modal`
+ * window is appended to document.body, so it has no `.nas-root` ancestor, and
+ * tentanas.css gives the two scopes different declarations in places
+ * (`.nas-modal .mono.fw-700` is modal-only). Flattening both scopes into one
+ * sheet would apply modal-only rules to the main screen.
+ *
+ * Because the selectors are unprefixed and use generic names (.mono, .text-3,
+ * .muted), this sheet MUST NOT apply to the document — it is linked with
+ * `media="not all"` in index.html and adopted only into the shadow roots of
+ * components that sit inside `.nas-root` (see js/components/shared-styles.js,
+ * adoptScopedSheetsInto).
+ *
+ * Most of the classes below are test-derived: js/components/tf-table.test.js
+ * parses the TentaNas sources for the classes that reach a `renderer="html"`
+ * cell and fails if one of them is styled in tentanas.css but missing here.
+ *
+ * NOT all of them. The parser only sees class names written literally, so
+ * modifiers composed at runtime (`class="health-dot ${cls}"`, where cls is
+ * 'ok'/'warn'/'err') are invisible to it. The rules carrying those — .ok,
+ * .warn, .err, .nvme, .ssd, .pending, .na, .error, polyline.write, and the
+ * spare .fw-800/.mb-sm/.num-ok/.text-2/.text-sm — are hand-kept and
+ * UNPROTECTED by the test: 14 classes in total, re-derived 2026-09-13 by
+ * running the coverage parser and subtracting its required set. Deleting one
+ * greys every health dot with the whole suite still green. Check them by eye
+ * when touching this file.
+ * ========================================================================== */
+
+/* Breadcrumbs in the directory browsers. */
+.nas-crumbs { display: block; font-size: 13px; }
+
+/* Section heads a cell can host. */
+.section-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.section-card-head .title .icon { width: 16px; height: 16px; color: var(--accent-1); }
+.section-card-head .hint { font-size: 12px; color: var(--text-3); }
+.section-card-head .actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.section-card-head .actions tf-input { width: 150px; flex: 0 0 auto; }
+
+/* Typography helpers used inside table cells. */
+.mono { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.text-2 { color: var(--text-2); }
+.text-3 { color: var(--text-3); }
+.muted { color: var(--text-3); font-size: 12px; }
+.stack { display: flex; flex-direction: column; gap: 12px; }
+.mt-sm { margin-top: 8px; }
+
+/* Stat rows — a whole labelled block built inside a single cell. */
+.stat-rows { display: flex; flex-direction: column; }
+.stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.stat-rows .sr:last-child { border-bottom: 0; }
+.stat-rows .k { color: var(--text-2); flex: 0 0 160px; }
+.stat-rows .v { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+
+/* Health dots — table cells. */
+.health-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--text-3); flex: 0 0 auto; }
+.health-dot.ok { background: var(--success); }
+.health-dot.warn { background: var(--warning); }
+.health-dot.err { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 25%, transparent); }
+.health-cell { display: flex; align-items: center; gap: 8px; }
+
+/* Disk kind badge. */
+.disk-kind { display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: .04em; padding: 1px 6px; border-radius: 4px; background: var(--bg-3); color: var(--text-2); text-transform: uppercase; }
+.disk-kind.nvme { background: color-mix(in srgb, var(--accent-1) 18%, transparent); color: var(--accent-1); }
+.disk-kind.ssd { background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info); }
+
+/* Two-line cell (value over caption). */
+.cell-2 { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cell-2 .l1 { display: flex; align-items: center; gap: 6px; }
+.cell-2 .l2 { font-size: 11px; color: var(--text-3); }
+
+/* Sparkline. Without these the polyline takes the UA default fill (black). */
+.trend svg { display: block; width: 90px; height: 22px; }
+.trend polyline { fill: none; stroke: var(--accent-1); stroke-width: 1.5; }
+.trend polyline.write { stroke: var(--warning); }
+
+/* Numeric emphasis. */
+.num-warn { color: var(--warning); font-weight: 600; }
+.num-err { color: var(--danger); font-weight: 600; }
+.num-ok { color: var(--success); font-weight: 600; }
+
+/* Explainer box — rendered inside expansion cells. */
+.explain-box { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; font-size: 13px; }
+.explain-box h4 { margin: 0 0 6px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.explain-box p { margin: 0 0 6px; color: var(--text-2); }
+.explain-box p:last-child { margin-bottom: 0; }
+
+/* "What you lose" lists. */
+.loss-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.loss-list .ll { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--text-2); }
+.loss-list .ll .icon { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 1px; }
+.loss-list .ll.bad .icon { color: var(--danger); }
+.loss-list .ll.good .icon { color: var(--success); }
+
+/* Toggle card. */
+.toggle-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-2); font-size: 13px; }
+
+/* Fleet mount dots — one square per node, in the "mounts" cell. */
+.mount-dots { display: inline-flex; gap: 4px; align-items: center; }
+.mount-dots .md { width: 8px; height: 8px; border-radius: 2px; background: var(--success); }
+.mount-dots .md.pending { background: var(--warning); }
+.mount-dots .md.error { background: var(--danger); }
+.mount-dots .md.na { background: var(--bg-3); border: 1px solid var(--border); }
+
+/* Schedule pill. */
+.sched-pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--bg-3); color: var(--text-2); font-size: 11px; white-space: nowrap; }
+.sched-pill .icon { width: 12px; height: 12px; }
+
+/* Typography helpers the mockups use inline. */
+.text-sm { font-size: 12px; }
+.text-xs { font-size: 11px; }
+.fw-700 { font-weight: 700; }
+.fw-800 { font-weight: 800; }
+.mb-sm { margin-bottom: 8px; }

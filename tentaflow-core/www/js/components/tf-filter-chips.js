@@ -23,11 +23,20 @@ class TfFilterChips extends HTMLElement {
     this._container = null;
     this._filters = [];
     this._observer = null;
+    // The markup last written into the container, so an identical render can
+    // skip the write entirely (see _render).
+    this._renderedHtml = null;
     this._syncOverflow = this._syncOverflow.bind(this);
   }
 
   connectedCallback() {
+    // A re-attached element still has its container — the container moved with
+    // it — so `_build` is skipped, but `disconnectedCallback` dropped the
+    // ResizeObserver. Without re-observing here a bar that is detached and put
+    // back (a tab switch that re-parents its toolbar) never tracks its width
+    // again, and the edge fade freezes on whatever the last resize said.
     if (!this._container) this._build();
+    else this._observe();
     this._render();
   }
 
@@ -53,16 +62,22 @@ class TfFilterChips extends HTMLElement {
 
   _build() {
     this.innerHTML = '';
+    this._renderedHtml = null;
     const el = document.createElement('div');
     el.className = 'tf-filter-chips';
     el.addEventListener('click', (e) => this._onClick(e));
     el.addEventListener('scroll', this._syncOverflow, { passive: true });
     this.appendChild(el);
     this._container = el;
-    if (typeof ResizeObserver !== 'undefined') {
-      this._observer = new ResizeObserver(this._syncOverflow);
-      this._observer.observe(el);
-    }
+    this._observe();
+  }
+
+  /// Starts tracking the container's width, unless it already is. Called both
+  /// when the container is first built and when the element is re-attached.
+  _observe() {
+    if (this._observer || !this._container || typeof ResizeObserver === 'undefined') return;
+    this._observer = new ResizeObserver(this._syncOverflow);
+    this._observer.observe(this._container);
   }
 
   // Which way the row can still travel. Read straight from layout rather than
@@ -97,7 +112,22 @@ class TfFilterChips extends HTMLElement {
       ? '<button class="tf-filter-chips__clear" type="button" aria-label="Wyczyść filtry">×</button>'
       : '';
 
-    this._container.innerHTML = html + clearHtml;
+    // An identical render is a no-op. Callers on a poll chain hand the same
+    // filters back every few seconds (TentaNas rebuilds the disk bar every
+    // 5 s because the labels carry live counts), and rewriting innerHTML
+    // destroys and recreates every chip: the button under the cursor loses
+    // its hover and :active styling mid-press, and a click that lands in that
+    // window is delivered to a node already detached from the document.
+    // Comparing the markup we are about to write is enough — this element is
+    // the only writer of its container.
+    const next = html + clearHtml;
+    if (this._renderedHtml !== next) {
+      this._renderedHtml = next;
+      this._container.innerHTML = next;
+    }
+    // Still re-read the overflow state: the row may have been resized or
+    // scrolled since the last render even when the chips themselves did not
+    // change, and this only reads layout and writes a data attribute.
     this._syncOverflow();
   }
 

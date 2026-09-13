@@ -54,6 +54,12 @@ const keepOf = (s, tier) => ({ daily: s.keepDaily, weekly: s.keepWeekly, monthly
 
 export async function drawSnapshots(screen, host, { pool, datasets = [], onChange = null }) {
   const admin = screen.isAdmin;
+  // ONE HOST, ONE WRITER: `host` is `#nas-pool-tab-body`, and this direct
+  // write is legal only because `drawInner` (pool-detail.js) nulls its
+  // `__tfHtml` on every tab switch and this is the first synchronous
+  // statement to touch it, before any await. Reached from anywhere else — a
+  // poll, a refresh — it would leave that cache describing markup that is
+  // gone, and the next `patchHtml` with the same string would be a no-op.
   host.innerHTML = `
     <div class="stack">
       <div class="grid-2">

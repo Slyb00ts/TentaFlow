@@ -19,10 +19,15 @@ const rdmaEnv = (status, detail = '') => ({ features: [{ id: 'nfs', status: 'ok'
 // is a real status a node reports with an RDMA card that works.
 const ksmbdEnv = (status, detail = '') => ({ features: [{ id: 'rdma', status: 'ok' }, { id: 'ksmbd', status, detail }] });
 
+// The values the wire actually carries: `elevation::Mode::as_str` emits
+// 'unset' | 'helper' | 'interactive', and `fleet.rs` puts that straight into
+// `elevationMode`. 'armed'/'unarmed' were this fixture's own invention, which
+// is exactly how the 'unset' regression got through — a node with no channel
+// at all read as a working one everywhere the UI compared against 'unarmed'.
 const fleet = [
-  { nodeId: 'node-orion', nodeName: 'orion', instanceStatus: 'ready', elevationMode: 'armed' },
-  { nodeId: 'node-atlas', nodeName: 'atlas', instanceStatus: 'ready', elevationMode: 'armed' },
-  { nodeId: 'node-helios', nodeName: 'helios', instanceStatus: 'ready', elevationMode: 'unarmed' },
+  { nodeId: 'node-orion', nodeName: 'orion', instanceStatus: 'ready', elevationMode: 'helper' },
+  { nodeId: 'node-atlas', nodeName: 'atlas', instanceStatus: 'ready', elevationMode: 'interactive' },
+  { nodeId: 'node-helios', nodeName: 'helios', instanceStatus: 'ready', elevationMode: 'unset' },
   { nodeId: 'node-tabbie', nodeName: 'tabbie', instanceStatus: 'missing', elevationMode: null },
 ];
 const users = [{ name: 'anna', description: 'Anna K.', shares: [] }, { name: 'backup', description: '', shares: [] }];

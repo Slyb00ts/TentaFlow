@@ -13,6 +13,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtAgo, fmtIn, fmtDate, errMessage, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { setAttr, setText, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
@@ -73,7 +74,8 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
 
   const paint = () => {
     const open = state.approvals.filter((a) => a.status === 'pending');
-    body.querySelector('#nas-approvals-count').setAttribute('label', String(open.length));
+    // `setAttribute` with an identical value still re-renders the chip.
+    setAttr(body.querySelector('#nas-approvals-count'), 'label', String(open.length));
     // The card stays out of the way while nothing waits and the switch is off:
     // an empty list plus a disabled feature is noise, not information.
     card.hidden = !open.length && !state.settings?.enabled;
@@ -118,18 +120,26 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
   const paintSettings = () => {
     const s = state.settings;
     const el = body.querySelector('#nas-approvals-settings');
-    if (!s) { el.textContent = ''; return; }
+    // `setText` rather than `textContent =`: it also drops the patch cache, so
+    // the same markup coming back later is not mistaken for "already there".
+    if (!s) { setText(el, ''); return; }
     const toggle = body.querySelector('#nas-approvals-enabled');
-    if (toggle) toggle.checked = Boolean(s.enabled);
+    // Assigning `checked` writes the attribute unconditionally, and tf-toggle
+    // re-renders in its attributeChangedCallback — so guard it.
+    if (toggle) setAttr(toggle, 'checked', Boolean(s.enabled));
     const ttl = body.querySelector('#nas-approvals-ttl');
     // Only while the admin is not mid-edit: a poll must not overwrite what is
-    // being typed.
-    if (ttl && document.activeElement !== ttl) ttl.value = String(s.ttlHours);
+    // being typed — and only when the number actually moved.
+    if (ttl && document.activeElement !== ttl && String(ttl.value) !== String(s.ttlHours)) ttl.value = String(s.ttlHours);
     const origin = s.byDefault
       ? T(s.enabled ? 'approvals.settings_default_on' : 'approvals.settings_default_off', { n: s.adminCount })
       : T('approvals.settings_admins', { n: s.adminCount });
-    el.innerHTML = `${escapeHtml(T('approvals.settings_sub'))} <span class="text-3">${escapeHtml(origin)}</span>${
-      s.adminCount < 2 ? `<div class="text-3">${escapeHtml(T('approvals.single_admin'))}</div>` : ''}`;
+    // This line is the same sentence on almost every poll — the settings
+    // change when an admin changes them, not every 30 s. Rewriting it
+    // destroyed and recreated it for nothing, which is exactly the flicker
+    // the mockups forbid ("nigdy pełne odświeżenie całości").
+    patchHtml(el, `${escapeHtml(T('approvals.settings_sub'))} <span class="text-3">${escapeHtml(origin)}</span>${
+      s.adminCount < 2 ? `<div class="text-3">${escapeHtml(T('approvals.single_admin'))}</div>` : ''}`);
   };
 
   const apply = (res) => {

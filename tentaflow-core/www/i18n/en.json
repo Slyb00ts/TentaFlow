@@ -6374,7 +6374,11 @@
       "cache": "Cache",
       "spare": "Spare",
       "system": "System",
-      "partitioned": "Partitioned"
+      "partitioned": "Partitioned",
+      "used": "In use",
+      "pool_member": "Pool member",
+      "array_member": "Array member",
+      "mounted": "Mounted"
     },
     "disks": {
       "search": "Search: device, model, serial…",
@@ -6666,6 +6670,33 @@
       "confirm": "Run",
       "arm_confirm": "Arm the channel",
       "ttl_info": "After {ttl} (or on logout / restart) the password is cleared from memory and has to be entered again."
+    },
+    "setup": {
+      "title": "The system privilege channel is not configured",
+      "lead": "TentaNas installed correctly, but it has no way yet to run operations that need root. Until you choose a mode, every disk, pool and array operation will be refused.",
+      "missing_unset": "No channel mode has been chosen yet — no privileged operation will run.",
+      "missing_helper": "The mode A helper is configured but not working: {state}.",
+      "missing_incompatible": "The mode A helper runs but was built from a different version than the core — the command catalog could diverge, so the channel is blocked.",
+      "plan_intro": "Mode A will run exactly these commands through sudo:",
+      "plan_failed": "Could not fetch the plan: {error}",
+      "mode_a_title": "Mode A — helper (recommended)",
+      "mode_a_desc": "You give the sudo password once. TentaNas installs a single sudoers line and a dedicated helper that validates every command. Schedules, SMART monitoring and recovery after a reboot work without you present.",
+      "mode_a_button": "Set up mode A…",
+      "mode_b_title": "Mode B — password on demand",
+      "mode_b_desc": "Nothing is installed on the system. You give the sudo password for each operation and the node keeps it in memory for the time you choose.",
+      "mode_b_button": "Use mode B…",
+      "helper_missing": "Mode A is unavailable: the helper binary is missing next to the core ({path}). Use mode B or place the helper on this node.",
+      "recheck": "Check again",
+      "configured_already": "The channel on this node is already configured ({mode}). You can change the mode or skip this step.",
+      "node_scope": "You are configuring the channel for node {node} — and only for it. Installing TentaNas covered the whole fleet, but system privileges are set up separately on every node.",
+      "post_install_title": "TentaNas installed — set up the privilege channel",
+      "dismiss": "I'll do it later",
+      "viewer_msg": "The system privilege channel on this node is not configured, so no disk, pool or array operation will run. Only an administrator can set it up.",
+      "probing": "Checking the state of this node…",
+      "probe_failed_title": "Could not read the state of this node",
+      "probe_failed_msg": "The environment probe did not answer: {error}",
+      "probe_failed_hint": "Until the node answers, the panel does not know whether the privilege channel works — so it does not show tiles that would all report this same failure.",
+      "probe_retry": "Try again"
     },
     "wizard": {
       "title": "System privilege channel — {node}",

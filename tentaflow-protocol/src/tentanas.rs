@@ -224,6 +224,14 @@ pub struct NasDisk {
     pub vdev_role: String,
     #[serde(default)]
     pub vdev_kind: String,
+    /// Filesystem signature lsblk reports on the disk (its FSTYPE), when one is
+    /// present. Carried so a disk whose `role` is the catch-all "used" can say
+    /// WHAT occupies it — that role covers 23 of 29 disks on a real machine and
+    /// on its own tells the reader nothing. `member_of` cannot be reused for
+    /// this: it feeds `NasReplacementAdvice.member_of`, where the UI prints a
+    /// pool name.
+    #[serde(default)]
+    pub fs_type: Option<String>,
 }
 
 /// One SMART attribute (ATA) or NVMe log field, normalized.
@@ -3041,6 +3049,7 @@ mod tests {
             mountpoints: vec![],
             vdev_role: "data".to_string(),
             vdev_kind: "raidz2".to_string(),
+            fs_type: Some("ext4".to_string()),
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::DisksListResponse {
             disks: vec![disk],

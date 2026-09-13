@@ -6274,7 +6274,11 @@
       "cache": "Caché",
       "spare": "Reserva",
       "system": "Sistema",
-      "partitioned": "Particionado"
+      "partitioned": "Particionado",
+      "used": "En uso",
+      "pool_member": "Miembro del pool",
+      "array_member": "Miembro del array",
+      "mounted": "Montado"
     },
     "disks": {
       "search": "Buscar: dispositivo, modelo, número de serie…",
@@ -6506,6 +6510,33 @@
       "confirm": "Ejecutar",
       "arm_confirm": "Activar el canal",
       "ttl_info": "Pasados {ttl} (o al cerrar sesión / reiniciar) la contraseña se borra de la memoria y hay que introducirla de nuevo."
+    },
+    "setup": {
+      "title": "El canal de privilegios del sistema no está configurado",
+      "lead": "TentaNas se instaló correctamente, pero todavía no tiene forma de ejecutar operaciones que necesitan root. Hasta que elijas un modo, se rechazará toda operación sobre discos, pools y matrices.",
+      "missing_unset": "Aún no se ha elegido un modo de canal — no se ejecutará ninguna operación privilegiada.",
+      "missing_helper": "El helper del modo A está declarado pero no funciona: {state}.",
+      "missing_incompatible": "El helper del modo A funciona, pero procede de una versión distinta a la del core — el catálogo de comandos podría divergir, así que el canal está bloqueado.",
+      "plan_intro": "El modo A ejecutará exactamente estos comandos mediante sudo:",
+      "plan_failed": "No se pudo obtener el plan: {error}",
+      "mode_a_title": "Modo A — helper (recomendado)",
+      "mode_a_desc": "Introduces la contraseña sudo una sola vez. TentaNas instala una única línea sudoers y un helper dedicado que valida cada comando. Las programaciones, la supervisión SMART y la recuperación tras un reinicio funcionan sin tu presencia.",
+      "mode_a_button": "Configurar el modo A…",
+      "mode_b_title": "Modo B — contraseña bajo demanda",
+      "mode_b_desc": "No se instala nada en el sistema. Introduces la contraseña sudo en cada operación y el nodo la mantiene en memoria durante el tiempo que elijas.",
+      "mode_b_button": "Usar el modo B…",
+      "helper_missing": "El modo A no está disponible: falta el binario del helper junto al core ({path}). Usa el modo B o coloca el helper en este nodo.",
+      "recheck": "Comprobar de nuevo",
+      "configured_already": "El canal de este nodo ya está configurado ({mode}). Puedes cambiar el modo u omitir este paso.",
+      "node_scope": "Estás configurando el canal para el nodo {node} — y solo para él. La instalación de TentaNas abarcó toda la flota, pero los privilegios del sistema se configuran por separado en cada nodo.",
+      "post_install_title": "TentaNas instalado — configura el canal de privilegios",
+      "dismiss": "Lo haré más tarde",
+      "viewer_msg": "El canal de privilegios del sistema de este nodo no está configurado, así que no se ejecutará ninguna operación sobre discos, pools o matrices. Solo un administrador puede configurarlo.",
+      "probing": "Comprobando el estado del nodo…",
+      "probe_failed_title": "No se pudo leer el estado de este nodo",
+      "probe_failed_msg": "La sonda del entorno no respondió: {error}",
+      "probe_failed_hint": "Mientras el nodo no responda, el panel no sabe si el canal de privilegios funciona — por eso no muestra tarjetas que informarían todas del mismo fallo.",
+      "probe_retry": "Reintentar"
     },
     "refreshed": "última actualización {t}",
     "duration": {

@@ -8,6 +8,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { Router } from '/js/router.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 
@@ -25,6 +26,12 @@ import { BindingsTab } from '/js/modules/addons/bindings.js';
 import { openUninstallDialog } from '/js/modules/addons/uninstall-dialog.js';
 // `openInstallWizard` reserved for the future "Install from ZIP" flow on the
 // addons list page; it is no longer triggered from the per-addon header.
+
+// The one package that finishes installing unable to do its job. TentaNas can
+// run nothing privileged until an admin picks a channel mode, and the install
+// request deliberately carries no sudo password, so the choice has to happen
+// right after the install rather than whenever someone next opens the app.
+const TENTANAS_PACKAGE_ID = 'tentanas';
 
 // --- Stan listy ------------------------------------------------------------
 let addonsList = [];
@@ -670,7 +677,25 @@ function openInstallInstanceModal(pkg) {
       });
       if (!res.ok) { toast(res.error || I18n.t('addons.install_failed'), 'error'); return false; }
       toast(I18n.t('addons.install_done', { name }), 'success');
-      await refreshAll();
+      // A failed refresh must not swallow the step below. The install already
+      // succeeded and the list can catch up late, but an unguarded await here
+      // dropped the elevation step silently on any transient error.
+      try {
+        await refreshAll();
+      } catch { /* the catalog refreshes on its own schedule; the step does not wait for it */ }
+      // The elevation step is raised NOW, not whenever somebody next navigates
+      // into an unconfigured node. The route only FORCES the step: it carries
+      // no password and configures nothing by itself — the existing channel
+      // wizard collects the sudo password, on the node it is configuring.
+      //
+      // What `navigate` guarantees is narrow, and this comment used to claim
+      // more: it returns false only for an unknown id or a screen that blocked
+      // the leave, and TRUE even when the target's render/mount threw (router.js
+      // paints an error box and still reports success). So routing here is not
+      // proof the step reached the admin — only that nothing refused it. The
+      // screen-open gate in tentanas.js `drawTab` is the backstop that catches
+      // every case this misses, which is why no error handling is invented here.
+      if (pkgId === TENTANAS_PACKAGE_ID) await Router.navigate('tentanas', { setup: '1' });
       return true;
     },
   });

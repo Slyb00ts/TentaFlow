@@ -13,6 +13,7 @@ import {
   fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
   layoutLabel, stateTone, stateLabel, stateChipHtml, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
+import { setAttr, setText, patchHtml, paintStatCards } from '/js/modules/tentanas/dom-patch.js';
 import { openScheduleEditor } from '/js/modules/tentanas/schedule-editor.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { scrubAction, trimAction } from '/js/modules/tentanas/pools.js';
@@ -183,15 +184,34 @@ function paintKpis(body, state) {
   const scan = p.scan || {};
   const diskWarnings = (p.vdevs || []).flatMap((v) => v.disks || []).filter((d) => d.state !== 'online' || (Number(d.readErrors) || 0) + (Number(d.writeErrors) || 0) + (Number(d.cksumErrors) || 0) > 0).length;
   const frag = Math.round(Number(p.fragmentationPct) || 0);
-  body.querySelector('#nas-pool-kpi').innerHTML = `
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_capacity'))}" value="${escapeAttr(cap.value)}" suffix="${escapeAttr(cap.suffix)}" icon="database" ${usedPct > 90 ? 'accent="danger"' : usedPct > 75 ? 'accent="warning"' : ''} delta="${escapeAttr(T('pool.kpi_capacity_delta', { pct: usedPct, ratio: fmtRatio(p.compressRatio) }))}"></tf-stat-card>
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_state'))}" value="${escapeAttr(stateLabel(p.state).toUpperCase())}" icon="check" accent="${stateTone(p.state) === 'ok' ? 'success' : stateTone(p.state) === 'warn' ? 'warning' : 'danger'}" delta="${escapeAttr(T('pool.kpi_state_delta', { e: Number(scan.errors) || 0, w: diskWarnings }))}"></tf-stat-card>
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_iops'))}" value="${Math.round((Number(io.readIops) || 0) + (Number(io.writeIops) || 0))}" icon="zap" delta="${escapeAttr(T('pool.kpi_iops_delta', { r: Math.round(Number(io.readIops) || 0), w: Math.round(Number(io.writeIops) || 0) }))}"></tf-stat-card>
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_fragmentation'))}" value="${frag}" suffix="%" icon="grid-2x2" ${frag > 50 ? 'accent="warning"' : ''} delta="${escapeAttr(frag > 50 ? T('pool.frag_high') : T('pool.frag_low'))}" delta-type="${frag > 50 ? 'warn' : 'neutral'}"></tf-stat-card>`;
+  // Four tiles created once; every later poll writes only the attributes that
+  // moved, so a tile keeps its identity while its numbers change.
+  paintStatCards(body.querySelector('#nas-pool-kpi'), [
+    { key: 'capacity', attrs: {
+      label: T('pool.kpi_capacity'), value: cap.value, suffix: cap.suffix, icon: 'database',
+      accent: usedPct > 90 ? 'danger' : usedPct > 75 ? 'warning' : null,
+      delta: T('pool.kpi_capacity_delta', { pct: usedPct, ratio: fmtRatio(p.compressRatio) }),
+    } },
+    { key: 'state', attrs: {
+      label: T('pool.kpi_state'), value: stateLabel(p.state).toUpperCase(), icon: 'check',
+      accent: stateTone(p.state) === 'ok' ? 'success' : stateTone(p.state) === 'warn' ? 'warning' : 'danger',
+      delta: T('pool.kpi_state_delta', { e: Number(scan.errors) || 0, w: diskWarnings }),
+    } },
+    { key: 'iops', attrs: {
+      label: T('pool.kpi_iops'), value: String(Math.round((Number(io.readIops) || 0) + (Number(io.writeIops) || 0))), icon: 'zap',
+      delta: T('pool.kpi_iops_delta', { r: Math.round(Number(io.readIops) || 0), w: Math.round(Number(io.writeIops) || 0) }),
+    } },
+    { key: 'fragmentation', attrs: {
+      label: T('pool.kpi_fragmentation'), value: String(frag), suffix: '%', icon: 'grid-2x2',
+      accent: frag > 50 ? 'warning' : null,
+      delta: frag > 50 ? T('pool.frag_high') : T('pool.frag_low'),
+      'delta-type': frag > 50 ? 'warn' : 'neutral',
+    } },
+  ]);
 
   const tabs = body.querySelector('#nas-pool-tabs');
-  tabs.querySelector('#datasets')?.setAttribute('count', String(p.datasetCount ?? 0));
-  tabs.querySelector('#snapshots')?.setAttribute('count', String(p.snapshotCount ?? 0));
+  setAttr(tabs.querySelector('#datasets'), 'count', String(p.datasetCount ?? 0));
+  setAttr(tabs.querySelector('#snapshots'), 'count', String(p.snapshotCount ?? 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +221,23 @@ function paintKpis(body, state) {
 function drawInner(screen, body, state, refresh) {
   const host = body.querySelector('#nas-pool-tab-body');
   state.live = null;
+  // Each inner tab owns this host while it is open, and several of them write
+  // it directly rather than through patchHtml. Drop the patch cache on every
+  // switch so the incoming pane is always rendered — otherwise a pane whose
+  // markup happened to equal the outgoing one's would be skipped as "already
+  // there" and the previous tab would stay on screen.
+  //
+  // ONE HOST, ONE WRITER. `#nas-pool-tab-body` is written directly (not
+  // through `patchHtml`) by `paintStats` here, by `drawDatasets` and by
+  // `drawSnapshots`. That is safe ONLY because all three are reached only
+  // from this switch and each does its write as its first synchronous
+  // statement, before any await — this line is what makes their direct
+  // `innerHTML =` legal. Calling one of them from `refresh` or a poll instead
+  // (the obvious optimization for the stats tab) would skip this
+  // invalidation: `__tfHtml` would go on describing markup that is no longer
+  // on screen, and the next `patchHtml` carrying that same string would be
+  // dropped as a no-op — a pane permanently stuck on stale content.
+  host.__tfHtml = null;
   switch (screen.poolTab) {
     case 'datasets':
       drawDatasets(screen, host, { pool: state.name, onChange: refresh });
@@ -233,6 +270,23 @@ const VDEV_HINTS = {
   cache: 'pool.hint_cache',
   dedup: 'pool.hint_dedup',
 };
+
+// The IO readout of the topology pane: the label is part of the markup, the
+// value is written as text on every poll. The label is resolved through T()
+// at RENDER time, not here — a module-level T() would be evaluated before the
+// language is loaded and would then never follow a locale switch.
+const IO_ROWS = [
+  ['throughput', 'pool.io_throughput'],
+  ['iops', 'pool.io_iops'],
+  ['latency', 'pool.io_latency'],
+];
+
+function paintIoRows(host, io) {
+  const write = (key, text) => setText(host.querySelector(`[data-io="${key}"]`), text);
+  write('throughput', `${fmtMBps(io.readBps)} / ${fmtMBps(io.writeBps)} MB/s`);
+  write('iops', `${Math.round(Number(io.readIops) || 0)} / ${Math.round(Number(io.writeIops) || 0)}`);
+  write('latency', `${(Number(io.readLatencyMs) || 0).toFixed(1)} / ${(Number(io.writeLatencyMs) || 0).toFixed(1)} ms`);
+}
 
 function paintTopology(screen, body, state, refresh) {
   const host = body.querySelector('#nas-pool-tab-body');
@@ -344,13 +398,8 @@ function paintTopology(screen, body, state, refresh) {
     ['clock', T('pool.trim_schedule'), `<span class="sched-pill" ${admin && trimSupported ? 'data-act="trim-schedule" role="button"' : ''}>${sprite('clock')} ${escapeHtml(p.trimSchedule ? fmtSchedule(p.trimSchedule) : T('schedule.none'))}</span>${p.nextTrimAt ? ` <span class="text-3">${escapeHtml(fmtIn(p.nextTrimAt))}</span>` : ''}`],
   );
   const io = p.io || {};
-  const ioRows = [
-    [T('pool.io_throughput'), `${fmtMBps(io.readBps)} / ${fmtMBps(io.writeBps)} MB/s`],
-    [T('pool.io_iops'), `${Math.round(Number(io.readIops) || 0)} / ${Math.round(Number(io.writeIops) || 0)}`],
-    [T('pool.io_latency'), `${(Number(io.readLatencyMs) || 0).toFixed(1)} / ${(Number(io.writeLatencyMs) || 0).toFixed(1)} ms`],
-  ];
 
-  host.innerHTML = `
+  const html = `
     <div class="stack">
       <div class="section-card">
         <div class="section-card-head">
@@ -368,15 +417,35 @@ function paintTopology(screen, body, state, refresh) {
         </div>
         <div class="section-card">
           <div class="section-card-head"><div class="title">${sprite('trend')} ${escapeHtml(T('pool.io_title'))}</div><span class="hint">${escapeHtml(T('pool.io_hint'))}</span></div>
-          <div class="stat-rows">${ioRows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v mono">${escapeHtml(v)}</span></div>`).join('')}</div>
+          <div class="stat-rows">${IO_ROWS.map(([key, labelKey]) => `<div class="sr"><span class="k">${escapeHtml(T(labelKey))}</span><span class="v mono" data-io="${key}"></span></div>`).join('')}</div>
           <tf-stream-chart id="nas-pool-io-live" class="mt-sm"></tf-stream-chart>
           <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(IO_WINDOW_SECS) }))}</div>
         </div>
       </div>
       ${propertiesSectionHtml(screen, state)}
     </div>`;
-  // The topology pane is rebuilt on every poll, so its stream chart is seeded
-  // from the samples kept on `state` instead of owning them.
+  // The three IO numbers are what a 5 s poll moves on an otherwise idle pool,
+  // and they are the reason this pane used to be rebuilt every time. They are
+  // rendered as empty slots above and written as TEXT below, so the markup
+  // compared here stays identical across polls and the vdev cells, their
+  // buttons and the chart are never destroyed under the cursor. (A disk
+  // crossing a temperature degree still rebuilds the pane — the comparison is
+  // over the whole joined string and cannot tell which cell moved.)
+  const rebuilt = patchHtml(host, html);
+  paintIoRows(host, io);
+  if (!rebuilt) {
+    // The pane survived, so its chart still owns the points it was seeded
+    // with: feed it the newest sample instead of re-seeding it from scratch.
+    const chart = host.querySelector('#nas-pool-io-live');
+    const last = state.ioSamples[state.ioSamples.length - 1];
+    if (chart && last) chart.push(last.t, { read: last.read, write: last.write });
+    // Rows only — the danger-zone listeners below are still attached to the
+    // markup that is on screen, and binding them twice would fire them twice.
+    paintProperties(screen, host, state, refresh, { wire: false });
+    return;
+  }
+  // A rebuilt pane needs its chart seeded from the samples kept on `state`,
+  // because the element that held them has just been replaced.
   mountIoChart(host.querySelector('#nas-pool-io-live'), 72, state);
   paintProperties(screen, host, state, refresh);
 
@@ -471,6 +540,11 @@ function openTrimScheduleEditor(screen, pool, refresh) {
 
 function paintStats(body, state) {
   const host = body.querySelector('#nas-pool-tab-body');
+  // ONE HOST, ONE WRITER: this direct write is legal only because `drawInner`
+  // nulls `host.__tfHtml` on every tab switch and this is the first
+  // synchronous statement here, before any await. Do not call `paintStats`
+  // from `refresh` or a poll without switching it to `patchHtml` — the stale
+  // cache would turn the next patch into a no-op and freeze the pane.
   host.innerHTML = `
     <div class="stack">
       <div class="section-card">
@@ -556,7 +630,12 @@ function paintLiveVal(body, state) {
   const last = state.ioSamples[state.ioSamples.length - 1];
   const val = body.querySelector('#nas-pool-live-val');
   if (!val || !last) return;
-  val.innerHTML = `<span class="sw primary"></span>${escapeHtml(T('disk.legend_read'))} ${escapeHtml(fmtMBps(last.read))} MB/s&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('disk.legend_write'))} ${escapeHtml(fmtMBps(last.write))} MB/s`;
+  // Swatches once, numbers as text — the same construct the overview uses in
+  // `pushOverviewSamples`. The readout under a live chart is written on every
+  // sample, so rebuilding it is a visible flicker right next to the motion.
+  patchHtml(val, '<span class="sw primary"></span><span class="v-read"></span><span class="sw info"></span><span class="v-write"></span>');
+  setText(val.querySelector('.v-read'), `${T('disk.legend_read')} ${fmtMBps(last.read)} MB/s  `);
+  setText(val.querySelector('.v-write'), `${T('disk.legend_write')} ${fmtMBps(last.write)} MB/s`);
 }
 
 function pushLiveSample(body, state) {
@@ -597,20 +676,25 @@ function propertiesSectionHtml(screen, state) {
 
 function paintPropertiesTab(screen, body, state, refresh) {
   const host = body.querySelector('#nas-pool-tab-body');
-  host.innerHTML = `<div class="stack">${propertiesSectionHtml(screen, state)}</div>`;
-  paintProperties(screen, host, state, refresh);
+  const rebuilt = patchHtml(host, `<div class="stack">${propertiesSectionHtml(screen, state)}</div>`);
+  paintProperties(screen, host, state, refresh, { wire: rebuilt });
 }
 
 // Fills the "Właściwości puli" table and wires the danger zone that follows
 // it on the topology and properties tabs (n06).
-function paintProperties(screen, host, state, refresh) {
+// `wire` is false when the caller re-used the markup that is already on
+// screen: the rows still have to be refreshed, but the danger-zone listeners
+// below are already attached and binding them again would fire them twice.
+function paintProperties(screen, host, state, refresh, { wire = true } = {}) {
   const p = state.res.pool;
   const admin = screen.isAdmin;
   const datasets = state.res.datasets || [];
   const table = host.querySelector('#nas-pool-props');
   const props = state.res.properties || [];
   const editable = (name) => admin && (name in POOL_PROPS || name in DATASET_PROPS);
-  table.rowActions = (row) => {
+  // Assigned once: `set rowActions` runs a full table render, and the handler
+  // needs only the row it is handed plus the pool name, which cannot change.
+  if (!table.rowActions) table.rowActions = (row) => {
     if (!editable(row._prop.name)) return null;
     const wrap = document.createElement('div');
     wrap.innerHTML = `<tf-button size="sm" variant="ghost" icon="edit" data-act="edit" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>`;

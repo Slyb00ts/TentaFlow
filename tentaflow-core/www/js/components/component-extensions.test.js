@@ -382,6 +382,161 @@ test('tf-table: actions-label names the trailing actions column', () => {
   assert.equal(after.getAttribute('aria-label'), null);
 });
 
+// ---------------------------------------------------------------------------
+// tf-table — rowActionsKey (the actions cell is not rebuilt on every render)
+// ---------------------------------------------------------------------------
+//
+// `_updateRowCells` recycles the <tr> but called `_writeActionsCell`
+// unconditionally, and that did `td.replaceChildren(el)` with a freshly built
+// element every time. On a polled screen every action button in every row was
+// therefore destroyed and recreated on a poll that moved nothing — a click
+// target vanishing out from under the cursor mid-gesture.
+//
+// A guard on object identity cannot fix it: each poll builds brand-new row
+// objects from fresh API data, so `row === lastRow` is never true. The host
+// declares a signature instead. Elements are compared by `===` and the result
+// asserted as a BOOLEAN — see the note on `absent` in modules/tentanas.test.js
+// for why a failing element comparison must never reach assert's differ.
+
+test('tf-table: an unchanged actions signature keeps the very same element', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
+  let built = 0;
+  t.rowActionsKey = (row) => `${row.id}|${row.v}`;
+  t.rowActions = (row) => {
+    built += 1;
+    const b = document.createElement('button');
+    b.dataset.row = row.id;
+    return b;
+  };
+  const el = bodyCells(t).at(-1).firstChild;
+  assert.ok(el, 'the actions cell is filled on the first render');
+  assert.equal(built, 1, 'built once');
+
+  // A brand-new row OBJECT carrying identical values — what every poll hands in.
+  t.rows = [{ a: '1', id: 'r1', v: 1 }];
+  assert.equal(built, 1, 'the builder is not called again for an unchanged row');
+  assert.equal(bodyCells(t).at(-1).firstChild === el, true, 'and the node is the same one');
+});
+
+test('tf-table: a new rowActions builder replaces the cells the old one produced', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
+  t.rowActionsKey = (row) => `${row.id}|${row.v}`;
+  t.rowActions = () => {
+    const b = document.createElement('button');
+    b.dataset.from = 'A';
+    return b;
+  };
+  assert.equal(bodyCells(t).at(-1).firstChild.dataset.from, 'A');
+
+  // Swapping the builder is how a host rewires handlers against new state — an
+  // `isAdmin` that just changed, a fresh permission check. The cached signature
+  // describes the ROW, not which builder made the element, so without
+  // invalidating it the old element and its stale closure would live forever.
+  t.rowActions = () => {
+    const b = document.createElement('button');
+    b.dataset.from = 'B';
+    return b;
+  };
+  assert.equal(bodyCells(t).at(-1).firstChild.dataset.from, 'B', 'the new builder owns the cell');
+});
+
+test('tf-table: a signature that is neither a string nor a number keeps rebuilding', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  let built = 0;
+  // A builder that returns nothing usable must count as "no signature" and NOT
+  // as a match — otherwise every such cell would freeze on its first element.
+  t.rowActionsKey = () => undefined;
+  t.rowActions = () => {
+    built += 1;
+    return document.createElement('button');
+  };
+  assert.equal(built, 1, 'built on the first render');
+  t.rows = [{ a: '1', id: 'r1' }];
+  assert.equal(built, 2, 'and again, exactly as before the guard existed');
+});
+
+test('tf-table: an unchanged chip cell keeps its span, a changed one replaces it', () => {
+  const t = table(
+    [{ key: 'r', label: 'R', renderer: 'chip' }],
+    [{ r: { status: 'ok', label: 'Zajety' } }],
+  );
+  const span = bodyCells(t)[0].firstElementChild;
+  assert.ok(span, 'the chip is rendered');
+
+  // A poll hands the same value in as a NEW object. Rewriting the cell anyway
+  // swapped one span per row on every tick: measured on the live disks table,
+  // 319 of the 329 DOM mutations left after the row-actions fix came from here.
+  t.rows = [{ r: { status: 'ok', label: 'Zajety' } }];
+  assert.equal(bodyCells(t)[0].firstElementChild === span, true, 'the same span survives a no-op poll');
+
+  t.rows = [{ r: { status: 'warn', label: 'Zajety' } }];
+  assert.equal(bodyCells(t)[0].firstElementChild === span, false, 'a changed status does replace it');
+  assert.equal(bodyCells(t)[0].firstElementChild.className, 'tf-chip warn');
+});
+
+test('tf-table: a moved signature rebuilds the cell and binds it to the CURRENT row', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
+  const fired = [];
+  t.rowActionsKey = (row) => `${row.id}|${row.v}`;
+  t.rowActions = (row) => {
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push(`${row.id}:${row.v}`));
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+
+  t.rows = [{ a: '1', id: 'r1', v: 2 }];
+  const second = bodyCells(t).at(-1).firstChild;
+  assert.equal(second === first, false, 'a moved signature rebuilds the element');
+  second.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['r1:2'], 'the handler closes over the row as it is NOW');
+});
+
+test('tf-table: a recycled row showing a different row rebuilds its actions', () => {
+  // The hazard a markup-only guard would miss: <tr> 0 is recycled, but it now
+  // shows a DIFFERENT logical row whose actions render identically. The row
+  // identity is part of the signature, so the cell is rebuilt and the handler
+  // follows the row that actually sits there.
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
+  const fired = [];
+  t.rowActionsKey = (row) => `${row.id}|${row.v}`;
+  t.rowActions = (row) => {
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push(row.id));
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+
+  // Same rendered actions, same `v`, different row.
+  t.rows = [{ a: '2', id: 'r2', v: 1 }];
+  const second = bodyCells(t).at(-1).firstChild;
+  assert.equal(second === first, false, 'the element is not reused across row identities');
+  second.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['r2'], 'and it acts on the row now in that position');
+});
+
+test('tf-table: without a signature the actions cell is rebuilt on every render', () => {
+  // The contract every existing rowActions caller relies on. Opting out must
+  // stay the default, so a host that declared no signature is never handed an
+  // element bound to a row object it has not seen.
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1' }]);
+  let built = 0;
+  t.rowActions = () => { built += 1; return document.createElement('span'); };
+  assert.equal(built, 1);
+  t.rows = [{ a: '1' }];
+  assert.equal(built, 2, 'rebuilt, exactly as before rowActionsKey existed');
+});
+
+test('tf-table: a signature builder that throws falls back to rebuilding', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1' }]);
+  let built = 0;
+  t.rowActionsKey = () => { throw new Error('boom'); };
+  t.rowActions = () => { built += 1; return document.createElement('span'); };
+  assert.equal(built, 1);
+  t.rows = [{ a: '1' }];
+  assert.equal(built, 2, 'a broken signature must never read as "unchanged"');
+});
+
 test('tf-table: the actions column header is right-aligned in controls.css', () => {
   const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
   const idx = css.indexOf('.tf-table th.tf-table__actions-col');
@@ -745,6 +900,65 @@ test('tf-filter-chips: controls.css fades the side that actually has more', () =
     );
     assert.match(css, rule, `${side} edge is faded`);
   }
+});
+
+// A poll chain hands the same filters back every few seconds — TentaNas
+// rebuilds its disk bar every 5 s because the counts live in the chip labels.
+// Rewriting innerHTML there destroys and recreates every button: the one under
+// the cursor loses its hover and :active styling mid-press, and a click landing
+// in that window is delivered to a node already detached from the document.
+test('tf-filter-chips: an identical render leaves the chips alone', async () => {
+  const { TfFilterChips } = await import('./tf-filter-chips.js');
+  const chips = mount(new TfFilterChips());
+  const bar = [{ id: 'all', label: 'Wszystkie 12', active: true }, { id: 'problems', label: 'Problemy 2' }];
+  chips.filters = bar;
+  const buttons = [...chips.querySelectorAll('.tf-filter-chip')];
+  assert.equal(buttons.length, 2);
+
+  chips.filters = bar.map((f) => ({ ...f }));
+  const after = [...chips.querySelectorAll('.tf-filter-chip')];
+  assert.equal(after.length, 2);
+  after.forEach((el, i) => assert.equal(el === buttons[i], true, `chip ${i} is the same element`));
+
+  // A count that genuinely moved must still re-render.
+  chips.filters = [{ id: 'all', label: 'Wszystkie 13', active: true }, { id: 'problems', label: 'Problemy 2' }];
+  assert.equal(chips.querySelector('.tf-filter-chip') === buttons[0], false, 'a changed label rebuilds the bar');
+  assert.equal(chips.querySelectorAll('.tf-filter-chip')[0].textContent, 'Wszystkie 13');
+  chips.remove();
+});
+
+test('tf-filter-chips: the guard does not freeze the selection a click makes', async () => {
+  const { TfFilterChips } = await import('./tf-filter-chips.js');
+  const chips = mount(new TfFilterChips(), { mode: 'single' });
+  chips.filters = [{ id: 'all', label: 'A', active: true }, { id: 'open', label: 'B' }];
+  chips.querySelectorAll('.tf-filter-chip')[1].dispatchEvent(new window.Event('click', { bubbles: true }));
+  const after = [...chips.querySelectorAll('.tf-filter-chip')];
+  assert.equal(after[1].classList.contains('active'), true, 'the clicked chip became active');
+  assert.equal(after[0].classList.contains('active'), false, 'and the previous one gave it up');
+  chips.remove();
+});
+
+// disconnectedCallback drops the ResizeObserver, but connectedCallback only
+// built one when there was no container yet — and a re-attached element still
+// has its container, because it moved with the element. A bar that is detached
+// and put back (a tab switch that re-parents its toolbar) therefore never
+// regained overflow tracking, and its edge fade froze on whatever the last
+// resize before the detach happened to say.
+test('tf-filter-chips: a re-attached bar regains its overflow tracking', async () => {
+  const { TfFilterChips } = await import('./tf-filter-chips.js');
+  const chips = mount(new TfFilterChips(), { scroll: '' });
+  chips.filters = [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }];
+  const box = chips.querySelector('.tf-filter-chips');
+  assert.ok(chips._observer, 'the bar tracks its own width while attached');
+
+  chips.remove();
+  assert.equal(chips._observer, null, 'and lets the observer go while detached');
+
+  document.body.appendChild(chips);
+  assert.equal(chips.querySelector('.tf-filter-chips') === box, true, 'the container came back with the element');
+  assert.ok(chips._observer, 'a re-attached bar observes its width again');
+  assert.equal(box.getAttribute('data-overflow'), 'none', 'and still publishes its overflow state');
+  chips.remove();
 });
 
 // ---------------------------------------------------------------------------

@@ -6274,7 +6274,11 @@
       "cache": "Cache",
       "spare": "Reserve",
       "system": "System",
-      "partitioned": "Partitioniert"
+      "partitioned": "Partitioniert",
+      "used": "Belegt",
+      "pool_member": "Pool-Mitglied",
+      "array_member": "Array-Mitglied",
+      "mounted": "Eingehängt"
     },
     "disks": {
       "search": "Suchen: Gerät, Modell, Seriennummer…",
@@ -6506,6 +6510,33 @@
       "confirm": "Ausführen",
       "arm_confirm": "Kanal scharfschalten",
       "ttl_info": "Nach {ttl} (oder beim Abmelden / Neustart) wird das Passwort aus dem Speicher gelöscht und muss erneut eingegeben werden."
+    },
+    "setup": {
+      "title": "Der Systemrechtekanal ist nicht eingerichtet",
+      "lead": "TentaNas wurde korrekt installiert, hat aber noch keine Möglichkeit, Operationen auszuführen, die root benötigen. Bis du einen Modus wählst, wird jede Operation an Festplatten, Pools und Arrays abgelehnt.",
+      "missing_unset": "Es wurde noch kein Kanalmodus gewählt — keine privilegierte Operation wird ausgeführt.",
+      "missing_helper": "Der Helper für Modus A ist eingetragen, funktioniert aber nicht: {state}.",
+      "missing_incompatible": "Der Helper für Modus A läuft, stammt aber aus einer anderen Version als der Core — der Befehlskatalog könnte auseinanderlaufen, deshalb ist der Kanal gesperrt.",
+      "plan_intro": "Modus A führt über sudo genau diese Befehle aus:",
+      "plan_failed": "Der Plan konnte nicht geladen werden: {error}",
+      "mode_a_title": "Modus A — Helper (empfohlen)",
+      "mode_a_desc": "Du gibst das sudo-Passwort einmalig an. TentaNas installiert eine einzige sudoers-Zeile und einen dedizierten Helper, der jeden Befehl prüft. Zeitpläne, SMART-Überwachung und die Wiederherstellung nach einem Neustart laufen ohne deine Anwesenheit.",
+      "mode_a_button": "Modus A einrichten…",
+      "mode_b_title": "Modus B — Passwort auf Anfrage",
+      "mode_b_desc": "Es wird nichts im System installiert. Du gibst das sudo-Passwort bei jeder Operation an, und der Knoten hält es für die gewählte Zeit im Speicher.",
+      "mode_b_button": "Modus B verwenden…",
+      "helper_missing": "Modus A ist nicht verfügbar: Das Helper-Binary fehlt neben dem Core ({path}). Verwende Modus B oder lege den Helper auf diesem Knoten ab.",
+      "recheck": "Erneut prüfen",
+      "configured_already": "Der Kanal auf diesem Knoten ist bereits eingerichtet ({mode}). Du kannst den Modus ändern oder diesen Schritt überspringen.",
+      "node_scope": "Du konfigurierst den Kanal für den Knoten {node} — und nur für ihn. Die Installation von TentaNas umfasste die gesamte Flotte, aber die Systemrechte werden auf jedem Knoten separat eingerichtet.",
+      "post_install_title": "TentaNas installiert — richte den Rechtekanal ein",
+      "dismiss": "Später erledigen",
+      "viewer_msg": "Der Systemrechtekanal auf diesem Knoten ist nicht eingerichtet, daher wird keine Operation an Festplatten, Pools oder Arrays ausgeführt. Nur ein Administrator kann ihn einrichten.",
+      "probing": "Zustand des Knotens wird geprüft…",
+      "probe_failed_title": "Der Zustand dieses Knotens konnte nicht gelesen werden",
+      "probe_failed_msg": "Die Umgebungssonde hat nicht geantwortet: {error}",
+      "probe_failed_hint": "Solange der Knoten nicht antwortet, weiß das Panel nicht, ob der Rechtekanal funktioniert — deshalb zeigt es keine Kacheln, die alle denselben Fehler melden würden.",
+      "probe_retry": "Erneut versuchen"
     },
     "refreshed": "letzte Aktualisierung {t}",
     "duration": {

@@ -10,6 +10,7 @@ import {
   T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS,
   fmtDate, fmtIn, fmtBytes, fmtRatio, pct, healthClass, healthChip, errMessage, layoutLabel, stateChipHtml, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
+import { setAttr, setText, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
 import { followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-window.js';
@@ -145,34 +146,41 @@ async function refreshPools(screen, body, state) {
 function renderPools(screen, body, state) {
   if (!state.isCurrent()) return;
   const sources = { zfs: 'ZFS', elastic: 'Elastic Array', capabilities: T('elastic.free_inventory'), disks: T('elastic.disks') };
-  body.querySelector('#nas-pools-errors').innerHTML = Object.entries(state.errors).map(([source, error]) => `<tf-alert tone="danger" title="${escapeAttr(sources[source])}" message="${escapeAttr(error)}"></tf-alert>`).join('');
+  patchHtml(body.querySelector('#nas-pools-errors'), Object.entries(state.errors).map(([source, error]) => `<tf-alert tone="danger" title="${escapeAttr(sources[source])}" message="${escapeAttr(error)}"></tf-alert>`).join(''));
   const partial = ['zfs', 'elastic'].some((key) => !state.completed.has(key) || state.errors[key]);
-  body.querySelector('#nas-pools-count').setAttribute('label', String(state.pools.length + state.arrays.length) + (partial ? ' + ?' : ''));
+  setAttr(body.querySelector('#nas-pools-count'), 'label', String(state.pools.length + state.arrays.length) + (partial ? ' + ?' : ''));
 
   const list = body.querySelector('#nas-pools-list');
   if (!state.pools.length && !state.arrays.length && !partial) {
-    list.innerHTML = `
+    const empty = `
       <tf-empty-state icon="layers" title="${escapeAttr(T('pools.empty_title'))}" message="${escapeAttr(state.freeDisks.length ? T('pools.empty_msg', { n: state.freeDisks.length }) : T('pools.empty_msg_no_disks'))}">
         ${state.freeDisks.length && screen.isAdmin ? `<tf-button variant="primary" icon="plus" data-act="create-empty">${escapeHtml(T('pools.create'))}</tf-button>` : ''}
       </tf-empty-state>`;
-    list.querySelector('[data-act="create-empty"]')?.addEventListener('click', () => {
-      if (!screen.isAdmin) { toast(T('elevation.admin_only'), 'warning'); return; }
-      openPoolWizard(screen, { freeDisks: state.freeDisks, pools: state.pools, onDone: () => refreshPools(screen, body, state), onCreated: state.onCreated, isCurrent: state.isCurrent });
-    });
+    if (patchHtml(list, empty)) {
+      list.querySelector('[data-act="create-empty"]')?.addEventListener('click', () => {
+        if (!screen.isAdmin) { toast(T('elevation.admin_only'), 'warning'); return; }
+        openPoolWizard(screen, { freeDisks: state.freeDisks, pools: state.pools, onDone: () => refreshPools(screen, body, state), onCreated: state.onCreated, isCurrent: state.isCurrent });
+      });
+    }
   } else {
-    list.innerHTML = state.pools.map((p) => poolCardHtml(p)).join('') + state.arrays.map(elasticCardHtml).join('');
-    if (!state.completed.has('zfs') || !state.completed.has('elastic')) list.insertAdjacentHTML('beforeend', `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`);
+    // The "still loading" line is part of the SAME patched string rather than
+    // an insertAdjacentHTML afterwards: one host, one writer, or the cache
+    // would describe markup that is not what is on screen.
+    const loading = (!state.completed.has('zfs') || !state.completed.has('elastic'))
+      ? `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`
+      : '';
+    patchHtml(list, state.pools.map((p) => poolCardHtml(p)).join('') + state.arrays.map(elasticCardHtml).join('') + loading);
   }
 
   const spares = spareDisks(state.pools);
   const freeCard = body.querySelector('#nas-free-card');
   freeCard.hidden = !state.freeDisks.length && !spares.length;
   if (freeCard.hidden) return;
-  body.querySelector('#nas-free-count').setAttribute('label', String(state.freeDisks.length + spares.length));
-  body.querySelector('#nas-free-hint').textContent = spares.length
+  setAttr(body.querySelector('#nas-free-count'), 'label', String(state.freeDisks.length + spares.length));
+  setText(body.querySelector('#nas-free-hint'), spares.length
     ? T('pools.spare_hint', { pool: [...new Set(spares.map((s) => s.pool))].join(', ') })
-    : T('pools.free_hint', { n: state.freeDisks.length, size: fmtBytes(state.freeDisks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0)) });
-  body.querySelector('#nas-free-cells').innerHTML = `
+    : T('pools.free_hint', { n: state.freeDisks.length, size: fmtBytes(state.freeDisks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0)) }));
+  patchHtml(body.querySelector('#nas-free-cells'), `
     ${spares.map(({ disk, pool }) => {
     const kind = state.diskKinds.get(disk.diskId) || '';
     return `
@@ -194,7 +202,7 @@ function renderPools(screen, body, state) {
         </div>
         <span class="disk-kind ${escapeAttr(d.kind)}">${escapeHtml(d.kind)}</span>
       </div>`).join('')}
-    ${state.freeDisks.length ? `<div class="disk-cell empty" data-act="create">${sprite('plus')}&nbsp;${escapeHtml(T('pools.free_use'))}</div>` : ''}`;
+    ${state.freeDisks.length ? `<div class="disk-cell empty" data-act="create">${sprite('plus')}&nbsp;${escapeHtml(T('pools.free_use'))}</div>` : ''}`);
 }
 
 /** "6×8 TB + special vdev (mirror) + SLOG + hot-spare · odporność: 2 dyski" — the one-line topology under the pool name. */

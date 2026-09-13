@@ -13,6 +13,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage } from '/js/modules/tentanas/format.js';
+import { setAttr, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns } from '/js/modules/tentanas/target-wizard.js';
 import '/js/components/tf-table.js';
@@ -198,27 +199,28 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
   const paint = () => {
     // The kernel side of each protocol, when it is not there. A node that
     // cannot serve NVMe-oF says so here instead of only inside the wizard.
-    host.querySelector('#nas-tg-services').innerHTML = state.services
+    patchHtml(host.querySelector('#nas-tg-services'), state.services
       .filter((s) => !s.installed)
       .map((s) => `<div class="muted">${escapeHtml(T('targets.service_missing', { proto: protocolLabel(s.protocol), detail: s.detail }))}</div>`)
-      .join('');
+      .join(''));
     const list = host.querySelector('#nas-tg-list');
-    host.querySelector('#nas-tg-count').setAttribute('label', String(state.targets.length));
+    setAttr(host.querySelector('#nas-tg-count'), 'label', String(state.targets.length));
     if (state.error && !state.targets.length) {
-      list.innerHTML = `<div class="num-err">${escapeHtml(state.error)}</div>`;
+      patchHtml(list, `<div class="num-err">${escapeHtml(state.error)}</div>`);
       return;
     }
     if (!state.targets.length) {
-      list.innerHTML = `
+      if (patchHtml(list, `
         <tf-empty-state icon="target" title="${escapeAttr(T('targets.empty_title'))}" message="${escapeAttr(T('targets.empty_msg'))}">
           ${screen.isAdmin ? `<tf-button variant="secondary" icon="plus" data-act="create-empty">${escapeHtml(T('targets.create'))}</tf-button>` : ''}
-        </tf-empty-state>`;
-      list.querySelector('[data-act="create-empty"]')?.addEventListener('click', openCreate);
+        </tf-empty-state>`)) {
+        list.querySelector('[data-act="create-empty"]')?.addEventListener('click', openCreate);
+      }
       return;
     }
-    let table = list.querySelector('#nas-tg-table');
-    if (!table) {
-      list.innerHTML = `
+    // One host, one writer (see the file-share table): the shell is written and
+    // wired exactly once, every later poll only hands over new rows.
+    const shell = `
         <tf-table id="nas-tg-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('targets.none_match'))}">
           <tf-column key="name" label="${escapeAttr(T('targets.col_name'))}" renderer="html" fill></tf-column>
           <tf-column key="protocol" label="${escapeAttr(T('targets.col_protocol'))}" renderer="html" nowrap></tf-column>
@@ -226,7 +228,8 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
           <tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html" nowrap></tf-column>
           <tf-column key="portal" label="${escapeAttr(T('targets.col_portal'))}" renderer="html" hide-below="1000"></tf-column>
         </tf-table>`;
-      table = list.querySelector('#nas-tg-table');
+    if (patchHtml(list, shell)) {
+      const table = list.querySelector('#nas-tg-table');
       table.rowActions = (row) => {
         const t = row._target;
         const wrap = document.createElement('div');
@@ -244,7 +247,7 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
       };
       table.addEventListener('row-click', (e) => screen.openTarget(e.detail.row._target.targetId));
     }
-    table.rows = visible().map(targetRow);
+    list.querySelector('#nas-tg-table').rows = visible().map(targetRow);
     // Nazwa z alertu zostaje rozwiązana do trwałego identyfikatora targetu.
     const wanted = screen.targetName;
     if (wanted) {

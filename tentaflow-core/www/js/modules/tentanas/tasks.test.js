@@ -353,3 +353,27 @@ test('editing the mover row opens on the array real rules, not on defaults', asy
   win.remove();
   screen.dispose();
 });
+
+// The jobs list polls every 3 s and the schedules every 30 s. Rebuilding
+// either on an unchanged answer throws away the row the admin is reaching for.
+test('an unchanged poll leaves the running jobs, the schedules and the strip alone', async () => {
+  const screen = fakeScreen(fixtures());
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  const running = [...body.querySelectorAll('#nas-jobs-running .job-row')];
+  const rows = scheduleRows(body);
+  const strip = body.querySelector('#nas-prot .sr');
+  assert.ok(running.length, 'a job is running');
+  assert.ok(rows.length, 'schedules are listed');
+  assert.ok(strip, 'the protection strip is painted');
+
+  for (const fn of [...scheduled]) await fn();
+  await flush();
+  [...body.querySelectorAll('#nas-jobs-running .job-row')].forEach((el, i) => assert.equal(el === running[i], true, `running job ${i} survives the poll`));
+  scheduleRows(body).forEach((el, i) => assert.equal(el === rows[i], true, `schedule row ${i} survives the poll`));
+  assert.equal(body.querySelector('#nas-prot .sr') === strip, true, 'the protection strip survives the poll');
+  screen.dispose();
+});

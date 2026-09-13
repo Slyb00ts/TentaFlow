@@ -46,15 +46,52 @@ fn internal(scope: &str, error: impl std::fmt::Display) -> ProtocolError {
 
 fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
     match error {
+        // The operator can act on this one, so it has to say what to do. The
+        // raw reason stays in the sentence: "not configured" and "sudo
+        // rejected the password" lead to the same screen but not to the same
+        // fix, and only the node knows which of them happened.
+        //
+        // The remedy names no tab on purpose. A node that answers this cannot
+        // run a privileged command, and the panel replaces ALL its tabs —
+        // Environment included — with the channel setup step, so "open the
+        // Environment tab and start the wizard" pointed at a card that is not
+        // on screen in exactly the state that produces this error.
+        //
+        // Polish, like every other operator-facing refusal this file writes
+        // ("Macierz nie istnieje w tej instancji", "Nieprawidłowy zestaw
+        // dysków Elastic"). The two arms below read English because they
+        // forward `BrokerError`'s own `#[error]` text verbatim from
+        // broker.rs — a pre-existing split across one error surface. It is
+        // real, and it is not silently converted here: those strings have
+        // other callers, so flipping them is its own change.
         BrokerError::Unarmed(why) => ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
-            format!("privilege channel not available: {why}"),
+            format!(
+                "Kanał uprawnień systemowych nie jest dostępny ({why}) — \
+                 otwórz TentaNas na tym węźle i dokończ krok konfiguracji \
+                 kanału, który pojawi się zamiast zakładek."
+            ),
         ),
         BrokerError::ToolMissing(tool) => {
             ProtocolError::new(ProtocolErrorCode::NotAvailable, format!("{tool} is not installed"))
         }
         BrokerError::InvalidArgument(d) => ProtocolError::bad_request(d),
         other => internal(scope, other),
+    }
+}
+
+/// A privileged read whose error crossed an `anyhow` boundary on the way up.
+///
+/// WHY this exists: `internal()` on such a path turns "the channel was never
+/// configured" — the one cause an operator can fix — into `tentanas {scope}
+/// failed`, which is what a freshly installed instance answered every Elastic
+/// request with. `anyhow` keeps the concrete error in the chain, so the
+/// actionable half is recoverable; anything that is not a `BrokerError` is a
+/// genuine internal fault and stays one.
+fn privileged_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    match error.downcast::<BrokerError>() {
+        Ok(broker) => broker_error(scope, broker),
+        Err(other) => internal(scope, other),
     }
 }
 
@@ -3113,10 +3150,29 @@ fn elastic_owner(g: &Gate) -> ElasticOwner {
     ElasticOwner { org_id: g.org_id.clone(), addon_id: g.addon_id.clone() }
 }
 
+/// The one way this module reads the root's Elastic claims.
+///
+/// WHY it exists: three call sites — the capabilities read, the plan the
+/// wizard asks for, and `elastic_create` just before it formats anything —
+/// each unwrapped the `anyhow` erasure themselves, so each was its own chance
+/// to reach for `internal()`. That is precisely what turned "this node has no
+/// privilege channel" into `tentanas elastic namespace failed` on a fresh
+/// install. Funnelling them through one function leaves one place to get the
+/// classification right, and one place a test can hold it to.
+async fn root_claims(
+    g: &Gate,
+    scope: &str,
+    name: Option<&str>,
+    explicit: Option<&ElevationToken>,
+) -> Result<tentanas_helper::elastic::ElasticClaimsResult, ProtocolError> {
+    tentanas::elastic::claims(&g.db, name, explicit)
+        .await
+        .map_err(|e| privileged_error(scope, e))
+}
+
 async fn arrays_claiming_disks(g: &Gate) -> Result<std::collections::BTreeSet<String>, ProtocolError> {
     let mut claims = store::elastic_claims(&g.db).map_err(|e| internal("elastic claims",e))?;
-    claims.extend(tentanas::elastic::claims(&g.db,None,None).await
-        .map_err(|e| internal("elastic root claims",e))?.disks);
+    claims.extend(root_claims(g,"elastic root claims",None,None).await?.disks);
     Ok(tentanas::elastic::claimed_disk_ids(&tentanas::disks::snapshot().0,&claims))
 }
 
@@ -3149,8 +3205,7 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     let parity = optional_disks(parity_disk_ids,&|ids| disks_by_id(ids,true))?;
     let cache = optional_disks(cache_disk_ids,&|ids| disks_by_id(ids,true))?;
     let explicit = secret.map(token);
-    let global = tentanas::elastic::claims(&g.db,Some(name),explicit.as_deref()).await
-        .map_err(|e| internal("elastic root claims",e))?;
+    let global = root_claims(&g,"elastic root claims",Some(name),explicit.as_deref()).await?;
     if global.name_claimed != Some(false) || global.namespace_clear != Some(true) {
         return Err(ProtocolError::bad_request("Nazwa lub przestrzeń montowania jest zajęta albo niepotwierdzona"));
     }
@@ -4090,8 +4145,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 |ids| disks_by_id(ids, false),
                 async {
                     let g = gate(ctx,PERM_READ)?;
-                    tentanas::elastic::claims(&g.db,(!name.is_empty()).then_some(name.as_str()),None)
-                        .await.map_err(|e| internal("elastic namespace",e))
+                    root_claims(&g,"elastic namespace",(!name.is_empty()).then_some(name.as_str()),None).await
                 },
             )
             .await
@@ -5295,6 +5349,74 @@ mod registration_tests {
             &store::now(),
         )
         .expect("środowisko bez uruchamiania sond dysków");
+    }
+
+    /// A fresh install answers a NON-destructive Elastic read. Nothing about
+    /// the request is wrong — the node simply has no privilege channel yet,
+    /// and that is the one fact the operator can act on, so it has to arrive
+    /// as `NotAvailable` naming the remedy rather than as `Internal` naming
+    /// nothing. This is the shape the product actually shipped: `ok: true` on
+    /// install, then `tentanas elastic namespace failed` on the first click.
+    ///
+    /// What this holds, precisely: `elastic_capabilities` is a real handler
+    /// run end to end, and `root_claims` is the single function the plan
+    /// dispatch arm, `elastic_create` and `arrays_claiming_disks` all reach
+    /// `tentanas::elastic::claims` through — so the classification is pinned
+    /// for all three. The previous version of this test handed
+    /// `elastic_array_plan` a closure it wrote ITSELF, which would have passed
+    /// with the production arm fully reverted; it proved nothing and is gone.
+    #[tokio::test]
+    async fn an_unconfigured_channel_refuses_elastic_reads_with_the_remedy_not_a_generic_fault() {
+        let fixture = dispatch_fixture();
+        cache_preview_environment(&fixture.ctx);
+        {
+            let g = gate(&fixture.ctx, PERM_READ).expect("dostęp do testowej instancji");
+            assert_eq!(
+                tentanas::elevation::mode(&g.db),
+                tentanas::elevation::Mode::Unset,
+                "świeża instalacja nie ma skonfigurowanego kanału"
+            );
+        }
+
+        let capabilities = elastic_capabilities(&fixture.ctx)
+            .await
+            .expect_err("nieskonfigurowany kanał nie może zwrócić listy możliwości");
+        let g = gate(&fixture.ctx, PERM_READ).expect("dostęp do testowej instancji");
+        // The namespace read behind the plan — the request measured on the
+        // server — and the root reservation `elastic_create` performs before
+        // it formats a single disk. One function, so one refusal.
+        let namespace = root_claims(&g, "elastic namespace", Some("media"), None)
+            .await
+            .expect_err("nieskonfigurowany kanał nie może potwierdzić przestrzeni nazw");
+        let create = root_claims(&g, "elastic root claims", Some("media"), None)
+            .await
+            .expect_err("nieskonfigurowany kanał nie może potwierdzić rezerwacji roota");
+
+        for (scope, error) in [
+            ("capabilities", capabilities),
+            ("namespace", namespace),
+            ("create", create),
+        ] {
+            assert_eq!(error.code, ProtocolErrorCode::NotAvailable, "{scope}");
+            assert!(
+                error.message.contains("TentaNas")
+                    && error.message.contains("konfiguracji kanału"),
+                "{scope} musi nazwać lekarstwo, nie samą porażkę: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("failed"),
+                "{scope} nie może zwrócić ogólnego błędu wewnętrznego: {}",
+                error.message
+            );
+            // The remedy must not send the operator to a tab that the setup
+            // gate has replaced on exactly the nodes that emit this error.
+            assert!(
+                !error.message.contains("zakładkę Środowisko"),
+                "{scope} nie może wskazywać zakładki, której w tym stanie nie ma: {}",
+                error.message
+            );
+        }
     }
 
     #[tokio::test]

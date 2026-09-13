@@ -247,3 +247,41 @@ test('a failed load shows the error with the breadcrumb back to the pools', asyn
   assert.equal(screen.locations, 1);
   screen.dispose();
 });
+
+// "nigdy pełne odświeżenie całości" (research/03-ui-wzorce-mockupy.md). The
+// topology pane was rebuilt by every 5 s poll, destroying every vdev cell,
+// every button in it and the live chart. The three IO numbers are the only
+// part a poll moves on an otherwise idle pool, so they are written as TEXT
+// into slots the pane keeps instead of being baked into its markup.
+test('a poll that only moves the IO numbers leaves the topology pane standing', async () => {
+  let readBps = 1_000_000;
+  const screen = makeScreen({
+    tentaNasPoolGetRequest: () => ({ ...poolGet, pool: { ...poolGet.pool, io: { readBps, writeBps: 0, readIops: 12, writeIops: 0 } } }),
+  });
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = mount();
+  await drawPoolDetail(screen, body);
+  await flush();
+  const pane = body.querySelector('#nas-pool-tab-body');
+  const cells = [...pane.querySelectorAll('.disk-cell')];
+  const chart = pane.querySelector('#nas-pool-io-live');
+  const throughput = pane.querySelector('[data-io="throughput"]');
+  const tiles = [...body.querySelectorAll('#nas-pool-kpi tf-stat-card')];
+  assert.equal(cells.length, 4, 'one cell per pool disk');
+  assert.equal(tiles.length, 4, 'four KPI tiles');
+  assert.ok(chart, 'the live chart is mounted');
+  const before = throughput.textContent;
+  assert.match(before, /MB\/s/, 'the readout is written as text');
+
+  readBps = 8_000_000;
+  assert.equal(scheduled.length, 1, 'exactly one polling chain');
+  await scheduled[0]();
+  await flush();
+  [...pane.querySelectorAll('.disk-cell')].forEach((el, i) => assert.equal(el === cells[i], true, `disk cell ${i} survives the poll`));
+  [...body.querySelectorAll('#nas-pool-kpi tf-stat-card')].forEach((el, i) => assert.equal(el === tiles[i], true, `KPI tile ${i} survives the poll`));
+  assert.equal(pane.querySelector('#nas-pool-io-live') === chart, true, 'the chart keeps the points it accumulated');
+  assert.equal(pane.querySelector('[data-io="throughput"]') === throughput, true, 'the readout element survives');
+  assert.equal(throughput.textContent !== before, true, 'and its number still moved');
+  screen.dispose();
+});

@@ -640,3 +640,29 @@ test('Restore ponownie sprawdza historię maintenance po oczekiwaniu na sudo', a
   assert.equal(body.querySelector('[data-act="restore"]'), null);
   screen.dispose();
 });
+
+// The whole pane is one template, rebuilt on every 5 s poll — which threw away
+// the KPI tiles, the disk cells and any <details> the admin had opened.
+test('an unchanged poll leaves the Elastic pane standing', async () => {
+  const screen = fakeScreen({ tentaNasElasticArrayGetRequest: { array: array() } });
+  screen.array = 'media';
+  screen.openArray = (name) => { screen.array = name; };
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = document.createElement('div');
+  document.body.appendChild(body);
+  await drawElasticDetail(screen, body);
+  await flush();
+  const view = body.querySelector('.nas-elastic-detail');
+  const tiles = [...view.querySelectorAll('tf-stat-card')];
+  const cells = [...view.querySelectorAll('.disk-cell')];
+  assert.ok(tiles.length, 'the KPI row is painted');
+  assert.ok(cells.length, 'the disks are painted');
+
+  assert.ok(scheduled.length, 'the pane armed its poll');
+  await scheduled[0]();
+  await flush();
+  [...view.querySelectorAll('tf-stat-card')].forEach((el, i) => assert.equal(el === tiles[i], true, `tile ${i} survives the poll`));
+  [...view.querySelectorAll('.disk-cell')].forEach((el, i) => assert.equal(el === cells[i], true, `disk cell ${i} survives the poll`));
+  screen.dispose();
+});

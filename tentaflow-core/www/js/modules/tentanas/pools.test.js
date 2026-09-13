@@ -196,3 +196,28 @@ test('a list failure leaves the tab standing instead of throwing', async () => {
   assert.equal(body.querySelector('#nas-pools-errors tf-alert').getAttribute('message'), 'zpool unavailable');
   screen.dispose();
 });
+
+// The tab polls every 5 s. Rebuilding the cards on an unchanged answer closes
+// a card's menu under the admin's hand and drops the hover off its buttons.
+test('an unchanged poll leaves the pool cards and the free-disk shelf alone', async () => {
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: { pools: [pool({ vdevs: tankVdevs })], freeDisks: [freeDisk] },
+    tentaNasDisksListRequest: inventory,
+  });
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = mount();
+  await drawPools(screen, body);
+  await flush();
+  const cards = [...body.querySelectorAll('.pool-card')];
+  const cells = [...body.querySelectorAll('#nas-free-cells .disk-cell')];
+  assert.equal(cards.length, 1);
+  assert.ok(cells.length, 'the shelf has cells');
+
+  assert.ok(scheduled.length, 'the tab armed its poll');
+  await scheduled[0]();
+  await flush();
+  [...body.querySelectorAll('.pool-card')].forEach((el, i) => assert.equal(el === cards[i], true, `pool card ${i} survives the poll`));
+  [...body.querySelectorAll('#nas-free-cells .disk-cell')].forEach((el, i) => assert.equal(el === cells[i], true, `free-disk cell ${i} survives the poll`));
+  screen.dispose();
+});

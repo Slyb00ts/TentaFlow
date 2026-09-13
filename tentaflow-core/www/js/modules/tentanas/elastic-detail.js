@@ -7,6 +7,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -328,7 +329,7 @@ export async function drawElasticDetail(screen, body) {
     const status = array && elasticState(array);
     const maintenanceDisabled = busy || submitted || Boolean(maintenanceReason());
     const moverDisabled = busy || submitted || Boolean(moverReason());
-    view.innerHTML = `<tf-breadcrumb class="nas-crumbs"><tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item><tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item></tf-breadcrumb><div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
+    const html = `<tf-breadcrumb class="nas-crumbs"><tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item><tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item></tf-breadcrumb><div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
       <tf-button variant="ghost" data-act="back">${escapeHtml(T('elastic.back'))}</tf-button><tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
       ${error ? `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(error)}"></tf-alert>` : ''}
       ${array ? `<div class="kpi">
@@ -354,6 +355,11 @@ export async function drawElasticDetail(screen, body) {
         ${maintenanceReason() ? `<div class="hint mb-sm">${escapeHtml(maintenanceReason())}</div>` : ''}<div class="stat-rows">
         ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.last_scrub'), fmtDate(array.snapraid?.lastScrub?.finishedAt))}${schedulePill(T('elastic.sync_schedule'), cadenceValue(array.snapraid?.syncSchedule, array.snapraid?.syncScheduleEnabled), 'sync-schedule', screen.isAdmin)}${schedulePill(T('elastic.scrub_schedule'), cadenceValue(array.snapraid?.scrubSchedule, array.snapraid?.scrubScheduleEnabled), 'scrub-schedule', screen.isAdmin)}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
       </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div>${moverPanelHtml(array, moverDisabled, moverReason(), screen.isAdmin)}</div>` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
+    // The whole pane is one patched string. An array that is simply sitting
+    // there polls to byte-identical markup, so nothing is destroyed and every
+    // listener below stays bound; when it DOES differ the pane is rebuilt and
+    // re-wired in the same breath, so a handler can never outlive its markup.
+    if (!patchHtml(view, html)) return;
     view.querySelector('[data-act="back"]').addEventListener('click', () => { if (isCurrent()) screen.openArray(null); });
     view.querySelector('.nas-crumbs').addEventListener('click', (event) => {
       if (!event.target.closest('a')) return;

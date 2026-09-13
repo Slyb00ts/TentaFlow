@@ -35,11 +35,15 @@ import {
 
 const DEFAULT_WINDOW_SECS = 300;
 const DEFAULT_FILL_OPACITY = 0.14;
-// Slide duration ceiling: a long polling interval must not turn into a
-// slow crawl that lags behind the next sample.
-const MAX_SLIDE_MS = 2000;
 
 let clipCounter = 0;
+
+/// Monotonic where the host offers one. Used to charge the slide only for the
+/// time it has left after the wait for the next animation frame, so a clock
+/// the user moves cannot turn a slide into a negative duration.
+const clock = () => (typeof performance === 'object' && performance && typeof performance.now === 'function'
+  ? performance.now()
+  : Date.now());
 
 /// Default relative label: whole minutes when the offset is a multiple of
 /// 60 s, seconds otherwise, and a bare "0" at the right edge.
@@ -265,7 +269,10 @@ class TfStreamChart extends TfCartesianChart {
     const xs = this._xDomain();
     const ys = this._yDomain(visible, xs);
     if (ys.max !== this._usedYMax || ys.min !== this._lastDomain?.ys.min) {
-      // Scale change: axes and gridlines have to be redrawn anyway.
+      // Scale change: axes and gridlines have to be redrawn anyway. The redraw
+      // replaces the layer, so a frame queued against the OLD one has to go
+      // with it — it would otherwise wake up and transform a detached node.
+      this._cancelSlide();
       this._animPending = false;
       this._renderPlot(true);
       return;
@@ -276,29 +283,75 @@ class TfStreamChart extends TfCartesianChart {
     this._slide(box, xs);
   }
 
+  /// Drops the frame a previous push queued and puts the layer back at rest.
+  /// Every early return in `_slide` is a decision NOT to slide, and a frame
+  /// left armed would still apply a transform computed from the OLD delta —
+  /// precisely in the hidden-tab case the wide-gap return below exists for.
+  /// Cancelling alone is not enough: the queued frame is what eases the layer
+  /// back to zero, so dropping it without clearing the transform would strand
+  /// the series one sample to the right forever.
+  _cancelSlide() {
+    if (this._slideRaf && typeof globalThis.cancelAnimationFrame === 'function') {
+      globalThis.cancelAnimationFrame(this._slideRaf);
+    }
+    this._slideRaf = 0;
+    if (this._layer) {
+      this._layer.style.transition = 'none';
+      this._layer.style.transform = '';
+    }
+  }
+
   /// One-sample slide: the layer is placed where the previous frame's
   /// points were and eased back to zero, so the eye sees a continuous
   /// leftward motion instead of a jump.
   _slide(box, xs) {
+    // Ahead of EVERY decision below, including the early returns.
+    this._cancelSlide();
     const layer = this._layer;
     if (!layer || this._prevX == null || !this._motionAllowed()) return;
     const deltaMs = this._lastX - this._prevX;
     if (!(deltaMs > 0)) return;
-    const dx = (deltaMs / (xs.max - xs.min)) * (box.x1 - box.x0);
+    const spanMs = xs.max - xs.min;
+    // A gap wider than the visible window carries nothing: the previous frame
+    // is entirely off-plot, so the new points simply are where they are. (A
+    // tab that was hidden for minutes comes back through here.)
+    if (deltaMs >= spanMs) return;
+    const dx = (deltaMs / spanMs) * (box.x1 - box.x0);
     if (!(dx > 0)) return;
-    const duration = Math.min(MAX_SLIDE_MS, deltaMs);
+    // The slide is paced by the interval that was actually MEASURED between
+    // the last two samples, so a steady feed reads as continuous motion
+    // instead of the sprint-then-freeze a fixed ceiling below the interval
+    // produced. It does not predict the future: the next sample arrives after
+    // the poll period plus that request's round trip, so a later-than-average
+    // sample leaves the layer resting at translateX(0) for the excess (a
+    // micro-stall) and an earlier one cuts the remaining travel short. Both
+    // are bounded by the jitter of one interval, and neither can drift,
+    // because every slide re-reads the real delta.
+    const startedAt = clock();
     layer.style.transition = 'none';
     layer.style.transform = `translateX(${dx}px)`;
     if (typeof globalThis.requestAnimationFrame !== 'function') {
       layer.style.transform = '';
       return;
     }
-    if (this._slideRaf) globalThis.cancelAnimationFrame(this._slideRaf);
     this._slideRaf = globalThis.requestAnimationFrame(() => {
       this._slideRaf = 0;
+      // The transition can only start on the next animation frame, and that
+      // frame is up to one refresh period away (~16 ms at 60 Hz). Charging
+      // the full interval to a slide that begins late overruns the next
+      // sample by exactly that much, every cycle. Start from where the motion
+      // should already have reached and animate only what is left.
+      const lost = Math.max(0, clock() - startedAt);
+      const remaining = deltaMs - lost;
+      if (remaining <= 0) {
+        layer.style.transition = 'none';
+        layer.style.transform = '';
+        return;
+      }
+      layer.style.transform = `translateX(${dx * (remaining / deltaMs)}px)`;
       // Force style flush so the transition starts from the offset position.
       void layer.getBoundingClientRect();
-      layer.style.transition = `transform ${duration}ms linear`;
+      layer.style.transition = `transform ${remaining}ms linear`;
       layer.style.transform = 'translateX(0)';
     });
   }

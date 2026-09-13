@@ -6425,7 +6425,11 @@
       "cache": "Cache",
       "spare": "Zapasowy",
       "system": "System",
-      "partitioned": "Partycje"
+      "partitioned": "Partycje",
+      "used": "Zajęty",
+      "pool_member": "W puli",
+      "array_member": "W macierzy",
+      "mounted": "Zamontowany"
     },
     "disks": {
       "search": "Szukaj: urządzenie, model, serial…",
@@ -6717,6 +6721,33 @@
       "confirm": "Wykonaj",
       "arm_confirm": "Uzbrój kanał",
       "ttl_info": "Po upływie {ttl} (lub wylogowaniu / restarcie) hasło jest czyszczone z pamięci i trzeba je podać ponownie."
+    },
+    "setup": {
+      "title": "Kanał uprawnień systemowych nie jest skonfigurowany",
+      "lead": "TentaNas zainstalował się poprawnie, ale nie ma jeszcze sposobu wykonywania operacji wymagających roota. Dopóki nie wybierzesz trybu, każda operacja na dyskach, pulach i macierzach zostanie odrzucona.",
+      "missing_unset": "Tryb kanału nie został jeszcze wybrany — żadna operacja uprzywilejowana nie zostanie wykonana.",
+      "missing_helper": "Helper trybu A jest wskazany, ale nie działa: {state}.",
+      "missing_incompatible": "Helper trybu A działa, lecz pochodzi z innej wersji niż core — katalog poleceń mógłby się rozejść, więc kanał jest zablokowany.",
+      "plan_intro": "Tryb A wykona przez sudo dokładnie te polecenia:",
+      "plan_failed": "Nie udało się pobrać planu: {error}",
+      "mode_a_title": "Tryb A — helper (zalecany)",
+      "mode_a_desc": "Jednorazowo podajesz hasło sudo. TentaNas instaluje jedną linię sudoers i dedykowany helper, który waliduje każde polecenie. Harmonogramy, monitoring SMART i odtwarzanie po restarcie działają bez Twojej obecności.",
+      "mode_a_button": "Skonfiguruj tryb A…",
+      "mode_b_title": "Tryb B — hasło na żądanie",
+      "mode_b_desc": "Nic nie jest instalowane w systemie. Hasło sudo podajesz przy każdej operacji, a węzeł trzyma je w pamięci przez wybrany czas.",
+      "mode_b_button": "Użyj trybu B…",
+      "helper_missing": "Tryb A jest niedostępny: brak binarium helpera obok core ({path}). Użyj trybu B albo dograj helper na ten węzeł.",
+      "recheck": "Sprawdź ponownie",
+      "configured_already": "Kanał na tym węźle jest już skonfigurowany ({mode}). Możesz zmienić tryb albo pominąć ten krok.",
+      "node_scope": "Konfigurujesz kanał dla węzła {node} — i tylko dla niego. Instalacja TentaNas objęła całą flotę, ale uprawnienia systemowe ustawia się osobno na każdym węźle.",
+      "post_install_title": "TentaNas zainstalowany — skonfiguruj kanał uprawnień",
+      "dismiss": "Zrobię to później",
+      "viewer_msg": "Kanał uprawnień systemowych na tym węźle nie jest skonfigurowany, więc żadna operacja na dyskach, pulach ani macierzach się nie wykona. Tę konfigurację może przeprowadzić wyłącznie administrator.",
+      "probing": "Sprawdzanie stanu węzła…",
+      "probe_failed_title": "Nie udało się odczytać stanu węzła",
+      "probe_failed_msg": "Sonda środowiska nie odpowiedziała: {error}",
+      "probe_failed_hint": "Dopóki węzeł nie odpowie, panel nie wie, czy kanał uprawnień działa — dlatego nie pokazuje kafelków, które i tak zgłosiłyby ten sam błąd.",
+      "probe_retry": "Spróbuj ponownie"
     },
     "wizard": {
       "title": "Kanał uprawnień systemowych — {node}",

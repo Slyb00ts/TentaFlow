@@ -6274,7 +6274,11 @@
       "cache": "Cache",
       "spare": "Secours",
       "system": "Système",
-      "partitioned": "Partitionné"
+      "partitioned": "Partitionné",
+      "used": "Utilisé",
+      "pool_member": "Membre du pool",
+      "array_member": "Membre de la matrice",
+      "mounted": "Monté"
     },
     "disks": {
       "search": "Rechercher : périphérique, modèle, numéro de série…",
@@ -6506,6 +6510,33 @@
       "confirm": "Exécuter",
       "arm_confirm": "Armer le canal",
       "ttl_info": "Au bout de {ttl} (ou à la déconnexion / au redémarrage), le mot de passe est effacé de la mémoire et doit être saisi à nouveau."
+    },
+    "setup": {
+      "title": "Le canal de privilèges système n'est pas configuré",
+      "lead": "TentaNas s'est installé correctement, mais il n'a encore aucun moyen d'exécuter les opérations qui nécessitent root. Tant que vous n'aurez pas choisi un mode, toute opération sur les disques, les pools et les matrices sera refusée.",
+      "missing_unset": "Aucun mode de canal n'a encore été choisi — aucune opération privilégiée ne sera exécutée.",
+      "missing_helper": "Le helper du mode A est déclaré mais ne fonctionne pas : {state}.",
+      "missing_incompatible": "Le helper du mode A fonctionne mais provient d'une version différente du core — le catalogue de commandes pourrait diverger, le canal est donc bloqué.",
+      "plan_intro": "Le mode A exécutera exactement ces commandes via sudo :",
+      "plan_failed": "Impossible de récupérer le plan : {error}",
+      "mode_a_title": "Mode A — helper (recommandé)",
+      "mode_a_desc": "Vous saisissez le mot de passe sudo une seule fois. TentaNas installe une seule ligne sudoers et un helper dédié qui valide chaque commande. Les planifications, la surveillance SMART et la reprise après un redémarrage fonctionnent sans votre présence.",
+      "mode_a_button": "Configurer le mode A…",
+      "mode_b_title": "Mode B — mot de passe à la demande",
+      "mode_b_desc": "Rien n'est installé sur le système. Vous saisissez le mot de passe sudo à chaque opération et le nœud le garde en mémoire pendant la durée choisie.",
+      "mode_b_button": "Utiliser le mode B…",
+      "helper_missing": "Le mode A est indisponible : le binaire du helper est absent à côté du core ({path}). Utilisez le mode B ou déposez le helper sur ce nœud.",
+      "recheck": "Vérifier à nouveau",
+      "configured_already": "Le canal de ce nœud est déjà configuré ({mode}). Vous pouvez changer de mode ou passer cette étape.",
+      "node_scope": "Vous configurez le canal pour le nœud {node} — et pour lui seul. L'installation de TentaNas a couvert toute la flotte, mais les privilèges système se configurent séparément sur chaque nœud.",
+      "post_install_title": "TentaNas installé — configurez le canal de privilèges",
+      "dismiss": "Je le ferai plus tard",
+      "viewer_msg": "Le canal de privilèges système de ce nœud n'est pas configuré : aucune opération sur les disques, les pools ou les matrices ne s'exécutera. Seul un administrateur peut le configurer.",
+      "probing": "Vérification de l'état du nœud…",
+      "probe_failed_title": "Impossible de lire l'état de ce nœud",
+      "probe_failed_msg": "La sonde d'environnement n'a pas répondu : {error}",
+      "probe_failed_hint": "Tant que le nœud ne répond pas, le panneau ignore si le canal de privilèges fonctionne — il n'affiche donc pas de tuiles qui signaleraient toutes la même erreur.",
+      "probe_retry": "Réessayer"
     },
     "refreshed": "dernière actualisation {t}",
     "duration": {

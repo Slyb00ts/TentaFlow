@@ -32,7 +32,7 @@
 //   t.rows = [{ name: 'x', status: 'ok' }, ...];
 // =============================================================================
 
-import { adoptControlsInto, injectSpriteIntoShadow } from './shared-styles.js';
+import { adoptControlsInto, adoptScopedSheetsInto, injectSpriteIntoShadow } from './shared-styles.js';
 
 class TfColumn extends HTMLElement {
   // rola pamietaj-tagu — dane czerpane z atrybutow przez parenta
@@ -75,9 +75,20 @@ class TfTable extends HTMLElement {
     this._sortDir = 'asc';
     // Optional per-row actions builder: (row, index) => Element | null.
     // When set, tf-table renders a trailing actions column hosting the
-    // returned element (e.g. a kebab tf-menu). Cells are rebuilt on every
-    // render so the element stays bound to its current row object.
+    // returned element (e.g. a kebab tf-menu). Without a rowActionsKey the
+    // cell is rebuilt on every render, so the element stays bound to its
+    // current row object.
     this._rowActions = null;
+    // Optional signature of the actions cell: (row, index) => string | number.
+    // Rows are rebuilt from fresh API data on every poll, so `row === lastRow`
+    // is never true and object identity cannot tell "unchanged" from "changed".
+    // The host declares the signature instead; while it holds, the element
+    // already in the cell is KEPT rather than rebuilt — which is what stops a
+    // 5 s poll from swapping a click target out from under the user's cursor.
+    // The signature must cover every row field the builder RENDERS and every
+    // field its handlers CLOSE OVER, including the row's identity. A field left
+    // out keeps the values captured when the element was built.
+    this._rowActionsKey = null;
     // Count of leading columns pinned with position:sticky. Per-column sticky
     // flags (<tf-column sticky>) extend this for explicitly marked columns.
     this._stickyColumns = 0;
@@ -117,9 +128,28 @@ class TfTable extends HTMLElement {
   get rowActions() { return this._rowActions; }
   set rowActions(fn) {
     this._rowActions = typeof fn === 'function' ? fn : null;
+    // A NEW builder means every cached actions element was produced by the OLD
+    // one and still closes over its values (an `isAdmin` that has since
+    // changed, a stale permission check). The cached signature describes the
+    // ROW, so on its own it would keep those elements alive for good. Bumping a
+    // generation invalidates every stored signature at once.
+    this._rowActionsGen = (this._rowActionsGen || 0) + 1;
     // Column count changes when actions toggle on/off — force thead rebuild.
     this._lastColsSig = null;
     this._render();
+  }
+
+  get rowActionsKey() { return this._rowActionsKey; }
+  set rowActionsKey(fn) {
+    this._rowActionsKey = typeof fn === 'function' ? fn : null;
+    // A different key function can return the SAME string for a different
+    // notion of "unchanged", so signatures cached under the previous one are
+    // meaningless and must not match.
+    this._rowActionsGen = (this._rowActionsGen || 0) + 1;
+    // Deliberately does NOT render: this is bookkeeping about how to refresh
+    // the actions cell, not a change to anything already on screen. Rendering
+    // here would cost a second full pass whenever a host assigns both this and
+    // `rowActions` while drawing a tab.
   }
 
   get stickyColumns() { return this._stickyColumns; }
@@ -222,7 +252,23 @@ class TfTable extends HTMLElement {
   }
 
   _build() {
-    adoptControlsInto(this._shadow);
+    // `renderer="html"` cells are written with td.innerHTML INSIDE this shadow
+    // root, where the screen's own stylesheet cannot reach them. Adopt the
+    // sheets scoped to the screen this table sits in (see shared-styles.js).
+    //
+    // Sequenced, not raced: adoptedStyleSheets is ordered, so letting the two
+    // adoptions resolve in whatever order the network returns would leave the
+    // cascade order up to chance. controls.css is the base, the screen sheet
+    // refines it, so the screen sheet must always come second.
+    //
+    // Each adoption carries its OWN catch. A shared trailing catch would let a
+    // single failed controls.css fetch skip the screen sheet entirely and
+    // swallow the reason — silently restoring the very defect this exists to
+    // fix (unstyled cells, black sparklines, nothing in the console).
+    adoptControlsInto(this._shadow)
+      .catch(() => { /* base styles unavailable — the screen sheet must still load */ })
+      .then(() => adoptScopedSheetsInto(this._shadow, this))
+      .catch(() => { /* styling is best-effort; the table still renders */ });
     // Row-action tf-buttons render <use href="#i-*"> — the document sprite is
     // not reachable from inside the shadow root, so clone it in.
     injectSpriteIntoShadow(this._shadow);
@@ -578,17 +624,41 @@ class TfTable extends HTMLElement {
       this._writeCell(td, cols[i], row[cols[i].key]);
     }
     if (this._rowActions) {
-      // Recyklowany wiersz wskazuje teraz na inny obiekt row — odbuduj
-      // element akcji, zeby byl zbindowany do aktualnego wiersza.
+      // Recyklowany wiersz wskazuje teraz na inny obiekt row, wiec element
+      // akcji musi byc zbindowany do aktualnego wiersza. Bez `rowActionsKey`
+      // oznacza to bezwarunkowy rebuild; z kluczem — rebuild tylko wtedy, gdy
+      // sygnatura wiersza sie ruszyla (patrz _writeActionsCell).
       this._writeActionsCell(tds[cols.length], row, idx);
     }
   }
 
+  // Signature of the actions cell for `row`, or null when the host declared
+  // none — then every render rebuilds, the behaviour every caller had before
+  // `rowActionsKey` existed. A builder that throws, or returns anything but a
+  // string/number, counts as "no signature" rather than as a false match.
+  _rowActionsSignature(row, idx) {
+    if (!this._rowActionsKey) return null;
+    let key = null;
+    try { key = this._rowActionsKey(row, idx); } catch { return null; }
+    return typeof key === 'string' || typeof key === 'number'
+      ? `k:${this._rowActionsGen || 0}:${key}`
+      : null;
+  }
+
   _writeActionsCell(td, row, idx) {
+    const key = this._rowActionsSignature(row, idx);
+    // The element sitting here was built for this very signature, so it renders
+    // the same markup AND its handlers close over the same values — keep the
+    // node. `null` never matches itself, so a table with no signature keeps
+    // rebuilding exactly as before.
+    if (key !== null && td._tfActionsKey === key) return;
     let el = null;
     try { el = this._rowActions(row, idx); } catch { el = null; }
     if (el instanceof Node) td.replaceChildren(el);
     else td.replaceChildren();
+    // Recorded even when null, so a cell whose builder returned nothing is not
+    // mistaken for one that was never written.
+    td._tfActionsKey = key;
   }
 
   _writeCell(td, col, value, keepExisting = false) {
@@ -607,15 +677,30 @@ class TfTable extends HTMLElement {
         ? value
         : { status: 'info', label: String(value ?? '') };
       const status = String(chip.status || 'info').replace(/[^a-zA-Z0-9_-]/g, '');
-      const span = document.createElement('span');
-      span.className = `tf-chip ${status}`;
-      if (chip.dot) {
-        const dot = document.createElement('span');
-        dot.className = 'tf-chip-dot';
-        span.appendChild(dot);
+      const cls = `tf-chip ${status}`;
+      const label = chip.label == null ? '' : String(chip.label);
+      // Skip an identical write, the way the `html` renderer below already
+      // does. Without this the cell swapped one <span> per row on EVERY poll:
+      // measured on the live disks table, 319 of the 329 remaining DOM
+      // mutations per 21 s came from here, long after the row-actions churn
+      // had been fixed.
+      const current = td.firstElementChild;
+      const unchanged = td.childNodes.length === 1
+        && current instanceof HTMLElement
+        && current.className === cls
+        && current.textContent === label
+        && !!current.querySelector('.tf-chip-dot') === !!chip.dot;
+      if (!unchanged) {
+        const span = document.createElement('span');
+        span.className = cls;
+        if (chip.dot) {
+          const dot = document.createElement('span');
+          dot.className = 'tf-chip-dot';
+          span.appendChild(dot);
+        }
+        span.appendChild(document.createTextNode(label));
+        td.replaceChildren(span);
       }
-      span.appendChild(document.createTextNode(chip.label == null ? '' : String(chip.label)));
-      td.replaceChildren(span);
     } else if (col.renderer === 'html') {
       const next = value ?? '';
       // Skip jesli identyczne — eliminuje koszt parsowania HTML komorki gdy

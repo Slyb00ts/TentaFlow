@@ -13,6 +13,7 @@ import {
   T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
   jobTone, jobKindLabel, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
+import { setAttr, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields, normalizeSchedule } from '/js/modules/tentanas/schedule-editor.js';
 import { openSnapshotScheduleEditor, keepSummary } from '/js/modules/tentanas/snapshots.js';
 import { openMoverScheduleEditor, openElasticScheduleEditor } from '/js/modules/tentanas/elastic-detail.js';
@@ -125,9 +126,13 @@ export async function drawTasks(screen, body) {
       const running = state.jobs.filter((j) => j.status === 'running' || j.status === 'queued');
       state.done = state.jobs.filter((j) => !running.includes(j));
       const runEl = body.querySelector('#nas-jobs-running');
-      runEl.innerHTML = running.length ? running.map((j) => screen.jobRowHtml(j)).join('') : `<div class="muted">${escapeHtml(T('jobs.none_running'))}</div>`;
-      screen.wireJobRows(runEl, refreshJobs);
-      body.querySelector('#nas-jobs-count').setAttribute('label', String(running.length));
+      // Re-wire exactly when the rows were rebuilt. A 3 s poll that brings the
+      // same running jobs now touches no node, so a cancel button under the
+      // cursor keeps its hover and stays the element the click lands on.
+      if (patchHtml(runEl, running.length ? running.map((j) => screen.jobRowHtml(j)).join('') : `<div class="muted">${escapeHtml(T('jobs.none_running'))}</div>`)) {
+        screen.wireJobRows(runEl, refreshJobs);
+      }
+      setAttr(body.querySelector('#nas-jobs-count'), 'label', String(running.length));
       paintHistory();
     } catch (e) {
       if (screen.disposed || !body.isConnected) return;
@@ -197,7 +202,7 @@ export async function drawTasks(screen, body) {
           : smart.lastShortAt ? chip('ok', T('schedules.prot_smart_last', { t: fmtAgo(smart.lastShortAt) }))
             : chip('info', T('schedules.prot_pending', { t: fmtIn(smart.nextShortAt) }))}</span></div>`,
     ].join('');
-    body.querySelector('#nas-prot').innerHTML = `<div class="stat-rows">${left}</div><div class="stat-rows">${right}</div>`;
+    patchHtml(body.querySelector('#nas-prot'), `<div class="stat-rows">${left}</div><div class="stat-rows">${right}</div>`);
   };
 
   const paintSchedules = () => {
@@ -208,10 +213,10 @@ export async function drawTasks(screen, body) {
     const items = rows.filter((r) => r.kind === 'scrub' || r.kind === 'trim' || r.kind === 'snapshot' || r.kind.startsWith('elastic_')).map((r) => scheduleItem(r));
     const smartRows = rows.filter((r) => r.kind === 'smart_short' || r.kind === 'smart_long');
     if (smartRows.length) items.push(smartItem(smart, smartRows));
-    body.querySelector('#nas-sched-count').setAttribute('label', String(items.length));
+    setAttr(body.querySelector('#nas-sched-count'), 'label', String(items.length));
     const list = body.querySelector('#nas-sched-list');
-    if (!items.length) { list.innerHTML = `<div class="muted">${escapeHtml(T('schedules.none'))}</div>`; return; }
-    list.innerHTML = items.map((it, i) => `
+    if (!items.length) { patchHtml(list, `<div class="muted">${escapeHtml(T('schedules.none'))}</div>`); return; }
+    const html = items.map((it, i) => `
       <div class="job-row" data-idx="${i}">
         <div class="job-ico">${sprite(it.icon)}</div>
         <div class="job-main">
@@ -225,6 +230,9 @@ export async function drawTasks(screen, body) {
           <tf-button size="sm" variant="ghost" icon="edit" data-act="edit" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>` : ''}
         </div>
       </div>`).join('');
+    // The toggle/run/edit handlers below close over THIS `items` array, so
+    // they may only be attached to markup written in this same call.
+    if (!patchHtml(list, html)) return;
     list.querySelectorAll('.job-row').forEach((rowEl) => {
       const it = items[Number(rowEl.dataset.idx)];
       rowEl.querySelector('[data-act="toggle"]').addEventListener('change', (e) => setEnabled(it, Boolean(e.target.checked)));

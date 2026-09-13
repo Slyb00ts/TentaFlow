@@ -9,6 +9,14 @@ import { I18n } from '/js/i18n.js';
 import { escapeAttr } from '/js/utils.js';
 
 export const T = (k, p) => I18n.t('tentanas.' + k, p);
+
+// The wire spells "no channel configured" as `unset` (`elevation::Mode::as_str`,
+// and `fleet.rs` for the per-node mode); this UI has always spelled it
+// `unarmed`. Every comparison tested only the latter, so a freshly installed
+// node read as a WORKING channel: no password was ever asked for, the header
+// badge said ok, and `elevation.short_unset` rendered as a raw key. One
+// spelling from here on — the i18n keys keep theirs.
+export const channelMode = (mode) => (!mode || mode === 'unset' ? 'unarmed' : mode);
 export const sprite = (id) => `<svg class="icon"><use href="#i-${id}"/></svg>`;
 
 export const POLL_DISKS_MS = 5000;

@@ -14,6 +14,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtDate, fmtAgo, errMessage } from '/js/modules/tentanas/format.js';
+import { setAttr, setText, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
@@ -94,9 +95,14 @@ export function wireAccessLog(screen, body) {
     // The card hides itself when nothing audits and nothing was ever logged:
     // an empty log plus a feature nobody switched on is noise.
     card.hidden = !audited.length && !exports_.length && !(res.total > 0);
-    body.querySelector('#nas-access-count').setAttribute('label', String(Number(res.total) || 0));
-    body.querySelector('#nas-access-hint').textContent = T('access.retention', { n: Number(audit.retentionDays) || 0 });
+    // Through the patch helpers: a bare `setAttribute` runs tf-chip's
+    // `attributeChangedCallback` (and so re-renders the chip) even when the
+    // value is identical, and a bare `textContent =` replaces the text node
+    // under whatever the admin had selected.
+    setAttr(body.querySelector('#nas-access-count'), 'label', String(Number(res.total) || 0));
+    setText(body.querySelector('#nas-access-hint'), T('access.retention', { n: Number(audit.retentionDays) || 0 }));
 
+    const shown = res.events || [];
     const lines = [];
     lines.push(audited.length
       ? T('access.audited_shares', { shares: audited.join(', ') })
@@ -119,10 +125,17 @@ export function wireAccessLog(screen, body) {
       }));
     }
     if (forward.lastError) lines.push(T('access.forward_error', { error: forward.lastError }));
-    const stateEl = body.querySelector('#nas-access-state');
-    stateEl.innerHTML = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join('');
+    // A page smaller than the match count has to say so, or the reader takes
+    // the page for the whole answer. It belongs to the SAME block as the lines
+    // above and is written with them in one go: the Tasks tab polls this card
+    // every 30 s, and rebuilding the block destroyed every line whose text had
+    // not changed. (It used to arrive through a second `innerHTML +=`, which
+    // rebuilt the block twice per tick.)
+    if (shown.length && Number(res.total) > shown.length) {
+      lines.push(T('access.truncated', { shown: shown.length, total: Number(res.total) }));
+    }
+    patchHtml(body.querySelector('#nas-access-state'), lines.map((l) => `<div>${escapeHtml(l)}</div>`).join(''));
 
-    const shown = res.events || [];
     table.rows = shown.map((e) => ({
       at: `<span class="tf-table__cell--mono">${escapeHtml(fmtDate(e.at))}</span>`,
       user: `<span class="tf-table__cell--mono">${escapeHtml(e.user || '—')}</span>${
@@ -133,11 +146,6 @@ export function wireAccessLog(screen, body) {
       result: `<tf-chip size="sm" dot status="${e.result === 'fail' ? 'err' : 'ok'}" label="${escapeAttr(T('access.result_' + (e.result === 'fail' ? 'fail' : 'ok')))}"></tf-chip>${
         e.detail ? `<div class="tf-table__cell-sub">${escapeHtml(e.detail)}</div>` : ''}`,
     }));
-    // A page smaller than the match count has to say so, or the reader takes
-    // the page for the whole answer.
-    if (shown.length && Number(res.total) > shown.length) {
-      stateEl.innerHTML += `<div>${escapeHtml(T('access.truncated', { shown: shown.length, total: Number(res.total) }))}</div>`;
-    }
   };
 
   const apply = (res) => { state.res = res; paintFilters(res); paint(); };

@@ -1516,6 +1516,29 @@ pub fn list_jobs(pool: &DbPool, limit: u32) -> Result<Vec<NasJob>> {
 
 /// Jobs that were `running` when the process died: marked failed on init so
 /// the list never shows a spinner for work nobody is doing.
+///
+/// KNOWN EXPOSURE — a long self-test job versus this sweep (medium severity,
+/// accepted deliberately, not an oversight):
+///
+/// A SMART self-test job now holds its `running` row for the disk's REAL test
+/// duration — 24.5 h on the captured SAS disk, and up to twice that before the
+/// stall window gives up — where it used to last about two minutes, because the
+/// poll misread a missing progress percentage as completion. Any core restart,
+/// upgrade or crash inside that window therefore lands here and stamps a
+/// healthy, still-running test `failed` / "interrupted by core restart" while
+/// the disk quietly keeps testing.
+///
+/// It is not a lost result: the real verdict reaches the disk detail view and
+/// `score_health` as soon as the periodic `refresh_smart` reads the self-test
+/// log again. The operator gets a misleading job row, not a missing answer —
+/// which is why this is documented rather than worked around here.
+///
+/// FOLLOW-UP "short-lived self-test job": the honest fix is that a self-test
+/// should not occupy a `running` row at all. The disk owns the test; the app
+/// only observes it. Starting the test, persisting `started_at` plus the
+/// baseline log, and letting `refresh_smart` surface the verdict would make the
+/// job short-lived and restart-immune. That is a redesign of the job's
+/// contract, so it is named here and left for its own change.
 pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
     let running = super::jobs::running().lock().unwrap_or_else(|p| p.into_inner());
     let mut conn = write(pool)?;
@@ -1523,6 +1546,9 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
     let candidates = tx.prepare("SELECT job_id FROM nas_jobs WHERE status IN ('queued','running')")?
         .query_map([],|r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut changed = 0;
+    // Every candidate is failed unconditionally — including a SMART self-test
+    // whose disk is still testing and will finish hours from now. See the
+    // exposure and the "short-lived self-test job" follow-up on this function.
     for job_id in candidates.into_iter().filter(|id| !running.contains_key(id)) {
         tx.execute("UPDATE nas_elastic_arrays SET state='needs_attention',
         state_detail='Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O', updated_at=?1

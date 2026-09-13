@@ -109,7 +109,9 @@ const fixtures = {
     localNodeId: LOCAL,
     nodes: [
       node({}),
-      node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, health: 'warning', disksWarning: 1, elevationMode: 'unarmed', poolsTotal: 0, features: [] }),
+      // 'unset' is what `elevation::Mode::as_str` puts on the wire for a node
+      // with no channel; 'unarmed' was this fixture's own spelling.
+      node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, health: 'warning', disksWarning: 1, elevationMode: 'unset', poolsTotal: 0, features: [] }),
       node({ nodeId: MAC, nodeName: 'mini', isLocal: false, instanceStatus: 'unsupported', osName: 'macOS', disksTotal: 0, poolsTotal: 0, features: [] }),
     ],
   },
@@ -117,7 +119,7 @@ const fixtures = {
   tentaNasElevationPlanRequest: { plan: { helperSource: '/opt/tentaflow/tentanas-helper', helperSourcePresent: true, helperPath: '/usr/local/libexec/tentanas-helper', sudoersPath: '/etc/sudoers.d/tentanas', sudoersLine: 'tentaflow ALL=(root) NOPASSWD: /usr/local/libexec/tentanas-helper', coreUser: 'tentaflow', coreVersion: '1.4.0', commands: [['install', '-m', '0755', '/opt/tentaflow/tentanas-helper', '/usr/local/libexec/tentanas-helper']] } },
   tentaNasDisksListRequest: {
     disks: [disk({}), disk({ diskId: 'nvme0n1', name: 'nvme0n1', path: '/dev/nvme0n1', kind: 'nvme', model: 'Samsung 980', serial: 'S-1', health: 'warning', healthReason: 'pending sectors', wearPct: 12, rotational: false })],
-    telemetry: { sampledAt: '2026-09-02 10:00:00', smartReadAt: '2026-09-02 09:59:00', smartState: 'live', detail: '' },
+    telemetry: { sampledAt: '2026-09-02 10:00:00', smartReadAt: '2026-09-02 09:59:00', smartState: 'ok', detail: '' },
     iopsHourAvg: 16,
   },
   tentaNasJobsListRequest: { jobs: [{ jobId: 'j1', kind: 'smart_test', subject: 'sda', status: 'running', progressPct: 40, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started'] }] },
@@ -139,6 +141,15 @@ async function mountScreen(params = {}) {
 }
 
 const kinds = (kind) => calls.filter((c) => c.kind === kind);
+
+// `assert.equal(el, null)` reads harmlessly and is a trap. On FAILURE node
+// builds the diff with `util.inspect` over a happy-dom element, which walks the
+// whole document graph: measured at ~96–107s, after which the runner reports the
+// FILE as failed with no test name at all and the remaining tests never run. It
+// is fast while passing, so the cost only appears when a test breaks — mutation
+// testing and real regressions, exactly when the name is what you need. Compare
+// a primitive instead.
+const absent = (root, sel) => root.querySelector(sel) === null;
 
 test('mount koduje AuthMe jako unit przez rzeczywisty codec i WASM', {
   skip: existsSync(new URL('../protocol/wasm_glue_bg.wasm', import.meta.url)) ? false : 'Brak wygenerowanego WASM; kodowanie nie zostało sprawdzone',
@@ -461,7 +472,7 @@ test('environment tab lists features, the fleet nodes with their capabilities an
   // n16:185-197 — two headingless boxes; "Konsekwencje:" holds three losses.
   const boxes = [...root.querySelectorAll('.grid-2 .explain-box')];
   assert.equal(boxes.length, 2);
-  assert.equal(boxes[0].querySelector('h4'), null, 'no invented heading');
+  assert.equal(absent(boxes[0], 'h4'), true, 'no invented heading');
   assert.match(boxes[0].textContent.trim(), /^Tryb A \(obecny\): jednorazowo podane hasło sudo/);
   assert.match(boxes[1].textContent, /Tryb B \(opt-out\):.*\(sesja 15 min\)\. Konsekwencje:/);
   assert.deepEqual([...boxes[1].querySelectorAll('.ll')].map((l) => l.textContent), [
@@ -502,9 +513,9 @@ test('withSudo skips the prompt on a provisioned helper and asks for a password 
   let seen = 'unset';
   await Screen.withSudo(async (password) => { seen = password; return {}; }, 'x');
   assert.equal(seen, undefined, 'helper channel needs no password');
-  assert.equal(document.querySelector('tf-window.nas-modal'), null, 'no prompt opened');
+  assert.equal(absent(document, 'tf-window.nas-modal'), true, 'no prompt opened');
 
-  Screen.environment = { ...environment, elevation: { ...environment.elevation, mode: 'unarmed', helperState: 'absent' } };
+  Screen.environment = { ...environment, elevation: { ...environment.elevation, mode: 'unset', helperState: 'absent' } };
   const pending = Screen.withSudo(async (password) => { seen = password; return {}; }, 'x');
   await flush();
   const prompt = document.querySelector('tf-window.nas-modal');
@@ -528,7 +539,7 @@ test('"Uzbrój kanał" stays on the arm-channel prompt and never labels a one-sh
   stubTransport(fixtures);
   await mountScreen({ node: LOCAL });
   await flush();
-  Screen.environment = { ...environment, elevation: { ...environment.elevation, mode: 'unarmed', helperState: 'absent' } };
+  Screen.environment = { ...environment, elevation: { ...environment.elevation, mode: 'unset', helperState: 'absent' } };
 
   const pending = Screen.withSudo(async () => ({}), 'Zniszcz pulę tank');
   await flush();
@@ -761,6 +772,287 @@ test('overview feeds every poll into the live throughput and temperature charts'
   Screen.unmount();
 });
 
+// --- "nigdy pełne odświeżenie całości" (research/03-ui-wzorce-mockupy.md) ----
+// A poll replaces DATA, never the elements that carry it. Node identity is the
+// assertion: a rebuilt <tf-alert> or stat card is a blink on screen.
+//
+// Identity is compared as a BOOLEAN for the reason `absent` above documents —
+// a failing `assert.strictEqual` over two happy-dom elements sends node's
+// util.inspect through the whole document graph (~2 min, after which the FILE
+// is reported failed with no test name).
+const same = (a, b) => a === b;
+
+test('a poll that brings the same telemetry keeps the very same tf-alert element', async () => {
+  const telemetry = {
+    sampledAt: '2026-09-02 10:00:00', smartReadAt: '2026-09-02 09:59:00', smartState: 'partial',
+    detail: '/dev/sdb: smartctl failed (4): no output',
+  };
+  stubTransport({ ...fixtures, tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, telemetry } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const host = root.querySelector('#nas-ov-telemetry');
+  const alert = host.querySelector('tf-alert');
+  assert.ok(alert, 'the banner is on screen');
+  const message = alert.querySelector('.tf-alert-message');
+  assert.equal(message.textContent, '/dev/sdb: smartctl failed (4): no output');
+
+  await Screen.refreshOverview(root.querySelector('#nas-tab-body'));
+  await flush();
+  assert.equal(same(host.querySelector('tf-alert'), alert), true, 'the same element survives the poll');
+  assert.equal(same(host.querySelector('.tf-alert-message'), message), true, 'and its insides are not re-rendered either');
+  Screen.unmount();
+});
+
+test('the disks tab keeps its telemetry banner, and its action, across a poll', async () => {
+  const telemetry = { sampledAt: '2026-09-02 10:00:00', smartReadAt: '2026-09-02 09:59:00', smartState: 'unarmed', detail: '' };
+  stubTransport({ ...fixtures, tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, telemetry } });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  await flush();
+  const host = root.querySelector('#nas-disks-telemetry');
+  const alert = host.querySelector('tf-alert');
+  const btn = alert.querySelector('tf-button');
+  assert.ok(btn, 'an admin gets the arming action');
+
+  await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+  await flush();
+  assert.equal(same(host.querySelector('tf-alert'), alert), true, 'the same element');
+  assert.equal(same(host.querySelector('tf-button'), btn), true, 'the same button, so a click target never moves under the cursor');
+  Screen.unmount();
+});
+
+// tf-table recycles its <tr> elements but rebuilt the ACTIONS cell on every
+// render: `_writeActionsCell` called the builder unconditionally and did
+// `td.replaceChildren(el)`. Every row here carries four tf-buttons, so a 5 s
+// poll that moved nothing but temperature destroyed and recreated all of them —
+// measured on the live page at 464 structural mutations on this table in 21 s,
+// with 440 tf-buttons created. The user-visible half is a click target that
+// vanishes mid-gesture.
+//
+// Object identity cannot guard this: `diskRow` builds a new `_disk` object from
+// fresh API data every poll. drawDisks declares a `rowActionsKey` signature
+// instead, covering every field the buttons render or their handlers read.
+test('a disk poll that changes nothing does not rebuild the row action buttons', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  await flush();
+  const tbody = root.querySelector('#nas-disk-table').shadowRoot.querySelector('tbody');
+  const actions = tbody.querySelector('.tf-table__actions-cell').firstElementChild;
+  assert.ok(actions, 'the disks table renders a row-actions element');
+  assert.equal(actions.querySelectorAll('tf-button').length, 4, 'four buttons on a free disk');
+
+  // Counted where the defect lives. The `role` column is renderer="chip", and
+  // `_writeCell` rebuilds a chip span unconditionally — a separate, pre-existing
+  // churn that this test deliberately does not pin.
+  // Records are COLLECTED IN THE CALLBACK, not read with takeRecords() at the
+  // end: the awaits below let happy-dom deliver and drain the queue first, so a
+  // trailing takeRecords() reads an empty list and the count passes vacuously
+  // even while every button is being recreated.
+  const records = [];
+  const obs = new window.MutationObserver((recs) => { records.push(...recs); });
+  obs.observe(tbody, { childList: true, subtree: true });
+  let added = 0;
+  let removed = 0;
+  try {
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    records.push(...obs.takeRecords());
+    for (const rec of records) {
+      if (!rec.target.closest || !rec.target.closest('.tf-table__actions-cell')) continue;
+      added += rec.addedNodes.length;
+      removed += rec.removedNodes.length;
+    }
+  } finally {
+    obs.disconnect();
+  }
+  assert.equal(added, 0, `an unchanged poll must add no node to an actions cell, added ${added}`);
+  assert.equal(removed, 0, `and remove none, removed ${removed}`);
+  assert.equal(
+    same(tbody.querySelector('.tf-table__actions-cell').firstElementChild, actions),
+    true,
+    'the very same actions element, so a click target never moves under the cursor',
+  );
+  Screen.unmount();
+});
+
+// The correctness half of the same guard: when the signature DOES move, the
+// element is rebuilt and its handlers close over the disk the latest poll
+// described — never the one they were originally built with.
+test('a disk action rebuilt by a poll acts on the disk as it is NOW', async () => {
+  let role = 'free';
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: () => ({ ...fixtures.tentaNasDisksListRequest, disks: [disk({ role })] }),
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  await flush();
+  const tbody = root.querySelector('#nas-disk-table').shadowRoot.querySelector('tbody');
+  const actsOf = () => [...tbody.querySelectorAll('.tf-table__actions-cell tf-button')].map((b) => b.dataset.act);
+  assert.deepEqual(actsOf(), ['locate', 'smart', 'use', 'details'], 'a free disk offers "use in pool"');
+
+  const seen = [];
+  const realLocate = Screen.locateDisk;
+  Screen.locateDisk = (d, enable) => { seen.push(`${d.diskId}:${d.role}:${enable}`); };
+  try {
+    role = 'data';
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.deepEqual(actsOf(), ['locate', 'smart', 'details'], 'the pool action goes once the disk is in use');
+    click(tbody.querySelector('[data-act="locate"]'));
+    assert.deepEqual(seen, ['sda:data:true'], 'the handler carries the role from the LATEST poll');
+  } finally {
+    Screen.locateDisk = realLocate;
+    Screen.unmount();
+  }
+});
+
+test('the KPI tiles are the same elements after a poll, with only their numbers moved', async () => {
+  let readBps = 1048576;
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: () => ({
+      ...fixtures.tentaNasDisksListRequest,
+      disks: [disk({ io: { readBps, writeBps: 0, readIops: 10, writeIops: 0, awaitMs: 2.5, utilPct: 3 } })],
+    }),
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const tiles = [...root.querySelectorAll('#nas-ov-kpi tf-stat-card')];
+  assert.equal(tiles.length, 4);
+  assert.equal(tiles[3].getAttribute('value'), '1.0');
+
+  readBps = 4 * 1048576;
+  await Screen.refreshOverview(root.querySelector('#nas-tab-body'));
+  await flush();
+  const after = [...root.querySelectorAll('#nas-ov-kpi tf-stat-card')];
+  assert.equal(after.length, 4);
+  after.forEach((el, i) => assert.equal(same(el, tiles[i]), true, `tile ${i} is the same element`));
+  assert.equal(after[3].getAttribute('value'), '4.0', 'the throughput moved without the tile being rebuilt');
+  assert.match(after[3].querySelector('.tf-stat-card-value').textContent, /^4\.0/, 'and the component rendered it');
+  // A tile whose numbers did not move is not touched at all: the poll writes
+  // no attribute, so the component does not re-render its insides either.
+  const labelEl = tiles[0].querySelector('.tf-stat-card-label');
+  await Screen.refreshOverview(root.querySelector('#nas-tab-body'));
+  await flush();
+  assert.equal(same(tiles[0].querySelector('.tf-stat-card-label'), labelEl), true, 'an unchanged tile is left alone');
+  Screen.unmount();
+});
+
+test('the fleet view is patched by its poll, never redrawn', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen();
+  await flush();
+  await flush();
+  const grid = root.querySelector('#nas-node-grid');
+  const cards = [...root.querySelectorAll('.kpi tf-stat-card')];
+  const alertsTable = root.querySelector('#nas-fleet-alerts');
+  assert.equal(cards.length, 4);
+
+  await Screen.refreshFleet();
+  await flush();
+  assert.equal(same(root.querySelector('#nas-node-grid'), grid), true, 'the node grid is not rebuilt');
+  assert.equal(same(root.querySelector('#nas-fleet-alerts'), alertsTable), true, 'nor the alert table');
+  [...root.querySelectorAll('.kpi tf-stat-card')].forEach((el, i) => assert.equal(same(el, cards[i]), true, `fleet tile ${i} survives`));
+  Screen.unmount();
+});
+
+// The grid used to be compared as ONE joined string, so any single node's
+// uptime or used-bytes ticking rebuilt every card on the fleet every 10 s —
+// the largest blink surface left in TentaNas. Each card is now compared
+// against its own previous markup, keyed by node id.
+test('one node moving rebuilds only that node card, not the whole grid', async () => {
+  const vega = () => node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, poolsTotal: 0, features: [] });
+  const mini = () => node({ nodeId: MAC, nodeName: 'mini', isLocal: false, instanceStatus: 'unsupported', osName: 'macOS', disksTotal: 0, poolsTotal: 0, features: [] });
+  let nodes = [node({}), vega(), mini()];
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: () => ({ localNodeId: LOCAL, nodes }) });
+  const root = await mountScreen();
+  await flush();
+  await flush();
+  const cards = [...root.querySelectorAll('.node-card')];
+  assert.equal(cards.length, 3);
+
+  // Only orion's uptime ticks; the other two carry identical values.
+  nodes = [node({ uptimeSecs: 7200 }), vega(), mini()];
+  await Screen.refreshFleet();
+  await flush();
+  const after = [...root.querySelectorAll('.node-card')];
+  assert.equal(after.length, 3);
+  assert.match(after[0].querySelector('.nc-sub').textContent, /uptime/, 'orion now reports an uptime');
+  assert.equal(same(after[0], cards[0]), false, 'the node whose value moved is rebuilt');
+  assert.equal(same(after[1], cards[1]), true, 'the node that did not move keeps its element');
+  assert.equal(same(after[2], cards[2]), true, 'and so does the third');
+  Screen.unmount();
+});
+
+test('a node leaving and rejoining the fleet leaves the other cards standing', async () => {
+  const vega = () => node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, poolsTotal: 0, features: [] });
+  const mini = () => node({ nodeId: MAC, nodeName: 'mini', isLocal: false, instanceStatus: 'unsupported', osName: 'macOS', disksTotal: 0, poolsTotal: 0, features: [] });
+  let nodes = [node({}), vega()];
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: () => ({ localNodeId: LOCAL, nodes }) });
+  const root = await mountScreen();
+  await flush();
+  await flush();
+  const orion = root.querySelectorAll('.node-card')[0];
+  assert.ok(orion, 'the local node has a card');
+
+  // vega drops out of the fleet: its card has to go with it.
+  nodes = [node({})];
+  await Screen.refreshFleet();
+  await flush();
+  let grid = [...root.querySelectorAll('.node-card')];
+  assert.equal(grid.length, 1, 'the stale card is removed, not left behind');
+  assert.equal(same(grid[0], orion), true, 'the surviving node keeps its element');
+
+  // …and rejoins, with a third node after it.
+  nodes = [node({}), vega(), mini()];
+  await Screen.refreshFleet();
+  await flush();
+  grid = [...root.querySelectorAll('.node-card')];
+  assert.equal(grid.length, 3, 'no duplicate card for the node that rejoined');
+  assert.equal(same(grid[0], orion), true, 'orion is the same element throughout');
+  assert.deepEqual(grid.map((c) => c.dataset.node), [LOCAL, REMOTE, MAC], 'and the grid is in fleet order');
+  Screen.unmount();
+});
+
+test('the unavailable banner offers an install only when a package is genuinely missing', async () => {
+  const telemetry = { sampledAt: '2026-09-02 10:00:00', smartReadAt: null, smartState: 'partial', detail: '/dev/sdb: smartctl failed (4): no output' };
+  // Nothing is missing here: smartctl is installed and merely failed on some
+  // disks. Offering "Doinstaluj" would name a cause that does not exist.
+  stubTransport({ ...fixtures, tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, telemetry } });
+  let root = await mountScreen({ node: LOCAL });
+  await flush();
+  assert.ok(root.querySelector('#nas-ov-telemetry tf-alert'), 'the banner is there');
+  assert.equal(absent(root, '#nas-ov-telemetry tf-button'), true, 'but no install action over a working smartctl');
+  Screen.unmount();
+
+  // The node's own probe reports the package absent → the banner routes to the
+  // very install flow the Environment tab uses.
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, telemetry },
+    tentaNasEnvironmentRequest: {
+      environment: {
+        ...environment,
+        features: [
+          ...environment.features,
+          { id: 'smartmontools', status: 'missing_package', version: null, requiredVersion: null, binaries: ['smartctl'], kernelModule: null, packages: ['smartmontools'], detail: '', optional: false },
+        ],
+      },
+    },
+  });
+  root = await mountScreen({ node: LOCAL });
+  await flush();
+  const btn = root.querySelector('#nas-ov-telemetry tf-button');
+  assert.ok(btn, 'the install action is offered');
+  assert.equal(btn.textContent, 'Doinstaluj (sudo)…', 'and it reuses the Environment tab wording');
+  click(btn);
+  await flush();
+  const win = document.querySelector('tf-window');
+  assert.ok(win, 'the install confirmation opens');
+  assert.match(win.textContent, /smartmontools/, 'and it names the package');
+  win.remove();
+  Screen.unmount();
+});
+
 test('disk detail draws the history charts over the window the backend reports', async () => {
   const sample = (at, temperatureC, readBps, reallocatedSectors) => ({ at, temperatureC, reallocatedSectors, pendingSectors: 0, readBps, writeBps: 0, awaitMs: 1 });
   stubTransport({
@@ -779,10 +1071,10 @@ test('disk detail draws the history charts over the window the backend reports',
   await flush();
   assert.match(root.querySelector('#nas-disk-temp-chart').previousElementSibling.textContent, /Temperatura — 30 dni/);
   assert.ok(root.querySelector('#nas-disk-temp-chart tf-line-chart'), 'temperature chart mounted');
-  assert.equal(root.querySelector('#nas-disk-io-chart'), null, 'the extra 24 h transfer chart is gone');
+  assert.equal(absent(root, '#nas-disk-io-chart'), true, 'the extra 24 h transfer chart is gone');
   assert.equal(root.querySelector('#nas-disk-temp-chart polyline.tf-chart__series-line').getAttribute('points').trim().split(' ').length, 3, 'three temperature samples plotted');
   // One reallocation sample only → no chart, the empty note instead.
-  assert.equal(root.querySelector('#nas-disk-realloc-chart tf-line-chart'), null);
+  assert.equal(absent(root, '#nas-disk-realloc-chart tf-line-chart'), true);
   assert.ok(root.querySelector('#nas-disk-realloc-chart .muted'));
   assert.match(root.querySelector('.id-badge').textContent, /hdd/);
   assert.ok(root.querySelector('[data-act="copy-serial"]'), 'the serial can be copied');
@@ -866,9 +1158,13 @@ test('the environment tab carries the ksmbd row with the kernel version and the 
     binaries: ['ksmbd.mountd', 'ksmbd.control', 'ksmbd.adduser'], kernelModule: 'ksmbd', packages: ['ksmbd-tools'],
     detail: 'enp1s0f0np0 10.10.0.5 · EXPERIMENTAL (kernel docs) · ksmbd loaded', optional: true,
   };
-  stubTransport(fixtures);
-  await mountScreen({ node: LOCAL, tab: 'environment' });
-  Screen.environment = { ...environment, features: [...environment.features, ksmbd] };
+  // The probe row arrives the way the node sends it. It used to be injected by
+  // assigning `Screen.environment` and re-mounting, which only worked while the
+  // tab body raced the header probe and won.
+  stubTransport({
+    ...fixtures,
+    tentaNasEnvironmentRequest: { environment: { ...environment, features: [...environment.features, ksmbd] } },
+  });
   const root = await mountScreen({ node: LOCAL, tab: 'environment' });
   await flush();
   await flush();
@@ -890,9 +1186,10 @@ test('a ksmbd row refused by the exposure guard reads as a warning, not as a mis
     detail: 'enp3s0 192.168.1.20 also carries the default gateway — SMB Direct needs a dedicated storage network · EXPERIMENTAL (kernel docs)',
     optional: true,
   };
-  stubTransport(fixtures);
-  await mountScreen({ node: LOCAL, tab: 'environment' });
-  Screen.environment = { ...environment, features: [...environment.features, exposed] };
+  stubTransport({
+    ...fixtures,
+    tentaNasEnvironmentRequest: { environment: { ...environment, features: [...environment.features, exposed] } },
+  });
   const root = await mountScreen({ node: LOCAL, tab: 'environment' });
   await flush();
   await flush();
@@ -903,4 +1200,445 @@ test('a ksmbd row refused by the exposure guard reads as a warning, not as a mis
   assert.equal(row.status.status, 'warn');
   assert.equal(row.status.label, 'interfejs z bramą domyślną');
   assert.match(row.version, /default gateway/);
+});
+
+// -----------------------------------------------------------------------------
+// The forced setup step (n16)
+//
+// WHY these exist: an instance installed through the catalog came up with
+// `elevation.mode: "unset"` — the spelling the wire uses — while every
+// comparison in this screen tested `"unarmed"`. The panel therefore read a
+// node that could not run a single privileged command as a working one: it
+// painted a dashboard, the header badge said ok, and `withSudo` decided no
+// password was needed. The first Elastic click then failed on the server.
+// -----------------------------------------------------------------------------
+
+const unconfigured = (over = {}) => ({
+  ...environment,
+  elevation: { ...environment.elevation, mode: 'unset', helperState: 'absent', coreCompatible: false, ...over },
+});
+
+test('a node whose privilege channel is not configured opens on the setup step instead of a dashboard', async () => {
+  stubTransport({ ...fixtures, tentaNasEnvironmentRequest: { environment: unconfigured() } });
+  const root = await mountScreen({ node: LOCAL, tab: 'overview' });
+  await flush();
+
+  assert.ok(root.querySelector('#nas-setup'), 'the setup step is what the panel shows');
+  assert.equal(absent(root, '#nas-ov-kpi'), true, 'no dashboard rendered behind it');
+  assert.match(root.querySelector('tf-alert').getAttribute('message'), /Tryb kanału nie został jeszcze wybrany/);
+  // n16 promises the admin sees exactly what mode A would run.
+  assert.match(root.querySelector('#nas-setup-plan').textContent, /install -m 0755 \/opt\/tentaflow\/tentanas-helper/);
+  assert.ok(root.querySelector('[data-act="setup-mode-a"]'), 'mode A offered');
+  assert.ok(root.querySelector('[data-act="setup-mode-b"]'), 'mode B offered');
+  // The dashboard stays gated on every tab, not just the one that was asked for.
+  Screen.tab = 'pools';
+  Screen.drawTab();
+  await flush();
+  assert.ok(root.querySelector('#nas-setup'), 'the pools tab is gated too');
+  assert.equal(absent(root, '#nas-pools-list'), true);
+  Screen.unmount();
+});
+
+test('cancelling the channel wizard leaves the not-configured state and arms nothing', async () => {
+  stubTransport({ ...fixtures, tentaNasEnvironmentRequest: { environment: unconfigured() } });
+  const root = await mountScreen({ node: LOCAL, tab: 'overview' });
+  await flush();
+
+  click(root.querySelector('[data-act="setup-mode-b"]'));
+  await flush();
+  const win = document.querySelector('tf-window.nas-modal');
+  assert.ok(win, 'the existing channel wizard opened — no second password dialog');
+  click(win.querySelector('[data-wizard-cancel]'));
+  await flush();
+
+  assert.equal(kinds('tentaNasElevationArmRequest').length, 0, 'a cancelled wizard arms nothing');
+  assert.equal(kinds('tentaNasElevationProvisionRequest').length, 0, 'and provisions nothing');
+  assert.ok(root.querySelector('#nas-setup'), 'the panel stays on the honest not-configured state');
+  assert.equal(absent(root, '#nas-ov-kpi'), true, 'and never falls through to a dashboard');
+  win.remove();
+  Screen.unmount();
+});
+
+test('mode A is not offered when the helper binary is missing next to the core', async () => {
+  // Measured on the installed node: the core looks for `tentanas-helper` beside
+  // its own binary and it was not there, so provisioning would die on its first
+  // command.
+  const plan = { ...fixtures.tentaNasElevationPlanRequest.plan, helperSourcePresent: false };
+  stubTransport({
+    ...fixtures,
+    tentaNasEnvironmentRequest: { environment: unconfigured() },
+    tentaNasElevationPlanRequest: { plan },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'overview' });
+  await flush();
+
+  assert.equal(absent(root, '[data-act="setup-mode-a"]'), true, 'no button that cannot work');
+  const blocked = root.querySelector('#nas-setup-mode-a-blocked').textContent;
+  assert.match(blocked, /brak binarium helpera obok core/, 'it says specifically what is missing');
+  assert.match(blocked, /\/opt\/tentaflow\/tentanas-helper/, 'and where it was looked for');
+  assert.ok(root.querySelector('[data-act="setup-mode-b"]'), 'mode B stays available');
+  Screen.unmount();
+});
+
+// -----------------------------------------------------------------------------
+// Straight after the install (the owner's actual requirement), the viewer's
+// state, and the two states around the environment probe
+// -----------------------------------------------------------------------------
+
+test('completing the wizard retires the forced post-install step instead of leaving a stale alert', async () => {
+  // `forceSetup` was cleared by nothing but the dismiss button, and the
+  // wizard's post-run redraw was conditional on the environment tab — while
+  // the post-install route lands on `overview`. An admin who typed the sudo
+  // password correctly was still shown "channel not configured", at exactly
+  // the moment the feature is meant to prove it worked.
+  //
+  // The environment answers `unset` until the channel is armed and healthy
+  // afterwards, because the step must retire on the REFRESHED state, not on
+  // the wizard reporting success: a wizard can succeed while the channel
+  // still fails `channelUnusable()`, and then the step has to stay.
+  let envCalls = 0;
+  stubTransport({
+    ...fixtures,
+    tentaNasEnvironmentRequest: () => {
+      envCalls += 1;
+      return { environment: envCalls === 1 ? unconfigured() : environment };
+    },
+    tentaNasElevationArmRequest: {
+      elevation: { ...environment.elevation, mode: 'interactive', armedUntil: '2026-09-13 12:00:00' },
+    },
+  });
+  const root = await mountScreen({ setup: '1' });
+  try {
+    assert.equal(Screen.forceSetup, true, 'the install forced the step');
+    assert.ok(root.querySelector('#nas-setup'), 'and the step is what is on screen');
+
+    click(root.querySelector('[data-act="setup-mode-b"]'));
+    await flush();
+    const win = document.querySelector('tf-window.nas-modal');
+    assert.ok(win, 'the existing channel wizard opened — no second password dialog');
+
+    click(win.querySelector('[data-wizard-next]'));
+    await flush();
+    const pass = win.querySelector('#nas-wz-pass');
+    assert.ok(pass, 'the wizard asks for the sudo password');
+    // The field binds through `input`; assigning .value alone would leave
+    // `state.password` empty and send a blank secret, passing for the wrong
+    // reason.
+    pass.value = 'sudo-secret';
+    pass.dispatchEvent(new window.Event('input', { bubbles: true }));
+
+    click(win.querySelector('[data-wizard-next]'));
+    for (let i = 0; i < 6; i += 1) await flush();
+
+    const armed = kinds('tentaNasElevationArmRequest');
+    assert.equal(armed.length, 1, 'the wizard armed the channel');
+    assert.equal(armed[0].payload.sudoPassword, 'sudo-secret', 'carrying the password that was typed');
+
+    assert.equal(Screen.forceSetup, false, 'the forced step retires once the channel reads as usable');
+    assert.ok(root.querySelector('#nas-ov-kpi'), 'and the dashboard is what the admin now sees');
+    assert.equal(absent(root, '#nas-setup'), true, 'not the stale not-configured panel');
+  } finally {
+    document.querySelector('tf-window.nas-modal')?.remove();
+    Screen.unmount();
+  }
+});
+
+test('the post-install route forces the setup step on this node even when the channel already works', async () => {
+  // The requirement is a forced elevation step IMMEDIATELY AFTER INSTALL, not
+  // a gate that waits for somebody to open an unconfigured node later. The
+  // install path routes here with `setup=1`; these fixtures describe a node
+  // whose helper channel is perfectly healthy, so only the forcing can put
+  // the step on screen.
+  stubTransport(fixtures);
+  const root = await mountScreen({ setup: '1' });
+  // `finally`, because the screen arms polling timers on mount: a failing
+  // assertion that skipped `unmount` would leave them running and the whole
+  // FILE would hang to the runner's timeout instead of reporting this test.
+  try {
+    assert.ok(root.querySelector('#nas-setup'), 'the step is forced right after the install');
+    assert.equal(absent(root, '#nas-ov-kpi'), true, 'and not the dashboard');
+    // The route named no node: the screen opened the one the admin is on.
+    assert.equal(Screen.nodeId, LOCAL);
+    // Install is fleet-wide, the channel is per node — the step has to say so
+    // rather than let the admin believe the fleet is now armed.
+    const scope = root.querySelector('#nas-setup-scope').textContent;
+    assert.match(scope, /orion/, 'it names the node being configured');
+    assert.match(scope, /tylko dla niego/, 'and says it configures only that node');
+    assert.match(scope, /osobno na każdym węźle/, 'and that every other node is still its own job');
+    // A healthy channel must not be described as a broken one.
+    assert.match(root.querySelector('tf-alert').getAttribute('message'), /jest już skonfigurowany/);
+    // The route itself collects no secret: the wizard does, after the install.
+    assert.equal(kinds('tentaNasElevationArmRequest').length, 0);
+    assert.equal(kinds('tentaNasElevationProvisionRequest').length, 0);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+test('the forced step can be dismissed, and an unconfigured node still reads as unconfigured', async () => {
+  stubTransport({ ...fixtures, tentaNasEnvironmentRequest: { environment: unconfigured() } });
+  const root = await mountScreen({ setup: '1' });
+  try {
+    assert.ok(root.querySelector('[data-act="setup-dismiss"]'), 'mode B is a deliberate downgrade, so dismissing is possible');
+
+    click(root.querySelector('[data-act="setup-dismiss"]'));
+    await flush();
+    assert.equal(Screen.forceSetup, false, 'the post-install forcing is dropped');
+    assert.ok(root.querySelector('#nas-setup'), 'but a node with no channel is still held on the step');
+    assert.equal(absent(root, '#nas-ov-kpi'), true, 'and never falls through to a dashboard');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+test('dismissing the forced step on a configured node returns to the dashboard', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen({ setup: '1' });
+  try {
+    click(root.querySelector('[data-act="setup-dismiss"]'));
+    await flush();
+    assert.equal(absent(root, '#nas-setup'), true, 'nothing traps a working node on the step');
+    assert.ok(root.querySelector('#nas-ov-kpi'), 'a configured node shows its dashboard');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+test('a viewer is told what is wrong and who must act, not left on a spinner that never resolves', async () => {
+  // The plan box rendered "Pobieranie planu…" unconditionally while the fetch
+  // behind it was admin-only, so a non-admin sat under a heading promising
+  // commands that were never going to arrive.
+  stubTransport({
+    ...fixtures,
+    authMeRequest: { role: 'user' },
+    tentaNasEnvironmentRequest: { environment: unconfigured() },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'overview' });
+  try {
+    assert.ok(root.querySelector('#nas-setup'), 'the viewer gets the honest state too');
+    assert.equal(absent(root, '#nas-setup-plan'), true, 'and no plan box that will never fill');
+    assert.equal(kinds('tentaNasElevationPlanRequest').length, 0, 'nor a request they are not allowed to make');
+    const viewer = root.querySelector('#nas-setup-viewer').textContent;
+    assert.match(viewer, /nie jest skonfigurowany/, 'it says what is wrong');
+    assert.match(viewer, /administrator/i, 'and who has to act');
+    assert.equal(absent(root, '[data-act="setup-mode-a"]'), true, 'no action a viewer cannot take');
+    assert.equal(absent(root, '[data-act="setup-mode-b"]'), true);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+test('a failed environment probe shows the failure and a retry, never a tile-by-tile dashboard', async () => {
+  // The catch only toasted: `environment` stayed undefined, `channelUnusable()`
+  // answered false, and the whole dashboard rendered anyway — every tile then
+  // failing separately against the same silent node.
+  let attempt = 0;
+  stubTransport({
+    ...fixtures,
+    tentaNasEnvironmentRequest: () => {
+      attempt += 1;
+      if (attempt === 1) throw new Error('probe timed out');
+      return { environment };
+    },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'overview' });
+  try {
+    assert.ok(root.querySelector('#nas-probe-failed'), 'the failure is stated');
+    assert.equal(absent(root, '#nas-ov-kpi'), true, 'no dashboard over a node that cannot answer');
+    assert.equal(absent(root, '#nas-setup'), true, '"unknown" is not reported as "not configured"');
+    assert.match(root.querySelector('tf-alert').getAttribute('message'), /probe timed out/, 'and it names the failure');
+
+    click(root.querySelector('[data-act="probe-retry"]'));
+    await flush();
+    await flush();
+    assert.equal(absent(root, '#nas-probe-failed'), true, 'the retry clears the error state');
+    assert.ok(root.querySelector('#nas-ov-kpi'), 'and a node that answers gets its dashboard');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// The disk bar is repainted by every 5 s poll (applyDiskRows → paintDiskFilters)
+// because the counts live in the chip labels. The pool selector next to it was
+// already guarded by `diskPoolSig`; the chips were not, so the button under the
+// cursor was destroyed and recreated twelve times a minute.
+test('the disk filter chips survive a poll, so a click never lands on a detached button', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  await flush();
+  const bar = root.querySelector('#nas-disk-filters');
+  const buttons = [...bar.querySelectorAll('.tf-filter-chip')];
+  assert.equal(buttons.length, 5, 'all / hdd / flash / problems / free');
+  assert.match(buttons[3].textContent, /\d/, 'the label carries the live count');
+
+  await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+  await flush();
+  const after = [...bar.querySelectorAll('.tf-filter-chip')];
+  assert.equal(after.length, 5);
+  after.forEach((el, i) => assert.equal(el === buttons[i], true, `filter ${i} is the same element after the poll`));
+  Screen.unmount();
+});
+
+// One transient failure used to do two things at once: replace the whole body
+// with an alert (destroying the charts and their accumulated history) and
+// return without re-arming the timer, so the overview never refreshed again
+// until the user changed tabs.
+test('a failed overview poll patches the error in and keeps the loop alive', async () => {
+  let failing = false;
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: () => {
+      if (failing) throw new Error('node busy');
+      return fixtures.tentaNasDisksListRequest;
+    },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'overview' });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+  const kpi = root.querySelector('#nas-ov-kpi');
+  const chart = root.querySelector('#nas-ov-io');
+  assert.equal(root.querySelectorAll('#nas-ov-kpi tf-stat-card').length, 4);
+
+  const scheduled = [];
+  const realLater = Screen.later;
+  Screen.later = (fn, ms) => { scheduled.push(ms); };
+  try {
+    failing = true;
+    await Screen.refreshOverview(body);
+    await flush();
+    assert.equal(root.querySelector('#nas-ov-kpi') === kpi, true, 'the dashboard is not thrown away');
+    assert.equal(root.querySelector('#nas-ov-io') === chart, true, 'and the live chart keeps its history');
+    assert.match(root.querySelector('#nas-ov-error tf-alert').getAttribute('message'), /node busy/, 'the failure is stated');
+    assert.deepEqual(scheduled, [5000], 'the poll loop re-armed itself');
+
+    // And it recovers on its own: the next poll retracts the banner.
+    failing = false;
+    scheduled.length = 0;
+    await Screen.refreshOverview(body);
+    await flush();
+    assert.equal(absent(root, '#nas-ov-error tf-alert'), true, 'the banner is retracted');
+    assert.equal(root.querySelector('#nas-ov-kpi') === kpi, true, 'over the very same tiles');
+  } finally {
+    Screen.later = realLater;
+    Screen.unmount();
+  }
+});
+
+// `set rows` and `set rowActions` each call the table's _render(). Painting
+// both on every poll therefore ran the whole table twice per 10 s tick; the
+// actions are a function OF THE ROW, so they belong in drawFleet, once.
+test('a fleet poll runs one render pass per table, not two', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen();
+  await flush();
+  await flush();
+  const table = root.querySelector('#nas-fleet-alerts');
+  assert.equal(typeof table.rowActions, 'function', 'row actions are wired at draw time');
+  let renders = 0;
+  const real = table._render;
+  table._render = function counted() { renders += 1; return real.call(this); };
+  try {
+    await Screen.refreshFleet();
+    await flush();
+    assert.equal(renders, 1, `one render pass per poll, got ${renders}`);
+  } finally {
+    table._render = real;
+    Screen.unmount();
+  }
+});
+
+// `setAttribute` with an IDENTICAL value still runs attributeChangedCallback,
+// and tf-chip._update() does `span.textContent = ''` and rebuilds the insides —
+// the chip's text node does not survive. Two raw setAttribute calls sat two
+// lines under already-converted code, so this counter was thrown away and
+// rebuilt every 5 s for a number that had not moved.
+test('the overview alert counter is not rewritten when the count did not change', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen({ node: LOCAL, tab: 'overview' });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+  const chip = root.querySelector('#nas-ov-alerts-count');
+  const text = chip.querySelector('span').firstChild;
+  assert.equal(text.nodeType, 3, 'the count is a text node inside the chip span');
+  assert.equal(chip.getAttribute('label'), '0', 'no alerts in the fixtures');
+  try {
+    await Screen.refreshOverview(body);
+    await flush();
+    assert.equal(chip.querySelector('span').firstChild === text, true, 'the very same text node after a 5 s poll');
+
+    // A count that really moves still lands: the guard skips the write, not
+    // the update.
+    const raised = { alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'sda', title: 'sda', detail: '', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null };
+    stubTransport({ ...fixtures, tentaNasAlertsListRequest: { alerts: [raised] } });
+    await Screen.refreshOverview(body);
+    await flush();
+    assert.equal(chip.getAttribute('label'), '1', 'a changed count is written');
+    assert.equal(chip.getAttribute('status'), 'err', 'and so is the status it carries');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// Same mechanism one tab strip over: TfTab.observedAttributes includes `count`,
+// and its attributeChangedCallback runs _update() → `this._btn.innerHTML = …`
+// unconditionally. setJobsBadge is called from refreshOverview, so the tab's
+// label and count pill were destroyed and recreated twelve times a minute.
+test('the jobs tab badge is not rewritten when the running count did not change', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen({ node: LOCAL, tab: 'overview' });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+  const tab = root.querySelector('#nas-tabs tf-tab#jobs');
+  assert.equal(tab.getAttribute('count'), '1', 'one running job in the fixtures');
+  const label = tab.querySelector('.tf-tab-label');
+  const pill = tab.querySelector('.tf-tab-count');
+  assert.equal(label === null, false, 'the tab has a label span');
+  assert.equal(pill === null, false, 'and a count pill');
+  try {
+    await Screen.refreshOverview(body);
+    await flush();
+    assert.equal(tab.querySelector('.tf-tab-label') === label, true, 'the tab label survived the 5 s poll');
+    assert.equal(tab.querySelector('.tf-tab-count') === pill, true, 'and so did the count pill');
+
+    // A count that really moves still lands.
+    stubTransport({ ...fixtures, tentaNasJobsListRequest: { jobs: [] } });
+    await Screen.refreshOverview(body);
+    await flush();
+    assert.equal(tab.hasAttribute('count'), false, 'nothing running, no badge');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// paintSmartBulkButton runs on every disks poll (applyDiskRows) and used to
+// write both the label and `disabled` unconditionally. `textContent =` replaces
+// the text node, and an identical setAttribute still fires
+// attributeChangedCallback, so tf-button rebuilt its insides every 5 s —
+// measured live as the toolbar label under 6 node identities in 21 s.
+test('the bulk SMART button is not rewritten when the selection did not change', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+  const btn = root.querySelector('[data-act="smart-bulk"]');
+  assert.equal(btn === null, false, 'the toolbar has the bulk button');
+  const inner = btn.querySelector('button');
+  assert.equal(inner === null, false, 'tf-button rendered its insides');
+  try {
+    await Screen.refreshDisks(body);
+    await flush();
+    assert.equal(btn.querySelector('button') === inner, true, 'the same element survived the 5 s poll');
+    assert.equal(btn.hasAttribute('disabled'), true, 'nothing selected, so still disabled');
+
+    // A selection that really changes still lands — without this half the test
+    // would also pass if the button stopped updating altogether.
+    Screen.diskSelection.add('any-disk-id');
+    Screen.paintSmartBulkButton();
+    await flush();
+    assert.equal(btn.hasAttribute('disabled'), false, 'one selected disk enables it');
+    assert.match(btn.textContent, /1/, 'and the count reaches the label');
+  } finally {
+    Screen.diskSelection.clear();
+    Screen.unmount();
+  }
 });

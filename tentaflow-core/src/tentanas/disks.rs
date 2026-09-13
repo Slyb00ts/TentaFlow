@@ -106,6 +106,11 @@ struct Usage {
     zfs_pool: Option<String>,
     raid_member: Option<String>,
     has_children_or_fs: bool,
+    /// First filesystem signature seen that is neither a ZFS nor a RAID member
+    /// label. `has_children_or_fs` only says THAT something occupies the disk;
+    /// this says what, so the "used" role can name it instead of being a
+    /// catch-all the reader cannot act on.
+    fs_hint: Option<String>,
 }
 
 fn collect_usage(node: &Value, usage: &mut Usage) {
@@ -119,7 +124,15 @@ fn collect_usage(node: &Value, usage: &mut Usage) {
     match fstype.as_deref() {
         Some("zfs_member") => usage.zfs_pool = usage.zfs_pool.take().or(label),
         Some("linux_raid_member") => usage.raid_member = usage.raid_member.take().or(label),
-        Some(_) => usage.has_children_or_fs = true,
+        Some(other) => {
+            usage.has_children_or_fs = true;
+            // Keep the OUTERMOST signature: collect_usage recurses into
+            // children afterwards, so the first one seen is the disk's own or
+            // its first partition's, which is what the role should name.
+            if usage.fs_hint.is_none() {
+                usage.fs_hint = Some(other.to_string());
+            }
+        }
         None => {}
     }
     if let Some(children) = node.get("children").and_then(Value::as_array) {
@@ -220,6 +233,7 @@ pub fn disk_from_lsblk(node: &Value) -> Option<NasDisk> {
         io: NasDiskIo::default(),
         io_history_bps: Vec::new(),
         mountpoints: usage.mountpoints,
+        fs_type: usage.fs_hint,
         // lsblk knows the pool from the member label, never the vdev inside
         // it; `refresh_inventory` fills these from `zpool status`.
         vdev_role: String::new(),
@@ -385,6 +399,31 @@ fn attr_value(doc: &Value, id: u64) -> Option<u64> {
         .as_u64()
 }
 
+/// Unrecovered errors of a SCSI disk, summed over the command classes it
+/// reported. They are disjoint event counts — a read that failed is not a write
+/// that failed — so the total is the disk's media-error count; `max` would hide
+/// every class but the worst, and a bare "any of them is non-zero" would throw
+/// away the number the disk list and the minute samples show.
+///
+/// smartctl emits only the classes the disk answered for: `verify` is absent on
+/// all ten SAS disks this was measured against, so no key may be assumed. A
+/// document that carries none of them returns None rather than 0 — "the disk
+/// did not report it" is not "the disk reported none".
+fn scsi_uncorrected_errors(doc: &Value) -> Option<u64> {
+    let log = doc.get("scsi_error_counter_log")?;
+    let mut total: Option<u64> = None;
+    for class in ["read", "write", "verify"] {
+        if let Some(n) = log
+            .get(class)
+            .and_then(|c| c.get("total_uncorrected_errors"))
+            .and_then(Value::as_u64)
+        {
+            total = Some(total.unwrap_or(0).saturating_add(n));
+        }
+    }
+    total
+}
+
 pub fn summarize_smart(doc: &Value) -> SmartSummary {
     let nvme = doc.get("nvme_smart_health_information_log");
     let mut s = SmartSummary {
@@ -394,7 +433,14 @@ pub fn summarize_smart(doc: &Value) -> SmartSummary {
             .and_then(Value::as_i64)
             .map(|t| t as i32),
         power_on_hours: doc.pointer("/power_on_time/hours").and_then(Value::as_u64),
-        firmware: doc.get("firmware_version").and_then(Value::as_str).map(str::to_string),
+        // A SAS/SCSI disk reports no `firmware_version` at all; the revision it
+        // does report is `scsi_revision` (measured on /dev/sdb: the first key
+        // absent, the second "0101").
+        firmware: doc
+            .get("firmware_version")
+            .or_else(|| doc.get("scsi_revision"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         ..Default::default()
     };
     if let Some(n) = nvme {
@@ -428,6 +474,19 @@ pub fn summarize_smart(doc: &Value) -> SmartSummary {
                 .or_else(|| attr_raw(doc, 190))
                 .map(|t| (t & 0xff) as i32);
         }
+        // SAS/SCSI disks carry no attribute table at all, so every `attr_raw`
+        // above is None for them. The grown defect list is the SCSI analogue of
+        // reallocated sectors: blocks the drive reassigned after it left the
+        // factory. The error counter log is the analogue of the ATA
+        // uncorrectable counts. `pending` and `crc_errors` stay unmapped — SCSI
+        // exposes no honest equivalent of a pending-reallocation count or of the
+        // SATA interface CRC counter.
+        if s.reallocated.is_none() {
+            s.reallocated = doc.get("scsi_grown_defect_list").and_then(Value::as_u64);
+        }
+        if s.media_errors.is_none() {
+            s.media_errors = scsi_uncorrected_errors(doc);
+        }
     }
     let st = doc.pointer("/ata_smart_data/self_test/status");
     if let Some(st) = st {
@@ -439,6 +498,17 @@ pub fn summarize_smart(doc: &Value) -> SmartSummary {
         {
             s.self_test_failed = true;
         }
+    }
+    // A SAS/SCSI disk has no ATA status pointer, so the block above never fires
+    // for it: without this, the detail view could show a red "failed" self-test
+    // row while `score_health` called the disk "ok" and no alert was raised.
+    // The newest entry that is not still running is the last verdict the disk
+    // gave — an in-progress entry on top must not hide the failure under it.
+    if st.is_none() && doc.get("scsi_self_test_0").is_some() {
+        s.self_test_failed = smart_self_tests(doc)
+            .iter()
+            .find(|t| t.status != "running")
+            .is_some_and(|t| t.status == "failed");
     }
     s
 }
@@ -582,6 +652,38 @@ pub fn smart_self_tests(doc: &Value) -> Vec<NasSmartSelfTest> {
                     .to_string(),
             });
         }
+    }
+    // SCSI has no self-test table: smartctl prints the log as numbered
+    // top-level keys, newest first, and stops emitting them where the log ends.
+    for i in 0..20 {
+        let Some(r) = doc.get(format!("scsi_self_test_{i}")) else {
+            break;
+        };
+        out.push(NasSmartSelfTest {
+            kind: r.pointer("/code/string").and_then(Value::as_str).unwrap_or("").to_string(),
+            // The SPC self-test result code (smartctl's own table in
+            // `scsiprint.cpp`): 0 completed, 1 aborted by the user's command,
+            // 2 aborted by a device reset, 3 "unknown error, incomplete",
+            // 4–7 segment failures, 8–14 reserved, 15 still running.
+            //
+            // Only 4–7 are a disk fault. Code 3 means the test did not finish
+            // and 8–14 mean nothing at all, so both stay "unknown": the
+            // self-test job fails a run on "failed", and the health score now
+            // marks a disk critical on it, so lumping them in would report a
+            // healthy disk as broken.
+            status: match r.pointer("/result/value").and_then(Value::as_u64) {
+                Some(0) => "passed",
+                Some(1 | 2) => "aborted",
+                Some(4..=7) => "failed",
+                Some(15) => "running",
+                // 3, 8–14, and a document with no result code at all.
+                _ => "unknown",
+            }
+            .to_string(),
+            lifetime_hours: r.pointer("/power_on_time/hours").and_then(Value::as_u64).unwrap_or(0),
+            started_at: None,
+            detail: r.pointer("/result/string").and_then(Value::as_str).unwrap_or("").to_string(),
+        });
     }
     out
 }
@@ -1060,9 +1162,9 @@ pub async fn refresh_smart(db: &DbPool) -> Result<()> {
     Ok(())
 }
 
-/// One `smartctl --json=c -x` run. smartctl's exit code is a bitmask; bits
-/// 0–2 mean the command itself failed, the rest are disk findings that
-/// still come with a full document.
+/// One `smartctl --json=c -x` run. smartctl's exit code is a bitmask; only
+/// bits 0–1 mean the command itself failed, the rest still come with a full
+/// document.
 pub async fn read_smart_document(
     db: &DbPool,
     device: &str,
@@ -1077,14 +1179,74 @@ pub async fn read_smart_document(
         Duration::from_secs(60),
     )
     .await?;
-    if out.code & 0b111 != 0 || out.stdout.trim().is_empty() {
+    smart_document_from_output(&out)
+}
+
+/// The exit-code bits that mean no document came back: bit 0 "command line did
+/// not parse", bit 1 "device open failed". Bit 2 is deliberately NOT here — it
+/// means "a SMART or other ATA command failed", which a SAS/SCSI disk reports
+/// routinely because the ATA-specific command does not apply to it, while still
+/// printing a complete SCSI document. Bits 3–7 are disk FINDINGS (failing,
+/// prefail, error-log records) and have always come with a full document.
+const SMARTCTL_NO_DOCUMENT: i32 = 0b011;
+
+fn smart_document_from_output(out: &broker::CommandOutput) -> Result<Value> {
+    if out.code & SMARTCTL_NO_DOCUMENT != 0 || out.stdout.trim().is_empty() {
         return Err(anyhow!(
             "smartctl failed ({}): {}",
             out.code,
-            out.stderr.trim().lines().next().unwrap_or("no output")
+            smartctl_failure_detail(out)
         ));
     }
     Ok(serde_json::from_str(&out.stdout)?)
+}
+
+/// What to tell the admin when the run really did fail. With `--json` smartctl
+/// reports through `smartctl.messages` on stdout and leaves stderr empty by
+/// design, so reading stderr alone produced "no output" even when stdout held a
+/// whole document.
+pub(super) fn smartctl_failure_detail(out: &broker::CommandOutput) -> String {
+    let doc = serde_json::from_str::<Value>(&out.stdout).ok();
+    // smartctl appends informational lines to this same array (`jinf()`), so
+    // joining all of it made a failure lead with a note that was not the
+    // failure. Informational text is still better than no reason at all, so it
+    // becomes the fallback rather than being dropped; a message carrying no
+    // severity is an unknown shape, not an informational one, and is kept.
+    let spoken = doc
+        .as_ref()
+        .and_then(|d| d.pointer("/smartctl/messages"))
+        .and_then(Value::as_array)
+        .and_then(|msgs| {
+            let join = |serious: bool| {
+                msgs.iter()
+                    .filter(|m| {
+                        let severity = m.get("severity").and_then(Value::as_str).unwrap_or("");
+                        (severity != "information") == serious
+                    })
+                    .filter_map(|m| m.get("string").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let text = match join(true) {
+                t if t.is_empty() => join(false),
+                t => t,
+            };
+            (!text.is_empty()).then_some(text)
+        });
+    if let Some(spoken) = spoken {
+        return spoken;
+    }
+    if let Some(line) = out.stderr.trim().lines().next() {
+        return line.to_string();
+    }
+    let stdout = out.stdout.trim();
+    if stdout.is_empty() {
+        "no output".to_string()
+    } else {
+        // Output WAS there, smartctl just gave no reason; say so honestly
+        // rather than claiming the run printed nothing.
+        format!("no diagnostic message ({} bytes on stdout)", stdout.len())
+    }
 }
 
 fn sync_health_alert(db: &DbPool, disk_id: &str, previous: &str, health: &str, reason: &str) -> Result<()> {
@@ -1216,12 +1378,18 @@ pub fn request_smart_refresh() {
 mod tests {
     use super::*;
 
+    /// `smartctl --json=c -x /dev/sdb` of a TOSHIBA MG07SCA14TE behind a SAS
+    /// expander, copied byte for byte off the node this fix was measured on.
+    const SMART_SAS: &str = include_str!("../../tests/fixtures/smart-sas-sdb.json");
+
     const LSBLK: &str = r#"{"blockdevices":[
       {"name":"sda","path":"/dev/sda","type":"disk","model":"WDC WD80EFZZ","serial":"WD-1","wwn":"0x5000cca","size":8001563222016,"tran":"sata","rota":true,"rm":false,"rev":"81.00","vendor":"ATA     ","mountpoints":[null],"fstype":null,"label":null,
        "children":[{"name":"sda1","path":"/dev/sda1","type":"part","mountpoints":[null],"fstype":"zfs_member","label":"tank"}]},
       {"name":"nvme0n1","path":"/dev/nvme0n1","type":"disk","model":"Samsung 980","serial":"S1","wwn":null,"size":1000204886016,"tran":"nvme","rota":false,"rm":false,"rev":null,"vendor":null,"mountpoints":[null],"fstype":null,"label":null,
        "children":[{"name":"nvme0n1p2","path":"/dev/nvme0n1p2","type":"part","mountpoints":["/"],"fstype":"ext4","label":null}]},
       {"name":"sdb","path":"/dev/sdb","type":"disk","model":"ST4000","serial":"Z4","wwn":null,"size":"4000787030016","tran":"sata","rota":"1","rm":"0","rev":null,"vendor":"ATA","mountpoints":[null],"fstype":null,"label":null},
+      {"name":"sdc","path":"/dev/sdc","type":"disk","model":"HUS726","serial":"K5","wwn":null,"size":6001175126016,"tran":"sas","rota":true,"rm":false,"rev":"A3","vendor":"HGST","mountpoints":[null],"fstype":null,"label":null,
+       "children":[{"name":"sdc1","path":"/dev/sdc1","type":"part","mountpoints":[null],"fstype":"ext4","label":"old-data"}]},
       {"name":"loop0","path":"/dev/loop0","type":"loop","size":1,"mountpoints":["/snap/x"]},
       {"name":"zd0","path":"/dev/zd0","type":"disk","size":1,"mountpoints":[null]}
     ]}"#;
@@ -1229,7 +1397,7 @@ mod tests {
     #[test]
     fn lsblk_inventory_classifies_disks() {
         let disks = disks_from_lsblk_json(LSBLK).unwrap();
-        assert_eq!(disks.len(), 3);
+        assert_eq!(disks.len(), 4);
         let sda = &disks[0];
         assert_eq!(sda.disk_id, "wwn-5000cca");
         assert_eq!(sda.kind, "hdd");
@@ -1245,6 +1413,32 @@ mod tests {
         assert_eq!(sdb.size_bytes, 4000787030016);
         assert!(sdb.rotational);
         assert_eq!(sdb.role, "free");
+    }
+
+    /// `used` is the role every disk falls back to that is not system, not in a
+    /// pool or array and not mounted, yet carries a filesystem signature. On the
+    /// machine this was measured on it covers 23 of 29 disks, so on its own it
+    /// tells the reader nothing they can act on — it has to name the occupier.
+    #[test]
+    fn a_disk_with_only_a_filesystem_signature_names_it() {
+        let disks = disks_from_lsblk_json(LSBLK).unwrap();
+        let sdc = disks.iter().find(|d| d.name == "sdc").expect("sdc is in the fixture");
+        assert_eq!(sdc.role, "used");
+        assert_eq!(sdc.fs_type.as_deref(), Some("ext4"));
+        // Nothing owns it, so no membership may be claimed.
+        assert_eq!(sdc.member_of, None);
+    }
+
+    /// A ZFS member label belongs in `member_of` and must never reach
+    /// `fs_type`: the two are rendered in different places, and a leak would
+    /// print a pool name where a filesystem is expected.
+    #[test]
+    fn a_pool_member_reports_no_filesystem_signature() {
+        let disks = disks_from_lsblk_json(LSBLK).unwrap();
+        let sda = disks.iter().find(|d| d.name == "sda").expect("sda is in the fixture");
+        assert_eq!(sda.role, "pool_member");
+        assert_eq!(sda.member_of.as_deref(), Some("tank"));
+        assert_eq!(sda.fs_type, None);
     }
 
     #[test]
@@ -1307,6 +1501,271 @@ mod tests {
         assert_eq!(score_health(&s, "nvme", None).0, "ok");
         let attrs = smart_attributes(&doc);
         assert!(attrs.iter().any(|a| a.name == "Unsafe Shutdowns" && a.status == "warning"));
+    }
+
+    /// A real SAS disk, captured verbatim from a node where every such disk
+    /// showed as "unknown" before the exit-code fix: `smartctl --json=c -x`
+    /// exits 4 (bit 2 set, because an ATA-only command does not apply to a SCSI
+    /// disk) and prints a complete document with no ATA attribute table in it.
+    /// Pinning the fixture to the capture keeps the SCSI field names honest —
+    /// every key read below is a key the disk really emitted.
+    #[test]
+    fn smart_summary_for_scsi() {
+        let doc: Value = serde_json::from_str(SMART_SAS).expect("captured SAS document");
+        assert_eq!(doc.pointer("/smartctl/exit_status").and_then(Value::as_i64), Some(4));
+        assert_eq!(doc.pointer("/device/type").and_then(Value::as_str), Some("scsi"));
+
+        let s = summarize_smart(&doc);
+        assert_eq!(s.passed, Some(true));
+        assert_eq!(s.temperature_c, Some(46));
+        assert_eq!(s.power_on_hours, Some(32392));
+        // The SCSI analogue of reallocated sectors: present, not silently missing.
+        assert_eq!(s.reallocated, Some(0));
+        // No ATA attribute table, and no honest SCSI equivalent for these two.
+        assert_eq!(s.pending, None);
+        assert_eq!(s.crc_errors, None);
+        // A SAS disk reports no `firmware_version` at all; the revision it does
+        // report lives in `scsi_revision`.
+        assert!(doc.get("firmware_version").is_none());
+        assert_eq!(s.firmware.as_deref(), Some("0101"));
+        // Unrecovered errors, summed over the classes the disk reported — this
+        // document carries `read` and `write` and no `verify` block.
+        assert!(doc.pointer("/scsi_error_counter_log/verify").is_none());
+        assert_eq!(s.media_errors, Some(0));
+        // Every counter clean, so the disk the node called "unknown" is "ok".
+        assert_eq!(score_health(&s, "hdd", None), ("ok", String::new()));
+
+        // SCSI keeps its self-test log in numbered keys, not a table.
+        let tests = smart_self_tests(&doc);
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].kind, "Background short");
+        assert_eq!(tests[0].status, "passed");
+        assert_eq!(tests[0].lifetime_hours, 32392);
+        assert_eq!(tests[0].detail, "Completed");
+
+        // Known gap, asserted so it cannot change unnoticed: the attribute grid
+        // of the detail view stays empty for SAS. SCSI has no attribute table
+        // and no thresholds, so filling the grid means inventing both.
+        assert!(smart_attributes(&doc).is_empty());
+    }
+
+    /// SCSI counts unrecovered errors per command class, and smartctl emits
+    /// only the classes the disk answered for, so the summary has to add up
+    /// what is there without assuming all three keys exist.
+    #[test]
+    fn scsi_uncorrected_errors_become_media_errors() {
+        let counted = |log: Value| {
+            summarize_smart(&serde_json::json!({
+                "smart_status": {"passed": true},
+                "scsi_error_counter_log": log,
+            }))
+        };
+
+        // All three classes: the disk's total, not the worst single class.
+        let s = counted(serde_json::json!({
+            "read": {"total_uncorrected_errors": 2},
+            "write": {"total_uncorrected_errors": 3},
+            "verify": {"total_uncorrected_errors": 4},
+        }));
+        assert_eq!(s.media_errors, Some(9));
+        assert_eq!(score_health(&s, "hdd", None).0, "critical");
+
+        // `verify` absent — the shape of every disk in the fleet.
+        let s = counted(serde_json::json!({
+            "read": {"total_uncorrected_errors": 0},
+            "write": {"total_uncorrected_errors": 0},
+        }));
+        assert_eq!(s.media_errors, Some(0));
+        assert_eq!(score_health(&s, "hdd", None).0, "ok");
+
+        // A log with corrected errors but no uncorrected counter at all is not
+        // evidence of zero: "not reported" must stay None, or the UI would show
+        // a clean count the disk never gave.
+        assert_eq!(counted(serde_json::json!({"read": {"total_errors_corrected": 7}})).media_errors, None);
+        // Neither is a document with no counter log.
+        assert_eq!(
+            summarize_smart(&serde_json::json!({"smart_status": {"passed": true}})).media_errors,
+            None
+        );
+    }
+
+    /// The SCSI self-test result is an SPC code, not a pass/fail flag; it maps
+    /// onto the same status vocabulary the ATA and NVMe logs already use.
+    #[test]
+    fn scsi_self_test_results_map_to_the_shared_vocabulary() {
+        let entry = |value: u64, string: &str| {
+            serde_json::json!({
+                "code": {"value": 1, "string": "Background short"},
+                "result": {"value": value, "string": string},
+                "power_on_time": {"hours": 100},
+            })
+        };
+        // EVERY code in each range appears, not a representative of it. A
+        // mutation run narrowed `4..=7` to `4..=6` with the whole suite still
+        // green, because this test asserted 5 but never 4, 6 or 7 — so code 7,
+        // a real disk failure, could be silently dropped. Both ends of every
+        // range are therefore spelled out below.
+        let doc = serde_json::json!({
+            "scsi_self_test_0": entry(15, "Self test in progress ..."),
+            "scsi_self_test_1": entry(1, "Aborted (by user command)"),
+            "scsi_self_test_2": entry(2, "Aborted (device reset ?)"),
+            "scsi_self_test_3": entry(4, "Completed, segment failed"),
+            "scsi_self_test_4": entry(5, "Failed in first segment"),
+            "scsi_self_test_5": entry(6, "Failed in second segment"),
+            "scsi_self_test_6": entry(7, "Failed in segment -->"),
+            "scsi_self_test_7": entry(3, "Unknown error, incomplete"),
+            "scsi_self_test_8": entry(8, "Reserved"),
+            "scsi_self_test_9": entry(14, "Reserved"),
+            "scsi_self_test_10": entry(0, "Completed"),
+        });
+        let statuses: Vec<String> = smart_self_tests(&doc).into_iter().map(|t| t.status).collect();
+        // Both abort codes are covered: 1 is the user's command, 2 is a device
+        // reset. Code 3 is "unknown error, incomplete" and 8–14 are reserved —
+        // neither is a segment failure, and the self-test job fails the run on
+        // "failed", so calling them one would report a healthy disk as broken.
+        assert_eq!(
+            statuses,
+            [
+                "running", "aborted", "aborted", // 15, 1, 2
+                "failed", "failed", "failed", "failed", // 4, 5, 6, 7 — both ends
+                "unknown", "unknown", "unknown", // 3, 8, 14 — both ends of reserved
+                "passed", // 0
+            ]
+        );
+    }
+
+    /// The self-test list reads the SCSI log, so the health score has to read it
+    /// too — otherwise a SAS disk shows a red "failed" row in the detail view
+    /// while `score_health` calls it "ok" and no alert is ever raised.
+    #[test]
+    fn a_failed_scsi_self_test_reaches_the_health_score() {
+        let entry = |value: u64, string: &str| {
+            serde_json::json!({
+                "code": {"value": 2, "string": "Background long"},
+                "result": {"value": value, "string": string},
+                "power_on_time": {"hours": 100},
+            })
+        };
+        let doc = |newest: Value, older: Value| {
+            summarize_smart(&serde_json::json!({
+                "smart_status": {"passed": true},
+                "scsi_grown_defect_list": 0,
+                "scsi_self_test_0": newest,
+                "scsi_self_test_1": older,
+            }))
+        };
+
+        let failed = doc(entry(5, "Failed in first segment"), entry(0, "Completed"));
+        assert!(failed.self_test_failed);
+        assert_eq!(score_health(&failed, "hdd", None).0, "critical");
+
+        // A test still running does not hide the verdict underneath it.
+        let running = doc(
+            entry(15, "Self test in progress ..."),
+            entry(5, "Failed in first segment"),
+        );
+        assert!(running.self_test_failed);
+
+        // A clean newest entry clears it — the last verdict is the one that counts.
+        let passed = doc(entry(0, "Completed"), entry(5, "Failed in first segment"));
+        assert!(!passed.self_test_failed);
+        assert_eq!(score_health(&passed, "hdd", None).0, "ok");
+
+        // An incomplete test (SPC 3) is not a disk fault.
+        let incomplete = doc(entry(3, "Unknown error, incomplete"), entry(0, "Completed"));
+        assert!(!incomplete.self_test_failed);
+    }
+
+    /// smartctl appends informational lines to the same `messages` array it
+    /// reports errors through, so a failure must lead with what actually failed.
+    #[test]
+    fn a_failure_reason_leads_with_the_message_that_failed() {
+        let out = |messages: &str| broker::CommandOutput {
+            code: 2,
+            stdout: format!(r#"{{"smartctl":{{"exit_status":2,"messages":{messages}}}}}"#),
+            stderr: String::new(),
+        };
+
+        let mixed = out(
+            r#"[{"string":"Note: mode page changed","severity":"information"},
+                {"string":"Smartctl open device: /dev/sdz failed: No such device","severity":"error"}]"#,
+        );
+        assert_eq!(
+            smartctl_failure_detail(&mixed),
+            "Smartctl open device: /dev/sdz failed: No such device"
+        );
+
+        // Informational is all there is: say it rather than pretending smartctl
+        // gave no reason at all.
+        let only_info = out(r#"[{"string":"Note: mode page changed","severity":"information"}]"#);
+        assert_eq!(smartctl_failure_detail(&only_info), "Note: mode page changed");
+
+        // No severity at all is an unknown shape, not an informational one.
+        let bare = out(r#"[{"string":"something went wrong"}]"#);
+        assert_eq!(smartctl_failure_detail(&bare), "something went wrong");
+    }
+
+    /// smartctl's exit code is a bitmask: only bits 0–1 mean "the command did
+    /// not run". Bit 2 and the findings bits still come with a full document.
+    #[test]
+    fn a_smart_document_is_kept_unless_the_command_itself_failed() {
+        const DOC: &str =
+            r#"{"smartctl":{"exit_status":4},"smart_status":{"passed":true},"scsi_grown_defect_list":0}"#;
+        let out = |code: i32, stdout: &str| broker::CommandOutput {
+            code,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        };
+
+        // Bit 2 on a SAS disk: the document is complete and must be used.
+        let v = smart_document_from_output(&out(4, DOC)).expect("exit 4 must be accepted");
+        assert_eq!(
+            v.pointer("/smart_status/passed").and_then(Value::as_bool),
+            Some(true)
+        );
+        // Findings bits were already accepted; keep it that way.
+        assert!(smart_document_from_output(&out(64, DOC)).is_ok());
+        assert!(smart_document_from_output(&out(0, DOC)).is_ok());
+
+        // Bits 0 and 1 genuinely mean there is no usable document.
+        assert!(smart_document_from_output(&out(1, DOC)).is_err());
+        assert!(smart_document_from_output(&out(2, DOC)).is_err());
+        // Nothing came back at all.
+        assert!(smart_document_from_output(&out(0, "   ")).is_err());
+    }
+
+    /// With `--json` smartctl reports through stdout and leaves stderr empty by
+    /// design, so the failure text must come from the document — and must never
+    /// claim there was no output when output was there.
+    #[test]
+    fn a_failed_smart_read_reports_an_honest_reason() {
+        // smartctl explained itself in the document: use its own words.
+        let spoken = broker::CommandOutput {
+            code: 2,
+            stdout: r#"{"smartctl":{"exit_status":2,"messages":[{"string":"Smartctl open device: /dev/sdz failed: No such device","severity":"error"}]}}"#.to_string(),
+            stderr: String::new(),
+        };
+        let e = smart_document_from_output(&spoken).unwrap_err().to_string();
+        assert!(e.contains("No such device"), "{e}");
+
+        // Nothing at all came back: "no output" is then the truth.
+        let silent = broker::CommandOutput {
+            code: 2,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let e = smart_document_from_output(&silent).unwrap_err().to_string();
+        assert!(e.contains("no output"), "{e}");
+
+        // Output was there but smartctl gave no reason for it.
+        let mute = broker::CommandOutput {
+            code: 1,
+            stdout: r#"{"smartctl":{"exit_status":1,"messages":null}}"#.to_string(),
+            stderr: String::new(),
+        };
+        let e = smart_document_from_output(&mute).unwrap_err().to_string();
+        assert!(!e.contains("no output"), "must not claim there was none: {e}");
+        assert!(e.contains("bytes on stdout"), "{e}");
     }
 
     fn warned(days: i64, reallocated: Option<u64>) -> (NasDisk, String) {

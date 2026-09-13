@@ -278,6 +278,43 @@ test('a parked answer reports that nothing ran instead of opening a job log', as
   screen.dispose();
 });
 
+// The purest form of the defect the owner complained about: the settings line
+// is rebuilt from byte-identical markup on every 30 s poll, so it flickers for
+// nothing and a selection inside it cannot survive one tick.
+test('an unchanged poll leaves the approvals settings line alone', async () => {
+  const screen = fakeScreen({ tentaNasApprovalsListRequest: { approvals: [pending()], settings: settings() } });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const el = body.querySelector('#nas-approvals-settings');
+  const span = el.querySelector('.text-3');
+  assert.ok(span, 'the line names where the rule comes from');
+
+  await refresh();
+  await flush();
+  assert.equal(el.querySelector('.text-3') === span, true, 'the settings line is not rewritten every poll');
+  screen.dispose();
+});
+
+// …and it still has to follow the setting when it really moves.
+test('a changed approvals setting is still repainted', async () => {
+  let adminCount = 2;
+  const screen = fakeScreen({ tentaNasApprovalsListRequest: () => ({ approvals: [pending()], settings: settings({ adminCount }) }) });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const el = body.querySelector('#nas-approvals-settings');
+  assert.doesNotMatch(el.textContent, /Tylko jeden administrator/, 'two admins need no single-admin warning');
+
+  adminCount = 1;
+  await refresh();
+  await flush();
+  assert.match(el.textContent, /Tylko jeden administrator/, 'dropping to one admin is reported');
+  screen.dispose();
+});
+
 test('reportParked names the operation and the resource it would have touched', async () => {
   const win = reportParked(pending({ operation: 'share_delete', subject: 'projekty' }));
   await flush();
