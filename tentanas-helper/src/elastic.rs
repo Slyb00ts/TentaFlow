@@ -5958,7 +5958,43 @@ pub(crate) mod execution {
         nothing: usize,
         nothing_status: usize,
         clean: usize,
-        error: bool,
+        /// Markers in the tool's OWN log that are a verdict — `error:`,
+        /// `parity_error:`, `msg:error:` — verbatim and bounded, so a run can
+        /// say what the tool actually reported instead of only that something
+        /// was reported.
+        fault: Option<String>,
+        /// `msg:fatal:` lines, verbatim and bounded. DESPITE THE SPELLING THIS
+        /// IS NOT A VERDICT. Measured on rig11 (2026-09-13), three different
+        /// texts arrive under this marker on runs that finished perfectly —
+        /// exit 0, complete summary, parity written: the two-parity
+        /// recommendation, a content file read from its second copy, and a
+        /// first sync assuming an empty content file. Genuine faults carrying
+        /// the same marker died before snapraid wrote any summary at all. So
+        /// the summary contract below decides the outcome and this text only
+        /// travels with the run.
+        advisory: Option<String>,
+        /// What the tool wrote to stderr, bounded and on one line, or `None`
+        /// when it wrote nothing. This is EVIDENCE, never a verdict: snapraid
+        /// prints configuration advice there on a perfectly healthy run — an
+        /// array with six or more data disks and one parity gets "WARNING! For
+        /// N disks, it's recommended to use two parity levels." on EVERY run.
+        /// Reading that as failure left a correct array read-only and its
+        /// parity marked stale (rig11, 2026-09-12).
+        warning: Option<String>,
+    }
+
+    /// Keeps a marker line the log carried, verbatim, joined and bounded. The
+    /// text is evidence an operator reads, so it is never summarised away —
+    /// only cut at the bound every journal text is cut at.
+    fn record_marker(slot: &mut Option<String>, line: &str) {
+        let text = slot.get_or_insert_with(String::new);
+        if text.len() >= TRANSFER_DETAIL_LIMIT {
+            return;
+        }
+        if !text.is_empty() {
+            text.push_str("; ");
+        }
+        text.push_str(&bounded_text(line, TRANSFER_DETAIL_LIMIT));
     }
 
     fn read_lines(
@@ -5989,6 +6025,18 @@ pub(crate) mod execution {
     }
 
     impl SnapraidLog {
+        /// Everything the tool said that is EVIDENCE rather than a verdict:
+        /// its `msg:fatal:` lines and whatever it wrote to stderr, as one
+        /// bounded line for the run's detail.
+        fn notes(&self) -> Option<String> {
+            let joined = [self.advisory.as_deref(), self.warning.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+            (!joined.is_empty()).then(|| bounded_text(&joined, TRANSFER_DETAIL_LIMIT))
+        }
+
         fn field(&self, key: &str) -> &[String] {
             self.fields.get(key).map(Vec::as_slice).unwrap_or(&[])
         }
@@ -6048,9 +6096,15 @@ pub(crate) mod execution {
                 if line.starts_with("error:")
                     || line.starts_with("parity_error:")
                     || line.starts_with("msg:error:")
-                    || line.starts_with("msg:fatal:")
                 {
-                    result.error = true;
+                    record_marker(&mut result.fault, line);
+                }
+                // `msg:fatal:` is snapraid's marker for "something you should
+                // know", not for "this run failed": it carries advice and
+                // successful recoveries as well as faults. It is kept as text
+                // and judged by the summary contract, never on its own.
+                if line.starts_with("msg:fatal:") {
+                    record_marker(&mut result.advisory, line);
                 }
                 Ok(())
             })?;
@@ -6143,8 +6197,18 @@ pub(crate) mod execution {
             run.errors_file = self.number("summary:error_file")?;
             run.errors_io = self.number("summary:error_io")?;
             run.errors_data = self.number("summary:error_data")?;
-            if self.error {
-                return Err("diagnostyka błędu w logu".into());
+            // Only the markers that ARE a verdict stop the run here, and the
+            // reason names what the tool said. A `msg:fatal:` advisory does
+            // NOT short-circuit: everything needed to judge the run is the
+            // contract below — the summary, one 100% progress entry, exactly
+            // one `Everything OK` and three zeroed counters — and that
+            // contract demands positive evidence, so a run that died part-way
+            // still fails whatever it printed.
+            if let Some(fault) = &self.fault {
+                return Err(bounded_text(
+                    &format!("diagnostyka błędu w logu: {fault}"),
+                    TRANSFER_DETAIL_LIMIT,
+                ));
             }
             let errors = [run.errors_file, run.errors_io, run.errors_data];
             if errors.iter().flatten().any(|v| *v != 0) {
@@ -6262,6 +6326,36 @@ pub(crate) mod execution {
         Ok((spec, empty))
     }
 
+    /// How the run's detail introduces text the tool wrote to stderr, so an
+    /// operator reading a run can tell the tool's own words from ours.
+    const SNAPRAID_WARNING_PREFIX: &str = "ostrzeżenie snapraid: ";
+    /// What is read back from a captured stderr. The text is bounded again to
+    /// `TRANSFER_DETAIL_LIMIT` afterwards; this only stops a runaway tool from
+    /// making the read itself unbounded.
+    const STDERR_CAPTURE_BYTES: u64 = 8 * 1024;
+
+    /// The text the tool wrote to stderr, as one bounded line, or `None` when
+    /// it wrote nothing printable. Reopened through `private_file` like the
+    /// log and the stdout capture, so the same ownership and mode check covers
+    /// it, and whitespace is collapsed so a multi-line advisory still reads as
+    /// one sentence in a run's detail.
+    fn captured_stderr(path: &Path, uid: u32) -> Result<Option<String>, String> {
+        let file = private_file(path, uid)?;
+        if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        file.take(STDERR_CAPTURE_BYTES)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&bytes);
+        let text = bounded_text(
+            &text.split_whitespace().collect::<Vec<_>>().join(" "),
+            TRANSFER_DETAIL_LIMIT,
+        );
+        Ok((!text.is_empty()).then_some(text))
+    }
+
     fn capture_snapraid(
         root: &Root,
         array_lock: &File,
@@ -6313,9 +6407,24 @@ pub(crate) mod execution {
             private_file(&directory.join(format!("{label}.log")), root.uid)?,
             private_file(&directory.join(format!("{label}.stdout")), root.uid)?,
         );
-        if stderr.metadata().map_err(|e| e.to_string())?.len() != 0 {
-            if let Ok(log) = &mut parsed {
-                log.error = true;
+        // stderr DOES NOT decide the outcome. The exit code and the markers
+        // the parser recognises in the log and on stdout do; what the tool
+        // wrote to stderr travels with the run as evidence, so an advisory
+        // printed by a healthy run is read by the operator instead of holding
+        // the array.
+        if let Some(warning) = captured_stderr(&directory.join(format!("{label}.stderr")), root.uid)?
+        {
+            match &mut parsed {
+                Ok(log) => log.warning = Some(warning),
+                // A log this helper cannot parse is a failure on its own, and
+                // the reason may well be in what the tool said on stderr: keep
+                // the text on that path too rather than swallowing it.
+                Err(error) => {
+                    *error = bounded_text(
+                        &format!("{error}; {SNAPRAID_WARNING_PREFIX}{warning}"),
+                        TRANSFER_DETAIL_LIMIT,
+                    )
+                }
             }
         }
         Ok((status.code(), parsed))
@@ -6409,7 +6518,15 @@ pub(crate) mod execution {
             )?;
             let diff = diff?;
             diff.identity(&spec, "diff")?;
-            if diff.error {
+            // A verdict marker only: neither stderr nor a `msg:fatal:`
+            // advisory blocks the pre-diff, which is judged by its exit code
+            // and its `summary:exit` below. Both appear on every invocation on
+            // an array like rig11's, and they would otherwise block every
+            // scrub. The diff's own notes are not carried into the run: a
+            // refusal's detail is a closed vocabulary the core validates, and
+            // the scrub that follows prints the same advisory itself, where
+            // the run does record it.
+            if diff.fault.is_some() {
                 return Err("błąd odczytowego pre-diff".into());
             }
             let changed = diff.scan()?;
@@ -6523,10 +6640,30 @@ pub(crate) mod execution {
             }
             parsed
         });
+        // What the tool said on stderr or under `msg:fatal:`, whatever the
+        // verdict was. It rides in the RUN's detail, where an operator reads
+        // the run; the ARRAY's detail stays clean on success, because advice
+        // is not a reason to hold an array whose parity is complete.
+        let warning = captured
+            .as_ref()
+            .and_then(|(_, parsed)| parsed.as_ref().ok())
+            .and_then(|log| log.notes());
         run.finished_at = Some(timestamp()?);
+        let outcome = match (outcome, &warning) {
+            // A failure keeps its own reason first: the stderr text explains
+            // it, it does not replace it.
+            (Err(error), Some(warning)) => Err(format!("{error}; {SNAPRAID_WARNING_PREFIX}{warning}")),
+            (outcome, _) => outcome,
+        };
         match outcome {
             Ok(()) => {
                 run.outcome = ElasticSnapraidOutcome::Succeeded;
+                run.detail = warning.map(|warning| {
+                    bounded_text(
+                        &format!("{SNAPRAID_WARNING_PREFIX}{warning}"),
+                        TRANSFER_DETAIL_LIMIT,
+                    )
+                });
                 if kind == ElasticSnapraidKind::Sync {
                     journal.sync_completed_at = run.finished_at.clone();
                     journal.stale_parity_bytes = None;
@@ -8457,6 +8594,300 @@ Nothing to do
                 false
             )
             .is_err());
+        }
+
+        /// The line snapraid printed on `archiwum` (rig11, 2026-09-12), word
+        /// for word. It is printed on EVERY run of an array with six or more
+        /// data disks and a single parity, and the run that produced it moved
+        /// 768 MiB and synced them correctly.
+        const PARITY_ADVISORY: &str =
+            "WARNING! For 7 disks, it's recommended to use two parity levels.\n";
+
+        /// A tool that writes the `-l` log it is handed, prints `stdout` and
+        /// `stderr`, and exits with `code`. A real child on the real capture
+        /// path: stderr only exists there.
+        fn stderr_tool(dir: &Path, log: &str, stdout: &str, stderr: &str, code: i32) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let program = dir.join(format!(
+                "stderr-tool-{}.py",
+                NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let source = format!(
+                "#!/usr/bin/python3\nimport sys\nassert sys.argv[1]=='-l'\nwith open(sys.argv[2],'w') as target: target.write({log:?})\nsys.stdout.write({stdout:?})\nsys.stderr.write({stderr:?})\nsys.exit({code})\n"
+            );
+            std::fs::write(&program, source).expect("script");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                .expect("mode");
+            program
+        }
+
+        /// A complete, well-formed Sync log body: the summary contract in full.
+        fn clean_sync_body() -> String {
+            scan_text(true)
+                + "block_count:9\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n"
+        }
+
+        /// The same run with the complete contract in its log, varying only
+        /// what reaches stdout/stderr and the exit code.
+        fn sync_with_stderr(stdout: &str, stderr: &str, code: i32) -> (ElasticSnapraidRun, Journal) {
+            sync_run(&clean_sync_body(), stdout, stderr, code)
+        }
+
+        /// One Sync of an array whose parity is already out of date, run
+        /// through the real capture, and the journal as the disk holds it
+        /// afterwards. Each test below varies exactly one thing: the log body,
+        /// what reaches stdout/stderr, or the exit code.
+        fn sync_run(
+            log_body: &str,
+            stdout: &str,
+            stderr: &str,
+            code: i32,
+        ) -> (ElasticSnapraidRun, Journal) {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            let array = root.array_lock(&spec().array_id).expect("array lock");
+            let mut journal = legacy_journal(&root);
+            journal.stage = ElasticStage::Ready;
+            journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
+            journal.stale_parity_bytes = Some(805_306_368);
+            root.save(&journal).expect("save");
+            let log = log_text("sync", log_body);
+            let program = stderr_tool(&dir.0, &log, stdout, stderr, code);
+            let run = perform_maintenance(
+                &root,
+                &mut journal,
+                run_record(ElasticSnapraidKind::Sync),
+                &snap_spec(),
+                || {
+                    capture_snapraid(
+                        &root,
+                        &array,
+                        &dir.0,
+                        "run",
+                        program.to_str().expect("program"),
+                        &["sync".into()],
+                    )
+                },
+                || Ok(false),
+                false,
+            )
+            .expect("typed result");
+            drop(root);
+            let stored = Root::open(&dir.0, uid)
+                .expect("reopen")
+                .load(&spec().array_id)
+                .expect("saved result");
+            (run, stored)
+        }
+
+        /// THE rig11 REGRESSION. The mover's coupled Sync did everything right
+        /// — exit 0, `Everything OK`, parity complete — and a single line of
+        /// advice on stderr turned it into `needs_attention`, held the union
+        /// read-only and left the array claiming stale parity.
+        #[test]
+        fn manual_sync_stderr_advisory_with_clean_exit_succeeds_and_records_the_text() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (run, stored) = sync_with_stderr(
+                "1%, 0 MB\r100% completed, 806 MB accessed in 0:00\r\nEverything OK\n",
+                PARITY_ADVISORY,
+                0,
+            );
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::Succeeded);
+            assert_eq!(run.exit_code, Some(0));
+            assert_eq!(run.accessed_mb, Some(806));
+            // The array is healthy: it serves, and its parity covers the run.
+            assert_eq!(stored.stage, ElasticStage::Ready);
+            assert_eq!(stored.stale_parity_bytes, None);
+            assert_eq!(stored.stale_sync_operation, None);
+            assert_eq!(stored.sync_completed_at, run.finished_at);
+            assert_eq!(stored.detail, None);
+            // The advice is not lost: it is the run's detail, where an
+            // operator reads it, with the tool's own words intact.
+            let detail = run.detail.as_deref().expect("zapisane ostrzeżenie");
+            assert!(
+                detail.contains("For 7 disks, it's recommended to use two parity levels."),
+                "{detail}"
+            );
+            assert!(detail.len() <= TRANSFER_DETAIL_LIMIT, "{detail}");
+            assert_eq!(stored.last_run.as_ref(), Some(&run));
+        }
+
+        /// The genuine-failure path is untouched: a tool that says the same
+        /// thing on stderr but exits non-zero still fails, and its words are
+        /// kept beside the reason rather than instead of it.
+        #[test]
+        fn manual_sync_stderr_with_failing_exit_still_fails() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (run, stored) = sync_with_stderr(
+                "1%, 0 MB\r100% completed, 806 MB accessed in 0:00\r\nEverything OK\n",
+                PARITY_ADVISORY,
+                1,
+            );
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::Failed);
+            assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+            assert_eq!(stored.stale_parity_bytes, Some(805_306_368));
+            assert_eq!(
+                stored.sync_completed_at.as_deref(),
+                Some("2026-09-08T10:00:00Z")
+            );
+            let detail = run.detail.as_deref().expect("powód niepowodzenia");
+            assert!(detail.contains("nie zakończył się sukcesem"), "{detail}");
+            assert!(detail.contains("two parity levels."), "{detail}");
+        }
+
+        /// And a run that exits 0 without ever saying it finished the work is
+        /// still a failure: stderr cannot stand in for a success marker.
+        #[test]
+        fn manual_sync_stderr_without_success_marker_still_fails() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (run, stored) = sync_with_stderr(
+                "1%, 0 MB\r100% completed, 806 MB accessed in 0:00\r\n",
+                PARITY_ADVISORY,
+                0,
+            );
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::NeedsAttention);
+            assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+            assert_eq!(stored.stale_parity_bytes, Some(805_306_368));
+            assert_eq!(
+                stored.sync_completed_at.as_deref(),
+                Some("2026-09-08T10:00:00Z")
+            );
+            let detail = run.detail.as_deref().expect("powód niepowodzenia");
+            assert!(detail.contains("niepełna praca sync"), "{detail}");
+        }
+
+        /// stdout of a sync that did the work: one final progress line and the
+        /// single `Everything OK` the contract demands.
+        const CLEAN_SYNC_STDOUT: &str =
+            "1%, 0 MB\r100% completed, 806 MB accessed in 0:00\r\nEverything OK\n";
+
+        /// The three `msg:fatal:` texts measured on rig11 (2026-09-13), word
+        /// for word. EVERY ONE of them came from a run that finished: exit 0,
+        /// a complete summary, parity written. The first is printed on every
+        /// sync of an array with seven data disks and one parity; the other
+        /// two are snapraid recovering from a missing content file.
+        const FATAL_TWO_PARITY: &str =
+            "msg:fatal: WARNING! For 7 disks, it's recommended to use two parity levels.\n";
+        const FATAL_CONTENT_FALLBACK: &str =
+            "msg:fatal: WARNING! Content file '…' not found, attempting with another copy...\n";
+        const FATAL_NO_CONTENT: &str = "msg:fatal: No content file found. Assuming empty.\n";
+        /// A marker that IS a verdict, kept as one so the tolerance above
+        /// cannot quietly widen to cover it.
+        const LOG_FAULT: &str = "msg:error: unexpected end of content file\n";
+
+        /// THE rig11 REGRESSION, one layer below the stderr rule: the same
+        /// advisory arrives under `msg:fatal:` IN THE LOG, on a run that did
+        /// everything right. `archiwum` reproduces this on every single sync.
+        #[test]
+        fn manual_sync_fatal_advisory_with_complete_summary_succeeds_and_records_the_text() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (run, stored) = sync_run(
+                &(FATAL_TWO_PARITY.to_string() + &clean_sync_body()),
+                CLEAN_SYNC_STDOUT,
+                "",
+                0,
+            );
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::Succeeded);
+            assert_eq!(run.exit_code, Some(0));
+            // The array serves and its parity covers the run.
+            assert_eq!(stored.stage, ElasticStage::Ready);
+            assert_eq!(stored.stale_parity_bytes, None);
+            assert_eq!(stored.stale_sync_operation, None);
+            assert_eq!(stored.sync_completed_at, run.finished_at);
+            assert_eq!(stored.detail, None);
+            let detail = run.detail.as_deref().expect("zapisane ostrzeżenie");
+            assert!(
+                detail.contains("For 7 disks, it's recommended to use two parity levels."),
+                "{detail}"
+            );
+            assert_eq!(stored.last_run.as_ref(), Some(&run));
+        }
+
+        /// snapraid recovering from a missing content file is a success too:
+        /// both recovery texts are kept, neither is a verdict.
+        #[test]
+        fn manual_sync_fatal_content_recovery_texts_succeed_and_are_recorded() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (run, stored) = sync_run(
+                &(FATAL_CONTENT_FALLBACK.to_string() + FATAL_NO_CONTENT + &clean_sync_body()),
+                CLEAN_SYNC_STDOUT,
+                "",
+                0,
+            );
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::Succeeded);
+            assert_eq!(stored.stage, ElasticStage::Ready);
+            assert_eq!(stored.stale_parity_bytes, None);
+            assert_eq!(stored.detail, None);
+            let detail = run.detail.as_deref().expect("zapisane ostrzeżenia");
+            assert!(detail.contains("attempting with another copy"), "{detail}");
+            assert!(
+                detail.contains("No content file found. Assuming empty."),
+                "{detail}"
+            );
+        }
+
+        /// The genuine-fault shape measured on rig11: the marker is there and
+        /// snapraid died before writing any summary. The contract demands
+        /// positive evidence, so its absence is still a failure.
+        #[test]
+        fn manual_sync_fatal_without_summary_block_still_fails() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (run, stored) = sync_run(FATAL_TWO_PARITY, "", "", 1);
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::Failed);
+            assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+            assert_eq!(stored.stale_parity_bytes, Some(805_306_368));
+            assert_eq!(
+                stored.sync_completed_at.as_deref(),
+                Some("2026-09-08T10:00:00Z")
+            );
+            let detail = run.detail.as_deref().expect("powód niepowodzenia");
+            assert!(detail.contains("nie zakończył się sukcesem"), "{detail}");
+            assert!(detail.contains("two parity levels."), "{detail}");
+        }
+
+        /// A summary that is present but does not say the run ended `ok` is
+        /// not a success, whatever the exit code and whatever was printed.
+        #[test]
+        fn manual_sync_fatal_with_summary_not_ok_still_fails() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (run, stored) = sync_run(
+                &(FATAL_TWO_PARITY.to_string()
+                    + &clean_sync_body().replace("summary:exit:ok", "summary:exit:diff")),
+                CLEAN_SYNC_STDOUT,
+                "",
+                0,
+            );
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::NeedsAttention);
+            assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+            assert_eq!(stored.stale_parity_bytes, Some(805_306_368));
+            let detail = run.detail.as_deref().expect("powód niepowodzenia");
+            assert!(detail.contains("niepełne zakończenie sync"), "{detail}");
+            assert!(detail.contains("two parity levels."), "{detail}");
+        }
+
+        /// The tolerance covers `msg:fatal:` and NOTHING ELSE: a `msg:error:`
+        /// line fails an otherwise perfect run, and the reason names what the
+        /// tool said.
+        #[test]
+        fn manual_sync_log_error_marker_on_a_clean_run_still_fails() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (run, stored) = sync_run(
+                &(LOG_FAULT.to_string() + &clean_sync_body()),
+                CLEAN_SYNC_STDOUT,
+                "",
+                0,
+            );
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::NeedsAttention);
+            assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+            assert_eq!(stored.stale_parity_bytes, Some(805_306_368));
+            assert_eq!(
+                stored.sync_completed_at.as_deref(),
+                Some("2026-09-08T10:00:00Z")
+            );
+            let detail = run.detail.as_deref().expect("powód niepowodzenia");
+            assert!(detail.contains("diagnostyka błędu w logu"), "{detail}");
+            assert!(detail.contains("unexpected end of content file"), "{detail}");
         }
 
         #[test]
