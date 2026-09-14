@@ -498,7 +498,10 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>) {
         return;
     }
     let mut changed = false;
-    for long in [false, true] {
+    // Long pass FIRST. Starting a short test aborts a long one already on the
+    // disk, so when both come due in the same tick the long pass — the one
+    // that reads the whole surface — is the one worth keeping.
+    for long in [true, false] {
         let schedule = if long { smart.long.clone() } else { smart.short.clone() };
         let stored_next = if long {
             smart.next_long_at.clone()
@@ -530,16 +533,39 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>) {
             smart.next_short_at = next;
         }
         changed = true;
+        // A disk already running a self-test is left alone: a second test
+        // aborts the first, and the long pass spans many ticks of a daily
+        // short schedule. Re-read per pass so the short pass sees the disks
+        // the long pass has just occupied, and extended as we go so one pass
+        // cannot start twice on one disk.
+        let mut busy = match store::running_job_subjects(db, "smart_test") {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("tentanas scheduler: running SMART tests unreadable: {e}");
+                std::collections::HashSet::new()
+            }
+        };
         for (disk_id, device) in super::disks::snapshot()
             .0
             .into_iter()
             .map(|d| (d.disk_id, d.path))
         {
+            if busy.contains(&disk_id) {
+                tracing::info!(
+                    "tentanas scheduler: SMART test for {disk_id} skipped, one is already running"
+                );
+                continue;
+            }
             let started = super::jobs::spawn(db, "smart_test", &disk_id, STARTED_BY, None, None, move |h| {
                 super::jobs::smart_self_test(h, device, kind, None)
             });
-            if let Err(e) = started {
-                tracing::warn!("tentanas scheduler: SMART test for {disk_id} not started: {e}");
+            match started {
+                Ok(_) => {
+                    busy.insert(disk_id);
+                }
+                Err(e) => {
+                    tracing::warn!("tentanas scheduler: SMART test for {disk_id} not started: {e}");
+                }
             }
         }
     }

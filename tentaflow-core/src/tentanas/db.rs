@@ -1503,6 +1503,23 @@ pub fn job(pool: &DbPool, job_id: &str) -> Result<Option<NasJob>> {
         .optional()?)
 }
 
+/// Subjects that still have a `kind` job running. The scheduler asks before
+/// starting a self-test: a second test on one disk ABORTS the first (ATA, SPC
+/// and NVMe all behave this way), and the long pass runs for hours, so without
+/// this a daily short pass would cut the long one short every time it came due.
+pub fn running_job_subjects(
+    pool: &DbPool,
+    kind: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt =
+        conn.prepare_cached("SELECT subject FROM nas_jobs WHERE kind = ?1 AND status = 'running'")?;
+    let rows = stmt
+        .query_map(params![kind], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows.into_iter().collect())
+}
+
 pub fn list_jobs(pool: &DbPool, limit: u32) -> Result<Vec<NasJob>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut stmt = conn.prepare_cached(&format!(
@@ -4908,6 +4925,32 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    /// What the scheduler consults before starting a self-test. A finished
+    /// test must not block the next one, and a job of another kind on another
+    /// subject must not block anything.
+    #[test]
+    fn running_job_subjects_lists_only_running_jobs_of_that_kind() {
+        let p = pool();
+        let mk = |id: &str, kind: &str, subject: &str, status: &str| NasJob {
+            job_id: id.into(),
+            kind: kind.into(),
+            subject: subject.into(),
+            status: status.into(),
+            started_by: "test".into(),
+            started_at: now(),
+            ..Default::default()
+        };
+        insert_job(&p, &mk("j1", "smart_test", "disk-a", "running"), None).unwrap();
+        insert_job(&p, &mk("j2", "smart_test", "disk-b", "running"), None).unwrap();
+        insert_job(&p, &mk("j3", "smart_test", "disk-c", "succeeded"), None).unwrap();
+        insert_job(&p, &mk("j4", "scrub", "tank", "running"), None).unwrap();
+        let busy = running_job_subjects(&p, "smart_test").unwrap();
+        assert_eq!(busy.len(), 2, "only the running smart_test rows");
+        assert!(busy.contains("disk-a") && busy.contains("disk-b"));
+        assert!(!busy.contains("disk-c"), "a finished test does not block the next one");
+        assert!(!busy.contains("tank"), "another kind does not block a disk");
     }
 
     #[test]
