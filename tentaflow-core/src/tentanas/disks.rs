@@ -630,17 +630,31 @@ pub fn smart_self_tests(doc: &Value) -> Vec<NasSmartSelfTest> {
     if let Some(rows) = doc.pointer("/nvme_self_test_log/table").and_then(Value::as_array) {
         for r in rows {
             let result = r.pointer("/self_test_result/value").and_then(Value::as_u64);
+            // 15 means the log slot holds NO result (NVMe Device Self-test Log,
+            // Self-test Result field). It is not a test that went wrong, it is
+            // the absence of a test, and reporting it collapsed an empty row
+            // into a failure.
+            if result == Some(15) {
+                continue;
+            }
             out.push(NasSmartSelfTest {
                 kind: r
                     .pointer("/self_test_code/string")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                // An abort is not a failure, exactly as for ATA and SPC. Per
+                // the same field: 1 aborted by a self-test command, 2 by a
+                // controller reset, 3 by a namespace removal, 4 by a Format
+                // NVM, 8 for an unknown reason, 9 by a sanitize — none of
+                // those says anything bad about the medium. Only 5 (fatal or
+                // unknown error), 6 (a failed segment, unidentified) and 7 (a
+                // failed segment, identified) are real failures.
                 status: match result {
                     Some(0) => "passed",
-                    Some(1) => "aborted",
-                    Some(_) => "failed",
-                    None => "unknown",
+                    Some(1..=4 | 8 | 9) => "aborted",
+                    Some(5..=7) => "failed",
+                    _ => "unknown",
                 }
                 .to_string(),
                 lifetime_hours: r.get("power_on_hours").and_then(Value::as_u64).unwrap_or(0),
@@ -1439,6 +1453,33 @@ mod tests {
         assert_eq!(sda.role, "pool_member");
         assert_eq!(sda.member_of.as_deref(), Some("tank"));
         assert_eq!(sda.fs_type, None);
+    }
+
+    /// NVMe self-test results are not a pass/fail pair. Collapsing everything
+    /// above 1 into "failed" made a disk whose test was merely interrupted —
+    /// or an empty log row — read as a failed self-test. Same defect class as
+    /// the ATA and SPC arms, left behind for NVMe.
+    #[test]
+    fn nvme_self_test_codes_separate_abort_from_failure() {
+        let doc: Value = serde_json::json!({
+            "nvme_self_test_log": {"table": [
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 0, "string": "ok"}, "power_on_hours": 10},
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 1, "string": "aborted by command"}, "power_on_hours": 11},
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 2, "string": "aborted by reset"}, "power_on_hours": 12},
+                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 4, "string": "aborted by format"}, "power_on_hours": 13},
+                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 5, "string": "fatal error"}, "power_on_hours": 14},
+                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 7, "string": "segment failed"}, "power_on_hours": 15},
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 9, "string": "aborted by sanitize"}, "power_on_hours": 16},
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 15, "string": "entry not used"}, "power_on_hours": 17}
+            ]}
+        });
+        let tests = smart_self_tests(&doc);
+        assert_eq!(tests.len(), 7, "the `entry not used` row is dropped, not reported");
+        let statuses: Vec<&str> = tests.iter().map(|t| t.status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            vec!["passed", "aborted", "aborted", "aborted", "failed", "failed", "aborted"]
+        );
     }
 
     #[test]
