@@ -2331,15 +2331,21 @@ function renderAgentRunsTable() {
   });
 }
 
-async function cancelRun(runId, reload) {
+// `scope` is the same 'global' | 'agent' vocabulary openRunDetail uses: it says
+// WHICH list to refresh after the cancel, because the two tabs own separate
+// hosts and state. The parameter used to be called `reload`, which reads like a
+// boolean — a caller passing `true` would have refreshed nothing at all, with
+// no error and no visible symptom. Anything outside the two values refreshes
+// nothing on purpose (a cancel driven from somewhere with no list to update).
+async function cancelRun(runId, scope) {
   if (!runId) return;
   try {
     const resp = await ApiBinary.action('agentRunCancelRequest', { runId });
     if (resp && (resp.cancelled === true || resp.cancelled === 'true')) {
       toast(t('run_cancel_ok'), 'success');
     }
-    if (reload === 'global') await loadRunsTab();
-    else if (reload === 'agent') await loadAgentRuns();
+    if (scope === 'global') await loadRunsTab();
+    else if (scope === 'agent') await loadAgentRuns();
   } catch (err) {
     toast(`${t('run_cancel_failed')}: ${err.message}`, 'error');
   }
