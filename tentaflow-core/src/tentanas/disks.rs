@@ -504,7 +504,16 @@ pub fn summarize_smart(doc: &Value) -> SmartSummary {
     // row while `score_health` called the disk "ok" and no alert was raised.
     // The newest entry that is not still running is the last verdict the disk
     // gave — an in-progress entry on top must not hide the failure under it.
-    if st.is_none() && doc.get("scsi_self_test_0").is_some() {
+    // NVMe has neither an ATA status pointer nor `scsi_self_test_0`, so until
+    // now its self-test verdict reached NOTHING: a genuinely failed NVMe test
+    // (result 5, 6 or 7) left `self_test_failed` false and `score_health`
+    // never saw it. Reading the normalised entries covers both transports with
+    // one rule — and it is only safe because the mapping above now separates
+    // an abort from a failure. Without that, a test the controller merely
+    // interrupted would mark the disk critical.
+    if st.is_none()
+        && (doc.get("scsi_self_test_0").is_some() || doc.get("nvme_self_test_log").is_some())
+    {
         s.self_test_failed = smart_self_tests(doc)
             .iter()
             .find(|t| t.status != "running")
@@ -1480,6 +1489,35 @@ mod tests {
             statuses,
             vec!["passed", "aborted", "aborted", "aborted", "failed", "failed", "aborted"]
         );
+    }
+
+    /// A failed NVMe self-test has to reach `score_health`, and an aborted one
+    /// must not. Before this the NVMe verdict reached nothing at all, so a
+    /// disk that reported a failed segment still read as healthy.
+    #[test]
+    fn a_failed_nvme_self_test_counts_but_an_aborted_one_does_not() {
+        let doc = |result: u64| {
+            serde_json::json!({
+                "nvme_self_test_log": {"table": [
+                    {"self_test_code": {"string": "Extended"},
+                     "self_test_result": {"value": result, "string": "x"},
+                     "power_on_hours": 5}
+                ]}
+            })
+        };
+        assert!(
+            summarize_smart(&doc(6)).self_test_failed,
+            "result 6 is a failed segment and must reach health"
+        );
+        assert!(
+            !summarize_smart(&doc(2)).self_test_failed,
+            "result 2 is a controller reset, not a verdict on the medium"
+        );
+        assert!(
+            !summarize_smart(&doc(9)).self_test_failed,
+            "result 9 is a sanitize abort, not a failure"
+        );
+        assert!(!summarize_smart(&doc(0)).self_test_failed, "result 0 passed");
     }
 
     #[test]
