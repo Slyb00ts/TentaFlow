@@ -6322,6 +6322,7 @@
       "fleet_nodes_suffix": "/ {total} supported",
       "node_unarmed": "{node}: channel not armed",
       "warnings_suffix": "{n|warning|warnings}",
+      "failures_suffix": "{n|failure|failures}",
       "capacity_total": "Total capacity",
       "disk_health": "Disk health",
       "disk_health_ok": "all disks OK",

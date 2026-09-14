@@ -1198,7 +1198,14 @@ const TentaNasScreen = {
     patchHtml(body.querySelector('#nas-ov-error'), '');
 
     const disks = disksRes.disks || [];
-    const warned = disks.filter((d) => d.health === 'warning' || d.health === 'critical');
+    // Split, because collapsing them is what made this screen lie: the disks
+    // table and the fleet card both call nvme0n1 an "Awaria", while this tile
+    // announced it as one of "6 ostrzeżeń". Two screens contradicting each
+    // other about the same failing disk is worse than either wording alone.
+    const critical = disks.filter((d) => d.health === 'critical');
+    const warnings = disks.filter((d) => d.health === 'warning');
+    // Failures first, so the delta line below names the worst disk first.
+    const warned = critical.concat(warnings);
     const read = disks.reduce((a, d) => a + (Number(d.io?.readBps) || 0), 0);
     const write = disks.reduce((a, d) => a + (Number(d.io?.writeBps) || 0), 0);
     const iops = Math.round(disks.reduce((a, d) => a + (Number(d.io?.readIops) || 0) + (Number(d.io?.writeIops) || 0), 0));
@@ -1228,8 +1235,19 @@ const TentaNasScreen = {
         delta: T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools.length }),
       } },
       { key: 'disks', className: 'clickable', attrs: {
-        label: T('kpi.disk_health'), value: String(warned.length), suffix: T('kpi.warnings_suffix', { n: warned.length }), icon: 'cylinder',
-        accent: warned.length ? 'warning' : null,
+        label: T('kpi.disk_health'), icon: 'cylinder',
+        // The worst state leads. The rest stays reachable: the delta line below
+        // names up to three problem disks with their reasons, and the tile is
+        // clickable straight into the disks tab filtered to problems.
+        value: String(critical.length || warnings.length),
+        suffix: critical.length
+          ? T('kpi.failures_suffix', { n: critical.length })
+          : T('kpi.warnings_suffix', { n: warnings.length }),
+        // `danger` is one of the FOUR accents tf-stat-card accepts
+        // (success | danger | warning | info, tf-stat-card.js:10). Any other
+        // word is silently dropped and the tile renders with no accent at all,
+        // which is how a red state would quietly become an ordinary one.
+        accent: critical.length ? 'danger' : warnings.length ? 'warning' : null,
         delta: warned.length
           ? warned.slice(0, 3).map((d) => `${d.name}: ${d.healthReason}`).join(' · ')
           : T('kpi.disk_health_ok'),

@@ -1673,3 +1673,54 @@ test('the bulk SMART button is not rewritten when the selection did not change',
     Screen.unmount();
   }
 });
+
+// The disks table and the fleet card both call a failing disk "Awaria", while
+// this tile folded critical into the warning count and announced it in warning
+// tone — so the screen the admin lands on understated a dying disk, and two
+// screens contradicted each other about the same device.
+test('a failing disk makes the health tile a failure, not a warning', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      ...fixtures.tentaNasDisksListRequest,
+      disks: [
+        disk({ health: 'critical', healthReason: '835 media errors' }),
+        disk({ diskId: 'sdz', name: 'sdz', path: '/dev/sdz', health: 'warning', healthReason: '51°C' }),
+      ],
+    },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const tile = root.querySelector('#nas-ov-kpi [data-kpi="disks"]');
+    assert.equal(tile === null, false, 'the disks tile is on screen');
+    assert.equal(tile.getAttribute('accent'), 'danger', 'a failure is not painted as a warning');
+    assert.equal(tile.getAttribute('value'), '1', 'the failure count leads the tile');
+    assert.match(tile.getAttribute('suffix'), /awari/i, 'and it is named a failure');
+    // Failures come first in the detail line, so the dying disk is the one read.
+    assert.match(tile.getAttribute('delta'), /^[^·]*835 media errors/);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// The other half: without this, a change that painted every non-ok state red
+// would pass, and one wrong tone would simply replace the other.
+test('with warnings only, the health tile stays a warning', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      ...fixtures.tentaNasDisksListRequest,
+      disks: [disk({ health: 'warning', healthReason: '51°C' })],
+    },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const tile = root.querySelector('#nas-ov-kpi [data-kpi="disks"]');
+    assert.equal(tile.getAttribute('accent'), 'warning', 'a warning is still a warning');
+    assert.match(tile.getAttribute('suffix'), /ostrzeż/i);
+  } finally {
+    Screen.unmount();
+  }
+});

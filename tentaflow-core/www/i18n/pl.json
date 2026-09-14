@@ -6373,6 +6373,7 @@
       "fleet_nodes_suffix": "/ {total} wspierane",
       "node_unarmed": "{node}: kanał nieuzbrojony",
       "warnings_suffix": "{n|ostrzeżenie|ostrzeżenia|ostrzeżeń}",
+      "failures_suffix": "{n|awaria|awarie|awarii}",
       "capacity_total": "Pojemność łączna",
       "disk_health": "Zdrowie dysków",
       "disk_health_ok": "wszystkie dyski OK",

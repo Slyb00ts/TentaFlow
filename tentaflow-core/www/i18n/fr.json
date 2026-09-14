@@ -5901,6 +5901,7 @@
       "fleet_nodes_suffix": "/ {total} pris en charge",
       "node_unarmed": "{node} : canal non armé",
       "warnings_suffix": "{n|avertissement|avertissements}",
+      "failures_suffix": "{n|panne|pannes}",
       "capacity_total": "Capacité totale",
       "disk_health": "Santé des disques",
       "disk_health_ok": "tous les disques OK",

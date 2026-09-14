@@ -5901,6 +5901,7 @@
       "fleet_nodes_suffix": "/ {total} unterstützt",
       "node_unarmed": "{node}: Kanal nicht scharfgeschaltet",
       "warnings_suffix": "{n|Warnung|Warnungen}",
+      "failures_suffix": "{n|Ausfall|Ausfälle}",
       "capacity_total": "Gesamtkapazität",
       "disk_health": "Festplattenzustand",
       "disk_health_ok": "alle Festplatten OK",
