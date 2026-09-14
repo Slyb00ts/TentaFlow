@@ -502,8 +502,6 @@ pub fn summarize_smart(doc: &Value) -> SmartSummary {
     // A SAS/SCSI disk has no ATA status pointer, so the block above never fires
     // for it: without this, the detail view could show a red "failed" self-test
     // row while `score_health` called the disk "ok" and no alert was raised.
-    // The newest entry that is not still running is the last verdict the disk
-    // gave — an in-progress entry on top must not hide the failure under it.
     // NVMe has neither an ATA status pointer nor `scsi_self_test_0`, so until
     // now its self-test verdict reached NOTHING: a genuinely failed NVMe test
     // (result 5, 6 or 7) left `self_test_failed` false and `score_health`
@@ -511,12 +509,22 @@ pub fn summarize_smart(doc: &Value) -> SmartSummary {
     // one rule — and it is only safe because the mapping above now separates
     // an abort from a failure. Without that, a test the controller merely
     // interrupted would mark the disk critical.
+    //
+    // The newest entry that carries a VERDICT is the last one the disk gave,
+    // and only "passed", "aborted" and "failed" are verdicts. Skipping just
+    // "running" was not enough: a reserved NVMe code (Ah–Eh), an SPC code 3
+    // ("unknown error, incomplete"), an SPC reserved code (8–14) and an entry
+    // with no parseable result all normalise to "unknown", and any of them
+    // sitting on top was taken as THE verdict — showing a red "failed" row in
+    // the detail view while `score_health` still called the disk "ok". Listing
+    // the verdicts rather than the non-verdicts also keeps a status added
+    // later from silently counting as one.
     if st.is_none()
         && (doc.get("scsi_self_test_0").is_some() || doc.get("nvme_self_test_log").is_some())
     {
         s.self_test_failed = smart_self_tests(doc)
             .iter()
-            .find(|t| t.status != "running")
+            .find(|t| matches!(t.status.as_str(), "passed" | "aborted" | "failed"))
             .is_some_and(|t| t.status == "failed");
     }
     s
@@ -638,17 +646,33 @@ pub fn smart_self_tests(doc: &Value) -> Vec<NasSmartSelfTest> {
     }
     if let Some(rows) = doc.pointer("/nvme_self_test_log/table").and_then(Value::as_array) {
         for r in rows {
-            let result = r.pointer("/self_test_result/value").and_then(Value::as_u64);
+            // smartctl writes `jref["table"][i]` at the RAW log index
+            // (`nvmeprint.cpp`), so the array it emits is SPARSE and its JSON
+            // writer prints every slot it never set as a literal `null`. A
+            // null is not a test: it used to fall through the match below into
+            // "unknown" and become a phantom row with an empty kind and zero
+            // hours — which, sitting on top of the list, was then read as the
+            // disk's last verdict.
+            let Some(r) = r.as_object() else {
+                continue;
+            };
+            let result = r
+                .get("self_test_result")
+                .and_then(|v| v.get("value"))
+                .and_then(Value::as_u64);
             // 15 means the log slot holds NO result (NVMe Device Self-test Log,
-            // Self-test Result field). It is not a test that went wrong, it is
-            // the absence of a test, and reporting it collapsed an empty row
-            // into a failure.
+            // Self-test Result field). The real producer drops those entries
+            // before it writes JSON (`if (!op || res == 0xf) continue;`), so
+            // this arm is the spec, not the observed shape — kept because it
+            // costs nothing and reporting the absence of a test as a failure
+            // is exactly the defect above.
             if result == Some(15) {
                 continue;
             }
             out.push(NasSmartSelfTest {
                 kind: r
-                    .pointer("/self_test_code/string")
+                    .get("self_test_code")
+                    .and_then(|v| v.get("string"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
@@ -669,7 +693,8 @@ pub fn smart_self_tests(doc: &Value) -> Vec<NasSmartSelfTest> {
                 lifetime_hours: r.get("power_on_hours").and_then(Value::as_u64).unwrap_or(0),
                 started_at: None,
                 detail: r
-                    .pointer("/self_test_result/string")
+                    .get("self_test_result")
+                    .and_then(|v| v.get("string"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
@@ -1468,6 +1493,13 @@ mod tests {
     /// above 1 into "failed" made a disk whose test was merely interrupted —
     /// or an empty log row — read as a failed self-test. Same defect class as
     /// the ATA and SPC arms, left behind for NVMe.
+    ///
+    /// EVERY code of every range appears here, not a representative of it, and
+    /// the fallback arm is pinned too. A mutation run walked straight through
+    /// the earlier vector: dropping `| 8` from the aborted arm, narrowing
+    /// `1..=4` to `1 | 2 | 4` and turning `_ => "unknown"` into
+    /// `_ => "failed"` all left the suite green, because 3, 8, a reserved code
+    /// and an entry with no readable result were never in the table.
     #[test]
     fn nvme_self_test_codes_separate_abort_from_failure() {
         let doc: Value = serde_json::json!({
@@ -1475,20 +1507,117 @@ mod tests {
                 {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 0, "string": "ok"}, "power_on_hours": 10},
                 {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 1, "string": "aborted by command"}, "power_on_hours": 11},
                 {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 2, "string": "aborted by reset"}, "power_on_hours": 12},
-                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 4, "string": "aborted by format"}, "power_on_hours": 13},
-                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 5, "string": "fatal error"}, "power_on_hours": 14},
-                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 7, "string": "segment failed"}, "power_on_hours": 15},
-                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 9, "string": "aborted by sanitize"}, "power_on_hours": 16},
-                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 15, "string": "entry not used"}, "power_on_hours": 17}
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 3, "string": "aborted by namespace removal"}, "power_on_hours": 13},
+                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 4, "string": "aborted by format"}, "power_on_hours": 14},
+                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 5, "string": "fatal error"}, "power_on_hours": 15},
+                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 6, "string": "unknown segment failed"}, "power_on_hours": 16},
+                {"self_test_code": {"string": "Extended"}, "self_test_result": {"value": 7, "string": "segment failed"}, "power_on_hours": 17},
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 8, "string": "aborted for an unknown reason"}, "power_on_hours": 18},
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 9, "string": "aborted by sanitize"}, "power_on_hours": 19},
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 11, "string": "reserved"}, "power_on_hours": 20},
+                {"self_test_code": {"string": "Short"}, "power_on_hours": 21},
+                {"self_test_code": {"string": "Short"}, "self_test_result": {"value": 15, "string": "entry not used"}, "power_on_hours": 22},
+                null
             ]}
         });
         let tests = smart_self_tests(&doc);
-        assert_eq!(tests.len(), 7, "the `entry not used` row is dropped, not reported");
+        assert_eq!(
+            tests.len(),
+            12,
+            "the `entry not used` row and the unset slot are dropped, not reported: {tests:?}"
+        );
         let statuses: Vec<&str> = tests.iter().map(|t| t.status.as_str()).collect();
         assert_eq!(
             statuses,
-            vec!["passed", "aborted", "aborted", "aborted", "failed", "failed", "aborted"]
+            vec![
+                "passed",                                     // 0
+                "aborted", "aborted", "aborted", "aborted",   // 1, 2, 3, 4 — both ends
+                "failed", "failed", "failed",                 // 5, 6, 7 — both ends
+                "aborted", "aborted",                         // 8, 9 — both ends
+                "unknown", "unknown",                         // reserved Bh, and no result field
+            ]
         );
+        // The dropped rows are the LAST two of the table, so a phantom row
+        // would land at the end with nothing of its own in it.
+        assert!(
+            tests.iter().all(|t| t.lifetime_hours != 0 && !t.kind.is_empty()),
+            "every reported row came from a real entry: {tests:?}"
+        );
+    }
+
+    /// The newest entry that carries a VERDICT is the disk's last verdict, and
+    /// "unknown" is not one. A reserved NVMe code, an entry whose result field
+    /// cannot be read, an unset (null) log slot and — pre-existing on SCSI —
+    /// an SPC code 3 or a reserved 8–14 all normalise to "unknown", and any of
+    /// them on top used to be taken as THE verdict: the detail view showed a
+    /// red `failed` row while `self_test_failed` stayed false and
+    /// `score_health` called the disk "ok".
+    #[test]
+    fn a_non_verdict_entry_does_not_hide_the_failure_under_it() {
+        let nvme_entry = |value: u64| {
+            serde_json::json!({
+                "self_test_code": {"string": "Extended"},
+                "self_test_result": {"value": value, "string": "x"},
+                "power_on_hours": 5,
+            })
+        };
+        let nvme = |table: Value| {
+            summarize_smart(&serde_json::json!({
+                "smart_status": {"passed": true},
+                "nvme_self_test_log": {"table": table},
+            }))
+        };
+
+        // A reserved code (Ch, in the Ah–Eh range) on top of a failed segment.
+        let reserved = nvme(serde_json::json!([nvme_entry(12), nvme_entry(6)]));
+        assert!(reserved.self_test_failed, "a reserved code is not a verdict");
+        assert_eq!(score_health(&reserved, "ssd", None).0, "critical");
+
+        // An entry with no readable `self_test_result.value` at all.
+        let unreadable = nvme(serde_json::json!([
+            {"self_test_code": {"string": "Extended"}, "power_on_hours": 6},
+            nvme_entry(6),
+        ]));
+        assert!(unreadable.self_test_failed, "an unreadable result is not a verdict");
+
+        // An unset log slot: smartctl writes the table at the RAW log index,
+        // so the array is sparse and the gaps arrive as literal nulls.
+        let sparse = nvme(serde_json::json!([Value::Null, nvme_entry(6)]));
+        assert!(sparse.self_test_failed, "a null slot is not even an entry");
+
+        // A real verdict on top still wins — the newest VERDICT is the verdict.
+        let cleared = nvme(serde_json::json!([
+            nvme_entry(12),
+            nvme_entry(0),
+            nvme_entry(6),
+        ]));
+        assert!(!cleared.self_test_failed, "the newest verdict is a pass");
+        assert_eq!(score_health(&cleared, "ssd", None).0, "ok");
+
+        // SCSI: the same shape, newest first as numbered top-level keys.
+        let scsi_entry = |value: u64| {
+            serde_json::json!({
+                "code": {"string": "Background long"},
+                "result": {"value": value, "string": "x"},
+                "power_on_time": {"hours": 100},
+            })
+        };
+        let scsi = |newest: u64, older: u64| {
+            summarize_smart(&serde_json::json!({
+                "smart_status": {"passed": true},
+                "scsi_grown_defect_list": 0,
+                "scsi_self_test_0": scsi_entry(newest),
+                "scsi_self_test_1": scsi_entry(older),
+            }))
+        };
+        let incomplete = scsi(3, 5);
+        assert!(
+            incomplete.self_test_failed,
+            "SPC 3 (unknown error, incomplete) is not a verdict"
+        );
+        assert_eq!(score_health(&incomplete, "hdd", None).0, "critical");
+        assert!(scsi(8, 5).self_test_failed, "an SPC reserved code is not a verdict");
+        assert!(!scsi(0, 5).self_test_failed, "a pass on top clears it");
     }
 
     /// A failed NVMe self-test has to reach `score_health`, and an aborted one

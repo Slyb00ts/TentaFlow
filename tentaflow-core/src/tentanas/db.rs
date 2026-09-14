@@ -1013,6 +1013,23 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
             [],|r| r.get(0))?;
         anyhow::ensure!(!closing,"Rozpoczęto usuwanie instancji; odmowa nowej intencji Elastic");
     }
+    // A second self-test on a disk that is already running one would ABORT the
+    // first (ATA, SPC and NVMe all behave this way), and the long test spans
+    // many ticks of a daily short schedule. The refusal lives HERE, not at the
+    // callers: the scheduler's two passes, the manual start from the disk
+    // detail view and two rapid clicks on it all arrive through this
+    // transaction, and only here are the check and the insert one atomic step.
+    // Scoped to `smart_test` because no other kind serialises on its subject
+    // this way — a pool takes two scrubs, a dataset two snapshots.
+    if job.kind == "smart_test" {
+        let running: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nas_jobs
+             WHERE kind = 'smart_test' AND subject = ?1 AND status = 'running')",
+            params![job.subject],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(!running, "Na tym dysku trwa już autotest SMART; odmowa drugiego");
+    }
     tx.execute(
         "INSERT INTO nas_jobs (job_id, kind, subject, status, progress_pct, started_by,
                                started_at, log)
@@ -1501,23 +1518,6 @@ pub fn job(pool: &DbPool, job_id: &str) -> Result<Option<NasJob>> {
             job_from_row,
         )
         .optional()?)
-}
-
-/// Subjects that still have a `kind` job running. The scheduler asks before
-/// starting a self-test: a second test on one disk ABORTS the first (ATA, SPC
-/// and NVMe all behave this way), and the long pass runs for hours, so without
-/// this a daily short pass would cut the long one short every time it came due.
-pub fn running_job_subjects(
-    pool: &DbPool,
-    kind: &str,
-) -> Result<std::collections::HashSet<String>> {
-    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let mut stmt =
-        conn.prepare_cached("SELECT subject FROM nas_jobs WHERE kind = ?1 AND status = 'running'")?;
-    let rows = stmt
-        .query_map(params![kind], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows.into_iter().collect())
 }
 
 pub fn list_jobs(pool: &DbPool, limit: u32) -> Result<Vec<NasJob>> {
@@ -4927,11 +4927,17 @@ mod tests {
         Arc::new(crate::db::Db::from_connection(conn))
     }
 
-    /// What the scheduler consults before starting a self-test. A finished
-    /// test must not block the next one, and a job of another kind on another
-    /// subject must not block anything.
+    /// A second self-test on one disk ABORTS the first, so `insert_job`
+    /// refuses it — for the scheduler's short pass, for the manual start and
+    /// for two rapid clicks on it alike, because this is the only place where
+    /// the check and the insert are one atomic step.
+    ///
+    /// The refusal is scoped to the disk, to the kind and to a test that is
+    /// still running: another disk, another kind and a finished test all stay
+    /// startable. Without the scoping this would refuse legitimate work,
+    /// because `insert_job` opens EVERY job of the node.
     #[test]
-    fn running_job_subjects_lists_only_running_jobs_of_that_kind() {
+    fn a_second_running_smart_test_on_one_disk_is_refused() {
         let p = pool();
         let mk = |id: &str, kind: &str, subject: &str, status: &str| NasJob {
             job_id: id.into(),
@@ -4943,14 +4949,34 @@ mod tests {
             ..Default::default()
         };
         insert_job(&p, &mk("j1", "smart_test", "disk-a", "running"), None).unwrap();
-        insert_job(&p, &mk("j2", "smart_test", "disk-b", "running"), None).unwrap();
-        insert_job(&p, &mk("j3", "smart_test", "disk-c", "succeeded"), None).unwrap();
-        insert_job(&p, &mk("j4", "scrub", "tank", "running"), None).unwrap();
-        let busy = running_job_subjects(&p, "smart_test").unwrap();
-        assert_eq!(busy.len(), 2, "only the running smart_test rows");
-        assert!(busy.contains("disk-a") && busy.contains("disk-b"));
-        assert!(!busy.contains("disk-c"), "a finished test does not block the next one");
-        assert!(!busy.contains("tank"), "another kind does not block a disk");
+
+        // The manual path, or the short pass, arriving at a disk already under test.
+        let refused = insert_job(&p, &mk("j2", "smart_test", "disk-a", "running"), None)
+            .expect_err("a second test on disk-a is refused");
+        assert!(
+            refused.to_string().contains("autotest SMART"),
+            "{refused}"
+        );
+        let rows: i64 = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM nas_jobs WHERE subject = 'disk-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "the refused job left no row behind");
+
+        // Everything the refusal must NOT touch.
+        insert_job(&p, &mk("j3", "smart_test", "disk-b", "running"), None)
+            .expect("another disk is free");
+        insert_job(&p, &mk("j4", "scrub", "disk-a", "running"), None)
+            .expect("another kind does not serialise on the disk");
+        insert_job(&p, &mk("j5", "smart_test", "disk-c", "succeeded"), None)
+            .expect("a finished test is not a running one");
+        insert_job(&p, &mk("j6", "smart_test", "disk-c", "running"), None)
+            .expect("a finished test does not block the next one");
     }
 
     #[test]

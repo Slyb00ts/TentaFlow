@@ -233,7 +233,16 @@ async fn tick(main_db: &DbPool, db: &DbPool) {
     run_due_pool_tasks(db, store::PoolTask::Scrub, now).await;
     run_due_pool_tasks(db, store::PoolTask::Trim, now).await;
     run_due_snapshots(db, now).await;
-    run_due_smart_tests(db, now).await;
+    run_due_smart_tests(
+        db,
+        now,
+        super::disks::snapshot()
+            .0
+            .into_iter()
+            .map(|d| (d.disk_id, d.path))
+            .collect(),
+    )
+    .await;
     // Both Elastic passes read ONE snapshot of the arrays: the second pass
     // would otherwise re-read rows the first pass has just changed, and the
     // work below is the same for both.
@@ -486,7 +495,21 @@ async fn run_due_snapshots(db: &DbPool, now: DateTime<Local>) {
     }
 }
 
-async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>) {
+/// §5.10: the two SMART self-test cadences, long pass then short pass.
+///
+/// `disks` is one `(disk_id, device path)` pair per disk, INJECTED by the
+/// caller. The inventory lives in a process-global snapshot a test cannot
+/// seed, and without the injection neither the order of the two passes nor
+/// what a pass does when every disk refuses could be tested at all.
+///
+/// A REFUSED SPAWN IS NORMAL AND DOES NOT FAIL THE TICK, exactly as on the
+/// Elastic path: `insert_job` refuses a self-test on a disk that is already
+/// running one, because the second test would ABORT the first (ATA, SPC and
+/// NVMe all behave this way) and a long test spans many ticks of a daily short
+/// schedule. That refusal IS the serialisation this needs — for the scheduled
+/// and the manual start alike — and a second lock here would only be able to
+/// disagree with it.
+async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>, disks: Vec<(String, String)>) {
     let mut smart = match store::smart_schedule(db) {
         Ok(s) => s,
         Err(e) => {
@@ -500,7 +523,9 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>) {
     let mut changed = false;
     // Long pass FIRST. Starting a short test aborts a long one already on the
     // disk, so when both come due in the same tick the long pass — the one
-    // that reads the whole surface — is the one worth keeping.
+    // that reads the whole surface — takes the disks, and the short pass is
+    // refused on every disk the long pass has just occupied. Reversing these
+    // two would make a daily short test cut every long test short.
     for long in [true, false] {
         let schedule = if long { smart.long.clone() } else { smart.short.clone() };
         let stored_next = if long {
@@ -525,48 +550,46 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>) {
         } else {
             tentanas_helper::SelfTestKind::Short
         };
+        // The cadence re-arms FORWARD even when every disk refuses: a pass
+        // left due would retry — and log — on every tick for the hours a long
+        // test takes, and the next short test is wanted at the next deadline,
+        // not the minute the long one ends.
         if long {
-            smart.last_long_at = Some(store::now());
             smart.next_long_at = next;
         } else {
-            smart.last_short_at = Some(store::now());
             smart.next_short_at = next;
         }
         changed = true;
-        // A disk already running a self-test is left alone: a second test
-        // aborts the first, and the long pass spans many ticks of a daily
-        // short schedule. Re-read per pass so the short pass sees the disks
-        // the long pass has just occupied, and extended as we go so one pass
-        // cannot start twice on one disk.
-        let mut busy = match store::running_job_subjects(db, "smart_test") {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("tentanas scheduler: running SMART tests unreadable: {e}");
-                std::collections::HashSet::new()
-            }
-        };
-        for (disk_id, device) in super::disks::snapshot()
-            .0
-            .into_iter()
-            .map(|d| (d.disk_id, d.path))
-        {
-            if busy.contains(&disk_id) {
-                tracing::info!(
-                    "tentanas scheduler: SMART test for {disk_id} skipped, one is already running"
-                );
-                continue;
-            }
-            let started = super::jobs::spawn(db, "smart_test", &disk_id, STARTED_BY, None, None, move |h| {
+        let mut started_any = false;
+        for (disk_id, device) in disks.iter().cloned() {
+            match super::jobs::spawn(db, "smart_test", &disk_id, STARTED_BY, None, None, move |h| {
                 super::jobs::smart_self_test(h, device, kind, None)
-            });
-            match started {
-                Ok(_) => {
-                    busy.insert(disk_id);
-                }
-                Err(e) => {
-                    tracing::warn!("tentanas scheduler: SMART test for {disk_id} not started: {e}");
-                }
+            }) {
+                Ok(_) => started_any = true,
+                // Logged at info, not warn: on a node whose long test is still
+                // running this is the expected answer for every disk, and the
+                // message carries the reason the refusal gave.
+                Err(e) => tracing::info!(
+                    "tentanas scheduler: SMART test for {disk_id} not started: {e}"
+                ),
             }
+        }
+        // A pass that started NOTHING did not run, so it does not stamp
+        // `last_*_at`. The Tasks tab renders that field as the schedule's
+        // `last_run_at` with no result column beside it (§5.10), so a stamp
+        // here would tell the operator a test ran on every disk while the
+        // long pass held them all and the short pass did nothing.
+        if started_any {
+            if long {
+                smart.last_long_at = Some(store::now());
+            } else {
+                smart.last_short_at = Some(store::now());
+            }
+        } else {
+            tracing::info!(
+                "tentanas scheduler: SMART {} pass started nothing, the schedule records no run",
+                if long { "long" } else { "short" }
+            );
         }
     }
     if changed {
@@ -970,6 +993,147 @@ mod tests {
             started.last_result.starts_with("started job"),
             "one array's refusal must not stop the next one: {}",
             started.last_result
+        );
+    }
+    // ----- SMART self-tests ---------------------------------------------------
+
+    /// Arms both SMART cadences at an explicit deadline. `run_due_smart_tests`
+    /// reads only `next_*_at` to decide what is due, so seeding those two
+    /// fields is what puts a pass in the past without waiting for a clock.
+    fn arm_smart(p: &DbPool, next_short: DateTime<Local>, next_long: DateTime<Local>) {
+        let mut smart = store::smart_schedule(p).expect("default schedule");
+        smart.enabled = true;
+        smart.short = schedule("daily", 3, 0);
+        smart.long = schedule("weekly", 4, 0);
+        smart.next_short_at = Some(next_short.to_rfc3339());
+        smart.next_long_at = Some(next_long.to_rfc3339());
+        store::set_smart_schedule(p, &smart).expect("arm");
+    }
+
+    /// The row a self-test holds while it runs — `insert_job` refuses a second
+    /// one on the same subject, which is the whole serialisation.
+    fn occupy_disk(p: &DbPool, disk_id: &str) {
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "smart_test".to_string(),
+            subject: disk_id.to_string(),
+            status: "running".to_string(),
+            started_by: STARTED_BY.to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(p, &job, None).expect("occupy the disk");
+    }
+
+    fn smart_test_subjects(p: &DbPool) -> Vec<String> {
+        let mut subjects: Vec<String> = store::list_jobs(p, 500)
+            .expect("jobs")
+            .into_iter()
+            .filter(|j| j.kind == "smart_test")
+            .map(|j| j.subject)
+            .collect();
+        subjects.sort();
+        subjects
+    }
+
+    fn two_disks() -> Vec<(String, String)> {
+        vec![
+            ("disk-a".to_string(), "/dev/sda".to_string()),
+            ("disk-b".to_string(), "/dev/sdb".to_string()),
+        ]
+    }
+
+    /// A second self-test on one disk ABORTS the first, so a disk that is
+    /// already under test is left alone — and the disks beside it still get
+    /// theirs, because one refusal must not end the pass.
+    #[tokio::test]
+    async fn a_disk_already_running_a_self_test_gets_no_second_one() {
+        let p = db();
+        occupy_disk(&p, "disk-a");
+        let now = at(2026, 9, 1, 3, 0);
+        arm_smart(
+            &p,
+            now - chrono::Duration::minutes(1),
+            now + chrono::Duration::days(3),
+        );
+
+        run_due_smart_tests(&p, now, two_disks()).await;
+
+        assert_eq!(
+            smart_test_subjects(&p),
+            ["disk-a", "disk-b"],
+            "disk-a keeps the ONE test it was already running and disk-b gets its first"
+        );
+        let after = store::smart_schedule(&p).expect("schedule");
+        assert!(after.last_short_at.is_some(), "disk-b did start, so the pass ran");
+        assert!(after.last_long_at.is_none(), "the long pass was not due");
+    }
+
+    /// Both cadences due in the same tick: the LONG pass takes the disks and
+    /// the short pass is refused on every one of them. Reversing the two loop
+    /// passes would make a daily short test cut every long test short — and
+    /// the only thing that records WHICH pass got the disks is `last_*_at`,
+    /// because the job row says "smart_test" for both.
+    #[tokio::test]
+    async fn the_long_pass_takes_the_disks_before_the_short_pass_sees_them() {
+        let p = db();
+        let now = at(2026, 9, 1, 4, 0);
+        let due = now - chrono::Duration::minutes(1);
+        arm_smart(&p, due, due);
+
+        run_due_smart_tests(&p, now, two_disks()).await;
+
+        assert_eq!(
+            smart_test_subjects(&p),
+            ["disk-a", "disk-b"],
+            "one test per disk, not one per pass"
+        );
+        let after = store::smart_schedule(&p).expect("schedule");
+        assert!(after.last_long_at.is_some(), "the long pass is the one that ran");
+        assert!(
+            after.last_short_at.is_none(),
+            "the short pass started nothing, so it records no run"
+        );
+        // Both cadences still move forward: a pass whose disks were all busy
+        // must not stay due and retry on every tick for the hours a long test
+        // takes.
+        assert_eq!(after.next_long_at, next_run_utc(&after.long, now));
+        assert_eq!(after.next_short_at, next_run_utc(&after.short, now));
+    }
+
+    /// A pass that started NOTHING did not run. `last_short_at` is what the
+    /// Tasks tab shows as the schedule's `last_run_at`, and there is no result
+    /// column beside it that could say "skipped", so stamping it would tell
+    /// the operator a test ran on every disk while none did.
+    #[tokio::test]
+    async fn a_pass_that_starts_nothing_records_no_run_but_still_rearms() {
+        let p = db();
+        occupy_disk(&p, "disk-a");
+        occupy_disk(&p, "disk-b");
+        let now = at(2026, 9, 1, 3, 0);
+        arm_smart(
+            &p,
+            now - chrono::Duration::minutes(1),
+            now + chrono::Duration::days(3),
+        );
+
+        run_due_smart_tests(&p, now, two_disks()).await;
+
+        assert_eq!(
+            smart_test_subjects(&p),
+            ["disk-a", "disk-b"],
+            "only the two tests that were already running"
+        );
+        let after = store::smart_schedule(&p).expect("schedule");
+        assert!(
+            after.last_short_at.is_none(),
+            "every disk refused, so the schedule shows no run at {:?}",
+            after.last_short_at
+        );
+        assert_eq!(
+            after.next_short_at,
+            next_run_utc(&after.short, now),
+            "the cadence re-arms forward anyway"
         );
     }
 }
