@@ -415,10 +415,15 @@ test('tf-table: an unchanged actions signature keeps the very same element', () 
   const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
   let built = 0;
   t.rowActionsKey = (row) => `${row.id}|${row.v}`;
-  t.rowActions = (row) => {
+  // A complete key is no longer sufficient on its own: the builder must also
+  // have asked for the live row. Completeness of a key is a promise tf-table
+  // cannot verify, and a key that omitted the identity was shown to strand a
+  // handler on a stale row. A caller with a complete key but an old-style
+  // builder now loses this optimisation, never correctness.
+  t.rowActions = (row, idx, currentRow) => {
     built += 1;
     const b = document.createElement('button');
-    b.dataset.row = row.id;
+    b.dataset.row = (currentRow?.() ?? row).id;
     return b;
   };
   const el = bodyCells(t).at(-1).firstChild;
@@ -539,7 +544,12 @@ test('tf-table: with no signature at all, a no-op poll still touches no node', (
   // may be reaching for is left exactly where it is.
   const t = table([{ key: 'a', label: 'A' }], [{ a: '1' }]);
   let built = 0;
-  t.rowActions = () => { built += 1; return document.createElement('span'); };
+  // Three parameters: only a builder that asked for the live row may have its
+  // element kept. The zero-parameter shape this test first used is
+  // indistinguishable from a rest-parameter builder that CAN read the row, so
+  // tf-table no longer trusts it. The point of the test — no SIGNATURE, yet an
+  // identical result is discarded — is unchanged.
+  t.rowActions = (row, idx, currentRow) => { built += 1; return document.createElement('span'); };
   const el = bodyCells(t).at(-1).firstChild;
   assert.ok(el, 'the actions cell is filled on the first render');
   assert.equal(built, 1);
@@ -1269,4 +1279,31 @@ test('tf-table: a builder that asked for the live row still keeps its element', 
 
   t.rows = [{ a: '1', id: 'r1' }];
   assert.equal(bodyCells(t).at(-1).firstChild === first, true, 'the node survives for a migrated builder');
+});
+
+// The fast path for a declared signature used to run BEFORE any check on the
+// builder, so a hand-rolled key that omits the row identity, paired with a
+// builder that never asked for the live row, kept a node whose handlers fired
+// on the row that used to sit in this slot. A critic reproduced that against
+// the shipped code; this pins the gate that closes it.
+test('tf-table: a declared signature cannot keep a node for an unmigrated builder', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  const fired = [];
+  // A key that deliberately omits the row identity: the caller's promise is
+  // incomplete, which is precisely the case that must not be trusted.
+  t.rowActionsKey = () => 'constant';
+  t.rowActions = (row) => {
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push(row.id));
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+  assert.ok(first, 'the actions cell is filled on the first render');
+
+  // A different logical row slides into the slot.
+  t.rows = [{ a: '1', id: 'r2' }];
+  const second = bodyCells(t).at(-1).firstChild;
+  assert.equal(second === first, false, 'the node is not kept for an unmigrated builder');
+  second.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['r2'], 'and the handler acts on the row now in that slot');
 });

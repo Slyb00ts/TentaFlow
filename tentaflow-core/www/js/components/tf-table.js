@@ -671,11 +671,30 @@ class TfTable extends HTMLElement {
   // Comparing against the live DOM would read those as "changed" and destroy
   // precisely the element being interacted with.
   _writeActionsCell(td, row, idx) {
+    // Whether an existing element may be KEPT at all — decided before either
+    // path that could keep one. A builder is trusted only when it declared the
+    // live accessor (three parameters), because then its handlers resolve the
+    // row occupying this slot at click time. One that took `(row)` or
+    // `(row, idx)` closes over the row it was built from, so reusing its
+    // element would fire its handlers on data from a poll ago with no visible
+    // symptom. Those are rebuilt, exactly as tf-table behaved before any of
+    // this existed: such a caller loses performance, never correctness.
+    //
+    // `Function.length` stops counting at the first defaulted or rest
+    // parameter, so `(row = x, idx, cur) => {}` and `(...args) => {}` both
+    // report 0. Requiring >= 3 is therefore sound BY CONSTRUCTION rather than
+    // by convention: every shape that could hide a row read fails the test
+    // instead of passing it.
+    const cannotHoldStaleRow = typeof this._rowActions === 'function' && this._rowActions.length >= 3;
     const key = this._rowActionsSignature(row, idx);
     // A declared signature that still holds skips the build entirely — the
-    // optional fast path. `null` never matches itself, so a table without a
-    // signature always builds and falls through to the markup comparison.
-    if (key !== null && td._tfActionsKey === key) return;
+    // optional fast path, gated on the SAME condition. A hand-rolled key that
+    // omits the row identity, paired with an unmigrated builder, would
+    // otherwise keep a node whose handlers fire on the row that used to sit
+    // here (reproduced against the shipped code during review). `null` never
+    // matches itself, so a table without a signature always builds and falls
+    // through to the markup comparison below.
+    if (key !== null && cannotHoldStaleRow && td._tfActionsKey === key) return;
     const gen = this._rowActionsGen || 0;
     let el = null;
     try {
@@ -689,22 +708,13 @@ class TfTable extends HTMLElement {
     // The generation is part of the match: a NEW builder closes over new
     // values (an `isAdmin` that has since changed), so its output has to
     // replace the old element even when the two render the same markup.
-    // Keeping an element is only sound when the builder cannot be holding a
-    // stale row, and two shapes qualify. One that declared the live accessor
-    // (three parameters) resolves the row at click time. One that declared NO
-    // parameters cannot read row data at all, so there is nothing to go stale.
-    // The hazard is the shape in between: a builder that took `(row)` or
-    // `(row, idx)` and nothing else closes over the row it was built from, so
-    // reusing its element would hand its handlers data from a poll ago with no
-    // visible symptom — the guarantee the opt-in signature used to give and
-    // the markup comparison silently dropped. Those are rebuilt, exactly as
-    // tf-table behaved before any of this existed: such a caller loses
-    // performance, never correctness.
-    // Residual, stated rather than hidden: a `function () {}` builder could
-    // still reach row data through `arguments`. Nothing here does, and an
-    // arrow function has no `arguments` at all.
-    const arity = typeof this._rowActions === 'function' ? this._rowActions.length : -1;
-    const cannotHoldStaleRow = arity === 0 || arity >= 3;
+    //
+    // `html !== null` below is defensive, not decisive: no mutation of it can
+    // fail a test, because a builder returning a Text or Comment node is
+    // already stopped by `typeof held.outerHTML === 'string'` on the next
+    // render. Kept as a guard against a future path that records a non-null
+    // html for a node that has none, and said plainly here so the redundancy
+    // is not mistaken for untested logic.
     if (html !== null
       && cannotHoldStaleRow
       && held != null && typeof held.outerHTML === 'string'
