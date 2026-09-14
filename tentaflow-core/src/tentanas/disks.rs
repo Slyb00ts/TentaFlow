@@ -499,6 +499,29 @@ pub fn summarize_smart(doc: &Value) -> SmartSummary {
             s.self_test_failed = true;
         }
     }
+    // NVMe has no status block at all: it reports a running test in the header
+    // of the self-test log itself. `current_self_test_operation.value` is the
+    // operation code and 0 means none is running, and the percentage is emitted
+    // ONLY while one is — in `nvmeprint.cpp` the assignment
+    // `jref["current_self_test_completion_percent"]` sits inside
+    // `if (self_test_log.current_operation & 0xf)`, under
+    // `jref = jglb["nvme_self_test_log"]`. Verified against smartctl 7.5
+    // (r5714), whose string table carries both keys.
+    //
+    // Unlike ATA's `remaining_percent` this is the percentage ALREADY DONE, so
+    // it is taken as it stands rather than subtracted from 100.
+    if s.self_test_running_pct.is_none()
+        && doc
+            .pointer("/nvme_self_test_log/current_self_test_operation/value")
+            .and_then(Value::as_u64)
+            .is_some_and(|op| op != 0)
+    {
+        let done = doc
+            .pointer("/nvme_self_test_log/current_self_test_completion_percent")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        s.self_test_running_pct = Some(done.min(100) as u8);
+    }
     // A SAS/SCSI disk has no ATA status pointer, so the block above never fires
     // for it: without this, the detail view could show a red "failed" self-test
     // row while `score_health` called the disk "ok" and no alert was raised.
@@ -511,20 +534,34 @@ pub fn summarize_smart(doc: &Value) -> SmartSummary {
     // interrupted would mark the disk critical.
     //
     // The newest entry that carries a VERDICT is the last one the disk gave,
-    // and only "passed", "aborted" and "failed" are verdicts. Skipping just
-    // "running" was not enough: a reserved NVMe code (Ah–Eh), an SPC code 3
+    // and only "passed" and "failed" are verdicts. Skipping just "running" was
+    // not enough: a reserved NVMe code (Ah–Eh), an SPC code 3
     // ("unknown error, incomplete"), an SPC reserved code (8–14) and an entry
     // with no parseable result all normalise to "unknown", and any of them
     // sitting on top was taken as THE verdict — showing a red "failed" row in
     // the detail view while `score_health` still called the disk "ok". Listing
     // the verdicts rather than the non-verdicts also keeps a status added
     // later from silently counting as one.
+    //
+    // An ABORT is not one of them, and used to be. An abort says the run was
+    // stopped — the user's own command, a controller reset, a Format NVM, a
+    // sanitize — and says NOTHING about the medium, so reading it as "the last
+    // verdict" let a controller reset or a sanitize silently CLEAR a recorded
+    // failure underneath it: the disk had failed a test, one reset later the
+    // detail view was green and no alert was ever raised again. It is now
+    // skipped exactly like "running" and "unknown", and the newest real verdict
+    // stands. The counter-argument — that a very old failure followed by
+    // aborts may be stale — does not hold: an abort is no evidence that the
+    // medium improved, and the way to clear a stale failure is a test that
+    // PASSES, which still clears it on the next poll. The two mistakes are not
+    // symmetric either: a cleared real failure loses the alert on a dying
+    // disk, while a retained stale failure costs one more self-test.
     if st.is_none()
         && (doc.get("scsi_self_test_0").is_some() || doc.get("nvme_self_test_log").is_some())
     {
         s.self_test_failed = smart_self_tests(doc)
             .iter()
-            .find(|t| matches!(t.status.as_str(), "passed" | "aborted" | "failed"))
+            .find(|t| matches!(t.status.as_str(), "passed" | "failed"))
             .is_some_and(|t| t.status == "failed");
     }
     s
@@ -1623,6 +1660,12 @@ mod tests {
     /// A failed NVMe self-test has to reach `score_health`, and an aborted one
     /// must not. Before this the NVMe verdict reached nothing at all, so a
     /// disk that reported a failed segment still read as healthy.
+    ///
+    /// This test used to assert only the single-entry cases below, which read
+    /// the same under both abort contracts — an abort on its own has no verdict
+    /// beneath it to clear. That is precisely how the defect survived: an abort
+    /// counted as A VERDICT, so an abort STACKED on a failure cleared it. The
+    /// stacked cases are now asserted here too.
     #[test]
     fn a_failed_nvme_self_test_counts_but_an_aborted_one_does_not() {
         let doc = |result: u64| {
@@ -1647,6 +1690,75 @@ mod tests {
             "result 9 is a sanitize abort, not a failure"
         );
         assert!(!summarize_smart(&doc(0)).self_test_failed, "result 0 passed");
+    }
+
+    /// An abort is not a statement about the medium, so it is not a verdict:
+    /// it must neither raise a failure nor CLEAR one recorded beneath it. It
+    /// used to clear one — "aborted" sat in the same list as "passed" and
+    /// "failed" — so a controller reset (NVMe result 2) or a sanitize (result
+    /// 9) silently turned a disk that had failed its self-test green again,
+    /// and the alert was never raised a second time. Only a real verdict moves
+    /// the answer, and the way to clear a stale failure is a test that PASSES.
+    #[test]
+    fn an_abort_does_not_clear_a_failure_recorded_beneath_it() {
+        let nvme_entry = |value: u64| {
+            serde_json::json!({
+                "self_test_code": {"string": "Extended"},
+                "self_test_result": {"value": value, "string": "x"},
+                "power_on_hours": 5,
+            })
+        };
+        let nvme = |table: Value| {
+            summarize_smart(&serde_json::json!({
+                "smart_status": {"passed": true},
+                "nvme_self_test_log": {"table": table},
+            }))
+        };
+
+        // A controller reset on top of a failed segment: the failure stands.
+        let reset = nvme(serde_json::json!([nvme_entry(2), nvme_entry(6)]));
+        assert!(reset.self_test_failed, "a controller reset is not a verdict");
+        assert_eq!(score_health(&reset, "ssd", None).0, "critical");
+
+        // A sanitize abort on top of it, likewise.
+        let sanitize = nvme(serde_json::json!([nvme_entry(9), nvme_entry(6)]));
+        assert!(sanitize.self_test_failed, "a sanitize abort is not a verdict");
+
+        // Aborts stacked on top of a PASS leave the pass standing, so an abort
+        // never invents a failure either.
+        let clean = nvme(serde_json::json!([nvme_entry(2), nvme_entry(9), nvme_entry(0)]));
+        assert!(!clean.self_test_failed, "the newest verdict is still the pass");
+        assert_eq!(score_health(&clean, "ssd", None).0, "ok");
+
+        // A fresh PASS above the abort is what clears the failure.
+        let retested = nvme(serde_json::json!([
+            nvme_entry(0),
+            nvme_entry(2),
+            nvme_entry(6)
+        ]));
+        assert!(!retested.self_test_failed, "a passing re-test clears it");
+
+        // SCSI: the same contract. SPC 1 is the user's own abort command and
+        // SPC 2 a device reset, newest first as numbered top-level keys.
+        let scsi_entry = |value: u64| {
+            serde_json::json!({
+                "code": {"string": "Background long"},
+                "result": {"value": value, "string": "x"},
+                "power_on_time": {"hours": 100},
+            })
+        };
+        let scsi = |newest: u64, older: u64| {
+            summarize_smart(&serde_json::json!({
+                "smart_status": {"passed": true},
+                "scsi_grown_defect_list": 0,
+                "scsi_self_test_0": scsi_entry(newest),
+                "scsi_self_test_1": scsi_entry(older),
+            }))
+        };
+        assert!(scsi(1, 5).self_test_failed, "an abort by command is not a verdict");
+        assert!(scsi(2, 5).self_test_failed, "an abort by device reset is not a verdict");
+        assert!(!scsi(1, 0).self_test_failed, "an abort over a pass invents nothing");
+        assert!(!scsi(0, 5).self_test_failed, "a passing re-test still clears it");
     }
 
     #[test]

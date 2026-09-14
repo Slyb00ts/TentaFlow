@@ -773,6 +773,203 @@ mod tests {
         );
     }
 
+    /// The poll loop MUST terminate. The stall bound alone does not make it:
+    /// a disk left holding a stale "in progress" entry (an interrupted test, a
+    /// power loss) answers `Running` to every poll, which pushed the stall
+    /// bound back every time, and the job then polled a dead test forever.
+    #[test]
+    fn the_poll_loop_terminates_even_when_every_poll_reports_progress() {
+        let window = Duration::from_secs(3600);
+        // `since_sign` is zero on every call: this is exactly the stale
+        // in-progress entry, resetting the rolling bound at every poll.
+        let forever = Duration::ZERO;
+        assert_eq!(self_test_timeout(window, Duration::from_secs(3600), forever), None);
+        assert_eq!(self_test_timeout(window, Duration::from_secs(7199), forever), None);
+        // One window short of the cap is still inside it; the cap itself is not.
+        let (timeout, bound) = self_test_timeout(window, Duration::from_secs(7200), forever)
+            .expect("a run that keeps reporting progress must still be capped");
+        assert_eq!(timeout, SelfTestTimeout::Cap);
+        assert_eq!(bound, Duration::from_secs(7200), "the cap is twice the window");
+    }
+
+    /// An operator chasing a timeout has to be able to tell a disk that never
+    /// showed the run from one whose progress reports stopped being believed.
+    /// The two bounds are also ordered: the stall bound lies strictly inside
+    /// the cap, so adding the cap cannot cut short a run the stall bound would
+    /// have allowed.
+    #[test]
+    fn a_hard_cap_and_a_stall_are_told_apart_by_their_error() {
+        let window = Duration::from_secs(3600);
+        // A disk that never shows the run at all: `since_sign` tracks `elapsed`.
+        let (timeout, bound) = self_test_timeout(window, window, window)
+            .expect("a disk that never shows the run must stall out");
+        assert_eq!(timeout, SelfTestTimeout::Stall);
+        assert_eq!(bound, window, "a stall is reported against the window, not the cap");
+
+        let stall = SelfTestTimeout::Stall.error(window).to_string();
+        let cap = SelfTestTimeout::Cap.error(window * 2).to_string();
+        assert_eq!(stall, "the disk recorded no self-test result within 60 min");
+        assert!(
+            cap.contains("still reported the test as running after 120 min"),
+            "the cap must say the disk kept claiming progress, got {cap:?}"
+        );
+        assert!(
+            !cap.contains("recorded no self-test result"),
+            "the cap must not reuse the stall wording, got {cap:?}"
+        );
+    }
+
+    /// A failed pre-start read leaves the window on its FLOOR, because the
+    /// advertised duration is read from the very document that failed to load:
+    /// 6 h for a long test, not the 24.5 h the disk itself advertises. The
+    /// duration is static device metadata, so a later successful poll is just
+    /// as good a source for it.
+    #[test]
+    fn the_window_is_rederived_from_a_poll_when_the_pre_read_gave_nothing() {
+        let floor = self_test_window(&Value::Null, SelfTestKind::Long);
+        assert_eq!(floor, Duration::from_secs(6 * 60 * 60));
+
+        // ATA finishes on its own status block, so its run can be reported
+        // with no baseline at all and a longer window strictly helps it.
+        let ata = serde_json::json!({
+            "ata_smart_data": {"self_test": {
+                "status": {"remaining_percent": 40},
+                "polling_minutes": {"extended": 300},
+            }},
+        });
+        assert_eq!(
+            rederived_self_test_window(floor, &ata, SelfTestKind::Long, &[]),
+            Some(Duration::from_secs(600 * 60)),
+            "300 advertised minutes, doubled"
+        );
+
+        // A SAS poll with no baseline can never have its result attributed to
+        // this run, so stretching its window only delays the same error.
+        let sas = sas_doc(&[scsi_entry(0, "Completed", 32392)]);
+        assert_eq!(rederived_self_test_window(floor, &sas, SelfTestKind::Long, &[]), None);
+        // With a baseline the log can move, and then the disk's real 24.5 h
+        // figure replaces the floor.
+        assert_eq!(
+            rederived_self_test_window(floor, &sas, SelfTestKind::Long, &log_of(&sas)),
+            Some(Duration::from_secs(176_400))
+        );
+        // It only ever grows: a window already in force is never shortened.
+        assert_eq!(
+            rederived_self_test_window(
+                Duration::from_secs(200_000),
+                &sas,
+                SelfTestKind::Long,
+                &log_of(&sas)
+            ),
+            None
+        );
+    }
+
+    /// smartctl publishes NO self-test duration for NVMe, so an NVMe test runs
+    /// on the 6 h floor. What made that harmful was that a running NVMe test
+    /// looked like a stall: the log gains its entry only once the test is
+    /// over, so every poll in between read as "nothing belongs to this run".
+    /// NVMe does report progress — in the self-test log header, not in any
+    /// status block — and reading it keeps the stall bound pushed back for as
+    /// long as the test really runs.
+    #[test]
+    fn a_running_nvme_self_test_reports_progress_instead_of_stalling() {
+        let running = serde_json::json!({
+            "nvme_self_test_log": {
+                "current_self_test_operation": {
+                    "value": 2, "string": "Extended self-test operation in progress"
+                },
+                "current_self_test_completion_percent": 37,
+                "table": [],
+            },
+        });
+        // Unlike ATA this is the percentage already DONE, so it is not inverted.
+        assert_eq!(
+            classify_self_test_poll(&running, &[]),
+            SelfTestPoll::Running(Some(37))
+        );
+
+        // Operation 0 is "no self-test in progress", and smartctl then omits
+        // the percentage entirely; that is not a running test.
+        let idle = serde_json::json!({
+            "nvme_self_test_log": {
+                "current_self_test_operation": {
+                    "value": 0, "string": "No device self-test operation in progress"
+                },
+                "table": [],
+            },
+        });
+        assert_eq!(classify_self_test_poll(&idle, &[]), SelfTestPoll::Stalled);
+    }
+
+    /// The loop's own decision, not just the bound it consults: a `Running`
+    /// poll must NOT be the one classification that escapes the bound. It was
+    /// exactly that — the only arm that pushed the deadline back without ever
+    /// testing it — so a disk holding a stale in-progress entry answered
+    /// `Running` forever and the job polled a dead test with no way out.
+    #[test]
+    fn a_running_poll_does_not_let_the_loop_escape_its_bound() {
+        let window = Duration::from_secs(3600);
+        let cap = window * 2;
+
+        // Inside the cap a running poll simply reports progress.
+        assert_eq!(
+            self_test_step(SelfTestPoll::Running(Some(50)), window, window, Duration::ZERO),
+            SelfTestStep::Progress(Some(50))
+        );
+        // At the cap the very same poll ends the job.
+        assert_eq!(
+            self_test_step(SelfTestPoll::Running(Some(50)), window, cap, Duration::ZERO),
+            SelfTestStep::Expired(SelfTestTimeout::Cap, cap)
+        );
+        // A SCSI in-progress entry carries no percentage and is bounded alike.
+        assert_eq!(
+            self_test_step(SelfTestPoll::Running(None), window, cap, Duration::ZERO),
+            SelfTestStep::Expired(SelfTestTimeout::Cap, cap)
+        );
+
+        // A running poll is itself the sign, so a long silence before it does
+        // not stall the run out.
+        assert_eq!(
+            self_test_step(SelfTestPoll::Running(None), window, window, window * 10),
+            SelfTestStep::Progress(None)
+        );
+        // A silent poll after that same silence does.
+        assert_eq!(
+            self_test_step(SelfTestPoll::Stalled, window, window, window),
+            SelfTestStep::Expired(SelfTestTimeout::Stall, window)
+        );
+
+        // A result that arrived is reported as a result however late it is:
+        // the bounds never discard a verdict the disk actually gave.
+        assert_eq!(
+            self_test_step(SelfTestPoll::Finished(None), window, cap * 9, cap * 9),
+            SelfTestStep::Done(None)
+        );
+    }
+
+    /// A poll whose document could not be read is the other way the loop used
+    /// to escape its bound: the read-failure arm `continue`d, skipping the
+    /// check outright, so a device that had gone away or a credential that
+    /// stopped working failed every read and the job polled forever.
+    #[test]
+    fn a_poll_that_could_not_be_read_is_no_sign_of_the_run() {
+        let window = Duration::from_secs(3600);
+        assert_eq!(classify_self_test_read(None, &[]), SelfTestPoll::Stalled);
+        // A readable document still classifies exactly as before.
+        let running = sas_doc(&[scsi_entry(15, "Self test in progress ...", 32392)]);
+        assert_eq!(
+            classify_self_test_read(Some(&running), &log_of(&sas_doc(&[]))),
+            SelfTestPoll::Running(None)
+        );
+        // And an unreadable poll runs the stall bound down instead of being
+        // waved through.
+        assert_eq!(
+            self_test_step(classify_self_test_read(None, &[]), window, window, window),
+            SelfTestStep::Expired(SelfTestTimeout::Stall, window)
+        );
+    }
+
     /// A job row answers one question — did THIS run complete, and pass? — and
     /// the disk's health answers another. Reusing one status string for both
     /// showed the admin a green "succeeded" job for a run that never finished:
@@ -1240,17 +1437,37 @@ fn self_test_log_advanced(now: &[NasSmartSelfTest], before: &[NasSmartSelfTest])
 /// a self-test runs at background priority, and floored so a disk that
 /// advertises nothing still gets a sane window.
 ///
-/// Only a `Running` poll pushes the deadline back, and SCSI reports progress
-/// solely as an in-progress log entry, so for a disk that never writes one this
-/// is an ABSOLUTE deadline measured from the start, not a rolling stall window.
-/// That is why the doubling matters: it has to cover the whole run in one go.
+/// This is the STALL bound only, and it is rolling: a `Running` poll pushes it
+/// back. It used to be described as an absolute deadline measured from the
+/// start, which was true only for a disk that reports no progress whatsoever
+/// (a SAS disk that never writes an in-progress entry). For every disk that
+/// does report progress the claim was false, and a stale in-progress entry
+/// therefore reset it on every poll and the loop never terminated at all. The
+/// absolute bound now lives in `self_test_timeout`, which is what actually
+/// guarantees termination; the doubling still matters here because it has to
+/// cover a whole run in one go for a disk that stays silent throughout.
 ///
-/// LIMITATION — NVMe advertises neither field read here, so an NVMe extended
-/// test falls to the 6 h floor and one that genuinely runs longer is errored as
-/// stalled. smartctl does report an extended self-test time for NVMe, but not
-/// under either key above; wiring it up needs a captured NVMe document to name
-/// the key from, and guessing at JSON key names is what this whole area is
-/// recovering from. Follow-up "NVMe self-test window".
+/// FAILED PRE-READ — when the SMART read before the start fails, this is
+/// handed a `Value::Null` and there is no advertised duration in it, so the
+/// result is the FLOOR (6 h for a long test), not the disk's real duration.
+/// The comment here used to imply the disk's own figure still applied. It does
+/// not: the duration is read from the very document that failed to load.
+/// `rederived_self_test_window` recovers it from a later successful poll where
+/// doing so can still help.
+///
+/// LIMITATION — NVMe advertises NO self-test duration in smartctl's JSON at
+/// all, so an NVMe test falls to the floor. This is not a matter of reading a
+/// different key: smartctl parses the NVMe Identify Controller EDSTT field
+/// (Extended Device Self-test Time, minutes) into `nvme_id_ctrl::edstt` in
+/// `nvmecmds.h` and then never prints it — `edstt` appears nowhere in
+/// `nvmeprint.cpp`, in no version through current master, and the string
+/// `edstt` is absent from the smartctl 7.5 (r5714) binary's own string table,
+/// which is the complete inventory of keys it can emit. The only
+/// `*_extended_self_test_seconds` key smartctl has is the SCSI one, read
+/// above. So no key is guessed at here. What made the floor harmful — an NVMe
+/// test being errored as STALLED while it ran — is fixed instead by reading
+/// the progress NVMe does report (`summarize_smart`, the self-test log header),
+/// which keeps the stall bound pushed back for as long as the test really runs.
 fn self_test_window(doc: &Value, kind: SelfTestKind) -> Duration {
     let advertised = match kind {
         SelfTestKind::Long => doc
@@ -1271,6 +1488,157 @@ fn self_test_window(doc: &Value, kind: SelfTestKind) -> Duration {
         SelfTestKind::Long => 6 * 60 * 60,
     };
     Duration::from_secs(advertised.unwrap_or(0).saturating_mul(2).max(floor))
+}
+
+/// Recovers the window from a POLLED document when the pre-start read did not
+/// carry the disk's advertised duration.
+///
+/// The advertised duration is static device metadata (ATA IDENTIFY, the SCSI
+/// mode page), not run state, so a poll is exactly as trustworthy a source for
+/// it as the pre-read — and when the pre-read failed it is the ONLY source.
+/// Without this, a failed pre-read silently bounded a long test by the 6 h
+/// floor while the disk went on testing for 18 h and the job had already
+/// errored. Returns `None` when there is nothing to gain; the caller takes the
+/// value at most once, so the window can only ever hold one of two values and
+/// the hard cap derived from it stays finite.
+fn rederived_self_test_window(
+    window: Duration,
+    doc: &Value,
+    kind: SelfTestKind,
+    baseline: &[NasSmartSelfTest],
+) -> Option<Duration> {
+    // Without a baseline only ATA can still report this run's end: its status
+    // block is authoritative on its own, while every other transport needs the
+    // log to have MOVED against a baseline this run does not have. Stretching
+    // the window of a run whose result can never be attributed does not save
+    // it — it only makes the same unavoidable error arrive hours later, with
+    // the job row sitting on "running" the whole time.
+    if baseline.is_empty() && doc.pointer("/ata_smart_data/self_test/status").is_none() {
+        return None;
+    }
+    let fresh = self_test_window(doc, kind);
+    // Only ever grows: a poll that happens to carry less than the pre-read did
+    // must not shorten a window already in force.
+    (fresh > window).then_some(fresh)
+}
+
+/// Which of the poll loop's two bounds ran out.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SelfTestTimeout {
+    /// No poll ever showed a sign of this run, for one whole window.
+    Stall,
+    /// The disk kept claiming the run was going, past the absolute cap.
+    Cap,
+}
+
+impl SelfTestTimeout {
+    /// The two are deliberately different sentences: a stall means the disk
+    /// never showed the run at all (a start that silently did nothing, a log
+    /// that never moves), while the cap means the disk kept saying it was
+    /// working and was no longer believed. An operator chasing one must not be
+    /// handed the words for the other.
+    fn error(self, bound: Duration) -> anyhow::Error {
+        let min = bound.as_secs() / 60;
+        match self {
+            Self::Stall => anyhow!("the disk recorded no self-test result within {min} min"),
+            Self::Cap => anyhow!(
+                "the disk still reported the test as running after {min} min, twice the window it was given: its progress reports are no longer believed"
+            ),
+        }
+    }
+}
+
+/// The poll loop is bounded TWICE, and both bounds are needed.
+///
+/// `since_sign` is the time since the last poll that showed any sign of the
+/// run, and the rolling stall bound is what catches a start that did nothing.
+/// It cannot be the only bound, because a disk with a stale "in progress"
+/// entry — an interrupted test, a power loss — reports `Running` on every
+/// single poll, resets it every time, and the loop then never terminates at
+/// all. So `elapsed` since the start is bounded absolutely, independent of any
+/// reset.
+///
+/// The cap is twice the window, i.e. four times the duration the disk itself
+/// advertised. The window is already a doubling, sized to cover one whole run
+/// at background priority; a run that has been going for two of them is not
+/// merely slow. Doubling is also the smallest multiple that leaves the stall
+/// bound strictly INSIDE the cap, so adding the cap cannot cut short any run
+/// that the stall bound would have let finish within its first window — the
+/// cap only fires for runs that previously never terminated.
+fn self_test_timeout(
+    window: Duration,
+    elapsed: Duration,
+    since_sign: Duration,
+) -> Option<(SelfTestTimeout, Duration)> {
+    if since_sign >= window {
+        return Some((SelfTestTimeout::Stall, window));
+    }
+    let cap = window.saturating_mul(2);
+    if elapsed >= cap {
+        return Some((SelfTestTimeout::Cap, cap));
+    }
+    None
+}
+
+/// One poll, including the case where the document could not be read at all.
+///
+/// A failed read is NO SIGN of the run, so it is classified as a stall rather
+/// than waved through. The loop used to `continue` past a failed read, which
+/// skipped the bounds entirely: a device that had gone away, or a credential
+/// that stopped working, failed every read and the job then polled forever —
+/// the same unbounded loop as a stale in-progress entry, by a different route.
+fn classify_self_test_read(doc: Option<&Value>, baseline: &[NasSmartSelfTest]) -> SelfTestPoll {
+    match doc {
+        Some(doc) => classify_self_test_poll(doc, baseline),
+        None => SelfTestPoll::Stalled,
+    }
+}
+
+/// What the poll loop does with one polled document.
+#[derive(Debug, PartialEq)]
+enum SelfTestStep {
+    /// Keep polling, and report this progress percentage if the disk gave one.
+    Progress(Option<u8>),
+    /// Keep polling; the poll said nothing about this run.
+    Wait,
+    /// The run produced this result.
+    Done(Option<NasSmartSelfTest>),
+    /// One of the two bounds ran out; the job ends with this error.
+    Expired(SelfTestTimeout, Duration),
+}
+
+/// The whole decision the loop makes, kept out of the loop so it can be tested
+/// without a disk, a broker or a clock.
+///
+/// `elapsed` is measured from the start of the run and `since_sign` from the
+/// last poll that showed a sign of it. The bound is consulted for EVERY poll
+/// including a `Running` one: that is the fix. A `Running` poll used to be the
+/// one case that only ever pushed the deadline back and never tested it, so a
+/// disk holding a stale in-progress entry kept the loop alive indefinitely.
+fn self_test_step(
+    poll: SelfTestPoll,
+    window: Duration,
+    elapsed: Duration,
+    since_sign: Duration,
+) -> SelfTestStep {
+    // A `Running` poll IS the sign, so it resets the rolling half here rather
+    // than leaving the caller to remember to.
+    let since_sign = match poll {
+        SelfTestPoll::Running(_) => Duration::ZERO,
+        _ => since_sign,
+    };
+    // A result that did arrive is always reported as a result, never as a
+    // timeout, however late it is.
+    if let SelfTestPoll::Finished(latest) = poll {
+        return SelfTestStep::Done(latest);
+    }
+    if let Some((timeout, bound)) = self_test_timeout(window, elapsed, since_sign) {
+        return SelfTestStep::Expired(timeout, bound);
+    }
+    match poll {
+        SelfTestPoll::Running(pct) => SelfTestStep::Progress(pct),
+        _ => SelfTestStep::Wait,
+    }
 }
 
 /// Turns the log entry this run produced into the job's outcome: `Ok` carries
@@ -1375,7 +1743,7 @@ pub async fn smart_self_test(
             Value::Null
         });
     let baseline = super::disks::smart_self_tests(&before);
-    let window = self_test_window(&before, kind);
+    let mut window = self_test_window(&before, kind);
     let start = HelperCommand::SmartctlSelfTest {
         device: device.clone(),
         kind,
@@ -1404,42 +1772,58 @@ pub async fn smart_self_test(
     // the job "running" until the next arm — the disk keeps testing.
     drop(explicit);
     let poll = Duration::from_secs(if kind == SelfTestKind::Short { 20 } else { 120 });
-    // Only a `Running` poll pushes this back. A SAS disk that never writes an
-    // in-progress entry never produces one, so for that disk this is an
-    // absolute deadline from the start — which is exactly why `self_test_window`
-    // doubles the advertised duration instead of trusting a reset to arrive.
-    let mut stall_deadline = tokio::time::Instant::now() + window;
+    // `started` is fixed for the whole run and nothing below may touch it: it
+    // is what bounds the loop absolutely. `last_sign` is the rolling half, and
+    // a `Running` poll pushes only that one back.
+    let started = tokio::time::Instant::now();
+    let mut last_sign = started;
+    // The window may still grow once, from the first poll that carries the
+    // advertised duration the pre-read did not (see `rederived_self_test_window`).
+    let mut window_rederived = false;
     loop {
         tokio::time::sleep(poll).await;
         if h.cancelled() {
             return Err(anyhow!("cancelled"));
         }
+        // A read that failed is kept as `None` rather than `continue`d past:
+        // every path out of this loop has to reach the bound check below.
         let doc = match super::disks::read_smart_document(h.db(), &device, None).await {
-            Ok(d) => d,
+            Ok(d) => Some(d),
             Err(e) => {
                 h.log(format!("poll failed: {e}"));
-                continue;
+                None
             }
         };
-        match classify_self_test_poll(&doc, &baseline) {
-            SelfTestPoll::Running(pct) => {
+        if let Some(doc) = doc.as_ref() {
+            if !window_rederived {
+                if let Some(w) = rederived_self_test_window(window, doc, kind, &baseline) {
+                    h.log(format!(
+                        "the disk advertises a longer duration than the pre-start read gave: window {} min -> {} min",
+                        window.as_secs() / 60,
+                        w.as_secs() / 60
+                    ));
+                    window = w;
+                    window_rederived = true;
+                }
+            }
+        }
+        let polled = classify_self_test_read(doc.as_ref(), &baseline);
+        match self_test_step(polled, window, started.elapsed(), last_sign.elapsed()) {
+            SelfTestStep::Progress(pct) => {
                 if let Some(pct) = pct {
                     h.progress(pct);
                 }
-                stall_deadline = tokio::time::Instant::now() + window;
+                last_sign = tokio::time::Instant::now();
             }
-            SelfTestPoll::Stalled if tokio::time::Instant::now() >= stall_deadline => {
-                super::disks::request_smart_refresh();
-                return Err(anyhow!(
-                    "the disk recorded no self-test result within {} min",
-                    window.as_secs() / 60
-                ));
-            }
-            SelfTestPoll::Stalled => {}
-            SelfTestPoll::Finished(latest) => {
+            SelfTestStep::Wait => {}
+            SelfTestStep::Done(latest) => {
                 super::disks::request_smart_refresh();
                 h.log(self_test_outcome(latest.as_ref())?);
                 return Ok(());
+            }
+            SelfTestStep::Expired(timeout, bound) => {
+                super::disks::request_smart_refresh();
+                return Err(timeout.error(bound));
             }
         }
     }
