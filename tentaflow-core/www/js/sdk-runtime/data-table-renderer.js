@@ -537,9 +537,12 @@ function renderTable(component, ctx) {
   // its Button's backend handler enriched with the row key, reusing the
   // same eventDispatcher merge path as native handlers
   // (params <- {...handler.params, ...dom_event.detail}).
-  const buildRowActionsElement = (row) => {
+  const buildRowActionsElement = (row, idx, currentRow) => {
     if (rowActionDescriptors.length === 0) return null;
-    const rowId = extractRowId(row);
+    // The actions cell can be kept across re-renders, so each item resolves the
+    // row key at select time; this call keeps the build-time key validation.
+    const live = () => currentRow?.() ?? row;
+    extractRowId(row);
 
     const menu = document.createElement('tf-menu');
     menu.setAttribute('placement', 'bottom-end');
@@ -577,6 +580,7 @@ function renderTable(component, ctx) {
         // listener. Row key is injected via dom_event.detail so the backend
         // handler's params end up carrying both `row_id` and the concrete key
         // field (e.g. `camera_id`).
+        const rowId = extractRowId(live());
         const syntheticEvent = {
           detail: { row_id: rowId, [rowKeyField]: rowId },
         };
@@ -602,7 +606,7 @@ function renderTable(component, ctx) {
   };
 
   if (rowActionDescriptors.length > 0) {
-    tfTable.rowActions = (row) => buildRowActionsElement(row);
+    tfTable.rowActions = (row, idx, currentRow) => buildRowActionsElement(row, idx, currentRow);
   }
 
   // Expandable rows: tf-table renders the toggle + inserted expansion <tr>;

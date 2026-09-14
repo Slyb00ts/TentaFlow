@@ -6587,8 +6587,12 @@ function renderModelsTab(panel, p) {
       });
       // Per-wierszowy builder akcji tf-table: zwraca realny Element z własnym
       // handlerem klika — działa w shadow DOM (delegacja z light DOM by nie złapała).
-      table.rowActions = (row) => {
+      table.rowActions = (row, idx, currentRow) => {
         if (!row) return null;
+        // Handlers must read the row that occupies this slot at event time: an
+        // identical-markup actions cell is kept across re-renders, so `row` can
+        // be stale. Markup below may still use `row` — it renders immediately.
+        const live = () => currentRow?.() ?? row;
         const publishBtn = () => {
           const pub = document.createElement('tf-button');
           pub.setAttribute('size', 'sm');
@@ -6597,7 +6601,7 @@ function renderModelsTab(panel, p) {
           // Czytnik OCR nie trafia do rejestru kamer, tylko podmienia czytnik
           // ADR węzła — przycisk nie może obiecywać czegoś innego.
           pub.textContent = row._framework === 'ocr-crnn' ? 'Ustaw jako czytnik ADR' : 'Publikuj do kamer';
-          pub.addEventListener('click', () => openVisionPublishPanel(p, row, () => renderModelsTab(panel, p)));
+          pub.addEventListener('click', () => openVisionPublishPanel(p, live(), () => renderModelsTab(panel, p)));
           return pub;
         };
         if (row._isRecog) {
@@ -6608,7 +6612,7 @@ function renderModelsTab(panel, p) {
           btn.setAttribute('variant', 'outline');
           btn.setAttribute('icon', 'image');
           btn.textContent = 'Wykryj na zdjęciu';
-          btn.addEventListener('click', () => openRecogDetectPanel(p, row._modelId, row._modelName));
+          btn.addEventListener('click', () => { const r = live(); openRecogDetectPanel(p, r._modelId, r._modelName); });
           wrap.appendChild(btn);
           wrap.appendChild(publishBtn());
           return wrap;
@@ -6625,7 +6629,7 @@ function renderModelsTab(panel, p) {
           exp.setAttribute('variant', 'outline');
           exp.setAttribute('icon', 'package');
           exp.textContent = 'Eksportuj GGUF';
-          exp.addEventListener('click', () => openFtExportPanel(p, row._modelId, row._modelName));
+          exp.addEventListener('click', () => { const r = live(); openFtExportPanel(p, r._modelId, r._modelName); });
           wrap.appendChild(exp);
           return wrap;
         }
@@ -6638,7 +6642,7 @@ function renderModelsTab(panel, p) {
           ask.setAttribute('variant', 'primary');
           ask.setAttribute('icon', 'sparkle');
           ask.textContent = 'Zapytaj';
-          ask.addEventListener('click', () => openFtChatPanel(row._modelId, row._modelName));
+          ask.addEventListener('click', () => { const r = live(); openFtChatPanel(r._modelId, r._modelName); });
           wrap.appendChild(ask);
           if (row._canExport) {
             const exp = document.createElement('tf-button');
@@ -6646,7 +6650,7 @@ function renderModelsTab(panel, p) {
             exp.setAttribute('variant', 'outline');
             exp.setAttribute('icon', 'package');
             exp.textContent = 'Eksportuj GGUF';
-            exp.addEventListener('click', () => openFtExportPanel(p, row._modelId, row._modelName));
+            exp.addEventListener('click', () => { const r = live(); openFtExportPanel(p, r._modelId, r._modelName); });
             wrap.appendChild(exp);
           }
           return wrap;
@@ -6660,7 +6664,7 @@ function renderModelsTab(panel, p) {
           dep.setAttribute('variant', 'primary');
           dep.setAttribute('icon', 'cpu');
           dep.textContent = 'Wdróż';
-          dep.addEventListener('click', () => deployFtModel(row._modelId, row._modelName, () => renderModelsTab(panel, p), p));
+          dep.addEventListener('click', () => { const r = live(); deployFtModel(r._modelId, r._modelName, () => renderModelsTab(panel, p), p); });
           wrap.appendChild(dep);
           return wrap;
         }
@@ -6680,7 +6684,7 @@ function renderModelsTab(panel, p) {
         btn.setAttribute('variant', 'outline');
         btn.setAttribute('icon', 'package');
         btn.textContent = 'Eksportuj GGUF';
-        btn.addEventListener('click', () => openFtExportPanel(p, row._modelId, row._modelName));
+        btn.addEventListener('click', () => { const r = live(); openFtExportPanel(p, r._modelId, r._modelName); });
         return btn;
       };
       const tableHost = byId('ml-studio-models-table');
@@ -6744,8 +6748,11 @@ function renderVisionRegistrySection(panel, p) {
         createdAt: formatRelative(m.createdAt ?? m.created_at),
         _modelName: String(m.modelName ?? m.model_name ?? ''),
       }));
-      table.rowActions = (row) => {
+      table.rowActions = (row, idx, currentRow) => {
         if (!row) return null;
+        // Read the row occupying this slot at event time — an identical-markup
+        // actions cell survives re-renders, so `row` may point at a stale model.
+        const live = () => currentRow?.() ?? row;
         const wrap = document.createElement('div');
         wrap.style.display = 'flex';
         wrap.style.gap = '6px';
@@ -6754,18 +6761,19 @@ function renderVisionRegistrySection(panel, p) {
         share.setAttribute('variant', 'ghost');
         share.setAttribute('icon', 'share');
         share.textContent = 'Udostępnij';
-        share.addEventListener('click', () => openVisionShareModal(row._modelName));
+        share.addEventListener('click', () => openVisionShareModal(live()._modelName));
         const del = document.createElement('tf-button');
         del.setAttribute('size', 'sm');
         del.setAttribute('variant', 'danger');
         del.setAttribute('icon', 'trash');
         del.textContent = 'Usuń';
         del.addEventListener('click', async () => {
-          if (!window.confirm(`Usunąć model wizyjny „${row._modelName}" z rejestru?`)) return;
+          const modelName = live()._modelName;
+          if (!window.confirm(`Usunąć model wizyjny „${modelName}" z rejestru?`)) return;
           try {
-            const resp = await ApiBinary.one('mlStudioVisionModelDeleteRequest', { modelName: row._modelName });
+            const resp = await ApiBinary.one('mlStudioVisionModelDeleteRequest', { modelName });
             if (!resp.ok) throw new Error(resp.error || 'usunięcie odrzucone');
-            toast(`Model „${row._modelName}" usunięty z rejestru`, 'success');
+            toast(`Model „${modelName}" usunięty z rejestru`, 'success');
             renderModelsTab(panel, p);
           } catch (err) {
             toast(`Usuwanie modelu: ${err.message}`, 'error');
@@ -9071,7 +9079,10 @@ function renderMembersTable(pid, project, members, isOwner) {
 
   // The owner manages access; non-owners get a read-only table (no actions col).
   if (isOwner) {
-    table.rowActions = (row) => {
+    table.rowActions = (row, idx, currentRow) => {
+      // Handlers read the row sitting in this slot at event time; an unchanged
+      // actions cell is reused across re-renders, so `row` can be stale.
+      const live = () => currentRow?.() ?? row;
       if (row._role === 'owner') {
         const note = document.createElement('span');
         note.className = 'ml-studio-member-note';
@@ -9082,7 +9093,7 @@ function renderMembersTable(pid, project, members, isOwner) {
       btn.setAttribute('variant', 'ghost');
       btn.setAttribute('icon', 'trash');
       btn.textContent = row._status === 'invited' ? 'Cofnij' : 'Usuń';
-      btn.addEventListener('click', () => removeMember(pid, row._userId));
+      btn.addEventListener('click', () => removeMember(pid, live()._userId));
       return btn;
     };
   } else {
@@ -9463,12 +9474,15 @@ function renderGrantsTable(host, grants) {
       createdAt: formatDate(g.createdAt ?? g.created_at),
     };
   });
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    // The grant id must come from the row in this slot at event time — a reused
+    // actions cell would otherwise revoke whatever grant was here first.
+    const live = () => currentRow?.() ?? row;
     const btn = document.createElement('tf-button');
     btn.setAttribute('variant', 'ghost');
     btn.setAttribute('icon', 'trash');
     btn.textContent = 'Cofnij';
-    btn.addEventListener('click', () => revokeGrant(row._grantId));
+    btn.addEventListener('click', () => revokeGrant(live()._grantId));
     return btn;
   };
   host.appendChild(table);

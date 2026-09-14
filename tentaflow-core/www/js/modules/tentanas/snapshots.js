@@ -185,7 +185,8 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
     table.rows = rows.map((s) => snapshotRow(s, Boolean(state.dataset)));
   };
 
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const s = row._snap;
     const wrap = document.createElement('div');
     wrap.className = 'tf-table__cell-row';
@@ -196,11 +197,11 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
       <tf-button size="sm" variant="secondary" data-act="rollback">${escapeHtml(T('snapshots.rollback'))}</tf-button>
       ${isProtected(s) ? `<tf-button size="sm" variant="secondary" icon="unlock" data-act="release">${escapeHtml(T('snapshots.release_action'))}</tf-button>` : ''}
       <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>` : ''}`;
-    wrap.querySelector('[data-act="browse"]').addEventListener('click', (e) => { e.stopPropagation(); openSnapshotBrowser(screen, { snapshot: s }); });
-    wrap.querySelector('[data-act="rollback"]')?.addEventListener('click', (e) => { e.stopPropagation(); openRollbackDialog(screen, { snapshot: s, newer: newerThan(state.snapshots, s), pool, onDone: reloadAll }); });
-    wrap.querySelector('[data-act="clone"]')?.addEventListener('click', (e) => { e.stopPropagation(); openCloneDialog(screen, { snapshot: s, pool, onDone: reloadAll }); });
-    wrap.querySelector('[data-act="release"]')?.addEventListener('click', (e) => { e.stopPropagation(); openReleaseDialog(screen, { snapshot: s, onDone: reloadAll }); });
-    wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); destroySnapshots(screen, [s], reloadAll); });
+    wrap.querySelector('[data-act="browse"]').addEventListener('click', (e) => { e.stopPropagation(); openSnapshotBrowser(screen, { snapshot: live()._snap }); });
+    wrap.querySelector('[data-act="rollback"]')?.addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._snap; openRollbackDialog(screen, { snapshot: cur, newer: newerThan(state.snapshots, cur), pool, onDone: reloadAll }); });
+    wrap.querySelector('[data-act="clone"]')?.addEventListener('click', (e) => { e.stopPropagation(); openCloneDialog(screen, { snapshot: live()._snap, pool, onDone: reloadAll }); });
+    wrap.querySelector('[data-act="release"]')?.addEventListener('click', (e) => { e.stopPropagation(); openReleaseDialog(screen, { snapshot: live()._snap, onDone: reloadAll }); });
+    wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); destroySnapshots(screen, [live()._snap], reloadAll); });
     return wrap;
   };
 

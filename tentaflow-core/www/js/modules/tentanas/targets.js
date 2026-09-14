@@ -230,7 +230,8 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
         </tf-table>`;
     if (patchHtml(list, shell)) {
       const table = list.querySelector('#nas-tg-table');
-      table.rowActions = (row) => {
+      table.rowActions = (row, idx, currentRow) => {
+        const live = () => currentRow?.() ?? row;
         const t = row._target;
         const wrap = document.createElement('div');
         wrap.className = 'tf-table__cell-row';
@@ -239,10 +240,10 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
           <tf-button size="sm" variant="ghost" icon="${t.enabled ? 'pause' : 'play'}" data-act="pause" title="${escapeAttr(t.enabled ? T('targets.pause') : T('targets.resume'))}"></tf-button>
           <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(T('targets.delete'))}"></tf-button>`
           : `<tf-button size="sm" variant="ghost" icon="eye" data-act="details" title="${escapeAttr(T('targets.details'))}"></tf-button>`;
-        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); screen.openTarget(t.targetId); });
-        wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(t); });
-        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); setTargetEnabled(screen, t, !t.enabled, refresh, isCurrent); });
-        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openTargetDeleteDialog(screen, t, refresh, isCurrent); });
+        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); screen.openTarget(live()._target.targetId); });
+        wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(live()._target); });
+        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._target; setTargetEnabled(screen, cur, !cur.enabled, refresh, isCurrent); });
+        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openTargetDeleteDialog(screen, live()._target, refresh, isCurrent); });
         return wrap;
       };
       table.addEventListener('row-click', (e) => screen.openTarget(e.detail.row._target.targetId));
@@ -534,7 +535,8 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     };
     const interfaceTable = win.querySelector('#nas-td-interfaces');
     if (interfaceTable) {
-      if (screen.isAdmin) interfaceTable.rowActions = (row) => {
+      if (screen.isAdmin) interfaceTable.rowActions = (row, idx, currentRow) => {
+        const live = () => currentRow?.() ?? row;
         const button = document.createElement('tf-button');
         button.setAttribute('size', 'sm');
         button.setAttribute('variant', 'secondary');
@@ -544,7 +546,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
           button.setAttribute('disabled', '');
           button.setAttribute('title', T('targets.portal_available_note'));
         }
-        button.addEventListener('click', () => openPortalSelection(row.interface));
+        button.addEventListener('click', () => openPortalSelection(live().interface));
         return button;
       };
       interfaceTable.rows = interfaces.map((i) => ({ address: i.address, interface: i.name, network: T(i.shared ? 'targets.portal_network_shared' : 'targets.portal_network_storage'), _supported: i.supported }));
@@ -560,7 +562,8 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       }));
       win.querySelector('#nas-td-shared').innerHTML = sharedWarningHtml(t);
     };
-    if (screen.isAdmin) hostsTable.rowActions = (row) => {
+    if (screen.isAdmin) hostsTable.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const button = document.createElement('tf-button');
       button.setAttribute('variant', 'ghost');
       button.setAttribute('tone', 'critical');
@@ -568,7 +571,8 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       button.setAttribute('icon', 'trash');
       button.textContent = T('targets.remove_initiator');
       button.addEventListener('click', () => {
-        state.initiatorsText = parseInitiators(state.initiatorsText).filter((host) => host !== row.identity).join('\n');
+        const identity = live().identity;
+        state.initiatorsText = parseInitiators(state.initiatorsText).filter((host) => host !== identity).join('\n');
         win.querySelector('#nas-td-initiators').value = state.initiatorsText;
         updateHosts();
       });

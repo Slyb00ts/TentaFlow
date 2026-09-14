@@ -186,13 +186,16 @@ export function drawFiles(screen, host) {
     // component's shadow root, where a click listener on the host would only
     // ever see the retargeted table element.
     if (editable) {
-      table.rowActions = (row) => {
+      table.rowActions = (row, idx, currentRow) => {
+        // The actions cell can be kept across re-renders, so the file id comes
+        // from the row sitting in this slot at click time.
+        const live = () => currentRow?.() ?? row;
         const button = document.createElement('tf-button');
         button.setAttribute('variant', 'ghost');
         button.setAttribute('size', 'sm');
         button.setAttribute('icon', 'trash');
         button.setAttribute('title', T('files.delete'));
-        button.addEventListener('click', () => deleteFile(screen, files.find((f) => f.fileId === row._file)));
+        button.addEventListener('click', () => deleteFile(screen, files.find((f) => f.fileId === live()._file)));
         return button;
       };
     }

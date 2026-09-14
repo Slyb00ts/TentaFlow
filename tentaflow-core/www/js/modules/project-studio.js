@@ -2915,7 +2915,8 @@ function renderFilesTable() {
     chunks: f.chunk_count ?? f.chunkCount ?? 0,
     updated: formatTimestamp(f.updated_at ?? f.updatedAt),
   }));
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.className = 'ps-file-actions';
     const previewBtn = document.createElement('tf-button');
@@ -2923,7 +2924,7 @@ function renderFilesTable() {
     previewBtn.setAttribute('size', 'sm');
     previewBtn.setAttribute('icon', 'eye');
     previewBtn.setAttribute('title', t('kb_preview'));
-    previewBtn.addEventListener('click', (e) => { e.stopPropagation(); openFilePreview(row._id); });
+    previewBtn.addEventListener('click', (e) => { e.stopPropagation(); openFilePreview(live()._id); });
     wrap.appendChild(previewBtn);
     if (canEdit()) {
       const delBtn = document.createElement('tf-button');
@@ -2931,7 +2932,7 @@ function renderFilesTable() {
       delBtn.setAttribute('size', 'sm');
       delBtn.setAttribute('icon', 'trash');
       delBtn.setAttribute('title', t('action_delete'));
-      delBtn.addEventListener('click', (e) => { e.stopPropagation(); confirmDeleteFile(row); });
+      delBtn.addEventListener('click', (e) => { e.stopPropagation(); confirmDeleteFile(live()); });
       wrap.appendChild(delBtn);
     }
     return wrap;
@@ -4505,7 +4506,8 @@ function renderCasesTable() {
     });
   };
   assignRows();
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.className = 'ps-file-actions';
     const mk = (icon, title, handler) => {
@@ -4517,10 +4519,10 @@ function renderCasesTable() {
       btn.addEventListener('click', (e) => { e.stopPropagation(); handler(); });
       wrap.appendChild(btn);
     };
-    mk('edit', t(canEdit() ? 'action_edit' : 'cases_open'), () => openCaseEditor(row._id));
+    mk('edit', t(canEdit() ? 'action_edit' : 'cases_open'), () => openCaseEditor(live()._id));
     if (canEdit()) {
-      mk('copy', t('cases_duplicate'), () => duplicateCase(row._id));
-      mk('trash', t('action_delete'), () => deleteCaseFromList(row._row));
+      mk('copy', t('cases_duplicate'), () => duplicateCase(live()._id));
+      mk('trash', t('action_delete'), () => deleteCaseFromList(live()._row));
     }
     return wrap;
   };
@@ -6252,7 +6254,8 @@ function renderGenerationsTable() {
     startedBy: fv(g, 'started_by_name') || '',
     startedAt: formatTimestamp(fv(g, 'started_at')),
   }));
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.className = 'ps-file-actions';
     const open = document.createElement('tf-button');
@@ -6260,7 +6263,7 @@ function renderGenerationsTable() {
     open.setAttribute('size', 'sm');
     open.setAttribute('icon', 'external-link');
     open.setAttribute('title', t('gens_open'));
-    open.addEventListener('click', (e) => { e.stopPropagation(); openGenDetail(row._id); });
+    open.addEventListener('click', (e) => { e.stopPropagation(); openGenDetail(live()._id); });
     wrap.appendChild(open);
     const status = row._row.status;
     if (canManage() && status !== 'running' && status !== 'review') {
@@ -6269,7 +6272,7 @@ function renderGenerationsTable() {
       del.setAttribute('size', 'sm');
       del.setAttribute('icon', 'trash');
       del.setAttribute('title', t('action_delete'));
-      del.addEventListener('click', (e) => { e.stopPropagation(); deleteGeneration(row._id); });
+      del.addEventListener('click', (e) => { e.stopPropagation(); deleteGeneration(live()._id); });
       wrap.appendChild(del);
     }
     return wrap;
@@ -6671,7 +6674,8 @@ function renderEnvironmentsTable() {
     status: chipCell(ENV_STATUS_CHIP[fv(env, 'approval_status')], t(`env_status_${fv(env, 'approval_status')}`)),
     updated: formatTimestamp(fv(env, 'updated_at')),
   }));
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.className = 'ps-file-actions';
     if (!canManage()) return wrap;
@@ -6680,14 +6684,14 @@ function renderEnvironmentsTable() {
     edit.setAttribute('size', 'sm');
     edit.setAttribute('icon', 'edit');
     edit.setAttribute('title', t('action_edit'));
-    edit.addEventListener('click', (e) => { e.stopPropagation(); openEnvironmentWindow(row._row); });
+    edit.addEventListener('click', (e) => { e.stopPropagation(); openEnvironmentWindow(live()._row); });
     wrap.appendChild(edit);
     const del = document.createElement('tf-button');
     del.setAttribute('variant', 'ghost');
     del.setAttribute('size', 'sm');
     del.setAttribute('icon', 'trash');
     del.setAttribute('title', t('action_delete'));
-    del.addEventListener('click', (e) => { e.stopPropagation(); confirmDeleteEnvironment(row._row); });
+    del.addEventListener('click', (e) => { e.stopPropagation(); confirmDeleteEnvironment(live()._row); });
     wrap.appendChild(del);
     return wrap;
   };
@@ -7088,7 +7092,8 @@ function renderSuitesTable() {
       updated: formatTimestamp(fv(suite, 'updated_at')),
     };
   });
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.className = 'ps-file-actions';
     const mk = (icon, title, handler) => {
@@ -7101,11 +7106,11 @@ function renderSuitesTable() {
       wrap.appendChild(btn);
     };
     if (canEdit()) {
-      mk('edit', t('action_edit'), () => openSuiteEditor(row._id));
-      mk('play', t('suites_run'), () => openRunWindow({ suiteId: row._id }));
-      mk('trash', t('action_delete'), () => deleteSuite(row._row));
+      mk('edit', t('action_edit'), () => openSuiteEditor(live()._id));
+      mk('play', t('suites_run'), () => openRunWindow({ suiteId: live()._id }));
+      mk('trash', t('action_delete'), () => deleteSuite(live()._row));
     } else {
-      mk('eye', t('suites_open'), () => openSuiteEditor(row._id));
+      mk('eye', t('suites_open'), () => openSuiteEditor(live()._id));
     }
     return wrap;
   };
@@ -7577,7 +7582,8 @@ function renderRunsTable() {
     });
   };
   assignRows();
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.className = 'ps-file-actions';
     const open = document.createElement('tf-button');
@@ -7585,7 +7591,11 @@ function renderRunsTable() {
     open.setAttribute('size', 'sm');
     open.setAttribute('icon', 'external-link');
     open.setAttribute('title', t('runs_open'));
-    open.addEventListener('click', (e) => { e.stopPropagation(); openRunByType(row._id, fv(row._row, 'run_type')); });
+    open.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const r = live();
+      openRunByType(r._id, fv(r._row, 'run_type'));
+    });
     wrap.appendChild(open);
     if (canManage() && row._row.status !== 'running') {
       const del = document.createElement('tf-button');
@@ -7593,7 +7603,7 @@ function renderRunsTable() {
       del.setAttribute('size', 'sm');
       del.setAttribute('icon', 'trash');
       del.setAttribute('title', t('action_delete'));
-      del.addEventListener('click', (e) => { e.stopPropagation(); deleteRun(row._row); });
+      del.addEventListener('click', (e) => { e.stopPropagation(); deleteRun(live()._row); });
       wrap.appendChild(del);
     }
     return wrap;
@@ -11018,7 +11028,10 @@ async function renderSchedulesView(reload = true) {
       last: scheduleLastChip(row),
     };
   });
-  table.rowActions = (row) => buildScheduleRowActions(row._row);
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
+    return buildScheduleRowActions(row._row, () => live()._row);
+  };
   table.expandable = true;
   table.rowKey = '_id';
   table.expandRenderer = (row) => buildScheduleExpansion(row._row);
@@ -11027,10 +11040,11 @@ async function renderSchedulesView(reload = true) {
 // tf-table renders this cell inside its shadow root, where page-level CSS does
 // not reach — hence the inline layout and plain icon buttons instead of a
 // kebab tf-menu, whose absolute popup would have no positioned ancestor here.
-function buildScheduleRowActions(row) {
+// `live` returns the schedule sitting at this table slot at call time; the cell
+// element can outlive the row it was built from, so handlers must re-read it.
+function buildScheduleRowActions(row, live = () => row) {
   const wrap = document.createElement('div');
   wrap.style.cssText = 'display:flex; align-items:center; gap:4px; justify-content:flex-end;';
-  const scheduleId = fv(row, 'schedule_id');
 
   if (canManage()) {
     const toggle = document.createElement('tf-toggle');
@@ -11041,7 +11055,7 @@ function buildScheduleRowActions(row) {
       const enabled = !!(e.detail?.checked ?? toggle.hasAttribute('checked'));
       try {
         await ApiBinary.one('projectStudioScheduleSetEnabledRequest', {
-          projectId: projectId(), scheduleId, enabled,
+          projectId: projectId(), scheduleId: fv(live(), 'schedule_id'), enabled,
         });
         toast(t(enabled ? 'sch_enabled_ok' : 'sch_disabled_ok'), 'success');
       } catch (err) {
@@ -11062,11 +11076,11 @@ function buildScheduleRowActions(row) {
     wrap.appendChild(btn);
   };
 
-  if (canEdit()) action('play', t('sch_run_now'), 'ghost', () => runScheduleNow(row));
-  action('clock', t('sch_history'), 'ghost', () => openScheduleRunsWindow(row));
+  if (canEdit()) action('play', t('sch_run_now'), 'ghost', () => runScheduleNow(live()));
+  action('clock', t('sch_history'), 'ghost', () => openScheduleRunsWindow(live()));
   if (canManage()) {
-    action('edit', t('action_edit'), 'ghost', () => openScheduleWindow(row));
-    action('trash', t('action_delete'), 'ghost', () => confirmDeleteSchedule(row));
+    action('edit', t('action_edit'), 'ghost', () => openScheduleWindow(live()));
+    action('trash', t('action_delete'), 'ghost', () => confirmDeleteSchedule(live()));
   }
   return wrap;
 }

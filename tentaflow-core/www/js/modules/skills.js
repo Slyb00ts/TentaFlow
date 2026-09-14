@@ -319,7 +319,8 @@ function skillToRow(skill) {
   };
 }
 
-function buildRowActions(row) {
+function buildRowActions(row, idx, currentRow) {
+  const live = () => currentRow?.() ?? row;
   const wrap = document.createElement('div');
   wrap.style.display = 'flex';
   wrap.style.gap = '4px';
@@ -331,14 +332,14 @@ function buildRowActions(row) {
   edit.setAttribute('variant', 'ghost');
   edit.setAttribute('size', 'sm');
   edit.textContent = I18n.t('skills.action_edit');
-  edit.addEventListener('click', () => openSkillEditor(row._id));
+  edit.addEventListener('click', () => openSkillEditor(live()._id));
   wrap.appendChild(edit);
 
   const del = document.createElement('tf-button');
   del.setAttribute('variant', 'danger');
   del.setAttribute('size', 'sm');
   del.textContent = I18n.t('skills.action_delete');
-  del.addEventListener('click', () => deleteSkill(row._id));
+  del.addEventListener('click', () => deleteSkill(live()._id));
   wrap.appendChild(del);
 
   return wrap;
@@ -790,7 +791,8 @@ function renderHubResults(busy) {
       .join(''),
     source: r.source || '',
   }));
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.style.display = 'flex';
     wrap.style.justifyContent = 'flex-end';
@@ -799,7 +801,7 @@ function renderHubResults(busy) {
     imp.setAttribute('size', 'sm');
     imp.textContent = I18n.t('skills.hub.import_action');
     imp.addEventListener('click', () => {
-      const result = state.hubResults[row._idx];
+      const result = state.hubResults[live()._idx];
       if (result) importFromSource(result.source);
     });
     wrap.appendChild(imp);

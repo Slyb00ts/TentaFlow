@@ -1447,7 +1447,10 @@ function wireTopicsSkeleton(panel) {
   const table = panel.querySelector('#tb-topics-table');
   if (table) {
     wireRowKeyboardActivation(table);
-    table.rowActions = (row) => {
+    table.rowActions = (row, idx, currentRow) => {
+      // The actions cell can be kept across re-renders, so a handler must read
+      // the row sitting in this slot at click time, not the one built from.
+      const live = () => currentRow?.() ?? row;
       const wrap = document.createElement('div');
       wrap.className = 'tb-row-actions';
       const previewBtn = document.createElement('tf-button');
@@ -1455,7 +1458,7 @@ function wireTopicsSkeleton(panel) {
       previewBtn.setAttribute('size', 'sm');
       previewBtn.setAttribute('icon', 'eye');
       previewBtn.title = T('action_preview');
-      previewBtn.addEventListener('click', (e) => { e.stopPropagation(); openMessagePreview(row._topicName, row.partitions); });
+      previewBtn.addEventListener('click', (e) => { e.stopPropagation(); const r = live(); openMessagePreview(r._topicName, r.partitions); });
       wrap.appendChild(previewBtn);
       if (canAdmin()) {
         const delBtn = document.createElement('tf-button');
@@ -1463,7 +1466,7 @@ function wireTopicsSkeleton(panel) {
         delBtn.setAttribute('size', 'sm');
         delBtn.setAttribute('icon', 'trash');
         delBtn.title = T('action_delete');
-        delBtn.addEventListener('click', (e) => { e.stopPropagation(); confirmDeleteTopic(row._topicName); });
+        delBtn.addEventListener('click', (e) => { e.stopPropagation(); confirmDeleteTopic(live()._topicName); });
         wrap.appendChild(delBtn);
       }
       return wrap;
@@ -2993,14 +2996,17 @@ function wireGroupsSkeleton(panel) {
   const table = panel.querySelector('#tb-groups-table');
   if (!table) return;
   wireRowKeyboardActivation(table);
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
     if (!canAdmin()) return null;
+    // The actions cell can be kept across re-renders, so pause/resume must act
+    // on the row sitting in this slot at click time.
+    const live = () => currentRow?.() ?? row;
     const btn = document.createElement('tf-button');
     btn.setAttribute('variant', 'ghost');
     btn.setAttribute('size', 'sm');
     btn.setAttribute('icon', row.paused ? 'play' : 'pause');
     btn.title = T(row.paused ? 'groups_action_resume' : 'groups_action_pause');
-    btn.addEventListener('click', (e) => { e.stopPropagation(); toggleGroupPause(row); });
+    btn.addEventListener('click', (e) => { e.stopPropagation(); toggleGroupPause(live()); });
     return btn;
   };
   table.addEventListener('row-click', (e) => openGroupDetail(e.detail.row.group, e.detail.row.topic));

@@ -694,11 +694,12 @@ function paintProperties(screen, host, state, refresh, { wire = true } = {}) {
   const editable = (name) => admin && (name in POOL_PROPS || name in DATASET_PROPS);
   // Assigned once: `set rowActions` runs a full table render, and the handler
   // needs only the row it is handed plus the pool name, which cannot change.
-  if (!table.rowActions) table.rowActions = (row) => {
+  if (!table.rowActions) table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     if (!editable(row._prop.name)) return null;
     const wrap = document.createElement('div');
     wrap.innerHTML = `<tf-button size="sm" variant="ghost" icon="edit" data-act="edit" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>`;
-    wrap.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); openPropertyEditor(screen, p.name, row._prop, refresh); });
+    wrap.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); openPropertyEditor(screen, p.name, live()._prop, refresh); });
     return wrap;
   };
   table.rows = props.map((pr) => ({

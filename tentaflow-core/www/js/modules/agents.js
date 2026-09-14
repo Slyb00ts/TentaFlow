@@ -2324,7 +2324,7 @@ function renderAgentRunsTable() {
     prompt: runPromptCell(r),
     initiator: runInitiator(r),
   }));
-  table.rowActions = (row) => buildRunRowActions(row, 'agent');
+  table.rowActions = (row, idx, currentRow) => buildRunRowActions(row, 'agent', currentRow);
   table.addEventListener('row-click', (e) => {
     const id = e.detail?.row?._id;
     if (id) openRunDetail(id, 'agent-runs-detail-host', 'agent');
@@ -2792,7 +2792,7 @@ function renderRunsTable() {
       initiator: runInitiator(r),
     };
   });
-  table.rowActions = (row) => buildRunRowActions(row, 'global');
+  table.rowActions = (row, idx, currentRow) => buildRunRowActions(row, 'global', currentRow);
   table.addEventListener('row-click', (e) => {
     const id = e.detail?.row?._id;
     if (id) openRunDetail(id);
@@ -2807,20 +2807,21 @@ function renderTableFooter(hostId, shown, total) {
   host.textContent = total ? t('runs_footer', { shown, total }) : '';
 }
 
-function buildRunRowActions(row, scope = 'global') {
+function buildRunRowActions(row, scope = 'global', currentRow) {
+  const live = () => currentRow?.() ?? row;
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', 'secondary');
   btn.setAttribute('size', 'sm');
   if (TERMINAL_RUN_STATUSES.includes(row._status)) {
     btn.textContent = t('action_details');
     btn.addEventListener('click', () => (scope === 'agent'
-      ? openRunDetail(row._id, 'agent-runs-detail-host', 'agent')
-      : openRunDetail(row._id)));
+      ? openRunDetail(live()._id, 'agent-runs-detail-host', 'agent')
+      : openRunDetail(live()._id)));
     return btn;
   }
   btn.setAttribute('variant', 'danger-outline');
   btn.textContent = t('action_cancel');
-  btn.addEventListener('click', () => cancelRun(row._id, scope));
+  btn.addEventListener('click', () => cancelRun(live()._id, scope));
   return btn;
 }
 

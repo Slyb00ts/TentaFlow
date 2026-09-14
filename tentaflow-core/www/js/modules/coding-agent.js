@@ -203,12 +203,13 @@ export async function openAgentAccount(service) {
     picker.toggleAttribute('disabled', !candidates.length);
     body.querySelector('[data-account-grant]').toggleAttribute('disabled', !candidates.length);
     const table = body.querySelector('[data-account-grants]');
-    table.rowActions = (row) => {
+    table.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const button = document.createElement('tf-button');
       button.setAttribute('variant', 'ghost');
       button.setAttribute('size', 'sm');
       button.textContent = t('revoke');
-      button.addEventListener('click', () => changeGrant(row.id, false, button));
+      button.addEventListener('click', () => changeGrant(live().id, false, button));
       return button;
     };
     table.rows = grants.map((grant) => ({ id: grant.user_id,

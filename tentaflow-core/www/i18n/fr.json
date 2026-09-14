@@ -6250,7 +6250,8 @@
     "telemetry": {
       "stale_title": "Les données SMART sont périmées",
       "stale_msg": "Le canal de privilèges n'est pas armé, donc SMART n'est pas lu. Dernière lecture : {t}.",
-      "unavailable_title": "SMART indisponible"
+      "unavailable_title": "SMART indisponible",
+      "partial_title": "SMART partiellement indisponible"
     },
     "alerts": {
       "title": "Alertes",

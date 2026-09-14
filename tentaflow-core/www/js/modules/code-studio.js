@@ -590,7 +590,10 @@ function tableColumnsHtml(rows) {
   return cols.join('');
 }
 
-function buildRowMenu(row) {
+function buildRowMenu(row, idx, currentRow) {
+  // The actions cell can be kept across re-renders, so handlers re-resolve the
+  // row (and its workspace) at click time; the markup below stays build-time.
+  const live = () => currentRow?.() ?? row;
   const workspace = state.workspaces.find((w) => wsId(w) === row._id);
   if (!workspace) return null;
   const archived = statusOf(workspace) === 'archived';
@@ -654,11 +657,14 @@ function buildRowMenu(row) {
   });
   menu.addEventListener('action', (e) => {
     const action = e.detail?.action;
-    if (action === 'open') goto(row._id, null);
-    else if (action === 'settings') goto(row._id, 'settings');
-    else if (action === 'archive') setArchived(workspace, true);
-    else if (action === 'unarchive') setArchived(workspace, false);
-    else if (action === 'delete') confirmDelete(workspace);
+    const liveRow = live();
+    if (action === 'open') { goto(liveRow._id, null); return; }
+    if (action === 'settings') { goto(liveRow._id, 'settings'); return; }
+    const target = state.workspaces.find((w) => wsId(w) === liveRow._id);
+    if (!target) return;
+    if (action === 'archive') setArchived(target, true);
+    else if (action === 'unarchive') setArchived(target, false);
+    else if (action === 'delete') confirmDelete(target);
   });
   return wrap;
 }

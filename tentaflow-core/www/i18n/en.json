@@ -6350,7 +6350,8 @@
     "telemetry": {
       "stale_title": "SMART data is stale",
       "stale_msg": "The privilege channel is not armed, so SMART is not being read. Last read: {t}.",
-      "unavailable_title": "SMART unavailable"
+      "unavailable_title": "SMART unavailable",
+      "partial_title": "SMART partially unavailable"
     },
     "alerts": {
       "title": "Alerts",

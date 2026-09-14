@@ -451,20 +451,27 @@ const TentaNasScreen = {
     // do) is not merely redundant: `set rowActions` calls the table's
     // `_render()`, so setting `.rows` and `.rowActions` together ran TWO full
     // render passes per poll over both fleet tables.
-    this.root.querySelector('#nas-fleet-alerts').rowActions = (row) => {
+    this.root.querySelector('#nas-fleet-alerts').rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const { node, alert } = row._row;
       const wrap = document.createElement('div');
       wrap.className = 'row-actions';
       const target = alertTarget(alert);
       wrap.innerHTML = `<tf-button size="sm" variant="secondary" icon="chevron-right" data-act="go">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>`;
-      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(node.nodeId, target.tab, target.extra); });
+      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const now = live()._row;
+        const t = alertTarget(now.alert);
+        this.selectNode(now.node.nodeId, t.tab, t.extra);
+      });
       return wrap;
     };
-    this.root.querySelector('#nas-fleet-res-table').rowActions = (row) => {
+    this.root.querySelector('#nas-fleet-res-table').rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const wrap = document.createElement('div');
       wrap.className = 'row-actions';
       wrap.innerHTML = `<tf-button size="sm" variant="secondary" icon="chevron-right" data-act="go">${escapeHtml(T('fleet.act_manage'))}</tf-button>`;
-      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(row._node.nodeId, 'shares'); });
+      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(live()._node.nodeId, 'shares'); });
       return wrap;
     };
     this.paintFleet();
@@ -1351,7 +1358,14 @@ const TentaNasScreen = {
     return {
       kind: missing ? `unavailable:install:${missing.id}` : 'unavailable',
       tone: 'info',
-      title: T('telemetry.unavailable_title'),
+      // `partial` means SMART read the rest of the disks and failed only on the
+      // ones `detail` names — calling that "unavailable" overstates it, because
+      // the tab is not blind, it is blind to part of the fleet. Any other value
+      // is genuinely unknown to this screen and keeps the blunt title.
+      // `kind` deliberately stays as it is: it drives the element rebuild, and
+      // only the ACTION may force one. The title is written through setAttr,
+      // which skips an unchanged value, so varying it costs no churn.
+      title: T(t.smartState === 'partial' ? 'telemetry.partial_title' : 'telemetry.unavailable_title'),
       message: t.detail || '',
       // "Jak brakuje pakietu, to powinna być możliwość doinstalowania" — the
       // same route the Environment tab's per-feature button takes, so there is
@@ -1505,7 +1519,8 @@ const TentaNasScreen = {
       const d = row._disk;
       return `${d.diskId}|${d.name}|${d.role}|${d.locateActive ? 1 : 0}`;
     };
-    table.rowActions = (row) => {
+    table.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const d = row._disk;
       const wrap = document.createElement('div');
       wrap.className = 'row-actions';
@@ -1514,9 +1529,9 @@ const TentaNasScreen = {
         <tf-button size="sm" variant="ghost" icon="play" data-act="smart" title="${escapeAttr(T('disks.smart_test'))}"></tf-button>
         ${d.role === 'free' ? `<tf-button size="sm" variant="ghost" icon="layers" data-act="use" title="${escapeAttr(T('disks.use_in_pool'))}"></tf-button>` : ''}
         <tf-button size="sm" variant="secondary" icon="chevron-right" data-act="details">${escapeHtml(T('disks.details'))}</tf-button>`;
-      wrap.querySelector('[data-act="details"]').addEventListener('click', (e) => { e.stopPropagation(); this.openDisk(d.diskId); });
-      wrap.querySelector('[data-act="locate"]').addEventListener('click', (e) => { e.stopPropagation(); this.locateDisk(d, !d.locateActive); });
-      wrap.querySelector('[data-act="smart"]').addEventListener('click', (e) => { e.stopPropagation(); this.startSmartTest(d); });
+      wrap.querySelector('[data-act="details"]').addEventListener('click', (e) => { e.stopPropagation(); this.openDisk(live()._disk.diskId); });
+      wrap.querySelector('[data-act="locate"]').addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._disk; this.locateDisk(cur, !cur.locateActive); });
+      wrap.querySelector('[data-act="smart"]').addEventListener('click', (e) => { e.stopPropagation(); this.startSmartTest(live()._disk); });
       wrap.querySelector('[data-act="use"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.openPoolWizardForDisk(); });
       return wrap;
     };
@@ -2211,7 +2226,8 @@ const TentaNasScreen = {
         f.detail || '',
       ].filter(Boolean).join(' · ') || '—')}</span>`,
     }));
-    ftable.rowActions = (row) => {
+    ftable.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const f = row._feature;
       const installable = admin && f.status !== 'ok' && f.status !== 'unsupported_platform' && (f.packages || []).length > 0;
       if (!installable) return null;
@@ -2224,7 +2240,7 @@ const TentaNasScreen = {
         b.setAttribute('disabled', '');
         b.title = T('env.package_manager_none');
       }
-      b.addEventListener('click', (e) => { e.stopPropagation(); this.installFeature(f); });
+      b.addEventListener('click', (e) => { e.stopPropagation(); this.installFeature(live()._feature); });
       return b;
     };
 
@@ -2236,7 +2252,8 @@ const TentaNasScreen = {
       channel: { status: channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok', label: T('elevation.mode_' + channelMode(n.elevationMode)), dot: true },
       features: (n.features || []).join(' · ') || (n.instanceStatus === 'ready' ? T('env.features_unknown') : T('instance.' + n.instanceStatus)),
     }));
-    otable.rowActions = (row) => {
+    otable.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const n = row._node;
       if (n.instanceStatus !== 'ready') return null;
       const wrap = document.createElement('div');
@@ -2245,8 +2262,8 @@ const TentaNasScreen = {
       wrap.innerHTML = unarmed && admin
         ? `<tf-button size="sm" variant="secondary" icon="unlock" data-act="arm-node">${escapeHtml(T('env.arm_node'))}</tf-button>`
         : `<tf-button size="sm" variant="ghost" icon="chevron-right" data-act="go">${escapeHtml(T('env.go_to_node'))}</tf-button>`;
-      wrap.querySelector('[data-act="go"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(n.nodeId); });
-      wrap.querySelector('[data-act="arm-node"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.armNode(n); });
+      wrap.querySelector('[data-act="go"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(live()._node.nodeId); });
+      wrap.querySelector('[data-act="arm-node"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.armNode(live()._node); });
       return wrap;
     };
     otable.addEventListener('row-click', (e) => { if (e.detail.row._node.instanceStatus === 'ready') this.selectNode(e.detail.row._node.nodeId); });

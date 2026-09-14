@@ -151,7 +151,12 @@ export function drawRuns(screen, host, { projectId = null } = {}) {
       nodes,
       now,
     }));
-    table.rowActions = (row) => rowActions(screen, host, all.find((r) => r.runId === row._run), projectId);
+    table.rowActions = (row, idx, currentRow) => {
+      // The actions cell can be kept across re-renders, so the handlers get a
+      // getter that resolves the run from the row in this slot at click time.
+      const live = () => currentRow?.() ?? row;
+      return rowActions(screen, host, all.find((r) => r.runId === row._run), projectId, () => all.find((r) => r.runId === live()._run));
+    };
     table.addEventListener('row-click', (e) => selectRun(screen, host, e.detail.row._run, projectId));
   }
 
@@ -185,15 +190,21 @@ export function drawRuns(screen, host, { projectId = null } = {}) {
 /// the cell lives in the component's shadow root, where a listener on the host
 /// would only ever see the table element — and for the same reason the wrapper
 /// carries the controls.css class rather than one of this screen's own.
-function rowActions(screen, host, run, projectId) {
+function rowActions(screen, host, run, projectId, liveRun) {
   if (!run || !canControlRun(run, screen.userId)) return null;
+  const current = () => liveRun?.() ?? run;
   const wrap = document.createElement('span');
   wrap.className = 'tf-table__row-actions';
   wrap.appendChild(actionButton('star', T(run.pinnedAt ? 'runs.unpin' : 'runs.pin'), () => {
-    setRunPinned(screen, run, !run.pinnedAt, { projectId });
+    const target = current();
+    if (!target) return;
+    setRunPinned(screen, target, !target.pinnedAt, { projectId });
   }));
   if (runIsLive(run)) {
-    wrap.appendChild(actionButton('x', T('runs.cancel'), () => cancelRun(screen, run, { projectId })));
+    wrap.appendChild(actionButton('x', T('runs.cancel'), () => {
+      const target = current();
+      if (target) cancelRun(screen, target, { projectId });
+    }));
   }
   return wrap;
 }

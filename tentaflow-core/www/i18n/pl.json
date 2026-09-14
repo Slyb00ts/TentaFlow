@@ -6401,7 +6401,8 @@
     "telemetry": {
       "stale_title": "Dane SMART są nieaktualne",
       "stale_msg": "Kanał uprawnień nie jest uzbrojony, więc SMART nie jest odczytywany. Ostatni odczyt: {t}.",
-      "unavailable_title": "SMART niedostępny"
+      "unavailable_title": "SMART niedostępny",
+      "partial_title": "SMART częściowo niedostępny"
     },
     "alerts": {
       "title": "Alerty",

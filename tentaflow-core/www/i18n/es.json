@@ -6250,7 +6250,8 @@
     "telemetry": {
       "stale_title": "Los datos SMART están obsoletos",
       "stale_msg": "El canal de privilegios no está activado, por lo que no se lee SMART. Última lectura: {t}.",
-      "unavailable_title": "SMART no disponible"
+      "unavailable_title": "SMART no disponible",
+      "partial_title": "SMART parcialmente no disponible"
     },
     "alerts": {
       "title": "Alertas",

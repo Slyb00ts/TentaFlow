@@ -90,7 +90,8 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
     }));
   };
 
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const a = row._approval;
     const wrap = document.createElement('div');
     wrap.className = 'row-actions';
@@ -111,7 +112,7 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
       b.setAttribute('variant', variant);
       b.setAttribute('icon', icon);
       b.textContent = label;
-      b.addEventListener('click', (e) => { e.stopPropagation(); decide(a, act === 'approve'); });
+      b.addEventListener('click', (e) => { e.stopPropagation(); decide(live()._approval, act === 'approve'); });
       wrap.appendChild(b);
     }
     return wrap;

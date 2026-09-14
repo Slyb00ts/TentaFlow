@@ -73,11 +73,17 @@ class TfTable extends HTMLElement {
     this._rows = [];
     this._sortKey = null;
     this._sortDir = 'asc';
-    // Optional per-row actions builder: (row, index) => Element | null.
+    // Optional per-row actions builder:
+    //   (row, index, currentRow) => Element | null
     // When set, tf-table renders a trailing actions column hosting the
-    // returned element (e.g. a kebab tf-menu). Without a rowActionsKey the
-    // cell is rebuilt on every render, so the element stays bound to its
-    // current row object.
+    // returned element (e.g. a kebab tf-menu). `currentRow()` returns the row
+    // occupying this slot AT CALL TIME, so a handler that reads through it
+    // acts on the row that is actually there rather than on the one the
+    // element was built from. Builders read every row value their HANDLERS
+    // need through it; MARKUP may still come from `row`, which is rendered at
+    // once and therefore can never be stale. That split is what lets
+    // _writeActionsCell keep an existing node whenever a rebuild would have
+    // produced identical markup.
     this._rowActions = null;
     // Optional signature of the actions cell: (row, index) => string | number.
     // Rows are rebuilt from fresh API data on every poll, so `row === lastRow`
@@ -624,18 +630,19 @@ class TfTable extends HTMLElement {
       this._writeCell(td, cols[i], row[cols[i].key]);
     }
     if (this._rowActions) {
-      // Recyklowany wiersz wskazuje teraz na inny obiekt row, wiec element
-      // akcji musi byc zbindowany do aktualnego wiersza. Bez `rowActionsKey`
-      // oznacza to bezwarunkowy rebuild; z kluczem — rebuild tylko wtedy, gdy
-      // sygnatura wiersza sie ruszyla (patrz _writeActionsCell).
+      // A recycled <tr> may now show a different logical row. The actions
+      // element is replaced only when that changes the markup it builds;
+      // otherwise the node stays put and its handlers follow the current row
+      // by themselves (see _writeActionsCell).
       this._writeActionsCell(tds[cols.length], row, idx);
     }
   }
 
   // Signature of the actions cell for `row`, or null when the host declared
-  // none — then every render rebuilds, the behaviour every caller had before
-  // `rowActionsKey` existed. A builder that throws, or returns anything but a
-  // string/number, counts as "no signature" rather than as a false match.
+  // none — then the builder runs on every render and the markup comparison in
+  // _writeActionsCell decides whether anything is written. A builder that
+  // throws, or returns anything but a string/number, counts as "no signature"
+  // rather than as a false match.
   _rowActionsSignature(row, idx) {
     if (!this._rowActionsKey) return null;
     let key = null;
@@ -645,19 +652,56 @@ class TfTable extends HTMLElement {
       : null;
   }
 
+  // Builds the actions element for `row` and puts it in `td` — unless the cell
+  // already holds the markup that was just built, in which case the NEW
+  // element is DISCARDED and the existing node is left untouched. Not writing
+  // the DOM at all is the point: it is what keeps a click target alive under
+  // the user's cursor across a 5 s poll.
+  //
+  // Keeping a node is sound because the builder is handed `currentRow`, so its
+  // handlers resolve the row occupying this slot at CLICK time rather than the
+  // one they were built from. Identical markup therefore also means identical
+  // behaviour, even after a sort, a filter or a poll moved a different row
+  // into this position — which is why the guard needs no promise from the
+  // caller, unlike `rowActionsKey`.
+  //
+  // The comparison is against the markup AS BUILT, recorded here, and never
+  // against the live node: a tf-menu the user has opened carries an `open`
+  // attribute, and a button with an action in flight carries `disabled`.
+  // Comparing against the live DOM would read those as "changed" and destroy
+  // precisely the element being interacted with.
   _writeActionsCell(td, row, idx) {
     const key = this._rowActionsSignature(row, idx);
-    // The element sitting here was built for this very signature, so it renders
-    // the same markup AND its handlers close over the same values — keep the
-    // node. `null` never matches itself, so a table with no signature keeps
-    // rebuilding exactly as before.
+    // A declared signature that still holds skips the build entirely — the
+    // optional fast path. `null` never matches itself, so a table without a
+    // signature always builds and falls through to the markup comparison.
     if (key !== null && td._tfActionsKey === key) return;
+    const gen = this._rowActionsGen || 0;
     let el = null;
-    try { el = this._rowActions(row, idx); } catch { el = null; }
+    try {
+      el = this._rowActions(row, idx, () => this._sortedRows()[idx] ?? row);
+    } catch { el = null; }
+    // `outerHTML` is read off the element, not through `instanceof Element`:
+    // the test harness does not export that global, and a text node simply has
+    // no outerHTML and so can never match.
+    const html = el instanceof Node && typeof el.outerHTML === 'string' ? el.outerHTML : null;
+    const held = td.childNodes.length === 1 ? td.firstChild : null;
+    // The generation is part of the match: a NEW builder closes over new
+    // values (an `isAdmin` that has since changed), so its output has to
+    // replace the old element even when the two render the same markup.
+    if (html !== null
+      && held != null && typeof held.outerHTML === 'string'
+      && td._tfActionsGen === gen
+      && td._tfActionsHtml === html) {
+      td._tfActionsKey = key;
+      return;
+    }
     if (el instanceof Node) td.replaceChildren(el);
     else td.replaceChildren();
     // Recorded even when null, so a cell whose builder returned nothing is not
     // mistaken for one that was never written.
+    td._tfActionsHtml = html;
+    td._tfActionsGen = gen;
     td._tfActionsKey = key;
   }
 

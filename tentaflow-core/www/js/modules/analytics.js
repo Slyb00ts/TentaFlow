@@ -1705,7 +1705,8 @@ async function renderLimits(panel, seq) {
 
   const qTable = byId('an-quotas-table');
   if (qTable) {
-    qTable.rowActions = (row) => {
+    qTable.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const wrap = document.createElement('div');
       wrap.className = 'an-row-actions';
       const edit = document.createElement('tf-button');
@@ -1713,7 +1714,7 @@ async function renderLimits(panel, seq) {
       edit.setAttribute('size', 'sm');
       edit.setAttribute('icon', 'edit');
       edit.title = T('edit');
-      edit.addEventListener('click', () => openQuotaEditor(row._q));
+      edit.addEventListener('click', () => openQuotaEditor(live()._q));
       wrap.appendChild(edit);
       return wrap;
     };
@@ -2070,12 +2071,13 @@ function renderPricing(pricing, modelRows) {
   const priceInput = (modelId, field, value) => (applies(modelId, field)
     ? `<span class="tf-table__price tf-table__price--suffix"><tf-input type="number" step="0.0001" min="0" suffix="zł" data-model="${escapeAttr(modelId)}" data-field="${field}" value="${escapeAttr(num(value).toFixed(4))}"></tf-input></span>`
     : `<span class="tf-table__price tf-table__price--suffix"><tf-input type="text" disabled value="—" title="${escapeAttr(T('rate_not_applicable'))}"></tf-input></span>`);
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const btn = document.createElement('tf-button');
     btn.setAttribute('variant', row._missing ? 'primary' : 'secondary');
     btn.setAttribute('size', 'sm');
     btn.textContent = T('save');
-    btn.addEventListener('click', () => savePricingRow(row._model));
+    btn.addEventListener('click', () => savePricingRow(live()._model));
     return btn;
   };
   const missingSet = new Set(modelRows.filter((r) => r.missingPricing).map((r) => String(r.key)));

@@ -256,7 +256,8 @@ export async function drawShares(screen, body) {
         </tf-table>`;
     if (patchHtml(list, shell)) {
       const table = list.querySelector('#nas-sh-table');
-      table.rowActions = (row) => {
+      table.rowActions = (row, idx, currentRow) => {
+        const live = () => currentRow?.() ?? row;
         const s = row._share;
         const wrap = document.createElement('div');
         wrap.className = 'tf-table__cell-row';
@@ -265,10 +266,10 @@ export async function drawShares(screen, body) {
           <tf-button size="sm" variant="ghost" icon="${s.enabled ? 'pause' : 'play'}" data-act="pause" title="${escapeAttr(s.enabled ? T('shares.pause') : T('shares.resume'))}"></tf-button>
           <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(T('shares.delete'))}"></tf-button>`
           : `<tf-button size="sm" variant="ghost" icon="eye" data-act="details" title="${escapeAttr(T('shares.details'))}"></tf-button>`;
-        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDetail(screen, s.shareId, detailOpts()); });
-        wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(s); });
-        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); setShareEnabled(screen, s, !s.enabled, refresh); });
-        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDeleteDialog(screen, s, refresh); });
+        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDetail(screen, live()._share.shareId, detailOpts()); });
+        wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(live()._share); });
+        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._share; setShareEnabled(screen, cur, !cur.enabled, refresh); });
+        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDeleteDialog(screen, live()._share, refresh); });
         return wrap;
       };
       table.addEventListener('row-click', (e) => openShareDetail(screen, e.detail.row._share.shareId, detailOpts()));

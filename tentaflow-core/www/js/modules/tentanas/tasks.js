@@ -87,13 +87,14 @@ export async function drawTasks(screen, body) {
   const nodeName = screen.currentNode()?.nodeName || '';
 
   const jobsTable = body.querySelector('#nas-jobs-table');
-  jobsTable.rowActions = (row) => {
+  jobsTable.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const b = document.createElement('tf-button');
     b.setAttribute('size', 'sm');
     b.setAttribute('variant', 'ghost');
     b.setAttribute('icon', 'file-text');
     b.textContent = T('jobs.log');
-    b.addEventListener('click', (e) => { e.stopPropagation(); screen.openJobLog(row._job.jobId); });
+    b.addEventListener('click', (e) => { e.stopPropagation(); screen.openJobLog(live()._job.jobId); });
     return b;
   };
   jobsTable.addEventListener('row-click', (e) => screen.openJobLog(e.detail.row._job.jobId));

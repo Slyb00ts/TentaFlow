@@ -1013,6 +1013,37 @@ test('a node leaving and rejoining the fleet leaves the other cards standing', a
   Screen.unmount();
 });
 
+// `partial` is what the wire sends when SMART was read for most disks and
+// failed for the ones `detail` names (disks.rs:1145). Titling that "SMART
+// niedostępny" overstates it; an unknown state still deserves the blunt title.
+test('a partial SMART read says so, and an unknown state keeps the generic title', async () => {
+  const partial = {
+    sampledAt: '2026-09-02 10:00:00', smartReadAt: '2026-09-02 09:59:00',
+    smartState: 'partial', detail: '/dev/sdb: smartctl failed (4): no output',
+  };
+  stubTransport({ ...fixtures, tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, telemetry: partial } });
+  let root = await mountScreen({ node: LOCAL });
+  await flush();
+  const alert = root.querySelector('#nas-ov-telemetry tf-alert');
+  assert.equal(alert === null, false, 'the banner is on screen');
+  assert.equal(alert.getAttribute('title'), 'SMART częściowo niedostępny');
+  Screen.unmount();
+
+  // A state this screen has not been taught keeps the blunt wording rather than
+  // silently claiming the failure is partial.
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      ...fixtures.tentaNasDisksListRequest,
+      telemetry: { ...partial, smartState: 'something-the-wire-grew-later' },
+    },
+  });
+  root = await mountScreen({ node: LOCAL });
+  await flush();
+  assert.equal(root.querySelector('#nas-ov-telemetry tf-alert').getAttribute('title'), 'SMART niedostępny');
+  Screen.unmount();
+});
+
 test('the unavailable banner offers an install only when a package is genuinely missing', async () => {
   const telemetry = { sampledAt: '2026-09-02 10:00:00', smartReadAt: null, smartState: 'partial', detail: '/dev/sdb: smartctl failed (4): no output' };
   // Nothing is missing here: smartctl is installed and merely failed on some

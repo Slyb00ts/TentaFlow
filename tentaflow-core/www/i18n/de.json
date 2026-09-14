@@ -6250,7 +6250,8 @@
     "telemetry": {
       "stale_title": "SMART-Daten sind veraltet",
       "stale_msg": "Der Rechtekanal ist nicht scharfgeschaltet, daher wird SMART nicht gelesen. Letzte Lesung: {t}.",
-      "unavailable_title": "SMART nicht verfügbar"
+      "unavailable_title": "SMART nicht verfügbar",
+      "partial_title": "SMART teilweise nicht verfügbar"
     },
     "alerts": {
       "title": "Warnungen",
