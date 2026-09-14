@@ -1467,6 +1467,14 @@ mod tests {
     /// expander, copied byte for byte off the node this fix was measured on.
     const SMART_SAS: &str = include_str!("../../tests/fixtures/smart-sas-sdb.json");
 
+    /// `smartctl --json=c -x /dev/nvme0` off the node this area was measured
+    /// on, hardware identifiers scrubbed. Its self-test log is the shape the
+    /// synthetic documents cannot produce: `nvme_self_test_log` is PRESENT but
+    /// has **no `table` key at all** (no self-test has ever run), and
+    /// `current_self_test_completion_percent` is absent because smartctl emits
+    /// it only while a test is actually running.
+    const SMART_NVME: &str = include_str!("../../tests/fixtures/smart-nvme-nvme0.json");
+
     const LSBLK: &str = r#"{"blockdevices":[
       {"name":"sda","path":"/dev/sda","type":"disk","model":"WDC WD80EFZZ","serial":"WD-1","wwn":"0x5000cca","size":8001563222016,"tran":"sata","rota":true,"rm":false,"rev":"81.00","vendor":"ATA     ","mountpoints":[null],"fstype":null,"label":null,
        "children":[{"name":"sda1","path":"/dev/sda1","type":"part","mountpoints":[null],"fstype":"zfs_member","label":"tank"}]},
@@ -1759,6 +1767,29 @@ mod tests {
         assert!(scsi(2, 5).self_test_failed, "an abort by device reset is not a verdict");
         assert!(!scsi(1, 0).self_test_failed, "an abort over a pass invents nothing");
         assert!(!scsi(0, 5).self_test_failed, "a passing re-test still clears it");
+    }
+
+    /// A real NVMe document with no self-test history at all. The health guard
+    /// fires on `nvme_self_test_log` being present, so this is the path every
+    /// NVMe disk on a fresh node takes: present log, no table, therefore no
+    /// verdict — and it must not read as a failure or panic.
+    #[test]
+    fn a_real_nvme_document_without_a_self_test_table_yields_no_verdict() {
+        let doc: Value = serde_json::from_str(SMART_NVME).expect("fixture parses");
+        assert!(
+            doc.get("nvme_self_test_log").is_some(),
+            "the guard's trigger is present in the real document"
+        );
+        assert!(
+            doc.pointer("/nvme_self_test_log/table").is_none(),
+            "and the real document carries no table, not merely an empty one"
+        );
+        assert!(smart_self_tests(&doc).is_empty(), "no entries to report");
+        let s = summarize_smart(&doc);
+        assert!(!s.self_test_failed, "no verdict is not a failure");
+        // The counters this area reads, straight off the device.
+        assert_eq!(s.media_errors, Some(835));
+        assert_eq!(s.wear_pct, Some(9));
     }
 
     #[test]
