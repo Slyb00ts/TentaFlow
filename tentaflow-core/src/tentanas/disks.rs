@@ -238,6 +238,11 @@ pub fn disk_from_lsblk(node: &Value) -> Option<NasDisk> {
         // it; `refresh_inventory` fills these from `zpool status`.
         vdev_role: String::new(),
         vdev_kind: String::new(),
+        // An Elastic Array leaves NO signature on its disks — the union is a
+        // mergerfs mount over ordinary per-disk filesystems — so lsblk cannot
+        // see this either; `refresh_inventory` fills it from this node's own
+        // array rows.
+        array_role: String::new(),
     })
 }
 
@@ -273,6 +278,95 @@ async fn vdev_membership() -> HashMap<String, (String, String)> {
         }
     }
     index
+}
+
+/// Disk id → (array name, part played in it) for every Elastic Array this
+/// node has recorded.
+///
+/// Membership of an Elastic Array is NOT on the disk. mdraid writes a
+/// `linux_raid_member` superblock and ZFS a `zfs_member` label, so lsblk alone
+/// can name those owners; an Elastic Array is a union mount over ordinary xfs
+/// or ext4 filesystems, one per branch, and nothing on the disk says which
+/// array it serves. Only this node's database knows — which is why the lookup
+/// happens HERE, once per inventory refresh, and never on the tab's
+/// five-second poll, for the same reason `vdev_membership` is read here.
+///
+/// Keyed by `disk_id`, never by kernel name: `BranchRow::name` is the branch's
+/// slot name (`d1`, `c1`), not a device, and a kernel name can be handed to a
+/// different disk across a reboot.
+fn array_membership(db: &DbPool) -> HashMap<String, (String, String)> {
+    let arrays = match store::elastic_arrays_all(db) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("tentanas: elastic array list for disk roles failed: {e}");
+            return HashMap::new();
+        }
+    };
+    let mut index = HashMap::new();
+    for array in arrays {
+        for branch in &array.branches {
+            index.insert(
+                branch.disk_id.clone(),
+                (array.name.clone(), branch.role.clone()),
+            );
+        }
+        // Parity is not a branch of the union (it holds a file, not a tree),
+        // so it carries no role of its own in the row and gets one here.
+        for parity in &array.parity {
+            index.insert(
+                parity.disk_id.clone(),
+                (array.name.clone(), "parity".to_string()),
+            );
+        }
+    }
+    index
+}
+
+/// Applies the two memberships lsblk cannot see to a freshly scanned
+/// inventory: the ZFS vdev a pool member sits in, and the part an Elastic
+/// Array member plays in its array.
+///
+/// Split out of `refresh_inventory` so both can be exercised without lsblk,
+/// `zpool status` or a live node.
+fn apply_membership(
+    disks: &mut [NasDisk],
+    vdevs: &HashMap<String, (String, String)>,
+    arrays: &HashMap<String, (String, String)>,
+) {
+    for d in disks.iter_mut() {
+        apply_array_membership(d, arrays);
+        if let Some((role, kind)) = vdevs.get(&d.name) {
+            d.vdev_role.clone_from(role);
+            d.vdev_kind.clone_from(kind);
+        }
+    }
+}
+
+/// Names the Elastic Array that owns one disk, when this node recorded one.
+///
+/// Without this the branches of an array fall through `role_of` to the
+/// catch-all `used` (or `mounted`), which is why a node with one array of 23
+/// disks showed "Zajęty · xfs" 23 times: true, and useless — the filesystem is
+/// an implementation detail of the union, and the thing the admin acts on is
+/// the array.
+fn apply_array_membership(d: &mut NasDisk, arrays: &HashMap<String, (String, String)>) {
+    // The system disk stays the system disk, and a signature ON the disk
+    // (`zfs_member`, `linux_raid_member`) is harder evidence than a database
+    // row that a dissolved array may have left behind.
+    if d.role == "system" || d.member_of.is_some() {
+        return;
+    }
+    let Some((array, role)) = arrays.get(&d.disk_id) else {
+        return;
+    };
+    d.role = "array_member".to_string();
+    d.member_of = Some(array.clone());
+    d.array_role = role.clone();
+    // The branch filesystem is what the array built, not a foreign occupier:
+    // `fs_type` exists only so the catch-all `used` can name what it cannot
+    // otherwise explain, and leaving it set would put "· xfs" back on a row
+    // that now has a real owner to show.
+    d.fs_type = None;
 }
 
 pub fn disks_from_lsblk_json(text: &str) -> Result<Vec<NasDisk>> {
@@ -1054,7 +1148,7 @@ fn stale(last: Option<Instant>, every: Duration) -> bool {
 /// of disks that are still there. A disk that disappeared is dropped from
 /// the live view (its DB row stays for history).
 pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
-    let found = match inventory().await {
+    let mut found = match inventory().await {
         Ok(d) => d,
         Err(e) => {
             let mut st = state().write();
@@ -1064,6 +1158,8 @@ pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
         }
     };
     let vdevs = vdev_membership().await;
+    let arrays = array_membership(db);
+    apply_membership(&mut found, &vdevs, &arrays);
     for d in &found {
         store::upsert_disk_seen(
             db,
@@ -1089,10 +1185,6 @@ pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
     let mut st = state().write();
     let mut next = BTreeMap::new();
     for mut d in found {
-        if let Some((role, kind)) = vdevs.get(&d.name) {
-            d.vdev_role.clone_from(role);
-            d.vdev_kind.clone_from(kind);
-        }
         let live = match st.disks.remove(&d.disk_id) {
             Some(mut old) => {
                 // Identity/role/mounts from the fresh scan, everything SMART
@@ -1520,6 +1612,171 @@ mod tests {
         assert_eq!(sdc.fs_type.as_deref(), Some("ext4"));
         // Nothing owns it, so no membership may be claimed.
         assert_eq!(sdc.member_of, None);
+    }
+
+    /// An lsblk document of a node whose Elastic Array `produkt` owns three
+    /// disks. This is what the union really looks like from below: every
+    /// branch carries its OWN xfs filesystem and nothing that names the array
+    /// — no `linux_raid_member`, no `zfs_member` — which is exactly why
+    /// `role_of` alone cannot classify them. Deliberately separate from
+    /// `LSBLK`, whose `disks.len()` and indexes other tests depend on.
+    const LSBLK_ARRAY: &str = r#"{"blockdevices":[
+      {"name":"sdg","path":"/dev/sdg","type":"disk","model":"WD80EFZZ","serial":"D1","wwn":null,"size":8001563222016,"tran":"sata","rota":true,"rm":false,"rev":null,"vendor":"ATA","mountpoints":[null],"fstype":"xfs","label":null},
+      {"name":"sdh","path":"/dev/sdh","type":"disk","model":"WD80EFZZ","serial":"P1","wwn":null,"size":8001563222016,"tran":"sata","rota":true,"rm":false,"rev":null,"vendor":"ATA","mountpoints":[null],"fstype":"xfs","label":null},
+      {"name":"nvme1n1","path":"/dev/nvme1n1","type":"disk","model":"980 PRO","serial":"C1","wwn":null,"size":1000204886016,"tran":"nvme","rota":false,"rm":false,"rev":null,"vendor":null,"mountpoints":[null],"fstype":"xfs","label":null},
+      {"name":"sdi","path":"/dev/sdi","type":"disk","model":"ST4000","serial":"F1","wwn":null,"size":4000787030016,"tran":"sata","rota":true,"rm":false,"rev":null,"vendor":"ATA","mountpoints":[null],"fstype":null,"label":null},
+      {"name":"sdj","path":"/dev/sdj","type":"disk","model":"WD80EFZZ","serial":"Z1","wwn":null,"size":8001563222016,"tran":"sata","rota":true,"rm":false,"rev":null,"vendor":"ATA","mountpoints":[null],"fstype":null,"label":null,
+       "children":[{"name":"sdj1","path":"/dev/sdj1","type":"part","mountpoints":[null],"fstype":"zfs_member","label":"tank"}]},
+      {"name":"nvme0n1","path":"/dev/nvme0n1","type":"disk","model":"Samsung 980","serial":"S1","wwn":null,"size":1000204886016,"tran":"nvme","rota":false,"rm":false,"rev":null,"vendor":null,"mountpoints":[null],"fstype":null,"label":null,
+       "children":[{"name":"nvme0n1p2","path":"/dev/nvme0n1p2","type":"part","mountpoints":["/"],"fstype":"ext4","label":null}]}
+    ]}"#;
+
+    fn array_index(pairs: &[(&str, &str, &str)]) -> HashMap<String, (String, String)> {
+        pairs
+            .iter()
+            .map(|(id, array, role)| {
+                ((*id).to_string(), ((*array).to_string(), (*role).to_string()))
+            })
+            .collect()
+    }
+
+    fn by_name(disks: &[NasDisk], name: &str) -> NasDisk {
+        disks
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the fixture"))
+            .clone()
+    }
+
+    /// The defect: an Elastic Array leaves no signature on its disks, so every
+    /// branch fell through `role_of` to the catch-all `used` and the chip read
+    /// "Zajęty · xfs" — 23 times on the node this was measured on. Membership
+    /// lives in this node's database, so it is applied after the scan, and
+    /// each part of the array says which part it is: the admin's next move
+    /// differs between data, cache (unprotected bytes) and parity (no data at
+    /// all).
+    #[test]
+    fn an_elastic_array_member_is_named_after_its_array_not_its_filesystem() {
+        let mut disks = disks_from_lsblk_json(LSBLK_ARRAY).unwrap();
+        // Before membership is applied the three branches are exactly the
+        // useless rows the owner complained about.
+        for name in ["sdg", "sdh", "nvme1n1"] {
+            let raw = by_name(&disks, name);
+            assert_eq!(raw.role, "used", "{name} before membership");
+            assert_eq!(raw.fs_type.as_deref(), Some("xfs"), "{name} before membership");
+        }
+        let arrays = array_index(&[
+            ("sn-D1", "produkt", "data"),
+            ("sn-C1", "produkt", "cache"),
+            ("sn-P1", "produkt", "parity"),
+        ]);
+        apply_membership(&mut disks, &HashMap::new(), &arrays);
+        for (name, role) in [("sdg", "data"), ("nvme1n1", "cache"), ("sdh", "parity")] {
+            let d = by_name(&disks, name);
+            assert_eq!(d.role, "array_member", "{name}");
+            assert_eq!(d.member_of.as_deref(), Some("produkt"), "{name}");
+            assert_eq!(d.array_role, role, "{name}");
+            // The branch filesystem is the array's own doing; leaving it would
+            // put "· xfs" back on a row that now has an owner to show.
+            assert_eq!(d.fs_type, None, "{name}");
+        }
+    }
+
+    /// The array rows are this node's record, not evidence on the disk, so
+    /// they may NOT overrule what the disk itself says. A stale row naming the
+    /// system disk or a ZFS member must leave both exactly as the scan found
+    /// them, and a disk no array claims stays free.
+    #[test]
+    fn array_rows_never_overrule_the_system_disk_a_pool_member_or_a_free_disk() {
+        let mut disks = disks_from_lsblk_json(LSBLK_ARRAY).unwrap();
+        let arrays = array_index(&[
+            // Both of these are wrong on purpose: the row outlived the array.
+            ("sn-S1", "produkt", "data"),
+            ("sn-Z1", "produkt", "data"),
+        ]);
+        let vdevs: HashMap<String, (String, String)> =
+            [("sdj".to_string(), ("data".to_string(), "raidz3".to_string()))].into();
+        apply_membership(&mut disks, &vdevs, &arrays);
+
+        let system = by_name(&disks, "nvme0n1");
+        assert_eq!(system.role, "system");
+        assert_eq!(system.member_of, None);
+        assert!(system.array_role.is_empty());
+
+        // "tank · RAIDZ3" on the node this was measured on: the pool, its vdev
+        // role and its layout, none of them touched.
+        let member = by_name(&disks, "sdj");
+        assert_eq!(member.role, "pool_member");
+        assert_eq!(member.member_of.as_deref(), Some("tank"));
+        assert_eq!((member.vdev_role.as_str(), member.vdev_kind.as_str()), ("data", "raidz3"));
+        assert!(member.array_role.is_empty());
+
+        let free = by_name(&disks, "sdi");
+        assert_eq!(free.role, "free");
+        assert_eq!(free.member_of, None);
+        assert!(free.array_role.is_empty());
+        assert_eq!(free.fs_type, None);
+    }
+
+    /// A disk carrying a filesystem that belongs to NOTHING keeps the `used`
+    /// role and its signature: that is the one row where naming the
+    /// filesystem is all the inventory can honestly say. Applying array
+    /// membership must not blank it.
+    #[test]
+    fn a_disk_no_array_claims_keeps_used_and_its_filesystem() {
+        let mut disks = disks_from_lsblk_json(LSBLK_ARRAY).unwrap();
+        apply_membership(&mut disks, &HashMap::new(), &array_index(&[("sn-D1", "produkt", "data")]));
+        let orphan = by_name(&disks, "sdh");
+        assert_eq!(orphan.role, "used");
+        assert_eq!(orphan.fs_type.as_deref(), Some("xfs"));
+        assert_eq!(orphan.member_of, None);
+        assert!(orphan.array_role.is_empty());
+    }
+
+    /// The lookup itself, against a real database: an array created through
+    /// the production intent must yield every one of its disks, keyed by the
+    /// stable `disk_id` the branch rows carry — never by kernel name, which
+    /// the rows do not even store (`BranchRow::name` is the slot, `d1`/`c1`).
+    #[test]
+    fn array_membership_reads_every_disk_of_every_recorded_array() {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        store::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+
+        let mut spec = crate::tentanas::elastic::tests::create_spec("produkt");
+        spec.cache = Some(tentanas_helper::elastic::ElasticDiskSpec {
+            disk_id: "produkt-cache".to_string(),
+            wwn: Some("wwn-produkt-cache".to_string()),
+            serial: Some("serial-produkt-cache".to_string()),
+            bytes: 32 * 1024 * 1024 * 1024,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        });
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::new_v4().to_string(),
+            kind: "elastic_create".to_string(),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_by: "test".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&db, &job, Some(&crate::tentanas::jobs::ElasticJobIntent::Create(spec)))
+            .expect("record the array");
+
+        let index = array_membership(&db);
+        let mut rows: Vec<(String, String, String)> = index
+            .into_iter()
+            .map(|(id, (array, role))| (id, array, role))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("produkt-cache".to_string(), "produkt".to_string(), "cache".to_string()),
+                ("produkt-data".to_string(), "produkt".to_string(), "data".to_string()),
+                ("produkt-parity".to_string(), "produkt".to_string(), "parity".to_string()),
+            ]
+        );
     }
 
     /// A ZFS member label belongs in `member_of` and must never reach

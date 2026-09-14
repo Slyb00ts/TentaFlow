@@ -6281,6 +6281,9 @@
       "used": "En uso",
       "pool_member": "Miembro del pool",
       "array_member": "Miembro del array",
+      "array_data": "Datos",
+      "array_cache": "Caché",
+      "array_parity": "Paridad",
       "mounted": "Montado"
     },
     "disks": {

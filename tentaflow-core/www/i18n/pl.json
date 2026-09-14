@@ -6432,6 +6432,9 @@
       "used": "Zajęty",
       "pool_member": "W puli",
       "array_member": "W macierzy",
+      "array_data": "Dane",
+      "array_cache": "Cache",
+      "array_parity": "Parzystość",
       "mounted": "Zamontowany"
     },
     "disks": {

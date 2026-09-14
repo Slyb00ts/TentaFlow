@@ -6281,6 +6281,9 @@
       "used": "Utilisé",
       "pool_member": "Membre du pool",
       "array_member": "Membre de la matrice",
+      "array_data": "Données",
+      "array_cache": "Cache",
+      "array_parity": "Parité",
       "mounted": "Monté"
     },
     "disks": {

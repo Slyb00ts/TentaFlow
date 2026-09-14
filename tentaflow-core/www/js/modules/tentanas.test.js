@@ -38,7 +38,7 @@ function disk(overrides) {
     temperatureC: 34, powerOnHours: 100, reallocatedSectors: 0, pendingSectors: 0, crcErrors: 0, mediaErrors: null, wearPct: null,
     smartAvailable: true, smartPassed: true, smartReadAt: '2026-09-02 09:59:00',
     io: { readBps: 1048576, writeBps: 0, readIops: 10, writeIops: 0, awaitMs: 2.5, utilPct: 3 }, ioHistoryBps: [0, 1, 2], mountpoints: [],
-    vdevRole: '', vdevKind: '',
+    vdevRole: '', vdevKind: '', fsType: null, arrayRole: '',
     ...overrides,
   };
 }
@@ -422,6 +422,38 @@ test('the role chip names the pool first and then the vdev it serves (n03:210)',
   // The chip is built from the inventory alone: the five-second disk poll
   // must not pull the pool topology a second time.
   assert.equal(kinds('tentaNasPoolsListRequest').length, 0, 'no pool listing on the disks tab');
+  Screen.unmount();
+});
+
+test('an Elastic Array member is named by its array and the part it plays (n03:210)', async () => {
+  // An Elastic Array leaves nothing on its disks — the union is a mergerfs
+  // mount over one ordinary filesystem per branch — so without the array's own
+  // field every one of these rows read "Zajęty · xfs", 23 times on the node
+  // this was measured on. `arrayRole` must NOT travel as `vdevRole`: 'data'
+  // there means a ZFS top-level vdev and would be printed as a RAID layout.
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      disks: [
+        disk({ diskId: 'sdg', name: 'sdg', role: 'array_member', memberOf: 'produkt', arrayRole: 'data' }),
+        disk({ diskId: 'nvme1n1', name: 'nvme1n1', role: 'array_member', memberOf: 'produkt', arrayRole: 'cache' }),
+        disk({ diskId: 'sdh', name: 'sdh', role: 'array_member', memberOf: 'produkt', arrayRole: 'parity' }),
+        disk({ diskId: 'sdi', name: 'sdi', role: 'used', fsType: 'xfs' }),
+        disk({ diskId: 'sdk', name: 'sdk', role: 'array_member', memberOf: 'produkt', arrayRole: 'witness' }),
+      ],
+      telemetry: fixtures.tentaNasDisksListRequest.telemetry,
+    },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  const rows = root.querySelector('#nas-disk-table').rows;
+  assert.equal(rows[0].role.label, 'produkt \u00b7 Dane', 'the array and the part, not the filesystem');
+  assert.equal(rows[1].role.label, 'produkt \u00b7 Cache');
+  assert.equal(rows[2].role.label, 'produkt \u00b7 Parzysto\u015b\u0107');
+  assert.equal(rows[3].role.label, 'Zaj\u0119ty \u00b7 xfs', 'a filesystem nothing owns still names itself');
+  assert.equal(rows[4].role.label, 'produkt \u00b7 W macierzy', 'a part this build has no word for degrades to the membership, never a raw key');
+  // Same contract the vdev chip has: the chip is built from the inventory
+  // alone, so the five-second disk poll must not pull the array list too.
+  assert.equal(kinds('tentaNasElasticArraysListRequest').length, 0, 'no array listing on the disks tab');
   Screen.unmount();
 });
 

@@ -2955,6 +2955,14 @@ function roleTone(role) {
 // n03 role chip: pool first, then the concrete layout or group role
 // ("tank · RAIDZ2", "tank · Special"). The inventory carries the owning vdev
 // on the disk row, so the chip needs no pool topology of its own.
+// The parts of an Elastic Array this build can name, `NasDisk.arrayRole` →
+// locale key.
+const ARRAY_PART_KEYS = {
+  data: 'role.array_data',
+  cache: 'role.array_cache',
+  parity: 'role.array_parity',
+};
+
 function roleChipLabel(disk) {
   // "used" is the catch-all `role_of` falls back to: not system, not in a pool
   // or array, not mounted, but carrying a filesystem signature. On a real
@@ -2964,6 +2972,20 @@ function roleChipLabel(disk) {
   if (!disk.memberOf) {
     const base = T('role.' + disk.role);
     return disk.role === 'used' && disk.fsType ? `${base} · ${disk.fsType}` : base;
+  }
+  // An Elastic Array is not a pool: it is a union mount over per-disk
+  // filesystems, so it has no vdev and no RAID layout. `vdevRole`/`vdevKind`
+  // therefore may NOT carry its members — `vdevRole === 'data'` would send the
+  // label through `layoutLabel(vdevKind)` and print a RAID layout for a union
+  // branch. The array carries its own field, and the second half names the
+  // PART the disk plays, because that is what differs in what the admin does
+  // next: data, cache (unprotected bytes) or parity (no data at all).
+  if (disk.arrayRole) {
+    // Listed, not derived: a part this build has no word for must stay
+    // readable as the plain membership ("produkt · W macierzy"), and `T` of a
+    // missing key answers with the key itself, which is not a label.
+    const part = ARRAY_PART_KEYS[disk.arrayRole];
+    return `${disk.memberOf} · ${T(part || ('role.' + disk.role))}`;
   }
   if (!disk.vdevRole) return `${disk.memberOf} · ${T('role.' + disk.role)}`;
   return `${disk.memberOf} · ${disk.vdevRole === 'data' ? layoutLabel(disk.vdevKind) : T('pool.role_' + disk.vdevRole)}`;

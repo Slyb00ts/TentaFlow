@@ -6281,6 +6281,9 @@
       "used": "Belegt",
       "pool_member": "Pool-Mitglied",
       "array_member": "Array-Mitglied",
+      "array_data": "Daten",
+      "array_cache": "Cache",
+      "array_parity": "Parität",
       "mounted": "Eingehängt"
     },
     "disks": {

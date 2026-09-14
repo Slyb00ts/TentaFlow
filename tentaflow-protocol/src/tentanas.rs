@@ -232,6 +232,20 @@ pub struct NasDisk {
     /// pool name.
     #[serde(default)]
     pub fs_type: Option<String>,
+    /// Which part of the Elastic Array named by `member_of` this disk is:
+    /// 'data' | 'cache' | 'parity'. Empty when the disk belongs to no array.
+    ///
+    /// Deliberately NOT `vdev_role`/`vdev_kind`: those two describe a ZFS
+    /// top-level vdev and its redundancy, and the Disks tab renders
+    /// `vdev_kind` through the RAID layout names. An Elastic Array is a union
+    /// mount over ordinary per-disk filesystems — it has no vdev and no
+    /// layout — so borrowing that pair would print a RAID layout for a union
+    /// branch. `role`/`member_of` alone cannot carry it either: they say
+    /// "member of produkt" and every member would read the same, while the
+    /// admin's next move differs per part (a cache disk holds unprotected
+    /// bytes, a parity disk holds no data at all).
+    #[serde(default)]
+    pub array_role: String,
 }
 
 /// One SMART attribute (ATA) or NVMe log field, normalized.
@@ -2897,8 +2911,12 @@ mod tests {
         let fields = disk.as_object_mut().expect("object");
         fields.remove("vdev_role");
         fields.remove("vdev_kind");
+        // Same for the Elastic Array part: a node that predates `array_role`
+        // says nothing about arrays, which is the empty string, not a panic.
+        fields.remove("array_role");
         let disk: NasDisk = serde_json::from_value(disk).expect("decode");
         assert!(disk.vdev_role.is_empty() && disk.vdev_kind.is_empty());
+        assert!(disk.array_role.is_empty());
 
         // The §5.5a transport fields: a peer that predates them sends an NFS
         // share without `rdma` and a mount status without `transport`, and
@@ -3050,9 +3068,25 @@ mod tests {
             vdev_role: "data".to_string(),
             vdev_kind: "raidz2".to_string(),
             fs_type: Some("ext4".to_string()),
+            // A ZFS pool member is in no Elastic Array, so the field that says
+            // which part of one it is stays empty here — the branch below
+            // carries it.
+            array_role: String::new(),
+        };
+        // A second row whose state the first one cannot hold honestly: an
+        // Elastic Array branch has no vdev and no RAID layout, the union owns
+        // it, and the PART it plays there has to survive the wire on its own.
+        let branch = NasDisk {
+            disk_id: "sn-D1".to_string(),
+            name: "sdg".to_string(),
+            path: "/dev/sdg".to_string(),
+            role: "array_member".to_string(),
+            member_of: Some("produkt".to_string()),
+            array_role: "parity".to_string(),
+            ..NasDisk::default()
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::DisksListResponse {
-            disks: vec![disk],
+            disks: vec![disk, branch],
             telemetry: NasTelemetryState {
                 sampled_at: Some("2026-09-01T14:06:00Z".to_string()),
                 smart_read_at: None,
