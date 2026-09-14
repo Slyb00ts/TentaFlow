@@ -53,7 +53,7 @@ async function login(page) {
   const rotation = required('TENTANAS_LIVE_ROTATION');
   if (!['required', 'none'].includes(rotation)) throw new Error('Rotation musi być required albo none');
   const nextPassword = rotation === 'required' ? required('TENTANAS_LIVE_NEW_PASSWORD') : null;
-  if (nextPassword && ([...nextPassword].length < 12 || nextPassword === password)) {
+  if (nextPassword && ([...nextPassword].length < 8 || nextPassword === password)) {
     throw new Error('Nowe hasło musi spełniać wymagania formularza');
   }
   await page.goto('/');

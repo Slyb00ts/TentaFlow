@@ -3484,13 +3484,22 @@ mod tests {
             org_context: None,
         };
         assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
-        let change = |current: &str| MessageBody::AuthPasswordChangeRequest {
+        let change = |current: &str, new: &str| MessageBody::AuthPasswordChangeRequest {
             current_password: current.into(),
-            new_password: "replacement-password".into(),
+            new_password: new.into(),
         };
-        assert!(is_sensitive_variant(&change("initial-password")));
-        assert!(handlers::auth_password_change(&change("incorrect"), &ctx).is_err());
-        assert!(handlers::auth_password_change(&change("initial-password"), &ctx).is_ok());
+        assert!(is_sensitive_variant(&change(
+            "initial-password",
+            "repl-pw8"
+        )));
+        assert!(handlers::auth_password_change(&change("incorrect", "repl-pw8"), &ctx).is_err());
+        // Minimum length boundary: 7 characters are rejected, exactly 8 are accepted.
+        assert!(
+            handlers::auth_password_change(&change("initial-password", "repl-pw"), &ctx).is_err()
+        );
+        assert!(
+            handlers::auth_password_change(&change("initial-password", "repl-pw8"), &ctx).is_ok()
+        );
         let user = crate::db::repository::get_user_account_by_id(&ctx.state.db, &id)
             .unwrap()
             .unwrap();
@@ -3500,7 +3509,7 @@ mod tests {
             &user.password_hash
         ));
         assert!(crate::api::dashboard::auth::verify_password(
-            "replacement-password",
+            "repl-pw8",
             &user.password_hash
         ));
         assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());

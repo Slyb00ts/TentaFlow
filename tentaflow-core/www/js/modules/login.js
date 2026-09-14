@@ -74,7 +74,7 @@ const LoginScreen = {
       if (!username || !password) return;
 
       const newPassword = byId('login-new-password')?.value ?? '';
-      if (passwordRotation && (newPassword !== byId('login-confirm-password').value || [...newPassword].length < 12 || newPassword === password)) {
+      if (passwordRotation && (newPassword !== byId('login-confirm-password').value || [...newPassword].length < 8 || newPassword === password)) {
         errorEl.textContent = I18n.t('login.password_requirements');
         errorEl.style.display = 'block';
         return;

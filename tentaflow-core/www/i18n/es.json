@@ -1506,11 +1506,11 @@
   "login": {
     "back_to_login": "Volver al inicio de sesión",
     "current_password": "Contraseña actual",
-    "password_rotation": "Cambia tu contraseña inicial para continuar. La nueva contraseña debe tener al menos 12 caracteres.",
+    "password_rotation": "Cambia tu contraseña inicial para continuar. La nueva contraseña debe tener al menos 8 caracteres.",
     "new_password": "Nueva contraseña",
     "confirm_password": "Confirmar nueva contraseña",
     "change_password": "Cambiar contraseña",
-    "password_requirements": "Usa al menos 12 caracteres, una contraseña diferente y una confirmación idéntica.",
+    "password_requirements": "Usa al menos 8 caracteres, una contraseña diferente y una confirmación idéntica.",
     "title": "TentaFlow",
     "subtitle": "Panel del enrutador",
     "username": "Usuario",

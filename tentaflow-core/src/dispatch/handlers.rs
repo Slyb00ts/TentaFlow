@@ -358,11 +358,11 @@ pub fn auth_password_change(
             "current password is incorrect",
         ));
     }
-    if new_password.chars().count() < 12
+    if new_password.chars().count() < 8
         || new_password.len() > 1024
         || new_password == current_password
     {
-        return Err(ProtocolError::bad_request("new password must have at least 12 characters, at most 1024 bytes, and differ from the current password"));
+        return Err(ProtocolError::bad_request("new password must have at least 8 characters, at most 1024 bytes, and differ from the current password"));
     }
     let hash = crate::crypto::hash_password(new_password)
         .map_err(|e| ProtocolError::internal(e.to_string()))?;

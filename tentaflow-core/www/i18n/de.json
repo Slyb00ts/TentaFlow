@@ -1506,11 +1506,11 @@
   "login": {
     "back_to_login": "Zurück zur Anmeldung",
     "current_password": "Aktuelles Passwort",
-    "password_rotation": "Ändern Sie Ihr Anfangspasswort, um fortzufahren. Das neue Passwort muss mindestens 12 Zeichen enthalten.",
+    "password_rotation": "Ändern Sie Ihr Anfangspasswort, um fortzufahren. Das neue Passwort muss mindestens 8 Zeichen enthalten.",
     "new_password": "Neues Passwort",
     "confirm_password": "Neues Passwort bestätigen",
     "change_password": "Passwort ändern",
-    "password_requirements": "Verwenden Sie mindestens 12 Zeichen, ein anderes Passwort und eine passende Bestätigung.",
+    "password_requirements": "Verwenden Sie mindestens 8 Zeichen, ein anderes Passwort und eine passende Bestätigung.",
     "title": "TentaFlow",
     "subtitle": "Router-Dashboard",
     "username": "Benutzername",
