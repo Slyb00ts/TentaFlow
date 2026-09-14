@@ -1225,3 +1225,48 @@ test('tf-select: markup options still reach the select when nothing replaces the
   assert.equal(select.value, 'b');
   host.remove();
 });
+
+// The guarantee that vanished when the markup comparison replaced the opt-in
+// signature: a builder written the OLD way never asked for the live row, so it
+// closes over the row it was built from. Keeping its element would hand its
+// handlers data from a poll ago with no visible symptom. tf-table therefore
+// asks whether the builder requested the accessor at all.
+test('tf-table: a builder that never asked for the live row keeps being rebuilt', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  let built = 0;
+  // Two declared parameters — the shape every caller had before the accessor.
+  t.rowActions = (row, idx) => {
+    built += 1;
+    const b = document.createElement('button');
+    b.dataset.row = row.id;
+    b.dataset.idx = String(idx);
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+  assert.ok(first, 'the actions cell is filled');
+  assert.equal(built, 1, 'built once');
+
+  // A fresh row object carrying identical values: the markup comparison alone
+  // would keep the node here, which is exactly what must NOT happen.
+  t.rows = [{ a: '1', id: 'r1' }];
+  assert.equal(built, 2, 'the builder ran again');
+  assert.equal(bodyCells(t).at(-1).firstChild === first, false, 'and its element was replaced');
+});
+
+// The other half: the check must not cost a MIGRATED caller its guard, or the
+// whole refactor is undone without a single test noticing.
+test('tf-table: a builder that asked for the live row still keeps its element', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  let built = 0;
+  t.rowActions = (row, idx, currentRow) => {
+    built += 1;
+    const b = document.createElement('button');
+    b.dataset.row = (currentRow?.() ?? row).id;
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+  assert.equal(built, 1, 'built once');
+
+  t.rows = [{ a: '1', id: 'r1' }];
+  assert.equal(bodyCells(t).at(-1).firstChild === first, true, 'the node survives for a migrated builder');
+});
