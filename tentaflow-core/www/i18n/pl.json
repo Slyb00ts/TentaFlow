@@ -6366,6 +6366,7 @@
       "shares": "Share",
       "fleet_capacity": "Pojemność floty",
       "capacity_delta": "zajęte {used} ({pct}%) · {n} {n|pula|pule|pul}",
+      "capacity_unmeasured": "{n} bez pomiaru pojemności",
       "fleet_health": "Zdrowie floty",
       "fleet_health_ok": "wszystkie dyski OK",
       "fleet_health_on": "na węzłach: {nodes}",

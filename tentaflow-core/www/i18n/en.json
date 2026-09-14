@@ -6315,6 +6315,7 @@
       "shares": "Shares",
       "fleet_capacity": "Fleet capacity",
       "capacity_delta": "used {used} ({pct}%) · {n} {n|pool|pools}",
+      "capacity_unmeasured": "{n} with no capacity reading",
       "fleet_health": "Fleet health",
       "fleet_health_ok": "all disks OK",
       "fleet_health_on": "on nodes: {nodes}",

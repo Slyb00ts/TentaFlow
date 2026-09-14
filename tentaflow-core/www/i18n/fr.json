@@ -5894,6 +5894,7 @@
       "throughput": "Débit",
       "fleet_capacity": "Capacité de la flotte",
       "capacity_delta": "utilisé {used} ({pct}%) · {n} {n|pool|pools}",
+      "capacity_unmeasured": "{n} sans mesure de capacité",
       "fleet_health": "Santé de la flotte",
       "fleet_health_ok": "tous les disques OK",
       "fleet_health_on": "sur les nœuds : {nodes}",

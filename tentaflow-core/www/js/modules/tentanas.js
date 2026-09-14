@@ -19,7 +19,7 @@ import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, channelMode, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
+  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
   layoutLabel, stateChipHtml, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards } from '/js/modules/tentanas/dom-patch.js';
@@ -53,7 +53,7 @@ import '/js/components/tf-choice-card.js';
 import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
 import { openTargetDetail } from '/js/modules/tentanas/targets.js';
-import { drawElasticDetail } from '/js/modules/tentanas/elastic-detail.js';
+import { drawElasticDetail, elasticState, elasticProtection, elasticCapacity } from '/js/modules/tentanas/elastic-detail.js';
 import { jobCanCancel } from '/js/modules/tentanas/format.js';
 
 // -----------------------------------------------------------------------------
@@ -123,6 +123,34 @@ function mountDotsHtml(mounts, nodes) {
     const cls = state === 'mounted' || state === 'source' ? '' : state === 'pending' ? 'pending' : state === 'error' ? 'error' : 'na';
     return `<span class="md ${cls}" title="${escapeAttr(`${n.nodeName}: ${m ? (m.detail || m.state) : T('fleet.mount_na')}`)}"></span>`;
   }).join('')}</span>`;
+}
+
+// One Elastic Array as a `.pool-mini` row of the node dashboard (n02:297) —
+// the same shape a ZFS pool gets, so the dashboard shows every pool the Pools
+// tab lists instead of only the ZFS half. Two chips carry the two questions an
+// array raises: is it up, and is what it holds protected.
+//
+// The fill bar is rendered ONLY for a measured array: `pct` reads a missing
+// capacity as 0, and a bar drawn at 0% claims an empty array where the node
+// merely never measured one. The used/usable pair says "—" there instead.
+function arrayMiniHtml(a) {
+  const state = elasticState(a);
+  const protection = elasticProtection(a);
+  const fs = a.filesystem ? String(a.filesystem).toUpperCase() : T('elastic.unknown');
+  const topology = T('elastic.topology', { data: (a.dataDisks || []).length, parity: (a.parityDisks || []).length, fs });
+  const bar = elasticCapacity(a).measured
+    ? `<tf-progress-bar value="${pct(a.usedBytes, a.usableBytes)}" size="sm" tone="accent"></tf-progress-bar>`
+    : '';
+  return `
+      <div class="pool-mini" data-array="${escapeAttr(a.name)}">
+        <div class="pm-ico">${sprite('cylinder')}</div>
+        <div class="pm-main">
+          <div class="pm-name"><span class="mono">${escapeHtml(a.name)}</span> <tf-chip status="${escapeAttr(state.tone)}" dot label="${escapeAttr(state.label)}"></tf-chip> <tf-chip size="sm" status="${escapeAttr(protection.tone)}" label="${escapeAttr(protection.label)}"></tf-chip></div>
+          <div class="pm-sub">Elastic Array · ${escapeHtml(topology)}</div>
+          ${bar}
+        </div>
+        <div class="kv-inline"><span class="v">${escapeHtml(fmtOptionalBytes(a.usedBytes))} / ${escapeHtml(fmtOptionalBytes(a.usableBytes))}</span></div>
+      </div>`;
 }
 
 // -----------------------------------------------------------------------------
@@ -1170,14 +1198,21 @@ const TentaNasScreen = {
   },
 
   async refreshOverview(body) {
-    let disksRes, jobsRes, alertsRes, poolsRes, arcRes;
+    let disksRes, jobsRes, alertsRes, poolsRes, arcRes, arraysRes;
     try {
-      [disksRes, jobsRes, alertsRes, poolsRes, arcRes] = await Promise.all([
+      [disksRes, jobsRes, alertsRes, poolsRes, arcRes, arraysRes] = await Promise.all([
         this.nas('tentaNasDisksListRequest', {}),
         this.nas('tentaNasJobsListRequest', { limit: 20 }),
         this.nas('tentaNasAlertsListRequest', { includeAcked: false }),
         this.nas('tentaNasPoolsListRequest', {}),
         this.nas('tentaNasArcStatsRequest', {}).catch(() => ({ arc: null })),
+        // An Elastic Array is a pool on this screen: the Pools tab lists both,
+        // and a dashboard that showed only the ZFS half hid a whole pool, its
+        // capacity and its protection state from the screen the admin lands
+        // on. Degraded like ARC and for the same reason: a node without
+        // Elastic support, or one whose array probe fails, must lose the array
+        // rows and NOT the dashboard.
+        this.nas('tentaNasElasticArraysListRequest', {}).catch(() => ({ arrays: [] })),
       ]);
     } catch (e) {
       if (this.disposed || !body.isConnected) return;
@@ -1218,10 +1253,24 @@ const TentaNasScreen = {
     const running = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
     const alerts = alertsRes.alerts || [];
     const pools = poolsRes.pools || [];
+    // A malformed answer is not a reason to throw the dashboard away, but it is
+    // also not an array list: anything that is not a list counts as none.
+    const arrays = Array.isArray(arraysRes.arrays) ? arraysRes.arrays : [];
     this.overviewPools = pools;
+    this.overviewArrays = arrays;
     this.overviewFreeDisks = poolsRes.freeDisks || [];
-    const cap = pools.reduce((a, p) => a + (Number(p.usableBytes) || 0), 0) || disks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0);
-    const used = pools.reduce((a, p) => a + (Number(p.usedBytes) || 0), 0);
+    // An array reports `usableBytes` / `usedBytes` in the same unit a pool
+    // does, so the two belong in the same total — but only once the node has
+    // actually measured them. `elasticCapacity().measured` is the single test
+    // for that, and an unmeasured array contributes no bytes and is named
+    // separately in the delta line instead of being silently read as zero.
+    const measured = arrays.filter((a) => elasticCapacity(a).measured);
+    const unmeasured = arrays.length - measured.length;
+    const poolCap = pools.reduce((a, p) => a + (Number(p.usableBytes) || 0), 0)
+      + measured.reduce((a, x) => a + Number(x.usableBytes), 0);
+    const cap = poolCap || disks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0);
+    const used = pools.reduce((a, p) => a + (Number(p.usedBytes) || 0), 0)
+      + measured.reduce((a, x) => a + Number(x.usedBytes), 0);
     this.setJobsBadge(jobs);
 
     const kpi = body.querySelector('#nas-ov-kpi');
@@ -1232,7 +1281,10 @@ const TentaNasScreen = {
     const built = paintStatCards(kpi, [
       { key: 'pools', className: 'clickable', attrs: {
         label: T('kpi.capacity_total'), value: fmtBytes(cap), icon: 'database',
-        delta: T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools.length }),
+        delta: [
+          T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools.length + arrays.length }),
+          unmeasured ? T('kpi.capacity_unmeasured', { n: unmeasured }) : null,
+        ].filter(Boolean).join(' · '),
       } },
       { key: 'disks', className: 'clickable', attrs: {
         label: T('kpi.disk_health'), icon: 'cylinder',
@@ -1269,7 +1321,7 @@ const TentaNasScreen = {
     this.paintTelemetryAlert(body.querySelector('#nas-ov-telemetry'), disksRes.telemetry);
 
     this.paintArcCard(body, arcRes.arc);
-    this.paintPoolsMini(body, pools);
+    this.paintPoolsMini(body, pools, arrays);
 
     // tf-chip._update() empties its span and rebuilds it, so a raw setAttribute
     // with an unchanged value blinked this counter on every 5 s poll.
@@ -1327,10 +1379,13 @@ const TentaNasScreen = {
   },
 
   // n02 pool mini-list: name + state, the one-line topology and the fill bar.
-  paintPoolsMini(body, pools) {
+  // Both kinds of pool live here, ZFS first and then the Elastic Arrays, in
+  // ONE patched string: an unchanged poll compares equal and writes nothing,
+  // so every row on screen survives it as the same node.
+  paintPoolsMini(body, pools, arrays = []) {
     const host = body.querySelector('#nas-ov-pools');
     if (!host) return;
-    if (!pools.length) {
+    if (!pools.length && !arrays.length) {
       patchHtml(host, `<div class="muted">${escapeHtml(T('pools.empty_title'))}</div>`);
       return;
     }
@@ -1343,9 +1398,12 @@ const TentaNasScreen = {
           <tf-progress-bar value="${pct(p.usedBytes, p.usableBytes)}" size="sm" tone="accent"></tf-progress-bar>
         </div>
         <div class="kv-inline"><span class="v">${escapeHtml(fmtBytes(p.usedBytes))} / ${escapeHtml(fmtBytes(p.usableBytes))}</span></div>
-      </div>`).join('');
+      </div>`).join('') + arrays.map((a) => arrayMiniHtml(a)).join('');
     if (!patchHtml(host, html)) return;
     host.querySelectorAll('.pool-mini[data-pool]').forEach((el) => el.addEventListener('click', () => this.openPool(el.dataset.pool)));
+    // `data-array`, so the click lands on the ARRAY detail (n11) and not on a
+    // ZFS pool route that has no such pool to open.
+    host.querySelectorAll('.pool-mini[data-array]').forEach((el) => el.addEventListener('click', () => this.openArray(el.dataset.array)));
   },
 
   // What the disk-telemetry banner should say, or null when SMART is live and

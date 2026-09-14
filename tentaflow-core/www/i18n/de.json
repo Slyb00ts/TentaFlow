@@ -5894,6 +5894,7 @@
       "throughput": "Durchsatz",
       "fleet_capacity": "Flottenkapazität",
       "capacity_delta": "belegt {used} ({pct}%) · {n} {n|Pool|Pools}",
+      "capacity_unmeasured": "{n} ohne Kapazitätsmessung",
       "fleet_health": "Flottenzustand",
       "fleet_health_ok": "alle Festplatten OK",
       "fleet_health_on": "auf Knoten: {nodes}",

@@ -670,6 +670,132 @@ test('the overview pool mini-list opens a pool and the running jobs are listed n
   Screen.unmount();
 });
 
+// --- n02: the node dashboard must show EVERY pool, not only the ZFS half ----
+// The Pools tab lists ZFS pools and Elastic Arrays side by side, but the
+// dashboard fetched only the ZFS list: on the live node `#nas-ov-pools` held
+// one row while the tab held two, so a whole pool — its capacity and its
+// protection state — was missing from the screen the admin lands on.
+const TIB = 1024 ** 4;
+const elasticArray = (overrides) => ({
+  name: 'produkt', kind: 'elastic-array', filesystem: 'xfs', state: 'active', unionPath: '/mnt/produkt',
+  usableBytes: 10 * TIB, usedBytes: 6 * TIB,
+  dataDisks: [{ diskId: 'sdb', sizeBytes: 5 * TIB }, { diskId: 'sdc', sizeBytes: 5 * TIB }, { diskId: 'sdg', sizeBytes: 5 * TIB }],
+  parityDisks: [{ diskId: 'sdh', sizeBytes: 5 * TIB }],
+  protection: { status: 'window_open', protectedAsOf: '2026-09-02 09:00:00' },
+  ...overrides,
+});
+
+test('the overview mini-list carries the Elastic Array too, and its row opens the ARRAY detail (n02:297)', async () => {
+  stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: { arrays: [elasticArray()] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const mini = [...root.querySelectorAll('#nas-ov-pools .pool-mini')];
+  assert.equal(mini.length, 2, 'both pools the node has are on the dashboard');
+  assert.equal(mini[0].dataset.pool, 'tank');
+  assert.equal(mini[1].dataset.array, 'produkt');
+  // `data-pool` on this row would send the click down the ZFS route, which has
+  // no such pool to open — the row would look live and do nothing.
+  assert.equal(mini[1].hasAttribute('data-pool'), false, 'the array row is keyed data-array');
+  assert.match(mini[1].querySelector('.pm-name').textContent, /produkt/);
+  assert.deepEqual(
+    [...mini[1].querySelectorAll('tf-chip')].map((c) => c.getAttribute('label')),
+    ['Aktywna', 'Dane poza checkpointem'],
+    'state and protection: the two questions an array raises',
+  );
+  // The tone is half the message: n02:300 draws the protection chip as a
+  // WARNING, and an open checkpoint window rendered in the ok colour reads as
+  // "everything is fine" at a glance.
+  assert.deepEqual(
+    [...mini[1].querySelectorAll('tf-chip')].map((c) => c.getAttribute('status')),
+    ['ok', 'warn'],
+  );
+  assert.equal(mini[1].querySelector('.pm-sub').textContent.trim(), 'Elastic Array · mergerfs · 3 dane (XFS) + 1 parity');
+  assert.equal(mini[1].querySelector('tf-progress-bar').getAttribute('value'), '60');
+  assert.equal(mini[1].querySelector('.kv-inline .v').textContent, '6.0 TiB / 10 TiB');
+
+  click(mini[1]);
+  await flush();
+  assert.equal(Screen.tab, 'pools');
+  assert.equal(Screen.array, 'produkt', 'the row opens the array detail');
+  assert.equal(Screen.pool, null, 'and not a ZFS pool of the same name');
+  Screen.unmount();
+});
+
+test('the capacity KPI of the node dashboard counts the Elastic Array and its bytes', async () => {
+  stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: { arrays: [elasticArray()] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const tile = root.querySelector('#nas-ov-kpi [data-kpi="pools"]');
+  // ZFS alone: 2.9 TiB / "931 GiB (31%) · 1 pula". The array's 10 TiB usable
+  // and 6 TiB used are bytes in the same unit, so they belong in the same sum.
+  assert.equal(tile.getAttribute('value'), '13 TiB');
+  assert.equal(tile.getAttribute('delta'), 'zajęte 6.9 TiB (54%) · 2 pule');
+  Screen.unmount();
+});
+
+test('an Elastic Array with no capacity reading is named in the KPI, never summed as zero', async () => {
+  stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: { arrays: [elasticArray({ usableBytes: null, usedBytes: null })] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const row = root.querySelector('#nas-ov-pools .pool-mini[data-array="produkt"]');
+  assert.ok(row, 'an unmeasured array is still a pool the admin owns');
+  // `pct` reads a missing capacity as 0, and a bar at 0% claims an empty array
+  // where the node merely never measured one. "Nie zmierzono ≠ zero."
+  assert.equal(absent(row, 'tf-progress-bar'), true, 'no fill bar for an unmeasured array');
+  assert.equal(row.querySelector('.kv-inline .v').textContent, '— / —');
+  const tile = root.querySelector('#nas-ov-kpi [data-kpi="pools"]');
+  assert.equal(tile.getAttribute('value'), '2.9 TiB', 'the unmeasured array adds no bytes');
+  assert.equal(tile.getAttribute('delta'), 'zajęte 931 GiB (31%) · 2 pule · 1 bez pomiaru pojemności');
+  Screen.unmount();
+});
+
+test('an Elastic Array list that fails costs the dashboard its array rows and nothing else', async () => {
+  stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: () => { throw new Error('snapraid niedostępny'); } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  assert.equal(absent(root, '#nas-ov-error tf-alert'), true, 'one failing list is not a dashboard-wide failure');
+  assert.equal(root.querySelectorAll('#nas-ov-kpi tf-stat-card').length, 4, 'the KPI row survives');
+  assert.equal(root.querySelectorAll('#nas-ov-pools .pool-mini').length, 1, 'the ZFS pool still shows');
+  assert.ok(root.querySelector('#nas-ov-arc .donut'), 'and so does the rest of the dashboard');
+  Screen.unmount();
+});
+
+// The 5 s poll rule: `paintPoolsMini` writes ONE patched string for both kinds
+// of pool, so a poll that brings identical data compares equal and touches no
+// node at all. A per-row write, or a second host, would blink the array row —
+// and a click landing mid-rebuild would land on a detached element.
+test('a dashboard poll that brings the same Elastic Array mutates no node of the pool mini-list', async () => {
+  stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: { arrays: [elasticArray()] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const host = root.querySelector('#nas-ov-pools');
+  const rows = [...host.querySelectorAll('.pool-mini')];
+  assert.equal(rows.length, 2, 'both rows are on screen before the poll');
+  const bar = rows[1].querySelector('tf-progress-bar');
+  const chip = rows[1].querySelector('tf-chip');
+
+  // Collected IN THE CALLBACK: the awaits below drain happy-dom's queue, so a
+  // trailing takeRecords() alone would read an empty list and pass vacuously.
+  const records = [];
+  const obs = new window.MutationObserver((recs) => { records.push(...recs); });
+  obs.observe(host, { childList: true, subtree: true, attributes: true, characterData: true });
+  try {
+    await Screen.refreshOverview(root.querySelector('#nas-tab-body'));
+    await flush();
+    records.push(...obs.takeRecords());
+  } finally {
+    obs.disconnect();
+  }
+  assert.equal(records.length, 0, `an unchanged poll must touch no node of the mini-list, saw ${records.map((r) => `${r.type}@${r.target.nodeName}`).join(', ')}`);
+  const after = [...host.querySelectorAll('.pool-mini')];
+  assert.equal(after.length, 2, 'and the rows are still both there');
+  assert.equal(same(after[0], rows[0]), true, 'the ZFS row is the very same node');
+  assert.equal(same(after[1], rows[1]), true, 'and so is the array row');
+  assert.equal(same(after[1].querySelector('tf-progress-bar'), bar), true, 'its fill bar is not rebuilt');
+  assert.equal(same(after[1].querySelector('tf-chip'), chip), true, 'nor is its state chip');
+  Screen.unmount();
+});
+
 test('every overview alert row carries the drill-down of its subject (n02)', async () => {
   stubTransport({
     ...fixtures,

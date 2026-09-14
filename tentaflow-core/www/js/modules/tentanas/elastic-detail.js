@@ -34,11 +34,19 @@ export function elasticState(array) {
   return { label: labels[array.state] || labels.unknown, tone: array.state === 'active' ? 'ok' : ['error', 'needs_attention'].includes(array.state) ? 'err' : 'warn' };
 }
 
-function protectionLabel(array) {
-  if (!(array.parityDisks || []).length) return T('elastic.no_parity');
+// The protection sentence AND the tone that sentence deserves, so the card on
+// the Pools tab and the mini row on the node dashboard cannot disagree about
+// how alarming the same state is. `unknown` is a WARNING, not an ok: an
+// unmeasured protection window is not a confirmed one.
+export function elasticProtection(array) {
+  if (!(array.parityDisks || []).length) return { label: T('elastic.no_parity'), tone: 'warn' };
   const labels = { protected: T('elastic.protected'), window_open: T('elastic.window_open'), unprotected: T('elastic.unprotected'), unknown: T('elastic.unknown') };
-  return labels[array.protection?.status] || labels.unknown;
+  const tones = { protected: 'ok', window_open: 'warn', unprotected: 'err', unknown: 'warn' };
+  const status = array.protection?.status;
+  return { label: labels[status] || labels.unknown, tone: tones[status] || tones.unknown };
 }
+
+const protectionLabel = (array) => elasticProtection(array).label;
 
 export function elasticCapacity(array) {
   const parity = array.parityDisks || [];
