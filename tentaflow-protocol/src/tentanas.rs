@@ -260,6 +260,15 @@ pub struct NasDisk {
     /// one somebody has since reused".
     #[serde(default)]
     pub fs_uuid: Option<String>,
+    /// The filesystem LABEL lsblk reports for that same signature, when there
+    /// is one. Set together with `fs_type` and `fs_uuid` and never on its own:
+    /// a label read off one signature beside another signature's type would
+    /// name the wrong thing in the one place it is used — the wipe plan, which
+    /// has to tell the admin WHICH filesystem is about to be erased. For a
+    /// `zfs_member` or `linux_raid_member` disk the label is the pool or array
+    /// name and goes to `member_of` instead, so this stays empty there.
+    #[serde(default)]
+    pub fs_label: Option<String>,
     /// Which part of the Elastic Array named by `member_of` this disk is:
     /// 'data' | 'cache' | 'parity'. Empty when the disk belongs to no array.
     ///
@@ -409,6 +418,94 @@ pub struct NasReplacementAdvice {
     /// Whether the pool has a spare standing by, so the UI can say whether the
     /// replacement is a hot swap or needs a disk bought first.
     pub spare_available: bool,
+}
+
+/// One reason the node refuses to clear a disk, with a machine code beside
+/// the sentence so a caller can branch on the cause without parsing prose.
+///
+/// Every refusal here is a HARD stop with one exception, `journal_claim`,
+/// which the request may acknowledge (see `NasDiskWipePlan::journal_claim`).
+/// There is no force flag and no "wipe anyway": the reason a disk reads as
+/// occupied is the reason clearing it would destroy something.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasDiskWipeRefusal {
+    /// 'system' | 'zfs_pool' | 'mdraid' | 'elastic_member' | 'mounted' |
+    /// 'journal_serving' | 'journal_unknown'.
+    ///
+    /// Every code here is produced by `tentanas::disks::plan_wipe`; a code
+    /// documented and never produced is a promise to the frontend that
+    /// nothing keeps.
+    pub code: String,
+    /// The refusal as one sentence naming the cause AND the remedy, which is
+    /// the only form an admin can act on: "sda jest w puli ZFS tank — usuń
+    /// pulę albo odłącz od niej ten dysk" says what to do next, while "disk
+    /// busy" does not.
+    pub detail: String,
+}
+
+/// The Elastic Array journal that still claims a disk left over from a
+/// dissolved array.
+///
+/// A dissolve keeps the journal on purpose, so the array import can take the
+/// array back whole — which means `ElasticClaims` goes on reporting the
+/// members AND the name as reserved, and the disks stay unusable until the
+/// claim is released. Clearing such a disk therefore has a second victim the
+/// device name does not mention: the array's recoverability. That is why this
+/// is reported apart from the refusals and needs its own acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasDiskWipeJournalClaim {
+    pub array_id: String,
+    pub name: String,
+    /// 'data' | 'cache' | 'parity' — what the disk was to the array.
+    pub array_role: String,
+    /// Members the journal lists, so the dialog can say how much of the array
+    /// is being given up ("1 z 9 dysków").
+    pub member_count: u32,
+    /// The owner the journal records. Shown when it is not this instance's
+    /// own, because then the array belongs to another provisioning and
+    /// acknowledging its loss is not this admin's own array to lose.
+    pub owner_org_id: String,
+    pub owner_addon_id: String,
+}
+
+/// What clearing one disk would remove, and everything that stops it.
+///
+/// Read-only: asking for this plan never opens a device for writing, never
+/// runs `wipefs` without `--no-act`, and changes nothing on the node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasDiskWipePlan {
+    pub disk_id: String,
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub model: String,
+    pub serial: String,
+    /// The filesystem signature that would be removed, with its label and
+    /// UUID — the three facts that identify WHAT is being erased, as opposed
+    /// to which device node it currently answers on.
+    pub fs_type: Option<String>,
+    pub fs_label: Option<String>,
+    pub fs_uuid: Option<String>,
+    /// Mountpoints this node can see. ALWAYS incomplete by design: Elastic
+    /// Array branches are mounted inside the union process's own mount
+    /// namespace, so a disk carrying a mounted filesystem can legitimately
+    /// show none here. It is reported because it is useful when non-empty,
+    /// never as evidence that a disk is idle.
+    pub mountpoints: Vec<String>,
+    /// Hard stops. A non-empty list means the confirm button stays disabled;
+    /// there is no "clear anyway".
+    pub refusals: Vec<NasDiskWipeRefusal>,
+    /// Set when a dissolved array's kept journal claims this disk. The wipe
+    /// then needs `DiskWipeRequest::release_journal_array` to carry this
+    /// array's `name`, on top of the retyped device name, and it releases the
+    /// claim by dropping the journal — after which the array can no longer be
+    /// imported back.
+    pub journal_claim: Option<NasDiskWipeJournalClaim>,
+    /// Whether a wipe would be accepted. False whenever `refusals` is
+    /// non-empty. True with a `journal_claim` present still requires the
+    /// acknowledgement: the plan says the wipe MAY proceed, not that it needs
+    /// nothing more.
+    pub allowed: bool,
 }
 
 /// Whether the disk data of the answer is fresh. Mode B between armed
@@ -1772,6 +1869,60 @@ pub enum TentaNasPayload {
         method: String,
         active: bool,
         detail: String,
+    },
+    /// What clearing ONE disk would remove, and every reason the node would
+    /// refuse. Read-only: it opens nothing for writing and runs no eraser.
+    ///
+    /// It is a request of its own rather than a field of `DiskGetResponse`
+    /// because answering it consults the privileged channel — the Elastic
+    /// journals this node holds are `0700 root`, and a disk left over from a
+    /// dissolved array is claimed by one of them without anything in the
+    /// database saying so.
+    DiskWipePlanRequest {
+        disk_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    DiskWipePlanResponse {
+        plan: NasDiskWipePlan,
+    },
+    /// Clears one disk: every filesystem, RAID and partition-table signature
+    /// on it goes, and the disk reads as free afterwards. Answers with
+    /// `JobResponse`.
+    ///
+    /// `confirm_device` is the retype gate — the device name as the plan
+    /// reported it (`sda`, not `/dev/sda`), the way a pool destroy makes the
+    /// admin retype the pool name. It is checked again here because the
+    /// dialog is not a security boundary.
+    ///
+    /// THE DEVICE NAME IS NOT THE IDENTITY. `disk_id` is (WWN, else serial),
+    /// and the privileged side re-resolves the device from it and refuses if
+    /// the name, the WWN, the serial or the size has moved since the plan —
+    /// a kernel rename between two reboots is exactly how a wipe reaches the
+    /// disk nobody meant.
+    ///
+    /// There is deliberately NO force or override flag. The last gate is an
+    /// exclusive open of the block device, which the kernel refuses whenever
+    /// the device carries a filesystem mounted in ANY mount namespace, and
+    /// that refusal is final — Elastic Array branches are mounted inside the
+    /// union process's own namespace, so `lsblk` and `/proc/mounts` on the
+    /// host cannot see them and no user-space check can stand in for it.
+    DiskWipeRequest {
+        disk_id: String,
+        confirm_device: String,
+        /// The SECOND, separate acknowledgement: the `name` of the Elastic
+        /// Array whose kept journal claims this disk, when the plan reports
+        /// one. Empty means "not acknowledged", and a disk under a journal
+        /// claim is then refused — a retyped device name alone must never be
+        /// able to make a dissolved array unrecoverable, because the admin
+        /// typing it is thinking about the disk, not about the array.
+        ///
+        /// With it, the wipe drops that journal first, which releases the
+        /// claim on EVERY member of the array and on the array's name.
+        #[serde(default)]
+        release_journal_array: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
     },
 
     // ----- alerts -----
@@ -3220,6 +3371,7 @@ mod tests {
             vdev_kind: "raidz2".to_string(),
             fs_type: Some("ext4".to_string()),
             fs_uuid: Some("2a7f1c30-9e64-4b8d-a5f2-71c3e806d914".to_string()),
+            fs_label: Some("archiwum".to_string()),
             // A ZFS pool member is in no Elastic Array, so the field that says
             // which part of one it is stays empty here — the branch below
             // carries it.
@@ -3261,6 +3413,79 @@ mod tests {
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
         assert_eq!(back, body);
+    }
+
+    /// The wipe plan and its two requests survive the wire whole.
+    ///
+    /// The dialog arms its danger button from `allowed`, `refusals` and
+    /// `journalClaim`, so a field lost in encoding is a button armed over a
+    /// refusal. `releaseJournalArray` defaults to empty on the way in, which
+    /// is what makes "not acknowledged" the state a client cannot omit its
+    /// way past.
+    #[test]
+    fn the_disk_wipe_plan_and_its_requests_round_trip() {
+        let plan = NasDiskWipePlan {
+            disk_id: "wwn-0x5000c500a1b2c3d4".to_string(),
+            name: "sdc".to_string(),
+            path: "/dev/sdc".to_string(),
+            size_bytes: 8_001_563_222_016,
+            model: "ST8000NM000A".to_string(),
+            serial: "ZR9AB12K".to_string(),
+            fs_type: Some("xfs".to_string()),
+            fs_label: Some("d1".to_string()),
+            fs_uuid: Some("2a7f1c30-9e64-4b8d-a5f2-71c3e806d914".to_string()),
+            mountpoints: vec!["/mnt/stare".to_string()],
+            refusals: vec![NasDiskWipeRefusal {
+                code: "mounted".to_string(),
+                detail: "sdc: dysk ma zamontowany system plików (/mnt/stare)".to_string(),
+            }],
+            journal_claim: Some(NasDiskWipeJournalClaim {
+                array_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                name: "produkt".to_string(),
+                array_role: "data".to_string(),
+                member_count: 9,
+                owner_org_id: "org".to_string(),
+                owner_addon_id: "nas".to_string(),
+            }),
+            allowed: false,
+        };
+        let body = MessageBody::TentaNasBody(TentaNasPayload::DiskWipePlanResponse {
+            plan: plan.clone(),
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
+
+        // The acknowledgement is absent by default, and a frame that omits it
+        // decodes as "not acknowledged" rather than failing open.
+        let request: TentaNasPayload =
+            serde_json::from_str(r#"{"DiskWipeRequest":{"disk_id":"wwn-x","confirm_device":"sdc"}}"#)
+                .expect("a request without the acknowledgement is still a request");
+        assert_eq!(
+            request,
+            TentaNasPayload::DiskWipeRequest {
+                disk_id: "wwn-x".to_string(),
+                confirm_device: "sdc".to_string(),
+                release_journal_array: String::new(),
+                sudo_password: None,
+            }
+        );
+        // And the password never appears in a serialized plan request.
+        let plan_request = TentaNasPayload::DiskWipePlanRequest {
+            disk_id: "wwn-x".to_string(),
+            sudo_password: None,
+        };
+        let text = serde_json::to_string(&plan_request).expect("serialize");
+        assert!(!text.contains("sudo_password"), "{text}");
+        let named = TentaNasPayload::DiskWipeRequest {
+            disk_id: "wwn-x".to_string(),
+            confirm_device: "sdc".to_string(),
+            release_journal_array: "produkt".to_string(),
+            sudo_password: Some(SudoSecret("hunter2".to_string())),
+        };
+        let back: TentaNasPayload =
+            crate::cbor::decode(&crate::cbor::encode(&named).expect("encode")).expect("decode");
+        assert_eq!(back, named);
     }
 
     /// The N2.5 additions (§5.10): every optional field of the new requests

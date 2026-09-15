@@ -433,6 +433,39 @@ pub struct ElasticClaimsResult {
     pub disks: Vec<ElasticClaim>,
 }
 
+/// One signature `wipefs` reports on a device: what it is, where it sits, and
+/// the label and UUID that say WHICH filesystem it is rather than merely what
+/// kind. Reported before the erase and again after it, so the result can
+/// prove the medium came back blank instead of assuming it did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WipedSignature {
+    /// `wipefs`' `type`: 'xfs', 'ext4', 'gpt', 'zfs_member', 'linux_raid_member'…
+    pub kind: String,
+    /// Byte offset on the device, as `wipefs` prints it.
+    pub offset: String,
+    pub label: Option<String>,
+    pub uuid: Option<String>,
+}
+
+/// The outcome of clearing one disk. Only ever produced for a disk that came
+/// back blank: the erase is verified by re-reading the device, and signatures
+/// still there make the operation fail rather than qualify its result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DiskWipeResult {
+    pub device: String,
+    /// Signatures the device carried when the exclusive open succeeded — what
+    /// this operation removed.
+    pub removed: Vec<WipedSignature>,
+    /// The Elastic Array whose journal was dropped to release this disk's
+    /// claim, when the request acknowledged one. That array can no longer be
+    /// taken back by an import.
+    pub journal_released: Option<String>,
+    /// The privileged sequence as it ran, for the job log.
+    pub steps: Vec<String>,
+}
+
 /// One journal this node holds, as an import scan reads it.
 ///
 /// The journals live under `/var/lib/tentanas`, which is `0700 root`, so an
@@ -475,6 +508,17 @@ pub fn validate_elastic_uuid(value: &str) -> Result<(), CatalogError> {
 fn identity_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.trim() == value
         && !value.chars().any(char::is_control)
+}
+
+/// The same rule as an owner field or a disk identity inside a spec, for the
+/// disk identities that arrive OUTSIDE one — the WWN and serial a wipe
+/// carries so the privileged side can re-resolve the device it was told about.
+pub fn validate_identity_text(value: &str) -> Result<(), CatalogError> {
+    if identity_text(value) {
+        Ok(())
+    } else {
+        Err(invalid("nieprawidłowa tożsamość urządzenia"))
+    }
 }
 
 impl ElasticOwner {
@@ -2780,6 +2824,44 @@ pub(crate) mod execution {
             atomic_write(&target, &bytes, self.uid)
         }
 
+        /// Drops one journal, so this node stops claiming the array's disks
+        /// and its name.
+        ///
+        /// IRREVERSIBLE in the one way that matters: the journal is what an
+        /// array import reads, so an array whose journal is gone cannot be
+        /// taken back even though its disks still carry their filesystems,
+        /// their files, the parity file and the snapraid config. That is why
+        /// nothing calls this on its own — only a wipe that has been given an
+        /// explicit acknowledgement naming this very array, and only for a
+        /// journal that is not serving.
+        ///
+        /// It refuses a journal with an operation in flight for the same
+        /// reason `destroy` does: a half-finished mover or transfer is a state
+        /// a later Restore has to be able to read.
+        fn forget(&self, journal: &Journal) -> Result<(), String> {
+            let _array_lock = self.array_lock(&journal.spec.array_id)?;
+            if journal.private.as_ref().is_some_and(|private| private.anchor.is_some()) {
+                return Err("macierz nadal publikuje unię".into());
+            }
+            if journal.pending.is_some()
+                || journal
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.finished_at.is_none())
+            {
+                return Err("dziennik ma otwartą operację macierzy".into());
+            }
+            let target = self.path.join(format!("{}.json", journal.spec.array_id));
+            // Validated as ours before it is removed, exactly as a journal
+            // write validates its target: a foreign file, a symlink or a mode
+            // we did not write is not a journal and is never deleted.
+            private_file(&target, self.uid)?;
+            std::fs::remove_file(&target).map_err(|e| format!("usunięcie dziennika: {e}"))?;
+            File::open(&self.path)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| e.to_string())
+        }
+
         /// Rewrites ONE field of a persisted spec: the owner.
         ///
         /// It cannot go through `save`, and that is the point of it existing —
@@ -3111,38 +3193,52 @@ pub(crate) mod execution {
         Ok(result)
     }
 
-    fn identity_device<'a>(
-        disk: &ElasticDiskSpec,
+    /// The ONE device of this node that answers to a (WWN, serial, size)
+    /// identity. Shared by the Elastic branch resolver and the wipe, because
+    /// both exist to make "the device that used to be called this" impossible:
+    /// the whole point is that a kernel name is not an identity.
+    ///
+    /// A WWN or a serial the caller gave must MATCH, not merely not
+    /// contradict: a device that answers on the serial while reporting a
+    /// different WWN is a different disk wearing a familiar name.
+    fn device_by_identity<'a>(
         devices: &'a [Device],
+        wwn: Option<&String>,
+        serial: Option<&String>,
+        bytes: u64,
     ) -> Result<&'a Device, String> {
         let matches: Vec<_> = devices
             .iter()
             .filter(|d| {
-                disk.wwn.as_ref().is_some_and(|v| d.wwn.as_ref() == Some(v))
-                    || disk
-                        .serial
-                        .as_ref()
-                        .is_some_and(|v| d.serial.as_ref() == Some(v))
+                wwn.is_some_and(|v| d.wwn.as_ref() == Some(v))
+                    || serial.is_some_and(|v| d.serial.as_ref() == Some(v))
             })
             .collect();
         if matches.len() != 1 {
             return Err("urządzenie nieobecne lub tożsamość niejednoznaczna".into());
         }
         let d = matches[0];
-        if d.bytes != disk.bytes
-            || disk.wwn.as_ref().is_some_and(|v| d.wwn.as_ref() != Some(v))
-            || disk
-                .serial
-                .as_ref()
-                .is_some_and(|v| d.serial.as_ref() != Some(v))
+        if d.bytes != bytes
+            || wwn.is_some_and(|v| d.wwn.as_ref() != Some(v))
+            || serial.is_some_and(|v| d.serial.as_ref() != Some(v))
         {
             return Err("zmieniona tożsamość lub wielkość urządzenia".into());
         }
         Ok(d)
     }
 
-    fn resolve<'a>(disk: &ElasticDiskSpec, devices: &'a [Device]) -> Result<&'a Device, String> {
-        let d = identity_device(disk, devices)?;
+    fn identity_device<'a>(
+        disk: &ElasticDiskSpec,
+        devices: &'a [Device],
+    ) -> Result<&'a Device, String> {
+        device_by_identity(devices, disk.wwn.as_ref(), disk.serial.as_ref(), disk.bytes)
+    }
+
+    /// The inventory row still describes the device node it was read from: a
+    /// block device, and the same `maj:min`. Checked apart from the identity
+    /// match so the wipe can run it on a device it resolved by identity
+    /// WITHOUT inventing an `ElasticDiskSpec` to ask with.
+    fn confirm_device(d: &Device) -> Result<(), String> {
         let metadata = std::fs::metadata(&d.path).map_err(|e| e.to_string())?;
         let actual = format!(
             "{}:{}",
@@ -3152,6 +3248,12 @@ pub(crate) mod execution {
         if !metadata.file_type().is_block_device() || actual != d.major_minor {
             return Err("urządzenie zmieniło się podczas odczytu".into());
         }
+        Ok(())
+    }
+
+    fn resolve<'a>(disk: &ElasticDiskSpec, devices: &'a [Device]) -> Result<&'a Device, String> {
+        let d = identity_device(disk, devices)?;
+        confirm_device(d)?;
         Ok(d)
     }
 
@@ -3194,15 +3296,39 @@ pub(crate) mod execution {
         Ok(fields)
     }
 
-    fn parse_blank_wipefs(output: Output) -> Result<(), String> {
+    /// Every signature `wipefs --no-act --json` reports, in the order it
+    /// prints them. A document without the `signatures` array is not an empty
+    /// device, it is an answer this code does not understand, and it errors —
+    /// which is what keeps "wipefs said nothing" from reading as "the disk is
+    /// blank".
+    fn parse_wipefs_signatures(output: Output) -> Result<Vec<WipedSignature>, String> {
         if !output.stderr.is_empty() {
             return Err("diagnostyka odczytu wipefs".into());
         }
         let value: serde_json::Value = serde_json::from_str(&success(output)?)
             .map_err(|e| format!("nieczytelny wipefs: {e}"))?;
-        match value.get("signatures").and_then(|v| v.as_array()) {
-            Some(signatures) if signatures.is_empty() => Ok(()),
-            _ => Err("wipefs nie potwierdził pustego nośnika".into()),
+        let rows = value
+            .get("signatures")
+            .and_then(|v| v.as_array())
+            .ok_or("wipefs bez listy sygnatur")?;
+        let mut out = Vec::new();
+        for row in rows {
+            let text = |key: &str| row.get(key).and_then(|v| v.as_str()).map(str::to_string);
+            out.push(WipedSignature {
+                kind: text("type").ok_or("sygnatura wipefs bez typu")?,
+                offset: text("offset").unwrap_or_default(),
+                label: text("label"),
+                uuid: text("uuid"),
+            });
+        }
+        Ok(out)
+    }
+
+    fn parse_blank_wipefs(output: Output) -> Result<(), String> {
+        if parse_wipefs_signatures(output)?.is_empty() {
+            Ok(())
+        } else {
+            Err("wipefs nie potwierdził pustego nośnika".into())
         }
     }
 
@@ -8276,6 +8402,422 @@ pub(crate) mod execution {
         Ok(matches.remove(0))
     }
 
+    // =========================================================================
+    // Clearing a disk
+    // =========================================================================
+    //
+    // WHY THIS LIVES HERE, beside the Elastic executor rather than in a module
+    // of its own: the wipe has to consult the Elastic journals (a disk left
+    // over from a dissolved array is claimed by one, and releasing that claim
+    // means dropping the journal under its array lock), and it re-uses this
+    // module's device inventory, mount-table reader, tool resolution and
+    // `wipefs` parsing. `guarded_zfs` is here for the same reason: it is not a
+    // ZFS module, it is a ZFS command the Elastic journals have to approve.
+    //
+    // THE SAFETY MODEL, and it is the reason the operation exists at all.
+    // Three user-space guards once passed 17 live members of two Elastic
+    // Arrays as free disks: a serial denylist built from the application
+    // database (which did not know those arrays), an `lsblk -o MOUNTPOINTS`
+    // check, and a filesystem-type check (a plain `xfs` signature reads as
+    // "nothing of ours"). Only the kernel refused.
+    //
+    // `lsblk` is BLIND here by design: Elastic Array branches are mounted
+    // inside the union process's own mount namespace (see
+    // `elastic_namespace`), and only the union is published to the host. From
+    // a host shell `/proc/mounts` showed no xfs at all while nine branches
+    // were mounted.
+    //
+    // So the authoritative gate is an exclusive open of the block device,
+    // which the kernel refuses with EBUSY whenever the device — or ANY of its
+    // partitions — carries a filesystem mounted in ANY namespace, or is
+    // claimed by a device-mapper or md holder. `open_exclusive` is the LAST
+    // thing that happens before anything is written, and its refusal is the
+    // answer: there is no force flag and nothing retries past it. Every other
+    // check below exists only to produce a legible reason BEFORE that point.
+
+    /// What the wipe decides over, gathered before anything is written.
+    ///
+    /// `exclusive` is the outcome of the exclusive open, already classified.
+    /// It is a FIELD rather than a call inside `wipe_verdict` so the decision
+    /// stays pure and every refusal — the kernel's EBUSY included, which no
+    /// unit test can provoke without a real mounted device — can be exercised
+    /// directly.
+    pub(crate) struct WipeFacts {
+        pub(crate) device: String,
+        /// Holder names from `/sys/class/block/<kernel>/holders`: an assembled
+        /// md array, a device-mapper table, a mounted LUKS.
+        pub(crate) holders: Vec<String>,
+        /// Mounts this node's OWN namespace shows for the disk or any of its
+        /// partitions. Never trusted when empty — see the note above.
+        pub(crate) host_mounts: Vec<String>,
+        pub(crate) swap: bool,
+        /// Everything `wipefs --no-act` found, i.e. what the erase would take.
+        pub(crate) signatures: Vec<WipedSignature>,
+        pub(crate) claim: Option<WipeClaim>,
+        /// The array name the request acknowledged losing, when it did.
+        pub(crate) acknowledged: Option<String>,
+        pub(crate) exclusive: Result<(), String>,
+    }
+
+    /// The Elastic journal that still claims this disk.
+    pub(crate) struct WipeClaim {
+        pub(crate) array_id: String,
+        pub(crate) name: String,
+        /// Whether the array is serving right now: the union is published, or
+        /// the journal still holds a namespace anchor. `None` means the mount
+        /// table could not be read — unknown, never "not serving".
+        pub(crate) serving: Option<bool>,
+    }
+
+    pub(crate) enum WipeVerdict {
+        /// Erase, and drop the journal of this array_id first when set.
+        Erase { release: Option<String> },
+        Refuse(String),
+    }
+
+    /// The whole decision, as one pure function over gathered facts.
+    ///
+    /// The order IS the guard order, and the exclusive open is last: no
+    /// combination of the other facts can reach `Erase` while `exclusive` is
+    /// an error, which is the invariant the tests pin.
+    pub(crate) fn wipe_verdict(facts: &WipeFacts) -> WipeVerdict {
+        use WipeVerdict::*;
+        if !facts.holders.is_empty() {
+            return Refuse(format!(
+                "{}: urządzenie ma aktywnych właścicieli ({}) — rozłóż tablicę md albo \
+                 device-mapper, która je trzyma, i powtórz",
+                facts.device,
+                facts.holders.join(", ")
+            ));
+        }
+        if !facts.host_mounts.is_empty() {
+            return Refuse(format!(
+                "{}: urządzenie jest zamontowane ({}) — odmontuj je i powtórz",
+                facts.device,
+                facts.host_mounts.join(", ")
+            ));
+        }
+        if facts.swap {
+            return Refuse(format!(
+                "{}: urządzenie jest swapem — wyłącz swap (swapoff) i powtórz",
+                facts.device
+            ));
+        }
+        for signature in &facts.signatures {
+            if signature.kind == "zfs_member" {
+                return Refuse(format!(
+                    "{}: urządzenie nosi sygnaturę członka puli ZFS{} — usuń albo wyeksportuj \
+                     pulę i powtórz",
+                    facts.device,
+                    signature
+                        .label
+                        .as_deref()
+                        .map(|label| format!(" {label}"))
+                        .unwrap_or_default()
+                ));
+            }
+            if signature.kind == "linux_raid_member" {
+                return Refuse(format!(
+                    "{}: urządzenie nosi sygnaturę członka macierzy mdraid{} — rozłóż macierz \
+                     (mdadm --stop) i powtórz",
+                    facts.device,
+                    signature
+                        .label
+                        .as_deref()
+                        .map(|label| format!(" {label}"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+        let release = match &facts.claim {
+            None => None,
+            Some(claim) if claim.serving != Some(false) => {
+                return Refuse(format!(
+                    "{}: dysk należy do macierzy Elastic {}, która {} — rozwiąż macierz i \
+                     powtórz",
+                    facts.device,
+                    claim.name,
+                    if claim.serving == Some(true) {
+                        "nadal udostępnia unię"
+                    } else {
+                        "ma nieodczytany stan montowań"
+                    }
+                ));
+            }
+            Some(claim) if facts.acknowledged.as_deref() != Some(claim.name.as_str()) => {
+                return Refuse(format!(
+                    "{}: dziennik rozwiązanej macierzy Elastic {} nadal rezerwuje ten dysk — \
+                     potwierdź utratę tej macierzy albo przywróć ją importem macierzy",
+                    facts.device, claim.name
+                ));
+            }
+            Some(claim) => Some(claim.array_id.clone()),
+        };
+        // LAST. Nothing below it, and nothing above it may reach the erase.
+        if let Err(reason) = &facts.exclusive {
+            return Refuse(reason.clone());
+        }
+        Erase { release }
+    }
+
+    /// The exclusive open's outcome, as a sentence naming cause and remedy.
+    ///
+    /// Pure over the errno so the kernel's veto is testable: EBUSY is the one
+    /// branch that matters and the one a unit test cannot provoke without a
+    /// real mounted block device.
+    pub(crate) fn exclusive_open_refusal(device: &str, errno: Option<i32>) -> Result<(), String> {
+        let reason = match errno {
+            None => return Ok(()),
+            // THE VETO. The kernel holds this against a filesystem mounted in
+            // ANY mount namespace, which is the only way an Elastic Array
+            // branch is ever seen from outside the union process.
+            Some(libc::EBUSY) => "urządzenie jest zajęte — jądro odmówiło wyłącznego otwarcia, \
+                 więc nosi zamontowany system plików (także w prywatnej przestrzeni montowań \
+                 macierzy Elastic) albo aktywnego właściciela; odmontuj go i powtórz"
+                .to_string(),
+            Some(libc::EROFS) | Some(libc::EACCES) | Some(libc::EPERM) => {
+                "urządzenie nie daje się otworzyć do zapisu — sprawdź, czy nie jest tylko do \
+                 odczytu (blockdev --setrw) i czy kanał uprawnień działa"
+                    .to_string()
+            }
+            Some(libc::ENOENT) | Some(libc::ENXIO) | Some(libc::ENODEV) => {
+                "urządzenia nie ma — odśwież listę dysków i powtórz".to_string()
+            }
+            Some(other) => format!(
+                "wyłączne otwarcie urządzenia nie udało się: {}",
+                std::io::Error::from_raw_os_error(other)
+            ),
+        };
+        Err(format!("{device}: {reason}"))
+    }
+
+    /// Opens the block device the way the erase needs it — for writing, and
+    /// EXCLUSIVELY. `O_EXCL` on a block device is not the file-creation flag:
+    /// the kernel takes it as a claim on the whole device and refuses it while
+    /// anything else holds the device or any of its partitions, mounts
+    /// included, in any namespace.
+    ///
+    /// `O_NOFOLLOW` because the path came from an inventory and a symlink
+    /// there would be a redirect to a device nobody picked; the caller has
+    /// already checked that it is the block device it resolved.
+    fn open_exclusive(device: &str) -> Result<File, String> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY)
+            .open(device)
+            .map_err(|e| {
+                exclusive_open_refusal(device, Some(e.raw_os_error().unwrap_or(libc::EIO)))
+                    .expect_err("an open error always classifies as a refusal")
+            })
+    }
+
+    /// `maj:min` of the disk and of every partition on it, from sysfs. The
+    /// mount and swap checks need the partitions too: the system disk is
+    /// almost never mounted itself — its partitions are.
+    fn device_numbers(device: &Device) -> Result<Vec<String>, String> {
+        let mut out = vec![device.major_minor.clone()];
+        let base = PathBuf::from(format!("/sys/class/block/{}", device.kernel));
+        for entry in std::fs::read_dir(&base).map_err(|e| format!("{}: {e}", base.display()))? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if !path.join("partition").is_file() {
+                continue;
+            }
+            let dev = std::fs::read_to_string(path.join("dev")).map_err(|e| e.to_string())?;
+            out.push(dev.trim().to_string());
+        }
+        Ok(out)
+    }
+
+    fn device_holders(device: &Device) -> Result<Vec<String>, String> {
+        let path = format!("/sys/class/block/{}/holders", device.kernel);
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&path).map_err(|e| format!("{path}: {e}"))? {
+            out.push(
+                entry
+                    .map_err(|e| e.to_string())?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn swap_holds(numbers: &[String]) -> Result<bool, String> {
+        let text = std::fs::read_to_string("/proc/swaps").map_err(|e| e.to_string())?;
+        for line in text.lines().skip(1) {
+            let source = line.split_whitespace().next().ok_or("nieczytelny swap")?;
+            let Ok(metadata) = std::fs::metadata(source) else {
+                // A swap FILE, not a device: it has no bearing on this disk's
+                // exclusivity and must not fail the read of the ones that do.
+                continue;
+            };
+            if metadata.file_type().is_block_device()
+                && numbers.contains(&format!(
+                    "{}:{}",
+                    libc::major(metadata.rdev()),
+                    libc::minor(metadata.rdev())
+                ))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn wipefs_probe(path: &str) -> Result<Vec<WipedSignature>, String> {
+        parse_wipefs_signatures(run(
+            &tool(&["/usr/sbin/wipefs", "/sbin/wipefs", "/usr/bin/wipefs"])?,
+            &["--no-act".into(), "--json".into(), path.to_string()],
+            None,
+            &[],
+        )?)
+    }
+
+    /// Clears one disk. Root-side, behind the same catalog validation as every
+    /// other entry.
+    ///
+    /// `wipefs --all` is run WITHOUT `--force`, deliberately and permanently:
+    /// `--force` is precisely what makes util-linux skip its own exclusive
+    /// open, and that open is the second half of the gate this operation is
+    /// built around. A refusal from it is honoured, never worked around.
+    pub(crate) fn guarded_wipe(command: &crate::HelperCommand) -> Result<String, String> {
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("czyszczenie dysku wymaga root".into());
+        }
+        let crate::HelperCommand::DiskWipe { device, wwn, serial, bytes, release_journal } = command
+        else {
+            return Err("nie jest poleceniem czyszczenia dysku".into());
+        };
+        command.plan().map_err(|e| e.to_string())?;
+        let root = Root::open(Path::new(ROOT), 0)?;
+        let devices = inventory()?;
+        let resolved = device_by_identity(&devices, wwn.as_ref(), serial.as_ref(), *bytes)?;
+        // The name the caller asked for must still BE this disk. It is checked
+        // rather than silently corrected: an admin who confirmed "sdc" and a
+        // node that would then clear "sdf" is the accident this whole
+        // operation is shaped around.
+        if resolved.path != *device {
+            return Err(format!(
+                "{device}: tożsamość wskazuje teraz na {} — odśwież listę dysków i powtórz",
+                resolved.path
+            ));
+        }
+        confirm_device(resolved)?;
+        let numbers = device_numbers(resolved)?;
+        let journals = root.journals()?;
+        let rows = mount_rows().ok();
+        let claiming = journals.iter().find(|journal| {
+            journal
+                .spec
+                .data
+                .iter()
+                .chain(journal.spec.cache.iter())
+                .chain(&journal.spec.parity)
+                .any(|disk| {
+                    wwn.is_some() && disk.wwn == *wwn || serial.is_some() && disk.serial == *serial
+                })
+        });
+        let facts = WipeFacts {
+            device: device.clone(),
+            holders: device_holders(resolved)?,
+            host_mounts: rows
+                .as_ref()
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|row| numbers.contains(&row.major_minor))
+                        .map(|row| row.path.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            swap: swap_holds(&numbers)?,
+            signatures: wipefs_probe(&resolved.path)?,
+            claim: claiming.map(|journal| WipeClaim {
+                array_id: journal.spec.array_id.clone(),
+                name: journal.spec.name.clone(),
+                serving: if journal
+                    .private
+                    .as_ref()
+                    .is_some_and(|private| private.anchor.is_some())
+                {
+                    Some(true)
+                } else {
+                    rows.as_ref().map(|rows| {
+                        rows.iter().any(|row| {
+                            row.path == union_path(&journal.spec.name)
+                                && row.filesystem == "fuse.mergerfs"
+                        })
+                    })
+                },
+            }),
+            acknowledged: None,
+            exclusive: Ok(()),
+        };
+        let acknowledged = release_journal.as_ref().and_then(|array_id| {
+            claiming
+                .filter(|journal| &journal.spec.array_id == array_id)
+                .map(|journal| journal.spec.name.clone())
+        });
+        // An acknowledgement that names an array_id no journal claiming THIS
+        // device carries is refused outright rather than ignored: it means the
+        // caller and this node disagree about what the disk belongs to, and
+        // the disagreement is exactly what must not be resolved by acting.
+        if release_journal.is_some() && acknowledged.is_none() {
+            return Err(format!(
+                "{device}: potwierdzenie dotyczy innej macierzy niż ta, która rezerwuje ten \
+                 dysk — odczytaj plan ponownie"
+            ));
+        }
+        let mut facts = WipeFacts { acknowledged, ..facts };
+        // THE GATE. Held open across the journal drop and released only for
+        // `wipefs`, whose own exclusive open re-takes it; between the two
+        // there is no window in which a mount could be established and go
+        // unnoticed, because the second open would then fail the same way.
+        let gate = open_exclusive(&resolved.path);
+        facts.exclusive = gate.as_ref().map(|_| ()).map_err(Clone::clone);
+        let release = match wipe_verdict(&facts) {
+            WipeVerdict::Refuse(reason) => return Err(reason),
+            WipeVerdict::Erase { release } => release,
+        };
+        let gate = gate?;
+        // The steps are the privileged operations AS THEY RAN, in order, for
+        // the job log. They are commands, not prose: the sentence explaining
+        // what the admin lost belongs to the core, which owns the UI language.
+        let mut steps = vec![format!("open(O_RDWR|O_EXCL) {}", resolved.path)];
+        let mut journal_released = None;
+        if let Some(array_id) = &release {
+            let journal = root.load(array_id)?;
+            root.forget(&journal)?;
+            steps.push(format!("rm {ROOT}/{array_id}.json"));
+            journal_released = Some(journal.spec.name);
+        }
+        drop(gate);
+        let wipefs = tool(&["/usr/sbin/wipefs", "/sbin/wipefs", "/usr/bin/wipefs"])?;
+        steps.push(format!("wipefs --all {}", resolved.path));
+        success(run(&wipefs, &["--all".into(), resolved.path.clone()], None, &[])?)?;
+        // The erase is VERIFIED, not assumed: the same read-only probe that
+        // produced the signature list runs again, and anything still there
+        // fails the operation.
+        steps.push(format!("wipefs --no-act --json {}", resolved.path));
+        let remaining = wipefs_probe(&resolved.path)?;
+        if !remaining.is_empty() {
+            return Err(format!(
+                "{}: po czyszczeniu urządzenie nadal zgłasza sygnatury ({}) — powtórz operację",
+                resolved.path,
+                remaining.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        serde_json::to_string(&DiskWipeResult {
+            device: resolved.path.clone(),
+            removed: facts.signatures,
+            journal_released,
+            steps,
+        })
+        .map_err(|e| e.to_string())
+    }
+
     pub(crate) fn guarded_zfs(
         command: &crate::HelperCommand,
         payload: &[u8],
@@ -8645,6 +9187,356 @@ pub(crate) mod execution {
             )
             .expect("historyczny journal");
             root.load(&spec().array_id).expect("odczyt schema 1")
+        }
+
+        // ----- clearing a disk -------------------------------------------------
+
+        fn wipe_facts() -> WipeFacts {
+            WipeFacts {
+                device: "/dev/sdc".into(),
+                holders: Vec::new(),
+                host_mounts: Vec::new(),
+                swap: false,
+                signatures: vec![WipedSignature {
+                    kind: "xfs".into(),
+                    offset: "0x0".into(),
+                    label: Some("d3".into()),
+                    uuid: Some("33333333-3333-4333-8333-333333333333".into()),
+                }],
+                claim: None,
+                acknowledged: None,
+                exclusive: Ok(()),
+            }
+        }
+
+        fn refusal(facts: &WipeFacts) -> String {
+            match wipe_verdict(facts) {
+                WipeVerdict::Refuse(reason) => reason,
+                WipeVerdict::Erase { .. } => panic!("czyszczenie miało zostać odrzucone"),
+            }
+        }
+
+        /// A plain `xfs` signature is what a dissolved Elastic Array leaves
+        /// behind, and it is the ONE shape the wipe exists for. Nothing in the
+        /// facts refuses it, so it has to reach the erase — otherwise the
+        /// guards below would all be "passing" by refusing everything.
+        #[test]
+        fn a_disk_with_only_a_filesystem_signature_is_cleared() {
+            match wipe_verdict(&wipe_facts()) {
+                WipeVerdict::Erase { release } => assert!(release.is_none(), "brak dziennika"),
+                WipeVerdict::Refuse(reason) => panic!("nieoczekiwana odmowa: {reason}"),
+            }
+        }
+
+        /// Each refusal fires for its OWN cause and names it, and each names a
+        /// remedy: a sentence an admin cannot act on is the failure mode the
+        /// whole plan exists to prevent.
+        #[test]
+        fn every_wipe_refusal_fires_for_its_own_cause_and_names_a_remedy() {
+            let holders = WipeFacts { holders: vec!["md0".into()], ..wipe_facts() };
+            let reason = refusal(&holders);
+            assert!(reason.contains("właścicieli") && reason.contains("md0"), "{reason}");
+            assert!(reason.contains("powtórz"), "brak zaradzenia: {reason}");
+
+            let mounted = WipeFacts { host_mounts: vec!["/mnt/stare".into()], ..wipe_facts() };
+            let reason = refusal(&mounted);
+            assert!(reason.contains("zamontowane") && reason.contains("/mnt/stare"), "{reason}");
+            assert!(reason.contains("Odmontuj") || reason.contains("odmontuj"), "{reason}");
+
+            let swap = WipeFacts { swap: true, ..wipe_facts() };
+            let reason = refusal(&swap);
+            assert!(reason.contains("swap") && reason.contains("swapoff"), "{reason}");
+
+            let zfs = WipeFacts {
+                signatures: vec![WipedSignature {
+                    kind: "zfs_member".into(),
+                    offset: "0x0".into(),
+                    label: Some("tank".into()),
+                    uuid: None,
+                }],
+                ..wipe_facts()
+            };
+            let reason = refusal(&zfs);
+            assert!(reason.contains("puli ZFS") && reason.contains("tank"), "{reason}");
+            assert!(reason.contains("wyeksportuj"), "{reason}");
+
+            let md = WipeFacts {
+                signatures: vec![WipedSignature {
+                    kind: "linux_raid_member".into(),
+                    offset: "0x1000".into(),
+                    label: Some("nas:0".into()),
+                    uuid: None,
+                }],
+                ..wipe_facts()
+            };
+            let reason = refusal(&md);
+            assert!(reason.contains("mdraid") && reason.contains("nas:0"), "{reason}");
+            assert!(reason.contains("mdadm --stop"), "{reason}");
+
+            // A signature list is scanned WHOLE: a partition table in front of
+            // a ZFS label must not let the label through.
+            let behind = WipeFacts {
+                signatures: vec![
+                    WipedSignature { kind: "gpt".into(), offset: "0x200".into(), label: None, uuid: None },
+                    WipedSignature { kind: "zfs_member".into(), offset: "0x40000".into(), label: None, uuid: None },
+                ],
+                ..wipe_facts()
+            };
+            assert!(refusal(&behind).contains("puli ZFS"), "sygnatura za tablicą partycji");
+        }
+
+        /// The journal case, in all four of its states. The acknowledgement is
+        /// a SEPARATE fact from the device name the admin retyped, and it
+        /// cannot release an array that is still serving.
+        #[test]
+        fn a_journal_claim_needs_its_own_acknowledgement_and_a_dissolved_array() {
+            let claim = || WipeClaim {
+                array_id: spec().array_id.clone(),
+                name: "media".into(),
+                serving: Some(false),
+            };
+
+            let serving = WipeFacts {
+                claim: Some(WipeClaim { serving: Some(true), ..claim() }),
+                acknowledged: Some("media".into()),
+                ..wipe_facts()
+            };
+            let reason = refusal(&serving);
+            assert!(reason.contains("nadal udostępnia unię"), "{reason}");
+            assert!(reason.contains("media"), "odmowa nazywa macierz: {reason}");
+
+            // The mount table could not be read. Unknown is NOT free: this is
+            // the exact shape of the incident this operation was written after.
+            let unknown = WipeFacts {
+                claim: Some(WipeClaim { serving: None, ..claim() }),
+                acknowledged: Some("media".into()),
+                ..wipe_facts()
+            };
+            assert!(refusal(&unknown).contains("nieodczytany stan montowań"));
+
+            let unacknowledged = WipeFacts { claim: Some(claim()), ..wipe_facts() };
+            let reason = refusal(&unacknowledged);
+            assert!(reason.contains("rozwiązanej macierzy Elastic media"), "{reason}");
+            assert!(reason.contains("importem macierzy"), "odmowa oferuje odzysk: {reason}");
+
+            // An acknowledgement for a DIFFERENT array does not release this one.
+            let wrong = WipeFacts {
+                claim: Some(claim()),
+                acknowledged: Some("foto".into()),
+                ..wipe_facts()
+            };
+            assert!(refusal(&wrong).contains("rozwiązanej macierzy Elastic media"));
+
+            let ready = WipeFacts {
+                claim: Some(claim()),
+                acknowledged: Some("media".into()),
+                ..wipe_facts()
+            };
+            match wipe_verdict(&ready) {
+                WipeVerdict::Erase { release } => {
+                    assert_eq!(release.as_deref(), Some(spec().array_id.as_str()))
+                }
+                WipeVerdict::Refuse(reason) => panic!("potwierdzone czyszczenie: {reason}"),
+            }
+        }
+
+        /// THE GATE. The exclusive open is the LAST decision, and no
+        /// combination of otherwise-clean facts can reach the erase past it.
+        ///
+        /// The kernel's EBUSY cannot be provoked in a unit test without a real
+        /// mounted block device, so the gate is a pure decision over the
+        /// injected open result: `exclusive_open_refusal` classifies the errno
+        /// (tested below) and `wipe_verdict` honours the verdict. The real
+        /// path has no other route to the erase — `guarded_wipe` assigns
+        /// `facts.exclusive` from `open_exclusive` and calls `wipe_verdict`
+        /// immediately after.
+        #[test]
+        fn the_exclusive_open_is_the_last_gate_and_its_refusal_is_final() {
+            let busy = exclusive_open_refusal("/dev/sdc", Some(libc::EBUSY))
+                .expect_err("EBUSY jest odmową");
+            let facts = WipeFacts { exclusive: Err(busy.clone()), ..wipe_facts() };
+            assert_eq!(refusal(&facts), busy, "odmowa jądra jest odpowiedzią, nie ostrzeżeniem");
+
+            // Every other fact clean, an acknowledged journal released — still
+            // refused, and refused with the KERNEL's reason rather than any
+            // earlier one.
+            let acknowledged = WipeFacts {
+                claim: Some(WipeClaim {
+                    array_id: spec().array_id.clone(),
+                    name: "media".into(),
+                    serving: Some(false),
+                }),
+                acknowledged: Some("media".into()),
+                exclusive: Err(busy.clone()),
+                ..wipe_facts()
+            };
+            assert_eq!(refusal(&acknowledged), busy, "potwierdzenie nie omija jądra");
+
+            // And an EARLIER cause still wins, so the gate is last and not
+            // merely present: the admin gets the legible reason when there is
+            // one.
+            let also_mounted = WipeFacts {
+                host_mounts: vec!["/srv".into()], ..acknowledged
+            };
+            assert!(refusal(&also_mounted).contains("/srv"), "czytelna przyczyna ma pierwszeństwo");
+        }
+
+        #[test]
+        fn the_exclusive_open_errnos_each_name_their_own_cause() {
+            assert!(exclusive_open_refusal("/dev/sdc", None).is_ok(), "udane otwarcie przechodzi");
+            for (errno, needle) in [
+                (libc::EBUSY, "zajęte"),
+                (libc::EROFS, "tylko do odczytu"),
+                (libc::EACCES, "do zapisu"),
+                (libc::EPERM, "do zapisu"),
+                (libc::ENOENT, "nie ma"),
+                (libc::ENXIO, "nie ma"),
+                (libc::ENODEV, "nie ma"),
+                (libc::EIO, "wyłączne otwarcie"),
+            ] {
+                let reason = exclusive_open_refusal("/dev/sdc", Some(errno))
+                    .expect_err("każdy błąd otwarcia jest odmową");
+                assert!(reason.starts_with("/dev/sdc: "), "odmowa nazywa urządzenie: {reason}");
+                assert!(reason.contains(needle), "errno {errno}: {reason}");
+            }
+            // EBUSY is the one that has to say WHY user space could not see
+            // the mount, or the admin reads it as a transient fault to retry.
+            let busy = exclusive_open_refusal("/dev/sdc", Some(libc::EBUSY)).expect_err("EBUSY");
+            assert!(busy.contains("prywatnej przestrzeni montowań"), "{busy}");
+        }
+
+        /// The gate really opens the device: exercised against real paths, so
+        /// the classification above is not the only thing under test.
+        #[test]
+        fn the_exclusive_open_runs_against_the_real_path() {
+            let dir = Temp::new();
+            let file = dir.0.join("device");
+            std::fs::write(&file, "nie jest urządzeniem blokowym").expect("plik");
+            // A regular file has no exclusive claim to lose, so this succeeds
+            // — which is exactly what proves the open happened.
+            open_exclusive(file.to_str().expect("ścieżka")).expect("otwarcie zwykłego pliku");
+
+            let missing = dir.0.join("nie-ma");
+            let reason = open_exclusive(missing.to_str().expect("ścieżka"))
+                .expect_err("brak urządzenia jest odmową");
+            assert!(reason.contains("nie ma"), "{reason}");
+
+            let reason = open_exclusive(dir.0.to_str().expect("ścieżka"))
+                .expect_err("katalog nie jest urządzeniem");
+            assert!(reason.starts_with(dir.0.to_str().expect("ścieżka")), "{reason}");
+        }
+
+        #[test]
+        fn wipefs_signatures_are_read_with_their_label_and_uuid() {
+            let parsed = parse_wipefs_signatures(output(
+                0,
+                "{\"signatures\":[{\"device\":\"sdc\",\"offset\":\"0x0\",\"type\":\"xfs\",\
+                 \"uuid\":\"33333333-3333-4333-8333-333333333333\",\"label\":\"d3\"},\
+                 {\"device\":\"sdc\",\"offset\":\"0x200\",\"type\":\"gpt\"}]}",
+                "",
+            ))
+            .expect("dwie sygnatury");
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].kind, "xfs");
+            assert_eq!(parsed[0].label.as_deref(), Some("d3"));
+            assert_eq!(parsed[0].uuid.as_deref(), Some("33333333-3333-4333-8333-333333333333"));
+            assert_eq!(parsed[1].kind, "gpt");
+            assert!(parsed[1].label.is_none() && parsed[1].uuid.is_none());
+            // A document this code does not understand is never an empty disk.
+            for (code, stdout, stderr) in [
+                (0, "{}", ""),
+                (0, "{\"signatures\":[{\"offset\":\"0x0\"}]}", ""),
+                (1, "{\"signatures\":[]}", ""),
+                (0, "{\"signatures\":[]}", "read error"),
+            ] {
+                assert!(parse_wipefs_signatures(output(code, stdout, stderr)).is_err());
+            }
+            assert!(parse_wipefs_signatures(output(0, "{\"signatures\":[]}", ""))
+                .expect("pusty nośnik")
+                .is_empty());
+        }
+
+        /// Releasing the claim means the journal is GONE — that is the whole
+        /// cost of the acknowledgement, and it has to be real.
+        #[test]
+        fn forgetting_a_journal_releases_the_claim_and_refuses_a_serving_array() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            let journal = root.reserve(&spec(), boot(), || Ok(())).expect("dziennik");
+            assert_eq!(root.journals().expect("lista").len(), 1);
+            // While the array still publishes its union the journal stays, so
+            // an acknowledgement can never be the thing that erases a live
+            // array's metadata.
+            let serving = Journal {
+                private: Some(PrivateTopology {
+                    anchor: Some(anchor_fixture()),
+                    published: true,
+                    service: None,
+                }),
+                ..journal.clone()
+            };
+            assert!(root.forget(&serving).is_err(), "publikująca macierz zachowuje dziennik");
+            assert_eq!(root.journals().expect("lista").len(), 1, "nic nie usunięto");
+
+            root.forget(&journal).expect("zwolnienie rezerwacji");
+            assert!(root.journals().expect("lista").is_empty(), "rezerwacja zwolniona");
+            // And the name is free again: a claims read is what reported the
+            // dissolved array's disks AND its name as taken.
+            assert!(claims_guard(&root.journals().expect("lista"), &spec()).is_ok());
+        }
+
+        /// The identity match is what stops a kernel rename from redirecting a
+        /// wipe. A serial that still answers while the WWN or the size moved
+        /// is a DIFFERENT disk wearing a familiar name.
+        #[test]
+        fn a_device_is_resolved_by_identity_and_never_by_name_alone() {
+            let devices = vec![
+                Device {
+                    path: "/dev/sdc".into(),
+                    kernel: "sdc".into(),
+                    bytes: 32 << 30,
+                    wwn: Some("0x5000c500aaaa0001".into()),
+                    serial: Some("SN-AAAA".into()),
+                    major_minor: "8:32".into(),
+                    occupied: false,
+                },
+                Device {
+                    path: "/dev/sdd".into(),
+                    kernel: "sdd".into(),
+                    bytes: 32 << 30,
+                    wwn: Some("0x5000c500bbbb0002".into()),
+                    serial: Some("SN-BBBB".into()),
+                    major_minor: "8:48".into(),
+                    occupied: false,
+                },
+            ];
+            let wwn = Some("0x5000c500aaaa0001".to_string());
+            let serial = Some("SN-AAAA".to_string());
+            assert_eq!(
+                device_by_identity(&devices, wwn.as_ref(), serial.as_ref(), 32 << 30)
+                    .expect("dysk po tożsamości")
+                    .path,
+                "/dev/sdc"
+            );
+            // Same serial, the WWN reports another disk: refused.
+            assert!(device_by_identity(
+                &devices,
+                Some(&"0x5000c500cccc0003".to_string()),
+                serial.as_ref(),
+                32 << 30
+            )
+            .is_err());
+            // Same identity, different size: refused.
+            assert!(device_by_identity(&devices, wwn.as_ref(), serial.as_ref(), 16 << 30).is_err());
+            // Absent: refused, never "the only one left".
+            assert!(device_by_identity(
+                &devices,
+                Some(&"0x5000c500dddd0004".to_string()),
+                Some(&"SN-DDDD".to_string()),
+                32 << 30
+            )
+            .is_err());
         }
 
         fn anchor_fixture() -> Anchor {

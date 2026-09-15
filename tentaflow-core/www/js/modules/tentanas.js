@@ -29,6 +29,7 @@ import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
 import { drawTasks, openSmartScheduleEditor } from '/js/modules/tentanas/tasks.js';
 import { drawShares, protocolChipHtml } from '/js/modules/tentanas/shares.js';
 import { warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { openDiskWipeDialog } from '/js/modules/tentanas/disk-wipe.js';
 import { exportConfig, mountImportPicker, applyImport, planBlocked } from '/js/modules/tentanas/config-transfer.js';
 import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-slider.js';
@@ -1632,9 +1633,9 @@ const TentaNasScreen = {
     // latency — none of which the action buttons render or their handlers read.
     // This signature lists everything they DO depend on: `diskId` (the row's
     // identity, and what every handler sends to the core), `name` (the toasts),
-    // `role` (whether the "use in pool" button exists) and `locateActive` (the
-    // locate icon). Nothing the builder below touches is missing, so a kept
-    // element can never act on a stale disk.
+    // `role` (which of the "use in pool" and "clear disk" buttons exists) and
+    // `locateActive` (the locate icon). Nothing the builder below touches is
+    // missing, so a kept element can never act on a stale disk.
     table.rowActionsKey = (row) => {
       const d = row._disk;
       return `${d.diskId}|${d.name}|${d.role}|${d.locateActive ? 1 : 0}`;
@@ -1648,11 +1649,17 @@ const TentaNasScreen = {
         <tf-button size="sm" variant="ghost" icon="${d.locateActive ? 'eye' : 'search'}" data-act="locate" title="${escapeAttr(T('disks.locate'))}"></tf-button>
         <tf-button size="sm" variant="ghost" icon="play" data-act="smart" title="${escapeAttr(T('disks.smart_test'))}"></tf-button>
         ${d.role === 'free' ? `<tf-button size="sm" variant="ghost" icon="layers" data-act="use" title="${escapeAttr(T('disks.use_in_pool'))}"></tf-button>` : ''}
+        ${d.role === 'used' ? `<tf-button size="sm" variant="ghost" icon="trash" data-act="wipe" title="${escapeAttr(T('disks.wipe'))}"></tf-button>` : ''}
         <tf-button size="sm" variant="secondary" icon="chevron-right" data-act="details">${escapeHtml(T('disks.details'))}</tf-button>`;
       wrap.querySelector('[data-act="details"]').addEventListener('click', (e) => { e.stopPropagation(); this.openDisk(live()._disk.diskId); });
       wrap.querySelector('[data-act="locate"]').addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._disk; this.locateDisk(cur, !cur.locateActive); });
       wrap.querySelector('[data-act="smart"]').addEventListener('click', (e) => { e.stopPropagation(); this.startSmartTest(live()._disk); });
       wrap.querySelector('[data-act="use"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.openPoolWizardForDisk(); });
+      // `live()` and not `d`: the plan is read for the disk sitting in THIS
+      // row at click time. A kept actions cell survives a sort or a filter,
+      // and a wipe is the one action where acting on the row a poll ago would
+      // erase the wrong device.
+      wrap.querySelector('[data-act="wipe"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.wipeDisk(live()._disk); });
       return wrap;
     };
     table.addEventListener('row-click', (e) => this.openDisk(e.detail.row._disk.diskId));
@@ -1672,6 +1679,24 @@ const TentaNasScreen = {
 
     this.locateState = this.locateState || {};
     await this.refreshDisks(body);
+  },
+
+  // n03 row action for a disk whose role is the catch-all `used`: it carries
+  // a filesystem signature, belongs to no pool and no array this node records,
+  // and therefore cannot be offered to either until it is cleared.
+  async wipeDisk(disk) {
+    if (!disk?.diskId) return;
+    try {
+      // The Disks tab is repainted from a fresh list so the cleared disk
+      // reads as free without waiting out a poll — but only while the tab is
+      // still on screen, because `refreshDisks` reads the surface it paints.
+      await openDiskWipeDialog(this, disk, () => {
+        const surface = this.root.querySelector('#nas-tab-body')?.firstElementChild;
+        if (surface?.isConnected) this.refreshDisks(surface);
+      });
+    } catch (e) {
+      toast(T('wipe_disk.failed', { error: errMessage(e) }), 'error');
+    }
   },
 
   async openPoolWizardForDisk() {

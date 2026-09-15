@@ -348,6 +348,36 @@ pub enum HelperCommand {
     /// ONLY command that changes a persisted spec, and it changes nothing but
     /// the owner.
     ElasticAdopt { array_id: String, owner: elastic::ElasticOwner },
+    /// Clears every filesystem, RAID and partition-table signature off ONE
+    /// whole disk, so it reads as free again. The only command in the catalog
+    /// that erases a disk outside a create.
+    ///
+    /// It carries the disk's IDENTITY beside the device path and re-resolves
+    /// the two against this node's own inventory, because a device name is
+    /// not an identity: a kernel rename between reboots is how a wipe reaches
+    /// a disk nobody meant. `bytes` is part of that identity — a disk that
+    /// came back with a different size is a different disk.
+    ///
+    /// `release_journal` is the array_id of the Elastic Array whose kept
+    /// journal claims this disk, when the caller has acknowledged losing it.
+    /// `None` means no acknowledgement, and a claimed disk is then refused.
+    /// The wrapper checks that the journal it is about to drop really is the
+    /// one claiming this device, so an acknowledgement for one array can
+    /// never release another's.
+    ///
+    /// The last gate before anything is written is an exclusive open of the
+    /// block device. The kernel refuses it whenever the device carries a
+    /// filesystem mounted in ANY mount namespace, which is the only check
+    /// that sees an Elastic Array branch — those live in the union process's
+    /// private namespace and are invisible to `lsblk` and to `/proc/mounts`
+    /// on the host. There is no force flag: that refusal is the answer.
+    DiskWipe {
+        device: String,
+        wwn: Option<String>,
+        serial: Option<String>,
+        bytes: u64,
+        release_journal: Option<String>,
+    },
     /// `smartctl --json=c -x <device>`: identity, health, attributes, NVMe log
     /// and the self-test log in one JSON document.
     SmartctlInfo { device: String },
@@ -1989,6 +2019,7 @@ impl HelperCommand {
             Self::ElasticClaims { .. } => Some("elastic_claims"),
             Self::ElasticJournals {} => Some("elastic_journals"),
             Self::ElasticAdopt { .. } => Some("elastic_adopt"),
+            Self::DiskWipe { .. } => Some("disk_wipe"),
             Self::SmbIncludeEnsure {} => Some("smb_include_ensure"),
             Self::SmbIncludeRemove {} => Some("smb_include_remove"),
             Self::SmbConfigWrite {} => Some("smb_config_write"),
@@ -2085,6 +2116,30 @@ impl HelperCommand {
             Self::ElasticAdopt { array_id, owner } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 owner.validate()
+            }
+            Self::DiskWipe { device, wwn, serial, bytes, release_journal } => {
+                validate_device(device)?;
+                // A disk with neither a WWN nor a serial cannot be
+                // re-identified after a rename, and the wipe's whole
+                // protection against hitting the wrong device is that
+                // re-identification. Refusing is the only honest answer.
+                if wwn.is_none() && serial.is_none() {
+                    return Err(CatalogError::InvalidArgument(
+                        "czyszczenie wymaga WWN albo numeru seryjnego dysku".into(),
+                    ));
+                }
+                for value in [wwn, serial].into_iter().flatten() {
+                    elastic::validate_identity_text(value)?;
+                }
+                if *bytes == 0 {
+                    return Err(CatalogError::InvalidArgument(
+                        "czyszczony dysk bez rozmiaru".into(),
+                    ));
+                }
+                match release_journal {
+                    Some(array_id) => elastic::validate_elastic_uuid(array_id),
+                    None => Ok(()),
+                }
             }
             Self::SmbIncludeEnsure {}
             | Self::SmbIncludeRemove {}
@@ -2742,6 +2797,7 @@ impl HelperCommand {
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
             Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym węźle."),
             Self::ElasticAdopt { .. } => ("builtin", "Przepisuje właściciela dziennika macierzy Elastic na przejmującą instancję."),
+            Self::DiskWipe { .. } => ("builtin", "Usuwa sygnatury systemów plików i tablicy partycji z jednego dysku po wyłącznym otwarciu urządzenia."),
             Self::SmartctlInfo { .. } => (
                 "smartctl",
                 "Read one disk's SMART/NVMe health document (identity, attributes, self-test log).",
@@ -2930,6 +2986,7 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ElasticClaims { name: Some(s()) },
         HelperCommand::ElasticJournals {},
         HelperCommand::ElasticAdopt { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
+        HelperCommand::DiskWipe { device: "/dev/sda".into(), wwn: Some(s()), serial: Some(s()), bytes: 1, release_journal: None },
         HelperCommand::SmartctlInfo { device: s() },
         HelperCommand::SmartctlSelfTest {
             device: s(),

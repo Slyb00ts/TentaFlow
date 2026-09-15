@@ -59,6 +59,10 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         | HelperCommand::ElasticJournals {} | HelperCommand::ElasticAdopt { .. } => {
             crate::elastic::execution::execute(command)
         }
+        // The Elastic journals decide whether a disk may be cleared, exactly
+        // as they decide whether a pool may take a name, so the wipe is
+        // performed by the same guarded executor.
+        HelperCommand::DiskWipe { .. } => crate::elastic::execution::guarded_wipe(command),
         HelperCommand::SmbIncludeEnsure {} => smb_include_ensure(),
         HelperCommand::SmbIncludeRemove {} => smb_include_remove(),
         HelperCommand::SmbConfigWrite {} => smb_config_write(payload),

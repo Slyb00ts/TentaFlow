@@ -1077,6 +1077,60 @@ test('a disk action rebuilt by a poll acts on the disk as it is NOW', async () =
   }
 });
 
+// The clearing action, offered exactly where an admin meets the problem: a
+// disk whose role is the catch-all `used` carries a filesystem signature,
+// belongs to no pool and to no array this node records, and can therefore go
+// into neither — which is the state every disk of a dissolved Elastic Array
+// is left in.
+//
+// The handler reads the LIVE row for the same reason the locate handler does,
+// and it matters more here: a kept actions cell survives a sort, a filter and
+// a poll, and this is the one action that erases a device.
+test('a used disk offers the clearing action, and it acts on the disk as it is NOW', async () => {
+  let role = 'used';
+  let diskId = 'sda';
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: () => ({
+      ...fixtures.tentaNasDisksListRequest,
+      disks: [disk({ role, diskId, fsType: 'xfs' })],
+    }),
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  await flush();
+  const tbody = root.querySelector('#nas-disk-table').shadowRoot.querySelector('tbody');
+  const actsOf = () => [...tbody.querySelectorAll('.tf-table__actions-cell tf-button')].map((b) => b.dataset.act);
+  assert.deepEqual(actsOf(), ['locate', 'smart', 'wipe', 'details'], 'a used disk offers "clear disk"');
+
+  const seen = [];
+  const real = Screen.wipeDisk;
+  Screen.wipeDisk = (d) => { seen.push(`${d.diskId}:${d.role}`); };
+  try {
+    diskId = 'sdz';
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    click(tbody.querySelector('[data-act="wipe"]'));
+    assert.deepEqual(seen, ['sdz:used'], 'the handler carries the disk from the LATEST poll');
+
+    // A free disk is offered the pool wizard instead: there is nothing on it
+    // to clear, and a destructive action with nothing to destroy is noise.
+    role = 'free';
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.deepEqual(actsOf(), ['locate', 'smart', 'use', 'details']);
+
+    // And a disk with a real owner keeps neither: the action on it is on its
+    // pool or its array, not on the device.
+    role = 'pool_member';
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.deepEqual(actsOf(), ['locate', 'smart', 'details']);
+  } finally {
+    Screen.wipeDisk = real;
+    Screen.unmount();
+  }
+});
+
 test('the KPI tiles are the same elements after a poll, with only their numbers moved', async () => {
   let readBps = 1048576;
   stubTransport({

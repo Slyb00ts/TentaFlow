@@ -256,6 +256,7 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::ElasticMover { .. }
         | HelperCommand::ElasticFix { .. } | HelperCommand::ElasticAddDisk { .. }
         | HelperCommand::ElasticDestroy { .. } => "Elastic Array",
+        HelperCommand::DiskWipe { .. } => "wipefs",
     }
 }
 

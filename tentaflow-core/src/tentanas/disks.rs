@@ -13,21 +13,22 @@
 // =============================================================================
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use serde_json::Value;
 use tentaflow_protocol::tentanas::{
-    NasDisk, NasDiskIo, NasReplacementAdvice, NasSmartAttribute, NasSmartSelfTest,
-    NasTelemetryState,
+    NasDisk, NasDiskIo, NasDiskWipeJournalClaim, NasDiskWipePlan, NasDiskWipeRefusal,
+    NasReplacementAdvice, NasSmartAttribute, NasSmartSelfTest, NasTelemetryState,
 };
 use tentanas_helper::HelperCommand;
 
 use super::broker;
 use super::db::{self as store, DiskIdentity, SampleInsert};
 use crate::db::DbPool;
+use crate::profiling::collectors::elevation::ElevationToken;
 
 const TICK: Duration = Duration::from_secs(5);
 const INVENTORY_EVERY: Duration = Duration::from_secs(30);
@@ -35,6 +36,10 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(60);
 const SMART_EVERY: Duration = Duration::from_secs(30 * 60);
 const PRUNE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const SUMMARY_EVERY: Duration = Duration::from_secs(60);
+/// A `wipefs` of one disk is a handful of small writes and a re-read, so the
+/// only way it takes minutes is a device that has stopped answering — which
+/// is precisely the case the timeout has to end rather than wait out.
+const WIPE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Points of the per-row sparkline (one per tick → five minutes).
 const HISTORY_POINTS: usize = 60;
 /// Ticks the IOPS baseline of the Overview tile averages over — one hour.
@@ -115,6 +120,11 @@ struct Usage {
     /// and never separately, because a disk reporting one filesystem's type
     /// beside another's UUID is what an import would then adopt.
     fs_uuid: Option<String>,
+    /// LABEL of that same signature, set with the other two for the same
+    /// reason. It is the one human-readable name a bare filesystem carries,
+    /// and the wipe plan needs it: "d3" tells an admin which Elastic branch a
+    /// leftover xfs used to be, while "xfs" does not.
+    fs_label: Option<String>,
 }
 
 fn collect_usage(node: &Value, usage: &mut Usage) {
@@ -136,6 +146,7 @@ fn collect_usage(node: &Value, usage: &mut Usage) {
             if usage.fs_hint.is_none() {
                 usage.fs_hint = Some(other.to_string());
                 usage.fs_uuid = node.get("uuid").and_then(json_str);
+                usage.fs_label = label;
             }
         }
         None => {}
@@ -240,6 +251,7 @@ pub fn disk_from_lsblk(node: &Value) -> Option<NasDisk> {
         mountpoints: usage.mountpoints,
         fs_type: usage.fs_hint,
         fs_uuid: usage.fs_uuid,
+        fs_label: usage.fs_label,
         // lsblk knows the pool from the member label, never the vdev inside
         // it; `refresh_inventory` fills these from `zpool status`.
         vdev_role: String::new(),
@@ -250,6 +262,330 @@ pub fn disk_from_lsblk(node: &Value) -> Option<NasDisk> {
         // array rows.
         array_role: String::new(),
     })
+}
+
+// =============================================================================
+// Clearing a disk: the plan
+// =============================================================================
+//
+// Read-only, and the whole point of it is the REASON. A disk that reads as
+// `used` on the Disks tab cannot be put into a pool or an array, and until
+// this existed the only way to free one was to build an array on it. What an
+// admin needs before erasing 32 TB is not a yes/no but a sentence naming what
+// occupies the disk and what to do about it.
+//
+// NONE of these checks is a safety guarantee, and the code must not pretend
+// otherwise. `lsblk` — which is all `NasDisk` is built from — cannot see an
+// Elastic Array branch at all: the branches are mounted inside the union
+// process's own mount namespace and only the union is published to the host.
+// On a live node `grep -c xfs /proc/mounts` read 0 while nine branches were
+// mounted. The guarantee is the exclusive open of the block device on the
+// privileged side, which the kernel refuses for a filesystem mounted in ANY
+// namespace. Everything here exists to explain a refusal BEFORE the kernel
+// has to produce it.
+
+/// The Elastic journal that still claims a disk, with the one fact the
+/// protocol struct does not carry: whether the array is serving right now.
+///
+/// Read from the node's journals (`0700 root`), which is the only place a
+/// dissolved array still exists — a dissolve keeps the journal so the array
+/// import can take the array back, and the database row is gone.
+pub struct JournalClaim {
+    pub claim: NasDiskWipeJournalClaim,
+    /// The union is published on the host, or the journal still holds a
+    /// namespace anchor. `None` means the mount table could not be read:
+    /// unknown, and unknown is never "free".
+    pub serving: Option<bool>,
+}
+
+fn refuse(code: &str, detail: String) -> NasDiskWipeRefusal {
+    NasDiskWipeRefusal { code: code.to_string(), detail }
+}
+
+/// Everything clearing `disk` would remove and every reason the node would
+/// refuse. Pure: it reads no device, runs no tool and changes nothing.
+pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePlan {
+    let name = disk.name.as_str();
+    let mounts = || disk.mountpoints.join(", ");
+    let mut refusals = Vec::new();
+    match disk.role.as_str() {
+        "system" => refusals.push(refuse(
+            "system",
+            format!(
+                "{name}: to dysk systemowy tego węzła ({}) — nie ma operacji, która go zwalnia; \
+                 przenieś system na inny nośnik, jeśli ten dysk ma być wolny",
+                mounts()
+            ),
+        )),
+        "pool_member" => refusals.push(refuse(
+            "zfs_pool",
+            format!(
+                "{name}: dysk należy do puli ZFS {} — zniszcz pulę albo odłącz od niej ten dysk, \
+                 a potem wyczyść go ponownie",
+                disk.member_of.as_deref().unwrap_or("?")
+            ),
+        )),
+        "array_member" if disk.array_role.is_empty() => refusals.push(refuse(
+            "mdraid",
+            format!(
+                "{name}: dysk jest członkiem macierzy mdraid {} — rozłóż macierz \
+                 (mdadm --stop) i wyczyść dysk ponownie",
+                disk.member_of.as_deref().unwrap_or("?")
+            ),
+        )),
+        // `array_role` is what separates the two owners that share this role:
+        // it is set only for a member of an Elastic Array this node has a
+        // record of, and empty for an mdraid member, whose label `lsblk`
+        // reads off the disk itself.
+        "array_member" => refusals.push(refuse(
+            "elastic_member",
+            format!(
+                "{name}: dysk należy do macierzy Elastic {} jako {} — rozwiąż macierz, a potem \
+                 wyczyść jej dyski",
+                disk.member_of.as_deref().unwrap_or("?"),
+                disk.array_role
+            ),
+        )),
+        "mounted" => refusals.push(refuse(
+            "mounted",
+            format!(
+                "{name}: dysk ma zamontowany system plików ({}) — odmontuj go i wyczyść ponownie",
+                mounts()
+            ),
+        )),
+        _ => (),
+    }
+    // A mount the role did not already refuse. `role_of` reports 'system' or
+    // 'mounted' for a disk with mountpoints, so this only fires for one the
+    // inventory classified by a signature while something still has it
+    // mounted — and it is then the last legible warning before the kernel's.
+    if refusals.is_empty() && !disk.mountpoints.is_empty() {
+        refusals.push(refuse(
+            "mounted",
+            format!(
+                "{name}: dysk ma zamontowany system plików ({}) — odmontuj go i wyczyść ponownie",
+                mounts()
+            ),
+        ));
+    }
+    let claim = journal.and_then(|journal| match journal.serving {
+        Some(true) => {
+            refusals.push(refuse(
+                "journal_serving",
+                format!(
+                    "{name}: dysk należy do macierzy Elastic {}, która nadal udostępnia unię na \
+                     tym węźle — rozwiąż macierz, a potem wyczyść jej dyski",
+                    journal.claim.name
+                ),
+            ));
+            None
+        }
+        None => {
+            refusals.push(refuse(
+                "journal_unknown",
+                format!(
+                    "{name}: nie udało się odczytać, czy macierz Elastic {} jest jeszcze \
+                     udostępniana — nieznany stan nie jest stanem wolnym; powtórz plan, gdy \
+                     węzeł odpowie",
+                    journal.claim.name
+                ),
+            ));
+            None
+        }
+        Some(false) => Some(journal.claim),
+    });
+    NasDiskWipePlan {
+        disk_id: disk.disk_id.clone(),
+        name: disk.name.clone(),
+        path: disk.path.clone(),
+        size_bytes: disk.size_bytes,
+        model: disk.model.clone(),
+        serial: disk.serial.clone(),
+        fs_type: disk.fs_type.clone(),
+        fs_label: disk.fs_label.clone(),
+        fs_uuid: disk.fs_uuid.clone(),
+        mountpoints: disk.mountpoints.clone(),
+        allowed: refusals.is_empty(),
+        refusals,
+        journal_claim: claim,
+    }
+}
+
+/// Why a wipe request was refused before anything privileged ran. The two
+/// cases are kept apart because they mean different things to the caller: a
+/// mismatch is the REQUEST being wrong (a stale dialog, a hand-built frame),
+/// while the node's own state is the DISK being unavailable, and only the
+/// second is worth showing an admin as a condition to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WipeRefusal {
+    BadRequest(String),
+    NotAvailable(String),
+}
+
+/// The wipe request turned into the ONE privileged command that performs it.
+///
+/// Pure over the plan the node just read for itself, so every gate between
+/// "an admin clicked" and "a device is opened" is a decision a test can make
+/// the node take. It is also the only place a `HelperCommand::DiskWipe` is
+/// ever built: the plan request cannot reach it, which is what makes the plan
+/// read-only by construction rather than by review.
+///
+/// `plan` must be the node's OWN plan, never one a client carried back — the
+/// device set moves, and a plan is a statement about the moment it was read.
+pub fn wipe_command(
+    plan: &NasDiskWipePlan,
+    disk: &NasDisk,
+    confirm_device: &str,
+    release_journal_array: &str,
+) -> Result<HelperCommand, WipeRefusal> {
+    // The retype gate, against the PLAN's device name rather than anything the
+    // request carried: a request naming a device that has since been renamed
+    // fails here instead of reaching whatever answers to that name now.
+    if confirm_device != plan.name {
+        return Err(WipeRefusal::BadRequest(format!(
+            "Przepisana nazwa urządzenia nie zgadza się z {}",
+            plan.name
+        )));
+    }
+    if plan.disk_id != disk.disk_id || plan.path != disk.path {
+        return Err(WipeRefusal::BadRequest(
+            "Plan dotyczy innego dysku niż ten, który węzeł ma teraz w inwentarzu".to_string(),
+        ));
+    }
+    if !plan.refusals.is_empty() {
+        return Err(WipeRefusal::NotAvailable(
+            plan.refusals
+                .iter()
+                .map(|r| r.detail.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    // The SECOND acknowledgement, deliberately not a boolean: it names the
+    // array, so a client that never showed the claim cannot satisfy it, and an
+    // acknowledgement meant for one array cannot release another's journal.
+    let release_journal = match (&plan.journal_claim, release_journal_array) {
+        (None, "") => None,
+        (None, _) => {
+            return Err(WipeRefusal::BadRequest(
+                "Żaden dziennik macierzy Elastic nie rezerwuje tego dysku — odczytaj plan ponownie"
+                    .to_string(),
+            ))
+        }
+        (Some(claim), ack) if ack == claim.name => Some(claim.array_id.clone()),
+        (Some(claim), _) => {
+            return Err(WipeRefusal::NotAvailable(format!(
+                "Dziennik rozwiązanej macierzy Elastic {} nadal rezerwuje ten dysk — potwierdź \
+                 utratę tej macierzy albo przywróć ją importem macierzy",
+                claim.name
+            )))
+        }
+    };
+    Ok(HelperCommand::DiskWipe {
+        device: disk.path.clone(),
+        // Identity beside the path, because the path is not one: the
+        // privileged side re-resolves the disk from these three and refuses if
+        // the node now answers on a different device.
+        wwn: disk.wwn.clone().filter(|w| !w.is_empty()),
+        serial: (!disk.serial.is_empty()).then(|| disk.serial.clone()),
+        bytes: disk.size_bytes,
+        release_journal,
+    })
+}
+
+/// Runs the wipe and reports what it removed.
+///
+/// A job rather than a direct answer for two reasons that are not cosmetic:
+/// the step log IS the audit trail of the one operation in the product that
+/// erases a disk outside a create, and the Disks tab has to show the disk as
+/// `free` afterwards — which only a fresh inventory can say, and saying it
+/// here means the admin does not have to wait out a poll to learn whether the
+/// disk actually came back.
+pub async fn wipe_job(
+    h: super::jobs::JobHandle,
+    command: HelperCommand,
+    explicit: Option<Arc<ElevationToken>>,
+) -> Result<()> {
+    let out = super::jobs::run_step(&h, &command, explicit.as_deref(), WIPE_TIMEOUT).await?;
+    drop(explicit);
+    let result: tentanas_helper::elastic::DiskWipeResult = serde_json::from_str(&out.stdout)?;
+    for step in &result.steps {
+        h.log(step);
+    }
+    for signature in &result.removed {
+        h.log(format!(
+            "usunięto sygnaturę {} na {}{}{}",
+            signature.kind,
+            signature.offset,
+            signature
+                .label
+                .as_deref()
+                .map(|l| format!(" (label {l})"))
+                .unwrap_or_default(),
+            signature
+                .uuid
+                .as_deref()
+                .map(|u| format!(" (uuid {u})"))
+                .unwrap_or_default(),
+        ));
+    }
+    if let Some(array) = &result.journal_released {
+        h.log(format!(
+            "zwolniono rezerwację dziennika macierzy Elastic {array}: macierzy nie da się już \
+             przywrócić importem"
+        ));
+    }
+    h.log(format!("urządzenie {} nie zgłasza już żadnych sygnatur", result.device));
+    refresh_inventory(h.db()).await?;
+    h.progress(100);
+    Ok(())
+}
+
+/// The journal claiming one disk, out of every journal this node holds.
+///
+/// Identity, never the device name: a journal records a member's WWN and
+/// serial, and matching on either is what makes the claim survive the kernel
+/// renaming the disk between two boots.
+pub fn journal_claim_of(
+    disk: &NasDisk,
+    journals: &[tentanas_helper::elastic::ElasticJournalEntry],
+) -> Option<JournalClaim> {
+    for entry in journals {
+        let members = || {
+            entry
+                .spec
+                .data
+                .iter()
+                .map(|d| (d, "data"))
+                .chain(entry.spec.cache.iter().map(|d| (d, "cache")))
+                .chain(entry.spec.parity.iter().map(|d| (d, "parity")))
+        };
+        let Some((_, role)) = members().find(|(member, _)| {
+            member.disk_id == disk.disk_id
+                || member
+                    .wwn
+                    .as_ref()
+                    .is_some_and(|w| !w.is_empty() && disk.wwn.as_ref() == Some(w))
+                || member
+                    .serial
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty() && *s == disk.serial)
+        }) else {
+            continue;
+        };
+        return Some(JournalClaim {
+            claim: NasDiskWipeJournalClaim {
+                array_id: entry.spec.array_id.clone(),
+                name: entry.spec.name.clone(),
+                array_role: role.to_string(),
+                member_count: members().count() as u32,
+                owner_org_id: entry.spec.owner.org_id.clone(),
+                owner_addon_id: entry.spec.owner.addon_id.clone(),
+            },
+            serving: entry.union_mounted,
+        });
+    }
+    None
 }
 
 /// Kernel name → (vdev role, vdev kind) for every leaf of every imported
@@ -373,6 +709,7 @@ fn apply_array_membership(d: &mut NasDisk, arrays: &HashMap<String, (String, Str
     // otherwise explain, and leaving it set would put "· xfs" back on a row
     // that now has a real owner to show.
     d.fs_type = None;
+    d.fs_label = None;
 }
 
 pub fn disks_from_lsblk_json(text: &str) -> Result<Vec<NasDisk>> {
@@ -1589,6 +1926,368 @@ mod tests {
       {"name":"loop0","path":"/dev/loop0","type":"loop","size":1,"mountpoints":["/snap/x"]},
       {"name":"zd0","path":"/dev/zd0","type":"disk","size":1,"mountpoints":[null]}
     ]}"#;
+
+    // ----- clearing a disk -----------------------------------------------------
+
+    /// The shape the whole feature exists for: a disk left over from a
+    /// DISSOLVED Elastic Array. It carries a bare `xfs` signature, belongs to
+    /// no pool and to no array this node has a database row for, and therefore
+    /// reads as the catch-all `used` — which is exactly what makes it unusable
+    /// for a new pool and what three user-space guards once read as "free".
+    fn used_disk() -> NasDisk {
+        NasDisk {
+            disk_id: "wwn-produkt-data".to_string(),
+            name: "sdc".to_string(),
+            path: "/dev/sdc".to_string(),
+            kind: "hdd".to_string(),
+            model: "HGST HUS726".to_string(),
+            serial: "serial-produkt-data".to_string(),
+            wwn: Some("wwn-produkt-data".to_string()),
+            size_bytes: 32 * 1024 * 1024 * 1024,
+            role: "used".to_string(),
+            fs_type: Some("xfs".to_string()),
+            fs_label: Some("d1".to_string()),
+            fs_uuid: Some("33333333-3333-4333-8333-333333333333".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn journal_entry(
+        spec: tentanas_helper::elastic::ElasticCreateSpec,
+        union_mounted: Option<bool>,
+    ) -> tentanas_helper::elastic::ElasticJournalEntry {
+        tentanas_helper::elastic::ElasticJournalEntry { spec, union_mounted }
+    }
+
+    /// The plan names WHAT would be removed, not merely that something would.
+    /// `fs_type` alone covered 23 of 29 disks on a real node and told the
+    /// reader nothing; the label and the filesystem UUID are what identify the
+    /// filesystem being erased rather than the device node it answers on.
+    #[test]
+    fn the_wipe_plan_names_the_signature_label_and_filesystem_uuid() {
+        let disk = used_disk();
+        let plan = plan_wipe(&disk, None);
+        assert!(plan.allowed, "{:?}", plan.refusals);
+        assert!(plan.refusals.is_empty());
+        assert_eq!(plan.fs_type.as_deref(), Some("xfs"));
+        assert_eq!(plan.fs_label.as_deref(), Some("d1"));
+        assert_eq!(plan.fs_uuid.as_deref(), Some("33333333-3333-4333-8333-333333333333"));
+        assert_eq!(plan.name, "sdc");
+        assert_eq!(plan.path, "/dev/sdc");
+        assert_eq!(plan.size_bytes, disk.size_bytes);
+        assert!(plan.journal_claim.is_none());
+        // Read-only, and the plan is the ONE thing the plan request produces:
+        // the privileged command that erases a disk is built by `wipe_command`
+        // and cannot be reached from here. It refuses the plan on its own,
+        // with no typed confirmation.
+        assert!(matches!(
+            wipe_command(&plan, &disk, "", ""),
+            Err(WipeRefusal::BadRequest(_))
+        ));
+        assert_eq!(disk, used_disk(), "plan_wipe nie zmienia dysku, o który pyta");
+    }
+
+    /// One refusal per cause, each firing for its OWN cause and each naming
+    /// both the cause and the remedy. A sentence an admin cannot act on is the
+    /// failure this plan exists to prevent.
+    #[test]
+    fn every_wipe_plan_refusal_fires_for_its_own_cause_and_names_a_remedy() {
+        let system = NasDisk {
+            role: "system".to_string(),
+            mountpoints: vec!["/".to_string(), "/boot/efi".to_string()],
+            ..used_disk()
+        };
+        let plan = plan_wipe(&system, None);
+        assert!(!plan.allowed);
+        assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
+        assert_eq!(plan.refusals[0].code, "system");
+        assert!(plan.refusals[0].detail.contains("dysk systemowy"), "{:?}", plan.refusals[0]);
+        assert!(plan.refusals[0].detail.contains("/boot/efi"), "{:?}", plan.refusals[0]);
+        assert!(plan.refusals[0].detail.contains("przenieś system"), "{:?}", plan.refusals[0]);
+
+        let pool = NasDisk {
+            role: "pool_member".to_string(),
+            member_of: Some("tank".to_string()),
+            ..used_disk()
+        };
+        let plan = plan_wipe(&pool, None);
+        assert_eq!(plan.refusals[0].code, "zfs_pool");
+        assert!(plan.refusals[0].detail.contains("puli ZFS tank"));
+        assert!(plan.refusals[0].detail.contains("zniszcz pulę"));
+
+        // An mdraid member and an Elastic Array member share `role`; what
+        // separates them is `array_role`, which only an Elastic member has.
+        let md = NasDisk {
+            role: "array_member".to_string(),
+            member_of: Some("nas:0".to_string()),
+            ..used_disk()
+        };
+        let plan = plan_wipe(&md, None);
+        assert_eq!(plan.refusals[0].code, "mdraid");
+        assert!(plan.refusals[0].detail.contains("mdraid nas:0"));
+        assert!(plan.refusals[0].detail.contains("mdadm --stop"));
+
+        let elastic = NasDisk {
+            role: "array_member".to_string(),
+            member_of: Some("produkt".to_string()),
+            array_role: "parity".to_string(),
+            ..used_disk()
+        };
+        let plan = plan_wipe(&elastic, None);
+        assert_eq!(plan.refusals[0].code, "elastic_member");
+        assert!(plan.refusals[0].detail.contains("macierzy Elastic produkt"));
+        assert!(plan.refusals[0].detail.contains("parity"));
+        assert!(plan.refusals[0].detail.contains("rozwiąż macierz"));
+
+        let mounted = NasDisk {
+            role: "mounted".to_string(),
+            mountpoints: vec!["/srv/stare".to_string()],
+            ..used_disk()
+        };
+        let plan = plan_wipe(&mounted, None);
+        assert_eq!(plan.refusals[0].code, "mounted");
+        assert!(plan.refusals[0].detail.contains("/srv/stare"));
+        assert!(plan.refusals[0].detail.contains("odmontuj"));
+
+        // A mount the ROLE did not already explain still refuses: the role is
+        // decided by the first rule that matches, and a signature-classified
+        // disk with a mountpoint would otherwise sail through.
+        let odd = NasDisk { mountpoints: vec!["/mnt/x".to_string()], ..used_disk() };
+        let plan = plan_wipe(&odd, None);
+        assert_eq!(plan.refusals[0].code, "mounted");
+        assert!(!plan.allowed);
+    }
+
+    /// The journal question, in all three states a dissolved array can be in.
+    ///
+    /// The claim is reported apart from the refusals ONLY when it can be
+    /// acknowledged: a serving array, or one whose mount state could not be
+    /// read, is a refusal no acknowledgement can lift.
+    #[test]
+    fn a_dissolved_arrays_journal_claim_is_reported_and_a_serving_one_refused() {
+        let disk = used_disk();
+        let spec = crate::tentanas::elastic::tests::create_spec("produkt");
+        let journals = vec![journal_entry(spec.clone(), Some(false))];
+
+        let claim = journal_claim_of(&disk, &journals).expect("dziennik rezerwuje ten dysk");
+        assert_eq!(claim.claim.name, "produkt");
+        assert_eq!(claim.claim.array_id, spec.array_id);
+        assert_eq!(claim.claim.array_role, "data");
+        assert_eq!(claim.claim.member_count, 2, "jeden data i jeden parity");
+        assert_eq!(claim.claim.owner_org_id, "org");
+        let plan = plan_wipe(&disk, Some(claim));
+        assert!(plan.allowed, "{:?}", plan.refusals);
+        let reported = plan.journal_claim.as_ref().expect("rezerwacja w planie");
+        assert_eq!(reported.name, "produkt");
+
+        // Serving: the array is publishing its union right now.
+        let serving = journal_claim_of(&disk, &[journal_entry(spec.clone(), Some(true))])
+            .expect("dziennik");
+        let plan = plan_wipe(&disk, Some(serving));
+        assert!(!plan.allowed);
+        assert_eq!(plan.refusals[0].code, "journal_serving");
+        assert!(plan.refusals[0].detail.contains("produkt"));
+        assert!(plan.journal_claim.is_none(), "nie ma czego potwierdzać");
+
+        // Unknown mount state. THIS is the incident: unreadable is not free.
+        let unknown =
+            journal_claim_of(&disk, &[journal_entry(spec.clone(), None)]).expect("dziennik");
+        let plan = plan_wipe(&disk, Some(unknown));
+        assert!(!plan.allowed);
+        assert_eq!(plan.refusals[0].code, "journal_unknown");
+        assert!(plan.refusals[0].detail.contains("nieznany stan nie jest stanem wolnym"));
+        assert!(plan.journal_claim.is_none());
+    }
+
+    /// A journal claims a disk by IDENTITY. The device name is not an
+    /// identity: a kernel rename between two boots is how a wipe reaches the
+    /// disk nobody meant.
+    #[test]
+    fn a_journal_claim_is_matched_by_identity_and_never_by_device_name() {
+        let spec = crate::tentanas::elastic::tests::create_spec("produkt");
+        let journals = vec![journal_entry(spec.clone(), Some(false))];
+
+        // Renamed device, same serial: still claimed.
+        let renamed = NasDisk {
+            name: "sdz".to_string(),
+            path: "/dev/sdz".to_string(),
+            disk_id: "sn-serial-produkt-data".to_string(),
+            wwn: None,
+            ..used_disk()
+        };
+        assert_eq!(
+            journal_claim_of(&renamed, &journals).expect("po numerze seryjnym").claim.array_role,
+            "data"
+        );
+
+        // Same device name, no matching identity: NOT claimed.
+        let stranger = NasDisk {
+            disk_id: "wwn-obcy".to_string(),
+            serial: "serial-obcy".to_string(),
+            wwn: Some("wwn-obcy".to_string()),
+            ..used_disk()
+        };
+        assert!(journal_claim_of(&stranger, &journals).is_none());
+
+        // The parity disk of the same array is claimed as parity.
+        let parity = NasDisk {
+            disk_id: "wwn-produkt-parity".to_string(),
+            serial: "serial-produkt-parity".to_string(),
+            wwn: Some("wwn-produkt-parity".to_string()),
+            ..used_disk()
+        };
+        assert_eq!(
+            journal_claim_of(&parity, &journals).expect("parity").claim.array_role,
+            "parity"
+        );
+    }
+
+    /// The two confirmations, and the one command they unlock.
+    #[test]
+    fn the_wipe_command_needs_the_typed_name_and_a_named_journal_acknowledgement() {
+        let disk = used_disk();
+        let plan = plan_wipe(&disk, None);
+
+        // The retype gate. Case, whitespace and a near miss all refuse.
+        for typed in ["", "sdb", "SDC", " sdc", "/dev/sdc"] {
+            assert!(
+                matches!(wipe_command(&plan, &disk, typed, ""), Err(WipeRefusal::BadRequest(_))),
+                "'{typed}' nie może przejść"
+            );
+        }
+        let command = wipe_command(&plan, &disk, "sdc", "").expect("przepisana nazwa");
+        // The command carries the IDENTITY, not just the path.
+        assert_eq!(
+            command,
+            HelperCommand::DiskWipe {
+                device: "/dev/sdc".to_string(),
+                wwn: Some("wwn-produkt-data".to_string()),
+                serial: Some("serial-produkt-data".to_string()),
+                bytes: 32 * 1024 * 1024 * 1024,
+                release_journal: None,
+            }
+        );
+        // And it is a real catalog entry, validated as one.
+        assert_eq!(command.builtin_label(), Some("disk_wipe"));
+        assert!(command.plan().is_ok());
+
+        // A plan with any refusal never produces a command, however carefully
+        // the name was typed.
+        let refused = plan_wipe(
+            &NasDisk { role: "pool_member".to_string(), member_of: Some("tank".into()), ..disk.clone() },
+            None,
+        );
+        assert!(matches!(
+            wipe_command(&refused, &disk, "sdc", ""),
+            Err(WipeRefusal::NotAvailable(_))
+        ));
+
+        // An acknowledgement for a disk no journal claims is a disagreement
+        // between the caller and this node, and is refused rather than ignored.
+        assert!(matches!(
+            wipe_command(&plan, &disk, "sdc", "produkt"),
+            Err(WipeRefusal::BadRequest(_))
+        ));
+
+        // A plan whose disk is no longer the one in the inventory refuses.
+        let moved = NasDisk { path: "/dev/sdz".to_string(), ..disk.clone() };
+        assert!(matches!(
+            wipe_command(&plan, &moved, "sdc", ""),
+            Err(WipeRefusal::BadRequest(_))
+        ));
+    }
+
+    /// The journal acknowledgement is a SECOND gate, and it names the array.
+    #[test]
+    fn releasing_a_journal_claim_takes_more_than_the_typed_device_name() {
+        let disk = used_disk();
+        let spec = crate::tentanas::elastic::tests::create_spec("produkt");
+        let claim = journal_claim_of(&disk, &[journal_entry(spec.clone(), Some(false))])
+            .expect("dziennik");
+        let plan = plan_wipe(&disk, Some(claim));
+
+        // The retyped device name alone does NOT release the array.
+        let refusal = wipe_command(&plan, &disk, "sdc", "").expect_err("brak potwierdzenia");
+        assert!(matches!(&refusal, WipeRefusal::NotAvailable(d) if d.contains("produkt")));
+        // Neither does an acknowledgement naming a different array.
+        assert!(matches!(
+            wipe_command(&plan, &disk, "sdc", "foto"),
+            Err(WipeRefusal::NotAvailable(_))
+        ));
+        // Nor a truthy-looking value that is not the array's name: the
+        // acknowledgement cannot be satisfied by a client that never showed it.
+        for ack in ["true", "1", "yes", "PRODUKT"] {
+            assert!(
+                matches!(wipe_command(&plan, &disk, "sdc", ack), Err(WipeRefusal::NotAvailable(_))),
+                "'{ack}' nie jest potwierdzeniem"
+            );
+        }
+        let command = wipe_command(&plan, &disk, "sdc", "produkt").expect("potwierdzone");
+        assert_eq!(
+            command,
+            HelperCommand::DiskWipe {
+                device: "/dev/sdc".to_string(),
+                wwn: Some("wwn-produkt-data".to_string()),
+                serial: Some("serial-produkt-data".to_string()),
+                bytes: 32 * 1024 * 1024 * 1024,
+                // The array_id, so the privileged side drops the journal the
+                // admin acknowledged and not whichever one claims the disk.
+                release_journal: Some(spec.array_id.clone()),
+            }
+        );
+        assert!(command.plan().is_ok(), "uuid dziennika przechodzi walidację katalogu");
+    }
+
+    /// A disk with neither a WWN nor a serial cannot be re-identified after a
+    /// rename, and re-identification is the wipe's only protection against
+    /// reaching the wrong device. The catalog refuses such a command, so the
+    /// refusal happens before any channel is chosen.
+    #[test]
+    fn a_disk_without_any_identity_is_refused_by_the_catalog() {
+        let disk = NasDisk { wwn: None, serial: String::new(), ..used_disk() };
+        let plan = plan_wipe(&disk, None);
+        let command = wipe_command(&plan, &disk, "sdc", "").expect("plan bez odmów");
+        assert_eq!(
+            command,
+            HelperCommand::DiskWipe {
+                device: "/dev/sdc".to_string(),
+                wwn: None,
+                serial: None,
+                bytes: 32 * 1024 * 1024 * 1024,
+                release_journal: None,
+            }
+        );
+        assert!(command.plan().is_err(), "brak tożsamości nie może dojść do urządzenia");
+    }
+
+    /// The label travels with the signature it belongs to, and only with it.
+    /// A `zfs_member` or `linux_raid_member` label IS the pool or array name
+    /// and belongs in `member_of`; carrying it here too would name the wrong
+    /// thing in the wipe plan, which is the one place it is read.
+    #[test]
+    fn the_filesystem_label_is_read_with_its_own_signature_and_nowhere_else() {
+        let disks = disks_from_lsblk_json(LSBLK).unwrap();
+        let sdc = disks.iter().find(|d| d.name == "sdc").expect("sdc");
+        assert_eq!(sdc.role, "used");
+        assert_eq!(sdc.fs_type.as_deref(), Some("ext4"));
+        assert_eq!(sdc.fs_label.as_deref(), Some("old-data"));
+        // The pool member's label named the pool, so it went to `member_of`.
+        let sda = disks.iter().find(|d| d.name == "sda").expect("sda");
+        assert_eq!(sda.member_of.as_deref(), Some("tank"));
+        assert!(sda.fs_label.is_none(), "etykieta puli nie jest etykietą systemu plików");
+        assert!(sda.fs_type.is_none());
+        // And a recorded Elastic member loses both: the branch filesystem is
+        // what the array built, not a foreign occupier.
+        let mut member = sdc.clone();
+        let mut arrays = HashMap::new();
+        arrays.insert(
+            member.disk_id.clone(),
+            ("produkt".to_string(), "data".to_string()),
+        );
+        apply_array_membership(&mut member, &arrays);
+        assert_eq!(member.role, "array_member");
+        assert!(member.fs_type.is_none() && member.fs_label.is_none());
+    }
 
     #[test]
     fn lsblk_inventory_classifies_disks() {

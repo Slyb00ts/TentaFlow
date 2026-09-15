@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::tentanas::{
-    NasDataset, NasDisk, NasPropertyChange, NasSchedule, NasScheduleRow, SudoSecret,
-    TentaNasPayload as P,
+    NasDataset, NasDisk, NasDiskWipePlan, NasPropertyChange, NasSchedule, NasScheduleRow,
+    SudoSecret, TentaNasPayload as P,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 use tentanas_helper::{HelperCommand, PackageManager, SelfTestKind};
@@ -480,6 +480,95 @@ async fn disk_locate(ctx: &HandlerContext, disk_id: &str, enable: bool) -> Resul
         })),
         Err(e) => Err(broker_error("locate", e)),
     }
+}
+
+// ----- clearing a disk --------------------------------------------------------------
+//
+// One plan, read by BOTH requests. The wipe does not take the plan the browser
+// was shown — it reads its own, from a freshly refreshed inventory and the
+// node's own journals, and refuses on it. A plan the client could carry back
+// would be a decision made at dialog-open time about a device set that moves.
+
+/// The disk, refreshed, with the Elastic journal that claims it. Read-only.
+///
+/// Privileged: the journals under `/var/lib/tentanas` are `0700 root`, and a
+/// disk left over from a DISSOLVED array is claimed by one of them while
+/// nothing in the database says so — which is the single most likely reason a
+/// disk on a real node reads as `used` with a bare `xfs` signature.
+async fn wipe_plan_of(
+    g: &Gate,
+    disk_id: &str,
+    explicit: Option<&ElevationToken>,
+) -> Result<NasDiskWipePlan, ProtocolError> {
+    tentanas::disks::refresh_inventory(&g.db)
+        .await
+        .map_err(|e| internal("inventory", e))?;
+    let disk = tentanas::disks::disk(disk_id).ok_or_else(|| {
+        ProtocolError::not_found(format!("Dysk '{disk_id}' nie istnieje na tym węźle"))
+    })?;
+    let journals = tentanas::elastic::journals(&g.db, explicit)
+        .await
+        .map_err(|e| privileged_error("elastic journals", e))?;
+    let claim = tentanas::disks::journal_claim_of(&disk, &journals);
+    Ok(tentanas::disks::plan_wipe(&disk, claim))
+}
+
+async fn disk_wipe_plan(
+    ctx: &HandlerContext,
+    disk_id: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    // Gated exactly like the wipe it precedes: the refusals name this node's
+    // pools, arrays and journal owners, and that is not a read for anyone who
+    // could not perform the operation anyway.
+    let g = gate_destructive(ctx)?;
+    let explicit = secret.map(token);
+    Ok(tn(P::DiskWipePlanResponse {
+        plan: wipe_plan_of(&g, disk_id, explicit.as_deref()).await?,
+    }))
+}
+
+async fn disk_wipe(
+    ctx: &HandlerContext,
+    disk_id: &str,
+    confirm_device: &str,
+    release_journal_array: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_destructive(ctx)?;
+    let explicit = secret.map(token);
+    let plan = wipe_plan_of(&g, disk_id, explicit.as_deref()).await?;
+    let disk = tentanas::disks::disk(disk_id)
+        .ok_or_else(|| ProtocolError::not_found("Dysk zniknął z inwentarza"))?;
+    // Every gate between "an admin clicked" and "a device is opened" lives in
+    // one pure function, over the plan this node just read for ITSELF: the
+    // retyped device name, the plan's refusals and the separate journal
+    // acknowledgement. Nothing a client carried back is consulted.
+    let command = tentanas::disks::wipe_command(&plan, &disk, confirm_device, release_journal_array)
+        .map_err(|e| match e {
+            tentanas::disks::WipeRefusal::BadRequest(detail) => ProtocolError::bad_request(detail),
+            tentanas::disks::WipeRefusal::NotAvailable(detail) => {
+                ProtocolError::new(ProtocolErrorCode::NotAvailable, detail)
+            }
+        })?;
+    // Validated against the catalog before it becomes a job: a disk with
+    // neither a WWN nor a serial cannot be re-resolved after a rename, and the
+    // catalog refuses such a command — which must read as a refusal here, not
+    // as a job that fails later.
+    command
+        .plan()
+        .map_err(|e| broker_error("disk_wipe", catalog_error(e)))?;
+    let job = tentanas::jobs::spawn(
+        &g.db,
+        "disk_wipe",
+        &disk.name,
+        &g.user_id,
+        None,
+        None,
+        move |h| tentanas::disks::wipe_job(h, command, explicit),
+    )
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(job))
 }
 
 // ----- pools ------------------------------------------------------------------------
@@ -4054,6 +4143,24 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             disk_smart_test(ctx, disk_id, kind, sudo_password.as_ref()).await
         }
         P::DiskLocateRequest { disk_id, enable } => disk_locate(ctx, disk_id, *enable).await,
+        P::DiskWipePlanRequest { disk_id, sudo_password } => {
+            disk_wipe_plan(ctx, disk_id, sudo_password.as_ref()).await
+        }
+        P::DiskWipeRequest {
+            disk_id,
+            confirm_device,
+            release_journal_array,
+            sudo_password,
+        } => {
+            disk_wipe(
+                ctx,
+                disk_id,
+                confirm_device,
+                release_journal_array,
+                sudo_password.as_ref(),
+            )
+            .await
+        }
         P::AlertsListRequest { include_acked } => alerts_list(ctx, *include_acked),
         P::AlertAckRequest { alert_id } => alert_ack(ctx, alert_id),
 
@@ -4523,6 +4630,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::DisksListResponse { .. }
         | P::DiskGetResponse { .. }
         | P::DiskLocateResponse { .. }
+        | P::DiskWipePlanResponse { .. }
         | P::AlertsListResponse { .. }
         | P::PoolsListResponse { .. }
         | P::PoolGetResponse { .. }
@@ -4625,6 +4733,11 @@ register_tentanas_variant!(
     "tentaflow_ws_handler_nas_disk_smart_test"
 );
 register_tentanas_variant!("TentaNasDiskLocateRequest", "tentaflow_ws_handler_nas_disk_locate");
+register_tentanas_variant!(
+    "TentaNasDiskWipePlanRequest",
+    "tentaflow_ws_handler_nas_disk_wipe_plan"
+);
+register_tentanas_variant!("TentaNasDiskWipeRequest", "tentaflow_ws_handler_nas_disk_wipe");
 register_tentanas_variant!("TentaNasAlertsListRequest", "tentaflow_ws_handler_nas_alerts_list");
 register_tentanas_variant!("TentaNasAlertAckRequest", "tentaflow_ws_handler_nas_alert_ack");
 register_tentanas_variant!("TentaNasPoolsListRequest", "tentaflow_ws_handler_nas_pools_list");
