@@ -5874,11 +5874,20 @@ mod registration_tests {
             .unwrap_err();
         assert_eq!(missing.code, ProtocolErrorCode::NotFound);
 
-        // `/mnt/media` is not a mounted union on a test host, so the folder
-        // list is UNKNOWN — and the refusal has to say THAT rather than claim
-        // the folder does not exist. This is the clause: an unreadable union
-        // is never "this array has no folders".
-        let unknown = elastic_folder_cache_set(&fixture.ctx, "media", "foto", "only")
+        // The clause is that an unreadable union is never "this array has no
+        // folders" — but "/mnt/media does not exist on a test host" is the
+        // wrong way to produce one. MEASURED on the owner's node
+        // (2026-09-15): `/mnt/media` is a real mounted union there, so the
+        // list reads fine, `foto` is simply absent, and `NotFound` is the
+        // CORRECT answer — this assertion failed for being right. A test that
+        // only passes where the product is not installed is exactly the blind
+        // spot that let seven requests ship with no wire encoder.
+        //
+        // So the array under test is one whose union path no machine mounts.
+        let mut nowhere = tentanas::elastic::tests::create_spec("probe-unmounted-union");
+        nowhere.owner = elastic_owner(&g);
+        settled_array(&g, &nowhere).await;
+        let unknown = elastic_folder_cache_set(&fixture.ctx, "probe-unmounted-union", "foto", "only")
             .await
             .unwrap_err();
         assert_eq!(unknown.code, ProtocolErrorCode::NotAvailable);
