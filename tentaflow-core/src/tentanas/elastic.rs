@@ -7143,12 +7143,24 @@ pub(crate) mod tests {
         // that there are three of them and each names its disk.
         let wiped = plan.wiped_devices.clone();
         assert_eq!(wiped.len(), 3, "{wiped:?}");
-        for name in ["sdl", "sdm", "sdn"] {
-            assert!(
-                wiped.iter().any(|d| d.contains(name)),
-                "{name} is not among the disks the plan erases: {wiped:?}"
-            );
-        }
+        // Compared against what the plan's OWN resolver returns for the same
+        // three disks. The previous guard was `d.contains("sdl")`, which reads
+        // as machine-independent and is not: `stable_device_path` prefers a
+        // `/dev/disk/by-id/…` link, and such a link carries the disk's WWN and
+        // never its kernel name. It passed only on a host where sdl/sdm/sdn do
+        // not exist and the fallback returned `/dev/sdl`. MEASURED on the
+        // owner's node (2026-09-15), where those three names are real array
+        // members: `sdl is not among the disks the plan erases:
+        // ["/dev/disk/by-id/wwn-0x5000cca0bef1bcce", …]`.
+        let mut expected: Vec<String> =
+            [disk("sdl", 8 * TB), disk("sdn", 4 * TB), disk("sdm", 8 * TB)]
+                .iter()
+                .map(branch_device)
+                .collect();
+        expected.sort();
+        let mut got = wiped.clone();
+        got.sort();
+        assert_eq!(got, expected, "the plan erases exactly the three disks it was given");
         assert!(plan.steps_preview.contains("WIPE"), "{}", plan.steps_preview);
         assert!(
             plan.steps_preview.contains("/mnt/archiwum"),
