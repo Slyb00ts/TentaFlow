@@ -598,8 +598,19 @@ async fn refresh_fleet_exports(main_db: &DbPool, addon_id: &str, db: &DbPool) {
         return;
     };
     let active: Vec<ShareRow> = shares.into_iter().filter(|s| s.state == "active").collect();
+    // The arrays are read with the same `?`-like strictness `apply` uses, and
+    // for a harder reason here: a share on an Elastic Array union is exported
+    // under an explicit `fsid=` taken from the array's id, so a document
+    // generated without the array list would drop that option and `exportfs`
+    // would refuse the whole file. An unreadable table leaves the exports the
+    // last apply wrote exactly as they are — the fleet's addresses can wait
+    // for the next tick.
+    let Ok(arrays) = store::elastic_arrays_all(db) else {
+        tracing::warn!("tentanas: exports refresh skipped — the Elastic Array table is unreadable");
+        return;
+    };
     let clients = fleet_client_addresses(main_db, addon_id);
-    let document = super::shares::exports_document(&active, &clients);
+    let document = super::shares::exports_document(&active, &clients, &arrays);
     let previous = store::setting(db, super::shares::SETTING_EXPORTS)
         .ok()
         .flatten()

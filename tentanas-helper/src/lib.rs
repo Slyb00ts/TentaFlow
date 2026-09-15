@@ -1182,6 +1182,11 @@ pub fn validate_nfs_network(value: &str) -> Result<(), CatalogError> {
 
 /// Export options the channel is willing to write. Everything that runs code
 /// or reshapes identity mapping outside the squash flags stays out.
+///
+/// Every option listed here is a BARE FLAG. The options that carry a value are
+/// in `validate_export_option` instead, each with the rule that checks the
+/// value: a value is as much a part of the line the kernel will act on as the
+/// name is, and nothing downstream reads it — `exportfs` has no dry run.
 const EXPORT_OPTIONS: &[&str] = &[
     "rw",
     "ro",
@@ -1196,6 +1201,52 @@ const EXPORT_OPTIONS: &[&str] = &[
     "wdelay",
     "no_wdelay",
 ];
+
+/// The `fsid=` value of an export: a UUID and nothing else.
+///
+/// `fsid=` is how a filesystem with neither a device nor a UUID of its own is
+/// given an identity nfsd can put in a file handle (`man 5 exports`), and an
+/// Elastic Array's mergerfs union is exactly that filesystem. The app emits
+/// the array's own id, which is a UUID, so a UUID is the only shape accepted
+/// here: `exportfs` would also take a small decimal number, but nothing in
+/// this app writes one, and an allowance nobody exercises is an allowance
+/// nobody checks. Case-insensitive hex in 8-4-4-4-12 groups — no braces, no
+/// `urn:uuid:` prefix, no `0x`, which is also what keeps a path, a comma or a
+/// shell character out of the option list.
+fn validate_fsid(value: &str) -> Result<(), CatalogError> {
+    let groups: Vec<&str> = value.split('-').collect();
+    let shaped = groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(g, len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()));
+    if shaped {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "export option 'fsid={value}' is not a UUID"
+        )))
+    }
+}
+
+/// One option of an export's client list: a flag from the catalog, or one of
+/// the `name=value` options with its value checked.
+fn validate_export_option(opt: &str) -> Result<(), CatalogError> {
+    match opt.split_once('=') {
+        Some(("fsid", value)) => validate_fsid(value),
+        // A flag with a value is not the flag it looks like: `exportfs` reads
+        // `ro=0` as an option of its own and refuses it, and accepting the
+        // spelling here would let anything at all ride into the file behind a
+        // catalogued name.
+        Some((name, _)) if EXPORT_OPTIONS.contains(&name) => Err(invalid(format!(
+            "export option '{opt}' takes no value"
+        ))),
+        Some(_) | None if !EXPORT_OPTIONS.contains(&opt) => Err(invalid(format!(
+            "export option '{opt}' is not in the catalog"
+        ))),
+        _ => Ok(()),
+    }
+}
 
 /// One line of `/etc/exports.d/tentanas.exports`:
 /// `<path> <client>(<opts>) [<client>(<opts>) …]`. `exportfs` has no dry run,
@@ -1218,10 +1269,7 @@ pub fn validate_export_line(line: &str) -> Result<(), CatalogError> {
         };
         validate_nfs_network(&entry[..open])?;
         for opt in rest[open + 1..].split(',') {
-            let name = opt.split_once('=').map(|(k, _)| k).unwrap_or(opt);
-            if !EXPORT_OPTIONS.contains(&name) {
-                return Err(invalid(format!("export option '{opt}' is not in the catalog")));
-            }
+            validate_export_option(opt)?;
         }
         clients += 1;
     }
@@ -3791,6 +3839,42 @@ mod tests {
             "/mnt/tank/backups 10.10.0.0/24(rw,no_root_squash,exec_me)",
             "/mnt/tank/backups (rw)",
             "/mnt/../etc 10.10.0.0/24(rw)",
+        ] {
+            assert!(validate_export_line(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_elastic_array_union_is_exported_under_a_uuid_and_nothing_else() {
+        // The exact line core generates for a share on an array union: the
+        // mergerfs mount has no device and no filesystem UUID, so `fsid=` is
+        // what gives NFS an identity to put in a file handle.
+        assert!(validate_export_line(
+            "/mnt/media 10.10.0.0/24(rw,sync,root_squash,no_subtree_check,fsid=01a099b1-800b-7e01-9d10-8cac34a2257d)"
+        )
+        .is_ok());
+        assert!(validate_export_line(
+            "/mnt/media 10.10.0.6(rw,sync,root_squash,no_subtree_check,fsid=0BA4F7C2-9D31-7B44-8F70-2C1D7E9A5B06)"
+        )
+        .is_ok());
+        // `exportfs` has no dry run: a value that is not a UUID has to die
+        // here, because the next thing that would read it is the kernel.
+        for bad in [
+            "/mnt/media 10.10.0.0/24(rw,fsid=)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=0)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=17)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=01a099b1-800b-7e01-9d10-8cac34a2257)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=01a099b1800b7e019d108cac34a2257d)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=01a099b1-800b-7e01-9d10-8cac34a2257z)",
+            "/mnt/media 10.10.0.0/24(rw,fsid={01a099b1-800b-7e01-9d10-8cac34a2257d})",
+            "/mnt/media 10.10.0.0/24(rw,fsid=urn:uuid:01a099b1-800b-7e01-9d10-8cac34a2257d)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=/etc/passwd)",
+            // A name the catalog knows is not an option the catalog allows a
+            // value on, and `fsid` alone is not a flag.
+            "/mnt/media 10.10.0.0/24(rw,fsid)",
+            "/mnt/media 10.10.0.0/24(rw=1,sync)",
+            "/mnt/media 10.10.0.0/24(no_subtree_check=0)",
+            "/mnt/media 10.10.0.0/24(sync,uuid=01a099b1-800b-7e01-9d10-8cac34a2257d)",
         ] {
             assert!(validate_export_line(bad).is_err(), "{bad}");
         }

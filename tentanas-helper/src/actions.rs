@@ -376,6 +376,30 @@ fn smb_config_write(payload: &[u8]) -> Result<String, String> {
     Ok(log.join("\n"))
 }
 
+/// Writes the app-owned exports file and makes it live.
+///
+/// The file is applied AS A WHOLE and rolled back as a whole: `exportfs -ra`
+/// reads the whole file, and if it refuses anything in it the previous file is
+/// put back and re-applied, so the node keeps serving exactly what it served
+/// before and the apply fails with `exportfs`'s own message — which names the
+/// path it refused.
+///
+/// Attributing the failure to the offending share and keeping the other
+/// exports was weighed when Elastic Array unions became exportable — a union
+/// is the shape most likely to be refused, because it is a FUSE mount that
+/// only an explicit `fsid=` can identify — and deliberately not done. Deciding
+/// WHICH share to drop means parsing `exportfs`'s human-readable, untranslated
+/// stderr, and acting on that guess would silently unshare a share the admin
+/// created: core stores the document it generated after a successful write and
+/// the reconcile loop compares the next one against it, so a file that no
+/// longer matches the desired state would never be retried while the share
+/// still reported itself active. An all-or-nothing apply keeps one answer for
+/// "what is this node exporting" — the file — and turns a bad export into a
+/// failed apply the UI shows rather than a share that is configured, healthy
+/// and unreachable.
+///
+/// Either way the file on disk is never half-written: the write and the
+/// rollback both go through `write_atomic`'s rename.
 fn nfs_exports_write(payload: &[u8]) -> Result<String, String> {
     let text = std::str::from_utf8(payload).map_err(|_| "exports file is not UTF-8")?;
     for line in text.lines() {

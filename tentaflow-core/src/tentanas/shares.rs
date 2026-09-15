@@ -185,8 +185,10 @@ pub fn smb_document(shares: &[ShareRow], ksmbd_interfaces: &[String]) -> String 
 // exports generation
 // =============================================================================
 
-/// The option list of one export as the share configured it.
-pub fn export_options(nfs: &NasNfsOptions) -> String {
+/// The option list of one export as the share configured it. `fsid` is the
+/// identity the path has to be exported under when the kernel cannot derive
+/// one (`export_fsid`), and `None` for every path that needs no help.
+pub fn export_options(nfs: &NasNfsOptions, fsid: Option<&str>) -> String {
     let mut opts = vec![if nfs.read_only { "ro" } else { "rw" }];
     opts.push(if nfs.async_writes { "async" } else { "sync" });
     opts.push(if nfs.root_squash {
@@ -194,10 +196,74 @@ pub fn export_options(nfs: &NasNfsOptions) -> String {
     } else {
         "no_root_squash"
     });
-    // Subtree checks break on a renamed open file and buy nothing on a
-    // whole-dataset export, which is the only shape this app produces.
+    // Subtree checks break on a renamed open file — the handle a client holds
+    // encodes where the file sits under the export root, so a rename by
+    // another client turns it stale — and the app takes that trade on every
+    // shape it produces. Since Elastic Arrays became shareable that is no
+    // longer only the whole-dataset export it once was: a source may be a
+    // directory inside a dataset, an array union, or a directory inside one
+    // (`source_owner`). Subtree checking those would cost the renames without
+    // buying anything the app needs, because the isolation it is for is
+    // already decided before the line is written — every exported path was
+    // resolved against this node's own pools and unions, never taken from a
+    // client.
     opts.push("no_subtree_check");
-    opts.join(",")
+    let mut out = opts.join(",");
+    if let Some(fsid) = fsid {
+        // LAST, and only for a path that needs it: a dataset export's option
+        // string stays byte-for-byte what it has always been, so an apply
+        // that adds an array share does not rewrite the entry of every
+        // dataset share the node already serves.
+        out.push_str(",fsid=");
+        out.push_str(fsid);
+    }
+    out
+}
+
+/// The identity NFS has to be given for an export it cannot identify on its
+/// own, or `None` when it can.
+///
+/// A ZFS dataset answers `statfs` with a filesystem id of its own and the
+/// kernel's export code can identify it without help, so its line needs
+/// nothing — and must keep needing nothing, because rewriting the entry of a
+/// path clients are using buys nobody anything. An Elastic Array union has no
+/// such identity at all: mergerfs is a FUSE mount whose filesystem id is 0,
+/// which has no device id, and which `blkid` knows nothing about.
+/// `man 5 exports` is explicit
+/// about that case — "not all filesystems are stored on devices, and not all
+/// filesystems have UUIDs … it is sometimes necessary to explicitly tell NFS
+/// how to identify a filesystem. This is done with the fsid= option" — so
+/// without it `exportfs` refuses the line and an array stays reachable over
+/// SMB only.
+///
+/// The value is the array's OWN `array_id`: the UUID every other Elastic table
+/// already keys on, generated once when the array was created, unchanged by a
+/// remount, a rename or a reboot, and unique per node without a counter this
+/// app would have to keep in step with the exports file. A share on a
+/// DIRECTORY inside the union gets a UUID derived from that id and the
+/// directory's path inside the union, because two exports of ONE filesystem
+/// must not carry the same fsid — nfsd would then resolve a handle of one
+/// export into the other. v5 keeps the derivation a pure function of the two,
+/// so the same share is exported under the same identity on every apply.
+///
+/// `None` for a row whose persisted intention could not be read at all, or
+/// whose id is not a UUID: there is then no stable identity to hand the
+/// kernel, and inventing one would give clients handles that break the next
+/// time the array is applied. The line is generated as it was before arrays
+/// were shareable and `exportfs` refuses it by name, which is the loud failure
+/// that case deserves.
+pub fn export_fsid(arrays: &[ElasticArrayRow], path: &str) -> Option<String> {
+    let array = arrays.iter().find(|a| at_or_below(&a.union_path(), path))?;
+    let namespace = uuid::Uuid::parse_str(array.array_id()?).ok()?;
+    let inside = path
+        .strip_prefix(&array.union_path())
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    Some(if inside.is_empty() {
+        namespace.to_string()
+    } else {
+        uuid::Uuid::new_v5(&namespace, inside.as_bytes()).to_string()
+    })
 }
 
 /// The options a FLEET mount gets. Fleet traffic is node-to-node over the LAN
@@ -205,15 +271,39 @@ pub fn export_options(nfs: &NasNfsOptions) -> String {
 /// root, hence `root_squash` regardless of what the share itself allows.
 pub const FLEET_EXPORT_OPTIONS: &str = "rw,sync,root_squash,no_subtree_check";
 
+/// The fleet options of one path: the constant above plus the `fsid=` the path
+/// needs. A fleet export of an Elastic Array union needs it for exactly the
+/// reason the share's own export does — it is the same mergerfs mount, offered
+/// to the peers instead of to the LAN — and a fleet-mounted array whose line
+/// lacked it would take the whole exports file down with it (`exportfs -ra`
+/// applies the file as a whole).
+fn fleet_export_options(fsid: Option<&str>) -> String {
+    match fsid {
+        Some(fsid) => format!("{FLEET_EXPORT_OPTIONS},fsid={fsid}"),
+        None => FLEET_EXPORT_OPTIONS.to_string(),
+    }
+}
+
 /// The whole exports file: one line per exported path with every client of
 /// that path, because `exportfs` warns about a directory listed twice. The
 /// share's own clients win over the fleet clients when both name the same
 /// address — the admin's intent for that address is the explicit one.
-pub fn exports_document(shares: &[ShareRow], fleet_clients: &[String]) -> String {
+///
+/// `arrays` is the node's Elastic Arrays, and it is the only authority on
+/// whether a path is an array union: a share on one carries no dataset, but
+/// neither does a share on a directory INSIDE a dataset, and that one must not
+/// be given an fsid. Pass the arrays of the NODE (`elastic_arrays_all`), not
+/// of one owner — the union is a mountpoint of the node, and an array missing
+/// from the list produces an export the kernel refuses.
+pub fn exports_document(
+    shares: &[ShareRow],
+    fleet_clients: &[String],
+    arrays: &[ElasticArrayRow],
+) -> String {
     let mut by_path: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
     for share in shares {
         if let Some(nfs) = share.nfs.as_ref() {
-            let opts = export_options(nfs);
+            let opts = export_options(nfs, export_fsid(arrays, &share.source_path).as_deref());
             let clients: Vec<String> = if nfs.networks.is_empty() {
                 vec!["*".to_string()]
             } else {
@@ -228,10 +318,11 @@ pub fn exports_document(shares: &[ShareRow], fleet_clients: &[String]) -> String
         }
     }
     for share in shares.iter().filter(|s| s.fleet_mount) {
+        let opts = fleet_export_options(export_fsid(arrays, &share.source_path).as_deref());
         let entry = by_path.entry(share.source_path.as_str()).or_default();
         for client in fleet_clients {
             if !entry.iter().any(|(c, _)| c == client) {
-                entry.push((client.clone(), FLEET_EXPORT_OPTIONS.to_string()));
+                entry.push((client.clone(), opts.clone()));
             }
         }
     }
@@ -634,7 +725,7 @@ pub async fn apply(
     // mounted fleet-wide.
     if service_installed("nfs") {
         let clients = super::fleet_mounts::fleet_client_addresses(main_db, addon_id);
-        let document = exports_document(&active, &clients);
+        let document = exports_document(&active, &clients, &arrays);
         run(
             db,
             &HelperCommand::NfsExportsWrite {},
@@ -856,7 +947,7 @@ pub async fn remove_all(db: &DbPool, explicit: Option<&ElevationToken>) -> Vec<S
         }
     }
     if Path::new(tentanas_helper::NFS_EXPORTS_PATH).exists() {
-        let empty = exports_document(&[], &[]);
+        let empty = exports_document(&[], &[], &[]);
         if let Err(e) = run(
             db,
             &HelperCommand::NfsExportsWrite {},
@@ -1429,27 +1520,219 @@ mod tests {
     #[test]
     fn export_options_follow_the_wizard_toggles() {
         assert_eq!(
-            export_options(&NasNfsOptions {
-                networks: vec![],
+            export_options(
+                &NasNfsOptions {
+                    networks: vec![],
+                    read_only: false,
+                    root_squash: true,
+                    async_writes: false,
+                    rdma: false,
+                    audit: false,
+                },
+                None
+            ),
+            "rw,sync,root_squash,no_subtree_check"
+        );
+        assert_eq!(
+            export_options(
+                &NasNfsOptions {
+                    networks: vec![],
+                    read_only: true,
+                    root_squash: false,
+                    async_writes: true,
+                    rdma: false,
+                    audit: false,
+                },
+                None
+            ),
+            "ro,async,no_root_squash,no_subtree_check"
+        );
+        // The same toggles on an Elastic Array union: the identity the kernel
+        // cannot derive is appended, and nothing before it moves.
+        assert_eq!(
+            export_options(
+                &NasNfsOptions {
+                    networks: vec![],
+                    read_only: false,
+                    root_squash: true,
+                    async_writes: false,
+                    rdma: false,
+                    audit: false,
+                },
+                Some(MEDIA_ARRAY_ID)
+            ),
+            format!("rw,sync,root_squash,no_subtree_check,fsid={MEDIA_ARRAY_ID}")
+        );
+    }
+
+    /// The `array_id` of an Elastic Array: the UUID the node generated when the
+    /// array was created (`nas_elastic_arrays.array_id`), which is what an
+    /// export of the array's union is identified by.
+    const MEDIA_ARRAY_ID: &str = "01a099b1-800b-7e01-9d10-8cac34a2257d";
+    const ARCHIVE_ARRAY_ID: &str = "0ba4f7c2-9d31-7b44-8f70-2c1d7e9a5b06";
+
+    /// An array with its persisted intention, so `array_id()` answers. The
+    /// `array()` fixture below deliberately has none — a row whose intention
+    /// could not be read — so the two cover both halves of `export_fsid`.
+    fn shared_array(name: &str, array_id: &str) -> ElasticArrayRow {
+        let mut spec = crate::tentanas::elastic::tests::create_spec(name);
+        spec.array_id = array_id.to_string();
+        ElasticArrayRow {
+            create_spec: Some(spec),
+            ..array(name, "active")
+        }
+    }
+
+    fn nfs_share(name: &str, source_path: &str, networks: &[&str]) -> ShareRow {
+        ShareRow {
+            share_id: format!("s-{name}"),
+            name: name.to_string(),
+            protocol: "nfs".into(),
+            source_path: source_path.to_string(),
+            dataset: None,
+            smb: None,
+            nfs: Some(NasNfsOptions {
+                networks: networks.iter().map(|n| (*n).to_string()).collect(),
                 read_only: false,
                 root_squash: true,
                 async_writes: false,
                 rdma: false,
                 audit: false,
             }),
-            "rw,sync,root_squash,no_subtree_check"
+            fleet_mount: false,
+            ..smb_share(NasSmbOptions::default())
+        }
+    }
+
+    #[test]
+    fn an_array_union_is_exported_under_the_array_uuid_and_a_dataset_is_not() {
+        let arrays = vec![shared_array("media", MEDIA_ARRAY_ID)];
+        let document = exports_document(
+            &[
+                nfs_share("media", "/mnt/media", &["10.10.0.0/24"]),
+                nfs_share("backups", "/mnt/tank/backups", &["10.10.0.0/24"]),
+            ],
+            &[],
+            &arrays,
         );
+        let lines: Vec<String> = document
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(str::to_string)
+            .collect();
         assert_eq!(
-            export_options(&NasNfsOptions {
-                networks: vec![],
-                read_only: true,
-                root_squash: false,
-                async_writes: true,
-                rdma: false,
-                audit: false,
-            }),
-            "ro,async,no_root_squash,no_subtree_check"
+            lines,
+            vec![
+                // mergerfs has no device and no filesystem UUID, so this line
+                // is the whole reason an array could not be exported at all.
+                format!(
+                    "/mnt/media 10.10.0.0/24(rw,sync,root_squash,no_subtree_check,fsid={MEDIA_ARRAY_ID})"
+                ),
+                // And the dataset keeps the option string it has always had:
+                // changing it would re-export a path every client is using.
+                "/mnt/tank/backups 10.10.0.0/24(rw,sync,root_squash,no_subtree_check)".to_string(),
+            ]
         );
+        // The line the generator writes is the line the privileged side
+        // accepts — `exportfs` has no dry run, so this parser is the only
+        // check before the kernel.
+        for line in document.lines() {
+            assert!(
+                tentanas_helper::validate_export_line(line).is_ok(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_whole_dataset_is_exported_without_an_fsid() {
+        // The shape the option comment used to say this app never produces. It
+        // carries no dataset either, exactly like an array union — which is
+        // why the array list decides the fsid and the missing dataset does not.
+        let arrays = vec![shared_array("media", MEDIA_ARRAY_ID)];
+        let share = nfs_share("zdjecia", "/mnt/tank/projekty/zdjecia", &["10.10.0.5"]);
+        assert_eq!(share.dataset, None);
+        assert_eq!(export_fsid(&arrays, &share.source_path), None);
+        let document = exports_document(&[share], &[], &arrays);
+        assert!(
+            document.contains(
+                "/mnt/tank/projekty/zdjecia 10.10.0.5(rw,sync,root_squash,no_subtree_check)\n"
+            ),
+            "{document}"
+        );
+        assert!(!document.contains("fsid"), "{document}");
+    }
+
+    #[test]
+    fn every_export_of_one_union_gets_an_identity_of_its_own() {
+        let arrays = vec![
+            shared_array("media", MEDIA_ARRAY_ID),
+            shared_array("archiwum", ARCHIVE_ARRAY_ID),
+        ];
+        let union = export_fsid(&arrays, "/mnt/media").unwrap();
+        let films = export_fsid(&arrays, "/mnt/media/filmy").unwrap();
+        let music = export_fsid(&arrays, "/mnt/media/muzyka").unwrap();
+        let second = export_fsid(&arrays, "/mnt/archiwum").unwrap();
+        assert_eq!(union, MEDIA_ARRAY_ID);
+        assert_eq!(second, ARCHIVE_ARRAY_ID);
+        // Two exports of ONE filesystem may not share an fsid: nfsd would
+        // resolve a handle of one of them inside the other.
+        let mut all = vec![&union, &films, &music, &second];
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 4);
+        // Derived, not invented: the same directory is exported under the same
+        // identity on every apply, so the handles a client cached survive one.
+        assert_eq!(films, export_fsid(&arrays, "/mnt/media/filmy").unwrap());
+        // And a derived value is a UUID too, so the boundary accepts it.
+        for value in [&films, &music] {
+            let line =
+                format!("/mnt/media/x 10.10.0.5(rw,sync,root_squash,no_subtree_check,fsid={value})");
+            assert!(tentanas_helper::validate_export_line(&line).is_ok(), "{line}");
+        }
+        // A directory that merely starts like the union is not on the array,
+        // and a row whose intention could not be read has no identity to give.
+        assert_eq!(export_fsid(&arrays, "/mnt/media-old"), None);
+        assert_eq!(export_fsid(&arrays, "/mnt/tank/media"), None);
+        assert_eq!(export_fsid(&[array("media", "active")], "/mnt/media"), None);
+    }
+
+    #[test]
+    fn a_fleet_export_of_an_array_union_is_identified_too() {
+        // The fleet export is the same mergerfs mount offered to the peers, so
+        // it needs the same identity; without it the line the peers get would
+        // make `exportfs -ra` refuse the whole file.
+        let arrays = vec![shared_array("media", MEDIA_ARRAY_ID)];
+        let on_array = ShareRow {
+            source_path: "/mnt/media".into(),
+            dataset: None,
+            fleet_mount: true,
+            ..smb_share(NasSmbOptions::default())
+        };
+        let document = exports_document(
+            &[on_array, smb_share(NasSmbOptions::default())],
+            &["10.10.0.6".to_string()],
+            &arrays,
+        );
+        assert!(
+            document.contains(&format!(
+                "/mnt/media 10.10.0.6({FLEET_EXPORT_OPTIONS},fsid={MEDIA_ARRAY_ID})"
+            )),
+            "{document}"
+        );
+        // The dataset share's fleet line keeps the constant it always had.
+        assert!(
+            document.contains(&format!(
+                "/mnt/tank/projekty 10.10.0.6({FLEET_EXPORT_OPTIONS})"
+            )),
+            "{document}"
+        );
+        for line in document.lines() {
+            assert!(
+                tentanas_helper::validate_export_line(line).is_ok(),
+                "{line}"
+            );
+        }
     }
 
     #[test]
@@ -1476,6 +1759,7 @@ mod tests {
         let document = exports_document(
             &[smb_share(NasSmbOptions::default()), nfs],
             &["10.10.0.6".to_string(), "10.10.0.7".to_string()],
+            &[],
         );
         let lines: Vec<&str> = document.lines().filter(|l| !l.starts_with('#')).collect();
         assert_eq!(
@@ -1509,6 +1793,7 @@ mod tests {
                 ..smb_share(NasSmbOptions::default())
             }],
             &["10.10.0.6".to_string()],
+            &[],
         );
         assert!(single.contains("10.10.0.6(ro,sync,root_squash,no_subtree_check)"));
         assert_eq!(single.matches("10.10.0.6(").count(), 1);
@@ -1516,7 +1801,7 @@ mod tests {
 
     #[test]
     fn an_empty_fleet_and_no_shares_still_produce_a_valid_file() {
-        let document = exports_document(&[], &[]);
+        let document = exports_document(&[], &[], &[]);
         assert!(document.lines().all(|l| l.starts_with('#')));
         assert!(tentanas_helper::validate_smb_config(&smb_document(&[], &[])).is_ok());
     }
@@ -1848,7 +2133,7 @@ mod tests {
             fleet_mount: false,
             ..smb_share(NasSmbOptions::default())
         };
-        let document = exports_document(&[share], &[]);
+        let document = exports_document(&[share], &[], &[]);
         assert!(!document.contains("rdma"), "{document}");
         for line in document.lines() {
             assert!(tentanas_helper::validate_export_line(line).is_ok(), "{line}");
