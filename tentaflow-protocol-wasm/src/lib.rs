@@ -22768,14 +22768,106 @@ pub fn encode_tentanas_elastic_scrub_schedule_set_request(
     encode_tentanas_json_request("ElasticScrubScheduleSetRequest", &request_json)
 }
 
+/// Koduje żądanie ElasticFolderCacheSetRequest w rodzinie TentaNAS — polityka
+/// cache jednego folderu (kolumna „Cache" w n11).
+#[wasm_bindgen(js_name = encodeTentaNasElasticFolderCacheSetRequest)]
+pub fn encode_tentanas_elastic_folder_cache_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticFolderCacheSetRequest", &request_json)
+}
+
+/// Plan wyczyszczenia dysku — co zostanie usunięte i każda odmowa.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasDiskWipePlanRequest)]
+pub fn encode_tentanas_disk_wipe_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskWipePlanRequest", &request_json)
+}
+
+/// Wyczyszczenie dysku: przepisana nazwa urządzenia i osobne potwierdzenie macierzy.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasDiskWipeRequest)]
+pub fn encode_tentanas_disk_wipe_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskWipeRequest", &request_json)
+}
+
+/// Skan macierzy Elastic obecnych na węźle, których baza nie zna.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayImportScanRequest)]
+pub fn encode_tentanas_elastic_array_import_scan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayImportScanRequest", &request_json)
+}
+
+/// Adopcja jednej zeskanowanej macierzy do tej instancji.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayImportRequest)]
+pub fn encode_tentanas_elastic_array_import_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayImportRequest", &request_json)
+}
+
+/// Naprawa macierzy Elastic po awarii jednego dysku danych.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayFixRequest)]
+pub fn encode_tentanas_elastic_array_fix_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayFixRequest", &request_json)
+}
+
+/// Dodanie dysku danych do działającej macierzy Elastic.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayAddDiskRequest)]
+pub fn encode_tentanas_elastic_array_add_disk_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayAddDiskRequest", &request_json)
+}
+
+/// Rozwiązanie macierzy Elastic; dyski zachowują systemy plików.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayDestroyRequest)]
+pub fn encode_tentanas_elastic_array_destroy_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayDestroyRequest", &request_json)
+}
+
 #[cfg(test)]
 mod elastic_codec_tests {
     use super::*;
 
     #[test]
     fn elastic_encoders_roundtrip_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 12] = [
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 20] = [
             ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
+            ("DiskWipePlanRequest", encode_tentanas_disk_wipe_plan_request,
+                r#"{"disk_id":"wwn-0x5000c500a1b2c3d4"}"#),
+            ("DiskWipeRequest", encode_tentanas_disk_wipe_request,
+                r#"{"disk_id":"wwn-0x5000c500a1b2c3d4","confirm_device":"sdc","release_journal_array":"media"}"#),
+            ("ElasticArrayImportScanRequest", encode_tentanas_elastic_array_import_scan_request, "{}"),
+            ("ElasticArrayImportRequest", encode_tentanas_elastic_array_import_request,
+                r#"{"array_id":"3f1c9a64-5b27-4d8e-9c11-2ae7f4b0d853","confirm_name":"media"}"#),
+            ("ElasticArrayFixRequest", encode_tentanas_elastic_array_fix_request,
+                r#"{"name":"media","disk":"d1","confirm_disk":"d1"}"#),
+            ("ElasticArrayAddDiskRequest", encode_tentanas_elastic_array_add_disk_request,
+                r#"{"name":"media","disk_id":"wwn-0x5000c500a1b2c3d4","confirm_name":"media"}"#),
+            ("ElasticArrayDestroyRequest", encode_tentanas_elastic_array_destroy_request,
+                r#"{"name":"media","confirm_name":"media"}"#),
             ("ElasticArrayPlanRequest", encode_tentanas_elastic_array_plan_request,
                 r#"{"name":"dane","filesystem":"ext4","data_disk_ids":["d1"],"parity_disk_ids":["p1"],"cache_disk_ids":[]}"#),
             ("ElasticArrayCreateRequest", encode_tentanas_elastic_array_create_request,
@@ -22799,6 +22891,10 @@ mod elastic_codec_tests {
                 r#"{"name":"dane","enabled":true,"schedule":{"every":"daily","hour":3,"minute":0,"weekday":0,"day":1}}"#),
             ("ElasticScrubScheduleSetRequest", encode_tentanas_elastic_scrub_schedule_set_request,
                 r#"{"name":"dane","enabled":false,"schedule":{"every":"weekly","hour":4,"minute":0,"weekday":0,"day":1}}"#),
+            // The per-folder cache policy: three required fields, and 'yes' is
+            // how a folder goes back to the default rather than a fourth value.
+            ("ElasticFolderCacheSetRequest", encode_tentanas_elastic_folder_cache_set_request,
+                r#"{"name":"dane","folder":"foto","cache_policy":"only"}"#),
         ];
         for (variant, encode, fields) in cases {
             let bytes = encode(fields.to_owned()).unwrap();

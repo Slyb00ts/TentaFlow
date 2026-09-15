@@ -2548,6 +2548,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElasticScrubScheduleSetRequest { .. } => {
                     "TentaNasElasticScrubScheduleSetRequest"
                 }
+                Tn::ElasticFolderCacheSetRequest { .. } => {
+                    "TentaNasElasticFolderCacheSetRequest"
+                }
             }
         }
         MessageBody::TentaVmBody(p) => {

@@ -2899,6 +2899,71 @@ pub(crate) mod execution {
             Ok(journal.spec)
         }
 
+        /// Appends ONE data disk to a persisted spec, and nothing else.
+        ///
+        /// Like `reown` it cannot go through `save`, and for the same reason:
+        /// `save` refuses every spec change ("zmiana trwałej specyfikacji
+        /// Elastic"), which is what stops any other writer from reshaping an
+        /// array underneath its own journal. The array's headline operation is
+        /// a spec change, so it needs a road of its own — narrow enough that
+        /// "append one data disk" is the only thing it can possibly do.
+        ///
+        /// WHAT MAKES IT NARROW is that the caller hands over no spec. The
+        /// stored journal is re-read here, under the array lock the caller
+        /// already holds, and the only edit is a push onto `data` — so there
+        /// is no in-memory spec that could have drifted, and no comparison to
+        /// get wrong. Every invariant `save` enforces is then re-checked:
+        /// `ElasticCreateSpec::validate` is what refuses a 33rd device, a
+        /// repeated disk identity and a parity smaller than the array's
+        /// largest data disk, all judged on the array the add would produce.
+        ///
+        /// Idempotent: a journal whose last data disk is already this one is
+        /// returned unchanged, so a retry after an interrupted add resumes
+        /// instead of appending the same disk twice.
+        ///
+        /// Returns the journal as it now stands on disk, because the caller
+        /// must go on saving THAT: a later `save` still compares against the
+        /// stored spec, and an in-memory copy from before the growth would be
+        /// refused by the very rule this function exists beside.
+        fn grow_data(
+            &self,
+            array_id: &str,
+            disk: &ElasticDiskSpec,
+        ) -> Result<Journal, String> {
+            let mut journal = self.load(array_id)?;
+            if journal.spec.data.last() == Some(disk) {
+                return Ok(journal);
+            }
+            // A disk already present in ANY role is refused by `validate`
+            // below as a repeated identity; this says so in the caller's terms
+            // first, because "powtórzona tożsamość nośnika" reads as a
+            // corrupted journal rather than as "that disk is already yours".
+            if journal
+                .spec
+                .data
+                .iter()
+                .chain(journal.spec.cache.iter())
+                .chain(&journal.spec.parity)
+                .any(|member| member.disk_id == disk.disk_id)
+            {
+                return Err("dysk jest już członkiem tej macierzy".into());
+            }
+            journal.spec.data.push(disk.clone());
+            journal.spec.validate().map_err(|e| e.to_string())?;
+            validate_topology(&journal)?;
+            validate_operation_record(&journal)?;
+            let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > JOURNAL_LIMIT {
+                return Err("journal przekroczyłby limit odczytu".into());
+            }
+            atomic_write(
+                &self.path.join(format!("{}.json", journal.spec.array_id)),
+                &bytes,
+                self.uid,
+            )?;
+            Ok(journal)
+        }
+
         fn reserve(
             &self,
             spec: &ElasticCreateSpec,
@@ -7506,12 +7571,12 @@ pub(crate) mod execution {
                     // refuses. The name is blanked because THIS array's name
                     // is legitimately taken — by this array.
                     claims_guard(&others, &candidate)?;
-                    journal.spec.data.push(disk.clone());
-                    // The 32-device ceiling and the identity uniqueness of the
-                    // whole array, re-checked on the array the add would
-                    // produce rather than on the disk alone.
-                    journal.spec.validate().map_err(|e| e.to_string())?;
-                    root.save(&journal)?;
+                    // The ONE road a persisted spec may grow by. It cannot go
+                    // through `save`, which refuses every spec change so that
+                    // no other writer can reshape an array underneath its own
+                    // journal — and it re-reads the stored journal, so what
+                    // the caller goes on saving is what is now on disk.
+                    journal = root.grow_data(&journal.spec.array_id, disk)?;
                 }
             }
             let slot = journal.spec.data.len();
@@ -7656,7 +7721,7 @@ pub(crate) mod execution {
             }
         }
         if let Some(anchor) = &anchor {
-            elastic_namespace::stop(&private_paths(&journal.spec), anchor)?;
+            elastic_namespace::stop(anchor)?;
             released.extend(
                 roles(&journal.spec)
                     .into_iter()
@@ -8786,13 +8851,18 @@ pub(crate) mod execution {
         // the job log. They are commands, not prose: the sentence explaining
         // what the admin lost belongs to the core, which owns the UI language.
         let mut steps = vec![format!("open(O_RDWR|O_EXCL) {}", resolved.path)];
-        let mut journal_released = None;
-        if let Some(array_id) = &release {
-            let journal = root.load(array_id)?;
-            root.forget(&journal)?;
-            steps.push(format!("rm {ROOT}/{array_id}.json"));
-            journal_released = Some(journal.spec.name);
-        }
+        // The journal is released AFTER the verified erase, never before. Held
+        // the other way round, a `wipefs` that then failed — an absent tool, a
+        // device that went away, a refusal — left the array permanently
+        // unimportable AND disarmed the acknowledgement guard on every sibling
+        // disk, because no journal claimed them any more. That is a regression
+        // of the exact guard the 2026-09-15 near-miss motivated.
+        //
+        // `drop(gate)` stays here and is not an oversight: `wipefs` takes its
+        // own `O_EXCL`, so holding ours would make it fail with EBUSY. The gate
+        // did its job — it is the thing that proved no namespace holds this
+        // device — and the window between the two opens belongs to the kernel,
+        // not to us.
         drop(gate);
         let wipefs = tool(&["/usr/sbin/wipefs", "/sbin/wipefs", "/usr/bin/wipefs"])?;
         steps.push(format!("wipefs --all {}", resolved.path));
@@ -8808,6 +8878,24 @@ pub(crate) mod execution {
                 resolved.path,
                 remaining.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>().join(", ")
             ));
+        }
+        let mut journal_released = None;
+        if let Some(array_id) = &release {
+            let journal = root.load(array_id)?;
+            let name = journal.spec.name.clone();
+            // The disk is already erased at this point, so a failure here is
+            // NOT "nothing happened". Say both halves: the operation did not
+            // complete, and what it did do is irreversible.
+            root.forget(&journal).map_err(|e| {
+                format!(
+                    "{}: urządzenie zostało wyczyszczone, ale dziennik macierzy '{}' nie został \
+                     zwolniony ({e}) — dysk jest już pusty, a rezerwacja pozostaje; powtórz \
+                     zwolnienie",
+                    resolved.path, name
+                )
+            })?;
+            steps.push(format!("rm {ROOT}/{array_id}.json"));
+            journal_released = Some(name);
         }
         serde_json::to_string(&DiskWipeResult {
             device: resolved.path.clone(),
@@ -9174,19 +9262,36 @@ pub(crate) mod execution {
         }
 
         fn legacy_journal(root: &Root) -> Journal {
+            legacy_journal_of(root, &spec(), "prepared", serde_json::json!([]), serde_json::Value::Null)
+        }
+
+        /// A schema-1 journal of any spec, written the way a node from before
+        /// the private topology wrote one.
+        ///
+        /// It exists so the lifecycle refusals can be reached with no worker:
+        /// a schema-2 journal carries a private topology, and every operation
+        /// on one demands a confirmed publication before it looks at anything
+        /// else — which is the first refusal and would hide all the others.
+        fn legacy_journal_of(
+            root: &Root,
+            spec: &ElasticCreateSpec,
+            stage: &str,
+            formatted: serde_json::Value,
+            sync_completed_at: serde_json::Value,
+        ) -> Journal {
             let bytes = serde_json::to_vec(&serde_json::json!({
-                "schema": 1, "spec": spec(), "stage": "prepared", "formatted": [],
-                "pending": null, "boot_id": boot(), "sync_completed_at": null,
+                "schema": 1, "spec": spec, "stage": stage, "formatted": formatted,
+                "pending": null, "boot_id": boot(), "sync_completed_at": sync_completed_at,
                 "detail": null, "last_run": null
             }))
             .expect("publiczny historyczny format");
             atomic_write(
-                &root.path.join(format!("{}.json", spec().array_id)),
+                &root.path.join(format!("{}.json", spec.array_id)),
                 &bytes,
                 root.uid,
             )
             .expect("historyczny journal");
-            root.load(&spec().array_id).expect("odczyt schema 1")
+            root.load(&spec.array_id).expect("odczyt schema 1")
         }
 
         // ----- clearing a disk -------------------------------------------------
@@ -10724,6 +10829,218 @@ Nothing to do
             let mut foreign = root.load(&spec().array_id).expect("load");
             foreign.spec.owner = ElasticOwner { org_id: "org".into(), addon_id: "nas".into() };
             assert!(root.save(&foreign).is_err(), "even the owner cannot travel through save");
+        }
+
+        /// THE DEFECT THIS PINS: the array's headline operation persisted its
+        /// new disk with `save`, and `save` refuses every spec change — so the
+        /// online add could not work at all, and no test called the persist
+        /// path to find out. `grow_data` is the narrow road it needs, and the
+        /// refusal `save` carries has to keep refusing everything else.
+        #[test]
+        fn a_persisted_spec_grows_by_one_data_disk_and_by_nothing_else() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            let added = ElasticDiskSpec {
+                disk_id: "serial:grown".into(),
+                serial: Some("grown".into()),
+                wwn: None,
+                bytes: 32 << 30,
+                expected_uuid: "77777777-7777-4777-8777-777777777777".into(),
+            };
+
+            // IT GROWS, and the growth is on disk for the next command to read.
+            let grown = root
+                .grow_data(&spec().array_id, &added)
+                .expect("a data disk may be appended");
+            assert_eq!(grown.spec.data.len(), 2);
+            assert_eq!(grown.spec.data.last(), Some(&added));
+            let stored = root.load(&spec().array_id).expect("load");
+            assert_eq!(stored.spec, grown.spec);
+            // Nothing else about the array moved.
+            assert_eq!(
+                (
+                    stored.spec.array_id.as_str(),
+                    stored.spec.operation_id.as_str(),
+                    stored.spec.name.as_str(),
+                    &stored.spec.owner
+                ),
+                (
+                    spec().array_id.as_str(),
+                    spec().operation_id.as_str(),
+                    spec().name.as_str(),
+                    &spec().owner
+                )
+            );
+            assert_eq!(stored.spec.data[0], spec().data[0]);
+            assert_eq!((&stored.spec.cache, &stored.spec.parity), (&None, &Vec::new()));
+            assert_eq!(stored.stage, ElasticStage::Prepared, "the state is untouched");
+
+            // THE CALLER CAN GO ON SAVING what it was handed — the whole reason
+            // `grow_data` returns the journal rather than `()`. An in-memory
+            // copy from before the growth is what `save` still refuses.
+            root.save(&grown).expect("the grown journal saves");
+            let mut stale = grown.clone();
+            stale.spec.data.pop();
+            assert!(root.save(&stale).is_err(), "a shrunken spec is still refused");
+
+            // Idempotent, so an interrupted add resumes instead of appending
+            // the same disk twice.
+            let again = root.grow_data(&spec().array_id, &added).expect("again");
+            assert_eq!(again.spec, grown.spec);
+            assert_eq!(root.load(&spec().array_id).expect("load").spec.data.len(), 2);
+
+            // A disk already in the array, in any role, is refused by name.
+            assert_eq!(
+                root.grow_data(&spec().array_id, &spec().data[0])
+                    .expect_err("already a member"),
+                "dysk jest już członkiem tej macierzy"
+            );
+
+            // And every rule `save` enforces still applies to the array the
+            // growth would produce: a repeated filesystem UUID is a corrupted
+            // reservation, whatever road it arrived by.
+            let mut colliding = added.clone();
+            colliding.disk_id = "serial:other".into();
+            colliding.serial = Some("other".into());
+            assert!(
+                root.grow_data(&spec().array_id, &colliding).is_err(),
+                "a repeated expected_uuid may not be appended"
+            );
+
+            // The road is ONE field wide: `save` still refuses a rename, and
+            // still refuses a spec that grew behind its back.
+            let mut renamed = root.load(&spec().array_id).expect("load");
+            renamed.spec.name = "archiwum".into();
+            assert!(root.save(&renamed).is_err(), "save nadal odmawia zmiany specyfikacji");
+        }
+
+        /// The lifecycle refusals that come BEFORE the executor reads a single
+        /// device — the ones a test can reach on a node with none of the
+        /// array's disks attached, which is every node running this suite.
+        ///
+        /// A schema-1 journal is used on purpose: a schema-2 one carries a
+        /// private topology and every operation on it demands a confirmed
+        /// publication first, which would be the only refusal ever seen.
+        #[test]
+        fn adding_a_disk_refuses_before_it_reads_a_single_device() {
+            let uid = unsafe { libc::geteuid() };
+            let added = ElasticDiskSpec {
+                disk_id: "serial:new".into(),
+                serial: Some("new".into()),
+                wwn: None,
+                bytes: 8 << 30,
+                expected_uuid: "88888888-8888-4888-8888-888888888888".into(),
+            };
+            let with_parity = || {
+                let mut spec = spec();
+                spec.parity = vec![ElasticDiskSpec {
+                    disk_id: "serial:parity".into(),
+                    serial: Some("parity".into()),
+                    wwn: None,
+                    bytes: 64 << 30,
+                    expected_uuid: "99999999-9999-4999-8999-999999999999".into(),
+                }];
+                spec
+            };
+            // (stage, formatted, sync, disk to add, expected refusal)
+            let cases: Vec<(&str, serde_json::Value, serde_json::Value, ElasticDiskSpec, &str)> = vec![
+                (
+                    "prepared",
+                    serde_json::json!([]),
+                    serde_json::Value::Null,
+                    added.clone(),
+                    "dodanie dysku wymaga gotowej macierzy bez trwającej operacji",
+                ),
+                (
+                    "ready",
+                    serde_json::json!([]),
+                    serde_json::Value::Null,
+                    added.clone(),
+                    "nieukończone formatowanie macierzy",
+                ),
+                (
+                    "ready",
+                    serde_json::json!([{ "data": 1 }, { "parity": 1 }]),
+                    serde_json::Value::Null,
+                    added.clone(),
+                    "niepotwierdzony pierwszy sync",
+                ),
+                (
+                    "ready",
+                    serde_json::json!([{ "data": 1 }, { "parity": 1 }]),
+                    serde_json::json!("2026-09-08T10:00:00Z"),
+                    with_parity().parity[0].clone(),
+                    "dysk pełni w tej macierzy inną rolę",
+                ),
+            ];
+            for (stage, formatted, sync, disk, expected) in cases {
+                let dir = Temp::new();
+                let root = Root::open(&dir.0, uid).expect("root");
+                let journal = legacy_journal_of(&root, &with_parity(), stage, formatted, sync);
+                // Like every other operation, the add reports through `finish`:
+                // the answer is the array's state carrying the reason, not an
+                // `Err`, so the core can record WHY rather than only that
+                // something failed.
+                let observed = add_data_disk(&root, journal.clone(), &disk, None, None)
+                    .expect("an observation, refusal included");
+                assert_eq!(observed.stage, ElasticStage::NeedsAttention, "{expected}");
+                assert!(
+                    observed.detail.as_deref().is_some_and(|detail| detail.contains(expected)),
+                    "{expected}: {:?}",
+                    observed.detail
+                );
+                // AND THE SPEC IS UNTOUCHED: a refused add may not have
+                // reserved the slot, because the slot is what the next attempt
+                // reads the disk's identity from. The observation counts the
+                // members the array still has, which is what the core
+                // validates a refusal against.
+                let stored = root.load(&journal.spec.array_id).expect("load");
+                assert_eq!(stored.spec, with_parity(), "{expected}");
+                assert_eq!(observed.disks.len(), 2, "{expected}");
+            }
+        }
+
+        /// Dissolving refuses while the array still owes an answer, and it
+        /// refuses before it unmounts anything — the union coming down is what
+        /// takes every client's handles away, so an array whose journal does
+        /// not yet know what is on its disks must keep them.
+        #[test]
+        fn dissolving_refuses_an_unfinished_operation_before_it_unmounts_anything() {
+            let uid = unsafe { libc::geteuid() };
+            let operation = "aaaaaaa1-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            let create_operation = spec().operation_id;
+            let cases: Vec<(Box<dyn Fn(&mut Journal)>, &str, &str)> = vec![
+                (
+                    Box::new(|journal: &mut Journal| journal.pending = Some(Pending::Sync)),
+                    operation,
+                    "rozwiązanie wymaga zamkniętych operacji macierzy",
+                ),
+                (
+                    Box::new(|_: &mut Journal| ()),
+                    create_operation.as_str(),
+                    "ponowne użycie ID create",
+                ),
+                (Box::new(|_: &mut Journal| ()), "not-a-uuid", "nieprawidłowy UUID Elastic"),
+            ];
+            for (mutate, operation_id, expected) in cases {
+                let dir = Temp::new();
+                let root = Root::open(&dir.0, uid).expect("root");
+                let mut journal = legacy_journal_of(
+                    &root,
+                    &spec(),
+                    "ready",
+                    serde_json::json!([{ "data": 1 }]),
+                    serde_json::Value::Null,
+                );
+                mutate(&mut journal);
+                let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+                let before = std::fs::read(&path).expect("before");
+                let error = destroy(&root, journal, operation_id).expect_err("refusal");
+                assert!(error.contains(expected), "{expected}: {error}");
+                assert_eq!(std::fs::read(&path).expect("after"), before);
+            }
         }
 
         #[test]

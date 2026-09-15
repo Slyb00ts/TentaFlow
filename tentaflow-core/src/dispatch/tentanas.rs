@@ -3450,15 +3450,26 @@ async fn elastic_snapraid(
                 "Macierz '{name}' nie ma dysku danych '{disk}'"
             )));
         }
-        // Nothing to repair — see `elastic::repair_evidence` for why a repair
-        // needs evidence rather than permission. The OBSERVED array is read
-        // here, not the database row: the button on the screen reads exactly
-        // these fields off the wire, and one rule over one object is what keeps
-        // the two from disagreeing.
+        // The OBSERVED array is read here, not the database row: the button on
+        // the screen reads exactly these fields off the wire, and one rule over
+        // one object is what keeps the two from disagreeing.
         let observed = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
             .await
             .map_err(|e| internal("elastic get", e))?
             .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        // CAN it run, before WHETHER it should. A repair writes the named disk,
+        // so a data disk that is missing or unmounted makes it impossible —
+        // and that is the very state a repair is reached for, so the refusal
+        // has to say what must happen first instead of handing the admin the
+        // helper's `precondition_failed`.
+        if let Some(blocker) = tentanas::elastic::repair_blocker(&observed) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::NotAvailable,
+                format!("Naprawa macierzy '{name}' nie jest teraz możliwa: {blocker}"),
+            ));
+        }
+        // Nothing to repair — see `elastic::repair_evidence` for why a repair
+        // needs evidence rather than permission.
         if tentanas::elastic::repair_evidence(&observed).is_none() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::NotAvailable,
@@ -3997,6 +4008,77 @@ async fn elastic_schedule_set(
     }
     store::set_elastic_schedule(&g.db, &array_id, task, enabled, schedule, next.as_deref())
         .map_err(|e| internal("elastic schedule", e))?;
+    let array = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
+        .await
+        .map_err(|e| internal("elastic get", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    Ok(tn(P::ElasticArrayGetResponse { array }))
+}
+
+/// One folder's cache policy — §5.3's per-folder switch, n11's "Cache" column.
+///
+/// PERMISSIONED AS A CONFIGURATION CHANGE, not as a red path, and the
+/// difference from `elastic_schedule_set` next door is deliberate: that one
+/// ARMS an unattended privileged job, which is what §5.10 gates and what four
+/// eyes are for. This writes one row of this node's database, starts nothing,
+/// touches no disk and needs no sudo — the pool permission is the whole gate,
+/// exactly as it is for every other stored setting of a pool.
+///
+/// What it DOES change is the rules the next mover run is carried out under,
+/// and one of the three is load-bearing: a folder pinned 'only' keeps its
+/// bytes on the cache, where SnapRAID never reaches, for as long as the pin
+/// lasts. That consequence belongs where the admin chooses it — the dialog in
+/// `elastic-detail.js` says it in one sentence — and not only here.
+async fn elastic_folder_cache_set(
+    ctx: &HandlerContext,
+    name: &str,
+    folder: &str,
+    cache_policy: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_POOLS)?;
+    // Both shapes before either lookup: a caller who spelled the policy wrong
+    // gets told which values exist, rather than a refusal about a folder.
+    let policy = tentanas::elastic::CachePolicy::parse(cache_policy).ok_or_else(|| {
+        ProtocolError::bad_request("Nieznana polityka cache: dozwolone „yes”, „no” i „only”")
+    })?;
+    tentanas_helper::elastic::validate_array_name(name)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if !tentanas::elastic::folder_name_valid(folder) {
+        return Err(ProtocolError::bad_request(
+            "Folder musi być jedną nazwą bezpośrednio pod unią macierzy",
+        ));
+    }
+    let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
+        .map_err(|e| internal("elastic array", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    let array_id = array
+        .array_id()
+        .map(str::to_string)
+        .ok_or_else(|| internal("elastic folder cache", "macierz bez utrwalonej intencji"))?;
+    // The two refusals are NOT interchangeable. `NoSuchFolder` is a folder the
+    // node looked for in a list it could read; `FoldersUnknown` is a list it
+    // could not read at all, which happens on every array whose branches are
+    // not mounted — and answering that as "no such folder" would tell an admin
+    // their folder is gone.
+    if let Some(refusal) = tentanas::elastic::folder_policy_refusal(&array, folder) {
+        return Err(match refusal {
+            tentanas::elastic::FolderPolicyRefusal::NoSuchFolder => {
+                ProtocolError::not_found("Ten folder nie istnieje w tej macierzy")
+            }
+            tentanas::elastic::FolderPolicyRefusal::FoldersUnknown => ProtocolError::new(
+                ProtocolErrorCode::NotAvailable,
+                "Nie można odczytać listy folderów macierzy — polityka cache nie została zapisana",
+            ),
+        });
+    }
+    if !store::set_elastic_folder_policy(&g.db, &array_id, folder, policy)
+        .map_err(|e| internal("elastic folder cache", e))?
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "Najwyżej {} folderów tej macierzy może mieć własną politykę cache",
+            store::FOLDER_POLICY_LIMIT
+        )));
+    }
     let array = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
         .await
         .map_err(|e| internal("elastic get", e))?
@@ -4578,6 +4660,8 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             elastic_schedule_set(ctx,store::ElasticTask::Sync,name,*enabled,schedule,(None,None,None),Origin::Direct).await,
         P::ElasticScrubScheduleSetRequest {name,enabled,schedule} =>
             elastic_schedule_set(ctx,store::ElasticTask::Scrub,name,*enabled,schedule,(None,None,None),Origin::Direct).await,
+        P::ElasticFolderCacheSetRequest {name,folder,cache_policy} =>
+            elastic_folder_cache_set(ctx,name,folder,cache_policy).await,
         P::ElasticArraysListRequest {} => {
             let g = gate(ctx,PERM_READ)?;
             let arrays = tentanas::elastic::list(&g.db,&elastic_owner(&g)).await.map_err(|e| internal("elastic list",e))?;
@@ -4957,6 +5041,10 @@ register_tentanas_variant!(
     "TentaNasElasticScrubScheduleSetRequest",
     "tentaflow_ws_handler_nas_elastic_scrub_schedule_set"
 );
+register_tentanas_variant!(
+    "TentaNasElasticFolderCacheSetRequest",
+    "tentaflow_ws_handler_nas_elastic_folder_cache_set"
+);
 
 #[cfg(test)]
 mod registration_tests {
@@ -5197,6 +5285,31 @@ mod registration_tests {
         spec
     }
 
+    /// A scrub of this array that ended without success — the parity fault a
+    /// repair is reached for, and the only thing that arms one.
+    fn failed_scrub(g: &Gate, spec: &tentanas_helper::elastic::ElasticCreateSpec) {
+        let scrub = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_scrub".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &g.db,
+            &scrub,
+            Some(&tentanas::jobs::ElasticJobIntent::Snapraid {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                kind: tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
+            }),
+        )
+        .unwrap();
+        store::finish_job(&g.db, &scrub.job_id, "failed", Some("parity errors")).unwrap();
+    }
+
     /// What a REPAIR refuses, in the order it refuses it, and the proof that
     /// none of the refusals reaches storage.
     ///
@@ -5234,27 +5347,7 @@ mod registration_tests {
 
         // A disk the array does not carry, on an array that DOES have a fault
         // to repair — so the refusal can only be about the disk.
-        let scrub = tentaflow_protocol::tentanas::NasJob {
-            job_id: uuid::Uuid::now_v7().to_string(),
-            kind: "elastic_scrub".into(),
-            subject: spec.name.clone(),
-            status: "running".into(),
-            started_at: store::now(),
-            ..Default::default()
-        };
-        let scrub_operation = uuid::Uuid::now_v7().to_string();
-        store::insert_job(
-            &g.db,
-            &scrub,
-            Some(&tentanas::jobs::ElasticJobIntent::Snapraid {
-                owner: spec.owner.clone(),
-                array_id: spec.array_id.clone(),
-                operation_id: scrub_operation.clone(),
-                kind: ElasticSnapraidKind::Scrub,
-            }),
-        )
-        .unwrap();
-        store::finish_job(&g.db, &scrub.job_id, "failed", Some("parity errors")).unwrap();
+        failed_scrub(&g, &spec);
         let array = store::elastic_array(&g.db, &spec.owner, "media").unwrap().unwrap();
         assert!(
             array.unresolved_operation,
@@ -5309,6 +5402,56 @@ mod registration_tests {
             0
         );
         assert_eq!(tentanas::elevation::audit_entries(&g.db), 0);
+    }
+
+    /// A REPAIR parks for a second admin, and the approval row names the disk.
+    ///
+    /// Without this the `Fix` arm of `elastic_maintenance_gates_and_approval_…`
+    /// was dead code — that loop only iterates Sync and Scrub — so
+    /// `OP_ELASTIC_FIX` could have been mis-wired, or the payload could have
+    /// carried the sudo password to disk, and every test would still have been
+    /// green. A repair cannot join that loop: it needs a parity fault before it
+    /// is offered at all, so it needs an array that HAS one.
+    #[tokio::test]
+    async fn a_repair_parks_for_a_second_admin_naming_the_disk_and_storing_no_secret() {
+        use tentanas_helper::elastic::ElasticSnapraidKind;
+        let mut fixture = dispatch_fixture();
+        let spec = active_array(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+        failed_scrub(&g, &spec);
+        tentanas::approvals::set_settings(&actor(&fixture.ctx, &g).unwrap(), true, 24).unwrap();
+
+        let response = elastic_snapraid(
+            &fixture.ctx,
+            "media",
+            Some(&SudoSecret("never-store-repair-secret".into())),
+            Origin::Direct,
+            ElasticSnapraidKind::Fix { disk: "d1".into() },
+        )
+        .await
+        .unwrap();
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else {
+            panic!("a repair on a four-eyes fleet has to park")
+        };
+        let stored = store::approval(&g.db, &approval.request_id).unwrap().unwrap();
+        assert_eq!(stored.approval.operation, tentanas::approvals::OP_ELASTIC_FIX);
+        assert_eq!(stored.approval.subject, "media");
+        // The row has to name the DISK: what it authorises is overwriting that
+        // one disk from parity, and an approval reading only "repair" would be
+        // an approval for whichever disk the author picked afterwards.
+        assert!(stored.approval.detail.contains("d1"), "{}", stored.approval.detail);
+        assert!(stored.payload_json.contains("\"disk\":\"d1\""), "{}", stored.payload_json);
+        assert!(!stored.payload_json.contains("never-store-repair-secret"));
+        assert!(!stored.payload_json.contains("sudo_password"));
+        // Nothing ran, and the author cannot release their own request.
+        assert!(store::list_jobs(&g.db, 100)
+            .unwrap()
+            .into_iter()
+            .all(|job| job.kind != "elastic_fix"));
+        assert!(matches!(
+            tentanas::approvals::claim(&actor(&fixture.ctx, &g).unwrap(), &approval.request_id),
+            Err(tentanas::approvals::ApprovalError::OwnRequest)
+        ));
     }
 
     /// What ADDING A DISK refuses.
@@ -5683,6 +5826,109 @@ mod registration_tests {
                 "allow",
             );
         }
+    }
+
+    /// The per-folder cache policy: who may set one, what it refuses, and the
+    /// fact that it never asks for root.
+    ///
+    /// It is deliberately NOT gated like the schedule next door: that one arms
+    /// unattended privileged work, this one writes a row. So the assertion
+    /// about permissions is the pool permission alone, and the assertion about
+    /// the red path is that nothing parked and nothing ran.
+    #[tokio::test]
+    async fn setting_a_folder_cache_policy_refuses_a_reader_a_bad_policy_and_an_unreadable_union() {
+        let mut fixture = dispatch_fixture();
+        // No pool permission at all: settled before the request's shape, so a
+        // reader who also misspelled the policy still gets `PolicyDenied`.
+        let denied = elastic_folder_cache_set(&fixture.ctx, "media", "foto", "maybe")
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+
+        elastic_admin(&mut fixture);
+        let g = gate(&fixture.ctx, PERM_POOLS).unwrap();
+        let mut spec = tentanas::elastic::tests::create_spec("media");
+        spec.owner = elastic_owner(&g);
+        settled_array(&g, &spec).await;
+
+        // An unknown policy value names the three that exist.
+        let bad = elastic_folder_cache_set(&fixture.ctx, "media", "foto", "maybe")
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code, ProtocolErrorCode::BadRequest);
+        assert!(bad.message.contains("only"), "{}", bad.message);
+
+        // A folder that is a PATH is refused before anything is read: the name
+        // becomes a mover rule the helper resolves under the union.
+        for folder in ["a/b", "..", ""] {
+            let refused = elastic_folder_cache_set(&fixture.ctx, "media", folder, "only")
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code, ProtocolErrorCode::BadRequest, "{folder:?}");
+        }
+
+        // An array nobody has is `NotFound`, and it is a different answer from
+        // a folder nobody has.
+        let missing = elastic_folder_cache_set(&fixture.ctx, "niema", "foto", "only")
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, ProtocolErrorCode::NotFound);
+
+        // `/mnt/media` is not a mounted union on a test host, so the folder
+        // list is UNKNOWN — and the refusal has to say THAT rather than claim
+        // the folder does not exist. This is the clause: an unreadable union
+        // is never "this array has no folders".
+        let unknown = elastic_folder_cache_set(&fixture.ctx, "media", "foto", "only")
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.code, ProtocolErrorCode::NotAvailable);
+        assert!(
+            unknown.message.contains("Nie można odczytać listy folderów"),
+            "{}",
+            unknown.message
+        );
+        // And it wrote nothing — a refused request must not leave a rule the
+        // next mover run would honour.
+        let stored: i64 = g
+            .db
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM nas_elastic_folder_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 0);
+
+        // Nothing here is a red path: no approval was parked, no job started
+        // (only the create that `settled_array` wrote stands) and the
+        // privilege channel was never armed.
+        assert!(store::list_approvals(&g.db, true).unwrap().is_empty());
+        assert_eq!(
+            store::list_jobs(&g.db, 100)
+                .unwrap()
+                .iter()
+                .filter(|job| job.kind != "elastic_create")
+                .count(),
+            0
+        );
+        assert_eq!(tentanas::elevation::audit_entries(&g.db), 0);
+
+        // The policy an admin CAN always take back: a folder that already
+        // carries a stored rule passes even while the union is unreadable, so
+        // a pin can be lifted without waiting for a mount.
+        assert!(store::set_elastic_folder_policy(
+            &g.db,
+            &spec.array_id,
+            "foto",
+            tentanas::elastic::CachePolicy::Only,
+        )
+        .unwrap());
+        let response = elastic_folder_cache_set(&fixture.ctx, "media", "foto", "yes")
+            .await
+            .unwrap();
+        let MessageBody::TentaNasBody(P::ElasticArrayGetResponse { array }) = response else {
+            panic!("the save answers with the array");
+        };
+        assert!(array.folders.is_empty(), "returning to the default drops the row");
+        assert!(!array.folders_known, "an unreadable union stays unknown on the wire");
     }
 
     /// The schedule-set path: who may arm it, what it refuses, and the fact

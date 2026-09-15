@@ -281,7 +281,15 @@ where
         error: None,
         log: Vec::new(),
     };
-    let cancellable = intent.is_none();
+    // `intent.is_none()` alone made the one IRREVERSIBLE job of this family the
+    // only cancellable one: a disk wipe carries no elastic intent, so it got a
+    // Cancel button. Cancelling drops the future, never the helper process —
+    // which by then has released the array journal and is inside
+    // `wipefs --all`. The row would be written `cancelled` with no error while
+    // the disk was being erased, which is the worst possible thing for a job
+    // log to say. A job is cancellable only if cancelling it can still stop
+    // the work.
+    let cancellable = intent.is_none() && kind != "disk_wipe";
     // These close their own operation row — maintenance and the mover inside
     // `finish_job`, from the result the body recorded; the add inside its own
     // body, because the member row and the operation have to land together.

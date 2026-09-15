@@ -16,6 +16,7 @@ use tentaflow_protocol::tentanas::{
 };
 
 use crate::db::DbPool;
+use std::collections::BTreeMap;
 use tentanas_helper::elastic::{ElasticClaim, ElasticCreateSpec, ElasticDiskSpec, ElasticOwner, ElasticResult};
 use super::jobs::ElasticJobIntent;
 
@@ -563,6 +564,41 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         ON nas_elastic_operations(array_id) WHERE state = 'running';
     CREATE UNIQUE INDEX nas_elastic_operation_origin
         ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
+), (
+    16,
+    // Where a folder's cache policy lives. Until now `ElasticArrayRow.folders`
+    // was built from nothing on every read, so `mover_rules` derived its
+    // `pinned_folders`/`eager_folders` from an empty Vec and the helper — which
+    // honours both — was handed two empty lists for every array that has ever
+    // existed. §5.3's per-folder switch was typed, transported and executed,
+    // and there was no way to create one.
+    //
+    // A new table, so the CHECK constraints are written once and nothing is
+    // rebuilt (migration 13's shape, not 12's).
+    //
+    // ONLY THE EXCEPTIONS ARE STORED. 'yes' is the default and is spelled by
+    // the ABSENCE of a row, which is why the CHECK admits 'no' and 'only' and
+    // not 'yes': with all three storable, a folder could be 'yes' in two ways
+    // at once and the two spellings could then disagree about which one the
+    // mover read. Returning a folder to the default is a DELETE.
+    //
+    // The folder is ONE top-level name and the constraints say so in SQL, not
+    // only in Rust: it becomes a mover rule the helper resolves under the
+    // union, so a row holding 'a/b' or '..' would be a path this node handed
+    // to a privileged step. `nas_elastic_folders` would have been the obvious
+    // name and is deliberately not used — this table holds a policy per
+    // folder, never the folders themselves, which are discovered by reading
+    // the union (`elastic::folders_of`).
+    "CREATE TABLE nas_elastic_folder_cache (
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        folder TEXT NOT NULL CHECK(
+            length(folder) > 0 AND length(folder) <= 255
+            AND folder NOT LIKE '%/%' AND folder NOT IN ('.','..')
+            AND folder = trim(folder, char(9,10,13,0))
+        ),
+        cache_policy TEXT NOT NULL CHECK(cache_policy IN ('no','only')),
+        PRIMARY KEY (array_id, folder)
+    ) WITHOUT ROWID;",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -1245,10 +1281,17 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                     // The superseded attempt stops holding the array. Its row
                     // stays as history — the add DID stop part-way — but a
                     // later sync, scrub or mover no longer waits on it.
+                    // `state IN ('failed','needs_attention')` and never
+                    // `<> 'succeeded'`: a RUNNING row is what the partial
+                    // unique index refuses a second operation by, and clearing
+                    // it here would let this insert race the job that is still
+                    // executing. `reserve_added_disk` has already refused that
+                    // case, so this only closes attempts that have stopped.
                     tx.execute(
                         "UPDATE nas_elastic_operations SET state='failed',error=?3,
                             finished_at=COALESCE(finished_at,?4)
-                         WHERE array_id=?1 AND kind='add_disk' AND state<>'succeeded'
+                         WHERE array_id=?1 AND kind='add_disk'
+                           AND state IN ('failed','needs_attention')
                            AND operation_id<>?2",
                         params![
                             array_id,
@@ -1820,7 +1863,21 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     headers.into_iter().map(|(array_id,state,state_detail,created_at,updated_at)| {
         let spec = elastic_spec(&conn, owner, &array_id)?;
+        // The folders are DISCOVERED, not stored: the union is published on
+        // the host, so its real top level is one unprivileged `read_dir` away,
+        // and the stored policies are joined onto it. Doing it here and not in
+        // `elastic::list` is deliberate — every consumer of a row gets the
+        // same folders, the mover that `spawn_mover` derives its rules from
+        // included, and there is one place that could get it wrong.
+        let union = tentanas_helper::elastic::union_path(&spec.name);
+        let (folders, folders_known) = super::elastic::folders_of(
+            std::path::Path::new(&union),
+            &elastic_folder_policies_on(&conn, &array_id)?,
+            &folder_shares_on(&conn, &union)?,
+        );
         Ok(super::elastic::ElasticArrayRow {
+            folders,
+            folders_known,
             snapraid_history: elastic_runs(&conn, &spec, None, false, 20, None)?,
             parity_window_runs: elastic_runs(&conn, &spec, None, false,
                 super::elastic::PARITY_ERRORS_MAX_ROWS, Some(&parity_since))?,
@@ -2175,9 +2232,23 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
     // has to reuse that identity, so a DIFFERENT disk arriving for the same
     // slot is refused here rather than formatting a second device, while the
     // SAME disk is admitted and reported as the retry it is.
-    let Some(held) = unfinished_add_disk(tx, array_id)? else {
+    let Some((state, held)) = latest_add_disk(tx, array_id)? else {
         return Ok(false);
     };
+    if state == "succeeded" {
+        return Ok(false);
+    }
+    // A RUNNING add is not a resumable one. Treating it as one flipped its row
+    // out of `running` — which is what the partial unique index refuses a
+    // second operation by — and a second helper invocation then raced the first
+    // over the same slot: the disk ends up joined to the live union with no
+    // member row, because the loser's `finish_elastic_add_disk` finds no
+    // running operation of its own. Wait for the verdict instead.
+    anyhow::ensure!(
+        state != "running",
+        "Dodanie dysku {} do tej macierzy jest w toku; poczekaj na jego wynik",
+        held.disk_id
+    );
     anyhow::ensure!(
         held == *disk,
         "Poprzednie dodanie dysku {} nie zostało zakończone; powtórz je tym samym dyskiem",
@@ -2186,17 +2257,22 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
     Ok(true)
 }
 
-/// The disk spec of this array's LATEST add, when that add has not succeeded.
+/// This array's LATEST add, as `(state, disk)`.
 ///
 /// The question is about the latest attempt and not about "any attempt that
 /// failed": an array that was grown after one failed attempt carries both rows
 /// for ever, and reading the failed one would hand a caller the identity of an
 /// add that a later one already completed — pinning the array to a disk it
-/// already holds. So the newest row is read whatever its state, and only its
-/// state decides. `(created_at, operation_id)` is the ordering for the reason
+/// already holds. So the newest row is read whatever its state, and the STATE
+/// is returned with it because it decides three different things: a succeeded
+/// add holds nothing, a running one may not be touched, and only a stopped one
+/// is resumable. `(created_at, operation_id)` is the ordering for the reason
 /// `UNRESOLVED_ELASTIC_OPERATION` uses it: `created_at` has second resolution
 /// and an operation id is a uuid v7.
-fn unfinished_add_disk(conn: &Connection, array_id: &str) -> Result<Option<ElasticDiskSpec>> {
+fn latest_add_disk(
+    conn: &Connection,
+    array_id: &str,
+) -> Result<Option<(String, ElasticDiskSpec)>> {
     let latest: Option<(String, String)> = conn
         .query_row(
             "SELECT state,request_json FROM nas_elastic_operations
@@ -2209,11 +2285,8 @@ fn unfinished_add_disk(conn: &Connection, array_id: &str) -> Result<Option<Elast
     let Some((state, json)) = latest else {
         return Ok(None);
     };
-    if state == "succeeded" {
-        return Ok(None);
-    }
     match serde_json::from_str::<tentanas_helper::HelperCommand>(&json)? {
-        tentanas_helper::HelperCommand::ElasticAddDisk { disk, .. } => Ok(Some(disk)),
+        tentanas_helper::HelperCommand::ElasticAddDisk { disk, .. } => Ok(Some((state, disk))),
         _ => Err(anyhow!("Niezgodna intencja dodania dysku")),
     }
 }
@@ -2238,7 +2311,13 @@ pub fn unfinished_elastic_add_disk(
     if !mine {
         return Ok(None);
     }
-    unfinished_add_disk(&conn, array_id)
+    // A running add is deliberately NOT offered: the caller asks this in order
+    // to decide whether it may repeat the operation, and an add still in
+    // flight may not be repeated. `reserve_added_disk` refuses it by name in
+    // the transaction, so the answer here is simply "nothing to resume".
+    Ok(latest_add_disk(&conn, array_id)?
+        .filter(|(state, _)| !matches!(state.as_str(), "succeeded" | "running"))
+        .map(|(_, disk)| disk))
 }
 
 /// Closes a successful add by making the array's persisted intention and its
@@ -2361,6 +2440,7 @@ pub fn delete_elastic_array(pool: &DbPool, owner: &ElasticOwner, array_id: &str)
         "DELETE FROM nas_elastic_disks WHERE array_id=?1",
         "DELETE FROM nas_elastic_schedules WHERE array_id=?1",
         "DELETE FROM nas_elastic_mover_settings WHERE array_id=?1",
+        "DELETE FROM nas_elastic_folder_cache WHERE array_id=?1",
         "DELETE FROM nas_elastic_operations WHERE array_id=?1",
     ] {
         tx.execute(statement, params![array_id])?;
@@ -2835,6 +2915,123 @@ pub fn set_mover_settings(
         ],
     )?;
     Ok(())
+}
+
+/// How many folders of ONE array may carry a policy of their own.
+///
+/// It is the helper's own ceiling (`MoverRules::validate` refuses more than
+/// 128 folder rules), enforced HERE so an admin is refused at the row they are
+/// editing instead of by the mover run months later, on a request that names
+/// no folder at all.
+pub const FOLDER_POLICY_LIMIT: i64 = 128;
+
+/// The cache policies this node has STORED for one array, keyed by folder.
+///
+/// Only the exceptions are in here: 'yes' is the default and is spelled by the
+/// absence of a row, so a folder missing from this map is a folder the age and
+/// free-space rules decide for.
+fn elastic_folder_policies_on(
+    conn: &Connection,
+    array_id: &str,
+) -> rusqlite::Result<BTreeMap<String, String>> {
+    conn.prepare(
+        "SELECT folder, cache_policy FROM nas_elastic_folder_cache
+         WHERE array_id = ?1 ORDER BY folder",
+    )?
+    .query_map(params![array_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?
+    .collect()
+}
+
+/// The share serving each folder of one union, keyed by folder name.
+///
+/// A share names the union path and a folder under it (`shares.rs` builds it
+/// with `union_path()`), so the folder is the FIRST segment after the union
+/// and a share pointing deeper belongs to the folder it sits inside. The
+/// union path is bound, never interpolated: it comes from an array name the
+/// helper validated, and the one place that could get that wrong should not
+/// be this query.
+fn folder_shares_on(
+    conn: &Connection,
+    union: &str,
+) -> rusqlite::Result<BTreeMap<String, (String, String)>> {
+    let mut shares = BTreeMap::new();
+    let mut statement = conn.prepare(
+        "SELECT share_id, name, source_path FROM nas_shares
+         WHERE source_path LIKE ?1 ESCAPE '\\' ORDER BY name",
+    )?;
+    let prefix = format!("{union}/");
+    let pattern = format!(
+        "{}%",
+        prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    );
+    let rows = statement.query_map(params![pattern], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (share_id, name, source_path) = row?;
+        let Some(rest) = source_path.strip_prefix(&prefix) else {
+            continue;
+        };
+        let folder = rest.split('/').next().unwrap_or_default();
+        if folder.is_empty() {
+            continue;
+        }
+        // First share wins, ordered by name, so the same array always reports
+        // the same one rather than whichever row the planner returned last.
+        shares.entry(folder.to_string()).or_insert((share_id, name));
+    }
+    Ok(shares)
+}
+
+/// Stores one folder's cache policy, or RETURNS IT TO THE DEFAULT.
+///
+/// `CachePolicy::Yes` deletes the row: the default is the absence of one, so
+/// writing 'yes' would create a second spelling of the same state.
+///
+/// Answers `false` when `FOLDER_POLICY_LIMIT` refused the write and NOTHING
+/// was written — a refusal the caller turns into a sentence, kept apart from
+/// the `Err` of a database that is actually broken. The bound is checked
+/// inside the transaction that writes: counting on one connection and writing
+/// on another is how a limit gets exceeded by exactly the two admins who were
+/// both told they were under it.
+pub fn set_elastic_folder_policy(
+    pool: &DbPool,
+    array_id: &str,
+    folder: &str,
+    policy: super::elastic::CachePolicy,
+) -> Result<bool> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if policy == super::elastic::CachePolicy::Yes {
+        tx.execute(
+            "DELETE FROM nas_elastic_folder_cache WHERE array_id=?1 AND folder=?2",
+            params![array_id, folder],
+        )?;
+        tx.commit()?;
+        return Ok(true);
+    }
+    let stored: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM nas_elastic_folder_cache WHERE array_id=?1 AND folder<>?2",
+        params![array_id, folder],
+        |r| r.get(0),
+    )?;
+    if stored >= FOLDER_POLICY_LIMIT {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO nas_elastic_folder_cache (array_id, folder, cache_policy)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(array_id, folder) DO UPDATE SET cache_policy = excluded.cache_policy",
+        params![array_id, folder, policy.as_str()],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// The persisted mover configuration of one array, read on a connection the
@@ -5731,16 +5928,18 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(before.data.len(), 1);
-        assert_eq!(
+        // While the add is IN FLIGHT there is nothing to resume: a running
+        // operation is not a stopped one, and offering it as resumable is what
+        // let a second job race the first over the same slot.
+        assert!(
             super::super::db::unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id)
                 .unwrap()
-                .as_ref(),
-            Some(&added),
-            "a retry has to reuse the recorded filesystem UUID"
+                .is_none(),
+            "an add in flight is not offered as resumable"
         );
-        // A SECOND, DIFFERENT disk for the same array is refused while that
-        // reservation stands: two adds racing into one slot would format two
-        // devices for one place in the array.
+        // A SECOND disk for the same array is refused while that reservation
+        // stands: two adds racing into one slot would format two devices for
+        // one place in the array.
         let mut intruder = added.clone();
         intruder.disk_id = "grow-data-3".into();
         intruder.wwn = Some("wwn-grow-data-3".into());
@@ -5867,6 +6066,36 @@ mod tests {
 
         let (first_job, first_intent, first_id) = start(&added);
         insert_job(&p, &first_job, Some(&first_intent)).unwrap();
+
+        // A RUNNING add IS NOT A RESUMABLE ONE, and this is the defect that
+        // pins it: treating it as one flipped its row out of `running` — which
+        // is what the partial unique index refuses a second operation by — and
+        // a second helper invocation then raced the first over the same slot,
+        // leaving the disk joined to the live union with no member row, because
+        // the loser's `finish_elastic_add_disk` finds no running operation of
+        // its own. The wait has to be for the verdict.
+        let (racing_job, racing_intent, _) = start(&added);
+        let racing = insert_job(&p, &racing_job, Some(&racing_intent)).unwrap_err();
+        assert!(racing.to_string().contains("jest w toku"), "{racing}");
+        assert!(super::super::db::job(&p, &racing_job.job_id).unwrap().is_none());
+        // The in-flight row is still running and still holds the array.
+        let running: String = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM nas_elastic_operations WHERE operation_id=?1",
+                params![first_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(running, "running", "a refused retry may not close the live attempt");
+        // And while it runs there is nothing to resume, so the handler cannot
+        // take the retry branch and skip the unresolved-operation gate.
+        assert!(
+            unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id).unwrap().is_none(),
+            "an add in flight is not offered as resumable"
+        );
+
         // The attempt fails the way the job body's error path closes it.
         finish_elastic_operation(&p, &spec.owner, &first_id, Err("mkfs przerwany")).unwrap();
         finish_job(&p, &first_job.job_id, "failed", Some("mkfs przerwany")).unwrap();
@@ -5896,11 +6125,11 @@ mod tests {
         );
         let (second_job, second_intent, second_id) = start(&added);
         insert_job(&p, &second_job, Some(&second_intent)).unwrap();
-        // The superseded attempt no longer holds the array.
-        assert_eq!(
-            unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id).unwrap().as_ref(),
-            Some(&added),
-            "the retry's own row now carries the identity"
+        // The retry is now the one in flight, so — like any add in flight — it
+        // is not itself offered as resumable until it stops.
+        assert!(
+            unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id).unwrap().is_none(),
+            "the retry is in flight, not resumable"
         );
         let first_state: String = p
             .read()
@@ -6075,6 +6304,231 @@ mod tests {
             .expect("a finished test does not block the next one");
     }
 
+    /// Migration 16 in the shape migration 13 used: a NEW table, so nothing is
+    /// rebuilt and every existing row and index has to come through untouched.
+    #[test]
+    fn schema_sixteen_adds_the_folder_cache_and_keeps_every_row_and_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..15]).unwrap();
+        let array_id = "16161616-1616-4616-8616-161616161616";
+        conn.execute(
+            "INSERT INTO nas_elastic_arrays
+             (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+             VALUES (?1,'org','addon','legacy','xfs','active','','now','now')",
+            params![array_id],
+        )
+        .unwrap();
+        // A v15 database with everything the other Elastic tables can hold, so
+        // a migration that touched them would be visible here.
+        conn.execute(
+            "INSERT INTO nas_elastic_mover_settings
+             (array_id,min_age_secs,cache_min_free_pct,coupled_sync) VALUES (?1,7200,20,1)",
+            params![array_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_schedules (array_id,kind,enabled,schedule_json)
+             VALUES (?1,'mover',1,'{}')",
+            params![array_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log)
+             VALUES ('job-create','elastic_create','legacy','succeeded','test','now','')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_operations
+             (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+             VALUES ('op-create',?1,'job-create','create','succeeded','{}','','2026-09-01T00:00:00Z')",
+            params![array_id],
+        )
+        .unwrap();
+        let snapshot = |conn: &Connection| -> (Vec<String>, Vec<(String, i64, i64, i64)>, Vec<(String, String)>) {
+            let indexes = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index'
+                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap();
+            let settings = conn
+                .prepare("SELECT array_id,min_age_secs,cache_min_free_pct,coupled_sync
+                          FROM nas_elastic_mover_settings ORDER BY array_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let operations = conn
+                .prepare("SELECT operation_id,state FROM nas_elastic_operations ORDER BY operation_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (indexes, settings, operations)
+        };
+        let before = snapshot(&conn);
+        let folder_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='nas_elastic_folder_cache'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(folder_table, 0, "v15 has nowhere to put a folder policy");
+
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+
+        assert_eq!(snapshot(&conn), before, "migracja 16 zmieniła istniejące dane");
+        conn.execute(
+            "INSERT INTO nas_elastic_folder_cache (array_id,folder,cache_policy)
+             VALUES (?1,'foto','only')",
+            params![array_id],
+        )
+        .unwrap();
+        // 'yes' is the DEFAULT and the default is the absence of a row, so the
+        // schema itself refuses a second spelling of it. The same CHECK is what
+        // keeps a path out of a column the mover resolves under the union.
+        for (folder, policy) in [
+            ("foto2", "yes"),
+            ("a/b", "only"),
+            ("..", "only"),
+            ("", "only"),
+            ("foto3", "maybe"),
+        ] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO nas_elastic_folder_cache (array_id,folder,cache_policy)
+                     VALUES (?1,?2,?3)",
+                    params![array_id, folder, policy],
+                )
+                .is_err(),
+                "schema przyjęła ({folder}, {policy})"
+            );
+        }
+        // The foreign key is the array's, so a policy for an array nobody has
+        // cannot be written at all.
+        assert!(conn
+            .execute(
+                "INSERT INTO nas_elastic_folder_cache (array_id,folder,cache_policy)
+                 VALUES ('nie-ma','foto','no')",
+                [],
+            )
+            .is_err());
+    }
+
+    /// The clause this whole slice exists for: a policy an admin stored is what
+    /// the mover is carried out under, and a folder nobody decided for is
+    /// `yes`. Read through the REAL store, not through a hand-built row.
+    #[test]
+    fn a_stored_policy_becomes_a_mover_rule_and_an_absent_one_stays_the_default() {
+        use super::super::elastic::CachePolicy;
+        let p = pool();
+        let spec = completed_array(&p, "folder-policy");
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        // `/mnt/folder-policy` is not a mounted union on a test host, so the
+        // discovery half is UNKNOWN. That is not "no folders" — see
+        // `an_unreadable_union_is_unknown_and_never_zero_folders`.
+        assert!(!array.folders_known);
+        assert!(array.mover_rules().pinned_folders.is_empty());
+        assert!(array.mover_rules().eager_folders.is_empty());
+
+        assert!(set_elastic_folder_policy(&p, &spec.array_id, "foto", CachePolicy::Only).unwrap());
+        assert!(set_elastic_folder_policy(&p, &spec.array_id, "backup", CachePolicy::No).unwrap());
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        let rules = array.mover_rules();
+        assert_eq!(rules.pinned_folders, vec!["foto".to_string()]);
+        assert_eq!(rules.eager_folders, vec!["backup".to_string()]);
+        // A stored policy is listed even while the union cannot be read: it is
+        // an intention the run has to honour, not a directory listing.
+        assert!(!array.folders_known);
+        assert_eq!(array.folders.len(), 2);
+        // And the helper accepts what we derived, so a policy that can be
+        // stored can always be run.
+        rules.validate().expect("the helper accepts these rules");
+
+        // Back to the default: the row goes away rather than turning into a
+        // third stored value that could disagree with the absence of one.
+        assert!(set_elastic_folder_policy(&p, &spec.array_id, "foto", CachePolicy::Yes).unwrap());
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert!(array.mover_rules().pinned_folders.is_empty());
+        assert_eq!(array.mover_rules().eager_folders, vec!["backup".to_string()]);
+        let stored: i64 = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM nas_elastic_folder_cache WHERE array_id=?1",
+                params![spec.array_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1, "domyślna polityka nie zostawia wiersza");
+    }
+
+    /// Dissolving an array takes its folder policies with it. A leftover row
+    /// holds the array's foreign key, so the next `delete` of an array that
+    /// reused the id would be refused by the key rather than by anything that
+    /// could explain itself.
+    #[test]
+    fn deleting_an_array_leaves_no_folder_policy_rows() {
+        use super::super::elastic::CachePolicy;
+        let p = pool();
+        let spec = completed_array(&p, "folder-orphans");
+        assert!(set_elastic_folder_policy(&p, &spec.array_id, "foto", CachePolicy::Only).unwrap());
+        assert!(set_elastic_folder_policy(&p, &spec.array_id, "backup", CachePolicy::No).unwrap());
+        set_mover_settings(&p, &spec.array_id, 3600, 25, true).unwrap();
+
+        assert!(delete_elastic_array(&p, &spec.owner, &spec.array_id).unwrap());
+
+        let conn = p.read().unwrap();
+        for table in [
+            "nas_elastic_folder_cache",
+            "nas_elastic_mover_settings",
+            "nas_elastic_schedules",
+            "nas_elastic_disks",
+            "nas_elastic_operations",
+        ] {
+            let left: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "{table} zostawiła sierotę");
+        }
+    }
+
+    /// The ceiling is the helper's own, enforced where the admin can read it.
+    #[test]
+    fn the_folder_policy_limit_refuses_the_hundred_and_twenty_ninth_folder() {
+        use super::super::elastic::CachePolicy;
+        let p = pool();
+        let spec = completed_array(&p, "folder-limit");
+        for i in 0..FOLDER_POLICY_LIMIT {
+            assert!(
+                set_elastic_folder_policy(&p, &spec.array_id, &format!("f{i}"), CachePolicy::Only)
+                    .unwrap(),
+                "folder {i} mieści się w limicie"
+            );
+        }
+        assert!(
+            !set_elastic_folder_policy(&p, &spec.array_id, "jeszcze-jeden", CachePolicy::No)
+                .unwrap(),
+            "limit musi odmówić, nie zapisać"
+        );
+        // A refusal writes NOTHING, and an edit of a folder already inside the
+        // limit still works — it is not a new row.
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(array.folders.len(), FOLDER_POLICY_LIMIT as usize);
+        array.mover_rules().validate().expect("helper accepts a full set");
+        assert!(set_elastic_folder_policy(&p, &spec.array_id, "f0", CachePolicy::No).unwrap());
+    }
+
     #[test]
     fn migration_is_idempotent_and_tables_exist() {
         let p = pool();
@@ -6088,8 +6542,9 @@ mod tests {
             )
             .unwrap();
         // Migracje 1–8 mają 19 tabel; schema9 dodaje cztery tabele Elastic,
-        // a schema13 harmonogramy Elastic i ustawienia movera (E2-10).
-        assert_eq!(n, 25);
+        // schema13 harmonogramy Elastic i ustawienia movera (E2-10),
+        // a schema16 polityki cache folderów.
+        assert_eq!(n, 26);
     }
 
     #[test]

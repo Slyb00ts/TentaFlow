@@ -184,6 +184,114 @@ impl CachePolicy {
     }
 }
 
+/// The most top-level folders one array may publish.
+///
+/// The bound is not cosmetic: `MoverRules::validate` refuses more than 128
+/// folder rules and 16 KiB of names, and the wire carries this list on every
+/// read of the array. A union with more entries than this is a union nobody
+/// can administer one row at a time, and a truncated list would be read as
+/// "these are the folders" — so the listing answers UNKNOWN at the cap, the
+/// same way `PARITY_ERRORS_MAX_ROWS` refuses to report a possibly truncated
+/// window as a count.
+pub const FOLDERS_MAX_ROWS: usize = 256;
+
+/// Whether `name` can be ONE top-level folder of a union.
+///
+/// It is the single-segment half of the helper's own `mover_folder_valid`,
+/// which is what finally accepts these names as mover rules — a name this
+/// accepts and the helper refuses would be a policy an admin could store and
+/// no run could honour.
+pub fn folder_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.chars().any(char::is_control)
+}
+
+/// The top-level directory names under `union`, or `None` when this node
+/// cannot say what they are.
+///
+/// AN EMPTY READ IS `None`, AND THAT IS THE WHOLE POINT. §3.4 forbids fstab,
+/// so TentaNas is the only thing that mounts an array's branches: before the
+/// mounts are made `/mnt/<array>` is an ordinary, empty directory of the ROOT
+/// filesystem, and `read_dir` on it succeeds and yields nothing. Reading that
+/// as "this array has no folders" would publish an empty Foldery table for an
+/// array that is full of them — the §3.4 empty-share trap, one screen up.
+/// A union that genuinely holds nothing reads unknown too, which costs an
+/// admin one sentence and cannot cost anybody a folder.
+///
+/// A name this node cannot publish faithfully — not UTF-8, or past the cap —
+/// also yields `None` rather than a list with a hole in it: a hole is exactly
+/// where a pinned folder would go missing.
+fn read_union_folders(union: &std::path::Path) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for entry in std::fs::read_dir(union).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().into_string().ok()?;
+        // Every ext4 branch carries one at its root and the union merges them
+        // all into a single entry. It is the filesystem's, not the admin's,
+        // and offering to pin it would offer a cache policy for a directory
+        // the mover has no business walking.
+        if name == "lost+found" {
+            continue;
+        }
+        if !folder_name_valid(&name) {
+            return None;
+        }
+        names.insert(name);
+        if names.len() > FOLDERS_MAX_ROWS {
+            return None;
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+/// The array's folders: its real top-level directories joined with the cache
+/// policies this node has STORED, and whether the first half could be read.
+///
+/// The two halves are not symmetric, and that asymmetry is the safety rule:
+/// * a folder with a stored policy is ALWAYS listed, whatever the union says.
+///   The policy is a persisted intention, `mover_rules` turns it into what the
+///   next run may and may not touch, and dropping it because a mount is not up
+///   yet would quietly unpin a folder whose bytes were pinned on purpose;
+/// * a folder with no stored policy is listed only because it was FOUND, at
+///   the default `yes`. That is what lets an admin discover what there is to
+///   pin instead of having to guess a name.
+///
+/// `shares` maps a folder name to the `(share_id, label)` serving it.
+pub fn folders_of(
+    union: &std::path::Path,
+    stored: &BTreeMap<String, String>,
+    shares: &BTreeMap<String, (String, String)>,
+) -> (Vec<FolderRow>, bool) {
+    let discovered = read_union_folders(union);
+    let mut names: BTreeSet<&str> = stored.keys().map(String::as_str).collect();
+    if let Some(found) = discovered.as_ref() {
+        names.extend(found.iter().map(String::as_str));
+    }
+    let folders = names
+        .into_iter()
+        .map(|name| {
+            let (share_id, share_label) = shares.get(name).cloned().unwrap_or_default();
+            FolderRow {
+                name: name.to_string(),
+                cache_policy: stored
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| CachePolicy::Yes.as_str().to_string()),
+                share_id,
+                share_label,
+            }
+        })
+        .collect();
+    (folders, discovered.is_some())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoverConfig {
     pub enabled: bool,
@@ -227,6 +335,39 @@ pub struct SnapraidConfig {
     pub scrub_older_than_days: u32,
 }
 
+/// Why one folder of an array cannot be given a cache policy.
+///
+/// Two arms and not one boolean, because the two are the difference this
+/// whole feature keeps having to make: a folder the node LOOKED FOR and did
+/// not find is a typo an admin should fix, while a folder nobody could look
+/// for is a mount that is not up — and answering the second as the first
+/// would tell an admin their folder does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderPolicyRefusal {
+    NoSuchFolder,
+    FoldersUnknown,
+}
+
+/// Whether `folder` may be given a cache policy on this array. `None` = it may.
+///
+/// A folder that already CARRIES a stored policy passes even while the union
+/// is unreadable: it is in `folders` either way (see `folders_of`), so an
+/// admin can always take a pin back off, which is the one edit that must not
+/// depend on a mount being up.
+pub fn folder_policy_refusal(
+    array: &ElasticArrayRow,
+    folder: &str,
+) -> Option<FolderPolicyRefusal> {
+    if array.folders.iter().any(|f| f.name == folder) {
+        return None;
+    }
+    Some(if array.folders_known {
+        FolderPolicyRefusal::NoSuchFolder
+    } else {
+        FolderPolicyRefusal::FoldersUnknown
+    })
+}
+
 /// One array's desired state, the shape a store row will carry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ElasticArrayRow {
@@ -248,6 +389,10 @@ pub struct ElasticArrayRow {
     pub branches: Vec<BranchRow>,
     pub parity: Vec<ParityRow>,
     pub folders: Vec<FolderRow>,
+    /// Whether `folders` is the array's real top level — see `folders_of`.
+    /// `false` is unknown, never "none", and `Default` starts there because a
+    /// row nobody has looked at has looked at nothing.
+    pub folders_known: bool,
     pub mover: MoverConfig,
     /// The mover runs this node has RECORDED, newest first — n11's history
     /// strip. Empty means "nothing recorded", which is why the strip says that
@@ -2038,6 +2183,7 @@ pub fn to_protocol(
                 share_label: f.share_label.clone(),
             })
             .collect(),
+        folders_known: array.folders_known,
         mover: NasMoverSettings {
             enabled: array.mover.enabled,
             schedule: array.mover.schedule.clone(),
@@ -2137,46 +2283,82 @@ fn parity_errors_in_window(
     total
 }
 
-/// What a repair would be working on, or `None` when the array reports
-/// nothing to repair.
+/// Why a repair cannot run right now, or `None` when the array is in a shape
+/// `snapraid fix` can work on.
+///
+/// SEPARATE from `repair_evidence` because the two answer opposite questions:
+/// this one is about whether the operation is POSSIBLE, that one about whether
+/// it is WARRANTED. A repair writes the named disk's blocks back from parity,
+/// so it needs that disk present and mounted — and a dead data disk, which is
+/// the very situation a repair is reached for, is therefore the one situation
+/// in which it cannot run at all. There is no replace-disk path in this
+/// product yet, so the honest answer is to say what has to happen first rather
+/// than to offer a button whose only possible outcome is
+/// `precondition_failed` from the helper's own guard.
+pub fn repair_blocker(array: &NasElasticArray) -> Option<String> {
+    for member in &array.data_disks {
+        if member.device_present == Some(false) {
+            return Some(format!(
+                "dysk '{}' nie jest widoczny na tym węźle: podłącz go ponownie, \
+                 bo naprawa z parity zapisuje właśnie ten dysk",
+                member.name
+            ));
+        }
+        if member.mounted == Some(false) {
+            return Some(format!(
+                "dysk '{}' nie jest zamontowany: odtwórz montowania macierzy, \
+                 bo naprawa zapisałaby katalog brancha na systemie plików węzła",
+                member.name
+            ));
+        }
+    }
+    None
+}
+
+/// A parity run of this array that ended without success and that nothing has
+/// settled since — the state a scrub which found errors leaves behind.
+///
+/// It reads the SnapRAID HISTORY rather than `unresolved_operation`, and that
+/// difference is the point: `unresolved_operation` is equally true for a mover
+/// that stopped part-way and for an add-disk that failed, and neither is
+/// something parity can repair. Reading it here described a mover's problem as
+/// "nierozwiązana operacja parity" and offered to overwrite a data disk from
+/// parity over it.
+///
+/// The history arrives newest first, so a successful repair seen BEFORE an
+/// unsuccessful run is one that came after it — the same rule
+/// `db::UNRESOLVED_ELASTIC_OPERATION` applies in SQL, over the same rows.
+fn unresolved_parity_run(array: &NasElasticArray) -> Option<&NasSnapraidRun> {
+    for run in &array.snapraid.history {
+        match (run.kind.as_str(), run.outcome.as_str()) {
+            ("fix", "ok") => return None,
+            (_, "failed" | "needs_attention") => return Some(run),
+            _ => (),
+        }
+    }
+    None
+}
+
+/// What a repair would be working on, or `None` when the array reports nothing
+/// a repair could recover.
 ///
 /// `snapraid fix -d <disk>` WRITES the named disk's blocks back from the parity
 /// checkpoint, so on an array that reports nothing wrong it overwrites healthy
-/// data for no reason — and it is the one operation whose whole purpose is to
-/// run on a broken array, so it cannot simply require a healthy one. The bar
-/// here is therefore evidence, not permission: a member the node cannot see, a
-/// member SMART calls critical, a parity operation nobody has resolved, or
-/// errors the array's own runs recorded inside the advertised window. An array
-/// with none of those has nothing a repair could recover, and the admin's next
-/// step is a scrub — which is what the refusal says.
+/// data for no reason. The bar here is therefore evidence, not permission —
+/// and the evidence has to be about PARITY, because parity is what the repair
+/// recovers from. An array with none of it has nothing a repair could recover,
+/// and the admin's next step is a scrub, which is what the refusal says.
 ///
 /// It takes the OBSERVED array rather than the database row because the
 /// frontend's own gate reads exactly these fields off the wire: one rule over
 /// one object is what keeps the button and the handler from disagreeing, and a
 /// button the node then refuses reads to an admin as a fault.
-///
-/// `device_present` is a tri-state and only `Some(false)` counts. `None` is
-/// "nothing looked", which is the state of every array on a node whose disks
-/// have not been read yet — treating it as absence would offer a repair on
-/// every array on the dashboard.
 pub fn repair_evidence(array: &NasElasticArray) -> Option<String> {
-    for member in &array.data_disks {
-        if member.device_present == Some(false) {
-            return Some(format!("dysku '{}' nie widać na tym węźle", member.name));
-        }
-        if member.health == "critical" {
-            return Some(format!(
-                "dysk '{}' zgłasza krytyczny stan SMART",
-                member.name
-            ));
-        }
-    }
-    // The state a scrub that found errors leaves behind, and the reason this
-    // check cannot lean on the error COUNT alone: the count comes from a
-    // bounded window of rows and reads `None` once that window overflows,
-    // while the unresolved operation stands until something resolves it.
-    if array.unresolved_operation {
-        return Some("macierz ma nierozwiązaną operację parity".to_string());
+    if let Some(run) = unresolved_parity_run(array) {
+        return Some(format!(
+            "przebieg {} macierzy zakończył się bez sukcesu i nic go nie rozwiązało",
+            run.kind
+        ));
     }
     match array.snapraid.parity_errors {
         Some(errors) if errors > 0 => Some(format!(
@@ -3169,50 +3351,64 @@ pub fn spec_with_added_disk(
     Ok(after)
 }
 
+/// Members a persisted intention describes, across every role.
+fn member_count(spec: &ElasticCreateSpec) -> usize {
+    spec.data.len() + usize::from(spec.cache.is_some()) + spec.parity.len()
+}
+
 async fn execute_add_disk_job(
     h: &jobs::JobHandle,
+    spec_before: &ElasticCreateSpec,
     spec_after: &ElasticCreateSpec,
     operation_id: &str,
     disk: &ElasticDiskSpec,
     run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
 ) -> Result<()> {
+    let key = format!("elastic:{}:add-disk", spec_after.array_id);
     let result = async {
         let out = run.await?;
         ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
         ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
         let result: ElasticResult = serde_json::from_str(&out.stdout)?;
-        // Against the array the add PRODUCES, never the one it started from:
-        // the helper answers with N+1 disks, and validating that against the
-        // old spec would read a successful add as an incomplete observation.
-        validate_result(spec_after, &result)?;
+        // WHICH array the answer describes decides which spec validates it.
+        // An add that was refused before it reached the journal answers with
+        // the array it started from; one that got through answers with N+1
+        // disks. Holding a refusal to `spec_after` replaced its own sentence
+        // with "Niepełny zestaw obserwacji dysków", which told the admin the
+        // helper was inconsistent instead of telling them why it said no.
+        if result.disks.len() == member_count(spec_after) {
+            validate_result(spec_after, &result)?;
+        } else {
+            validate_observation(spec_before, &result)?;
+        }
         Ok::<_, anyhow::Error>(result)
     }
     .await;
-    let key = format!("elastic:{}:add-disk", spec_after.array_id);
-    match result {
+    let outcome = match result {
+        // A refusal, or an add that stopped part-way: the helper says what
+        // happened and the member row is NOT written. The helper records the
+        // slot in its own journal before it formats anything, so repeating the
+        // operation is what finishes it — and repeating it is what writes the
+        // row.
+        Ok(result) if result.stage != ElasticStage::Ready => Err(anyhow!(result
+            .detail
+            .unwrap_or_else(|| "Dodanie dysku wymaga interwencji; rezerwacje zachowane".into()))),
         Ok(result) => {
             // ONE transaction writes the member row and closes the operation,
             // so the instance database never holds an array whose spec and
             // whose finished operation disagree about how many disks it has.
-            store::finish_elastic_add_disk(h.db(), &spec_after.owner, operation_id, disk, &result)?;
-            if result.stage != ElasticStage::Ready {
-                let detail = result
-                    .detail
-                    .as_deref()
-                    .unwrap_or("Dodanie dysku wymaga interwencji; rezerwacje zachowane");
-                store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name,
-                    "Macierz wymaga interwencji", detail)?;
-                return Err(anyhow!(detail.to_string()));
-            }
+            store::finish_elastic_add_disk(h.db(), &spec_after.owner, operation_id, disk, &result)
+                .map(|()| result)
+        }
+        Err(error) => Err(error),
+    };
+    match outcome {
+        Ok(_) => {
             store::resolve_alert(h.db(), &key)?;
             h.progress(100);
             Ok(())
         }
         Err(error) => {
-            // The member row is NOT written. The helper records the slot in
-            // its own journal before it formats anything, so repeating the
-            // operation is what finishes it — and repeating it is what writes
-            // the row.
             let detail = format!("{error}; dysk nie został dopisany do macierzy");
             store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
             store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name,
@@ -3229,7 +3425,8 @@ pub fn spawn_add_disk(
     explicit: Option<Arc<ElevationToken>>,
     disk: ElasticDiskSpec,
 ) -> Result<tentaflow_protocol::tentanas::NasJob> {
-    let spec_after = spec_with_added_disk(array.persisted_spec()?, &disk)?;
+    let spec_before = array.persisted_spec()?.clone();
+    let spec_after = spec_with_added_disk(&spec_before, &disk)?;
     let operation_id = uuid::Uuid::now_v7().to_string();
     let intent = jobs::ElasticJobIntent::AddDisk {
         owner: spec_after.owner.clone(),
@@ -3253,7 +3450,7 @@ pub fn spawn_add_disk(
                 explicit.as_deref(),
                 Duration::from_secs(24 * 60 * 60),
             );
-            execute_add_disk_job(&h, &spec_after, &operation_id, &disk, run).await
+            execute_add_disk_job(&h, &spec_before, &spec_after, &operation_id, &disk, run).await
         },
     )
 }
@@ -3556,6 +3753,135 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// One observed array on the wire, healthy, as the three lifecycle gates
+    /// read it. Only the fields those gates consult are filled.
+    fn observed_array() -> NasElasticArray {
+        NasElasticArray {
+            name: "media".into(),
+            kind: KIND.into(),
+            state: "active".into(),
+            enabled: true,
+            data_disks: vec![NasElasticBranch {
+                disk_id: "media-data".into(),
+                name: "d1".into(),
+                role: "data".into(),
+                mounted: Some(true),
+                device_present: Some(true),
+                health: "ok".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn parity_run(kind: &str, outcome: &str) -> tentaflow_protocol::tentanas::NasSnapraidRun {
+        tentaflow_protocol::tentanas::NasSnapraidRun {
+            kind: kind.into(),
+            outcome: outcome.into(),
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: Some("2026-09-08T01:10:00Z".into()),
+            ..Default::default()
+        }
+    }
+
+    /// THE DEFECT THIS PINS: a repair was armed by `unresolved_operation`,
+    /// which is equally true for a mover that stopped part-way and for an
+    /// add-disk that failed — so the product offered to overwrite a data disk
+    /// from parity over a mover's problem, and called it
+    /// "nierozwiązana operacja parity". A parity repair needs parity evidence.
+    #[test]
+    fn a_repair_is_armed_by_parity_evidence_and_never_by_another_operation() {
+        // Healthy: nothing to recover.
+        assert_eq!(repair_evidence(&observed_array()), None);
+
+        // `unresolved_operation` on its own is NOT evidence. It is what a
+        // stuck mover and a failed add both set, and neither is repairable
+        // from parity.
+        let mut stuck = observed_array();
+        stuck.unresolved_operation = true;
+        stuck.state = "needs_attention".into();
+        assert_eq!(
+            repair_evidence(&stuck),
+            None,
+            "a mover or an add that stopped is not a parity fault"
+        );
+
+        // A PARITY RUN that ended without success is.
+        for outcome in ["failed", "needs_attention"] {
+            let mut hurt = observed_array();
+            hurt.snapraid.history = vec![parity_run("scrub", outcome)];
+            assert!(
+                repair_evidence(&hurt).is_some_and(|why| why.contains("scrub")),
+                "{outcome}: {:?}",
+                repair_evidence(&hurt)
+            );
+        }
+        // So are recorded parity errors.
+        let mut counted = observed_array();
+        counted.snapraid.parity_errors = Some(4);
+        assert!(repair_evidence(&counted).is_some_and(|why| why.contains('4')));
+        let mut clean = observed_array();
+        clean.snapraid.parity_errors = Some(0);
+        assert_eq!(repair_evidence(&clean), None);
+
+        // A run that was merely REFUSED is not a fault, and neither is one
+        // still going.
+        for outcome in ["refused", "running", "ok"] {
+            let mut other = observed_array();
+            other.snapraid.history = vec![parity_run("scrub", outcome)];
+            assert_eq!(repair_evidence(&other), None, "{outcome}");
+        }
+
+        // The history arrives NEWEST FIRST, so a successful repair above an
+        // unsuccessful run is one that came after it and settled it — the rule
+        // `db::UNRESOLVED_ELASTIC_OPERATION` applies in SQL over the same rows.
+        let mut healed = observed_array();
+        healed.snapraid.history = vec![parity_run("fix", "ok"), parity_run("scrub", "failed")];
+        assert_eq!(repair_evidence(&healed), None);
+        let mut hurt_again = observed_array();
+        hurt_again.snapraid.history = vec![
+            parity_run("scrub", "failed"),
+            parity_run("fix", "ok"),
+            parity_run("scrub", "failed"),
+        ];
+        assert!(repair_evidence(&hurt_again).is_some(), "a newer fault stands again");
+    }
+
+    /// A repair WRITES the disk it names, so a data disk that is missing or
+    /// unmounted makes it impossible — and that is the very state a repair is
+    /// reached for. The blocker is what turns that into a sentence the admin
+    /// can act on instead of the helper's `precondition_failed` after a job
+    /// has already been started.
+    #[test]
+    fn a_repair_is_blocked_by_the_disk_it_would_have_to_write() {
+        assert_eq!(repair_blocker(&observed_array()), None);
+
+        let mut absent = observed_array();
+        absent.data_disks[0].device_present = Some(false);
+        assert!(repair_blocker(&absent).is_some_and(|why| why.contains("d1")
+            && why.contains("podłącz")));
+
+        let mut cold = observed_array();
+        cold.data_disks[0].mounted = Some(false);
+        assert!(repair_blocker(&cold).is_some_and(|why| why.contains("d1")
+            && why.contains("odtwórz montowania")));
+
+        // Both are tri-states and only `Some(false)` counts: `None` is
+        // "nothing looked", the state of every array on a node whose disks
+        // have not been read, and reading it as absence would block them all.
+        let mut unmeasured = observed_array();
+        unmeasured.data_disks[0].device_present = None;
+        unmeasured.data_disks[0].mounted = None;
+        assert_eq!(repair_blocker(&unmeasured), None);
+
+        // SMART alone does not block it: a disk the vendor calls failing is
+        // still readable and writable, and a repair onto it is exactly what an
+        // admin may want before replacing it.
+        let mut failing = observed_array();
+        failing.data_disks[0].health = "critical".into();
+        assert_eq!(repair_blocker(&failing), None);
+    }
 
     pub(crate) fn create_spec(name: &str) -> ElasticCreateSpec {
         let disk = |role: &str| tentanas_helper::elastic::ElasticDiskSpec {
@@ -6918,6 +7244,144 @@ pub(crate) mod tests {
         let defaulted = plan("", &[]);
         assert!(defaulted.refusals.is_empty(), "{:?}", defaulted.refusals);
         assert!(defaulted.steps_preview.contains("mkfs.xfs"), "{}", defaulted.steps_preview);
+    }
+
+    /// The union's REAL top level, joined with the policies this node stored.
+    ///
+    /// A tempdir stands in for `/mnt/<array>`: `union_path` is a constant
+    /// `/mnt/` away from the array name, so the discovery is given the path
+    /// rather than the name and this is the same call the store makes.
+    #[test]
+    fn the_folder_list_is_the_union_joined_with_the_stored_policies() {
+        let union = tempfile::TempDir::new().expect("tempdir");
+        for name in ["filmy", "foto", "backup", "lost+found"] {
+            std::fs::create_dir(union.path().join(name)).expect("mkdir");
+        }
+        // Files at the union root are not folders — snapraid's own content
+        // file sits there on every array with parity.
+        std::fs::write(union.path().join("snapraid.content"), b"x").expect("write");
+        let stored = BTreeMap::from([
+            ("foto".to_string(), "only".to_string()),
+            ("backup".to_string(), "no".to_string()),
+        ]);
+        let shares = BTreeMap::from([(
+            "filmy".to_string(),
+            ("share-1".to_string(), "Filmy".to_string()),
+        )]);
+        let (folders, known) = folders_of(union.path(), &stored, &shares);
+        assert!(known, "a readable union is a known folder list");
+        assert_eq!(
+            folders.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["backup", "filmy", "foto"],
+            "lost+found belongs to the filesystem, not to the admin"
+        );
+        // The clause: a folder nobody decided for is `yes`, and that is a
+        // DEFAULT and not a stored decision.
+        let filmy = folders.iter().find(|f| f.name == "filmy").expect("filmy");
+        assert_eq!(filmy.cache_policy, "yes");
+        assert_eq!(filmy.share_id, "share-1");
+        assert_eq!(filmy.share_label, "Filmy");
+        assert!(folders.iter().all(|f| f.name == "filmy" || f.share_id.is_empty()));
+
+        let mut row = array();
+        row.folders = folders;
+        row.folders_known = known;
+        let rules = row.mover_rules();
+        assert_eq!(rules.pinned_folders, vec!["foto".to_string()]);
+        assert_eq!(rules.eager_folders, vec!["backup".to_string()]);
+        rules.validate().expect("the helper accepts what discovery produced");
+    }
+
+    /// The distinction the rest of this file makes about bytes, made about
+    /// folders: §3.4 forbids fstab, so before TentaNas mounts the branches
+    /// `/mnt/<array>` is an ordinary EMPTY directory of the root filesystem —
+    /// and a `read_dir` of it succeeds. Reading that as "this array has no
+    /// folders" would publish an empty table for an array full of them.
+    #[test]
+    fn an_unreadable_union_is_unknown_and_never_zero_folders() {
+        let stored = BTreeMap::from([("foto".to_string(), "only".to_string())]);
+        let shares = BTreeMap::new();
+
+        // 1. The union directory does not exist at all.
+        let missing = std::path::Path::new("/nonexistent-union-tentanas-test");
+        let (folders, known) = folders_of(missing, &stored, &shares);
+        assert!(!known, "a union that cannot be read is unknown");
+        // The stored policy survives it: the pin is an intention, and dropping
+        // it because a mount is not up would silently unpin the folder.
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].cache_policy, "only");
+
+        // 2. The union directory exists and is empty — the cold-boot shape,
+        //    and the one that reads as a successful measurement of zero.
+        let empty = tempfile::TempDir::new().expect("tempdir");
+        let (cold, cold_known) = folders_of(empty.path(), &stored, &shares);
+        assert!(!cold_known, "an empty read is unknown, never zero folders");
+        assert_eq!(cold.len(), 1, "the stored pin is still listed");
+        let mut row = array();
+        row.folders = cold;
+        row.folders_known = cold_known;
+        assert_eq!(row.mover_rules().pinned_folders, vec!["foto".to_string()]);
+
+        // 3. And with nothing stored either, the answer is still unknown and
+        //    NOT an array whose folder list is empty.
+        let (none, none_known) = folders_of(empty.path(), &BTreeMap::new(), &shares);
+        assert!(none.is_empty());
+        assert!(!none_known, "no rows AND no measurement is unknown");
+    }
+
+    /// Past the cap the listing is a truncation, and a truncated list read as
+    /// "these are the folders" is what would hide the one an admin came to
+    /// pin. `PARITY_ERRORS_MAX_ROWS` answers unknown at its bound for the
+    /// same reason.
+    #[test]
+    fn a_union_past_the_cap_answers_unknown_rather_than_a_truncated_list() {
+        let union = tempfile::TempDir::new().expect("tempdir");
+        for i in 0..=FOLDERS_MAX_ROWS {
+            std::fs::create_dir(union.path().join(format!("f{i}"))).expect("mkdir");
+        }
+        let (folders, known) = folders_of(union.path(), &BTreeMap::new(), &BTreeMap::new());
+        assert!(!known);
+        assert!(folders.is_empty());
+    }
+
+    /// The two refusals a per-folder policy can meet, and why they may never
+    /// be the same answer.
+    #[test]
+    fn a_folder_policy_tells_an_unknown_folder_from_an_unreadable_list() {
+        let mut row = array();
+        row.folders = vec![FolderRow {
+            name: "foto".to_string(),
+            cache_policy: "only".to_string(),
+            ..Default::default()
+        }];
+        row.folders_known = true;
+        assert_eq!(folder_policy_refusal(&row, "foto"), None);
+        assert_eq!(
+            folder_policy_refusal(&row, "nie-ma"),
+            Some(FolderPolicyRefusal::NoSuchFolder)
+        );
+
+        row.folders_known = false;
+        // The stored folder still passes: taking a pin back off must not
+        // depend on a mount being up.
+        assert_eq!(folder_policy_refusal(&row, "foto"), None);
+        assert_eq!(
+            folder_policy_refusal(&row, "filmy"),
+            Some(FolderPolicyRefusal::FoldersUnknown),
+            "an unreadable list must never answer 'no such folder'"
+        );
+    }
+
+    /// The names a folder may have are the helper's, not this file's: a name
+    /// stored here becomes a mover rule the helper validates.
+    #[test]
+    fn a_folder_name_is_one_segment_under_the_union() {
+        for good in ["foto", "Moje Filmy", ".ukryty", "a-b_c.d"] {
+            assert!(folder_name_valid(good), "{good}");
+        }
+        for bad in ["", ".", "..", "a/b", "/foto", "foto\n", "foto\0", &"x".repeat(256)] {
+            assert!(!folder_name_valid(bad), "{bad:?}");
+        }
     }
 
     /// The row is the single source of the spec, and the spec is what the

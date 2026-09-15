@@ -707,24 +707,50 @@ test('an unchanged poll leaves the Elastic pane standing', async () => {
 /// possible effect is overwriting healthy data — and on an array with no parity
 /// at all the node can only refuse it. Both are checked here against the same
 /// four kinds of evidence `tentanas::elastic::repair_evidence` accepts.
-test('naprawa pojawia się tylko przy dowodzie awarii i nigdy bez parity', async () => {
+// The array a repair is actually reached for: a scrub that ended without
+// success. THAT is a parity fault; `unresolvedOperation` is not, because it is
+// equally true for a mover that stopped part-way and for an add-disk that
+// failed, and parity cannot repair either of those.
+const snapraidWith = (history, parityErrors = null) => ({
+  parityErrors, configPath: '/etc/tentanas/snapraid-media.conf', history,
+});
+const failedScrub = { kind: 'scrub', outcome: 'needs_attention', startedAt: '2026-09-08 01:00:00', finishedAt: '2026-09-08 01:10:00' };
+const okFix = { kind: 'fix', outcome: 'ok', startedAt: '2026-09-08 02:00:00', finishedAt: '2026-09-08 02:30:00' };
+
+test('naprawa pojawia się tylko przy dowodzie awarii parity i nigdy bez parity', async () => {
   const cases = [
     [{}, false, 'zdrowa macierz nie oferuje naprawy'],
     [{ parityDisks: [] }, false, 'bez parity nie ma z czego odbudować'],
-    [{ dataDisks: [{ ...disk, devicePresent: false }] }, true, 'brak dysku na węźle'],
-    [{ dataDisks: [{ ...disk, health: 'critical' }] }, true, 'krytyczny SMART'],
-    [{ unresolvedOperation: true }, true, 'nierozwiązana operacja parity'],
-    [{ snapraid: { parityErrors: 3, configPath: '/etc/tentanas/snapraid-media.conf' } }, true, 'zgłoszone błędy parity'],
-    [{ state: 'needs_attention', unresolvedOperation: true }, true, 'naprawa startuje z needs_attention'],
-    [{ enabled: false, unresolvedOperation: true }, false, 'wyłączona macierz nic nie uruchamia'],
+    [{ snapraid: snapraidWith([failedScrub]) }, true, 'scrub bez sukcesu to awaria parity'],
+    [{ snapraid: snapraidWith([], 3) }, true, 'zgłoszone błędy parity'],
+    [{ state: 'needs_attention', snapraid: snapraidWith([failedScrub]) }, true, 'naprawa startuje z needs_attention'],
+    // Newest first, so a repair that already succeeded settled the run below
+    // it — the same rule the node applies in SQL over the same rows.
+    [{ snapraid: snapraidWith([okFix, failedScrub]) }, false, 'udana naprawa rozwiązała ten przebieg'],
+    // NOT parity faults: a stuck mover and a failed add both set
+    // `unresolvedOperation`, and offering to overwrite a data disk from parity
+    // over either of them would be a repair for the wrong problem.
+    [{ unresolvedOperation: true }, false, 'nierozwiązana operacja to nie awaria parity'],
+    [{ dataDisks: [{ ...disk, health: 'critical' }] }, false, 'sam SMART nie jest awarią parity'],
+    // A dead data disk is the one case a repair CANNOT run on: it writes that
+    // very disk. The screen must say what to do first, not offer the button.
+    [{ dataDisks: [{ ...disk, devicePresent: false }], snapraid: snapraidWith([failedScrub]) }, false, 'brak dysku blokuje naprawę'],
+    [{ dataDisks: [{ ...disk, mounted: false }], snapraid: snapraidWith([failedScrub]) }, false, 'niezamontowany dysk blokuje naprawę'],
+    [{ enabled: false, snapraid: snapraidWith([failedScrub]) }, false, 'wyłączona macierz nic nie uruchamia'],
   ];
   for (const [overrides, offered, why] of cases) {
     const { screen, body } = await mount(array(overrides));
     assert.equal(Boolean(body.querySelector('[data-act="fix"]')), offered, why);
     screen.dispose();
   }
-  // And a reader never sees it, whatever the array reports.
-  const { screen, body } = await mount(array({ unresolvedOperation: true }), {}, { admin: false });
+  // And when it is blocked the reason is the disk, in the admin's words —
+  // never the helper's `precondition_failed` after a job has been started.
+  const blocked = await mount(array({ dataDisks: [{ ...disk, devicePresent: false }], snapraid: snapraidWith([failedScrub]) }));
+  assert.match(blocked.body.querySelector('.nas-snapraid').textContent, /nie widać na tym węźle/);
+  blocked.screen.dispose();
+
+  // And a reader never sees any of the three, whatever the array reports.
+  const { screen, body } = await mount(array({ snapraid: snapraidWith([failedScrub]) }), {}, { admin: false });
   assert.equal(body.querySelector('[data-act="fix"]'), null);
   assert.equal(body.querySelector('[data-act="add-disk"]'), null);
   assert.equal(body.querySelector('[data-act="destroy"]'), null);
@@ -735,7 +761,7 @@ test('naprawa pojawia się tylko przy dowodzie awarii i nigdy bez parity', async
 /// follows the job. Retyping the ARRAY name must not arm it: the mistake this
 /// dialog exists to stop is repairing the wrong disk of the right array.
 test('naprawa wymaga przepisania nazwy dysku i wysyła dokładnie jedno żądanie', async () => {
-  const { screen, body } = await mount(array({ unresolvedOperation: true }), {
+  const { screen, body } = await mount(array({ snapraid: snapraidWith([failedScrub]) }), {
     tentaNasElasticArrayFixRequest: { job: { jobId: 'job-fix', status: 'running' } },
   });
   click(body.querySelector('[data-act="fix"]'));
@@ -843,7 +869,7 @@ test('etykiety naprawy, dodania dysku i rozwiązania są tłumaczone w pięciu l
   try {
     for (const [language, repair, add, dissolve] of locales) {
       await I18n.setLanguage(language);
-      const { screen, body } = await mount(array({ unresolvedOperation: true }));
+      const { screen, body } = await mount(array({ snapraid: snapraidWith([failedScrub]) }));
       assert.equal(body.querySelector('[data-act="fix"]').textContent.trim(), repair, language);
       assert.equal(body.querySelector('[data-act="add-disk"]').textContent.trim(), add, language);
       assert.equal(body.querySelector('.danger-zone [data-act="destroy"]').textContent.trim(), dissolve, language);
@@ -852,4 +878,111 @@ test('etykiety naprawy, dodania dysku i rozwiązania są tłumaczone w pięciu l
   } finally {
     await I18n.setLanguage('pl');
   }
+});
+
+const folders = [
+  { name: 'filmy', path: '/mnt/media/filmy', cachePolicy: 'yes', shareId: 'sh-1', shareLabel: 'Filmy' },
+  { name: 'foto', path: '/mnt/media/foto', cachePolicy: 'only', shareId: '', shareLabel: '' },
+  { name: 'backup', path: '/mnt/media/backup', cachePolicy: 'no', shareId: '', shareLabel: '' },
+];
+
+test('tabela Foldery rozdziela nieznaną listę od macierzy bez folderów', async (t) => {
+  await t.test('nieodczytana unia bez zapisanych polityk', async () => {
+    const { screen, body } = await mount(array({ folders: [], foldersKnown: false }));
+    const card = body.querySelector('.nas-folders');
+    assert.ok(card, 'karta Foldery istnieje');
+    assert.equal(card.querySelector('.nas-folder-rows'), null, 'nie ma wiersza, bo nic nie wiemy');
+    assert.match(card.textContent, /Nie można odczytać listy folderów/);
+    assert.doesNotMatch(card.textContent, /nie ma jeszcze folderów/);
+    screen.dispose();
+  });
+  await t.test('odczytana unia, która naprawdę nie ma folderów', async () => {
+    const { screen, body } = await mount(array({ folders: [], foldersKnown: true }));
+    const card = body.querySelector('.nas-folders');
+    assert.match(card.textContent, /nie ma jeszcze folderów/);
+    assert.doesNotMatch(card.textContent, /Nie można odczytać listy folderów/);
+    screen.dispose();
+  });
+  await t.test('nieodczytana unia, ale z zapisanym przypięciem', async () => {
+    const { screen, body } = await mount(array({ folders: [folders[1]], foldersKnown: false }));
+    const card = body.querySelector('.nas-folders');
+    assert.equal(card.querySelectorAll('.nas-folder-rows .fr[data-folder]').length, 1);
+    assert.match(card.textContent, /tylko te z zapisaną polityką/);
+    screen.dispose();
+  });
+  // Brak pola na drucie to też „nie zmierzono”, nie „brak folderów”.
+  const { screen, body } = await mount(array({ folders: [] }));
+  assert.match(body.querySelector('.nas-folders').textContent, /Nie można odczytać listy folderów/);
+  screen.dispose();
+});
+
+test('wiersz folderu pokazuje udział, politykę i ostrzeżenie o bajtach poza parity', async () => {
+  const { screen, body } = await mount(array({ folders, foldersKnown: true }));
+  const rows = [...body.querySelectorAll('.nas-folder-rows .fr[data-folder]')];
+  assert.deepEqual(rows.map((r) => r.dataset.folder), ['filmy', 'foto', 'backup']);
+  assert.match(rows[0].textContent, /Filmy/);
+  assert.match(rows[0].textContent, /\/mnt\/media\/filmy/);
+  assert.match(rows[0].textContent, /Tak \(domyślnie\)/);
+  assert.match(rows[1].textContent, /Tylko cache/);
+  assert.match(rows[2].textContent, /brak/, 'folder bez udziału mówi „brak”, nie zostaje pusty');
+  // Przypięty folder jest oznaczony i karta mówi, co to znaczy dla parity.
+  assert.equal(rows[1].querySelector('tf-chip').getAttribute('label'), 'poza parity');
+  assert.equal(rows[0].querySelector('tf-chip'), null);
+  assert.match(body.querySelector('.nas-folders-pinned').textContent, /pozostają poza parity/);
+  screen.dispose();
+});
+
+test('kolumna Cache jest kontrolką tylko dla admina', async () => {
+  const { screen, body } = await mount(array({ folders, foldersKnown: true }), {}, { admin: false });
+  assert.equal(body.querySelector('.nas-folders [data-act="folder-cache"]'), null);
+  assert.match(body.querySelector('.nas-folders .fr[data-folder="foto"]').textContent, /Tylko cache/);
+  screen.dispose();
+});
+
+test('dialog polityki cache ostrzega przy „tylko cache” i zapisuje wybór jednym żądaniem', async () => {
+  let sent = null;
+  const { screen, body } = await mount(array({ folders, foldersKnown: true }), {
+    tentaNasElasticFolderCacheSetRequest: (payload) => { sent = payload; return { array: array({ folders, foldersKnown: true }) }; },
+  });
+  click(body.querySelector('.nas-folders .fr[data-folder="filmy"] [data-act="folder-cache"]'));
+  await flush();
+  const win = document.querySelector('tf-window.nas-folder-cache');
+  assert.ok(win, 'okno się otwiera');
+  const select = win.querySelector('#nas-folder-policy');
+  assert.equal(select.value, 'yes');
+  // Ostrzeżenie pojawia się tam, gdzie admin wybiera — nie tylko w komentarzu.
+  assert.equal(win.querySelector('#nas-folder-policy-warn').hidden, true);
+  select.value = 'only';
+  select.dispatchEvent(new window.CustomEvent('change', { detail: { value: 'only' }, bubbles: true }));
+  const warn = win.querySelector('#nas-folder-policy-warn');
+  assert.equal(warn.hidden, false);
+  assert.match(warn.textContent, /pozostaną poza parity tak długo, jak trwa przypięcie/);
+  assert.match(win.querySelector('#nas-folder-policy-sub').textContent, /nigdy nie zabiera plików z cache/);
+
+  confirmWindow(win);
+  await flush();
+  await flush();
+  assert.deepEqual(sent, { name: 'media', folder: 'filmy', cachePolicy: 'only' });
+  // Zapis odświeża detal, więc tabela pokazuje stan po zapisie, a nie draft.
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayGetRequest').length, 2);
+  screen.dispose();
+});
+
+test('odmowa zapisu polityki zostaje w oknie i nic nie zmienia', async () => {
+  const { screen, body } = await mount(array({ folders, foldersKnown: true }), {
+    tentaNasElasticFolderCacheSetRequest: () => { throw new Error('Ten folder nie istnieje w tej macierzy'); },
+  });
+  click(body.querySelector('.nas-folders .fr[data-folder="foto"] [data-act="folder-cache"]'));
+  await flush();
+  const win = document.querySelector('tf-window.nas-folder-cache');
+  assert.equal(win.querySelector('#nas-folder-policy').value, 'only');
+  confirmWindow(win);
+  await flush();
+  await flush();
+  const err = win.querySelector('#nas-folder-error');
+  assert.equal(err.hidden, false);
+  assert.match(err.textContent, /Ten folder nie istnieje w tej macierzy/);
+  assert.ok(win.isConnected, 'okno zostaje otwarte po odmowie');
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayGetRequest').length, 1);
+  screen.dispose();
 });

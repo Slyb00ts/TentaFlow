@@ -8494,6 +8494,117 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * Polityka cache jednego folderu (kolumna „Cache" w n11). Wszystkie trzy
+   * pola są wymagane: „yes" to powrót do domyślnej, a nie brak wartości.
+   */
+  tentaNasElasticFolderCacheSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      folder: csText(payload.folder),
+      cache_policy: csText(payload.cachePolicy ?? payload.cache_policy),
+    };
+    const body = _wasm.encodeTentaNasElasticFolderCacheSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaNasBody(DiskWipePlanRequest) — read-only, but privileged:
+   * the refusals name this node's pools, arrays and journal owners.
+   */
+  tentaNasDiskWipePlanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      disk_id: csText(payload.diskId ?? payload.disk_id),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDiskWipePlanRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaNasBody(DiskWipeRequest). `releaseJournalArray` is the
+   * SECOND acknowledgement and an empty string means "not acknowledged", so it
+   * goes through `csText` (which defaults to '') and never `csOptText`: a null
+   * there would read as the field being absent rather than withheld.
+   */
+  tentaNasDiskWipeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      disk_id: csText(payload.diskId ?? payload.disk_id),
+      confirm_device: csText(payload.confirmDevice ?? payload.confirm_device),
+      release_journal_array: csText(payload.releaseJournalArray ?? payload.release_journal_array),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDiskWipeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElasticArrayImportScanRequest). */
+  tentaNasElasticArrayImportScanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayImportScanRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElasticArrayImportRequest). */
+  tentaNasElasticArrayImportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      array_id: csText(payload.arrayId ?? payload.array_id),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayImportRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaNasBody(ElasticArrayFixRequest). The retyped
+   * confirmation is the DISK, not the array: picking the wrong disk is the
+   * hazard a repair carries.
+   */
+  tentaNasElasticArrayFixRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      disk: csText(payload.disk),
+      confirm_disk: csText(payload.confirmDisk ?? payload.confirm_disk),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayFixRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElasticArrayAddDiskRequest). */
+  tentaNasElasticArrayAddDiskRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      disk_id: csText(payload.diskId ?? payload.disk_id),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayAddDiskRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElasticArrayDestroyRequest). */
+  tentaNasElasticArrayDestroyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayDestroyRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** Nocny sync parity, niezależny od sprzężonego sync movera. */
   tentaNasElasticSyncScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

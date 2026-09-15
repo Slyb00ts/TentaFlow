@@ -318,6 +318,24 @@
 .nas-root .nas-mover > .section-card-head, .nas-root .nas-mover .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .nas-root .mover-hist { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; font-size: 11px; color: var(--text-2); }
 .nas-root .mover-hist span { padding: 2px 8px; border-radius: 999px; background: var(--bg-3); white-space: nowrap; }
+/* Foldery (n11): the union's top level, one row per folder, the Cache cell
+   being the control. A grid and not a tf-table on purpose — this pane is
+   written as ONE patched string (dom-patch.js), and a tf-table takes its rows
+   through a property the string cannot carry. */
+.nas-root .nas-folder-rows { display: flex; flex-direction: column; margin-top: 8px; }
+.nas-root .nas-folder-rows .fr { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); font-size: 12px; min-width: 0; }
+.nas-root .nas-folder-rows .fr-head { border-top: 0; padding-top: 0; color: var(--text-3); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.nas-root .nas-folder-rows .fr-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.nas-root .nas-folder-rows .fr-sub { font-weight: 400; font-size: 11px; color: var(--text-3); overflow-wrap: anywhere; }
+.nas-root .nas-folder-rows .fr-share { color: var(--text-2); overflow-wrap: anywhere; min-width: 0; }
+.nas-root .nas-folder-rows .fr-cache { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.nas-root .nas-folders .nas-folders-pinned { margin-top: 12px; }
+@media (max-width: 720px) {
+  .nas-root .nas-folder-rows .fr { grid-template-columns: minmax(0, 1fr); }
+  .nas-root .nas-folder-rows .fr-head { display: none; }
+  .nas-root .nas-folder-rows .fr-cache { justify-content: flex-start; }
+}
+
 .nas-elastic-wizard { max-width: min(760px, calc(100vw - 24px)); }
 .nas-elastic-wizard .nas-elastic-preview { overflow-wrap: anywhere; }
 .nas-elastic-wizard .install-header, .nas-elastic-wizard .install-progress { margin-bottom: 12px; }

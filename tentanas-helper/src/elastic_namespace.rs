@@ -994,8 +994,110 @@ mod linux {
         })
     }
 
-    /// Stops the private namespace an anchor names, and confirms the union
-    /// path is nobody's mount afterwards.
+    /// Whether this node can still see the process at `pid`.
+    ///
+    /// `Ok(false)` ONLY for a `/proc` entry the kernel says is not there.
+    /// Every other error is returned, because an unreadable `/proc` is not
+    /// evidence that a process has ended — and a caller about to report a
+    /// namespace released on the strength of it would be reporting a guess.
+    fn process_present(pid: u32) -> Result<bool, String> {
+        match std::fs::metadata(format!("/proc/{pid}")) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("nieczytelny /proc/{pid}: {error}")),
+        }
+    }
+
+    /// The mount namespace one `/proc` entry is in.
+    ///
+    /// `Ok(None)` ONLY for an entry the kernel says is not there — a process
+    /// that exited between the listing and this read, which is not a member of
+    /// anything. Everything else is returned, including a permission error:
+    /// the executor runs as root (`execute` refuses otherwise), so a link it
+    /// cannot read is a fact about the node, not about the process, and the
+    /// caller may not conclude "no member" from it.
+    fn namespace_of(pid: u32) -> Result<Option<u64>, String> {
+        match std::fs::metadata(format!("/proc/{pid}/ns/mnt")) {
+            Ok(metadata) => Ok(Some(metadata.ino())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("nieczytelna namespace /proc/{pid}: {error}")),
+        }
+    }
+
+    /// Whether `inode` is still held, given what each `/proc` entry answered.
+    ///
+    /// The decision is separated from the walk so a test can pin the property
+    /// that matters and could not otherwise be reached: ONE unreadable entry
+    /// makes the whole answer a refusal. "No member" may only be concluded
+    /// from a complete reading — a partial one that answered `false` would
+    /// report branches released on the strength of the processes it happened
+    /// to be able to see.
+    fn namespace_held(
+        inode: u64,
+        entries: impl IntoIterator<Item = Result<Option<u64>, String>>,
+    ) -> Result<bool, String> {
+        for entry in entries {
+            if entry? == Some(inode) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether any process on this node is still a member of the mount
+    /// namespace the anchor recorded.
+    ///
+    /// THIS is the question a dissolve has to answer, and the host's mount
+    /// table cannot answer it: the branches live inside the private namespace,
+    /// so a host `mountinfo` that does not list them says nothing whatever
+    /// about whether they are mounted. A mount namespace exists exactly as
+    /// long as it has a member and the kernel frees its mounts with it, so
+    /// "no member" IS "no branch mounts" — and the kernel offers no lookup
+    /// from an nsfs inode back to its namespace, which is why `/proc` is
+    /// walked. A dissolve is rare and deliberate; one directory scan for the
+    /// one fact that decides whether the disks are really released is the
+    /// honest trade.
+    ///
+    /// An nsfs inode CAN be reused once its namespace is freed, so this may
+    /// answer `true` about an unrelated namespace. That direction is the safe
+    /// one: it produces a refusal to report the release, never a release
+    /// reported over live mounts.
+    fn namespace_alive(inode: u64) -> Result<bool, String> {
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir("/proc").map_err(|e| e.to_string())? {
+            let name = entry.map_err(|e| e.to_string())?.file_name();
+            if let Some(pid) = name.to_str().and_then(|pid| pid.parse::<u32>().ok()) {
+                pids.push(pid);
+            }
+        }
+        namespace_held(inode, pids.into_iter().map(namespace_of))
+    }
+
+    /// Whether the anchor's daemon is still the process at its pid, given what
+    /// `/proc` answered.
+    ///
+    /// The decision is separated from the reads so a test can pin it, because
+    /// the rule it carries is the whole point: AN UNREADABLE `/proc` IS NOT A
+    /// DEAD PROCESS. Folding an error into "gone" skipped the kill and then
+    /// reported the namespace released — the single outcome that must be
+    /// impossible, because it tells an admin the disks are free while a live
+    /// daemon goes on serving them.
+    fn daemon_live(
+        present: Result<bool, String>,
+        ticks: impl FnOnce() -> Result<u64, String>,
+        recorded: u64,
+    ) -> Result<bool, String> {
+        if !present? {
+            return Ok(false);
+        }
+        // The pid exists. Whether it is OUR daemon is `start_ticks`' answer,
+        // and an unreadable stat is returned rather than read as death: a pid
+        // that exists and cannot be identified must neither be signalled nor
+        // assumed dead.
+        Ok(ticks()? == recorded)
+    }
+
+    /// Stops the private namespace an anchor names, and confirms it is gone.
     ///
     /// This is how a dissolve releases a private array. The branches are NOT
     /// unmounted one by one: they exist only inside the mergerfs process's own
@@ -1011,57 +1113,64 @@ mod linux {
     /// stop answering for the pid with the recorded start time, which is the
     /// only evidence available and the only one that cannot be fooled by pid
     /// reuse.
-    pub(crate) fn stop(paths: &Paths, anchor: &Anchor) -> Result<(), String> {
-        // A boot or a pid that no longer matches the anchor means the daemon
-        // is already gone, and with it the namespace and every branch mount in
-        // it. That is the state the caller asked for.
-        let gone = match boot_id() {
-            Ok(current) if current != anchor.boot_id => true,
-            Ok(_) => match start_ticks(anchor.pid) {
-                Ok(ticks) => ticks != anchor.start_ticks,
-                Err(_) => true,
-            },
-            Err(error) => return Err(error),
-        };
-        if !gone {
-            let ns = validate_anchor(anchor)?;
-            drop(ns);
-            let pid = anchor.pid as libc::pid_t;
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut killed = false;
-            loop {
-                match start_ticks(anchor.pid) {
-                    Err(_) => break,
-                    Ok(ticks) if ticks != anchor.start_ticks => break,
-                    Ok(_) => (),
+    ///
+    /// UNKNOWN IS NOT GONE. Every read of `/proc` here either answers or
+    /// refuses: a stat this node cannot perform used to skip the kill and then
+    /// report success, which is the one outcome that must be impossible — it
+    /// would tell an admin the disks are released while a live daemon went on
+    /// serving them.
+    pub(crate) fn stop(anchor: &Anchor) -> Result<(), String> {
+        // A different boot is the one assumption worth making, because it is
+        // not one: nothing survives a reboot, so neither the process nor its
+        // namespace can still exist.
+        if boot_id()? == anchor.boot_id {
+            let live = daemon_live(
+                process_present(anchor.pid),
+                || start_ticks(anchor.pid),
+                anchor.start_ticks,
+            )?;
+            if live {
+                // The fd `validate_anchor` returns is a REFERENCE to the
+                // namespace and would keep it alive on its own, so the
+                // identity check has to be finished with before the signals.
+                drop(validate_anchor(anchor)?);
+                let pid = anchor.pid as libc::pid_t;
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
                 }
-                if Instant::now() >= deadline {
-                    if killed {
-                        return Err("proces unii nie zakończył się".into());
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut killed = false;
+                loop {
+                    if !daemon_live(
+                        process_present(anchor.pid),
+                        || start_ticks(anchor.pid),
+                        anchor.start_ticks,
+                    )? {
+                        break;
                     }
-                    // SIGTERM leaves a FUSE daemon waiting on in-flight
-                    // requests; the second signal does not.
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
+                    if Instant::now() >= deadline {
+                        if killed {
+                            return Err("proces unii nie zakończył się".into());
+                        }
+                        // SIGTERM leaves a FUSE daemon waiting on in-flight
+                        // requests; the second signal does not.
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                        killed = true;
                     }
-                    killed = true;
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                std::thread::sleep(Duration::from_millis(50));
             }
-        }
-        // POSITIVE evidence, and the caller's order is what gives it teeth: the
-        // dissolve unmounts the PUBLISHED union first, in the host namespace,
-        // so a union still in use refuses there before anything is signalled.
-        // This confirms nothing came back — a mount reappearing at the path
-        // would mean the process stopped was not the one serving it.
-        if mount_rows()?
-            .iter()
-            .any(|row| Path::new(&row.path) == paths.union_path)
-        {
-            return Err("unia nadal zamontowana po zatrzymaniu procesu".into());
+            // POSITIVE EVIDENCE about the thing that actually holds the
+            // branches. The daemon's pid being gone is not enough on its own:
+            // any other process still inside that namespace keeps it, and its
+            // mounts, alive.
+            if namespace_alive(anchor.mount_ns_inode)? {
+                return Err(
+                    "prywatna namespace unii nadal ma proces; branche nie zostały zwolnione".into(),
+                );
+            }
         }
         Ok(())
     }
@@ -1127,6 +1236,84 @@ mod linux {
     mod tests {
         use super::*;
         use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// THE DEFECT THIS PINS: `stop` used to map every `/proc` read error
+        /// to "the process is gone", so an unreadable `/proc` skipped the kill
+        /// and the dissolve then reported the branches released while the
+        /// mergerfs daemon was still serving them. Unknown is not a state this
+        /// codebase acts on.
+        #[test]
+        fn an_unreadable_proc_is_never_read_as_a_dead_daemon() {
+            // The pid is gone: the one answer that means "already stopped".
+            assert_eq!(daemon_live(Ok(false), || panic!("not asked"), 7), Ok(false));
+            // The pid exists and is ours.
+            assert_eq!(daemon_live(Ok(true), || Ok(7), 7), Ok(true));
+            // The pid exists and was reused by something else.
+            assert_eq!(daemon_live(Ok(true), || Ok(8), 7), Ok(false));
+            // UNREADABLE, either half. Both must refuse rather than answer.
+            assert_eq!(
+                daemon_live(Err("nieczytelny /proc/42".into()), || Ok(7), 7),
+                Err("nieczytelny /proc/42".into())
+            );
+            assert_eq!(
+                daemon_live(Ok(true), || Err("nieczytelny starttime".into()), 7),
+                Err("nieczytelny starttime".into())
+            );
+        }
+
+        /// The evidence a dissolve actually needs: is that mount namespace
+        /// still alive.
+        ///
+        /// It replaced a check that read the HOST mount table for the union
+        /// path, which `destroy` had already unmounted a moment earlier — that
+        /// check was true by construction and could never have failed. The
+        /// property pinned here is the one that makes the new check worth
+        /// having: a reading that is INCOMPLETE answers neither way.
+        #[test]
+        fn the_namespace_evidence_refuses_rather_than_answer_from_a_partial_walk() {
+            let found = |inode| Ok(Some(inode));
+            // A member is a member, wherever in the walk it appears.
+            assert_eq!(namespace_held(42, vec![found(7), found(42), found(9)]), Ok(true));
+            // Nobody holds it, and every entry was read.
+            assert_eq!(namespace_held(42, vec![found(7), Ok(None), found(9)]), Ok(false));
+            // ONE entry this node could not read and the answer is a refusal —
+            // even though no member was seen, which is exactly the shape a
+            // permissive version would have reported as "released".
+            assert_eq!(
+                namespace_held(42, vec![found(7), Err("nieczytelna namespace /proc/1".into())]),
+                Err("nieczytelna namespace /proc/1".into())
+            );
+            // A member found BEFORE the unreadable entry still answers, because
+            // the question is already settled.
+            assert_eq!(
+                namespace_held(42, vec![found(42), Err("nieczytelna".into())]),
+                Ok(true)
+            );
+        }
+
+        /// The I/O half: an absent process is `Ok(None)` and a present one
+        /// reports the namespace it is in. Only ENOENT may read as absent.
+        #[test]
+        fn a_namespace_link_maps_absent_apart_from_unreadable() {
+            let mine = std::fs::metadata("/proc/self/ns/mnt")
+                .expect("own mount namespace")
+                .ino();
+            assert_eq!(namespace_of(std::process::id()), Ok(Some(mine)));
+            // Above the kernel's pid ceiling, so `/proc` answers ENOENT rather
+            // than a permission error — the only case that may read as absent.
+            assert_eq!(namespace_of(u32::MAX), Ok(None));
+        }
+
+        /// A pid the kernel does not have is `Ok(false)`; a pid it does have is
+        /// `Ok(true)`. Nothing here may turn a read error into either.
+        #[test]
+        fn process_presence_separates_absent_from_unreadable() {
+            assert_eq!(process_present(std::process::id()), Ok(true));
+            // The kernel's own ceiling is well below this, so no process can
+            // hold it and `/proc` answers ENOENT rather than a permission
+            // error — which is the only case that may read as "absent".
+            assert_eq!(process_present(u32::MAX), Ok(false));
+        }
 
         #[test]
         fn superblock_state_requires_exactly_one_global_flag() {
@@ -1366,7 +1553,7 @@ pub(crate) fn preflight(_: &Paths, _: &std::path::Path) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn stop(_: &Paths, _: &Anchor) -> Result<(), String> {
+pub(crate) fn stop(_: &Anchor) -> Result<(), String> {
     Err("prywatna namespace wymaga Linux".into())
 }
 

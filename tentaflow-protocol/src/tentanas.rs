@@ -1621,6 +1621,19 @@ pub struct NasElasticArray {
     pub cache_disks: Vec<NasElasticBranch>,
     pub parity_disks: Vec<NasElasticParity>,
     pub folders: Vec<NasElasticFolder>,
+    /// Whether the list above is the array's REAL top-level folders.
+    ///
+    /// `false` is UNKNOWN and never "this array has no folders", and the
+    /// difference is not cosmetic: the folders are discovered by reading the
+    /// union, and §3.4 forbids fstab — so on a node that has not mounted the
+    /// branches yet `/mnt/<array>` is an ordinary empty directory of the root
+    /// filesystem and reads back as zero entries. Publishing that as "no
+    /// folders" would tell an admin their data is gone. The folders whose
+    /// policy this node has STORED are listed either way, because a stored
+    /// policy is an intention and the mover honours it whatever the union
+    /// says; `folders_known` describes the discovery half alone.
+    #[serde(default)]
+    pub folders_known: bool,
     pub mover: NasMoverSettings,
     pub snapraid: NasSnapraidState,
     pub protection: NasElasticProtection,
@@ -1917,8 +1930,12 @@ pub enum TentaNasPayload {
         /// able to make a dissolved array unrecoverable, because the admin
         /// typing it is thinking about the disk, not about the array.
         ///
-        /// With it, the wipe drops that journal first, which releases the
-        /// claim on EVERY member of the array and on the array's name.
+        /// With it, the wipe drops that journal once the erase is VERIFIED —
+        /// never before it. Released first, a `wipefs` that then failed left
+        /// the array permanently unimportable and disarmed this very
+        /// acknowledgement on every sibling disk, since no journal claimed
+        /// them any more. Dropping it releases the claim on EVERY member of
+        /// the array and on the array's name.
         #[serde(default)]
         release_journal_array: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2854,6 +2871,23 @@ pub enum TentaNasPayload {
         enabled: bool,
         schedule: NasSchedule,
     },
+    /// One folder's cache policy — n11's "Cache" column, per row. Answers with
+    /// `ElasticArrayGetResponse`.
+    ///
+    /// It carries NO `sudo_password` and parks with nobody: it writes one row
+    /// of this node's database and starts no privileged step. What it changes
+    /// is the rules the NEXT mover run is carried out under.
+    ///
+    /// `cache_policy` is 'yes' | 'no' | 'only', and 'yes' is how a folder is
+    /// RETURNED TO THE DEFAULT: the default is the absence of a stored row, so
+    /// storing 'yes' beside it would be a second spelling of the same state
+    /// that could then disagree with it.
+    ElasticFolderCacheSetRequest {
+        name: String,
+        /// One top-level folder of the union, relative to it — never a path.
+        folder: String,
+        cache_policy: String,
+    },
 }
 
 #[cfg(test)]
@@ -3052,6 +3086,30 @@ mod tests {
                     .expect("decode");
             assert_eq!(back, variant, "elastic schedule variant wire drift");
         }
+
+        // The per-folder cache policy. Every field is required: absent is not
+        // a spelling this request has, because "no policy" is 'yes' and the
+        // handler has to be able to tell that apart from a dropped field.
+        let folder = TentaNasPayload::ElasticFolderCacheSetRequest {
+            name: "media".to_string(),
+            folder: "foto".to_string(),
+            cache_policy: "only".to_string(),
+        };
+        let back: TentaNasPayload =
+            crate::cbor::decode(&crate::cbor::encode(&folder).expect("encode")).expect("decode");
+        assert_eq!(back, folder, "ElasticFolderCacheSetRequest wire drift");
+        let json = serde_json::json!({
+            "ElasticFolderCacheSetRequest": { "name": "media", "folder": "foto", "cache_policy": "yes" }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ElasticFolderCacheSetRequest {
+                name: "media".to_string(),
+                folder: "foto".to_string(),
+                cache_policy: "yes".to_string(),
+            }
+        );
     }
 
     /// The approval answers travel through the same CBOR the browser decodes,
@@ -3845,6 +3903,16 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            // One folder with a policy the admin chose, published beside the
+            // flag that says the union WAS readable — so the list is the
+            // array's real top level and not a guess.
+            folders: vec![NasElasticFolder {
+                name: "foto".to_string(),
+                path: "/mnt/media/foto".to_string(),
+                cache_policy: "only".to_string(),
+                ..Default::default()
+            }],
+            folders_known: true,
             usable_bytes: Some(3_998_000_000_000),
             used_bytes: Some(2_300_000_000_000),
             ..Default::default()
@@ -3907,6 +3975,38 @@ mod tests {
         assert_eq!(decoded.cache_disks[0].mounted, None);
         assert_eq!(decoded.data_disks[0].mounted, Some(true));
         assert_eq!(decoded.mover.last_run.expect("a run").skipped_files, 3);
+        assert!(decoded.folders_known, "a readable union stays readable over the wire");
+        assert_eq!(decoded.folders[0].cache_policy, "only");
+
+        // The THIRD state of the folder list, and the one that costs data if
+        // it collapses into the second: an array whose union could not be read
+        // carries no folders AND `folders_known: false`, which is not the same
+        // value as an array that really has none.
+        let unreadable = NasElasticArray {
+            name: "media".to_string(),
+            folders: Vec::new(),
+            folders_known: false,
+            ..Default::default()
+        };
+        let empty = NasElasticArray {
+            name: "media".to_string(),
+            folders: Vec::new(),
+            folders_known: true,
+            ..Default::default()
+        };
+        assert_ne!(unreadable, empty, "unknown folders must not equal zero folders");
+        let back: NasElasticArray =
+            crate::cbor::decode(&crate::cbor::encode(&unreadable).expect("encode")).expect("decode");
+        assert!(!back.folders_known);
+        // A peer that predates the field sends no key at all, and the decode
+        // has to land on UNKNOWN rather than on "this array has no folders".
+        let mut json = serde_json::to_value(&empty).expect("json");
+        assert!(
+            json.as_object_mut().expect("object").remove("folders_known").is_some(),
+            "the field has to be there before the test can take it away"
+        );
+        let old_peer: NasElasticArray = serde_json::from_value(json).expect("decode");
+        assert!(!old_peer.folders_known, "a missing field is unknown, never zero");
 
         // The wizard's step 2 sends only the data disks, so the four
         // defaulted fields have to decode from the encoders' minimal JSON —

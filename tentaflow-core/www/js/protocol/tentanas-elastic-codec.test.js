@@ -67,6 +67,10 @@ const cases = [
   }, {
     name: 'archiwum', enabled: false, schedule: { every: 'weekly', hour: 4, minute: 0, weekday: 0, day: 1 },
   }],
+  // Polityka cache jednego folderu. Wszystkie trzy pola są wymagane, a „yes"
+  // jest powrotem do domyślnej — nie ma tu kształtu „bez wartości".
+  ['ElasticFolderCacheSet', { name: 'archiwum', folder: 'foto', cachePolicy: 'only' },
+    { name: 'archiwum', folder: 'foto', cache_policy: 'only' }],
 ];
 
 for (const [name, request, expected] of cases) {

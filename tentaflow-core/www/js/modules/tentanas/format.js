@@ -99,7 +99,12 @@ export function fmtOptionalBytes(n) {
 }
 
 export function jobCanCancel(job) {
-  return !['elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover'].includes(job.kind);
+  // `disk_wipe` is here for a different reason than the elastic runs: those
+  // cannot be interrupted safely, this one cannot be interrupted AT ALL — the
+  // helper is already erasing, so the button could only ever lie about what it
+  // did. The server refuses it too (`jobs.rs`); this keeps the button away
+  // from the admin in the first place.
+  return !['elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'disk_wipe'].includes(job.kind);
 }
 
 export function fmtMBps(bps) {
