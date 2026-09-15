@@ -5923,14 +5923,20 @@ mod registration_tests {
         // The policy an admin CAN always take back: a folder that already
         // carries a stored rule passes even while the union is unreadable, so
         // a pin can be lifted without waiting for a mount.
+        //
+        // Asserted on the array whose union is unreadable BY CONSTRUCTION, not
+        // on `media`: both assertions below are about an unknown folder list,
+        // and on a node that really has `/mnt/media` the list is known and
+        // carries that array's actual folders — so on the owner's machine this
+        // clause was checking the opposite of what it says.
         assert!(store::set_elastic_folder_policy(
             &g.db,
-            &spec.array_id,
+            &nowhere.array_id,
             "foto",
             tentanas::elastic::CachePolicy::Only,
         )
         .unwrap());
-        let response = elastic_folder_cache_set(&fixture.ctx, "media", "foto", "yes")
+        let response = elastic_folder_cache_set(&fixture.ctx, "probe-unmounted-union", "foto", "yes")
             .await
             .unwrap();
         let MessageBody::TentaNasBody(P::ElasticArrayGetResponse { array }) = response else {
