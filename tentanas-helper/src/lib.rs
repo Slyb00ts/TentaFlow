@@ -327,6 +327,17 @@ pub enum HelperCommand {
     ElasticMover { array_id: String, owner: elastic::ElasticOwner, operation_id: String, resume_operation_id: String, rules: elastic::MoverRules, coupled_sync: bool },
     ElasticSync { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticScrub { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    /// Rebuilds one data disk of an array from its parity (`snapraid fix -d`).
+    /// `disk` is the array's own branch name (`d1`, `d2`, …), not a device:
+    /// the disk being repaired may well be the one that is failing, and the
+    /// only name that survives a kernel rename is the array's.
+    ElasticFix { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: String },
+    /// One more data disk, on a LIVE array. The union is never taken down.
+    ElasticAddDisk { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: elastic::ElasticDiskSpec },
+    /// Stops serving the array and releases its mounts. Formats nothing and
+    /// removes nothing: the journal, the configs and every filesystem stay, so
+    /// the array import can take the array back whole.
+    ElasticDestroy { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticInspect { array_id: String, owner: elastic::ElasticOwner },
     ElasticClaims { name: Option<String> },
     /// Every Elastic journal on this node, whatever its owner. Owner-blind on
@@ -1971,6 +1982,9 @@ impl HelperCommand {
             Self::ElasticMover { .. } => Some("elastic_mover"),
             Self::ElasticSync { .. } => Some("elastic_sync"),
             Self::ElasticScrub { .. } => Some("elastic_scrub"),
+            Self::ElasticFix { .. } => Some("elastic_fix"),
+            Self::ElasticAddDisk { .. } => Some("elastic_add_disk"),
+            Self::ElasticDestroy { .. } => Some("elastic_destroy"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
             Self::ElasticClaims { .. } => Some("elastic_claims"),
             Self::ElasticJournals {} => Some("elastic_journals"),
@@ -2023,7 +2037,24 @@ impl HelperCommand {
         if self.guards_storage() { return self.resolve_exec().map(|_| ()); }
         match self {
             Self::ElasticCreate { operation } => operation.validate(),
-            Self::ElasticSync { array_id, owner, operation_id } | Self::ElasticScrub { array_id, owner, operation_id } => {
+            Self::ElasticFix { array_id, owner, operation_id, disk } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                elastic::validate_data_branch_name(disk)?;
+                owner.validate()
+            }
+            Self::ElasticAddDisk { array_id, owner, operation_id, disk } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                elastic::validate_elastic_uuid(&disk.expected_uuid)?;
+                if !matches!(disk.bytes, 1..=u64::MAX) {
+                    return Err(CatalogError::InvalidArgument("dodawany dysk bez rozmiaru".into()));
+                }
+                owner.validate()
+            }
+            Self::ElasticDestroy { array_id, owner, operation_id }
+            | Self::ElasticSync { array_id, owner, operation_id }
+            | Self::ElasticScrub { array_id, owner, operation_id } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 elastic::validate_elastic_uuid(operation_id)?;
                 owner.validate()
@@ -2704,6 +2735,9 @@ impl HelperCommand {
             Self::ElasticMover { .. } => ("builtin", "Przenosi pliki cache do data z trwałym dziennikiem i synchronizacją parity."),
             Self::ElasticSync { .. } => ("builtin", "Synchronizuje parity własnej macierzy Elastic z trwałym wynikiem."),
             Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
+            Self::ElasticFix { .. } => ("builtin", "Odbudowuje wskazany dysk danych własnej macierzy Elastic z parity."),
+            Self::ElasticAddDisk { .. } => ("builtin", "Dodaje dysk danych do działającej unii własnej macierzy Elastic."),
+            Self::ElasticDestroy { .. } => ("builtin", "Zatrzymuje udostępnianie własnej macierzy Elastic bez formatowania dysków."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
             Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym węźle."),
@@ -2888,6 +2922,10 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ElasticMover { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), resume_operation_id: s(), rules: elastic::MoverRules::default(), coupled_sync: true },
         HelperCommand::ElasticSync { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticScrub { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticFix { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), disk: s() },
+        HelperCommand::ElasticAddDisk { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(),
+            disk: elastic::ElasticDiskSpec { disk_id: s(), wwn: None, serial: None, bytes: 0, expected_uuid: s() } },
+        HelperCommand::ElasticDestroy { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::ElasticClaims { name: Some(s()) },
         HelperCommand::ElasticJournals {},
@@ -4238,6 +4276,62 @@ mod tests {
                 Some(snake(name[..end].trim()))
             })
             .collect()
+    }
+
+    /// EVERY Elastic command is a builtin, and every one of the five tables
+    /// that decide what happens to it knows it.
+    ///
+    /// `describe` and `validate_builtin` are exhaustive matches, so the
+    /// compiler holds those two. `builtin_label` ends in `_ => None` and
+    /// `catalog_examples` is a hand-written list — so a new Elastic variant
+    /// missing from either would compile, and would then be routed to the
+    /// EXEC channel: the wrapper would look for a program named after it,
+    /// fail to find one, and the array operation would surface as a missing
+    /// tool. That is the failure this test exists to make impossible.
+    #[test]
+    fn every_elastic_command_is_a_builtin_the_five_tables_know() {
+        let elastic: Vec<String> = declared_variant_names()
+            .into_iter()
+            .filter(|name| name.starts_with("elastic_"))
+            .collect();
+        assert!(
+            elastic.len() >= 14,
+            "parsed {} Elastic variants: {elastic:?}",
+            elastic.len()
+        );
+        for name in ["elastic_fix", "elastic_add_disk", "elastic_destroy"] {
+            assert!(elastic.contains(&name.to_string()), "{name} is not declared");
+        }
+        let listed: Vec<String> = catalog().into_iter().map(|e| e.name).collect();
+        let examples = catalog_examples();
+        for name in &elastic {
+            // `catalog()` is built from `catalog_examples`, so this is the
+            // hand-written list being checked against the enum.
+            assert!(listed.contains(name), "{name} is missing from catalog_examples()");
+            let example = examples
+                .iter()
+                .find(|command| command.variant_name() == *name)
+                .unwrap_or_else(|| panic!("{name} has no example"));
+            assert_eq!(
+                example.builtin_label(),
+                Some(name.as_str()),
+                "{name} fell through builtin_label to the exec channel"
+            );
+            assert_eq!(
+                example.describe().0,
+                "builtin",
+                "{name} is not described as a builtin"
+            );
+            // `validate_builtin` is reached through `plan()`, which is what the
+            // wrapper actually calls. The example specs are placeholders, so
+            // the verdict is not asserted — only that the command resolves to
+            // its OWN builtin rather than to an exec entry.
+            match example.plan() {
+                Ok(Plan::Builtin(label)) => assert_eq!(label, name.as_str()),
+                Ok(Plan::Exec(r)) => panic!("{name} resolved to exec {:?}", r.args),
+                Err(_) => (),
+            }
+        }
     }
 
     #[test]

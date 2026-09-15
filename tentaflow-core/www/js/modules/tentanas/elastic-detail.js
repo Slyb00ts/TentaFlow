@@ -8,6 +8,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
 import { patchHtml } from '/js/modules/tentanas/dom-patch.js';
+import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -28,6 +29,30 @@ const ACTION_REQUEST = { restore: 'tentaNasElasticArrayRestoreRequest', sync: 't
 const ACTION_TITLE = { restore: 'elastic.restore', sync: 'elastic.sync_now', scrub: 'elastic.scrub_now', mover: 'elastic.mover_run_now' };
 const ACTION_ACCEPTED = { restore: 'elastic.job_running', sync: 'elastic.maintenance_accepted', scrub: 'elastic.maintenance_accepted', mover: 'elastic.mover_accepted' };
 const ACTION_APPROVAL = { restore: 'elastic.approval', sync: 'elastic.maintenance_approval', scrub: 'elastic.maintenance_approval', mover: 'elastic.mover_approval' };
+
+// What a repair would be working on, or '' when the array reports nothing to
+// repair.
+//
+// It MIRRORS `tentanas::elastic::repair_evidence` FIELD FOR FIELD, over the
+// same object: the node runs that rule on the very `NasElasticArray` this
+// reads. `snapraid fix` writes the named disk back from the parity checkpoint,
+// so a button on an array that reports nothing wrong would only overwrite
+// healthy data — and a button the node then refuses is worse still, because
+// the admin reads the refusal as a fault.
+//
+// `devicePresent` is a tri-state and only `false` counts: `null` is "nothing
+// looked", the state of every array on a node whose disks have not been read
+// yet, and treating it as absence would put a repair button on all of them.
+function repairEvidence(array) {
+  for (const member of array?.dataDisks || []) {
+    if (member.devicePresent === false) return T('elastic.repair_reason_gone', { disk: member.name });
+    if (member.health === 'critical') return T('elastic.repair_reason_smart', { disk: member.name });
+  }
+  if (array?.unresolvedOperation) return T('elastic.repair_reason_unresolved');
+  const errors = array?.snapraid?.parityErrors;
+  if (typeof errors === 'number' && errors > 0) return T('elastic.repair_reason_errors', { n: errors });
+  return '';
+}
 
 export function elasticState(array) {
   const labels = { active: T('elastic.active'), pending: T('elastic.pending'), creating: T('elastic.creating'), needs_attention: T('elastic.error'), error: T('elastic.error'), disabled: T('elastic.disabled'), unknown: T('elastic.unknown') };
@@ -86,23 +111,159 @@ export function elasticCardHtml(array) {
   </div>`;
 }
 
-function diskHtml(disk, filesystem) {
-  return `<div class="disk-cell" data-disk="${escapeAttr(disk.diskId)}">
+// `repair` is the reason a repair is offered on THIS disk, or '' when it is
+// not. It is rendered as its own button rather than folded into the drill-in,
+// because a repair overwrites the disk and must never be one click away from
+// "show me this disk".
+function diskHtml(disk, filesystem, repair = '') {
+  return `<div class="disk-cell" data-disk="${escapeAttr(disk.diskId)}" data-branch="${escapeAttr(disk.name)}">
     <span class="health-dot ${healthClass(disk.health)}"></span>
     <div class="dc-main"><div class="dc-name"><span class="mono">${escapeHtml(disk.name)}</span></div>
       <div class="dc-sub">${escapeHtml(fmtOptionalBytes(disk.usedBytes))} / ${escapeHtml(fmtOptionalBytes(disk.sizeBytes))} · ${escapeHtml(filesystem.toUpperCase())}</div>
       <div class="dc-sub">${escapeHtml(disk.device || disk.diskId)}</div>
       <div class="dc-sub">${escapeHtml(T('elastic.mounted'))}: ${escapeHtml(triState(disk.mounted))} · ${escapeHtml(T('elastic.present'))}: ${escapeHtml(triState(disk.devicePresent))}</div>
       <div class="dc-sub mono">${escapeHtml(disk.mountpoint)}</div>
-    </div><tf-button variant="ghost" size="sm" icon="external-link" data-act="disk" title="${escapeAttr(T('elastic.disk_details', { name: disk.name }))}"></tf-button>
+    </div>${repair ? `<tf-button variant="danger" size="sm" icon="shield" data-act="fix" title="${escapeAttr(repair)}">${escapeHtml(T('elastic.repair'))}</tf-button>` : ''}<tf-button variant="ghost" size="sm" icon="external-link" data-act="disk" title="${escapeAttr(T('elastic.disk_details', { name: disk.name }))}"></tf-button>
   </div>`;
+}
+
+/// The repair dialog. The retype is the DISK and not the array: what the
+/// operation overwrites is that one disk, so the mistake worth making
+/// impossible is repairing the wrong disk of the right array.
+function openElasticFixDialog(screen, array, disk, evidence, onDone) {
+  const bodyHtml = `
+    ${warningHtml('danger', T('elastic.repair_warning', { disk: disk.name, name: array.name }))}
+    <ul class="loss-list">
+      <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.repair_loses', { disk: disk.name, path: disk.mountpoint }))}</span></li>
+      <li class="ll">${sprite('shield')}<span>${escapeHtml(evidence)}</span></li>
+    </ul>
+    <div class="explain-box">${escapeHtml(T('elastic.repair_explain'))}</div>`;
+  return openRetypeDialog({
+    title: T('elastic.repair_title', { disk: disk.name, name: array.name }),
+    icon: 'alert',
+    name: disk.name,
+    bodyHtml,
+    retypeLabel: `${escapeHtml(T('elastic.repair_retype'))} <span class="mono num-err">${escapeHtml(disk.name)}</span>`,
+    confirmLabel: T('elastic.repair_confirm', { disk: disk.name }),
+    confirmIcon: 'shield',
+    onConfirm: async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArrayFixRequest', {
+        name: array.name, disk: disk.name, confirmDisk: disk.name, sudoPassword,
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.repair_title', { disk: disk.name, name: array.name }));
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('elastic.repair_done', { disk: disk.name }));
+      return true;
+    },
+  });
+}
+
+/// Adding one data disk. The free-disk list is fetched WHEN THE DIALOG OPENS
+/// rather than polled with the screen: it is the one moment the answer has to
+/// be current, and a stale list is how an admin picks a disk another array
+/// took in the meantime.
+async function openAddDataDiskDialog(screen, array, onDone) {
+  let free = [];
+  try {
+    const res = await screen.nas('tentaNasElasticCapabilitiesRequest');
+    if (!Array.isArray(res?.freeDisks)) throw new Error(T('elastic.bad_response'));
+    free = res.freeDisks.filter((d) => d.health !== 'critical');
+  } catch (error) {
+    toast(T('elastic.add_disk_failed', { error: errMessage(error) }), 'error');
+    return null;
+  }
+  // The parity ceiling is the node's rule and the ONLY warning that arrives in
+  // time: snapraid accepts a data disk larger than its parity and refuses only
+  // months later, once the data has outgrown it (MEASURED 2026-09-06,
+  // snapraid 14.7). So an oversized disk stays visible with the reason instead
+  // of being silently dropped from the list.
+  const parityBytes = (array.parityDisks || []).map((p) => Number(p.sizeBytes) || 0);
+  const parityFloor = parityBytes.length ? Math.min(...parityBytes) : null;
+  const reasonFor = (disk) => parityFloor != null && Number(disk.sizeBytes) > parityFloor
+    ? T('elastic.add_disk_over_parity', { parity: fmtOptionalBytes(parityFloor) })
+    : '';
+  if (!free.length) {
+    toast(T('elastic.add_disk_none'), 'error');
+    return null;
+  }
+  let picked = '';
+  const cells = free.map((disk) => {
+    const reason = reasonFor(disk);
+    return `<div class="disk-cell ${reason ? 'disabled' : ''}" data-disk="${escapeAttr(disk.diskId)}" title="${escapeAttr(reason)}">
+      <div class="dc-main"><div class="dc-name mono">${escapeHtml(disk.name)}</div>
+      <div class="dc-sub">${escapeHtml(fmtOptionalBytes(disk.sizeBytes))} · ${escapeHtml(disk.serial || '—')}${reason ? ` · ${escapeHtml(reason)}` : ''}</div></div></div>`;
+  }).join('');
+  const bodyHtml = `
+    ${warningHtml('danger', T('elastic.add_disk_warning', { name: array.name }))}
+    <p class="wizard-section-sub">${escapeHtml(T('elastic.add_disk_sub'))}</p>
+    <div class="disk-cells" id="nas-add-disk">${cells}</div>
+    <div class="explain-box">${escapeHtml(T('elastic.add_disk_explain'))}</div>`;
+  return openRetypeDialog({
+    title: T('elastic.add_disk_title', { name: array.name }),
+    icon: 'plus',
+    name: array.name,
+    bodyHtml,
+    retypeLabel: `${escapeHtml(T('elastic.add_disk_retype'))} <span class="mono num-err">${escapeHtml(array.name)}</span>`,
+    confirmLabel: T('elastic.add_disk_confirm'),
+    confirmIcon: 'plus',
+    width: 620,
+    wire: (win) => {
+      win.querySelectorAll('#nas-add-disk .disk-cell').forEach((cell) => cell.addEventListener('click', () => {
+        if (cell.classList.contains('disabled')) return;
+        picked = cell.dataset.disk;
+        // Only the two cells whose selection actually changed are touched —
+        // the list is not rebuilt, so nothing the admin is reading moves.
+        win.querySelectorAll('#nas-add-disk .disk-cell.checked').forEach((other) => other.classList.remove('checked'));
+        cell.classList.add('checked');
+      }));
+    },
+    onConfirm: async () => {
+      if (!picked) throw new Error(T('elastic.add_disk_pick'));
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArrayAddDiskRequest', {
+        name: array.name, diskId: picked, confirmName: array.name, sudoPassword,
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.add_disk_title', { name: array.name }));
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('elastic.add_disk_done'));
+      return true;
+    },
+  });
+}
+
+/// The danger zone. It says plainly what dissolving does NOT do, because that
+/// is the whole shape of the operation: nothing is formatted, so the disks keep
+/// their filesystems and their files and the array import takes the array back.
+function openElasticDestroyDialog(screen, array, onDone) {
+  const disks = [...(array.dataDisks || []), ...(array.cacheDisks || [])];
+  const bodyHtml = `
+    ${warningHtml('danger', T('elastic.dissolve_warning', { name: array.name }))}
+    <ul class="loss-list">
+      <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.dissolve_loses', { path: array.unionPath }))}</span></li>
+      <li class="ll">${sprite('shield')}<span>${escapeHtml(T('elastic.dissolve_keeps', { n: disks.length, disks: disks.map((d) => d.name).join(', ') || '—' }))}</span></li>
+      <li class="ll">${sprite('info')}<span>${escapeHtml(T('elastic.dissolve_reimport'))}</span></li>
+    </ul>
+    <div class="explain-box">${escapeHtml(T('elastic.dissolve_explain'))}</div>`;
+  return openRetypeDialog({
+    title: T('elastic.dissolve_title', { name: array.name }),
+    icon: 'alert',
+    name: array.name,
+    bodyHtml,
+    retypeLabel: `${escapeHtml(T('elastic.dissolve_retype'))} <span class="mono num-err">${escapeHtml(array.name)}</span>`,
+    confirmLabel: T('elastic.dissolve_confirm', { name: array.name }),
+    onConfirm: async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArrayDestroyRequest', {
+        name: array.name, confirmName: array.name, sudoPassword,
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.dissolve_title', { name: array.name }));
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('elastic.dissolve_done', { name: array.name }));
+      return true;
+    },
+  });
 }
 
 function snapraidHistoryHtml(history, expanded) {
   const outcomes = { running: 'run_running', ok: 'run_ok', failed: 'run_failed', needs_attention: 'error', refused: 'run_refused' };
   const refusals = { no_parity: 'no_parity', precondition_failed: 'refused_precondition', unsynced_changes: 'refused_dirty', empty_parity: 'refused_empty' };
   return `<div class="nas-snapraid-history mt-md"><div class="title">${escapeHtml(T('elastic.history'))}</div>${history.length ? `<ol>${history.map((run) => {
-    const label = run.kind === 'sync' ? 'Sync' : run.kind === 'scrub' ? 'Scrub' : run.kind;
+    const label = run.kind === 'sync' ? 'Sync' : run.kind === 'scrub' ? 'Scrub' : run.kind === 'fix' ? T('elastic.run_fix') : run.kind;
     const result = T(`elastic.${outcomes[run.outcome] || 'unknown'}`);
     const key = JSON.stringify([run.operationId, run.jobId, run.startedAt, run.kind]);
     const detail = run.outcome === 'refused' && refusals[run.detail] ? T(`elastic.${refusals[run.detail]}`) : run.detail;
@@ -341,6 +502,19 @@ export async function drawElasticDetail(screen, body) {
   // history: the blocking row may be a mover's, and it outlives the array
   // returning to 'active' after a Restore. Without it the button would be
   // offered for a request the node can only refuse.
+  // A repair may start on an array that NEEDS ATTENTION — that is the state it
+  // exists to resolve — so it deliberately does not share `maintenanceReason`,
+  // which requires an active one.
+  const repairReason = () => !screen.isAdmin ? T('elevation.admin_only')
+    : !(array?.parityDisks || []).length ? T('elastic.no_parity')
+      : !array?.enabled || !['active', 'needs_attention'].includes(array.state) ? T('elastic.repair_not_ready')
+        : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running')
+          : !repairEvidence(array) ? T('elastic.repair_none') : '';
+  const addDiskReason = () => !screen.isAdmin ? T('elevation.admin_only')
+    : !array?.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
+      : array.unresolvedOperation ? T('elastic.add_disk_unresolved')
+        : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running')
+          : array.mover?.lastRun?.outcome === 'running' ? T('elastic.mover_running') : '';
   const moverReason = () => !screen.isAdmin ? T('elevation.admin_only')
     : !(array?.cacheDisks || []).length ? T('elastic.mover_no_cache')
       : !array.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
@@ -353,6 +527,18 @@ export async function drawElasticDetail(screen, body) {
     const status = array && elasticState(array);
     const maintenanceDisabled = busy || submitted || Boolean(maintenanceReason());
     const moverDisabled = busy || submitted || Boolean(moverReason());
+    const addDiskBlocked = addDiskReason();
+    const addDiskDisabled = busy || submitted || Boolean(addDiskBlocked);
+    // ONE reason for the whole array, rendered on every data disk that shows a
+    // fault. An array with no evidence gets no repair control at all, so the
+    // button cannot be the thing that suggests a repair is due.
+    const repairBlocked = array ? repairReason() : T('elevation.admin_only');
+    const repairFor = (disk) => {
+      if (repairBlocked) return '';
+      if (disk.devicePresent === false) return T('elastic.repair_reason_gone', { disk: disk.name });
+      if (disk.health === 'critical') return T('elastic.repair_reason_smart', { disk: disk.name });
+      return repairEvidence(array);
+    };
     const html = `<tf-breadcrumb class="nas-crumbs"><tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item><tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item></tf-breadcrumb><div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
       <tf-button variant="ghost" data-act="back">${escapeHtml(T('elastic.back'))}</tf-button><tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
       ${error ? `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(error)}"></tf-alert>` : ''}
@@ -363,8 +549,9 @@ export async function drawElasticDetail(screen, body) {
         <tf-stat-card icon="database" label="${escapeAttr(T('elastic.cache'))}" value="${escapeAttr(fmtOptionalBytes(array.cacheUsedBytes))}" suffix="${escapeAttr('/ ' + fmtOptionalBytes(array.cacheSizeBytes))}"></tf-stat-card>
       </div>
       <div class="section-card"><div class="section-card-head"><div class="title">${sprite('cylinder')} ${escapeHtml(T('elastic.disks'))}</div><span class="hint">${escapeHtml(T('elastic.independent_fs'))}</span></div>
-        <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.data'))} · MERGERFS</span><span class="mono">${escapeHtml(array.unionPath)}</span><span class="hint">${escapeHtml(T('elastic.policy'))}: ${escapeHtml(array.createPolicy)}</span></div>
-          <div class="disk-cells">${(array.dataDisks || []).map((d) => diskHtml(d, d.filesystem || array.filesystem)).join('')}</div></div>
+        <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.data'))} · MERGERFS</span><span class="mono">${escapeHtml(array.unionPath)}</span><span class="hint">${escapeHtml(T('elastic.policy'))}: ${escapeHtml(array.createPolicy)}</span>${screen.isAdmin ? `<span class="actions"><tf-button variant="secondary" size="sm" icon="plus" data-act="add-disk" ${addDiskDisabled ? 'disabled' : ''} title="${escapeAttr(addDiskBlocked || T('elastic.add_disk_online'))}">${escapeHtml(T('elastic.add_disk'))}</tf-button></span>` : ''}</div>
+          <div class="disk-cells">${(array.dataDisks || []).map((d) => diskHtml(d, d.filesystem || array.filesystem, repairFor(d))).join('')}</div>
+          ${screen.isAdmin && addDiskBlocked ? `<div class="hint">${escapeHtml(addDiskBlocked)}</div>` : ''}</div>
         <div class="vdev-group"><div class="vg-head"><span class="vg-type">PARITY · SNAPRAID</span></div><div class="disk-cells">${(array.parityDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${!(array.parityDisks || []).length ? `<div class="hint">${escapeHtml(T('elastic.no_parity'))}</div>` : ''}</div>
         <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.cache'))}</span><span class="hint">${escapeHtml(T('elastic.cache_no_protection'))}</span></div><div class="disk-cells">${(array.cacheDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${!(array.cacheDisks || []).length ? `<div class="hint">${escapeHtml(T('elastic.cache_none'))}</div>` : ''}</div>
       </div>
@@ -378,7 +565,10 @@ export async function drawElasticDetail(screen, body) {
         <tf-button variant="secondary" size="sm" icon="refresh" data-act="sync" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.sync_now'))}</tf-button><tf-button variant="ghost" size="sm" icon="search" data-act="scrub" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.scrub_now'))}</tf-button></div></div>
         ${maintenanceReason() ? `<div class="hint mb-sm">${escapeHtml(maintenanceReason())}</div>` : ''}<div class="stat-rows">
         ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.last_scrub'), fmtDate(array.snapraid?.lastScrub?.finishedAt))}${schedulePill(T('elastic.sync_schedule'), cadenceValue(array.snapraid?.syncSchedule, array.snapraid?.syncScheduleEnabled), 'sync-schedule', screen.isAdmin)}${schedulePill(T('elastic.scrub_schedule'), cadenceValue(array.snapraid?.scrubSchedule, array.snapraid?.scrubScheduleEnabled), 'scrub-schedule', screen.isAdmin)}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
-      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div>${moverPanelHtml(array, moverDisabled, moverReason(), screen.isAdmin)}</div>` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
+      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div>${moverPanelHtml(array, moverDisabled, moverReason(), screen.isAdmin)}</div>
+      ${screen.isAdmin ? `<div class="section-card danger-zone"><h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
+        ${dangerRowHtml({ title: T('elastic.dissolve', { name: array.name }), desc: T('elastic.dissolve_desc'), action: T('elastic.dissolve_action'), icon: 'trash', act: 'destroy', disabled: busy || submitted })}
+      </div>` : ''}` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
     // The whole pane is one patched string. An array that is simply sitting
     // there polls to byte-identical markup, so nothing is destroyed and every
     // listener below stays bound; when it DOES differ the pane is rebuilt and
@@ -397,6 +587,20 @@ export async function drawElasticDetail(screen, body) {
       button.addEventListener('click', () => { if (isCurrent()) screen.openDisk(button.closest('[data-disk]').dataset.disk); });
     });
     for (const action of ['restore', 'sync', 'scrub', 'mover']) view.querySelector(`[data-act="${action}"]`)?.addEventListener('click', () => execute(action));
+    // querySelectorAll: every faulted data disk carries its own repair button.
+    view.querySelectorAll('[data-act="fix"]').forEach((button) => button.addEventListener('click', () => {
+      if (!isCurrent() || !array || repairReason()) return;
+      const branch = button.closest('[data-branch]')?.dataset.branch;
+      const disk = (array.dataDisks || []).find((d) => d.name === branch);
+      if (!disk) return;
+      openElasticFixDialog(screen, array, disk, repairFor(disk), refresh);
+    }));
+    view.querySelector('[data-act="add-disk"]')?.addEventListener('click', () => {
+      if (isCurrent() && array && !addDiskReason()) openAddDataDiskDialog(screen, array, refresh);
+    });
+    view.querySelector('[data-act="destroy"]')?.addEventListener('click', () => {
+      if (isCurrent() && array) openElasticDestroyDialog(screen, array, () => screen.openArray(null));
+    });
     // querySelectorAll, not querySelector: the header button AND the pill both
     // carry this action, and binding only the first match left the pill — the
     // control this panel documents as the way in — doing nothing at all.

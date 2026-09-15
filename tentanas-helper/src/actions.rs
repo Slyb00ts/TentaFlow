@@ -53,6 +53,8 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. }
         | HelperCommand::ElasticMover { .. }
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
+        | HelperCommand::ElasticFix { .. } | HelperCommand::ElasticAddDisk { .. }
+        | HelperCommand::ElasticDestroy { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. }
         | HelperCommand::ElasticJournals {} | HelperCommand::ElasticAdopt { .. } => {
             crate::elastic::execution::execute(command)

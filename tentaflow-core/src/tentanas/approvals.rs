@@ -41,6 +41,26 @@ pub const OP_ELASTIC_SCRUB: &str = "elastic_scrub";
 /// Running the mover by hand. It moves files off the cache and then syncs
 /// parity, so it is a red path for the same reason a sync is.
 pub const OP_ELASTIC_MOVER: &str = "elastic_mover";
+/// Rebuilding one data disk from parity. Red for the reason a restore is not:
+/// it WRITES the named disk, overwriting whatever it currently holds with what
+/// the parity checkpoint says it should hold.
+pub const OP_ELASTIC_FIX: &str = "elastic_fix";
+/// Adding a data disk to a live array. The disk is formatted before it joins,
+/// so this destroys whatever was on it — the same blast radius as one disk of
+/// a create.
+pub const OP_ELASTIC_ADD_DISK: &str = "elastic_add_disk";
+/// Dissolving the array.
+///
+/// It joins the four-eyes list even though it is REVERSIBLE — the disks keep
+/// their filesystems and the array import takes the array back — because what
+/// is at stake is not the bytes: dissolving is what takes an array's shares
+/// off every client at once, and it is the one operation that lets the addon be
+/// uninstalled (`db::block_elastic_teardown` refuses while any array row
+/// stands). One admin alone taking a fleet's storage offline, and unlocking the
+/// uninstall that follows it, is exactly what the second pair of eyes is for.
+/// The plan's list already carries `destroy pool` for a ZFS pool; this is the
+/// same decision for the other kind of array.
+pub const OP_ELASTIC_DESTROY: &str = "elastic_destroy";
 
 /// ARMING one of an array's cadences (E2-10).
 ///
@@ -417,6 +437,12 @@ fn without_secret(payload: &TentaNasPayload) -> TentaNasPayload {
     match payload.clone() {
         P::ElasticArraySyncRequest { name, .. } => P::ElasticArraySyncRequest { name, sudo_password: None },
         P::ElasticArrayScrubRequest { name, .. } => P::ElasticArrayScrubRequest { name, sudo_password: None },
+        P::ElasticArrayFixRequest { name, disk, confirm_disk, .. } =>
+            P::ElasticArrayFixRequest { name, disk, confirm_disk, sudo_password: None },
+        P::ElasticArrayAddDiskRequest { name, disk_id, confirm_name, .. } =>
+            P::ElasticArrayAddDiskRequest { name, disk_id, confirm_name, sudo_password: None },
+        P::ElasticArrayDestroyRequest { name, confirm_name, .. } =>
+            P::ElasticArrayDestroyRequest { name, confirm_name, sudo_password: None },
         P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,.. } =>
             P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,sudo_password:None },
         P::PoolDestroyRequest {

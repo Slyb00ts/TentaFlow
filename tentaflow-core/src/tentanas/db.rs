@@ -525,6 +525,44 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         ON nas_elastic_operations(array_id) WHERE state = 'running';
     CREATE UNIQUE INDEX nas_elastic_operation_origin
         ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
+), (
+    15,
+    // The three lifecycle operations §5.3 promised and the schema had no room
+    // for: repairing one data disk from parity, adding a data disk to a live
+    // array, and dissolving the array. A widened CHECK needs the whole table
+    // rebuilt (the same shape migration 14 used), so this repeats 14's
+    // statement with three kinds added and nothing else changed.
+    //
+    // NO index of its own for 'add_disk'. The rule that matters — a second add
+    // of a DIFFERENT disk while one is unfinished — is `reserve_added_disk`'s,
+    // and it cannot be an index: a unique index over the unfinished adds would
+    // also refuse the RETRY, which has to be allowed, because the failed
+    // attempt's request row is the only record of the filesystem UUID its mkfs
+    // stamped on the disk. `nas_elastic_operation_running` already refuses two
+    // at once.
+    "CREATE TABLE nas_elastic_operations_new (
+        operation_id TEXT PRIMARY KEY,
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        job_id TEXT NOT NULL UNIQUE REFERENCES nas_jobs(job_id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK(kind IN
+            ('create','import','restore','sync','scrub','mover','fix','add_disk','dissolve')),
+        state TEXT NOT NULL CHECK(state IN ('running','succeeded','failed','needs_attention')),
+        request_json TEXT NOT NULL,
+        result_json TEXT,
+        error TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    );
+    INSERT INTO nas_elastic_operations_new
+        SELECT operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at
+        FROM nas_elastic_operations;
+    DROP TABLE nas_elastic_operations;
+    ALTER TABLE nas_elastic_operations_new RENAME TO nas_elastic_operations;
+    CREATE INDEX nas_elastic_operation_array ON nas_elastic_operations(array_id, created_at);
+    CREATE UNIQUE INDEX nas_elastic_operation_running
+        ON nas_elastic_operations(array_id) WHERE state = 'running';
+    CREATE UNIQUE INDEX nas_elastic_operation_origin
+        ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -1041,6 +1079,32 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasJob> {
 const JOB_COLUMNS: &str = "job_id, kind, subject, status, progress_pct, started_by, started_at, \
                            finished_at, error, log";
 
+/// Whether an array carries a parity operation nobody has resolved. `?1` is the
+/// array id.
+///
+/// A SUCCESSFUL REPAIR SUPERSEDES the operations that preceded it, and that is
+/// the whole reason this is one string rather than four copies of a `state =
+/// 'needs_attention'` test. A scrub that finds errors closes `needs_attention`
+/// and blocks every later sync, scrub, mover and add; `snapraid fix` is what
+/// makes the array whole again, so after it succeeds those rows no longer
+/// describe the array. They are NOT rewritten — a failed scrub happened, and
+/// the history says so, and the history decoder is entitled to expect that a
+/// row which carries no validated result reads `needs_attention`. What changes
+/// is only whether they still hold the array.
+///
+/// The ordering compares `(created_at, operation_id)` as a pair because
+/// `created_at` has second resolution: an operation id is a uuid v7, so the
+/// pair is total even for two rows written in the same second.
+const UNRESOLVED_ELASTIC_OPERATION: &str = "EXISTS(
+    SELECT 1 FROM nas_elastic_operations o
+    WHERE o.array_id = ?1
+      AND o.kind IN ('sync','scrub','mover','fix','add_disk')
+      AND o.state = 'needs_attention'
+      AND NOT EXISTS(
+        SELECT 1 FROM nas_elastic_operations f
+        WHERE f.array_id = o.array_id AND f.kind = 'fix' AND f.state = 'succeeded'
+          AND (f.created_at, f.operation_id) > (o.created_at, o.operation_id)))";
+
 pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>) -> Result<()> {
     let mut conn = write(pool)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1106,19 +1170,104 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
             }
             ElasticJobIntent::Snapraid { owner, array_id, operation_id, kind } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
-                let action = super::elastic::snapraid_kind(*kind);
+                let action = super::elastic::snapraid_kind(kind);
                 anyhow::ensure!(job.kind == format!("elastic_{action}") && job.subject == spec.name,
                     "Zadanie nie odpowiada intencji SnapRAID");
                 anyhow::ensure!(!spec.parity.is_empty(), "Macierz bez parity nie wykonuje SnapRAID");
-                let active: bool = tx.query_row("SELECT state='active' FROM nas_elastic_arrays WHERE array_id=?1",
+                if let Some(disk) = super::elastic::snapraid_disk(kind) {
+                    // The repair's disk is checked against the array HERE, in
+                    // the transaction that reserves the operation: a row that
+                    // could only ever produce a refusal must not be written,
+                    // and the helper's own refusal would arrive as a failed job
+                    // with no sentence the admin can act on.
+                    anyhow::ensure!(
+                        spec.data.iter().enumerate().any(|(index, _)|
+                            tentanas_helper::elastic::data_branch_name(index + 1) == disk),
+                        "Macierz nie ma dysku danych '{disk}'");
+                }
+                let state: String = tx.query_row("SELECT state FROM nas_elastic_arrays WHERE array_id=?1",
                     params![array_id], |r| r.get(0))?;
-                let unresolved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_operations
-                    WHERE array_id=?1 AND kind IN ('sync','scrub') AND state='needs_attention')",
+                let unresolved: bool = tx.query_row(
+                    &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
                     params![array_id], |r| r.get(0))?;
-                anyhow::ensure!(active && !unresolved, "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                // A REPAIR is the one maintenance operation an array that needs
+                // attention may start, because it is the one that RESOLVES that
+                // state: a scrub which found errors leaves exactly this row, and
+                // refusing the repair here would make the unresolved operation
+                // permanent and the array unrepairable through the product.
+                anyhow::ensure!(
+                    if super::elastic::snapraid_disk(kind).is_some() {
+                        matches!(state.as_str(), "active" | "needs_attention")
+                    } else {
+                        state == "active" && !unresolved
+                    },
+                    "Macierz ma niepotwierdzoną operację; brak ponowienia");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
-                let command = super::elastic::snapraid_command(owner, array_id, operation_id, *kind);
+                let command = super::elastic::snapraid_command(owner, array_id, operation_id, kind);
                 (array_id, operation_id, action, serde_json::to_string(&command)?)
+            }
+            ElasticJobIntent::AddDisk { owner, array_id, operation_id, disk } => {
+                let spec = elastic_spec(&tx, owner, array_id)?;
+                anyhow::ensure!(job.kind == "elastic_add_disk" && job.subject == spec.name,
+                    "Zadanie nie odpowiada intencji dodania dysku");
+                tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
+                // The array the add would PRODUCE has to be a legal array: the
+                // 32-device ceiling and the identity uniqueness are checked on
+                // it, not on the disk alone.
+                super::elastic::spec_with_added_disk(&spec, disk)?;
+                // The RESERVATION, in the transaction that opens the operation
+                // and before the helper formats anything: the member row cannot
+                // be written yet — `elastic_spec` cross-checks it against the
+                // array's persisted intention, which is still the array without
+                // this disk — so the uniqueness rules the row would enforce are
+                // enforced here by hand instead. It also answers whether this
+                // is the RETRY of an add that stopped part-way.
+                let retry = reserve_added_disk(&tx, array_id, disk)?;
+                let state: String = tx.query_row("SELECT state FROM nas_elastic_arrays WHERE array_id=?1",
+                    params![array_id], |r| r.get(0))?;
+                let unresolved: bool = tx.query_row(
+                    &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
+                    params![array_id], |r| r.get(0))?;
+                // A RETRY is admitted on an array that needs attention, because
+                // the operation needing attention is the add itself: the helper
+                // recorded the slot in its journal before it formatted
+                // anything, so repeating the command is what finishes the work
+                // — and refusing it here would leave a disk half-joined with no
+                // way through the product to either finish or undo it.
+                anyhow::ensure!(
+                    if retry {
+                        matches!(state.as_str(), "active" | "needs_attention")
+                    } else {
+                        state == "active" && !unresolved
+                    },
+                    "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                if retry {
+                    // The superseded attempt stops holding the array. Its row
+                    // stays as history — the add DID stop part-way — but a
+                    // later sync, scrub or mover no longer waits on it.
+                    tx.execute(
+                        "UPDATE nas_elastic_operations SET state='failed',error=?3,
+                            finished_at=COALESCE(finished_at,?4)
+                         WHERE array_id=?1 AND kind='add_disk' AND state<>'succeeded'
+                           AND operation_id<>?2",
+                        params![
+                            array_id,
+                            operation_id,
+                            format!("ponowione operacją {operation_id}"),
+                            job.started_at
+                        ],
+                    )?;
+                }
+                let command = super::elastic::add_disk_command(owner, array_id, operation_id, disk);
+                (array_id, operation_id, "add_disk", serde_json::to_string(&command)?)
+            }
+            ElasticJobIntent::Dissolve { owner, array_id, operation_id } => {
+                let spec = elastic_spec(&tx, owner, array_id)?;
+                anyhow::ensure!(job.kind == "elastic_destroy" && job.subject == spec.name,
+                    "Zadanie nie odpowiada intencji rozwiązania");
+                tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
+                let command = super::elastic::dissolve_command(owner, array_id, operation_id);
+                (array_id, operation_id, "dissolve", serde_json::to_string(&command)?)
             }
             ElasticJobIntent::Mover { owner, array_id, operation_id, resume_operation_id, rules, coupled_sync } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
@@ -1133,8 +1282,8 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                 // mover: an unresolved parity operation means nothing knows
                 // what parity currently covers, and a run would move more
                 // bytes out of the cache and then sync on top of that unknown.
-                let unresolved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_operations
-                    WHERE array_id=?1 AND kind IN ('sync','scrub','mover') AND state='needs_attention')",
+                let unresolved: bool = tx.query_row(
+                    &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
                     params![array_id], |r| r.get(0))?;
                 anyhow::ensure!(active && !unresolved, "Macierz ma niepotwierdzoną operację; brak ponowienia");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
@@ -1200,7 +1349,7 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                 anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
                 let result: tentanas_helper::elastic::ElasticSnapraidResult =
                     serde_json::from_str(json)?;
-                super::elastic::validate_snapraid_result(&spec, &operation_id, kind, &result)?;
+                super::elastic::validate_snapraid_result(&spec, &operation_id, &kind, &result)?;
                 Ok(result)
             });
         let (operation_state, update_array, array_state) = match validated {
@@ -1352,7 +1501,7 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
         "SELECT o.operation_id,o.array_id,o.kind,a.org_id,a.addon_id,o.request_json,o.result_json,j.kind,j.subject
          FROM nas_elastic_operations o JOIN nas_elastic_arrays a ON a.array_id=o.array_id
          JOIN nas_jobs j ON j.job_id=o.job_id
-         WHERE o.job_id=?1 AND o.kind IN ('sync','scrub') AND o.state='running'
+         WHERE o.job_id=?1 AND o.kind IN ('sync','scrub','fix') AND o.state='running'
          AND j.status IN ('queued','running')", params![job_id],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
     let Some((
@@ -1369,7 +1518,8 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
     else {
         let is_maintenance: bool = conn
             .query_row(
-                "SELECT kind IN ('elastic_sync','elastic_scrub') FROM nas_jobs WHERE job_id=?1",
+                "SELECT kind IN ('elastic_sync','elastic_scrub','elastic_fix')
+                 FROM nas_jobs WHERE job_id=?1",
                 params![job_id],
                 |r| r.get(0),
             )
@@ -1383,11 +1533,6 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
     };
     let owner = ElasticOwner { org_id, addon_id };
     let spec = elastic_spec(conn, &owner, &array_id)?;
-    let kind = if action == "sync" {
-        tentanas_helper::elastic::ElasticSnapraidKind::Sync
-    } else {
-        tentanas_helper::elastic::ElasticSnapraidKind::Scrub
-    };
     tentanas_helper::elastic::validate_elastic_uuid(&operation_id)?;
     anyhow::ensure!(
         job_kind == format!("elastic_{action}")
@@ -1396,8 +1541,21 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
         "Niezgodna intencja zadania SnapRAID"
     );
     let command: tentanas_helper::HelperCommand = serde_json::from_str(&request)?;
+    // A repair's disk is part of its KIND, and the only record of it is the
+    // stored request — so the kind is read back out of the command and then the
+    // whole command is rebuilt from it and compared. A request whose disk had
+    // been edited would fail that comparison exactly as a request whose array
+    // had been.
+    let kind = match (action.as_str(), &command) {
+        ("sync", _) => tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+        ("scrub", _) => tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
+        ("fix", tentanas_helper::HelperCommand::ElasticFix { disk, .. }) => {
+            tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: disk.clone() }
+        }
+        _ => anyhow::bail!("Zmienione żądanie operacji SnapRAID"),
+    };
     anyhow::ensure!(
-        command == super::elastic::snapraid_command(&owner, &array_id, &operation_id, kind),
+        command == super::elastic::snapraid_command(&owner, &array_id, &operation_id, &kind),
         "Zmienione żądanie operacji SnapRAID"
     );
     Ok(Some((operation_id, spec, kind, candidate)))
@@ -1424,7 +1582,7 @@ pub fn record_snapraid_result(
         stored_id == operation_id && candidate.is_none(),
         "Wynik operacji już zapisano"
     );
-    super::elastic::validate_snapraid_result(&spec, operation_id, kind, result)?;
+    super::elastic::validate_snapraid_result(&spec, operation_id, &kind, result)?;
     let json = serde_json::to_string(result)?;
     anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
     anyhow::ensure!(tx.execute("UPDATE nas_elastic_operations SET result_json=?2 WHERE operation_id=?1 AND state='running' AND result_json IS NULL",
@@ -1689,8 +1847,7 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             // Restore after a failed sync leaves this standing. It is the
             // reason the mover is refused, so the wire has to carry it.
             unresolved_operation: conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM nas_elastic_operations
-                 WHERE array_id=?1 AND kind IN ('sync','scrub','mover') AND state='needs_attention')",
+                &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
                 params![array_id], |r| r.get(0))?,
             create_spec: Some(spec), state, state_detail, created_at, updated_at,
             ..Default::default()
@@ -1698,7 +1855,7 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
     }).collect()
 }
 
-/// Reads an array's sync and scrub history.
+/// Reads an array's sync, scrub and repair history.
 ///
 /// `since` bounds the STORED `finished_at` from below, RFC3339 in UTC like
 /// `now()` writes it, so a caller can ask for a WINDOW instead of a row count.
@@ -1722,7 +1879,7 @@ fn elastic_runs(
     };
     let mut statement = conn.prepare(
         "SELECT operation_id,job_id,kind,state,created_at,finished_at,error,result_json
-        FROM nas_elastic_operations WHERE array_id=?1 AND kind IN ('sync','scrub')
+        FROM nas_elastic_operations WHERE array_id=?1 AND kind IN ('sync','scrub','fix')
         AND (?2 IS NULL OR kind=?2) AND (?3=0 OR state='succeeded')
         AND (?2 IS NULL OR ?3!=0 OR state NOT IN ('running','failed'))
         AND (?5 IS NULL OR finished_at >= ?5)
@@ -1776,14 +1933,19 @@ fn elastic_runs(
                 .ok_or_else(|| anyhow!("Brak potwierdzonego wyniku"))
                 .and_then(|json| {
                     let result: ElasticSnapraidResult = serde_json::from_str(json)?;
+                    // The repair's disk comes from the RESULT and is then
+                    // held to the array by `validate_snapraid_result`: the
+                    // operations table records the action, not the disk, and a
+                    // history row may not invent one the array never had.
+                    let expected = match kind.as_str() {
+                        "sync" => ElasticSnapraidKind::Sync,
+                        "scrub" => ElasticSnapraidKind::Scrub,
+                        _ => result.run.kind.clone(),
+                    };
                     super::elastic::validate_snapraid_result(
                         spec,
                         &operation_id,
-                        if kind == "sync" {
-                            ElasticSnapraidKind::Sync
-                        } else {
-                            ElasticSnapraidKind::Scrub
-                        },
+                        &expected,
                         &result,
                     )?;
                     Ok(result)
@@ -1968,6 +2130,247 @@ fn insert_elastic_disks(tx: &Connection, spec: &ElasticCreateSpec) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// Checks that one disk may join an array, under the SAME rules the member
+/// rows enforce once it has.
+///
+/// It exists because the row cannot be written yet: `elastic_spec` cross-checks
+/// `nas_elastic_disks` against the array's persisted intention, and until the
+/// add closes that intention is still the array WITHOUT this disk — so writing
+/// the row first would make every read of the array fail for the length of the
+/// operation. The reservation is therefore the running operation row, and these
+/// are the checks its `UNIQUE` columns would have made.
+fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -> Result<bool> {
+    let claimed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_elastic_disks WHERE disk_id=?1 OR expected_uuid=?2)",
+        params![disk.disk_id, disk.expected_uuid],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        !claimed,
+        "Dysk {} należy już do macierzy tej instancji",
+        disk.disk_id
+    );
+    for value in [
+        Some(disk.disk_id.as_str()),
+        disk.wwn.as_deref(),
+        disk.serial.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let reserved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nas_elastic_disk_aliases WHERE value=?1)",
+            params![value],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            !reserved,
+            "Identyfikator {value} jest już zarezerwowany przez macierz tej instancji"
+        );
+    }
+    // Another add of this array that never closed successfully holds the slot
+    // and — more importantly — the filesystem UUID its mkfs was given. A retry
+    // has to reuse that identity, so a DIFFERENT disk arriving for the same
+    // slot is refused here rather than formatting a second device, while the
+    // SAME disk is admitted and reported as the retry it is.
+    let Some(held) = unfinished_add_disk(tx, array_id)? else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        held == *disk,
+        "Poprzednie dodanie dysku {} nie zostało zakończone; powtórz je tym samym dyskiem",
+        held.disk_id
+    );
+    Ok(true)
+}
+
+/// The disk spec of this array's LATEST add, when that add has not succeeded.
+///
+/// The question is about the latest attempt and not about "any attempt that
+/// failed": an array that was grown after one failed attempt carries both rows
+/// for ever, and reading the failed one would hand a caller the identity of an
+/// add that a later one already completed — pinning the array to a disk it
+/// already holds. So the newest row is read whatever its state, and only its
+/// state decides. `(created_at, operation_id)` is the ordering for the reason
+/// `UNRESOLVED_ELASTIC_OPERATION` uses it: `created_at` has second resolution
+/// and an operation id is a uuid v7.
+fn unfinished_add_disk(conn: &Connection, array_id: &str) -> Result<Option<ElasticDiskSpec>> {
+    let latest: Option<(String, String)> = conn
+        .query_row(
+            "SELECT state,request_json FROM nas_elastic_operations
+             WHERE array_id=?1 AND kind='add_disk'
+             ORDER BY created_at DESC, operation_id DESC LIMIT 1",
+            params![array_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((state, json)) = latest else {
+        return Ok(None);
+    };
+    if state == "succeeded" {
+        return Ok(None);
+    }
+    match serde_json::from_str::<tentanas_helper::HelperCommand>(&json)? {
+        tentanas_helper::HelperCommand::ElasticAddDisk { disk, .. } => Ok(Some(disk)),
+        _ => Err(anyhow!("Niezgodna intencja dodania dysku")),
+    }
+}
+
+/// The disk spec a retry of an unfinished add must reuse, if there is one.
+///
+/// The filesystem UUID is the reason: it is what the mkfs stamped on the disk
+/// and what `filesystem_matches` checks the branch by, so a retry that minted a
+/// new one would either format the disk a second time or refuse to mount it.
+pub fn unfinished_elastic_add_disk(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    array_id: &str,
+) -> Result<Option<ElasticDiskSpec>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mine: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays
+         WHERE array_id=?1 AND org_id=?2 AND addon_id=?3)",
+        params![array_id, owner.org_id, owner.addon_id],
+        |r| r.get(0),
+    )?;
+    if !mine {
+        return Ok(None);
+    }
+    unfinished_add_disk(&conn, array_id)
+}
+
+/// Closes a successful add by making the array's persisted intention and its
+/// member rows BOTH describe the array with the new disk — in one transaction.
+///
+/// They cannot be written apart. `elastic_spec` reads the intention from the
+/// origin operation's `request_json` and then refuses it unless
+/// `nas_elastic_disks` matches it exactly, so a commit that landed one without
+/// the other would make every read of the array fail.
+pub fn finish_elastic_add_disk(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    operation_id: &str,
+    disk: &ElasticDiskSpec,
+    observed: &ElasticResult,
+) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let array_id: String = tx.query_row(
+        "SELECT o.array_id FROM nas_elastic_operations o
+         JOIN nas_elastic_arrays a ON a.array_id=o.array_id
+         WHERE o.operation_id=?1 AND o.kind='add_disk' AND o.state='running'
+         AND a.org_id=?2 AND a.addon_id=?3",
+        params![operation_id, owner.org_id, owner.addon_id],
+        |r| r.get(0),
+    )?;
+    let before = elastic_spec(&tx, owner, &array_id)?;
+    let after = super::elastic::spec_with_added_disk(&before, disk)?;
+    super::elastic::validate_result(&after, observed)?;
+    let slot = i64::try_from(after.data.len())?;
+    tx.execute(
+        "INSERT INTO nas_elastic_disks
+            (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+         VALUES (?1,'data',?2,?3,?4,?5,?6,?7)",
+        params![
+            array_id,
+            slot,
+            disk.disk_id,
+            disk.wwn,
+            disk.serial,
+            i64::try_from(disk.bytes)?,
+            disk.expected_uuid
+        ],
+    )?;
+    for (kind, value) in [
+        ("disk_id", Some(disk.disk_id.as_str())),
+        ("wwn", disk.wwn.as_deref()),
+        ("serial", disk.serial.as_deref()),
+    ] {
+        if let Some(value) = value {
+            tx.execute(
+                "INSERT INTO nas_elastic_disk_aliases (kind,value,array_id,role,slot)
+                 VALUES (?1,?2,?3,'data',?4)",
+                params![kind, value, array_id, slot],
+            )?;
+        }
+    }
+    let json = serde_json::to_string(&after)?;
+    anyhow::ensure!(json.len() < 16 * 1024, "Intencja Elastic przekracza limit");
+    anyhow::ensure!(
+        tx.execute(
+            "UPDATE nas_elastic_operations SET request_json=?2
+             WHERE array_id=?1 AND kind IN ('create','import')",
+            params![array_id, json]
+        )? == 1,
+        "Brak jednej operacji źródłowej macierzy"
+    );
+    // The read-back is the proof the two writes agree: it is the very function
+    // every later read of this array goes through.
+    anyhow::ensure!(
+        elastic_spec(&tx, owner, &array_id)? == after,
+        "Zapis dysku nie odtworzył intencji macierzy"
+    );
+    let at = now();
+    tx.execute(
+        "UPDATE nas_elastic_operations SET state='succeeded',result_json=?2,error='',finished_at=?3
+         WHERE operation_id=?1",
+        params![operation_id, serde_json::to_string(observed)?, at],
+    )?;
+    tx.execute(
+        "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2
+         WHERE array_id=?1",
+        params![array_id, at],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Forgets one array: every reservation, schedule, setting and operation row,
+/// then the array itself.
+///
+/// Child-before-parent, in one immediate transaction, because every foreign key
+/// into `nas_elastic_arrays` is `ON DELETE RESTRICT` — that is what makes an
+/// array a RESERVATION rather than a note, and it is also why `db::block_elastic_teardown`
+/// refuses an uninstall while any array row stands. This is the only function
+/// that removes one, and it removes nothing else: no filesystem, no journal, no
+/// parity file. The array import takes the array back from those.
+///
+/// `owner` scopes it because the disks of another addon's array are that
+/// addon's reservation; without the scope one instance's destroy could release
+/// another's storage.
+pub fn delete_elastic_array(pool: &DbPool, owner: &ElasticOwner, array_id: &str) -> Result<bool> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mine: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays
+         WHERE array_id=?1 AND org_id=?2 AND addon_id=?3)",
+        params![array_id, owner.org_id, owner.addon_id],
+        |r| r.get(0),
+    )?;
+    if !mine {
+        return Ok(false);
+    }
+    // Aliases reference the member rows, which reference the array — so the
+    // order here is the reverse of the order `insert_elastic_disks` wrote them
+    // in, and any other order is refused by the keys rather than silently
+    // leaving an orphan.
+    for statement in [
+        "DELETE FROM nas_elastic_disk_aliases WHERE array_id=?1",
+        "DELETE FROM nas_elastic_disks WHERE array_id=?1",
+        "DELETE FROM nas_elastic_schedules WHERE array_id=?1",
+        "DELETE FROM nas_elastic_mover_settings WHERE array_id=?1",
+        "DELETE FROM nas_elastic_operations WHERE array_id=?1",
+    ] {
+        tx.execute(statement, params![array_id])?;
+    }
+    let removed = tx.execute(
+        "DELETE FROM nas_elastic_arrays WHERE array_id=?1 AND org_id=?2 AND addon_id=?3",
+        params![array_id, owner.org_id, owner.addon_id],
+    )?;
+    tx.commit()?;
+    Ok(removed == 1)
 }
 
 /// `(array_id, name)` of every array this node has a row for, whatever the
@@ -4052,7 +4455,7 @@ mod tests {
         kind: tentanas_helper::elastic::ElasticSnapraidKind,
     ) -> (NasJob, ElasticJobIntent, String) {
         let mut row = elastic_job(spec);
-        row.kind = format!("elastic_{}", super::super::elastic::snapraid_kind(kind));
+        row.kind = format!("elastic_{}", super::super::elastic::snapraid_kind(&kind));
         let id = uuid::Uuid::now_v7().to_string();
         let intent = ElasticJobIntent::Snapraid {
             owner: spec.owner.clone(),
@@ -4344,7 +4747,9 @@ mod tests {
         // Migration 14 rebuilds this table once more and renames the create
         // guard: an array's ORIGIN operation is now either the create that
         // made it or the import that adopted it, and exactly one of the two
-        // may exist. Every other index survives both rebuilds.
+        // may exist. Migration 15 rebuilds it a third time for the three
+        // lifecycle kinds and adds no index of its own. Every index survives
+        // all three rebuilds.
         let renamed: Vec<String> = indexes_before
             .iter()
             .map(|name| match name.as_str() {
@@ -5187,6 +5592,435 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    /// THE REASON `delete_elastic_array` exists: every foreign key into
+    /// `nas_elastic_arrays` is `ON DELETE RESTRICT`, and
+    /// `block_elastic_teardown` — the first statement of `native_teardown` —
+    /// refuses an uninstall while a single array row stands. So before this,
+    /// creating one array made the addon permanently un-uninstallable.
+    ///
+    /// Child-before-parent is not a style choice either: the alias rows key on
+    /// the member rows, which key on the array, so any other order is refused
+    /// by the keys rather than silently leaving an orphan. The foreign-key
+    /// check at the end is what proves nothing was left behind.
+    #[test]
+    fn deleting_an_array_releases_every_reservation_and_unblocks_the_uninstall() {
+        let p = pool();
+        let spec = completed_array(&p, "media");
+        let other = completed_array(&p, "foto");
+        set_elastic_schedule(
+            &p,
+            &spec.array_id,
+            ElasticTask::Sync,
+            true,
+            &NasSchedule {
+                every: "daily".into(),
+                hour: 3,
+                minute: 30,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        set_mover_settings(&p, &spec.array_id, 3600, 20, true).unwrap();
+        assert!(block_elastic_teardown(&p).is_err(), "an array row blocks the uninstall");
+        assert_eq!(elastic_claims(&p).unwrap().len(), 4, "two disks per array");
+
+        // An array of ANOTHER owner is not this owner's to release: without the
+        // scope one instance's destroy would free another instance's storage.
+        let foreign = ElasticOwner {
+            org_id: "other-org".into(),
+            addon_id: "nas".into(),
+        };
+        assert!(!delete_elastic_array(&p, &foreign, &spec.array_id).unwrap());
+        assert!(elastic_array(&p, &spec.owner, "media").unwrap().is_some());
+
+        assert!(delete_elastic_array(&p, &spec.owner, &spec.array_id).unwrap());
+        // Gone once, and only once: a second call is not an error and not a
+        // second deletion either.
+        assert!(!delete_elastic_array(&p, &spec.owner, &spec.array_id).unwrap());
+
+        assert!(elastic_array(&p, &spec.owner, "media").unwrap().is_none());
+        assert_eq!(
+            elastic_array_identities(&p).unwrap(),
+            vec![(other.array_id.clone(), "foto".to_string())]
+        );
+        // The DISK RESERVATION is what the destroy actually releases: the
+        // remaining claims are the other array's alone.
+        let claims = elastic_claims(&p).unwrap();
+        assert_eq!(claims.len(), 2);
+        assert!(
+            !claims.iter().any(|claim| claim.disk_id.starts_with("media-")),
+            "{claims:?}"
+        );
+        for (table, expected) in [
+            ("nas_elastic_disks", 2),
+            ("nas_elastic_disk_aliases", 6),
+            ("nas_elastic_schedules", 0),
+            ("nas_elastic_mover_settings", 0),
+        ] {
+            let left: i64 = p
+                .read()
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, expected, "{table}");
+        }
+        let operations: i64 = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM nas_elastic_operations WHERE array_id=?1",
+                params![spec.array_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(operations, 0);
+        assert!(p
+            .read()
+            .unwrap()
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none());
+
+        // The other array still holds the instance.
+        assert!(block_elastic_teardown(&p).is_err());
+        assert!(delete_elastic_array(&p, &other.owner, &other.array_id).unwrap());
+        // AND NOW THE UNINSTALL IS NO LONGER BLOCKED.
+        block_elastic_teardown(&p).expect("with no array row the teardown proceeds");
+    }
+
+    /// The add's two writes are ONE commit: the member row and the array's
+    /// persisted intention. `elastic_spec` refuses the array unless the two
+    /// agree, so a commit that landed one without the other would make every
+    /// later read of the array fail — which is exactly what the read-back
+    /// inside the transaction checks.
+    #[test]
+    fn a_finished_add_makes_the_spec_and_the_member_rows_agree_in_one_commit() {
+        let p = pool();
+        let spec = completed_array(&p, "grow");
+        let added = ElasticDiskSpec {
+            disk_id: "grow-data-2".into(),
+            wwn: Some("wwn-grow-data-2".into()),
+            serial: Some("serial-grow-data-2".into()),
+            bytes: 32 * 1024 * 1024 * 1024,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let mut job = elastic_job(&spec);
+        job.kind = "elastic_add_disk".into();
+        let intent = ElasticJobIntent::AddDisk {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: operation_id.clone(),
+            disk: added.clone(),
+        };
+        insert_job(&p, &job, Some(&intent)).unwrap();
+        // The operation row is the RESERVATION: while it is open the array's
+        // spec is still the array WITHOUT the disk, because `elastic_spec`
+        // cross-checks the member rows against that spec.
+        let before = elastic_array(&p, &spec.owner, "grow")
+            .unwrap()
+            .unwrap()
+            .persisted_spec()
+            .unwrap()
+            .clone();
+        assert_eq!(before.data.len(), 1);
+        assert_eq!(
+            super::super::db::unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id)
+                .unwrap()
+                .as_ref(),
+            Some(&added),
+            "a retry has to reuse the recorded filesystem UUID"
+        );
+        // A SECOND, DIFFERENT disk for the same array is refused while that
+        // reservation stands: two adds racing into one slot would format two
+        // devices for one place in the array.
+        let mut intruder = added.clone();
+        intruder.disk_id = "grow-data-3".into();
+        intruder.wwn = Some("wwn-grow-data-3".into());
+        intruder.serial = Some("serial-grow-data-3".into());
+        intruder.expected_uuid = uuid::Uuid::new_v4().to_string();
+        let mut second = elastic_job(&spec);
+        second.kind = "elastic_add_disk".into();
+        assert!(insert_job(
+            &p,
+            &second,
+            Some(&ElasticJobIntent::AddDisk {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                disk: intruder,
+            })
+        )
+        .is_err());
+
+        // A DISK ANOTHER ARRAY OF THIS INSTANCE ALREADY HOLDS is refused in
+        // the same transaction that would reserve it, under the very rules the
+        // member row's `UNIQUE` columns enforce once the add has closed. This
+        // is the "not free" case the handler cannot see from a mount table:
+        // an array's branches live in the union process's own namespace, so the
+        // host's `/proc/mounts` shows none of them.
+        let neighbour = completed_array(&p, "neighbour");
+        for taken in [neighbour.data[0].clone(), neighbour.parity[0].clone()] {
+            let mut stealing = elastic_job(&spec);
+            stealing.kind = "elastic_add_disk".into();
+            let error = insert_job(
+                &p,
+                &stealing,
+                Some(&ElasticJobIntent::AddDisk {
+                    owner: spec.owner.clone(),
+                    array_id: spec.array_id.clone(),
+                    operation_id: uuid::Uuid::now_v7().to_string(),
+                    disk: taken.clone(),
+                }),
+            )
+            .expect_err("a member of another array is not free");
+            assert!(
+                error.to_string().contains(&taken.disk_id)
+                    || error.to_string().contains("zarezerwowany"),
+                "{error}"
+            );
+            assert!(
+                super::super::db::job(&p, &stealing.job_id).unwrap().is_none(),
+                "no job row survived"
+            );
+        }
+
+        let after_spec = super::super::elastic::spec_with_added_disk(&before, &added).unwrap();
+        finish_elastic_add_disk(
+            &p,
+            &spec.owner,
+            &operation_id,
+            &added,
+            &super::super::elastic::tests::ready_result(&after_spec),
+        )
+        .unwrap();
+        finish_job(&p, &job.job_id, "succeeded", None).unwrap();
+
+        let grown = elastic_array(&p, &spec.owner, "grow").unwrap().unwrap();
+        assert_eq!(grown.state, "active");
+        assert_eq!(grown.persisted_spec().unwrap(), &after_spec);
+        assert_eq!(grown.data().count(), 2);
+        assert_eq!(grown.data().last().unwrap().name, "d2");
+        // The new disk is now a RESERVATION of this instance, the way every
+        // other member is: nothing else may claim it.
+        assert!(elastic_claims(&p)
+            .unwrap()
+            .iter()
+            .any(|claim| claim.disk_id == added.disk_id));
+        assert!(
+            super::super::db::unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(p
+            .read()
+            .unwrap()
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none());
+    }
+
+    /// AN ADD THAT STOPPED PART-WAY CAN BE FINISHED.
+    ///
+    /// The helper records the new slot in its own journal before it formats
+    /// anything, so repeating the command is what completes the work — and the
+    /// repeat must reuse the filesystem UUID the first attempt's mkfs stamped
+    /// on the disk, or it would either format a disk that is already a mounted
+    /// branch of the array or refuse to mount it. So: the failed attempt is
+    /// what HOLDS the identity, a different disk is refused while it stands,
+    /// the same disk is admitted even though the array needs attention, and the
+    /// superseded attempt stops holding the array.
+    #[test]
+    fn an_add_that_failed_is_retried_with_the_identity_it_recorded() {
+        let p = pool();
+        let spec = completed_array(&p, "resume");
+        let added = ElasticDiskSpec {
+            disk_id: "resume-data-2".into(),
+            wwn: Some("wwn-resume-data-2".into()),
+            serial: Some("serial-resume-data-2".into()),
+            bytes: 32 * 1024 * 1024 * 1024,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+        let start = |disk: &ElasticDiskSpec| {
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let mut job = elastic_job(&spec);
+            job.kind = "elastic_add_disk".into();
+            let intent = ElasticJobIntent::AddDisk {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: operation_id.clone(),
+                disk: disk.clone(),
+            };
+            (job, intent, operation_id)
+        };
+
+        let (first_job, first_intent, first_id) = start(&added);
+        insert_job(&p, &first_job, Some(&first_intent)).unwrap();
+        // The attempt fails the way the job body's error path closes it.
+        finish_elastic_operation(&p, &spec.owner, &first_id, Err("mkfs przerwany")).unwrap();
+        finish_job(&p, &first_job.job_id, "failed", Some("mkfs przerwany")).unwrap();
+        let hurt = elastic_array(&p, &spec.owner, "resume").unwrap().unwrap();
+        assert_eq!(hurt.state, "needs_attention");
+        assert!(hurt.unresolved_operation);
+        assert_eq!(hurt.data().count(), 1, "the member row was never written");
+
+        // A DIFFERENT disk is refused while the recorded identity stands, and
+        // the sentence says what to do instead.
+        let mut other = added.clone();
+        other.disk_id = "resume-data-3".into();
+        other.wwn = Some("wwn-resume-data-3".into());
+        other.serial = Some("serial-resume-data-3".into());
+        other.expected_uuid = uuid::Uuid::new_v4().to_string();
+        let (other_job, other_intent, _) = start(&other);
+        let refused = insert_job(&p, &other_job, Some(&other_intent)).unwrap_err();
+        assert!(
+            refused.to_string().contains("powtórz je tym samym dyskiem"),
+            "{refused}"
+        );
+
+        // THE SAME DISK is admitted, on an array that needs attention.
+        assert_eq!(
+            unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id).unwrap().as_ref(),
+            Some(&added)
+        );
+        let (second_job, second_intent, second_id) = start(&added);
+        insert_job(&p, &second_job, Some(&second_intent)).unwrap();
+        // The superseded attempt no longer holds the array.
+        assert_eq!(
+            unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id).unwrap().as_ref(),
+            Some(&added),
+            "the retry's own row now carries the identity"
+        );
+        let first_state: String = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM nas_elastic_operations WHERE operation_id=?1",
+                params![first_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_state, "failed", "the first attempt stays as history");
+
+        let after_spec =
+            super::super::elastic::spec_with_added_disk(hurt.persisted_spec().unwrap(), &added)
+                .unwrap();
+        finish_elastic_add_disk(
+            &p,
+            &spec.owner,
+            &second_id,
+            &added,
+            &super::super::elastic::tests::ready_result(&after_spec),
+        )
+        .unwrap();
+        finish_job(&p, &second_job.job_id, "succeeded", None).unwrap();
+
+        let grown = elastic_array(&p, &spec.owner, "resume").unwrap().unwrap();
+        assert_eq!(grown.state, "active");
+        assert_eq!(grown.data().count(), 2);
+        assert!(
+            !grown.unresolved_operation,
+            "nothing is left holding the array once the add has finished"
+        );
+        assert!(unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id).unwrap().is_none());
+        // And with the array whole again a sync is startable.
+        let (sync, sync_intent, _) = maintenance(
+            &grown.persisted_spec().unwrap().clone(),
+            tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+        );
+        insert_job(&p, &sync, Some(&sync_intent)).unwrap();
+    }
+
+    /// A repair is a first-class operation of the schema: migration 15 admits
+    /// its kind, the history reads it back, and a SUCCESSFUL repair resolves
+    /// the parity operation that reported the damage — without which the scrub
+    /// row that found the errors would block every later sync, scrub and mover
+    /// of an array that is demonstrably healthy again.
+    #[test]
+    fn a_successful_repair_closes_the_operation_that_reported_the_damage() {
+        use tentanas_helper::elastic::{ElasticSnapraidKind, ElasticSnapraidOutcome};
+        let p = pool();
+        let spec = completed_array(&p, "repair");
+        // A scrub that failed: the array needs attention and nothing else may
+        // start on it.
+        let (scrub, scrub_intent, _) = maintenance(&spec, ElasticSnapraidKind::Scrub);
+        insert_job(&p, &scrub, Some(&scrub_intent)).unwrap();
+        finish_job(&p, &scrub.job_id, "failed", Some("parity errors")).unwrap();
+        let hurt = elastic_array(&p, &spec.owner, "repair").unwrap().unwrap();
+        assert!(hurt.unresolved_operation);
+        assert_eq!(hurt.state, "needs_attention");
+        let (blocked, blocked_intent, _) = maintenance(&spec, ElasticSnapraidKind::Sync);
+        assert!(
+            insert_job(&p, &blocked, Some(&blocked_intent)).is_err(),
+            "an unresolved parity operation blocks a sync"
+        );
+
+        // The REPAIR is admitted there, and its kind reaches the table.
+        let (fix, fix_intent, fix_id) = maintenance(
+            &spec,
+            ElasticSnapraidKind::Fix {
+                disk: "d1".to_string(),
+            },
+        );
+        assert_eq!(fix.kind, "elastic_fix");
+        insert_job(&p, &fix, Some(&fix_intent)).unwrap();
+        let mut result = super::super::elastic::tests::snapraid_result(
+            &spec,
+            &fix_id,
+            ElasticSnapraidKind::Fix {
+                disk: "d1".to_string(),
+            },
+            ElasticSnapraidOutcome::Succeeded,
+        );
+        // A repair REPORTS what it repaired, so nonzero counters are its work.
+        // This is the assertion that would fail if `validate_snapraid_result`
+        // held a repair to the three-zero rule a sync and a scrub are held to.
+        result.run.errors_data = Some(7);
+        result.run.checked_blocks = None;
+        result.run.accessed_mb = Some(806);
+        // The answer has to BE the array's state: `validate_snapraid_result`
+        // refuses a result whose `last_run` is some other run.
+        result.state.last_run = Some(result.run.clone());
+        record_snapraid_result(&p, &spec.owner, &fix_id, &result).unwrap();
+        finish_job(&p, &fix.job_id, "succeeded", None).unwrap();
+
+        let healed = elastic_array(&p, &spec.owner, "repair").unwrap().unwrap();
+        assert_eq!(healed.state, "active");
+        assert!(
+            !healed.unresolved_operation,
+            "a successful repair is what resolves the operation that found the errors"
+        );
+        // The history carries the repair, and names the disk it rebuilt.
+        let repair_run = healed
+            .snapraid_history
+            .iter()
+            .find(|run| run.kind == "fix")
+            .expect("the repair is in the history");
+        assert_eq!(repair_run.outcome, "ok");
+        assert_eq!(repair_run.errors_data, Some(7));
+        // The scrub row is NOT rewritten: a failed scrub happened, and the
+        // history keeps saying so. What the repair changed is only whether it
+        // still holds the array.
+        let scrub_row = healed
+            .snapraid_history
+            .iter()
+            .find(|run| run.kind == "scrub")
+            .expect("the failed scrub stays in the history");
+        assert_eq!(scrub_row.outcome, "needs_attention");
+        // And a sync is startable again.
+        let (again, again_intent, _) = maintenance(&spec, ElasticSnapraidKind::Sync);
+        insert_job(&p, &again, Some(&again_intent)).unwrap();
     }
 
     /// A second self-test on one disk ABORTS the first, so `insert_job`

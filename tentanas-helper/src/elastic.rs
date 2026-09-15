@@ -240,11 +240,18 @@ pub struct ElasticResult {
     pub restart_required: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Which snapraid operation a run records.
+///
+/// `Fix` carries the disk BECAUSE the run record has to name it: a repair is
+/// scoped to one data disk (`snapraid fix -d <disk>`), and a history row
+/// saying only "fix" would leave an operator unable to tell which disk was
+/// rebuilt from parity. That is also why this enum is not `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElasticSnapraidKind {
     Sync,
     Scrub,
+    Fix { disk: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +287,27 @@ pub struct ElasticSnapraidRun {
 pub struct ElasticSnapraidResult {
     pub state: ElasticResult,
     pub run: ElasticSnapraidRun,
+}
+
+/// What a dissolve released, and what it deliberately did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticDissolveResult {
+    pub array_id: String,
+    pub operation_id: String,
+    pub owner: ElasticOwner,
+    pub name: String,
+    /// Mountpoints this node no longer serves, the union first.
+    pub released: Vec<String>,
+    /// The journal, the snapraid config and the parity file stayed on the
+    /// node, and so did every filesystem. It is ON THE WIRE rather than
+    /// assumed by the caller because it is the promise the dialog makes: this
+    /// is the one destructive array operation that is reversible, and the
+    /// array import is what reverses it. A helper that ever stopped keeping
+    /// them would have to say so here.
+    pub data_kept: bool,
+    /// The plan, rendered, for the job log.
+    pub steps: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,6 +606,51 @@ pub fn config_path(array: &str) -> String {
 /// it. A share on an Elastic Array must name the union path.
 pub fn is_branch_path(path: &str) -> bool {
     path.starts_with(BRANCH_ROOT)
+}
+
+/// Every role a persisted intention carries, data first, then the cache, then
+/// parity — the order the create plan builds them in.
+pub fn roles(spec: &ElasticCreateSpec) -> Vec<ElasticRole> {
+    (1..=spec.data.len())
+        .map(|i| ElasticRole::Data(i as u16))
+        .chain(spec.cache.as_ref().map(|_| ElasticRole::Cache))
+        .chain((1..=spec.parity.len()).map(|i| ElasticRole::Parity(i as u8)))
+        .collect()
+}
+
+/// Where one role of a persisted intention is mounted.
+///
+/// THE one place that turns a slot into the `d1` / `c1` / `p1` branch name, so
+/// the executor, the observation and the dissolve cannot disagree about which
+/// directory a disk lives under. A second copy of this mapping would let a
+/// dissolve unmount a path no branch was ever mounted at and report success.
+pub fn mount_path(spec: &ElasticCreateSpec, role: ElasticRole) -> String {
+    match role {
+        ElasticRole::Data(i) => data_branch_path(&spec.name, &format!("d{i}")),
+        ElasticRole::Cache => cache_branch_path(&spec.name, "c1"),
+        ElasticRole::Parity(i) => parity_mount_path(&spec.name, i),
+    }
+}
+
+/// The branch name of one data slot, as `snapraid fix -d` and the repair
+/// request name it.
+pub fn data_branch_name(slot: usize) -> String {
+    format!("d{slot}")
+}
+
+/// A data-disk name arriving from outside — a repair request naming the disk
+/// to rebuild. It is spliced into a snapraid argv, so it is held to the shape
+/// `layout_with` produces and nothing wider.
+pub fn validate_data_branch_name(disk: &str) -> Result<(), CatalogError> {
+    let ok = (2..=6).contains(&disk.len())
+        && disk.starts_with('d')
+        && disk[1..].bytes().all(|b| b.is_ascii_digit())
+        && disk[1..] != *"0";
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!("data disk name '{disk}'")))
+    }
 }
 
 // =============================================================================
@@ -1538,6 +1611,23 @@ pub fn validate_spec(spec: &ElasticSpec) -> Result<(), CatalogError> {
 /// or worse, mount a union over EMPTY directories and let every write land on
 /// the root filesystem — the §3.4 empty-share trap with the array's whole data
 /// path behind it. So an unknown mount table refuses to produce a plan.
+/// What a REPEATED add-disk has already achieved on this node.
+///
+/// A power cut between the mkfs and the sync leaves the journal naming the new
+/// slot and the work half done; the way out is to run the same operation
+/// again, and the plan it renders then has to be the work that is actually
+/// left. Without this the second attempt would try to format a disk that is
+/// already a mounted branch of the array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AddedDiskState {
+    /// The disk already carries the filesystem and the UUID the journal
+    /// recorded for this slot.
+    pub formatted: bool,
+    pub mounted: bool,
+    /// The live union is already serving the branch.
+    pub in_union: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observed {
     pub known: bool,
@@ -1820,17 +1910,18 @@ pub fn plan_mount(
     Ok(steps)
 }
 
-/// The array's headline feature: one more disk, at any time.
+/// The array's headline feature: one more disk, at any time, ONLINE.
 ///
-/// The union is remounted rather than grown in place because mergerfs takes
-/// its branch list at mount time; the config is rewritten because snapraid
-/// must learn the disk exists; and the sync comes last because until it runs
-/// the new disk is outside parity. The mkfs is here — this is the one
-/// non-create plan that formats anything, and it formats exactly the disk
-/// being added.
+/// The branch is added to the running union rather than remounted into a new
+/// one (see `ElasticStep::AddBranch` for the measurement); the config is
+/// rewritten because snapraid must learn the disk exists; and the sync comes
+/// last because until it runs the new disk is outside parity. The mkfs is
+/// here — this is the one non-create plan that formats anything, and it
+/// formats exactly the disk being added.
 pub fn plan_add_data_disk(
     spec_after: &ElasticSpec,
     added: &Branch,
+    done: &AddedDiskState,
     tools: &Tools,
 ) -> Result<Vec<ElasticStep>, CatalogError> {
     validate_spec(spec_after)?;
@@ -1841,8 +1932,14 @@ pub fn plan_add_data_disk(
         )));
     }
     let mountpoint = data_branch_path(&spec_after.name, &added.disk);
-    let mut steps = vec![
-        ElasticStep::Mkfs {
+    let mut steps = Vec::new();
+    if done.formatted {
+        steps.push(ElasticStep::Note(format!(
+            "{} already carries this array's filesystem",
+            added.device
+        )));
+    } else {
+        steps.push(ElasticStep::Mkfs {
             program: tools.mkfs(&spec_after.filesystem)?.to_string(),
             device: added.device.clone(),
             filesystem: spec_after.filesystem.clone(),
@@ -1859,36 +1956,48 @@ pub fn plan_add_data_disk(
                     .unwrap_or(spec_after.data.len()),
                 &added.disk,
             ),
-        },
-        ElasticStep::Mkdir {
+        });
+    }
+    if done.mounted {
+        steps.push(ElasticStep::Note(format!("{mountpoint} is already mounted")));
+    } else {
+        steps.push(ElasticStep::Mkdir {
             path: mountpoint.clone(),
-        },
-        ElasticStep::Mount {
+        });
+        steps.push(ElasticStep::Mount {
             source: added.device.clone(),
-            mountpoint,
+            mountpoint: mountpoint.clone(),
             filesystem: spec_after.filesystem.clone(),
             options: mount_options(&spec_after.filesystem),
-        },
-        // The union stays UP. This used to be an unmount followed by a fresh
-        // mergerfs mount, on the assumption that a branch list is fixed at
-        // mount time; MEASURED (2026-09-06, mergerfs 2.42.0) it is not, and
-        // the xattr write below adds the branch to a running union. The
-        // difference is not cosmetic: the remount version dropped every SMB
-        // and NFS client's handles on the array's headline operation.
-        //
-        // The branch is mounted BEFORE it is added, in that order, for the
-        // same reason the create plan mounts branches before the union: a
-        // branch added while its filesystem is not mounted would hand the
-        // union an empty directory on the root filesystem.
-        ElasticStep::AddBranch {
+        });
+    }
+    // The union stays UP. This used to be an unmount followed by a fresh
+    // mergerfs mount, on the assumption that a branch list is fixed at mount
+    // time; MEASURED (2026-09-06, mergerfs 2.42.0) it is not, and the xattr
+    // write below adds the branch to a running union. The difference is not
+    // cosmetic: the remount version dropped every SMB and NFS client's handles
+    // on the array's headline operation.
+    //
+    // The branch is mounted BEFORE it is added, in that order, for the same
+    // reason the create plan mounts branches before the union: a branch added
+    // while its filesystem is not mounted would hand the union an empty
+    // directory on the root filesystem.
+    if done.in_union {
+        steps.push(ElasticStep::Note(format!(
+            "{} is already a branch of {}",
+            mountpoint,
+            spec_after.union_path()
+        )));
+    } else {
+        steps.push(ElasticStep::AddBranch {
             union: spec_after.union_path(),
             // The MODE travels with it. Without it the disk joins as `RW`
             // while every other data branch is `NC`, and new files stop going
             // to the cache from that moment until the next reboot mounts the
             // union again — see `ElasticSpec::data_branch_mode`.
             branch: spec_after.data_branch_spec(&added.disk),
-        },
-    ];
+        });
+    }
     if spec_after.has_parity() {
         steps.push(ElasticStep::WriteFile {
             path: spec_after.config_path(),
@@ -1985,35 +2094,34 @@ pub fn plan_mover(
 ///
 /// The danger zone's promise is precise — "dane na dyskach XFS pozostają
 /// czytelne osobno" — so this plan must contain no `Mkfs` and no removal of a
-/// data disk's contents. The snapraid config and the union go; the disks and
-/// what is on them stay, each mountable on its own. The parity file is left
-/// where it is: it costs nothing, and an admin who dissolved an array by
-/// mistake still has it.
-pub fn plan_dissolve(spec: &ElasticSpec) -> Result<Vec<ElasticStep>, CatalogError> {
-    validate_spec(spec)?;
+/// data disk's contents. The union goes; the disks and what is on them stay,
+/// each mountable on its own. The snapraid config and the parity file are
+/// left where they are: they cost nothing, and together with the journal they
+/// are what lets the array import take a dissolved array back whole.
+///
+/// It takes the PERSISTED INTENTION rather than a resolved layout, because
+/// the case a dissolve exists for is the one where a member disk is no longer
+/// on the node: resolving devices first would refuse to take apart exactly
+/// the array that has to be taken apart. Every mountpoint here comes from
+/// `mount_path`, which needs no device at all.
+pub fn plan_dissolve(spec: &ElasticCreateSpec) -> Result<Vec<ElasticStep>, CatalogError> {
+    spec.validate()?;
     let mut steps = vec![
         ElasticStep::Note(
             "the disks keep their filesystems and their files: every data disk stays \
              mountable on its own"
                 .to_string(),
         ),
+        // The union goes FIRST. Taking a branch out from under a mounted
+        // union would leave mergerfs serving a directory on the root
+        // filesystem, which is the §3.4 trap the create plan orders against.
         ElasticStep::Unmount {
-            mountpoint: spec.union_path(),
+            mountpoint: union_path(&spec.name),
         },
     ];
-    for branch in &spec.cache {
+    for role in roles(spec) {
         steps.push(ElasticStep::Unmount {
-            mountpoint: cache_branch_path(&spec.name, &branch.disk),
-        });
-    }
-    for branch in &spec.data {
-        steps.push(ElasticStep::Unmount {
-            mountpoint: data_branch_path(&spec.name, &branch.disk),
-        });
-    }
-    for parity in &spec.parity {
-        steps.push(ElasticStep::Unmount {
-            mountpoint: parity_mount_path(&spec.name, parity.index),
+            mountpoint: mount_path(spec, role),
         });
     }
     Ok(steps)
@@ -2444,7 +2552,7 @@ pub(crate) mod execution {
             if run.operation_id == journal.spec.operation_id || run.outcome == ElasticSnapraidOutcome::Refused {
                 return Err("obcy rekord operacji".into());
             }
-            let pending = Some(Pending::Maintenance { operation_id: run.operation_id.clone(), kind: run.kind });
+            let pending = Some(Pending::Maintenance { operation_id: run.operation_id.clone(), kind: run.kind.clone() });
             // Only the mover's own coupled Sync that ended without success
             // pins no pending: it left parity marked stale instead, so the
             // array may mount (and remount after a boot) around it.
@@ -2832,22 +2940,6 @@ pub(crate) mod execution {
             ElasticRole::Parity(i) => spec.parity.get(usize::from(i).wrapping_sub(1)),
         }
         .ok_or_else(|| "nieznana rola journala".into())
-    }
-
-    fn roles(spec: &ElasticCreateSpec) -> Vec<ElasticRole> {
-        (1..=spec.data.len())
-            .map(|i| ElasticRole::Data(i as u16))
-            .chain(spec.cache.as_ref().map(|_| ElasticRole::Cache))
-            .chain((1..=spec.parity.len()).map(|i| ElasticRole::Parity(i as u8)))
-            .collect()
-    }
-
-    fn mount_path(spec: &ElasticCreateSpec, role: ElasticRole) -> String {
-        match role {
-            ElasticRole::Data(i) => data_branch_path(&spec.name, &format!("d{i}")),
-            ElasticRole::Cache => cache_branch_path(&spec.name, "c1"),
-            ElasticRole::Parity(i) => parity_mount_path(&spec.name, i),
-        }
     }
 
     fn boot_id() -> Result<String, String> {
@@ -3398,9 +3490,13 @@ pub(crate) mod execution {
         Ok(true)
     }
 
-    fn read_union_option(spec: &ElasticSpec, option: &str) -> Result<String, String> {
-        let path =
-            CString::new(format!("{}/.mergerfs", spec.union_path())).map_err(|e| e.to_string())?;
+    /// One runtime option of a LIVE union, read from its `.mergerfs` control
+    /// file. Taking the union path rather than a layout is what lets the
+    /// add-disk executor ask a running union what it is serving without first
+    /// resolving every device of the array.
+    fn union_option(union: &Path, option: &str) -> Result<String, String> {
+        let path = CString::new(format!("{}/.mergerfs", union.display()))
+            .map_err(|e| e.to_string())?;
         let key = CString::new(format!("user.mergerfs.{option}")).map_err(|e| e.to_string())?;
         let mut bytes = vec![0u8; 16384];
         let size = unsafe {
@@ -3419,6 +3515,95 @@ pub(crate) mod execution {
         }
         bytes.truncate(size as usize);
         String::from_utf8(bytes).map_err(|e| e.to_string())
+    }
+
+    fn read_union_option(spec: &ElasticSpec, option: &str) -> Result<String, String> {
+        union_option(Path::new(&spec.union_path()), option)
+    }
+
+    /// Branch specs a live union is serving, in its own order. Each entry is
+    /// `<path>=<mode>` exactly as mergerfs reports it.
+    fn read_union_branches(union: &Path) -> Result<Vec<String>, String> {
+        Ok(union_option(union, "srcmounts")?
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Adds one branch to a union that is ALREADY MOUNTED, and confirms the
+    /// live union came back carrying it.
+    ///
+    /// MEASURED (2026-09-06, mergerfs 2.42.0): the `+` form of
+    /// `user.mergerfs.srcmounts` appends to a running mount — see
+    /// `ElasticStep::AddBranch`. Idempotent by reading first, because the xattr
+    /// itself is not: a second `+` of the same path would leave the branch in
+    /// the list twice, and a retried add-disk must not do that.
+    fn add_union_branch(union: &Path, branch: &str) -> Result<(), String> {
+        let wanted = branch
+            .split_once('=')
+            .map(|(path, _)| path)
+            .unwrap_or(branch)
+            .to_string();
+        let present = |branches: &[String]| {
+            branches.iter().any(|entry| {
+                entry.split_once('=').map(|(path, _)| path).unwrap_or(entry) == wanted
+            })
+        };
+        if present(&read_union_branches(union)?) {
+            return Ok(());
+        }
+        let path = CString::new(format!("{}/.mergerfs", union.display()))
+            .map_err(|e| e.to_string())?;
+        let key = CString::new("user.mergerfs.srcmounts").map_err(|e| e.to_string())?;
+        let value = format!("+{branch}");
+        if unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "dopisanie brancha do unii: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // POSITIVE evidence, not the return code: a union that accepted the
+        // write and did not grow would leave the new disk outside the array
+        // while every later check said the add had succeeded.
+        if !present(&read_union_branches(union)?) {
+            return Err("unia nie przyjęła nowego brancha".into());
+        }
+        Ok(())
+    }
+
+    /// Unmounts one mountpoint, or says why it could not.
+    ///
+    /// NOT `MNT_DETACH`. A lazy unmount returns success while every process
+    /// that still holds the mount goes on using it, so a dissolve would report
+    /// an array taken apart while SMB clients kept writing into the union. A
+    /// busy mountpoint has to be an error the admin reads.
+    fn unmount_path(mountpoint: &Path) -> Result<(), String> {
+        let path = cpath_at(mountpoint)?;
+        if unsafe { libc::umount2(path.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // Already gone is the state the caller asked for. `EINVAL` is what
+        // the kernel answers for "not a mountpoint", which is what a branch
+        // of an array that never came up after a reboot looks like.
+        if matches!(error.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOENT)) {
+            return Ok(());
+        }
+        Err(format!("umount {}: {error}", mountpoint.display()))
+    }
+
+    fn cpath_at(path: &Path) -> Result<CString, String> {
+        CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())
     }
 
     /// mergerfs `minfreespace` in bytes: the floor every data branch keeps.
@@ -5524,7 +5709,7 @@ pub(crate) mod execution {
     }
 
     /// What one `execute_steps` call may do beyond mounting.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum StepMode {
         /// Create: may format and run the first Sync; publishes the union.
         Create,
@@ -5533,6 +5718,11 @@ pub(crate) mod execution {
         /// Mover recovery after a boot: never formats and never publishes;
         /// the private union waits under Hold for the declared Resume.
         Recover,
+        /// Adding one data disk to a LIVE array: formats exactly the slot the
+        /// journal has just gained, mounts it, adds it to the running union
+        /// and syncs. It never mounts a union of its own — the one that is
+        /// already serving is the point — so `MergerfsMount` stays refused.
+        AddDisk,
     }
 
     /// The effects below `execute_steps`: devices, filesystems, mounts, tools
@@ -5567,6 +5757,8 @@ pub(crate) mod execution {
         ) -> Result<(), String>;
         fn run_tool(&mut self, program: &Path, args: &[String], locks: &[RawFd]) -> Result<(), String>;
         fn write_file(&mut self, path: &str, content: &str, uid: u32) -> Result<(), String>;
+        /// Add one branch to a union that is already mounted.
+        fn add_branch(&mut self, union: &str, branch: &str) -> Result<(), String>;
         /// Whether a private worker hosts the union.
         fn has_worker(&self) -> bool;
         fn start_mergerfs(&mut self, program: &Path, args: &[String], log: &File) -> Result<Anchor, String>;
@@ -5658,6 +5850,10 @@ pub(crate) mod execution {
             atomic_write(Path::new(path), content.as_bytes(), uid)
         }
 
+        fn add_branch(&mut self, union: &str, branch: &str) -> Result<(), String> {
+            add_union_branch(Path::new(union), branch)
+        }
+
         fn has_worker(&self) -> bool {
             self.worker.is_some()
         }
@@ -5732,8 +5928,12 @@ pub(crate) mod execution {
                     filesystem,
                     label,
                 } => {
-                    if mode != StepMode::Create {
-                        return Err("restore nie może formatować".into());
+                    // Create formats every role; an add formats exactly the
+                    // slot the journal has just gained, which the `formatted`
+                    // check below is what actually enforces — every older
+                    // slot is already in it.
+                    if !matches!(mode, StepMode::Create | StepMode::AddDisk) {
+                        return Err("tylko create i dodanie dysku formatują".into());
                     }
                     let role = plan_role(plan, &device)?;
                     if journal.formatted.contains(&role) || journal.pending.is_some() {
@@ -5882,7 +6082,9 @@ pub(crate) mod execution {
                     root.save(journal)?;
                 }
                 ElasticStep::Run { program, args } => {
-                    if mode != StepMode::Create || journal.spec.parity.is_empty() {
+                    if !matches!(mode, StepMode::Create | StepMode::AddDisk)
+                        || journal.spec.parity.is_empty()
+                    {
                         return Err("nieoczekiwany sync".into());
                     }
                     pending_operation(
@@ -5896,7 +6098,20 @@ pub(crate) mod execution {
                     journal.pending = None;
                     root.save(journal)?;
                 }
-                _ => return Err("niedozwolony krok wykonawcy create/restore".into()),
+                ElasticStep::AddBranch { union, branch } => {
+                    if mode != StepMode::AddDisk {
+                        return Err("tylko dodanie dysku rozszerza żywą unię".into());
+                    }
+                    if union != plan.union_path() {
+                        return Err("obca unia w kroku AddBranch".into());
+                    }
+                    // The union stays UP, so there is no mount intent to
+                    // record and nothing to resume: the xattr write either
+                    // took or it did not, and `add_union_branch` reads the
+                    // live union back to find out which.
+                    system.add_branch(&union, &branch)?;
+                }
+                _ => return Err("niedozwolony krok wykonawcy".into()),
             }
         }
         Ok(())
@@ -6247,16 +6462,38 @@ pub(crate) mod execution {
             spec: &ElasticSpec,
             empty_parity: bool,
         ) -> Result<(), String> {
-            let command = if run.kind == ElasticSnapraidKind::Sync {
-                "sync"
-            } else {
-                "scrub"
+            let command = match &run.kind {
+                ElasticSnapraidKind::Sync => "sync",
+                ElasticSnapraidKind::Scrub => "scrub",
+                ElasticSnapraidKind::Fix { .. } => "fix",
             };
             self.identity(spec, command)?;
             run.total_blocks = self.number("block_count")?;
             run.errors_file = self.number("summary:error_file")?;
             run.errors_io = self.number("summary:error_io")?;
             run.errors_data = self.number("summary:error_data")?;
+            if matches!(run.kind, ElasticSnapraidKind::Fix { .. }) {
+                // A repair REPORTS the errors it repaired, so nonzero counters
+                // are its success and not its failure, and the `error:` /
+                // `parity_error:` lines name the blocks it rebuilt from
+                // parity. Judging a fix by the rules below would fail every
+                // run that actually did something. The verdict is the tool's
+                // own exit summary plus the exit code `perform_maintenance`
+                // checks, and the counters travel with the run as the record
+                // of how much was recovered.
+                //
+                // UNVERIFIED (snapraid 14.7): `-d <disk> fix` has never been
+                // run against this parser — `snapraid_args` carries the same
+                // note. A summary key `identity` does not know therefore fails
+                // the run, and that direction is deliberate: a repair reported
+                // as needing attention is recoverable by reading the run, a
+                // repair falsely reported as complete is not.
+                if self.field("summary:exit") != ["ok"] {
+                    return Err("niepełne zakończenie fix".into());
+                }
+                run.accessed_mb = self.progress.first().map(|(_, mb)| *mb);
+                return Ok(());
+            }
             // Only the markers that ARE a verdict stop the run here, and the
             // reason names what the tool said. A `msg:fatal:` advisory does
             // NOT short-circuit: everything needed to judge the run is the
@@ -6498,6 +6735,7 @@ pub(crate) mod execution {
         worker: Option<&Worker>,
         held_array_lock: Option<&File>,
     ) -> Result<ElasticSnapraidResult, String> {
+        let repairing = matches!(kind, ElasticSnapraidKind::Fix { .. });
         let owned_array_lock;
         let array_lock = match held_array_lock {
             Some(lock) => lock,
@@ -6509,7 +6747,16 @@ pub(crate) mod execution {
         if journal.private.is_some() && !worker.is_some_and(|worker| worker.public_mount().is_some()) {
             return Err("brak potwierdzonej publikacji prywatnej macierzy".into());
         }
-        if journal.pending.is_some() || journal.stage != ElasticStage::Ready
+        // A Fix is the ONE operation that may start on an array that needs
+        // attention, and it has to be: a scrub that found errors closes as
+        // `NeedsAttention`, and refusing the repair there would leave the
+        // array with no way out of the state the repair exists to resolve. An
+        // unfinished operation still blocks it — a pending intent or a mover
+        // mid-transfer means the journal does not yet know what is on the
+        // disks.
+        let stage_ready = journal.stage == ElasticStage::Ready
+            || (repairing && journal.stage == ElasticStage::NeedsAttention);
+        if journal.pending.is_some() || !stage_ready
             || journal.transfer.as_ref().is_some_and(|transfer| transfer.finished_at.is_none())
         {
             return Err("macierz wymaga uwagi lub operacja trwa".into());
@@ -6524,7 +6771,7 @@ pub(crate) mod execution {
         }
         let mut run = ElasticSnapraidRun {
             operation_id: operation_id.into(),
-            kind,
+            kind: kind.clone(),
             started_at: timestamp()?,
             finished_at: None,
             outcome: ElasticSnapraidOutcome::Running,
@@ -6621,11 +6868,15 @@ pub(crate) mod execution {
                 run,
             });
         }
-        let action = if kind == ElasticSnapraidKind::Sync {
-            SnapraidAction::Sync
-        } else {
-            SnapraidAction::Scrub
+        let action = match &kind {
+            ElasticSnapraidKind::Sync => SnapraidAction::Sync,
+            ElasticSnapraidKind::Scrub => SnapraidAction::Scrub,
+            ElasticSnapraidKind::Fix { disk } => SnapraidAction::Fix { disk: disk.clone() },
         };
+        // `snapraid_args` refuses a disk this array does not carry, and that
+        // refusal is a hard error rather than a recorded refusal on purpose:
+        // the core validated the disk name against the array before spawning,
+        // so reaching here with a foreign one means something bypassed it.
         let steps = plan_snapraid(&spec, &action, &tools).map_err(|e| e.to_string())?;
         let [ElasticStep::Run { program, args }] = steps.as_slice() else {
             return Err("nieprawidłowy plan ręcznej operacji".into());
@@ -6655,7 +6906,7 @@ pub(crate) mod execution {
         post_guard: impl FnOnce() -> Result<bool, String>,
         hold_after_success: bool,
     ) -> Result<ElasticSnapraidRun, String> {
-        let kind = run.kind;
+        let kind = run.kind.clone();
         if hold_after_success {
             let transfer = journal.transfer.as_ref().ok_or("mover Sync wymaga trwałego transferu")?;
             let owned = Pending::Maintenance {
@@ -6679,7 +6930,7 @@ pub(crate) mod execution {
             journal,
             Pending::Maintenance {
                 operation_id: run.operation_id.clone(),
-                kind,
+                kind: kind.clone(),
             },
             ElasticStage::SyncPending,
             |journal| root.save(journal),
@@ -7038,6 +7289,278 @@ pub(crate) mod execution {
         finish(root, &mut journal, outcome, worker.as_deref())
     }
 
+    /// One more data disk on a LIVE array — §5.3's headline operation.
+    ///
+    /// The journal gains the slot BEFORE anything is formatted, and that order
+    /// is the whole recovery story: the journal is the only durable record of
+    /// which slot a half-finished add belongs to and of the filesystem UUID
+    /// the mkfs was given. A node that loses power between the format and the
+    /// sync therefore comes back able to finish the add — a repeat of this
+    /// very command — instead of holding a disk nothing can account for.
+    /// Every step is idempotent against that record: `formatted` gates the
+    /// mkfs, the mount table gates the mount, and the live union is read
+    /// before the branch is appended to it.
+    ///
+    /// The union is never taken down. `union_mounted` is checked against BOTH
+    /// shapes the array may legitimately be in — N branches before the xattr
+    /// write, N+1 after it — because a retry arrives with the branch already
+    /// there.
+    fn add_data_disk(
+        root: &Root,
+        mut journal: Journal,
+        disk: &ElasticDiskSpec,
+        mut worker: Option<&mut Worker>,
+        held_array_lock: Option<&File>,
+    ) -> Result<ElasticResult, String> {
+        let owned_array_lock;
+        let array_lock = match held_array_lock {
+            Some(lock) => lock,
+            None => {
+                owned_array_lock = root.array_lock(&journal.spec.array_id)?;
+                &owned_array_lock
+            }
+        };
+        let outcome = (|| -> Result<(), String> {
+            if journal.private.is_some()
+                && !worker.as_deref().is_some_and(|worker| worker.public_mount().is_some())
+            {
+                return Err("brak potwierdzonej publikacji prywatnej macierzy".into());
+            }
+            if journal.pending.is_some()
+                || journal.stage != ElasticStage::Ready
+                || journal
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.finished_at.is_none())
+            {
+                return Err("dodanie dysku wymaga gotowej macierzy bez trwającej operacji".into());
+            }
+            if journal.formatted.len() != roles(&journal.spec).len() {
+                return Err("nieukończone formatowanie macierzy".into());
+            }
+            if !journal.spec.parity.is_empty() && journal.sync_completed_at.is_none() {
+                return Err("niepotwierdzony pierwszy sync".into());
+            }
+            match journal.spec.data.iter().position(|old| old.disk_id == disk.disk_id) {
+                // A repeat of an add this node already recorded. The stored
+                // entry is what everything below resumes against, so it has to
+                // be the SAME disk down to the filesystem UUID the mkfs was
+                // given — a different UUID would mean formatting a member of
+                // the array a second time.
+                Some(index) => {
+                    if journal.spec.data[index] != *disk
+                        || index + 1 != journal.spec.data.len()
+                    {
+                        return Err("dysk jest już innym członkiem tej macierzy".into());
+                    }
+                }
+                None => {
+                    if journal
+                        .spec
+                        .cache
+                        .iter()
+                        .chain(&journal.spec.parity)
+                        .any(|old| old.disk_id == disk.disk_id)
+                    {
+                        return Err("dysk pełni w tej macierzy inną rolę".into());
+                    }
+                    let others: Vec<Journal> = root
+                        .journals()?
+                        .into_iter()
+                        .filter(|other| other.spec.array_id != journal.spec.array_id)
+                        .collect();
+                    let mut candidate = journal.spec.clone();
+                    candidate.data = vec![disk.clone()];
+                    candidate.cache = None;
+                    candidate.parity = Vec::new();
+                    candidate.name = String::new();
+                    // `claims_guard` is the node-wide reservation check the
+                    // create path uses, and it is reused rather than copied so
+                    // a disk cannot be admitted here under a rule create
+                    // refuses. The name is blanked because THIS array's name
+                    // is legitimately taken — by this array.
+                    claims_guard(&others, &candidate)?;
+                    journal.spec.data.push(disk.clone());
+                    // The 32-device ceiling and the identity uniqueness of the
+                    // whole array, re-checked on the array the add would
+                    // produce rather than on the disk alone.
+                    journal.spec.validate().map_err(|e| e.to_string())?;
+                    root.save(&journal)?;
+                }
+            }
+            let slot = journal.spec.data.len();
+            let role = ElasticRole::Data(slot as u16);
+            let devices = inventory()?;
+            let spec_after = layout(&journal.spec, &devices)?;
+            let mut spec_before = spec_after.clone();
+            spec_before.data.pop();
+            for other in roles(&journal.spec) {
+                if other == role {
+                    continue;
+                }
+                let device = resolve(role_disk(&journal.spec, other)?, &devices)?;
+                filesystem_matches(&journal.spec, other, device)?;
+                if !branch_mounted(&journal.spec, other, device)? {
+                    return Err("niezamontowany branch macierzy".into());
+                }
+            }
+            // `union_mounted` is strict by design — any difference from the
+            // spec is an error rather than a `false` — so the shape a retry
+            // leaves is tried first and only the failure of the shape a FIRST
+            // attempt expects is reported.
+            let in_union = union_mounted(&spec_after).unwrap_or(false);
+            if !in_union && !union_mounted(&spec_before)? {
+                return Err("dodanie dysku wymaga działającej unii macierzy".into());
+            }
+            let added = spec_after.data.last().ok_or("brak dodanego brancha")?.clone();
+            let device = resolve(disk, &devices)?;
+            let done = AddedDiskState {
+                formatted: journal.formatted.contains(&role),
+                mounted: branch_mounted(&journal.spec, role, device)?,
+                in_union,
+            };
+            let tools = Tools::resolve(&spec_after).map_err(|e| e.to_string())?;
+            execute_steps(
+                root,
+                array_lock,
+                &mut journal,
+                &spec_after,
+                plan_add_data_disk(&spec_after, &added, &done, &tools).map_err(|e| e.to_string())?,
+                StepMode::AddDisk,
+                &mut LiveSteps {
+                    worker: worker.as_deref_mut(),
+                },
+            )?;
+            // POSITIVE evidence that the array really grew: the live union
+            // must now report exactly the branch list the journal describes,
+            // new disk included.
+            if !union_mounted(&spec_after)? {
+                return Err("unia nie potwierdziła nowego brancha".into());
+            }
+            Ok(())
+        })();
+        finish(root, &mut journal, outcome, worker.as_deref())
+    }
+
+    /// Taking the array apart without taking the data apart.
+    ///
+    /// The union goes down and the branches are released; NOTHING is
+    /// formatted, the journal stays, and so do the snapraid config and the
+    /// parity file. That is what makes this the one destructive array
+    /// operation that is reversible: the array import finds the journal again
+    /// and adopts the array back whole.
+    ///
+    /// A private array's branches are NOT unmounted one by one. They live in
+    /// the mergerfs process's own mount namespace, which this process cannot
+    /// reach and which the kernel destroys with its last member — so stopping
+    /// that process IS the release, and `elastic_namespace::stop` is what
+    /// proves the process it stopped was ours.
+    ///
+    /// The journal STAYS, and so do the disks' filesystem signatures. Both
+    /// have a visible consequence a caller has to know about: `ElasticClaims`
+    /// reads the journals, so the members and the NAME of a dissolved array go
+    /// on reading as reserved on this node until the journal is adopted away
+    /// by an import — and until a wipe primitive exists the disks read as
+    /// `used` rather than `free`. That is the price of the operation being
+    /// reversible, and it is what the dialog promises.
+    ///
+    /// The anchor is cleared, so an array taken back by the import in the SAME
+    /// boot reports "wymagany restart" until the node restarts and the startup
+    /// Restore stands a fresh namespace up. That is the module's existing rule
+    /// for a private array with no anchor, not a new one: starting a second
+    /// mergerfs beside one that might still be alive is the risk it exists to
+    /// refuse.
+    fn destroy(
+        root: &Root,
+        mut journal: Journal,
+        operation_id: &str,
+    ) -> Result<ElasticDissolveResult, String> {
+        validate_elastic_uuid(operation_id).map_err(|e| e.to_string())?;
+        if operation_id == journal.spec.operation_id {
+            return Err("ponowne użycie ID create".into());
+        }
+        let _array_lock = root.array_lock(&journal.spec.array_id)?;
+        if journal.pending.is_some()
+            || journal
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.finished_at.is_none())
+        {
+            return Err("rozwiązanie wymaga zamkniętych operacji macierzy".into());
+        }
+        let mut steps = plan_dissolve(&journal.spec).map_err(|e| e.to_string())?;
+        let union = union_path(&journal.spec.name);
+        let anchor = journal.private.as_ref().and_then(|private| private.anchor.clone());
+        if anchor.is_some() {
+            // The rendered plan has to say how the branch unmounts below it are
+            // actually reached, or a job log would show this process unmounting
+            // paths it cannot even see. They go with the namespace.
+            steps.insert(
+                1,
+                ElasticStep::Note(format!(
+                    "branch mounts live in the union process's own mount namespace \
+                     (pid {}); stopping it releases every one of them",
+                    anchor.as_ref().map(|a| a.pid).unwrap_or_default()
+                )),
+            );
+        }
+        let rendered = render(&steps);
+        let mut released = Vec::new();
+        for step in &steps {
+            match step {
+                ElasticStep::Note(_) => (),
+                ElasticStep::Unmount { mountpoint } => {
+                    if *mountpoint == union {
+                        // The PUBLISHED union first and in this namespace: it
+                        // is the only mount of a private array the host can
+                        // see, and taking it down is what stops every SMB and
+                        // NFS client. A busy union refuses HERE, before
+                        // anything else has been touched.
+                        unmount_path(Path::new(mountpoint))?;
+                        released.push(mountpoint.clone());
+                    } else if anchor.is_none() {
+                        // A journal from before the private topology: its
+                        // branches are mounted right here, so the plan runs as
+                        // written.
+                        unmount_path(Path::new(mountpoint))?;
+                        released.push(mountpoint.clone());
+                    }
+                }
+                _ => return Err("nieoczekiwany krok rozwiązania".into()),
+            }
+        }
+        if let Some(anchor) = &anchor {
+            elastic_namespace::stop(&private_paths(&journal.spec), anchor)?;
+            released.extend(
+                roles(&journal.spec)
+                    .into_iter()
+                    .map(|role| mount_path(&journal.spec, role)),
+            );
+            let private = journal.private.as_mut().ok_or("brak prywatnej topologii")?;
+            private.anchor = None;
+            private.published = false;
+        }
+        // The journal records that this node no longer serves the array, so a
+        // startup Restore cannot put it back up behind the admin's back and
+        // the import scan finds it in a state that explains itself.
+        journal.stage = ElasticStage::NeedsAttention;
+        journal.detail = Some(bounded_text(
+            "macierz rozwiązana: dyski zachowały systemy plików i dane, \
+             import macierzy przywraca ją w całości",
+            TRANSFER_DETAIL_LIMIT,
+        ));
+        root.save(&journal)?;
+        Ok(ElasticDissolveResult {
+            array_id: journal.spec.array_id.clone(),
+            operation_id: operation_id.to_string(),
+            owner: journal.spec.owner.clone(),
+            name: journal.spec.name.clone(),
+            released,
+            data_kept: true,
+            steps: rendered,
+        })
+    }
+
     #[derive(Serialize, Deserialize)]
     enum PrivateResponse {
         State(Box<ElasticResult>),
@@ -7131,6 +7654,7 @@ pub(crate) mod execution {
         let fresh = current_boot != journal.boot_id;
         let restoring = matches!(command, crate::HelperCommand::ElasticRestore { .. });
         let mover_command = matches!(command, crate::HelperCommand::ElasticMover { .. });
+        let add_disk_command = matches!(command, crate::HelperCommand::ElasticAddDisk { .. });
         let service_command = matches!(command,
             crate::HelperCommand::ElasticEnterService { .. } | crate::HelperCommand::ElasticResume { .. });
         if fresh && matches!(command, crate::HelperCommand::ElasticInspect { .. })
@@ -7142,7 +7666,13 @@ pub(crate) mod execution {
         if service_command && fresh && !matches!(command, crate::HelperCommand::ElasticResume { .. }) {
             return Err("service wymaga istniejącej kotwicy".into());
         }
-        if matches!(command, crate::HelperCommand::ElasticSync { .. } | crate::HelperCommand::ElasticScrub { .. }) {
+        if matches!(
+            command,
+            crate::HelperCommand::ElasticSync { .. }
+                | crate::HelperCommand::ElasticScrub { .. }
+                | crate::HelperCommand::ElasticFix { .. }
+                | crate::HelperCommand::ElasticAddDisk { .. }
+        ) {
             if let Some(service) = journal.private.as_ref().and_then(|private| private.service.as_ref()) {
                 if service.mode == ElasticServiceMode::Hold || service.pending {
                     return Err("SnapRAID niedostępny podczas service Hold/pending".into());
@@ -7155,6 +7685,9 @@ pub(crate) mod execution {
         if fresh {
             if !restoring && !matches!(command, crate::HelperCommand::ElasticResume { .. }) && !mover_command {
                 return Err("prywatna macierz wymaga Restore po zmianie boot".into());
+            }
+            if add_disk_command {
+                return Err("dodanie dysku wymaga macierzy przywróconej w tym uruchomieniu".into());
             }
             let devices = inventory()?;
             let layout = layout(&spec, &devices)?;
@@ -7262,6 +7795,19 @@ pub(crate) mod execution {
                     Some(&array_lock),
                 )
                 .map(|result| PrivateResponse::Maintenance(Box::new(result))),
+                crate::HelperCommand::ElasticFix { operation_id, disk, .. } => maintenance(
+                    root,
+                    journal,
+                    operation_id,
+                    ElasticSnapraidKind::Fix { disk: disk.clone() },
+                    Some(worker),
+                    Some(&array_lock),
+                )
+                .map(|result| PrivateResponse::Maintenance(Box::new(result))),
+                crate::HelperCommand::ElasticAddDisk { disk, .. } => {
+                    add_data_disk(root, journal, disk, Some(worker), Some(&array_lock))
+                        .map(|state| PrivateResponse::State(Box::new(state)))
+                }
                 _ => Err("nieprawidłowa operacja prywatnej macierzy".into()),
             },
             |anchor| authorize_publication(root, &spec, anchor),
@@ -7289,14 +7835,39 @@ pub(crate) mod execution {
                 serde_json::to_value(private_operation(&root, journal, command)?)
             }
             crate::HelperCommand::ElasticSync { array_id, owner, operation_id }
-            | crate::HelperCommand::ElasticScrub { array_id, owner, operation_id } => {
+            | crate::HelperCommand::ElasticScrub { array_id, owner, operation_id }
+            | crate::HelperCommand::ElasticFix { array_id, owner, operation_id, .. } => {
                 let journal = root.load(array_id)?;
                 if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
                 if journal.private.is_some() {
                     return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
                 }
-                let kind = if matches!(command, crate::HelperCommand::ElasticSync { .. }) { ElasticSnapraidKind::Sync } else { ElasticSnapraidKind::Scrub };
+                let kind = match command {
+                    crate::HelperCommand::ElasticSync { .. } => ElasticSnapraidKind::Sync,
+                    crate::HelperCommand::ElasticScrub { .. } => ElasticSnapraidKind::Scrub,
+                    crate::HelperCommand::ElasticFix { disk, .. } => {
+                        ElasticSnapraidKind::Fix { disk: disk.clone() }
+                    }
+                    _ => return Err("nie jest operacją SnapRAID".into()),
+                };
                 serde_json::to_value(maintenance(&root, journal, operation_id, kind, None, None)?)
+            }
+            crate::HelperCommand::ElasticAddDisk { array_id, owner, disk, .. } => {
+                let journal = root.load(array_id)?;
+                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if journal.private.is_some() {
+                    return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
+                }
+                serde_json::to_value(add_data_disk(&root, journal, disk, None, None)?)
+            }
+            // The dissolve NEVER enters the private namespace. It stops the
+            // mergerfs process that owns it, and re-entering a namespace in
+            // order to tear it down would mean running this code inside the
+            // very namespace whose last member it is about to kill.
+            crate::HelperCommand::ElasticDestroy { array_id, owner, operation_id } => {
+                let journal = root.load(array_id)?;
+                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                serde_json::to_value(destroy(&root, journal, operation_id)?)
             }
             crate::HelperCommand::ElasticInspect { array_id, owner }
             | crate::HelperCommand::ElasticRestore { array_id, owner } => {
@@ -9634,7 +10205,7 @@ Nothing to do
                     } else {
                         ElasticSnapraidKind::Scrub
                     };
-                    let run = run_record(kind);
+                    let run = run_record(kind.clone());
                     journal.pending = Some(Pending::Maintenance {
                         operation_id: run.operation_id.clone(),
                         kind,
@@ -9789,12 +10360,166 @@ Nothing to do
                 &mut LiveSteps { worker: None },
             )
             .expect_err("restore odmawia mkfs");
-            assert_eq!(error, "restore nie może formatować");
+            assert_eq!(error, "tylko create i dodanie dysku formatują");
             assert_eq!(
                 std::fs::read(dir.0.join(format!("{}.json", journal.spec.array_id)))
                     .expect("after"),
                 before
             );
+        }
+
+        /// The STAGE GATE of the three lifecycle operations, checked where it
+        /// is decided.
+        ///
+        /// A scrub that finds errors closes as `NeedsAttention`, and until now
+        /// that state refused every operation — including the repair that
+        /// exists to resolve it. So a repair, and ONLY a repair, may start
+        /// there; a sync and a scrub still may not, and nothing at all may
+        /// start while an intent is still pending. This fixture's journal
+        /// carries no parity, so the repair that gets past the gate lands on
+        /// the parity refusal, which is the proof it got past the gate at all.
+        #[test]
+        fn only_a_repair_may_start_on_an_array_that_needs_attention() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            let mut journal = legacy_journal(&root);
+            journal.stage = ElasticStage::NeedsAttention;
+            journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
+            root.save(&journal).expect("save");
+            let operation = |n: u8| format!("6666666{n}-6666-4666-8666-666666666666");
+
+            for (index, kind) in [ElasticSnapraidKind::Sync, ElasticSnapraidKind::Scrub]
+                .into_iter()
+                .enumerate()
+            {
+                let error = maintenance(
+                    &root,
+                    root.load(&spec().array_id).expect("load"),
+                    &operation(index as u8),
+                    kind.clone(),
+                    None,
+                    None,
+                )
+                .expect_err("needs attention refuses maintenance");
+                assert_eq!(error, "macierz wymaga uwagi lub operacja trwa", "{kind:?}");
+            }
+
+            let result = maintenance(
+                &root,
+                root.load(&spec().array_id).expect("load"),
+                &operation(2),
+                ElasticSnapraidKind::Fix { disk: "d1".into() },
+                None,
+                None,
+            )
+            .expect("the repair reaches its own preconditions");
+            assert_eq!(result.run.outcome, ElasticSnapraidOutcome::Refused);
+            assert_eq!(result.run.detail.as_deref(), Some("no_parity"));
+            assert_eq!(
+                result.run.kind,
+                ElasticSnapraidKind::Fix { disk: "d1".into() },
+                "the run names the disk it was asked to rebuild"
+            );
+
+            // A pending intent still stops everything, repair included: the
+            // journal does not yet know what is on the disks.
+            let mut held = root.load(&spec().array_id).expect("load");
+            held.pending = Some(Pending::Sync);
+            root.save(&held).expect("save");
+            let error = maintenance(
+                &root,
+                root.load(&spec().array_id).expect("load"),
+                &operation(3),
+                ElasticSnapraidKind::Fix { disk: "d1".into() },
+                None,
+                None,
+            )
+            .expect_err("an unfinished intent refuses even a repair");
+            assert_eq!(error, "macierz wymaga uwagi lub operacja trwa");
+        }
+
+        /// The executor's MODE table. Every step is legal in exactly the modes
+        /// that can do it, and `AddBranch` is the one that matters most: a
+        /// restore or a create writing the srcmounts xattr would grow a union
+        /// it is in the middle of standing up.
+        #[test]
+        fn the_executor_admits_each_step_only_in_the_modes_that_can_do_it() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            let array = root.array_lock(&spec().array_id).expect("array lock");
+            let mut journal = legacy_journal(&root);
+            journal.stage = ElasticStage::Ready;
+            root.save(&journal).expect("save");
+            let plan = snap_spec();
+            let run = |step: ElasticStep, mode: StepMode| {
+                let mut journal = journal.clone();
+                let mut steps = FakeSteps::live(&journal.spec, &boot());
+                execute_steps(
+                    &root,
+                    &array,
+                    &mut journal,
+                    &plan,
+                    vec![step],
+                    mode,
+                    &mut steps,
+                )
+                .map(|()| steps.log.clone())
+            };
+            let branch = ElasticStep::AddBranch {
+                union: plan.union_path(),
+                branch: format!("{}=RW", data_branch_path("media", "d1")),
+            };
+            for mode in [StepMode::Create, StepMode::Restore, StepMode::Recover] {
+                assert_eq!(
+                    run(branch.clone(), mode).expect_err("only an add grows a live union"),
+                    "tylko dodanie dysku rozszerza żywą unię",
+                    "{mode:?}"
+                );
+            }
+            let log = run(branch.clone(), StepMode::AddDisk).expect("the add writes the xattr");
+            assert_eq!(
+                log,
+                vec![format!(
+                    "addbranch {} {}=RW",
+                    plan.union_path(),
+                    data_branch_path("media", "d1")
+                )]
+            );
+            // A foreign union in the step is refused even in the mode that may
+            // write one: the xattr is a write into whatever path it names.
+            assert_eq!(
+                run(
+                    ElasticStep::AddBranch {
+                        union: "/mnt/other".into(),
+                        branch: format!("{}=RW", data_branch_path("media", "d1")),
+                    },
+                    StepMode::AddDisk
+                )
+                .expect_err("foreign union"),
+                "obca unia w kroku AddBranch"
+            );
+            // An unmount never runs through this executor at all — the dissolve
+            // walks its own plan, in the namespace that can see the mounts.
+            for mode in [
+                StepMode::Create,
+                StepMode::Restore,
+                StepMode::Recover,
+                StepMode::AddDisk,
+            ] {
+                assert_eq!(
+                    run(
+                        ElasticStep::Unmount {
+                            mountpoint: plan.union_path()
+                        },
+                        mode
+                    )
+                    .expect_err("no mode unmounts here"),
+                    "niedozwolony krok wykonawcy",
+                    "{mode:?}"
+                );
+            }
         }
 
         #[test]
@@ -10585,6 +11310,8 @@ Nothing to do
             worker: bool,
             log: Vec<String>,
             published: usize,
+            /// Branch specs the executor appended to the live union, in order.
+            branches: Vec<String>,
             on_readonly: Box<dyn FnMut() -> Result<(), String> + 'a>,
         }
 
@@ -10620,6 +11347,7 @@ Nothing to do
                     worker: true,
                     log: Vec::new(),
                     published: 0,
+                    branches: Vec::new(),
                     on_readonly: Box::new(|| Ok(())),
                 }
             }
@@ -10683,6 +11411,15 @@ Nothing to do
 
             fn write_file(&mut self, path: &str, _: &str, _: u32) -> Result<(), String> {
                 self.log.push(format!("write {path}"));
+                Ok(())
+            }
+
+            fn add_branch(&mut self, union: &str, branch: &str) -> Result<(), String> {
+                if !self.union {
+                    return Err("brak żywej unii".into());
+                }
+                self.log.push(format!("addbranch {union} {branch}"));
+                self.branches.push(branch.into());
                 Ok(())
             }
 
@@ -14669,6 +15406,36 @@ mod tests {
         Tools::for_preview()
     }
 
+    /// The same array as `spec()` as its PERSISTED INTENTION: two data disks,
+    /// one cache, one parity. `mount_path` derives `d1`/`c1`/`p1` from the
+    /// slots, so the dissolve plan can be checked without any disk being
+    /// present on the node running the test.
+    fn create_spec_fixture() -> ElasticCreateSpec {
+        let disk = |serial: &str, uuid: &str, bytes: u64| ElasticDiskSpec {
+            disk_id: format!("serial:{serial}"),
+            wwn: None,
+            serial: Some(serial.to_string()),
+            bytes,
+            expected_uuid: uuid.to_string(),
+        };
+        ElasticCreateSpec {
+            array_id: "11111111-1111-4111-8111-111111111111".into(),
+            operation_id: "22222222-2222-4222-8222-222222222222".into(),
+            owner: ElasticOwner {
+                org_id: "org".into(),
+                addon_id: "nas".into(),
+            },
+            name: "media".into(),
+            filesystem: ElasticFilesystem::Xfs,
+            data: vec![
+                disk("sdg", "33333333-3333-4333-8333-333333333333", 8 << 40),
+                disk("sdh", "44444444-4444-4444-8444-444444444444", 8 << 40),
+            ],
+            cache: Some(disk("nvme2n1", "55555555-5555-4555-8555-555555555555", 1 << 40)),
+            parity: vec![disk("sdj", "66666666-6666-4666-8666-666666666666", 8 << 40)],
+        }
+    }
+
     /// The topology claim of §5.3, checked where it is decided: the CACHE and
     /// the DATA disks are branches of ONE union, and the parity disk is not a
     /// branch at all.
@@ -15079,6 +15846,134 @@ mod tests {
         assert!(text.contains("keep on cache: foto"), "{text}");
     }
 
+    /// A repair, a sync and a scrub all need parity. The refusal is the same
+    /// sentence and comes from the same place, so an array without parity can
+    /// never reach snapraid through any of the three.
+    #[test]
+    fn every_snapraid_operation_is_refused_without_parity() {
+        let mut s = spec();
+        s.parity.clear();
+        for action in [
+            SnapraidAction::Sync,
+            SnapraidAction::Scrub,
+            SnapraidAction::Fix {
+                disk: "sdg".to_string(),
+            },
+        ] {
+            let error = plan_snapraid(&s, &action, &tools()).expect_err("no parity, no plan");
+            assert!(
+                error.to_string().contains("no parity disk"),
+                "{action:?}: {error}"
+            );
+        }
+        // With parity the repair is one snapraid invocation naming the disk,
+        // and nothing else: a fix must not write a config or start a sync.
+        let steps = plan_snapraid(
+            &spec(),
+            &SnapraidAction::Fix {
+                disk: "sdg".to_string(),
+            },
+            &tools(),
+        )
+        .expect("plan");
+        assert_eq!(steps.len(), 1, "{}", render(&steps));
+        let [ElasticStep::Run { args, .. }] = steps.as_slice() else {
+            panic!("a repair is one run: {steps:?}");
+        };
+        assert_eq!(args.last().map(String::as_str), Some("fix"));
+        assert!(args.windows(2).any(|w| w == ["-d", "sdg"]), "{args:?}");
+        assert!(wiped_devices(&steps).is_empty());
+    }
+
+    /// The disk name a repair request carries is spliced into a snapraid argv,
+    /// so it is held to the shape `layout_with` produces and nothing wider.
+    #[test]
+    fn a_repair_disk_name_is_narrower_than_a_shell_word() {
+        for good in ["d1", "d2", "d12", "d9999"] {
+            validate_data_branch_name(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        for bad in [
+            "", "d", "d0", "p1", "c1", "sdg", "d1 ", "d-1", "d1;rm", "../d1", "d1/d2", "D1",
+            "d123456",
+        ] {
+            assert!(validate_data_branch_name(bad).is_err(), "{bad} was accepted");
+        }
+        // And the names it accepts are exactly the ones the layout builds.
+        for slot in 1..=4usize {
+            validate_data_branch_name(&data_branch_name(slot)).expect("layout name");
+        }
+    }
+
+    /// A REPEATED add renders the work that is LEFT. Without this the second
+    /// attempt after a power cut would try to format a disk that is already a
+    /// mounted branch of the array, and the executor would refuse the whole
+    /// plan on the format it should have skipped.
+    #[test]
+    fn a_repeated_add_skips_what_is_already_done_and_still_syncs() {
+        let mut after = spec();
+        let added = Branch {
+            disk: "sdi".to_string(),
+            device: "/dev/sdi".to_string(),
+        };
+        after.data.push(added.clone());
+        let done = AddedDiskState {
+            formatted: true,
+            mounted: true,
+            in_union: true,
+        };
+        let steps = plan_add_data_disk(&after, &added, &done, &tools()).expect("plan");
+        assert!(
+            wiped_devices(&steps).is_empty(),
+            "a retry must not reformat a disk that already carries the array's filesystem: {}",
+            render(&steps)
+        );
+        for step in &steps {
+            assert!(
+                !matches!(
+                    step,
+                    ElasticStep::Mkfs { .. }
+                        | ElasticStep::Mount { .. }
+                        | ElasticStep::AddBranch { .. }
+                        | ElasticStep::Unmount { .. }
+                ),
+                "{step:?} was already done"
+            );
+        }
+        // What is NOT skipped: the config and the sync. Until the sync runs the
+        // new disk is outside parity, whichever attempt mounted it.
+        let last = steps.last().expect("a step");
+        let ElasticStep::Run { args, .. } = last else {
+            panic!("a retry still has to end in a sync: {last:?}");
+        };
+        assert!(args.contains(&"sync".to_string()));
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, ElasticStep::WriteFile { .. })),
+            "the config is rewritten on every attempt: {}",
+            render(&steps)
+        );
+        // Each fact is independent: only the mkfs is skipped when only the
+        // format survived the interruption.
+        let partial = plan_add_data_disk(
+            &after,
+            &added,
+            &AddedDiskState {
+                formatted: true,
+                ..AddedDiskState::default()
+            },
+            &tools(),
+        )
+        .expect("plan");
+        assert!(wiped_devices(&partial).is_empty());
+        assert!(partial
+            .iter()
+            .any(|s| matches!(s, ElasticStep::Mount { .. })));
+        assert!(partial
+            .iter()
+            .any(|s| matches!(s, ElasticStep::AddBranch { .. })));
+    }
+
     /// A mover on an array with no cache is a refusal, not an empty run:
     /// there is no branch to move from.
     #[test]
@@ -15092,7 +15987,7 @@ mod tests {
     /// the branches it sits on.
     #[test]
     fn dissolving_an_array_destroys_nothing_and_unmounts_top_down() {
-        let steps = plan_dissolve(&spec()).expect("plan");
+        let steps = plan_dissolve(&create_spec_fixture()).expect("plan");
         assert!(wiped_devices(&steps).is_empty(), "{}", render(&steps));
         let unmounts: Vec<&str> = steps
             .iter()
@@ -15121,7 +16016,8 @@ mod tests {
             device: "/dev/sdi".to_string(),
         };
         after.data.push(added.clone());
-        let steps = plan_add_data_disk(&after, &added, &tools()).expect("plan");
+        let steps =
+            plan_add_data_disk(&after, &added, &AddedDiskState::default(), &tools()).expect("plan");
         assert_eq!(
             wiped_devices(&steps),
             vec!["/dev/sdi"],
@@ -15174,7 +16070,8 @@ mod tests {
         // there is nothing to steer writes towards.
         let mut uncached = after.clone();
         uncached.cache.clear();
-        let steps_uncached = plan_add_data_disk(&uncached, &added, &tools()).expect("plan");
+        let steps_uncached =
+            plan_add_data_disk(&uncached, &added, &AddedDiskState::default(), &tools()).expect("plan");
         let ElasticStep::AddBranch { branch, .. } = steps_uncached
             .iter()
             .find(|s| matches!(s, ElasticStep::AddBranch { .. }))
@@ -15206,7 +16103,7 @@ mod tests {
             disk: "sdz".to_string(),
             device: "/dev/sdz".to_string(),
         };
-        assert!(plan_add_data_disk(&after, &stranger, &tools()).is_err());
+        assert!(plan_add_data_disk(&after, &stranger, &AddedDiskState::default(), &tools()).is_err());
     }
 
     /// Ręczny scrub obejmuje całość, a fix może wskazać tylko własny dysk.

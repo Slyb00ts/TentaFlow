@@ -1457,6 +1457,218 @@ test('the disk-detail breadcrumb walks back to the disk list and to the fleet', 
   Screen.unmount();
 });
 
+// --- n04 refreshes itself, and refreshes the way this screen refreshes -------
+// The disk detail is the screen the admin watches SMART and temperature on, so
+// it polls like every other live view: `drawDiskDetail` builds it once and
+// `refreshDiskDetail` patches the values in and re-arms itself. A redraw on a
+// timer would be the opposite of a fix — every node on the screen destroyed and
+// rebuilt every five seconds, the charts restarted and the scroll thrown away.
+//
+// `sdd` is the subject of all four: it is IN a pool, so the pool's own error
+// counters are part of what the poll has to keep fresh.
+const detailState = {
+  health: 'warning',
+  healthReason: '3 nowe realokowane sektory w 7 dni',
+  reallocated: 3,
+  cksum: 2,
+  history: [
+    { at: '2026-09-02 08:00:00', temperatureC: 33, reallocatedSectors: 3 },
+    { at: '2026-09-02 09:00:00', temperatureC: 35, reallocatedSectors: 3 },
+    { at: '2026-09-02 10:00:00', temperatureC: 34, reallocatedSectors: 3 },
+  ],
+  diskFails: false,
+  poolFails: false,
+};
+
+function diskDetailFixtures() {
+  return {
+    ...fixtures,
+    tentaNasDiskGetRequest: () => {
+      if (detailState.diskFails) throw new Error('node nie odpowiada');
+      return {
+        disk: disk({
+          diskId: 'sdd', name: 'sdd', serial: 'ZR9AB12K', role: 'pool', memberOf: 'tank',
+          health: detailState.health, healthReason: detailState.healthReason,
+          reallocatedSectors: detailState.reallocated, vdevRole: 'data', vdevKind: 'raidz2',
+        }),
+        attributes: [{ id: 5, name: 'Reallocated_Sector_Ct', value: 98, raw: detailState.reallocated, rawText: String(detailState.reallocated), rawWeekAgo: 0, status: 'warning' }],
+        selfTests: [{ startedAt: '2026-09-01 01:00:00', kind: 'Short offline', status: 'passed', detail: '', lifetimeHours: 99 }],
+        history: detailState.history,
+        alerts: [],
+        historyDays: 30,
+      };
+    },
+    tentaNasPoolGetRequest: () => {
+      if (detailState.poolFails) throw new Error('zpool status failed');
+      const vdev = pool.vdevs[0];
+      return {
+        pool: {
+          ...pool,
+          vdevs: [{ ...vdev, disks: vdev.disks.map((x) => (x.name === 'sdd' ? { ...x, cksumErrors: detailState.cksum } : x)) }],
+        },
+        properties: [], datasets: [], alerts: [], history: [],
+      };
+    },
+  };
+}
+
+async function openDiskDetail() {
+  detailState.health = 'warning';
+  detailState.healthReason = '3 nowe realokowane sektory w 7 dni';
+  detailState.reallocated = 3;
+  detailState.cksum = 2;
+  detailState.history = [
+    { at: '2026-09-02 08:00:00', temperatureC: 33, reallocatedSectors: 3 },
+    { at: '2026-09-02 09:00:00', temperatureC: 35, reallocatedSectors: 3 },
+    { at: '2026-09-02 10:00:00', temperatureC: 34, reallocatedSectors: 3 },
+  ];
+  detailState.diskFails = false;
+  detailState.poolFails = false;
+  stubTransport(diskDetailFixtures());
+  const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sdd' });
+  await flush();
+  await flush();
+  return root;
+}
+
+test('a disk-detail poll that brings the same disk replaces no node of the screen', async () => {
+  const root = await openDiskDetail();
+  const body = root.querySelector('#nas-tab-body');
+  const chip = root.querySelector('#nas-dd-health');
+  const grid = root.querySelector('.id-grid');
+  const reallocated = root.querySelector('[data-f="reallocated"]');
+  const rows = root.querySelector('#nas-dd-pool .stat-rows');
+  const cksum = root.querySelector('#nas-dd-pool [data-c="cksum"]');
+  const attrTable = root.querySelector('#nas-attr-table');
+  const stTable = root.querySelector('#nas-st-table');
+  const chart = root.querySelector('#nas-disk-temp-chart tf-line-chart');
+  assert.ok(chip && reallocated && rows && attrTable && stTable && chart, 'the screen is fully drawn before the poll');
+  assert.equal(chip.getAttribute('label'), 'Uwaga: 3 nowe realokowane sektory w 7 dni');
+  assert.equal(cksum.textContent, '2');
+
+  // Records are COLLECTED IN THE CALLBACK for the reason the fleet tests
+  // document: the awaits below drain happy-dom's queue, so a trailing
+  // takeRecords() would read an empty list and pass vacuously.
+  Screen.clearTimers();
+  const records = [];
+  const obs = new window.MutationObserver((recs) => { records.push(...recs); });
+  obs.observe(grid, { childList: true, subtree: true, attributes: true, characterData: true });
+  try {
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    records.push(...obs.takeRecords());
+  } finally {
+    obs.disconnect();
+  }
+  assert.equal(records.length, 0, `an unchanged poll must touch no node of the identification card, saw ${records.map((r) => `${r.type}@${r.target.nodeName}`).join(', ')}`);
+  assert.equal(same(root.querySelector('#nas-dd-health'), chip), true, 'the health chip is the very same element');
+  assert.equal(same(root.querySelector('.id-grid'), grid), true, 'so is the identification grid');
+  assert.equal(same(root.querySelector('[data-f="reallocated"]'), reallocated), true, 'and the counter cell inside it');
+  assert.equal(same(root.querySelector('#nas-dd-pool .stat-rows'), rows), true, 'the pool error rows are not rebuilt');
+  assert.equal(same(root.querySelector('#nas-attr-table'), attrTable), true, 'nor the SMART attribute table');
+  assert.equal(same(root.querySelector('#nas-st-table'), stTable), true, 'nor the self-test log');
+  // The history charts are a server-sent series, not a live stream: the same
+  // series must leave the chart element alone, or its line restarts its draw
+  // animation on every tick.
+  assert.equal(same(root.querySelector('#nas-disk-temp-chart tf-line-chart'), chart), true, 'the temperature chart keeps its element');
+  assert.equal(Screen.timers.size, 1, 'and the poll re-armed itself — without this the screen never refreshes again');
+  Screen.unmount();
+});
+
+test('a disk-detail poll moves the values that changed and leaves their surroundings standing', async () => {
+  const root = await openDiskDetail();
+  const body = root.querySelector('#nas-tab-body');
+  const chip = root.querySelector('#nas-dd-health');
+  const grid = root.querySelector('.id-grid');
+  const reallocated = root.querySelector('[data-f="reallocated"]');
+  const rows = root.querySelector('#nas-dd-pool .stat-rows');
+  const scrub = root.querySelector('#nas-dd-pool [data-c="scrub"]');
+  const chartHost = root.querySelector('#nas-disk-temp-chart');
+  const why = root.querySelector('#nas-dd-why');
+  assert.equal(reallocated.textContent, '3');
+  assert.equal(root.querySelector('#nas-disk-temp-chart polyline.tf-chart__series-line').getAttribute('points').trim().split(' ').length, 3);
+
+  detailState.health = 'critical';
+  detailState.healthReason = '8 realokowanych sektorów, rośnie';
+  detailState.reallocated = 8;
+  detailState.cksum = 5;
+  detailState.history = [...detailState.history, { at: '2026-09-02 11:00:00', temperatureC: 41, reallocatedSectors: 8 }];
+  await Screen.refreshDiskDetail(body);
+  await flush();
+
+  assert.equal(chip.getAttribute('label'), 'Awaria: 8 realokowanych sektorów, rośnie', 'the health chip carries the new status and reason');
+  assert.equal(chip.getAttribute('status'), 'err');
+  assert.equal(chip.textContent, 'Awaria: 8 realokowanych sektorów, rośnie', 'and the component rendered it');
+  assert.equal(root.querySelector('[data-f="reallocated"]').textContent, '8', 'the reallocated counter moved');
+  assert.equal(root.querySelector('#nas-dd-pool [data-c="cksum"]').textContent, '5', 'and so did the pool checksum counter');
+  assert.equal(root.querySelector('#nas-dd-pool [data-c="cksum"]').getAttribute('class'), 'v num-err');
+  assert.equal(why.textContent, '8 realokowanych sektorów, rośnie', 'the explanation box follows the reason');
+  // The surroundings survive: same chip, same grid, same counter cell, same
+  // rows — only their contents differ.
+  assert.equal(same(root.querySelector('#nas-dd-health'), chip), true, 'the chip was patched, not replaced');
+  assert.equal(same(root.querySelector('.id-grid'), grid), true, 'the identification grid stands');
+  assert.equal(same(root.querySelector('[data-f="reallocated"]'), reallocated), true, 'the counter cell stands');
+  assert.equal(same(root.querySelector('#nas-dd-pool .stat-rows'), rows), true, 'a moving counter does not rebuild the error rows');
+  assert.equal(same(root.querySelector('#nas-dd-pool [data-c="scrub"]'), scrub), true, 'nor the scrub line next to it');
+  assert.equal(same(root.querySelector('#nas-disk-temp-chart'), chartHost), true, 'the chart card is not rebuilt');
+  assert.equal(root.querySelector('#nas-disk-temp-chart polyline.tf-chart__series-line').getAttribute('points').trim().split(' ').length, 4, 'the new sample is plotted');
+  Screen.unmount();
+});
+
+test('a failed disk-detail poll keeps the last good screen and keeps asking', async () => {
+  const root = await openDiskDetail();
+  const body = root.querySelector('#nas-tab-body');
+  const chip = root.querySelector('#nas-dd-health');
+
+  detailState.diskFails = true;
+  Screen.clearTimers();
+  await Screen.refreshDiskDetail(body);
+  await flush();
+  assert.match(root.querySelector('#nas-dd-error tf-alert').getAttribute('message'), /node nie odpowiada/, 'the failure is stated');
+  assert.equal(chip.getAttribute('label'), 'Uwaga: 3 nowe realokowane sektory w 7 dni', 'the last good health stays on screen');
+  assert.equal(root.querySelector('[data-f="reallocated"]').textContent, '3', 'and the last good counter');
+  assert.equal(root.querySelector('#nas-dd-pool [data-c="cksum"]').textContent, '2', 'and the last good pool counters');
+  assert.ok(root.querySelector('#nas-attr-table'), 'the SMART table is not blanked');
+  assert.equal(Screen.timers.size, 1, 'and the screen keeps asking');
+
+  // The pool read is the secondary one: a node that answers about the disk but
+  // not about its pool must not be read as "this disk is in no pool" — that
+  // would announce a lost membership nothing has reported.
+  detailState.diskFails = false;
+  detailState.poolFails = true;
+  Screen.clearTimers();
+  await Screen.refreshDiskDetail(body);
+  await flush();
+  assert.equal(absent(root, '#nas-dd-error tf-alert'), true, 'the answered poll retracts the banner');
+  assert.equal(root.querySelector('#nas-dd-pool [data-c="cksum"]').textContent, '2', 'the last good pool counters stand');
+  assert.match(root.querySelector('#nas-dd-pool-title').textContent, /tank/);
+  assert.equal(Screen.timers.size, 1, 'and it is still asking');
+  Screen.unmount();
+});
+
+test('leaving the disk detail stops its poll', async () => {
+  const root = await openDiskDetail();
+  const body = root.querySelector('#nas-tab-body');
+  const detached = document.createElement('div');
+  detached.innerHTML = body.innerHTML;
+
+  // A body that is no longer in the document: nothing to patch, nothing to
+  // re-arm — and no request either, because the guard runs before the read.
+  const beforeDetached = kinds('tentaNasDiskGetRequest').length;
+  Screen.clearTimers();
+  await Screen.refreshDiskDetail(detached);
+  await flush();
+  assert.equal(kinds('tentaNasDiskGetRequest').length, beforeDetached, 'a disconnected body asks nothing');
+  assert.equal(Screen.timers.size, 0, 'and arms nothing');
+
+  Screen.unmount();
+  const beforeDisposed = kinds('tentaNasDiskGetRequest').length;
+  await Screen.refreshDiskDetail(body);
+  await flush();
+  assert.equal(kinds('tentaNasDiskGetRequest').length, beforeDisposed, 'an unmounted screen asks nothing');
+  assert.equal(Screen.timers.size, 0, 'and the polling chain is over');
+});
+
 test('the environment tab carries the ksmbd row with the kernel version and the EXPERIMENTAL note', async () => {
   // n16 gains one probe row per §5.4b. It reports the KERNEL version, because
   // ksmbd is in-tree: ksmbd-tools' own version says nothing about the server

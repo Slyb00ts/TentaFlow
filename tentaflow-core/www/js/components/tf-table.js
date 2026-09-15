@@ -60,7 +60,7 @@ const STICKY_COLUMN_WIDTH = 160;
 
 class TfTable extends HTMLElement {
   static get observedAttributes() {
-    return ['sortable', 'selectable', 'variant', 'density', 'narrow', 'page-size', 'total', 'page', 'actions-label'];
+    return ['sortable', 'selectable', 'variant', 'density', 'narrow', 'page-size', 'total', 'page', 'actions-label', 'empty-message'];
   }
 
   constructor() {
@@ -477,6 +477,21 @@ class TfTable extends HTMLElement {
   // burzyc. Eliminuje pelen rebuild tbody przy kazdym set rows / sort i
   // pozwala browserowi zachowac focus/selection w komorkach.
   _renderTbody(cols, rows) {
+    // An empty table has to say WHY it is empty. `empty-message` was passed by
+    // 19 call sites across 11 screens and every one of them was inert: the
+    // attribute was never read here and was not in `observedAttributes`, so a
+    // table with no rows rendered as nothing at all and the caller's sentence
+    // went nowhere. Handled before the expandable split, because both paths
+    // produce the same empty tbody.
+    if (rows.length === 0 && this.hasAttribute('empty-message')) {
+      this._renderEmptyRow(cols);
+      return;
+    }
+    // A leftover empty row must never survive into the recycling path below:
+    // that path updates `<tr>`s by index and would write data cells into it.
+    if (this._tbody.firstElementChild?.classList.contains('tf-table__empty-row')) {
+      this._tbody.textContent = '';
+    }
     // Tabela rozwijalna wstawia dodatkowe wiersze ekspansji miedzy wierszami
     // danych, wiec recykling po indeksie sie nie zgadza — odbudowujemy w calosci.
     // To NIE jest sciezka czestego odswiezania (rozwijalne tabele sa rzadkie).
@@ -509,6 +524,34 @@ class TfTable extends HTMLElement {
     while (tbody.children.length > target) {
       tbody.removeChild(tbody.lastChild);
     }
+  }
+
+  // The span comes from the RENDERED header rather than a second copy of the
+  // lead/actions arithmetic: selection, expansion and the actions column all
+  // already appear there, so the two can never drift apart.
+  //
+  // Patched in place when the row is already there: an unchanged poll on an
+  // empty table must not replace the node, for the same reason the data path
+  // recycles its rows.
+  _renderEmptyRow(cols) {
+    const tbody = this._tbody;
+    const text = this.getAttribute('empty-message') || '';
+    const span = this._thead?.querySelector('tr')?.children.length || Math.max(1, cols.length);
+    const current = tbody.firstElementChild;
+    if (tbody.children.length === 1 && current?.classList.contains('tf-table__empty-row')) {
+      const td = current.firstElementChild;
+      if (td.colSpan !== span) td.colSpan = span;
+      if (td.textContent !== text) td.textContent = text;
+      return;
+    }
+    const tr = document.createElement('tr');
+    tr.className = 'tf-table__empty-row';
+    const td = document.createElement('td');
+    td.className = 'tf-table__empty-cell';
+    td.colSpan = span;
+    td.textContent = text;
+    tr.appendChild(td);
+    tbody.replaceChildren(tr);
   }
 
   _renderTbodyExpandable(cols, rows) {

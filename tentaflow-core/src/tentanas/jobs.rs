@@ -38,6 +38,15 @@ pub enum ElasticJobIntent {
     /// command the body will run.
     Mover { owner: ElasticOwner, array_id: String, operation_id: String, resume_operation_id: String,
         rules: tentanas_helper::elastic::MoverRules, coupled_sync: bool },
+    /// One more data disk on a live array. `disk` travels WITH the intent
+    /// because nothing else records it: the array's persisted spec is still
+    /// the array WITHOUT the disk until the operation closes, so the request
+    /// row is the only place the slot's identity — including the filesystem
+    /// UUID its mkfs is given — is written down before anything is formatted.
+    AddDisk { owner: ElasticOwner, array_id: String, operation_id: String,
+        disk: tentanas_helper::elastic::ElasticDiskSpec },
+    /// Stops serving the array and deletes its rows. Formats nothing.
+    Dissolve { owner: ElasticOwner, array_id: String, operation_id: String },
 }
 
 pub(crate) struct RunningJob {
@@ -244,7 +253,9 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::ElasticJournals {} | HelperCommand::ElasticAdopt { .. }
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
         | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. }
-        | HelperCommand::ElasticMover { .. } => "Elastic Array",
+        | HelperCommand::ElasticMover { .. }
+        | HelperCommand::ElasticFix { .. } | HelperCommand::ElasticAddDisk { .. }
+        | HelperCommand::ElasticDestroy { .. } => "Elastic Array",
     }
 }
 
@@ -270,13 +281,19 @@ where
         log: Vec::new(),
     };
     let cancellable = intent.is_none();
-    // Maintenance closes its own operation row inside `finish_job`, from the
-    // result the body recorded. The blanket `fail_elastic_job` below would put
-    // the ARRAY into needs_attention for a run that merely reported a failure
-    // it already persisted, so maintenance is excluded from it.
-    let maintenance = matches!(
+    // These close their own operation row — maintenance and the mover inside
+    // `finish_job`, from the result the body recorded; the add inside its own
+    // body, because the member row and the operation have to land together.
+    // The blanket `fail_elastic_job` below would put the ARRAY into
+    // needs_attention for a run that merely reported a failure it already
+    // persisted, so they are excluded from it.
+    let self_closing = matches!(
         intent,
-        Some(ElasticJobIntent::Snapraid { .. } | ElasticJobIntent::Mover { .. })
+        Some(
+            ElasticJobIntent::Snapraid { .. }
+                | ElasticJobIntent::Mover { .. }
+                | ElasticJobIntent::AddDisk { .. }
+        )
     );
     let mut registry = running().lock().unwrap_or_else(|p| p.into_inner());
     store::insert_job(db, &job, intent.as_ref())?;
@@ -301,7 +318,7 @@ where
             body(handle).await
           }
         }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow!("Przerwanie wykonawcy zadania; stan I/O niepotwierdzony")));
-        if !cancellable && !maintenance {
+        if !cancellable && !self_closing {
             if let Err(error) = &outcome {
                 if let Err(persist) = store::fail_elastic_job(&db,&job_id,&error.to_string()) {
                     tracing::error!("tentanas job {job_id}: nie utrwalono needs_attention: {persist}");

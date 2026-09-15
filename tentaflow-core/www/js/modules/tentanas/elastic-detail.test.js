@@ -4,7 +4,7 @@
 // Przykład: node --test --import ./js/_test-register.js js/modules/tentanas/elastic-detail.test.js
 // =============================================================================
 
-import { fakeScreen, flush, click, confirmWindow, I18n } from './_test-setup.js';
+import { fakeScreen, flush, click, confirmWindow, typeInto, I18n } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { drawElasticDetail, elasticCapacity, elasticCardHtml, elasticState } from './elastic-detail.js';
@@ -88,7 +88,13 @@ test('detal ma prawdziwe role, ścieżki, null ochrony oraz działający link dy
   assert.match(body.querySelector('.kpi').textContent, /Cache/);
   assert.equal(body.querySelector('[data-act="restore"]'), null);
   for (const act of ['sync', 'scrub']) assert.equal(body.querySelector(`.nas-snapraid > .section-card-head [data-act="${act}"]`).hasAttribute('disabled'), false);
-  for (const act of ['fix', 'destroy', 'add-disk']) assert.equal(body.querySelector(`[data-act="${act}"]`), null);
+  // A HEALTHY array offers no repair: `snapraid fix` writes the disk back from
+  // parity, so a button here would be one click from overwriting good data.
+  // Growing it and dissolving it are offered, because both are always legal on
+  // an array that is simply serving.
+  assert.equal(body.querySelector('[data-act="fix"]'), null);
+  for (const act of ['destroy', 'add-disk']) assert.ok(body.querySelector(`[data-act="${act}"]`), act);
+  assert.equal(body.querySelector('[data-act="add-disk"]').hasAttribute('disabled'), false);
   // The mover panel always renders. This fixture has no cache disk, so the run
   // must be REFUSED with a reason rather than quietly hidden.
   assert.ok(body.querySelector('[data-act="mover"]').hasAttribute('disabled'));
@@ -688,4 +694,162 @@ test('an unchanged poll leaves the Elastic pane standing', async () => {
   [...view.querySelectorAll('tf-stat-card')].forEach((el, i) => assert.equal(el === tiles[i], true, `tile ${i} survives the poll`));
   [...view.querySelectorAll('.disk-cell')].forEach((el, i) => assert.equal(el === cells[i], true, `disk cell ${i} survives the poll`));
   screen.dispose();
+});
+
+// =============================================================================
+// Repair, grow, dissolve (§5.3 lifecycle)
+// =============================================================================
+
+/// The repair control appears on EVIDENCE and nowhere else.
+///
+/// `snapraid fix -d <disk>` writes the named disk back from the parity
+/// checkpoint, so on an array that reports nothing wrong the button's only
+/// possible effect is overwriting healthy data — and on an array with no parity
+/// at all the node can only refuse it. Both are checked here against the same
+/// four kinds of evidence `tentanas::elastic::repair_evidence` accepts.
+test('naprawa pojawia się tylko przy dowodzie awarii i nigdy bez parity', async () => {
+  const cases = [
+    [{}, false, 'zdrowa macierz nie oferuje naprawy'],
+    [{ parityDisks: [] }, false, 'bez parity nie ma z czego odbudować'],
+    [{ dataDisks: [{ ...disk, devicePresent: false }] }, true, 'brak dysku na węźle'],
+    [{ dataDisks: [{ ...disk, health: 'critical' }] }, true, 'krytyczny SMART'],
+    [{ unresolvedOperation: true }, true, 'nierozwiązana operacja parity'],
+    [{ snapraid: { parityErrors: 3, configPath: '/etc/tentanas/snapraid-media.conf' } }, true, 'zgłoszone błędy parity'],
+    [{ state: 'needs_attention', unresolvedOperation: true }, true, 'naprawa startuje z needs_attention'],
+    [{ enabled: false, unresolvedOperation: true }, false, 'wyłączona macierz nic nie uruchamia'],
+  ];
+  for (const [overrides, offered, why] of cases) {
+    const { screen, body } = await mount(array(overrides));
+    assert.equal(Boolean(body.querySelector('[data-act="fix"]')), offered, why);
+    screen.dispose();
+  }
+  // And a reader never sees it, whatever the array reports.
+  const { screen, body } = await mount(array({ unresolvedOperation: true }), {}, { admin: false });
+  assert.equal(body.querySelector('[data-act="fix"]'), null);
+  assert.equal(body.querySelector('[data-act="add-disk"]'), null);
+  assert.equal(body.querySelector('[data-act="destroy"]'), null);
+  screen.dispose();
+});
+
+/// The repair retypes the DISK, sends exactly one request naming that disk, and
+/// follows the job. Retyping the ARRAY name must not arm it: the mistake this
+/// dialog exists to stop is repairing the wrong disk of the right array.
+test('naprawa wymaga przepisania nazwy dysku i wysyła dokładnie jedno żądanie', async () => {
+  const { screen, body } = await mount(array({ unresolvedOperation: true }), {
+    tentaNasElasticArrayFixRequest: { job: { jobId: 'job-fix', status: 'running' } },
+  });
+  click(body.querySelector('[data-act="fix"]'));
+  await flush();
+  const win = document.querySelector('tf-window');
+  assert.ok(win, 'okno naprawy jest otwarte');
+  const confirm = win.querySelector('[data-action="confirm"]');
+  assert.ok(confirm.hasAttribute('disabled'), 'przycisk startuje zablokowany');
+  typeInto(win.querySelector('#nas-retype'), 'media');
+  assert.ok(confirm.hasAttribute('disabled'), 'nazwa macierzy nie uzbraja naprawy dysku');
+  typeInto(win.querySelector('#nas-retype'), 'd1');
+  assert.equal(confirm.hasAttribute('disabled'), false);
+  confirmWindow(win);
+  await flush();
+  const sent = screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayFixRequest');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].payload, { name: 'media', disk: 'd1', confirmDisk: 'd1', sudoPassword: 'hunter2' });
+  assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['job-fix']);
+  screen.dispose();
+});
+
+/// Growing the array: one request, the array name retyped, and the picked disk
+/// carried by id. A disk larger than the array's parity stays VISIBLE with the
+/// reason and cannot be picked — snapraid accepts such a disk and refuses only
+/// once the data has outgrown the parity, so this warning is the only one that
+/// arrives in time.
+test('dodanie dysku przepisuje nazwę macierzy, odmawia dysku większego niż parity i wysyła raz', async () => {
+  const free = [
+    { diskId: 'free-1', name: 'sdc', sizeBytes: 16 * GiB, serial: 'S1', kind: 'hdd', health: 'ok' },
+    { diskId: 'free-2', name: 'sdd', sizeBytes: 64 * GiB, serial: 'S2', kind: 'hdd', health: 'ok' },
+    { diskId: 'free-3', name: 'sde', sizeBytes: 16 * GiB, serial: 'S3', kind: 'hdd', health: 'critical' },
+  ];
+  const { screen, body } = await mount(array(), {
+    tentaNasElasticCapabilitiesRequest: { capabilities: { mergerfs: true, snapraid: true, filesystems: ['xfs'] }, freeDisks: free },
+    tentaNasElasticArrayAddDiskRequest: { job: { jobId: 'job-add', status: 'running' } },
+  });
+  click(body.querySelector('[data-act="add-disk"]'));
+  await flush();
+  const win = document.querySelector('tf-window');
+  assert.ok(win, 'okno dodania dysku jest otwarte');
+  const cells = [...win.querySelectorAll('#nas-add-disk .disk-cell')];
+  // The critical disk is not offered at all; the oversized one is offered and
+  // refused with its reason.
+  assert.deepEqual(cells.map((c) => c.dataset.disk), ['free-1', 'free-2']);
+  const oversized = cells.find((c) => c.dataset.disk === 'free-2');
+  assert.ok(oversized.classList.contains('disabled'));
+  assert.match(oversized.textContent, /parity/);
+  click(oversized);
+  assert.equal(oversized.classList.contains('checked'), false, 'dysku większego niż parity nie da się wybrać');
+  const good = cells.find((c) => c.dataset.disk === 'free-1');
+  click(good);
+  assert.ok(good.classList.contains('checked'));
+  typeInto(win.querySelector('#nas-retype'), 'media');
+  confirmWindow(win);
+  await flush();
+  const sent = screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayAddDiskRequest');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].payload, { name: 'media', diskId: 'free-1', confirmName: 'media', sudoPassword: 'hunter2' });
+  assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['job-add']);
+  screen.dispose();
+});
+
+/// A dissolve says what it does NOT do, because that is the shape of the
+/// operation: nothing is formatted, so the disks keep their filesystems and the
+/// array import takes the array back. Without the retype nothing is sent.
+test('rozwiązanie obiecuje zachowanie danych, wymaga przepisania nazwy i wysyła raz', async () => {
+  const { screen, body } = await mount(array(), {
+    tentaNasElasticArrayDestroyRequest: { job: { jobId: 'job-kill', status: 'running' } },
+  });
+  const row = body.querySelector('.danger-zone [data-act="destroy"]');
+  assert.ok(row, 'strefa zagrożenia ma akcję rozwiązania');
+  click(row);
+  await flush();
+  const win = document.querySelector('tf-window');
+  const confirm = win.querySelector('[data-action="confirm"]');
+  assert.ok(confirm.hasAttribute('disabled'));
+  assert.match(win.textContent, /zachowuje system plików/);
+  assert.match(win.textContent, /Import macierzy przywraca/);
+  assert.match(win.textContent, /nie formatuje niczego/, 'dialog mówi wprost, że nic nie formatuje');
+  // Nothing was sent while the retype was empty.
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayDestroyRequest').length, 0);
+  typeInto(win.querySelector('#nas-retype'), 'medi');
+  assert.ok(confirm.hasAttribute('disabled'), 'częściowa nazwa nie uzbraja');
+  typeInto(win.querySelector('#nas-retype'), 'media');
+  confirmWindow(win);
+  await flush();
+  const sent = screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayDestroyRequest');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].payload, { name: 'media', confirmName: 'media', sudoPassword: 'hunter2' });
+  assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['job-kill']);
+  screen.dispose();
+});
+
+/// Every sentence the three dialogs and the three gates put on screen exists in
+/// all five bundles. `i18n-parity` proves the KEYS are there; this proves the
+/// screen asks for the ones it means, in the language the admin picked.
+test('etykiety naprawy, dodania dysku i rozwiązania są tłumaczone w pięciu locale', async () => {
+  const locales = [
+    ['pl', 'Napraw z parity', 'Dodaj dysk danych', 'Rozwiąż macierz'],
+    ['en', 'Repair from parity', 'Add data disk', 'Dissolve the array'],
+    ['de', 'Aus Parität reparieren', 'Datenträger hinzufügen', 'Array auflösen'],
+    ['es', 'Reparar desde la paridad', 'Añadir disco de datos', 'Disolver la matriz'],
+    ['fr', 'Réparer depuis la parité', 'Ajouter un disque de données', 'Dissoudre la matrice'],
+  ];
+  try {
+    for (const [language, repair, add, dissolve] of locales) {
+      await I18n.setLanguage(language);
+      const { screen, body } = await mount(array({ unresolvedOperation: true }));
+      assert.equal(body.querySelector('[data-act="fix"]').textContent.trim(), repair, language);
+      assert.equal(body.querySelector('[data-act="add-disk"]').textContent.trim(), add, language);
+      assert.equal(body.querySelector('.danger-zone [data-act="destroy"]').textContent.trim(), dissolve, language);
+      screen.dispose();
+    }
+  } finally {
+    await I18n.setLanguage('pl');
+  }
 });

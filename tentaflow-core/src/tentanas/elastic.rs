@@ -54,7 +54,7 @@ use tentanas_helper::elastic::{
 };
 use anyhow::{anyhow, ensure, Result};
 use tentanas_helper::elastic::{ElasticCreateSpec, ElasticDiskSpec, ElasticJournalEntry, ElasticJournalsResult, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult, ElasticServiceMode};
-use tentanas_helper::elastic::{ElasticMoverIssueKind, ElasticMoverPhase, ElasticMoverResult, ElasticMoverRun, ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
+use tentanas_helper::elastic::{ElasticDissolveResult, ElasticMoverIssueKind, ElasticMoverPhase, ElasticMoverResult, ElasticMoverRun, ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
 use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -1914,7 +1914,7 @@ pub(crate) fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
         detail,
         coupled_sync: run.coupled_sync.as_ref().map(|sync| NasSnapraidRun {
             operation_id: Some(sync.operation_id.clone()),
-            kind: snapraid_kind_to_protocol(sync.kind),
+            kind: snapraid_kind_to_protocol(&sync.kind),
             started_at: sync.started_at.clone(),
             finished_at: sync.finished_at.clone(),
             outcome: snapraid_outcome_to_protocol(sync.outcome),
@@ -1932,11 +1932,8 @@ pub(crate) fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
     }
 }
 
-fn snapraid_kind_to_protocol(kind: ElasticSnapraidKind) -> String {
-    match kind {
-        ElasticSnapraidKind::Sync => "sync",
-        ElasticSnapraidKind::Scrub => "scrub",
-    }.to_string()
+fn snapraid_kind_to_protocol(kind: &ElasticSnapraidKind) -> String {
+    snapraid_kind(kind).to_string()
 }
 
 fn snapraid_outcome_to_protocol(outcome: ElasticSnapraidOutcome) -> String {
@@ -2112,6 +2109,9 @@ fn parity_errors_in_window(
     let since = now - chrono::Duration::days(i64::from(PARITY_ERRORS_WINDOW_DAYS));
     let mut total: Option<u64> = None;
     for run in &array.parity_window_runs {
+        // A REPAIR is excluded on purpose: the errors it reports are the ones
+        // it just rebuilt from parity, so counting them would leave a
+        // successfully repaired array reading damaged for the whole window.
         if !matches!(run.kind.as_str(), "sync" | "scrub") {
             continue;
         }
@@ -2135,6 +2135,55 @@ fn parity_errors_in_window(
         total = Some(total.unwrap_or(0).saturating_add(found));
     }
     total
+}
+
+/// What a repair would be working on, or `None` when the array reports
+/// nothing to repair.
+///
+/// `snapraid fix -d <disk>` WRITES the named disk's blocks back from the parity
+/// checkpoint, so on an array that reports nothing wrong it overwrites healthy
+/// data for no reason — and it is the one operation whose whole purpose is to
+/// run on a broken array, so it cannot simply require a healthy one. The bar
+/// here is therefore evidence, not permission: a member the node cannot see, a
+/// member SMART calls critical, a parity operation nobody has resolved, or
+/// errors the array's own runs recorded inside the advertised window. An array
+/// with none of those has nothing a repair could recover, and the admin's next
+/// step is a scrub — which is what the refusal says.
+///
+/// It takes the OBSERVED array rather than the database row because the
+/// frontend's own gate reads exactly these fields off the wire: one rule over
+/// one object is what keeps the button and the handler from disagreeing, and a
+/// button the node then refuses reads to an admin as a fault.
+///
+/// `device_present` is a tri-state and only `Some(false)` counts. `None` is
+/// "nothing looked", which is the state of every array on a node whose disks
+/// have not been read yet — treating it as absence would offer a repair on
+/// every array on the dashboard.
+pub fn repair_evidence(array: &NasElasticArray) -> Option<String> {
+    for member in &array.data_disks {
+        if member.device_present == Some(false) {
+            return Some(format!("dysku '{}' nie widać na tym węźle", member.name));
+        }
+        if member.health == "critical" {
+            return Some(format!(
+                "dysk '{}' zgłasza krytyczny stan SMART",
+                member.name
+            ));
+        }
+    }
+    // The state a scrub that found errors leaves behind, and the reason this
+    // check cannot lean on the error COUNT alone: the count comes from a
+    // bounded window of rows and reads `None` once that window overflows,
+    // while the unresolved operation stands until something resolves it.
+    if array.unresolved_operation {
+        return Some("macierz ma nierozwiązaną operację parity".to_string());
+    }
+    match array.snapraid.parity_errors {
+        Some(errors) if errors > 0 => Some(format!(
+            "przebiegi SnapRAID zgłosiły {errors} błędów w oknie raportowania"
+        )),
+        _ => None,
+    }
 }
 
 /// The one status of the array card, with its reason.
@@ -2702,10 +2751,19 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
     }
 }
 
-pub fn snapraid_kind(kind: ElasticSnapraidKind) -> &'static str {
+pub fn snapraid_kind(kind: &ElasticSnapraidKind) -> &'static str {
     match kind {
         ElasticSnapraidKind::Sync => "sync",
         ElasticSnapraidKind::Scrub => "scrub",
+        ElasticSnapraidKind::Fix { .. } => "fix",
+    }
+}
+
+/// The disk a repair names, or `None` for the array-wide operations.
+pub fn snapraid_disk(kind: &ElasticSnapraidKind) -> Option<&str> {
+    match kind {
+        ElasticSnapraidKind::Fix { disk } => Some(disk.as_str()),
+        _ => None,
     }
 }
 
@@ -2713,7 +2771,7 @@ pub fn snapraid_command(
     owner: &ElasticOwner,
     array_id: &str,
     operation_id: &str,
-    kind: ElasticSnapraidKind,
+    kind: &ElasticSnapraidKind,
 ) -> HelperCommand {
     match kind {
         ElasticSnapraidKind::Sync => HelperCommand::ElasticSync {
@@ -2726,15 +2784,48 @@ pub fn snapraid_command(
             array_id: array_id.into(),
             operation_id: operation_id.into(),
         },
+        ElasticSnapraidKind::Fix { disk } => HelperCommand::ElasticFix {
+            owner: owner.clone(),
+            array_id: array_id.into(),
+            operation_id: operation_id.into(),
+            disk: disk.clone(),
+        },
+    }
+}
+
+pub fn add_disk_command(
+    owner: &ElasticOwner,
+    array_id: &str,
+    operation_id: &str,
+    disk: &ElasticDiskSpec,
+) -> HelperCommand {
+    HelperCommand::ElasticAddDisk {
+        owner: owner.clone(),
+        array_id: array_id.into(),
+        operation_id: operation_id.into(),
+        disk: disk.clone(),
+    }
+}
+
+pub fn dissolve_command(
+    owner: &ElasticOwner,
+    array_id: &str,
+    operation_id: &str,
+) -> HelperCommand {
+    HelperCommand::ElasticDestroy {
+        owner: owner.clone(),
+        array_id: array_id.into(),
+        operation_id: operation_id.into(),
     }
 }
 
 pub fn validate_snapraid_result(
     spec: &ElasticCreateSpec,
     operation_id: &str,
-    kind: ElasticSnapraidKind,
+    kind: &ElasticSnapraidKind,
     result: &ElasticSnapraidResult,
 ) -> Result<()> {
+    let repairing = matches!(kind, ElasticSnapraidKind::Fix { .. });
     if result.run.outcome == ElasticSnapraidOutcome::Refused {
         validate_observation(spec, &result.state)?;
     } else {
@@ -2742,7 +2833,7 @@ pub fn validate_snapraid_result(
     }
     let run = &result.run;
     ensure!(
-        run.operation_id == operation_id && run.kind == kind,
+        run.operation_id == operation_id && run.kind == *kind,
         "Obca operacja SnapRAID"
     );
     tentanas_helper::elastic::validate_elastic_uuid(&run.operation_id)?;
@@ -2763,7 +2854,11 @@ pub fn validate_snapraid_result(
     match run.outcome {
         ElasticSnapraidOutcome::Refused => {
             ensure!(
-                result.state.stage == ElasticStage::Ready
+                // A repair is the one operation that may be REFUSED on an
+                // array that needs attention, because it is the one that may
+                // be started there at all.
+                (result.state.stage == ElasticStage::Ready
+                    || (repairing && result.state.stage == ElasticStage::NeedsAttention))
                     && run.exit_code.is_none()
                     && run.total_blocks.is_none()
                     && run.checked_blocks.is_none()
@@ -2784,7 +2879,7 @@ pub fn validate_snapraid_result(
             );
         }
         ElasticSnapraidOutcome::Succeeded => {
-            let empty_sync = kind == ElasticSnapraidKind::Sync
+            let empty_sync = *kind == ElasticSnapraidKind::Sync
                 && run.total_blocks == Some(0)
                 && run.checked_blocks.is_none()
                 && run.accessed_mb.is_none()
@@ -2795,13 +2890,20 @@ pub fn validate_snapraid_result(
                 result.state.stage == ElasticStage::Ready
                     && result.state.last_run.as_ref() == Some(run)
                     && run.exit_code == Some(0)
-                    && (empty_sync
+                    // A REPAIR reports the errors it repaired, so its counters
+                    // are its work and not its failure — demanding three zeroes
+                    // here would reject every run that actually rebuilt
+                    // anything. Its success is the exit code plus the array
+                    // coming back Ready, which is what `perform_maintenance`
+                    // and the helper's own summary contract decided.
+                    && (repairing
+                        || empty_sync
                         || (run.errors_file == Some(0)
                             && run.errors_io == Some(0)
                             && run.errors_data == Some(0))),
                 "Niepotwierdzony sukces SnapRAID"
             );
-            if kind == ElasticSnapraidKind::Scrub {
+            if *kind == ElasticSnapraidKind::Scrub {
                 ensure!(
                     run.total_blocks
                         .zip(run.checked_blocks)
@@ -2810,10 +2912,27 @@ pub fn validate_snapraid_result(
                     "Scrub nie potwierdził pełnego zakresu"
                 );
             }
-            if kind == ElasticSnapraidKind::Sync {
+            if *kind == ElasticSnapraidKind::Sync {
                 ensure!(
                     result.state.sync_completed_at == run.finished_at,
                     "Inny checkpoint sync"
+                );
+            }
+            if let ElasticSnapraidKind::Fix { disk } = kind {
+                // A repair rebuilds data from the parity checkpoint that is
+                // already on disk; it writes no new checkpoint, so claiming
+                // one would date the array's protection to the repair.
+                ensure!(
+                    result.state.sync_completed_at.as_ref() != run.finished_at.as_ref(),
+                    "Naprawa nie zapisuje checkpointu sync"
+                );
+                ensure!(
+                    spec.data
+                        .iter()
+                        .enumerate()
+                        .any(|(index, _)| tentanas_helper::elastic::data_branch_name(index + 1)
+                            == *disk),
+                    "Naprawa wskazała dysk, którego macierz nie ma"
                 );
             }
         }
@@ -2835,7 +2954,7 @@ async fn execute_snapraid_job(
     h: &jobs::JobHandle,
     spec: &ElasticCreateSpec,
     operation_id: &str,
-    kind: ElasticSnapraidKind,
+    kind: &ElasticSnapraidKind,
     run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
 ) -> Result<()> {
     let output = run.await?;
@@ -3010,24 +3129,228 @@ pub fn spawn_snapraid(
         owner: spec.owner.clone(),
         array_id: spec.array_id.clone(),
         operation_id: operation_id.clone(),
-        kind,
+        kind: kind.clone(),
     };
     jobs::spawn(
         db,
-        &format!("elastic_{}", snapraid_kind(kind)),
+        &format!("elastic_{}", snapraid_kind(&kind)),
         &array.name,
         started_by,
         Some(intent),
         None,
         move |h| async move {
-            let command = snapraid_command(&spec.owner, &spec.array_id, &operation_id, kind);
+            let command = snapraid_command(&spec.owner, &spec.array_id, &operation_id, &kind);
             let run = jobs::run_step(
                 &h,
                 &command,
                 explicit.as_deref(),
                 Duration::from_secs(24 * 60 * 60),
             );
-            execute_snapraid_job(&h, &spec, &operation_id, kind, run).await
+            execute_snapraid_job(&h, &spec, &operation_id, &kind, run).await
+        },
+    )
+}
+
+/// The array the add would produce, as its persisted intention: the row's own
+/// spec with one more data disk on the end.
+///
+/// It exists because BOTH sides need exactly this object and neither may build
+/// its own: the helper's answer is validated against it, and the disk row is
+/// written from the same slot it puts the disk in. Two constructions of "the
+/// array plus one disk" that disagreed by a slot would write a row for one
+/// array and validate the answer of another.
+pub fn spec_with_added_disk(
+    spec: &ElasticCreateSpec,
+    disk: &ElasticDiskSpec,
+) -> Result<ElasticCreateSpec> {
+    let mut after = spec.clone();
+    after.data.push(disk.clone());
+    after.validate()?;
+    Ok(after)
+}
+
+async fn execute_add_disk_job(
+    h: &jobs::JobHandle,
+    spec_after: &ElasticCreateSpec,
+    operation_id: &str,
+    disk: &ElasticDiskSpec,
+    run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
+) -> Result<()> {
+    let result = async {
+        let out = run.await?;
+        ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
+        ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
+        let result: ElasticResult = serde_json::from_str(&out.stdout)?;
+        // Against the array the add PRODUCES, never the one it started from:
+        // the helper answers with N+1 disks, and validating that against the
+        // old spec would read a successful add as an incomplete observation.
+        validate_result(spec_after, &result)?;
+        Ok::<_, anyhow::Error>(result)
+    }
+    .await;
+    let key = format!("elastic:{}:add-disk", spec_after.array_id);
+    match result {
+        Ok(result) => {
+            // ONE transaction writes the member row and closes the operation,
+            // so the instance database never holds an array whose spec and
+            // whose finished operation disagree about how many disks it has.
+            store::finish_elastic_add_disk(h.db(), &spec_after.owner, operation_id, disk, &result)?;
+            if result.stage != ElasticStage::Ready {
+                let detail = result
+                    .detail
+                    .as_deref()
+                    .unwrap_or("Dodanie dysku wymaga interwencji; rezerwacje zachowane");
+                store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name,
+                    "Macierz wymaga interwencji", detail)?;
+                return Err(anyhow!(detail.to_string()));
+            }
+            store::resolve_alert(h.db(), &key)?;
+            h.progress(100);
+            Ok(())
+        }
+        Err(error) => {
+            // The member row is NOT written. The helper records the slot in
+            // its own journal before it formats anything, so repeating the
+            // operation is what finishes it — and repeating it is what writes
+            // the row.
+            let detail = format!("{error}; dysk nie został dopisany do macierzy");
+            store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
+            store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name,
+                "Niepotwierdzone dodanie dysku", &detail)?;
+            Err(error)
+        }
+    }
+}
+
+pub fn spawn_add_disk(
+    db: &DbPool,
+    array: &ElasticArrayRow,
+    started_by: &str,
+    explicit: Option<Arc<ElevationToken>>,
+    disk: ElasticDiskSpec,
+) -> Result<tentaflow_protocol::tentanas::NasJob> {
+    let spec_after = spec_with_added_disk(array.persisted_spec()?, &disk)?;
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    let intent = jobs::ElasticJobIntent::AddDisk {
+        owner: spec_after.owner.clone(),
+        array_id: spec_after.array_id.clone(),
+        operation_id: operation_id.clone(),
+        disk: disk.clone(),
+    };
+    jobs::spawn(
+        db,
+        "elastic_add_disk",
+        &array.name,
+        started_by,
+        Some(intent),
+        None,
+        move |h| async move {
+            let command =
+                add_disk_command(&spec_after.owner, &spec_after.array_id, &operation_id, &disk);
+            let run = jobs::run_step(
+                &h,
+                &command,
+                explicit.as_deref(),
+                Duration::from_secs(24 * 60 * 60),
+            );
+            execute_add_disk_job(&h, &spec_after, &operation_id, &disk, run).await
+        },
+    )
+}
+
+/// The dissolve's answer, against the array that asked for it.
+///
+/// `data_kept` is checked rather than assumed: it is the promise the dialog
+/// made to the admin — the disks keep their filesystems and the array import
+/// takes the array back — and a helper that ever stopped keeping them must
+/// fail the job instead of having the promise quietly become false.
+pub fn validate_dissolve_result(
+    spec: &ElasticCreateSpec,
+    operation_id: &str,
+    result: &ElasticDissolveResult,
+) -> Result<()> {
+    ensure!(
+        result.array_id == spec.array_id
+            && result.owner == spec.owner
+            && result.name == spec.name
+            && result.operation_id == operation_id,
+        "Odpowiedź rozwiązania dotyczy innej macierzy lub operacji"
+    );
+    ensure!(result.data_kept, "Helper nie potwierdził zachowania danych");
+    ensure!(
+        result.released.first().map(String::as_str)
+            == Some(tentanas_helper::elastic::union_path(&spec.name).as_str()),
+        "Rozwiązanie nie zwolniło unii jako pierwszej"
+    );
+    ensure!(result.steps.len() < 64 * 1024, "Za duży plan rozwiązania");
+    Ok(())
+}
+
+async fn execute_dissolve_job(
+    h: &jobs::JobHandle,
+    spec: &ElasticCreateSpec,
+    operation_id: &str,
+    alerts: &[String],
+    run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
+) -> Result<()> {
+    let out = run.await?;
+    ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
+    ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
+    let result: ElasticDissolveResult = serde_json::from_str(&out.stdout)?;
+    validate_dissolve_result(spec, operation_id, &result)?;
+    for line in result.steps.lines() {
+        h.log(line);
+    }
+    for path in &result.released {
+        h.log(format!("zwolniono {path}"));
+    }
+    // ONLY after the node has stopped serving the array. Deleting the rows
+    // first would leave a union with no supervision: nothing would know the
+    // mount existed, and `block_elastic_teardown` would let an uninstall
+    // proceed over a live share.
+    store::delete_elastic_array(h.db(), &spec.owner, &spec.array_id)?;
+    // Alerts outlive their subject: a branch alert of an array nothing has a
+    // row for any more can never be resolved by a later reconcile, so it would
+    // sit red on the dashboard forever.
+    for key in alerts {
+        store::resolve_alert(h.db(), key)?;
+    }
+    h.progress(100);
+    Ok(())
+}
+
+pub fn spawn_dissolve(
+    db: &DbPool,
+    array: &ElasticArrayRow,
+    started_by: &str,
+    explicit: Option<Arc<ElevationToken>>,
+) -> Result<tentaflow_protocol::tentanas::NasJob> {
+    let spec = array.persisted_spec()?.clone();
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    let mut alerts = alert_keys(array);
+    alerts.push(format!("elastic:{}:restore", spec.array_id));
+    alerts.push(format!("elastic:{}:add-disk", spec.array_id));
+    let intent = jobs::ElasticJobIntent::Dissolve {
+        owner: spec.owner.clone(),
+        array_id: spec.array_id.clone(),
+        operation_id: operation_id.clone(),
+    };
+    jobs::spawn(
+        db,
+        "elastic_destroy",
+        &array.name,
+        started_by,
+        Some(intent),
+        None,
+        move |h| async move {
+            let command = dissolve_command(&spec.owner, &spec.array_id, &operation_id);
+            let run = jobs::run_step(
+                &h,
+                &command,
+                explicit.as_deref(),
+                Duration::from_secs(60 * 60),
+            );
+            execute_dissolve_job(&h, &spec, &operation_id, &alerts, run).await
         },
     )
 }
@@ -4167,6 +4490,8 @@ pub(crate) mod tests {
         let mut state = ready_result(spec);
         let success = outcome == ElasticSnapraidOutcome::Succeeded;
         let refused = outcome == ElasticSnapraidOutcome::Refused;
+        let scrubbing = kind == ElasticSnapraidKind::Scrub;
+        let syncing = kind == ElasticSnapraidKind::Sync;
         let run = tentanas_helper::elastic::ElasticSnapraidRun {
             operation_id: operation_id.into(),
             kind,
@@ -4175,8 +4500,8 @@ pub(crate) mod tests {
             outcome,
             exit_code: (!refused).then_some(if success { 0 } else { 1 }),
             total_blocks: success.then_some(80),
-            checked_blocks: (success && kind == ElasticSnapraidKind::Scrub).then_some(68),
-            accessed_mb: (success && kind == ElasticSnapraidKind::Scrub).then_some(17),
+            checked_blocks: (success && scrubbing).then_some(68),
+            accessed_mb: (success && scrubbing).then_some(17),
             errors_file: (!refused).then_some(0),
             errors_io: (!refused).then_some(0),
             errors_data: (!refused).then_some(if success { 0 } else { 1 }),
@@ -4196,7 +4521,7 @@ pub(crate) mod tests {
             state.stage = ElasticStage::NeedsAttention;
             state.detail = run.detail.clone();
         }
-        if success && kind == ElasticSnapraidKind::Sync {
+        if success && syncing {
             state.sync_completed_at = run.finished_at.clone();
         }
         ElasticSnapraidResult { state, run }
@@ -4522,7 +4847,7 @@ pub(crate) mod tests {
             ElasticSnapraidKind::Scrub,
             ElasticSnapraidOutcome::Succeeded,
         );
-        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &good).unwrap();
+        validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Scrub, &good).unwrap();
         for case in 0..8 {
             let mut bad = good.clone();
             match case {
@@ -4536,7 +4861,7 @@ pub(crate) mod tests {
                 _ => bad.run.exit_code = Some(1),
             }
             assert!(
-                validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &bad).is_err(),
+                validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Scrub, &bad).is_err(),
                 "{case}"
             );
         }
@@ -4547,10 +4872,10 @@ pub(crate) mod tests {
             ElasticSnapraidOutcome::Refused,
         );
         refused.state.union_mounted = Some(false);
-        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &refused).unwrap();
+        validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Scrub, &refused).unwrap();
         refused.run.checked_blocks = Some(0);
         assert!(
-            validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &refused).is_err()
+            validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Scrub, &refused).is_err()
         );
         let failed = snapraid_result(
             &spec,
@@ -4558,7 +4883,7 @@ pub(crate) mod tests {
             ElasticSnapraidKind::Scrub,
             ElasticSnapraidOutcome::Failed,
         );
-        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &failed).unwrap();
+        validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Scrub, &failed).unwrap();
         let mut empty = snapraid_result(
             &spec,
             &id,
@@ -4570,7 +4895,7 @@ pub(crate) mod tests {
         empty.run.errors_io = None;
         empty.run.errors_data = None;
         empty.state.last_run = Some(empty.run.clone());
-        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &empty).unwrap();
+        validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Sync, &empty).unwrap();
         let mut unchanged = snapraid_result(
             &spec,
             &id,
@@ -4581,25 +4906,25 @@ pub(crate) mod tests {
         unchanged.run.checked_blocks = None;
         unchanged.run.accessed_mb = None;
         unchanged.state.last_run = Some(unchanged.run.clone());
-        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &unchanged).unwrap();
+        validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Sync, &unchanged).unwrap();
         unchanged.run.errors_data = None;
         unchanged.state.last_run = Some(unchanged.run.clone());
         assert!(
-            validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &unchanged).is_err()
+            validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Sync, &unchanged).is_err()
         );
         empty.run.total_blocks = Some(1);
         empty.state.last_run = Some(empty.run.clone());
-        assert!(validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &empty).is_err());
+        assert!(validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Sync, &empty).is_err());
         let mut zero_scrub = good.clone();
         zero_scrub.run.checked_blocks = Some(0);
         zero_scrub.state.last_run = Some(zero_scrub.run.clone());
         assert!(
-            validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &zero_scrub).is_err()
+            validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Scrub, &zero_scrub).is_err()
         );
         let mut sub_mb = good;
         sub_mb.run.accessed_mb = Some(0);
         sub_mb.state.last_run = Some(sub_mb.run.clone());
-        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &sub_mb).unwrap();
+        validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Scrub, &sub_mb).unwrap();
     }
 
     #[test]
@@ -5113,7 +5438,7 @@ pub(crate) mod tests {
                         &h,
                         &work_spec,
                         &work_id,
-                        ElasticSnapraidKind::Sync,
+                        &ElasticSnapraidKind::Sync,
                         async {
                             Ok(super::super::broker::CommandOutput {
                                 code: if case == "transport" { 1 } else { 0 },

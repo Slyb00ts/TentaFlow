@@ -2607,6 +2607,55 @@ pub enum TentaNasPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
     },
+    /// Rebuilds ONE data disk of the array from its parity
+    /// (`snapraid fix -d <disk>`). `disk` is the array's own branch name
+    /// (`d1`, `d2`, …) as `NasElasticBranch::name` reports it, never a device:
+    /// the disk being repaired is by definition the one that is failing, and a
+    /// kernel name can point at a different disk after a reboot.
+    ///
+    /// The retype is the DISK, not the array, and that is deliberate: a repair
+    /// overwrites the named disk's current contents with what parity says they
+    /// should be, so the mistake to make impossible is repairing the wrong
+    /// disk of the right array.
+    ElasticArrayFixRequest {
+        name: String,
+        disk: String,
+        confirm_disk: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// §5.3's headline: one more data disk, added to the array while it keeps
+    /// serving. The union is never taken down — MEASURED, see
+    /// `tentanas_helper::elastic::ElasticStep::AddBranch` — so SMB and NFS
+    /// clients keep their handles throughout.
+    ///
+    /// The disk is ERASED: it is formatted with the array's filesystem before
+    /// it joins, which is why this carries the same retype a create does. It
+    /// comes under parity only after the sync this operation ends with.
+    ElasticArrayAddDiskRequest {
+        name: String,
+        disk_id: String,
+        confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Stops serving the array and forgets it in this instance.
+    ///
+    /// It formats NOTHING. Every data and cache disk keeps its filesystem and
+    /// its files, the parity file and the snapraid config stay, and the node
+    /// keeps the array's journal — so `ElasticArrayImportScanRequest` finds it
+    /// again and the array can be taken back whole. That is what makes this
+    /// the one destructive array operation that is reversible, and the dialog
+    /// has to say so.
+    ///
+    /// The member disks are NOT wiped, so they go on carrying filesystem
+    /// signatures and read as `used` rather than `free` until a wipe exists.
+    ElasticArrayDestroyRequest {
+        name: String,
+        confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
     /// "Uruchom mover teraz" (n11): moves aged cache files down onto the data
     /// disks and runs the coupled `snapraid sync` in the SAME job.
     ElasticArrayMoverRequest {

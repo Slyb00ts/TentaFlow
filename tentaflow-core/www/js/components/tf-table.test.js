@@ -416,3 +416,74 @@ test('the scoped cell sheets cover every class a TentaNas html cell emits', () =
     );
   }
 });
+
+// `empty-message` was passed by 19 call sites across 11 screens and did
+// nothing: the attribute was never read and was not in `observedAttributes`,
+// so every empty table in the product rendered as blank space and the
+// caller's sentence went nowhere. A claim that a given table "does carry an
+// empty-message" therefore said nothing about what the user sees.
+function mountPlain(attrs = '') {
+  document.body.innerHTML = '';
+  const table = document.createElement('tf-table');
+  if (attrs) {
+    for (const [k, v] of Object.entries(JSON.parse(attrs))) table.setAttribute(k, v);
+  }
+  table.innerHTML = '<tf-column key="name" label="Nazwa"></tf-column>'
+    + '<tf-column key="size" label="Rozmiar"></tf-column>';
+  document.body.appendChild(table);
+  return table;
+}
+
+const emptyCell = (t) => t.shadowRoot.querySelector('.tf-table__empty-row > .tf-table__empty-cell');
+
+test('an empty table renders the caller sentence across every column', () => {
+  const table = mountPlain('{"empty-message":"Brak dysków bez przypisania"}');
+  table.rows = [];
+
+  const cell = emptyCell(table);
+  assert.ok(cell, 'the empty row reached the shadow root');
+  assert.equal(cell.textContent, 'Brak dysków bez przypisania');
+  const headerCells = table.shadowRoot.querySelector('thead tr').children.length;
+  assert.equal(cell.colSpan, headerCells, 'it spans the header, so it cannot drift from the column count');
+});
+
+test('the span of an empty row covers the actions column too', () => {
+  const table = mountPlain('{"empty-message":"Nic tu nie ma"}');
+  table.rowActions = () => document.createElement('span');
+  table.rows = [];
+  const headerCells = table.shadowRoot.querySelector('thead tr').children.length;
+  assert.equal(emptyCell(table).colSpan, headerCells);
+  assert.ok(headerCells >= 3, 'the header really did gain the actions column');
+});
+
+test('a table with no empty-message stays blank, as before', () => {
+  const table = mountPlain();
+  table.rows = [];
+  assert.equal(table.shadowRoot.querySelector('.tf-table__empty-row'), null);
+  assert.equal(table.shadowRoot.querySelector('tbody').children.length, 0);
+});
+
+test('an unchanged repaint of an empty table replaces no node', () => {
+  const table = mountPlain('{"empty-message":"Brak zadań"}');
+  table.rows = [];
+  const before = emptyCell(table);
+  table.rows = [];
+  assert.equal(emptyCell(table), before, 'the empty cell is patched, never rebuilt');
+  assert.equal(before.textContent, 'Brak zadań');
+});
+
+test('rows arriving drop the empty row instead of being written into it', () => {
+  const table = mountPlain('{"empty-message":"Brak dysków"}');
+  table.rows = [];
+  assert.ok(emptyCell(table));
+
+  table.rows = [{ name: 'sdc', size: '7.3 TiB' }];
+  assert.equal(table.shadowRoot.querySelector('.tf-table__empty-row'), null, 'the empty row is gone');
+  const body = table.shadowRoot.querySelectorAll('tbody tr');
+  assert.equal(body.length, 1, 'exactly the one data row');
+  assert.match(body[0].textContent, /sdc/);
+  assert.match(body[0].textContent, /7\.3 TiB/, 'the data row is a real row, not a recycled empty one');
+
+  table.rows = [];
+  assert.equal(emptyCell(table).textContent, 'Brak dysków', 'and the sentence comes back when the rows go');
+});

@@ -44,7 +44,7 @@ pub(crate) struct RunResult<T> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{preflight, run, Worker};
+pub(crate) use linux::{preflight, run, stop, Worker};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -994,6 +994,78 @@ mod linux {
         })
     }
 
+    /// Stops the private namespace an anchor names, and confirms the union
+    /// path is nobody's mount afterwards.
+    ///
+    /// This is how a dissolve releases a private array. The branches are NOT
+    /// unmounted one by one: they exist only inside the mergerfs process's own
+    /// mount namespace, which this process cannot reach, and which the kernel
+    /// destroys together with its last member. Stopping the process that owns
+    /// it therefore IS the release — and `validate_anchor` is what makes that
+    /// safe, because a bare PID from a journal could by then belong to
+    /// anything at all. Signalling an unverified PID as root is how a stale
+    /// journal kills somebody else's process.
+    ///
+    /// The daemon is not a child of this process (the worker that forked it is
+    /// long gone), so there is no status to reap: the wait is for `/proc` to
+    /// stop answering for the pid with the recorded start time, which is the
+    /// only evidence available and the only one that cannot be fooled by pid
+    /// reuse.
+    pub(crate) fn stop(paths: &Paths, anchor: &Anchor) -> Result<(), String> {
+        // A boot or a pid that no longer matches the anchor means the daemon
+        // is already gone, and with it the namespace and every branch mount in
+        // it. That is the state the caller asked for.
+        let gone = match boot_id() {
+            Ok(current) if current != anchor.boot_id => true,
+            Ok(_) => match start_ticks(anchor.pid) {
+                Ok(ticks) => ticks != anchor.start_ticks,
+                Err(_) => true,
+            },
+            Err(error) => return Err(error),
+        };
+        if !gone {
+            let ns = validate_anchor(anchor)?;
+            drop(ns);
+            let pid = anchor.pid as libc::pid_t;
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut killed = false;
+            loop {
+                match start_ticks(anchor.pid) {
+                    Err(_) => break,
+                    Ok(ticks) if ticks != anchor.start_ticks => break,
+                    Ok(_) => (),
+                }
+                if Instant::now() >= deadline {
+                    if killed {
+                        return Err("proces unii nie zakończył się".into());
+                    }
+                    // SIGTERM leaves a FUSE daemon waiting on in-flight
+                    // requests; the second signal does not.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    killed = true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        // POSITIVE evidence, and the caller's order is what gives it teeth: the
+        // dissolve unmounts the PUBLISHED union first, in the host namespace,
+        // so a union still in use refuses there before anything is signalled.
+        // This confirms nothing came back — a mount reappearing at the path
+        // would mean the process stopped was not the one serving it.
+        if mount_rows()?
+            .iter()
+            .any(|row| Path::new(&row.path) == paths.union_path)
+        {
+            return Err("unia nadal zamontowana po zatrzymaniu procesu".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn preflight(paths: &Paths, mergerfs: &Path) -> Result<(), String> {
         let scratch = Paths {
             branch_root: paths.branch_root.clone(),
@@ -1290,6 +1362,11 @@ impl Worker<'_> {
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn preflight(_: &Paths, _: &std::path::Path) -> Result<(), String> {
+    Err("prywatna namespace wymaga Linux".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn stop(_: &Paths, _: &Anchor) -> Result<(), String> {
     Err("prywatna namespace wymaga Linux".into())
 }
 

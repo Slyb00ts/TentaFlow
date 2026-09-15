@@ -1888,11 +1888,28 @@ const TentaNasScreen = {
   // Disk detail (n04)
   // ---------------------------------------------------------------------------
 
+  // Builds n04 ONCE — the split drawDisks/refreshDisks already use. This method
+  // owns the markup and the listeners; every value a poll can move lives in a
+  // host it leaves empty for the paint to write. It is the screen the admin
+  // watches SMART and temperature on, so it polls like every other live view
+  // instead of standing still until the user navigates away and back.
+  //
+  // The SMART self-test cadence is read HERE and nowhere else: it is
+  // configuration, it moves only through the schedule editor, and that editor
+  // redraws the tab. Re-asking for it every five seconds buys nothing.
   async drawDiskDetail(body) {
     body.innerHTML = `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`;
-    let res;
+    // Nothing is described yet, and the pool read kept for the disk left
+    // behind must not be adopted by this one.
+    this.diskDetail = null;
+    let res, schedRes;
     try {
-      res = await this.nas('tentaNasDiskGetRequest', { diskId: this.diskId });
+      [res, schedRes] = await Promise.all([
+        this.nas('tentaNasDiskGetRequest', { diskId: this.diskId }),
+        // The cadence pills are an ornament: a node that cannot answer this
+        // still gets the whole disk.
+        this.nas('tentaNasSchedulesListRequest', {}).catch(() => null),
+      ]);
     } catch (e) {
       if (this.disposed || !body.isConnected) return;
       body.innerHTML = `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>`;
@@ -1900,34 +1917,12 @@ const TentaNasScreen = {
     }
     if (this.disposed || !body.isConnected) return;
     const d = res.disk;
-    const attrs = res.attributes || [];
-    const tests = res.selfTests || [];
-    const history = res.history || [];
-    const historyDays = Number(res.historyDays) || 0;
-    // The pool's own error counters and the SMART self-test cadence come from
-    // two more reads; neither is fatal for the page.
-    const [poolRes, schedRes] = await Promise.all([
-      d.memberOf ? this.nas('tentaNasPoolGetRequest', { name: d.memberOf }).catch(() => null) : Promise.resolve(null),
-      this.nas('tentaNasSchedulesListRequest', {}).catch(() => null),
-    ]);
-    if (this.disposed || !body.isConnected) return;
-    const pool = poolRes?.pool || null;
-    const vdev = pool ? (pool.vdevs || []).find((v) => (v.disks || []).some((x) => x.diskId === d.diskId || x.name === d.name)) : null;
-    const leaf = vdev ? (vdev.disks || []).find((x) => x.diskId === d.diskId || x.name === d.name) : null;
     const smart = schedRes?.smart || null;
-    // The replacement recommendation for THIS disk (§5.10), computed by the
-    // node from its own history; `null` when there is nothing to recommend.
-    const advice = res.advice || null;
 
-    const field = (k, v) => `<div class="f"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div></div>`;
-    const counter = (n) => `<span class="${Number(n) > 0 ? 'num-err' : 'num-ok'}">${Number(n) || 0}</span>`;
-    // n04:175 names the symptom next to the status ("Uwaga: realokacje"). The
-    // core joins several symptoms with "; " — only the first one fits a chip,
-    // the whole list stays in the "Dlaczego status…" box below.
-    const health = healthChip(d.health);
-    const healthLabel = d.healthReason
-      ? T('disk.health_chip', { status: health.label, reason: String(d.healthReason).split(';')[0].trim() })
-      : health.label;
+    // Labels are fixed, values are not: every field is a `k`/`v` pair whose
+    // `v` is addressed by name and written by the paint, so one counter moving
+    // cannot rebuild the grid it sits in.
+    const field = (label, id) => `<div class="f"><div class="k">${escapeHtml(label)}</div><div class="v" data-f="${escapeAttr(id)}"></div></div>`;
 
     body.innerHTML = `
       <div class="stack">
@@ -1935,29 +1930,30 @@ const TentaNasScreen = {
           { label: T('tabs.disks'), act: 'disks', query: `node=${this.nodeId}&tab=disks` },
           { label: d.name },
         ])}
+        <div id="nas-dd-error"></div>
         <div class="section-card">
           <div class="section-card-head">
             <div class="title">${sprite('cylinder')} ${escapeHtml(T('disk.identification'))}</div>
-            <tf-chip status="${health.status}" dot label="${escapeAttr(healthLabel)}"></tf-chip>
+            <tf-chip id="nas-dd-health" dot></tf-chip>
           </div>
           <div class="id-grid">
             <div class="id-badge">${sprite('cylinder')}<span class="k">${escapeHtml(d.kind)}</span></div>
             <div class="id-fields">
-              ${field(T('disks.col_device'), d.name)}
-              ${field(T('disk.serial'), d.serial || '—')}
-              ${field('WWN', d.wwn || '—')}
-              ${field(T('disk.model'), `${d.model || '—'} · ${fmtBytes(d.sizeBytes)}`)}
-              ${field(T('disk.path'), d.path)}
-              ${field(T('disk.firmware'), d.firmware || '—')}
-              ${field(T('disk.transport'), `${d.transport}${d.rotational ? ` · ${T('disk.rotational')}` : ''}${d.removable ? ` · ${T('disk.removable')}` : ''}`)}
-              ${field(T('disks.col_role'), roleChipLabel(d))}
-              ${field(T('disk.power_on'), d.powerOnHours == null ? '—' : fmtDuration(d.powerOnHours * 3600))}
-              ${field(T('disk.mountpoints'), d.mountpoints && d.mountpoints.length ? d.mountpoints.join(', ') : '—')}
-              ${field(T('disk.reallocated'), d.reallocatedSectors == null ? '—' : String(d.reallocatedSectors))}
-              ${field(T('disk.pending'), d.pendingSectors == null ? '—' : String(d.pendingSectors))}
-              ${field(T('disk.crc'), d.crcErrors == null ? '—' : String(d.crcErrors))}
-              ${field(T('disk.media_errors'), d.mediaErrors == null ? '—' : String(d.mediaErrors))}
-              ${field(T('disks.col_wear'), d.wearPct == null ? '—' : `${d.wearPct}%`)}
+              ${field(T('disks.col_device'), 'device')}
+              ${field(T('disk.serial'), 'serial')}
+              ${field('WWN', 'wwn')}
+              ${field(T('disk.model'), 'model')}
+              ${field(T('disk.path'), 'path')}
+              ${field(T('disk.firmware'), 'firmware')}
+              ${field(T('disk.transport'), 'transport')}
+              ${field(T('disks.col_role'), 'role')}
+              ${field(T('disk.power_on'), 'power_on')}
+              ${field(T('disk.mountpoints'), 'mountpoints')}
+              ${field(T('disk.reallocated'), 'reallocated')}
+              ${field(T('disk.pending'), 'pending')}
+              ${field(T('disk.crc'), 'crc')}
+              ${field(T('disk.media_errors'), 'media_errors')}
+              ${field(T('disks.col_wear'), 'wear')}
             </div>
             <div class="row">
               <tf-button variant="primary" icon="search" data-act="locate">${escapeHtml(T('disks.locate'))}</tf-button>
@@ -1968,56 +1964,32 @@ const TentaNasScreen = {
         </div>
         <div class="grid-2">
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('info')} ${escapeHtml(T('disk.why_title', { status: health.label }))}</div></div>
-            <div class="explain-box">${escapeHtml(d.healthReason || T('disk.why_ok'))}</div>
-            ${advice ? warningHtml(advice.severity === 'urgent' ? 'danger' : 'info', T('replace_advice.disk_' + advice.severity, {
-              reason: advice.reason,
-              spare: advice.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare'),
-            })) : ''}
-            <div class="row mt-md">
-              ${d.memberOf ? `<tf-button variant="danger" icon="refresh" data-act="replace">${escapeHtml(T('disk.replace'))}</tf-button>` : ''}
-              <tf-button variant="secondary" icon="play" data-act="smart-short">${escapeHtml(T('disks.smart_short'))}</tf-button>
-              <tf-button variant="secondary" icon="clock" data-act="smart-long">${escapeHtml(T('disks.smart_long'))}</tf-button>
-            </div>
+            <div class="section-card-head"><div class="title">${sprite('info')} <span id="nas-dd-why-title"></span></div></div>
+            <div class="explain-box" id="nas-dd-why"></div>
+            <div id="nas-dd-advice"></div>
+            <div class="row mt-md" id="nas-dd-acts"></div>
           </div>
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('alert')} ${escapeHtml(T('disk.pool_errors_title', { pool: d.memberOf || '—' }))}</div></div>
-            ${pool && leaf ? `
-              <div class="stat-rows">
-                <div class="sr"><span class="k">READ</span><span class="v">${counter(leaf.readErrors)}</span></div>
-                <div class="sr"><span class="k">WRITE</span><span class="v">${counter(leaf.writeErrors)}</span></div>
-                <div class="sr"><span class="k">CKSUM</span><span class="v">${counter(leaf.cksumErrors)}</span></div>
-                <div class="sr"><span class="k">${escapeHtml(T('disk.pool_vdev_state'))}</span><span class="v">${stateChipHtml(leaf.state)} <span class="mono text-3">${escapeHtml(vdev.id)} · ${escapeHtml(layoutLabel(vdev.kind))}</span></span></div>
-                <div class="sr"><span class="k">${escapeHtml(T('disk.pool_last_scrub'))}</span><span class="v">${escapeHtml(pool.lastScrubAt ? T('disk.pool_scrub_value', { t: fmtDate(pool.lastScrubAt), n: Number(pool.scan?.errors) || 0 }) : T('disk.pool_no_scrub'))}</span></div>
-              </div>
-              ${warningHtml('info', T('disk.pool_errors_info'))}
-              <div class="row mt-md"><tf-button variant="ghost" size="sm" icon="layers" data-act="open-pool">${escapeHtml(T('disk.pool_open', { pool: pool.name }))}</tf-button></div>
-            ` : `<div class="muted">${escapeHtml(T('disk.pool_none'))}</div>`}
+            <div class="section-card-head"><div class="title">${sprite('alert')} <span id="nas-dd-pool-title"></span></div></div>
+            <div id="nas-dd-pool"></div>
           </div>
         </div>
         <div class="section-card">
           <div class="section-card-head"><div class="title">${sprite('audit')} ${escapeHtml(T('disk.smart_attributes'))}</div>
-            <span class="hint">${d.smartReadAt ? escapeHtml(T('disk.smart_read', { t: fmtAgo(d.smartReadAt) })) : escapeHtml(T('disk.smart_never'))}${d.smartPassed === false ? ' · ' + escapeHtml(T('disk.smart_failed')) : ''} · ${escapeHtml(T('disk.attr_hint'))}</span></div>
-          ${attrs.length ? `<tf-table id="nas-attr-table">
-            <tf-column key="id" label="ID" renderer="text" width="60"></tf-column>
-            <tf-column key="name" label="${escapeAttr(T('disk.attr_name'))}" renderer="text" fill></tf-column>
-            <tf-column key="value" label="${escapeAttr(T('disk.attr_value'))}" renderer="num"></tf-column>
-            <tf-column key="raw" label="${escapeAttr(T('disk.attr_raw'))}" renderer="text" nowrap></tf-column>
-            <tf-column key="trend" label="${escapeAttr(T('disk.attr_trend'))}" renderer="html" nowrap hide-below="1000"></tf-column>
-            <tf-column key="status" label="${escapeAttr(T('disks.col_health'))}" renderer="chip"></tf-column>
-          </tf-table>` : `<div class="muted">${escapeHtml(d.smartAvailable ? T('disk.smart_no_attrs') : T('disk.smart_unavailable'))}</div>`}
+            <span class="hint" id="nas-dd-smart-hint"></span></div>
+          <div id="nas-dd-attrs"></div>
         </div>
         <div class="grid-2">
           <div class="section-card">
             <div class="chart-head">
-              <div class="ch-title">${sprite('zap')} ${escapeHtml(T('disk.temp_history', { d: historyDays }))}</div>
+              <div class="ch-title">${sprite('zap')} <span id="nas-dd-temp-title"></span></div>
               <div class="ch-val" id="nas-disk-temp-val"></div>
             </div>
             <div id="nas-disk-temp-chart"></div>
           </div>
           <div class="section-card">
             <div class="chart-head">
-              <div class="ch-title">${sprite('alert')} ${escapeHtml(T('disk.realloc_history', { d: historyDays }))}</div>
+              <div class="ch-title">${sprite('alert')} <span id="nas-dd-realloc-title"></span></div>
               <div class="ch-val" id="nas-disk-realloc-val"></div>
             </div>
             <div id="nas-disk-realloc-chart"></div>
@@ -2031,54 +2003,232 @@ const TentaNasScreen = {
               <tf-button variant="ghost" size="sm" icon="edit" data-act="smart-schedule" ${smart ? '' : 'disabled'}>${escapeHtml(T('disk.edit_schedule'))}</tf-button>
             </div>
           </div>
-          ${tests.length ? `<tf-table id="nas-st-table">
-            <tf-column key="date" label="${escapeAttr(T('disk.st_col_date'))}" renderer="text" nowrap width="170"></tf-column>
-            <tf-column key="kind" label="${escapeAttr(T('disk.st_col_kind'))}" renderer="chip" width="100"></tf-column>
-            <tf-column key="result" label="${escapeAttr(T('disk.st_col_result'))}" renderer="html" fill></tf-column>
-            <tf-column key="hours" label="${escapeAttr(T('disk.st_col_hours'))}" renderer="text" nowrap width="150"></tf-column>
-          </tf-table>` : `<div class="muted">${escapeHtml(T('disk.no_self_tests'))}</div>`}
+          <div id="nas-dd-tests"></div>
         </div>
       </div>`;
 
     // The shell header already says "TentaNas › node"; this tail adds
     // "Dyski › sdd", the same shape pool-detail.js uses for "Pule › tank".
     wireCrumbs(body, { disks: () => { this.diskId = null; this.clearTimers(); this.setLocation(); this.drawTab(); } });
-    body.querySelector('[data-act="locate"]').addEventListener('click', () => this.locateDisk(d, !this.locateState?.[d.diskId]));
+    // Wired once, and every handler reads the disk the LATEST poll described —
+    // never the one the button happened to be built with.
+    const live = () => this.diskDetail?.res.disk || d;
+    body.querySelector('[data-act="locate"]').addEventListener('click', () => { const cur = live(); this.locateDisk(cur, !this.locateState?.[cur.diskId]); });
     body.querySelector('[data-act="copy-serial"]').addEventListener('click', async () => {
-      await navigator.clipboard?.writeText(d.serial || '');
+      await navigator.clipboard?.writeText(live().serial || '');
       toast(T('disk.serial_copied'), 'success');
     });
-    body.querySelector('[data-act="smart-short"]').addEventListener('click', () => this.startSmartTest(d, 'short'));
-    body.querySelector('[data-act="smart-long"]').addEventListener('click', () => this.startSmartTest(d, 'long'));
-    body.querySelector('[data-act="replace"]')?.addEventListener('click', () => this.openReplaceForDisk(d));
-    body.querySelector('[data-act="open-pool"]')?.addEventListener('click', () => this.openPool(pool.name));
     body.querySelector('[data-act="smart-schedule"]')?.addEventListener('click', () => openSmartScheduleEditor(this, smart, () => this.drawTab()));
     this.locateState = this.locateState || {};
 
-    const attrTable = body.querySelector('#nas-attr-table');
-    if (attrTable) {
-      attrTable.rows = attrs.map((a) => ({
-        id: String(a.id),
-        name: a.name,
-        value: a.value,
-        raw: a.rawText || String(a.raw),
-        trend: a.rawWeekAgo == null ? '<span class="text-3">—</span>' : trendHtml(a.raw, a.rawWeekAgo),
-        status: { status: a.status === 'ok' ? 'ok' : a.status === 'critical' ? 'err' : a.status === 'warning' ? 'warn' : 'info', label: T('health.' + (['ok', 'warning', 'critical'].includes(a.status) ? a.status : 'unknown')), dot: true },
-      }));
+    // `res` is the read this draw already made: opening a disk must not ask
+    // the same question twice, so the first paint runs on it and only the
+    // polls after it read for themselves.
+    await this.refreshDiskDetail(body, res);
+  },
+
+  // The poll of n04. It re-reads the disk and — when the disk is in a pool —
+  // the pool, because that is where its READ/WRITE/CKSUM counters live; the
+  // SMART cadence read by the draw cannot move underneath it. Then it patches
+  // and re-arms itself, at the cadence of the disks tab it belongs to.
+  async refreshDiskDetail(body, seed = null) {
+    // The screen this chain was armed for is gone (unmounted, or the body now
+    // belongs to another view): there is nothing to patch and nothing to
+    // re-arm. A poll patches; it never redraws what it did not build.
+    if (this.disposed || !body.isConnected || !body.querySelector('#nas-dd-health')) return;
+    let res = seed;
+    if (!res) {
+      try {
+        res = await this.nas('tentaNasDiskGetRequest', { diskId: this.diskId });
+      } catch (e) {
+        if (this.disposed || !body.isConnected) return;
+        // A failed poll is a transient fact about one request, not a reason to
+        // throw a good screen away: the last temperature, health chip and
+        // counters stay exactly where they are, the banner says what failed,
+        // and the screen keeps asking.
+        patchHtml(body.querySelector('#nas-dd-error'),
+          `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>`);
+        this.later(() => this.refreshDiskDetail(body), POLL_DISKS_MS);
+        return;
+      }
+      if (this.disposed || !body.isConnected) return;
     }
-    const stTable = body.querySelector('#nas-st-table');
-    if (stTable) {
-      stTable.rows = tests.map((t) => ({
-        date: t.startedAt ? fmtDate(t.startedAt) : '—',
-        kind: { status: t.kind.toLowerCase().includes('extended') || t.kind.toLowerCase().includes('long') ? 'accent' : 'neutral', label: t.kind },
-        result: `<tf-chip size="sm" status="${t.status === 'passed' ? 'ok' : t.status === 'running' ? 'info' : t.status === 'failed' ? 'err' : 'warn'}" dot label="${escapeAttr(T('disk.st_status_' + (['passed', 'failed', 'running'].includes(t.status) ? t.status : 'unknown')))}"></tf-chip> <span class="text-3">${escapeHtml(t.detail || '')}</span>`,
-        // The SMART self-test log carries the disk's power-on counter at the
-        // test, never the test's own duration — the column says so, and a log
-        // row without the counter shows nothing instead of a bogus "0 h".
-        hours: t.lifetimeHours ? `${t.lifetimeHours} h` : '—',
-      }));
+    const d = res.disk;
+    const poolRes = d.memberOf
+      ? await this.nas('tentaNasPoolGetRequest', { name: d.memberOf }).catch(() => null)
+      : null;
+    if (this.disposed || !body.isConnected) return;
+    // A pool read that failed keeps the counters of the last one that worked:
+    // reading it as "not in a pool" would announce a lost membership that
+    // nothing has reported. A disk that really left its pool has no `memberOf`
+    // any more, and then the kept snapshot goes with it.
+    const prev = this.diskDetail;
+    let pool = poolRes?.pool || null;
+    if (!pool && d.memberOf && prev?.pool?.name === d.memberOf) pool = prev.pool;
+    const vdev = pool ? (pool.vdevs || []).find((v) => (v.disks || []).some((x) => x.diskId === d.diskId || x.name === d.name)) : null;
+    const leaf = vdev ? (vdev.disks || []).find((x) => x.diskId === d.diskId || x.name === d.name) : null;
+    this.diskDetail = { res, pool, vdev, leaf };
+    patchHtml(body.querySelector('#nas-dd-error'), '');
+    this.paintDiskDetail(body);
+    this.later(() => this.refreshDiskDetail(body), POLL_DISKS_MS);
+  },
+
+  // Everything on n04 that a poll can move, written into the screen that is
+  // already there. Values go through setText/setAttr; the two blocks whose
+  // SHAPE depends on the answer (the pool card, the two tables) are patched as
+  // one string each, so their skeleton is written once and only the values
+  // inside it move afterwards.
+  paintDiskDetail(body) {
+    const { res, pool, vdev, leaf } = this.diskDetail;
+    const d = res.disk;
+    const attrs = res.attributes || [];
+    const tests = res.selfTests || [];
+    // The replacement recommendation for THIS disk (§5.10), computed by the
+    // node from its own history; `null` when there is nothing to recommend.
+    const advice = res.advice || null;
+    const setField = (id, value) => setText(body.querySelector(`[data-f="${id}"]`), value);
+
+    // n04:175 names the symptom next to the status ("Uwaga: realokacje"). The
+    // core joins several symptoms with "; " — only the first one fits a chip,
+    // the whole list stays in the "Dlaczego status…" box below.
+    const health = healthChip(d.health);
+    const chip = body.querySelector('#nas-dd-health');
+    setAttr(chip, 'status', health.status);
+    setAttr(chip, 'label', d.healthReason
+      ? T('disk.health_chip', { status: health.label, reason: String(d.healthReason).split(';')[0].trim() })
+      : health.label);
+
+    setField('device', d.name);
+    setField('serial', d.serial || '—');
+    setField('wwn', d.wwn || '—');
+    setField('model', `${d.model || '—'} · ${fmtBytes(d.sizeBytes)}`);
+    setField('path', d.path);
+    setField('firmware', d.firmware || '—');
+    setField('transport', `${d.transport}${d.rotational ? ` · ${T('disk.rotational')}` : ''}${d.removable ? ` · ${T('disk.removable')}` : ''}`);
+    setField('role', roleChipLabel(d));
+    setField('power_on', d.powerOnHours == null ? '—' : fmtDuration(d.powerOnHours * 3600));
+    setField('mountpoints', d.mountpoints && d.mountpoints.length ? d.mountpoints.join(', ') : '—');
+    setField('reallocated', d.reallocatedSectors == null ? '—' : String(d.reallocatedSectors));
+    setField('pending', d.pendingSectors == null ? '—' : String(d.pendingSectors));
+    setField('crc', d.crcErrors == null ? '—' : String(d.crcErrors));
+    setField('media_errors', d.mediaErrors == null ? '—' : String(d.mediaErrors));
+    setField('wear', d.wearPct == null ? '—' : `${d.wearPct}%`);
+
+    setText(body.querySelector('#nas-dd-why-title'), T('disk.why_title', { status: health.label }));
+    setText(body.querySelector('#nas-dd-why'), d.healthReason || T('disk.why_ok'));
+    patchHtml(body.querySelector('#nas-dd-advice'), advice
+      ? warningHtml(advice.severity === 'urgent' ? 'danger' : 'info', T('replace_advice.disk_' + advice.severity, {
+        reason: advice.reason,
+        spare: advice.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare'),
+      }))
+      : '');
+
+    // "Wymień dysk…" exists only for a disk that is IN a pool, so this row is
+    // patched as one string and re-wired exactly when it was rebuilt.
+    const acts = body.querySelector('#nas-dd-acts');
+    if (patchHtml(acts, `
+      ${d.memberOf ? `<tf-button variant="danger" icon="refresh" data-act="replace">${escapeHtml(T('disk.replace'))}</tf-button>` : ''}
+      <tf-button variant="secondary" icon="play" data-act="smart-short">${escapeHtml(T('disks.smart_short'))}</tf-button>
+      <tf-button variant="secondary" icon="clock" data-act="smart-long">${escapeHtml(T('disks.smart_long'))}</tf-button>`)) {
+      acts.querySelector('[data-act="replace"]')?.addEventListener('click', () => this.openReplaceForDisk(this.diskDetail.res.disk));
+      acts.querySelector('[data-act="smart-short"]').addEventListener('click', () => this.startSmartTest(this.diskDetail.res.disk, 'short'));
+      acts.querySelector('[data-act="smart-long"]').addEventListener('click', () => this.startSmartTest(this.diskDetail.res.disk, 'long'));
     }
-    this.drawDiskHistory(body, history);
+
+    setText(body.querySelector('#nas-dd-pool-title'), T('disk.pool_errors_title', { pool: d.memberOf || '—' }));
+    this.paintDiskPoolErrors(body, pool, vdev, leaf);
+
+    setText(body.querySelector('#nas-dd-smart-hint'), [
+      d.smartReadAt ? T('disk.smart_read', { t: fmtAgo(d.smartReadAt) }) : T('disk.smart_never'),
+      d.smartPassed === false ? T('disk.smart_failed') : null,
+      T('disk.attr_hint'),
+    ].filter(Boolean).join(' · '));
+
+    // tf-table has no empty state of its own, so an empty list is a muted
+    // line and the table is not on screen at all; the skeleton is a constant
+    // string, which is why it is written once and the rows then flow into the
+    // element that is already there.
+    const attrsHost = body.querySelector('#nas-dd-attrs');
+    patchHtml(attrsHost, attrs.length ? `<tf-table id="nas-attr-table">
+      <tf-column key="id" label="ID" renderer="text" width="60"></tf-column>
+      <tf-column key="name" label="${escapeAttr(T('disk.attr_name'))}" renderer="text" fill></tf-column>
+      <tf-column key="value" label="${escapeAttr(T('disk.attr_value'))}" renderer="num"></tf-column>
+      <tf-column key="raw" label="${escapeAttr(T('disk.attr_raw'))}" renderer="text" nowrap></tf-column>
+      <tf-column key="trend" label="${escapeAttr(T('disk.attr_trend'))}" renderer="html" nowrap hide-below="1000"></tf-column>
+      <tf-column key="status" label="${escapeAttr(T('disks.col_health'))}" renderer="chip"></tf-column>
+    </tf-table>` : `<div class="muted">${escapeHtml(d.smartAvailable ? T('disk.smart_no_attrs') : T('disk.smart_unavailable'))}</div>`);
+    setTableRows(attrsHost.querySelector('#nas-attr-table'), attrs.map((a) => ({
+      id: String(a.id),
+      name: a.name,
+      value: a.value,
+      raw: a.rawText || String(a.raw),
+      trend: a.rawWeekAgo == null ? '<span class="text-3">—</span>' : trendHtml(a.raw, a.rawWeekAgo),
+      status: { status: a.status === 'ok' ? 'ok' : a.status === 'critical' ? 'err' : a.status === 'warning' ? 'warn' : 'info', label: T('health.' + (['ok', 'warning', 'critical'].includes(a.status) ? a.status : 'unknown')), dot: true },
+    })));
+
+    const testsHost = body.querySelector('#nas-dd-tests');
+    patchHtml(testsHost, tests.length ? `<tf-table id="nas-st-table">
+      <tf-column key="date" label="${escapeAttr(T('disk.st_col_date'))}" renderer="text" nowrap width="170"></tf-column>
+      <tf-column key="kind" label="${escapeAttr(T('disk.st_col_kind'))}" renderer="chip" width="100"></tf-column>
+      <tf-column key="result" label="${escapeAttr(T('disk.st_col_result'))}" renderer="html" fill></tf-column>
+      <tf-column key="hours" label="${escapeAttr(T('disk.st_col_hours'))}" renderer="text" nowrap width="150"></tf-column>
+    </tf-table>` : `<div class="muted">${escapeHtml(T('disk.no_self_tests'))}</div>`);
+    setTableRows(testsHost.querySelector('#nas-st-table'), tests.map((t) => ({
+      date: t.startedAt ? fmtDate(t.startedAt) : '—',
+      kind: { status: t.kind.toLowerCase().includes('extended') || t.kind.toLowerCase().includes('long') ? 'accent' : 'neutral', label: t.kind },
+      result: `<tf-chip size="sm" status="${t.status === 'passed' ? 'ok' : t.status === 'running' ? 'info' : t.status === 'failed' ? 'err' : 'warn'}" dot label="${escapeAttr(T('disk.st_status_' + (['passed', 'failed', 'running'].includes(t.status) ? t.status : 'unknown')))}"></tf-chip> <span class="text-3">${escapeHtml(t.detail || '')}</span>`,
+      // The SMART self-test log carries the disk's power-on counter at the
+      // test, never the test's own duration — the column says so, and a log
+      // row without the counter shows nothing instead of a bogus "0 h".
+      hours: t.lifetimeHours ? `${t.lifetimeHours} h` : '—',
+    })));
+
+    const historyDays = Number(res.historyDays) || 0;
+    setText(body.querySelector('#nas-dd-temp-title'), T('disk.temp_history', { d: historyDays }));
+    setText(body.querySelector('#nas-dd-realloc-title'), T('disk.realloc_history', { d: historyDays }));
+    this.drawDiskHistory(body, res.history || []);
+  },
+
+  // The pool's own view of this disk (n04): its READ/WRITE/CKSUM counters, the
+  // leaf state inside its vdev and the last scrub. The five rows are a shape
+  // that depends only on whether the disk is in a pool at all, so the shape is
+  // written once and each counter then moves on its own — an error that
+  // appears must not rebuild the scrub line next to it.
+  paintDiskPoolErrors(body, pool, vdev, leaf) {
+    const host = body.querySelector('#nas-dd-pool');
+    if (!pool || !vdev || !leaf) {
+      patchHtml(host, `<div class="muted">${escapeHtml(T('disk.pool_none'))}</div>`);
+      return;
+    }
+    const row = (key, label) => `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v" data-c="${key}"></span></div>`;
+    if (patchHtml(host, `
+      <div class="stat-rows">
+        ${row('read', 'READ')}
+        ${row('write', 'WRITE')}
+        ${row('cksum', 'CKSUM')}
+        ${row('state', T('disk.pool_vdev_state'))}
+        ${row('scrub', T('disk.pool_last_scrub'))}
+      </div>
+      ${warningHtml('info', T('disk.pool_errors_info'))}
+      <div class="row mt-md"><tf-button variant="ghost" size="sm" icon="layers" data-act="open-pool"></tf-button></div>`)) {
+      host.querySelector('[data-act="open-pool"]').addEventListener('click', () => this.openPool(this.diskDetail.pool.name));
+    }
+    const cell = (key) => host.querySelector(`[data-c="${key}"]`);
+    // A counter above zero is the whole point of this card, so the tone rides
+    // on the cell itself instead of a span this would have to rebuild.
+    const counter = (key, n) => {
+      const el = cell(key);
+      setText(el, String(Number(n) || 0));
+      setAttr(el, 'class', `v ${Number(n) > 0 ? 'num-err' : 'num-ok'}`);
+    };
+    counter('read', leaf.readErrors);
+    counter('write', leaf.writeErrors);
+    counter('cksum', leaf.cksumErrors);
+    patchHtml(cell('state'), `${stateChipHtml(leaf.state)} <span class="mono text-3">${escapeHtml(vdev.id)} · ${escapeHtml(layoutLabel(vdev.kind))}</span>`);
+    setText(cell('scrub'), pool.lastScrubAt
+      ? T('disk.pool_scrub_value', { t: fmtDate(pool.lastScrubAt), n: Number(pool.scan?.errors) || 0 })
+      : T('disk.pool_no_scrub'));
+    setText(host.querySelector('[data-act="open-pool"]'), T('disk.pool_open', { pool: pool.name }));
   },
 
   // The replace wizard needs the pool topology and the free disks of the node;
@@ -2107,11 +2257,29 @@ const TentaNasScreen = {
   // The disk's sample history (n04): temperature and the reallocated-sector
   // counter. Each card is a tf-line-chart on a time axis; fewer than two
   // samples shows the empty note instead of an empty plot.
+  //
+  // These two are NOT live streams: the node samples the disk itself and
+  // publishes days of history, so a poll that brings the same series has
+  // nothing to draw. It must then leave both charts alone — mounting a new
+  // <tf-line-chart> every five seconds restarts the line's draw animation and
+  // drops whatever the pointer was hovering. The series the node appends to is
+  // what moves them, so the signature is the sample count plus the ends of the
+  // window: history only ever grows at the back.
   drawDiskHistory(body, history) {
     const samples = (history || [])
       .map((h) => ({ ...h, t: parseServerTs(h.at)?.getTime() }))
       .filter((h) => h.t != null)
       .sort((a, b) => a.t - b.t);
+    const last = samples[samples.length - 1];
+    const sig = samples.length
+      ? `${samples.length}|${samples[0].t}|${last.t}|${last.temperatureC}|${last.reallocatedSectors}`
+      : '0';
+    // The signature is remembered on the chart HOST, not on the tab body: the
+    // body outlives this view, and a key left on it would tell a freshly drawn
+    // screen that it has already plotted a series it has never seen.
+    const temp = body.querySelector('#nas-disk-temp-chart');
+    if (!temp || temp.__tfHistory === sig) return;
+    temp.__tfHistory = sig;
     // A multi-day window is unreadable with clock ticks; the axis follows the
     // span the backend actually returned.
     const spanDays = samples.length ? (samples[samples.length - 1].t - samples[0].t) / 86400000 : 0;
@@ -3033,6 +3201,20 @@ function roleChipLabel(disk) {
   }
   if (!disk.vdevRole) return `${disk.memberOf} · ${T('role.' + disk.role)}`;
   return `${disk.memberOf} · ${disk.vdevRole === 'data' ? layoutLabel(disk.vdevKind) : T('pool.role_' + disk.vdevRole)}`;
+}
+
+// Writes a tf-table's rows, but only when the rendered rows really differ.
+// tf-table recycles its <tr> elements, yet `set rows` still re-renders every
+// cell — and `_writeCell` rebuilds a chip span unconditionally. The tables on
+// a disk (SMART attributes, the self-test log) move only when the node
+// re-reads SMART, minutes apart, so an unchanged poll must not pay for a
+// full render pass over them.
+function setTableRows(table, rows) {
+  if (!table) return;
+  const sig = JSON.stringify(rows);
+  if (table.__tfRows === sig) return;
+  table.__tfRows = sig;
+  table.rows = rows;
 }
 
 function trendHtml(now, weekAgo) {

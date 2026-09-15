@@ -1370,6 +1370,11 @@ th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
   background: var(--tf-bg-subtle);
 }
 .tf-table__expanded-region { padding: var(--tf-space-sm) var(--tf-space-md); }
+.tf-table__empty-row > .tf-table__empty-cell {
+  padding: var(--tf-space-lg) var(--tf-space-md);
+  text-align: center;
+  color: var(--tf-text-3);
+}
 /* =============================================================================
    .tf-toolbar — one-row filter/action bar shared by feature screens.
    tf-select/tf-input default to width:100%, so without this every control
