@@ -412,8 +412,31 @@ test('panel movera pokazuje reguły i sprzężony sync, a niezmierzone liczniki 
   assert.match(skipped.textContent, /nie zmierzono/);
   assert.doesNotMatch(skipped.textContent, /0/);
   assert.match(panel.querySelector('.mover-hist').textContent, /12 GiB/);
-  assert.match(panel.querySelector('.explain-box').textContent, /dopiero po najbliższym sync/);
+  assert.match(panel.querySelector('.nas-mover-parity-note').textContent, /dopiero po najbliższym sync/);
   assert.equal(body.querySelector('[data-act="mover"]').hasAttribute('disabled'), false);
+  screen.dispose();
+});
+
+test('panel movera nazywa się tym, co robi, i tłumaczy regułę własnymi progami macierzy', async () => {
+  const { screen, body } = await mount(moverArray());
+  const panel = body.querySelector('.nas-mover');
+  // The name alone ("Mover") told nobody what the panel does; the heading now
+  // says it and keeps the wire name only for the job history and the logs.
+  assert.match(panel.querySelector('.section-card-head .title').textContent, /Przenoszenie z cache na dyski \(Mover\)/);
+  const explain = panel.querySelector('.nas-mover-explain');
+  assert.match(explain.textContent, /Nowe pliki trafiają najpierw na dysk cache/);
+  // 7200 s and cacheMinFreePct 20 — the same numbers as the rules row, and the
+  // cache half is the FILL level, not the free one.
+  assert.match(explain.textContent, /starszy niż 2 h/);
+  assert.match(explain.textContent, /cache przekroczy 80%/);
+  screen.dispose();
+});
+
+test('mover bez ustawionych progów wyjaśnia zasadę bez wymyślania liczb', async () => {
+  const { screen, body } = await mount(moverArray({}, { minAgeSecs: null, cacheMinFreePct: null }));
+  const explain = body.querySelector('.nas-mover .nas-mover-explain');
+  assert.match(explain.textContent, /progi nie są jeszcze ustawione/);
+  assert.doesNotMatch(explain.textContent, /%/);
   screen.dispose();
 });
 
@@ -608,7 +631,7 @@ test('wyłączony automatyczny mover mówi o tym, lecz ręczny przebieg pozostaj
 
 test('wyłączony sprzężony sync ostrzega, że przeniesione pliki zostają poza parity', async () => {
   const { screen, body } = await mount(moverArray({}, { coupledSync: false }));
-  const explain = body.querySelector('.nas-mover .explain-box').textContent;
+  const explain = body.querySelector('.nas-mover .nas-mover-parity-note').textContent;
   assert.match(explain, /pozostaną poza parity/);
   assert.doesNotMatch(explain, /sprzężony krok/);
   screen.dispose();

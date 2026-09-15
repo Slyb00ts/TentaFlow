@@ -95,7 +95,16 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
     { value: '', label: T('snapshots.all_datasets', { n: totalCount }) },
   ], '');
   if (screen.dataset && datasets.some((d) => d.name === screen.dataset)) { state.dataset = screen.dataset; dsSel.value = screen.dataset; }
-  dsSel.addEventListener('change', (e) => { state.dataset = e.detail.value; reloadList(); paintCards(); });
+  // `reloadList` is async and `paintCards` reads `state.snapshots`, so calling
+  // the two side by side painted the cards from the PREVIOUS dataset's list:
+  // `paintCards` looks for the newest snapshot of the newly focused dataset
+  // among rows that belong to the old one, finds none, and says so — a dataset
+  // with hundreds of snapshots reads as having none, and reads as current.
+  dsSel.addEventListener('change', async (e) => {
+    state.dataset = e.detail.value;
+    await reloadList();
+    paintCards();
+  });
   const filters = host.querySelector('#nas-snap-filters');
   filters.addEventListener('change', (e) => { state.filter = e.detail.id; reloadList(); });
   host.querySelector('#nas-snap-search').addEventListener('search', (e) => { state.query = (e.detail.value || '').trim().toLowerCase(); applyRows(); });
@@ -166,7 +175,15 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
       state.total = Number(r.total) || state.snapshots.length;
       state.totalUsed = Number(r.totalUsedBytes) || 0;
     } catch (e) {
+      // Drop what was read for the PREVIOUS selection. Keeping it would let a
+      // later paint present one dataset's snapshots as another's, which is
+      // worse than showing nothing, because nothing in the view says which
+      // dataset the numbers came from.
+      state.snapshots = [];
+      state.total = 0;
+      state.totalUsed = 0;
       toast(errMessage(e), 'error');
+      applyRows();
       return;
     }
     if (screen.disposed || !host.isConnected) return;

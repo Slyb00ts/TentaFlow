@@ -129,16 +129,31 @@ const moverLastRun = (run) => !run ? '—'
 
 // The age rule is a duration and the cache rule a FILL level, while the setting
 // is the minimum FREE percentage — so the sentence n11 shows is its complement.
-// Absent settings render as `—`; neither half is invented.
+// `null` means one of the two halves is missing, and nothing invents it: both
+// the rules row and the explanation above it drop the numbers together.
+const moverRuleParams = (m) => {
+  const age = Number(m.minAgeSecs);
+  const free = Number(m.cacheMinFreePct);
+  if (m.minAgeSecs == null || m.cacheMinFreePct == null || !Number.isFinite(age) || !Number.isFinite(free)) return null;
+  return { age: fmtDuration(age), pct: 100 - free };
+};
+
+// Absent settings render as `—`.
 // With nothing configured these numbers are the built-in defaults a run falls
 // back on — real, but nobody's decision. They are shown (a manual run WILL
 // apply them) and labelled as defaults, rather than presented as settings.
 const moverRulesValue = (m) => {
-  const age = Number(m.minAgeSecs);
-  const free = Number(m.cacheMinFreePct);
-  if (m.minAgeSecs == null || m.cacheMinFreePct == null || !Number.isFinite(age) || !Number.isFinite(free)) return '—';
-  const params = { age: fmtDuration(age), pct: 100 - free };
+  const params = moverRuleParams(m);
+  if (!params) return '—';
   return m.configured ? T('elastic.mover_rules_value', params) : T('elastic.mover_rules_default', params);
+};
+
+// "Mover" is a name, not a description, so the panel says what the process
+// does before it says anything about its state — with THIS array's own
+// thresholds, so the sentence and the rules row below can never disagree.
+const moverExplain = (m) => {
+  const params = moverRuleParams(m);
+  return params ? T('elastic.mover_explain', params) : T('elastic.mover_explain_no_rules');
 };
 
 // The CADENCE is its own fact, separate from `configured`: a schedule row and
@@ -165,11 +180,12 @@ function moverPanelHtml(array, disabled, reason, admin) {
   return `<div class="section-card nas-mover"><div class="section-card-head"><div class="title">${sprite('transform')} ${escapeHtml(T('elastic.mover'))}</div><div class="actions">
     ${admin ? `<tf-button variant="ghost" size="sm" icon="edit" data-act="mover-schedule">${escapeHtml(T('elastic.schedule_edit'))}</tf-button>` : ''}
     <tf-button variant="primary" size="sm" icon="play" data-act="mover" ${disabled ? 'disabled' : ''}>${escapeHtml(T('elastic.mover_run_now'))}</tf-button></div></div>
+    <div class="explain-box mb-sm nas-mover-explain">${escapeHtml(moverExplain(m))}</div>
     ${reason ? `<div class="hint mb-sm">${escapeHtml(reason)}</div>` : ''}
     ${m.enabled === false ? `<div class="hint mb-sm">${escapeHtml(T('elastic.mover_disabled'))}</div>` : ''}
     <div class="stat-rows">${schedulePill(T('elastic.mover_schedule'), moverScheduleValue(m), 'mover-schedule', admin)}${row(T('elastic.mover_rules'), moverRulesValue(m))}${row(T('elastic.mover_open_files'), T('elastic.mover_open_files_skipped'))}${row(T('elastic.mover_last_run'), moverLastRun(last))}${row(T('elastic.mover_moved'), moverMoved(last))}${row(T('elastic.mover_skipped'), moverSkipped(last))}</div>
     <div class="mover-hist">${escapeHtml(T('elastic.mover_history'))}: ${history.length ? history.map((run) => `<span>${escapeHtml(fmtDate(run.finishedAt || run.startedAt))} · ${escapeHtml(fmtOptionalBytes(run.movedBytes))}</span>`).join('') : `<span>${escapeHtml(T('elastic.mover_history_empty'))}</span>`}</div>
-    <div class="explain-box mt-md">${escapeHtml(m.coupledSync === false ? T('elastic.mover_coupled_off') : T('elastic.mover_coupled_warning'))}</div>
+    <div class="explain-box mt-md nas-mover-parity-note">${escapeHtml(m.coupledSync === false ? T('elastic.mover_coupled_off') : T('elastic.mover_coupled_warning'))}</div>
   </div>`;
 }
 

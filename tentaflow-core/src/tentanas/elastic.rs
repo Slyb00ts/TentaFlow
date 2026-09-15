@@ -43,8 +43,9 @@ use std::time::{Duration, Instant};
 use tentaflow_protocol::features::FeatureState;
 use tentaflow_protocol::tentanas::{
     NasDisk, NasElasticArray, NasElasticBranch, NasElasticCapabilities, NasElasticFolder,
-    NasElasticParity, NasElasticPlan, NasElasticProtection, NasElasticRefusal, NasMoverRun,
-    NasMoverSettings, NasSchedule, NasSnapraidRun, NasSnapraidState,
+    NasElasticImportCandidate, NasElasticParity, NasElasticPlan, NasElasticProtection,
+    NasElasticRefusal, NasMoverRun, NasMoverSettings, NasSchedule, NasSnapraidRun,
+    NasSnapraidState,
 };
 use tentanas_helper::elastic::{
     cache_branch_path, config_path, data_branch_path, parity_file_path, parity_mount_path,
@@ -52,7 +53,7 @@ use tentanas_helper::elastic::{
     ParityDisk as SpecParity, SnapraidOptions, Tools,
 };
 use anyhow::{anyhow, ensure, Result};
-use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult, ElasticServiceMode};
+use tentanas_helper::elastic::{ElasticCreateSpec, ElasticDiskSpec, ElasticJournalEntry, ElasticJournalsResult, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult, ElasticServiceMode};
 use tentanas_helper::elastic::{ElasticMoverIssueKind, ElasticMoverPhase, ElasticMoverResult, ElasticMoverRun, ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
 use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
@@ -2371,6 +2372,300 @@ pub fn claimed_disk_ids(disks: &[NasDisk], claims: &[tentanas_helper::elastic::E
         || claim.wwn.as_ref().is_some_and(|w| !w.is_empty() && disk.wwn.as_ref() == Some(w))
         || claim.serial.as_ref().is_some_and(|s| !s.is_empty() && *s == disk.serial)))
         .map(|disk| disk.disk_id.clone()).collect()
+}
+
+// =============================================================================
+// Import: adopting an array this node holds but has no database record of
+// =============================================================================
+//
+// WHY this exists, measured and not hypothetical: re-provisioning the addon
+// gives it a new `org_id`/`addon_id`. The arrays created under the previous
+// identity keep their disks, keep their journals and keep serving their
+// unions, while the new database starts empty — and every read of an Elastic
+// Array is scoped by owner, so nothing in the product can reach them. Their
+// member disks then show in the Disks tab as "occupied" by nothing, and the
+// only action ever offered for such a disk was to erase it.
+//
+// THE IDENTITY QUESTION, and it is the whole feature. A disk_id is a path, a
+// WWN and a serial say "the same hardware came back" — none of the three says
+// the filesystem on it is still the array's. The journal records the
+// filesystem UUID it formatted each branch with (`expected_uuid`), so that
+// UUID against the live one is the only thing that may authorise an adoption.
+// The hardware identities are used for ONE thing here: naming a disk in a
+// refusal.
+//
+// AND THE OWNER LIVES IN TWO PLACES. The database row is one; the journal is
+// the other, and every privileged command refuses an array whose journal owner
+// is not the caller's ("macierz niedostępna dla właściciela"). An adoption
+// that wrote only the database would produce an array that lists, and then
+// fails every Inspect, Restore, Sync and mover on it. So `import_apply`
+// re-owns the journal through the helper FIRST and writes the row second.
+
+/// Every member of a journal spec named the way the array's own rows name it —
+/// `d1`, `c1`, `parity1` — plus the hardware identity, because a refusal has
+/// to point at a disk somebody can find in a shelf.
+fn member_names(spec: &ElasticCreateSpec) -> Vec<(String, &ElasticDiskSpec)> {
+    fn label(branch: String, disk: &ElasticDiskSpec) -> (String, &ElasticDiskSpec) {
+        let mut name = format!("{branch} · {}", disk.disk_id);
+        if let Some(serial) = disk.serial.as_deref().filter(|s| !s.is_empty()) {
+            name.push_str(&format!(" (S/N {serial})"));
+        }
+        (name, disk)
+    }
+    spec.data
+        .iter()
+        .enumerate()
+        .map(|(i, disk)| label(format!("d{}", i + 1), disk))
+        .chain(spec.cache.iter().map(|disk| label("c1".to_string(), disk)))
+        .chain(
+            spec.parity
+                .iter()
+                .enumerate()
+                .map(|(i, disk)| label(format!("parity{}", i + 1), disk)),
+        )
+        .collect()
+}
+
+/// Whether one inventory disk is the same PIECE OF HARDWARE the journal
+/// recorded. Deliberately not evidence of anything else: it is what separates
+/// "this disk is gone" from "this disk is here and no longer carries the
+/// array's filesystem", and the remedies differ.
+fn same_hardware(disk: &NasDisk, member: &ElasticDiskSpec) -> bool {
+    member.disk_id == disk.disk_id
+        || member.wwn.as_ref().is_some_and(|w| !w.is_empty() && disk.wwn.as_ref() == Some(w))
+        || member.serial.as_ref().is_some_and(|s| !s.is_empty() && *s == disk.serial)
+}
+
+/// What an import scan answers: one candidate per journal on this node.
+///
+/// `known` is `(array_id, name)` of every array this node already has a row
+/// for, whatever the owner — an array with a row is not offered a second time,
+/// and neither is one whose NAME a different array already holds, because that
+/// name is UNIQUE in the database and the adoption could not be written.
+pub fn import_candidates(
+    entries: &[ElasticJournalEntry],
+    disks: &[NasDisk],
+    known: &[(String, String)],
+    owner: &ElasticOwner,
+) -> Vec<NasElasticImportCandidate> {
+    entries
+        .iter()
+        .map(|entry| {
+            let spec = &entry.spec;
+            let members = member_names(spec);
+            let total = members.len();
+            let mut matched = 0u32;
+            let mut disks_missing = Vec::new();
+            let mut disks_reused = Vec::new();
+            for (name, member) in members {
+                if disks.iter().any(|disk| {
+                    disk.fs_uuid
+                        .as_deref()
+                        .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&member.expected_uuid))
+                }) {
+                    matched += 1;
+                } else if disks.iter().any(|disk| same_hardware(disk, member)) {
+                    // The hardware is here and the array's filesystem is not:
+                    // either somebody reused the disk or it was wiped. Both
+                    // mean adopting it would claim bytes that are no longer
+                    // the array's.
+                    disks_reused.push(name);
+                } else {
+                    disks_missing.push(name);
+                }
+            }
+            let owned_elsewhere = spec.owner != *owner;
+            let (status, detail) = match known
+                .iter()
+                .find(|(id, name)| *id == spec.array_id || *name == spec.name)
+            {
+                Some((id, _)) if *id == spec.array_id => (
+                    "already_known",
+                    "this node already has a database record of this array".to_string(),
+                ),
+                Some(_) => (
+                    "already_known",
+                    format!(
+                        "this node already has a different array named '{}', and an array name \
+                         is unique per node",
+                        spec.name
+                    ),
+                ),
+                None if !disks_missing.is_empty() || !disks_reused.is_empty() => (
+                    "incomplete",
+                    format!(
+                        "{matched} of {total} members still carry the filesystem UUID the \
+                         journal recorded: {} cannot be found and {} no longer carry it, so \
+                         adopting this array would claim storage that is not its own",
+                        disks_missing.len(),
+                        disks_reused.len()
+                    ),
+                ),
+                None => (
+                    "importable",
+                    if owned_elsewhere {
+                        format!(
+                            "all {total} members still carry the filesystem UUID the journal \
+                             recorded; adopting re-owns the array from {}/{} to this instance",
+                            spec.owner.org_id, spec.owner.addon_id
+                        )
+                    } else {
+                        format!(
+                            "all {total} members still carry the filesystem UUID the journal \
+                             recorded, and the journal already names this instance as the owner"
+                        )
+                    },
+                ),
+            };
+            NasElasticImportCandidate {
+                array_id: spec.array_id.clone(),
+                name: spec.name.clone(),
+                filesystem: spec.filesystem.as_str().to_string(),
+                owner_org_id: spec.owner.org_id.clone(),
+                owner_addon_id: spec.owner.addon_id.clone(),
+                data_disks: spec.data.len() as u32,
+                parity_disks: spec.parity.len() as u32,
+                cache_disks: spec.cache.iter().count() as u32,
+                disks_matched: matched,
+                disks_missing,
+                disks_reused,
+                // Unknown is not "not mounted": the helper answers `None` when
+                // it could not read the mount table at all.
+                union_mounted: entry.union_mounted.unwrap_or(false),
+                status: status.to_string(),
+                detail,
+            }
+        })
+        .collect()
+}
+
+/// The apply-time gate: the candidate the request names, out of a FRESHLY
+/// measured scan, and only when it may still be adopted.
+///
+/// Nothing here trusts the scan the dialog was drawn from. Between that scan
+/// and this call a member can be pulled, wiped, or claimed by another array,
+/// and each of those turns an `importable` candidate into a refusal.
+pub fn import_selection<'a>(
+    candidates: &'a [NasElasticImportCandidate],
+    array_id: &str,
+    confirm_name: &str,
+) -> Result<&'a NasElasticImportCandidate> {
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.array_id == array_id)
+        .ok_or_else(|| anyhow!("Węzeł nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
+    // The same sentence every other retype-to-confirm path in this module
+    // answers with, so one typo reads the same wherever it happens.
+    ensure!(
+        candidate.name == confirm_name,
+        "the typed confirmation does not match the name"
+    );
+    match candidate.status.as_str() {
+        "importable" => Ok(candidate),
+        "already_known" => Err(anyhow!("Ta macierz jest już zapisana w tej instancji")),
+        _ => Err(anyhow!(
+            "Macierz niekompletna: {} z {} dysków potwierdziło UUID z dziennika (brak: {}; użyte ponownie: {})",
+            candidate.disks_matched,
+            candidate.disks_matched as usize + candidate.disks_missing.len() + candidate.disks_reused.len(),
+            if candidate.disks_missing.is_empty() { "—".to_string() } else { candidate.disks_missing.join(", ") },
+            if candidate.disks_reused.is_empty() { "—".to_string() } else { candidate.disks_reused.join(", ") },
+        )),
+    }
+}
+
+/// The helper's refusal line, bounded. The broker already caps stderr, and a
+/// refusal is one sentence; this keeps a runaway one out of a dialog.
+fn helper_detail(stderr: &str) -> String {
+    let text: String = stderr.trim().lines().next().unwrap_or_default().chars().take(200).collect();
+    if text.is_empty() { "brak opisu z helpera".to_string() } else { text }
+}
+
+/// The journals of every owner on this node. Privileged even though it reads
+/// nothing but files: `/var/lib/tentanas` is `0700 root` and the service runs
+/// unprivileged, so there is no other way to learn that a lost array exists.
+pub async fn journals(
+    db: &DbPool,
+    explicit: Option<&ElevationToken>,
+) -> Result<Vec<ElasticJournalEntry>> {
+    let (out, _) = super::broker::run_privileged(
+        db,
+        &HelperCommand::ElasticJournals {},
+        explicit,
+        Duration::from_secs(60),
+    )
+    .await?;
+    // The helper's own one-line refusal is the only thing that can say WHY a
+    // journal could not be read (a corrupt file, a foreign mode), so it
+    // travels with the error instead of being replaced by it.
+    ensure!(
+        out.success() && out.stdout.len() < 512 * 1024,
+        "Nie można odczytać dzienników macierzy (kod {}): {}",
+        out.code,
+        helper_detail(&out.stderr)
+    );
+    let result: ElasticJournalsResult = serde_json::from_str(&out.stdout)?;
+    for entry in &result.arrays {
+        entry.spec.validate()?;
+    }
+    Ok(result.arrays)
+}
+
+/// One scan, as the dialog reads it: the journals, this node's live disk
+/// signatures and the arrays it already knows, turned into candidates.
+pub async fn import_scan(
+    db: &DbPool,
+    owner: &ElasticOwner,
+    explicit: Option<&ElevationToken>,
+) -> Result<Vec<NasElasticImportCandidate>> {
+    let entries = journals(db, explicit).await?;
+    super::disks::refresh_inventory(db).await?;
+    let known = store::elastic_array_identities(db)?;
+    Ok(import_candidates(&entries, &super::disks::snapshot().0, &known, owner))
+}
+
+/// Adopts one scanned array. Verifies again on its own measurement, re-owns
+/// the journal, then writes the row — in that order, because a row whose
+/// journal still names the previous owner describes an array this instance
+/// cannot operate.
+pub async fn import_apply(
+    db: &DbPool,
+    owner: &ElasticOwner,
+    array_id: &str,
+    confirm_name: &str,
+    started_by: &str,
+    explicit: Option<&ElevationToken>,
+) -> Result<String> {
+    let candidates = import_scan(db, owner, explicit).await?;
+    let candidate = import_selection(&candidates, array_id, confirm_name)?;
+    let previous = ElasticOwner {
+        org_id: candidate.owner_org_id.clone(),
+        addon_id: candidate.owner_addon_id.clone(),
+    };
+    let name = candidate.name.clone();
+    let (out, _) = super::broker::run_privileged(
+        db,
+        &HelperCommand::ElasticAdopt {
+            array_id: array_id.to_string(),
+            owner: owner.clone(),
+        },
+        explicit,
+        Duration::from_secs(60),
+    )
+    .await?;
+    ensure!(
+        out.success() && out.stdout.len() < 64 * 1024,
+        "Nie można przejąć dziennika macierzy (kod {}): {}",
+        out.code,
+        helper_detail(&out.stderr)
+    );
+    let spec: ElasticCreateSpec = serde_json::from_str(&out.stdout)?;
+    spec.validate()?;
+    ensure!(
+        spec.owner == *owner && spec.array_id == array_id && spec.name == name,
+        "Helper zwrócił niezgodną specyfikację przejmowanej macierzy"
+    );
+    store::elastic_import(db, &spec, &previous, started_by)?;
+    Ok(name)
 }
 
 async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id: String,
@@ -6565,5 +6860,190 @@ pub(crate) mod tests {
         let free = free_disks(&all, &taken);
         assert_eq!(free.len(), 1, "{free:?}");
         assert_eq!(free[0].name, "sdc");
+    }
+    // ----- import: adopting an array this node holds but has no record of ---
+
+    /// The journal of a two-data + parity array, owned by the identity the
+    /// addon had BEFORE it was re-provisioned.
+    fn lost_journal(name: &str) -> ElasticJournalEntry {
+        let mut spec = create_spec(name);
+        spec.data.push(ElasticDiskSpec {
+            disk_id: format!("{name}-data2"),
+            wwn: Some(format!("wwn-{name}-data2")),
+            serial: Some(format!("serial-{name}-data2")),
+            bytes: 32 * 1024 * 1024 * 1024,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        });
+        spec.owner = ElasticOwner { org_id: "orgtentanas-rig11".into(), addon_id: "addontentanas".into() };
+        ElasticJournalEntry { spec, union_mounted: Some(true) }
+    }
+
+    /// The live inventory a member of `entry` would produce: same hardware
+    /// identities, and the filesystem UUID the journal recorded.
+    fn member_disks(entry: &ElasticJournalEntry) -> Vec<NasDisk> {
+        member_names(&entry.spec)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, member))| {
+                let mut live = disk(&format!("sd{}", (b'a' + i as u8) as char), member.bytes);
+                live.disk_id = member.disk_id.clone();
+                live.wwn = member.wwn.clone();
+                live.serial = member.serial.clone().unwrap_or_default();
+                live.role = "used".to_string();
+                live.fs_type = Some("xfs".to_string());
+                live.fs_uuid = Some(member.expected_uuid.clone());
+                live
+            })
+            .collect()
+    }
+
+    fn this_addon() -> ElasticOwner {
+        ElasticOwner { org_id: "org-default".into(), addon_id: "tentanas-8dd19dc4".into() }
+    }
+
+    #[test]
+    fn a_lost_array_whose_every_member_still_carries_its_uuid_is_importable_and_says_it_re_owns() {
+        let entry = lost_journal("media");
+        let disks = member_disks(&entry);
+        let owner = this_addon();
+
+        let candidates = import_candidates(&[entry.clone()], &disks, &[], &owner);
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.status, "importable");
+        assert_eq!(candidate.disks_matched, 3, "2 data + 1 parity");
+        assert_eq!((candidate.data_disks, candidate.parity_disks, candidate.cache_disks), (2, 1, 0));
+        assert!(candidate.disks_missing.is_empty() && candidate.disks_reused.is_empty());
+        assert!(candidate.union_mounted, "the union is still published");
+        // The dialog has to be able to say whose storage this is.
+        assert_eq!(candidate.owner_org_id, "orgtentanas-rig11");
+        assert!(
+            candidate.detail.contains("re-owns") && candidate.detail.contains("addontentanas"),
+            "{}",
+            candidate.detail
+        );
+        assert!(import_selection(&candidates, &candidate.array_id, "media").is_ok());
+    }
+
+    #[test]
+    fn a_member_whose_filesystem_uuid_changed_refuses_the_adoption_and_is_named_as_reused() {
+        let entry = lost_journal("media");
+        let mut disks = member_disks(&entry);
+        // The disk came back — same serial, same WWN — carrying somebody
+        // else's filesystem. Hardware identity says "present", and that is
+        // exactly the evidence an adoption may not act on.
+        disks[0].fs_uuid = Some(uuid::Uuid::new_v4().to_string());
+        let candidates = import_candidates(&[entry.clone()], &disks, &[], &this_addon());
+        let candidate = &candidates[0];
+
+        assert_eq!(candidate.status, "incomplete");
+        assert_eq!(candidate.disks_matched, 2);
+        assert_eq!(candidate.disks_reused.len(), 1, "{:?}", candidate.disks_reused);
+        assert!(candidate.disks_missing.is_empty(), "{:?}", candidate.disks_missing);
+        assert!(
+            candidate.disks_reused[0].starts_with("d1 · media-data")
+                && candidate.disks_reused[0].contains("serial-media-data"),
+            "the refusal names the disk: {:?}",
+            candidate.disks_reused
+        );
+        let refusal = import_selection(&candidates, &candidate.array_id, "media")
+            .expect_err("a changed UUID must refuse")
+            .to_string();
+        assert!(refusal.contains("2 z 3") && refusal.contains("media-data"), "{refusal}");
+
+        // And the same disk present with NO readable signature at all is not
+        // read as a match either.
+        disks[0].fs_uuid = None;
+        disks[0].fs_type = None;
+        let blank = import_candidates(&[entry], &disks, &[], &this_addon());
+        assert_eq!(blank[0].status, "incomplete");
+        assert_eq!(blank[0].disks_matched, 2);
+    }
+
+    #[test]
+    fn a_member_that_is_not_in_the_inventory_at_all_is_reported_missing_by_name() {
+        let entry = lost_journal("archiwum");
+        let mut disks = member_disks(&entry);
+        let gone = disks.remove(1);
+        let candidates = import_candidates(&[entry], &disks, &[], &this_addon());
+        let candidate = &candidates[0];
+
+        assert_eq!(candidate.status, "incomplete");
+        assert_eq!(candidate.disks_matched, 2);
+        assert_eq!(candidate.disks_missing, vec![format!("d2 · {} (S/N {})", gone.disk_id, gone.serial)]);
+        assert!(candidate.disks_reused.is_empty());
+        assert!(
+            candidate.detail.contains("2 of 3") && candidate.detail.contains("cannot be found"),
+            "{}",
+            candidate.detail
+        );
+    }
+
+    #[test]
+    fn an_array_this_node_already_records_is_not_offered_and_neither_is_a_taken_name() {
+        let entry = lost_journal("produkt");
+        let disks = member_disks(&entry);
+        let owner = this_addon();
+
+        let by_id = import_candidates(
+            &[entry.clone()],
+            &disks,
+            &[(entry.spec.array_id.clone(), "produkt".to_string())],
+            &owner,
+        );
+        assert_eq!(by_id[0].status, "already_known");
+        assert!(import_selection(&by_id, &entry.spec.array_id, "produkt").is_err());
+
+        // A DIFFERENT array already holds the name. The name column is UNIQUE
+        // per node, so the adoption could not be written — and the sentence
+        // has to say which of the two reasons it is.
+        let by_name = import_candidates(
+            &[entry.clone()],
+            &disks,
+            &[("11111111-1111-4111-8111-111111111111".to_string(), "produkt".to_string())],
+            &owner,
+        );
+        assert_eq!(by_name[0].status, "already_known");
+        assert!(by_name[0].detail.contains("different array named 'produkt'"), "{}", by_name[0].detail);
+    }
+
+    #[test]
+    fn the_apply_gate_refuses_a_mistyped_name_and_an_array_the_fresh_scan_no_longer_sees() {
+        let entry = lost_journal("media");
+        let candidates = import_candidates(&[entry.clone()], &member_disks(&entry), &[], &this_addon());
+
+        let typo = import_selection(&candidates, &entry.spec.array_id, "Media")
+            .expect_err("the retyped name must match exactly")
+            .to_string();
+        assert_eq!(typo, "the typed confirmation does not match the name");
+
+        // Nothing is adopted on a name alone: the array is addressed by id,
+        // and an id the fresh scan does not carry is gone.
+        let vanished = import_selection(&candidates, "11111111-1111-4111-8111-111111111111", "media")
+            .expect_err("an array with no journal cannot be adopted")
+            .to_string();
+        assert!(vanished.contains("nie widzi już dziennika"), "{vanished}");
+    }
+
+    #[test]
+    fn a_journal_that_already_names_this_instance_is_importable_without_a_re_own_sentence() {
+        // The database was lost without the addon being re-provisioned: the
+        // journal owner is already ours, so there is nothing to re-own.
+        let mut entry = lost_journal("media");
+        entry.spec.owner = this_addon();
+        let candidates = import_candidates(&[entry.clone()], &member_disks(&entry), &[], &this_addon());
+
+        assert_eq!(candidates[0].status, "importable");
+        assert!(!candidates[0].detail.contains("re-owns"), "{}", candidates[0].detail);
+        assert!(candidates[0].detail.contains("already names this instance"), "{}", candidates[0].detail);
+    }
+
+    #[test]
+    fn an_unreadable_mount_table_never_reads_as_an_unmounted_union() {
+        let mut entry = lost_journal("media");
+        entry.union_mounted = None;
+        let candidates = import_candidates(&[entry.clone()], &member_disks(&entry), &[], &this_addon());
+        assert!(!candidates[0].union_mounted, "unknown is rendered as 'not claimed to be mounted'");
+        assert_eq!(candidates[0].status, "importable", "and it does not block the adoption");
     }
 }

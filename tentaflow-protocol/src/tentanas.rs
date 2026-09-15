@@ -70,6 +70,22 @@ pub struct NasNodeInfo {
     pub ram_bytes: u64,
     #[serde(default)]
     pub uptime_secs: u64,
+    /// Disks in 'critical', counted APART from `disks_warning` — which counts
+    /// warnings and nothing else. One shared counter made a node that had
+    /// lost a disk read as a warning on a screen that never looked at
+    /// `health`; a reader that wants "disks with a problem" adds the two.
+    #[serde(default)]
+    pub disks_critical: u32,
+    /// Elastic Arrays on the node, beside `pools_total` (ZFS pools) rather
+    /// than inside it: a node whose only storage is an array answered zero
+    /// pools, which read as "not a NAS".
+    #[serde(default)]
+    pub arrays_total: u32,
+    /// Arrays the node could not measure, left out of `capacity_bytes` AND
+    /// `used_bytes` both. Non-zero means those two are partial — say so
+    /// rather than showing a confident total with a disk shelf missing.
+    #[serde(default)]
+    pub arrays_unmeasured: u32,
 }
 
 // =============================================================================
@@ -189,7 +205,11 @@ pub struct NasDisk {
     pub rotational: bool,
     pub removable: bool,
     pub firmware: Option<String>,
-    /// 'free' | 'pool' | 'parity' | 'cache' | 'spare' | 'system' | 'partitioned'.
+    /// 'system' | 'pool_member' | 'array_member' | 'mounted' | 'used' | 'free',
+    /// as `role_of` decides it from lsblk. This list used to name values the
+    /// inventory never produces, 'spare' among them, and two call sites filtered
+    /// on `role == "spare"` accordingly and matched nothing. The part a disk
+    /// plays inside its owner is `vdev_role` (ZFS) or `array_role` (Elastic).
     pub role: String,
     /// Pool or array the disk belongs to, when `role` says so.
     pub member_of: Option<String>,
@@ -232,6 +252,14 @@ pub struct NasDisk {
     /// pool name.
     #[serde(default)]
     pub fs_type: Option<String>,
+    /// The filesystem UUID lsblk reports for that signature, when there is
+    /// one. This is the identity an Elastic Array records as `expected_uuid`
+    /// when it formats a branch, so it is what an import has to match before
+    /// adopting a disk: a serial or a WWN only says "the same hardware came
+    /// back", while the UUID says "this is still the same filesystem and not
+    /// one somebody has since reused".
+    #[serde(default)]
+    pub fs_uuid: Option<String>,
     /// Which part of the Elastic Array named by `member_of` this disk is:
     /// 'data' | 'cache' | 'parity'. Empty when the disk belongs to no array.
     ///
@@ -1563,6 +1591,50 @@ pub struct NasElasticPlan {
     pub steps_preview: String,
 }
 
+/// An Elastic Array this node holds on disk but has no database record of —
+/// what an import offers to adopt.
+///
+/// Losing the record is not hypothetical. Re-provisioning the addon gives it a
+/// new `org_id`/`addon_id`, and an array created under the previous identity
+/// keeps its disks, keeps serving its union and keeps its journal on the host
+/// while the new database starts empty. Nothing in the product could then
+/// reach it: `ConfigExportRequest` does not cover arrays either, so the
+/// members read as "occupied by nothing" and the only action ever offered for
+/// them was to erase them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasElasticImportCandidate {
+    pub array_id: String,
+    pub name: String,
+    /// 'xfs' | 'ext4'.
+    pub filesystem: String,
+    /// The owner the journal records. When it differs from this addon's own,
+    /// adopting re-owns the array, and the dialog has to say so rather than
+    /// quietly reassigning somebody else's storage.
+    pub owner_org_id: String,
+    pub owner_addon_id: String,
+    pub data_disks: u32,
+    pub parity_disks: u32,
+    pub cache_disks: u32,
+    /// Members whose filesystem UUID still matches what the journal recorded.
+    pub disks_matched: u32,
+    /// Members this node cannot find, named as the journal knew them.
+    pub disks_missing: Vec<String>,
+    /// Members that are present but whose filesystem UUID has changed: the
+    /// disk was reused for something else. Kept apart from `disks_missing`
+    /// because the remedy differs — a missing disk may come back, a reused one
+    /// is gone, and adopting it would claim data that is no longer the
+    /// array's.
+    pub disks_reused: Vec<String>,
+    /// The union is still published on the host: the array is live and serving
+    /// right now, even though the database has never heard of it.
+    pub union_mounted: bool,
+    /// 'importable' | 'already_known' | 'incomplete'.
+    pub status: String,
+    /// One sentence naming what adopting this would do, or why it cannot be
+    /// done.
+    pub detail: String,
+}
+
 /// Whether this node can run an Elastic Array at all — probed, never assumed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasElasticCapabilities {
@@ -2491,6 +2563,31 @@ pub enum TentaNasPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
     },
+    /// Arrays present on this node but absent from its database — the
+    /// recovery path described on `NasElasticImportCandidate`. Read-only: it
+    /// reads journals and disk UUIDs and changes nothing.
+    ///
+    /// Privileged despite being read-only, the way `PoolImportScanRequest` is:
+    /// the journals live under `/var/lib/tentanas`, which is `0700 root`, while
+    /// the service runs unprivileged — so there is no unprivileged way to learn
+    /// that a lost array exists.
+    ElasticArrayImportScanRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    ElasticArrayImportScanResponse {
+        candidates: Vec<NasElasticImportCandidate>,
+    },
+    /// Adopts one scanned array into this addon's database. Refuses unless
+    /// every member's filesystem UUID still matches its journal entry: the
+    /// alternative is claiming a disk somebody has since reused. `confirm_name`
+    /// carries the name the admin typed, as the destroy paths do.
+    ElasticArrayImportRequest {
+        array_id: String,
+        confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
     ElasticArraysListRequest {},
     ElasticArraysListResponse { arrays: Vec<NasElasticArray> },
     ElasticArrayGetRequest { name: String },
@@ -2887,6 +2984,11 @@ mod tests {
         assert!(node.features.is_empty());
         assert_eq!(node.ram_bytes, 0);
         assert_eq!(node.uptime_secs, 0);
+        // A peer that predates the split publishes one disk counter, and its
+        // row must not claim failures or arrays it never counted.
+        assert_eq!(node.disks_critical, 0);
+        assert_eq!(node.arrays_total, 0);
+        assert_eq!(node.arrays_unmeasured, 0);
 
         let elevation: NasElevation = serde_json::from_value(serde_json::json!({
             "mode": "helper",
@@ -3068,6 +3170,7 @@ mod tests {
             vdev_role: "data".to_string(),
             vdev_kind: "raidz2".to_string(),
             fs_type: Some("ext4".to_string()),
+            fs_uuid: Some("2a7f1c30-9e64-4b8d-a5f2-71c3e806d914".to_string()),
             // A ZFS pool member is in no Elastic Array, so the field that says
             // which part of one it is stays empty here — the branch below
             // carries it.

@@ -405,6 +405,29 @@ pub struct ElasticClaimsResult {
     pub disks: Vec<ElasticClaim>,
 }
 
+/// One journal this node holds, as an import scan reads it.
+///
+/// The journals live under `/var/lib/tentanas`, which is `0700 root`, so an
+/// unprivileged core cannot read them at all — this is the only way it learns
+/// that an array exists whose database record it has lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticJournalEntry {
+    /// The persisted intention, owner included — the owner the journal was
+    /// written with, which is precisely what an import may have to change.
+    pub spec: ElasticCreateSpec,
+    /// Whether the union is published on the host right now: the array is
+    /// serving even though nothing in the product can reach it. `None` when
+    /// the mount table could not be read — unknown, never "not mounted".
+    pub union_mounted: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticJournalsResult {
+    pub arrays: Vec<ElasticJournalEntry>,
+}
+
 pub fn validate_elastic_uuid(value: &str) -> Result<(), CatalogError> {
     if value.len() != 36
         || !value.bytes().enumerate().all(|(i, b)| {
@@ -2647,6 +2670,43 @@ pub(crate) mod execution {
                 return Err("journal przekroczyłby limit odczytu".into());
             }
             atomic_write(&target, &bytes, self.uid)
+        }
+
+        /// Rewrites ONE field of a persisted spec: the owner.
+        ///
+        /// It cannot go through `save`, and that is the point of it existing —
+        /// `save` refuses any spec change ("zmiana trwałej specyfikacji
+        /// Elastic"), which is what keeps every other writer from reshaping an
+        /// array underneath its own journal. Re-provisioning the addon gives it
+        /// a new `org_id`/`addon_id`, and every privileged Elastic command
+        /// checks `journal.spec.owner` against the caller's owner before it
+        /// acts; an adoption that only wrote the database would therefore be
+        /// cosmetic — the array would appear in the UI and every Inspect,
+        /// Restore, Sync and mover on it would answer "macierz niedostępna dla
+        /// właściciela". So the journal is re-owned here, under the array lock,
+        /// with every other invariant `save` checks still enforced.
+        ///
+        /// Idempotent: a journal that already carries `owner` is not rewritten,
+        /// so a retry after a failed database insert is safe.
+        fn reown(&self, mut journal: Journal, owner: &ElasticOwner) -> Result<ElasticCreateSpec, String> {
+            owner.validate().map_err(|e| e.to_string())?;
+            if journal.spec.owner == *owner {
+                return Ok(journal.spec);
+            }
+            journal.spec.owner = owner.clone();
+            journal.spec.validate().map_err(|e| e.to_string())?;
+            validate_topology(&journal)?;
+            validate_operation_record(&journal)?;
+            let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > JOURNAL_LIMIT {
+                return Err("journal przekroczyłby limit odczytu".into());
+            }
+            atomic_write(
+                &self.path.join(format!("{}.json", journal.spec.array_id)),
+                &bytes,
+                self.uid,
+            )?;
+            Ok(journal.spec)
         }
 
         fn reserve(
@@ -7254,6 +7314,37 @@ pub(crate) mod execution {
                 };
                 serde_json::to_value(result)
             }
+            crate::HelperCommand::ElasticJournals {} => {
+                let journals = root.journals()?;
+                // The mount table is read ONCE for the whole scan, and only
+                // for the union path: `union_mounted` resolves every device of
+                // the layout and validates the mergerfs options, which answers
+                // "is this array mounted the way its spec says" and errors on
+                // anything else. A scan asks the smaller question — is
+                // something publishing this path right now — because a lost
+                // array is exactly the case where the fuller answer is not
+                // available.
+                let rows = mount_rows().ok();
+                serde_json::to_value(ElasticJournalsResult {
+                    arrays: journals
+                        .into_iter()
+                        .map(|journal| ElasticJournalEntry {
+                            union_mounted: rows.as_ref().map(|rows| {
+                                rows.iter().any(|row| {
+                                    row.path == union_path(&journal.spec.name)
+                                        && row.filesystem == "fuse.mergerfs"
+                                })
+                            }),
+                            spec: journal.spec,
+                        })
+                        .collect(),
+                })
+            }
+            crate::HelperCommand::ElasticAdopt { array_id, owner } => {
+                let _array_lock = root.array_lock(array_id)?;
+                let journal = root.load(array_id)?;
+                serde_json::to_value(root.reown(journal, owner)?)
+            }
             crate::HelperCommand::ElasticClaims { name } => {
                 let journals = root.journals()?;
                 let disks = journals
@@ -9127,6 +9218,49 @@ Nothing to do
                 }
                 assert!(root.journals().is_err(), "{kind}");
             }
+        }
+
+        /// The adoption's whole point, on the side that decides it: every
+        /// privileged command compares the caller's owner with the journal's,
+        /// so a database-only adoption would list an array and then fail every
+        /// operation on it.
+        #[test]
+        fn reown_rewrites_only_the_owner_is_idempotent_and_save_still_refuses_the_rest() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            let adopting = ElasticOwner {
+                org_id: "org-default".into(),
+                addon_id: "tentanas-8dd19dc4".into(),
+            };
+
+            let adopted = root.reown(journal, &adopting).expect("reown");
+            assert_eq!(adopted.owner, adopting);
+            // Nothing else the array is identified by may move: the disks are
+            // reserved by these values on the core side too.
+            assert_eq!(
+                (adopted.array_id.as_str(), adopted.operation_id.as_str(), adopted.name.as_str()),
+                (spec().array_id.as_str(), spec().operation_id.as_str(), spec().name.as_str())
+            );
+            assert_eq!((&adopted.data, &adopted.parity, &adopted.cache),
+                (&spec().data, &spec().parity, &spec().cache));
+
+            // It is on disk and it reads back, which is what the next command
+            // will check the owner against.
+            let stored = root.load(&spec().array_id).expect("load");
+            assert_eq!(stored.spec, adopted);
+            assert_eq!(stored.stage, ElasticStage::Prepared, "the state is untouched");
+
+            // Idempotent, so a retry after a refused database insert is safe.
+            assert_eq!(root.reown(stored, &adopting).expect("again"), adopted);
+
+            // And the owner stays the ONLY field this road may change.
+            let mut renamed = root.load(&spec().array_id).expect("load");
+            renamed.spec.name = "archiwum".into();
+            assert!(root.save(&renamed).is_err(), "save nadal odmawia zmiany specyfikacji");
+            let mut foreign = root.load(&spec().array_id).expect("load");
+            foreign.spec.owner = ElasticOwner { org_id: "org".into(), addon_id: "nas".into() };
+            assert!(root.save(&foreign).is_err(), "even the owner cannot travel through save");
         }
 
         #[test]

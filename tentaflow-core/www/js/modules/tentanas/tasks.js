@@ -99,13 +99,17 @@ export async function drawTasks(screen, body) {
   };
   jobsTable.addEventListener('row-click', (e) => screen.openJobLog(e.detail.row._job.jobId));
   const filters = body.querySelector('#nas-jobs-filters');
-  filters.filters = ['all', 'errors', 'scrub'].map((id) => ({ id, label: T('jobs.filter_' + id), active: id === state.filter }));
+  filters.filters = ['all', 'errors', 'scrub', 'mover'].map((id) => ({ id, label: T('jobs.filter_' + id), active: id === state.filter }));
   filters.addEventListener('change', (e) => { state.filter = e.detail.id; paintHistory(); });
 
   const paintHistory = () => {
     const rows = state.done.filter((j) => {
       if (state.filter === 'errors') return j.status === 'failed' || j.status === 'blocked';
       if (state.filter === 'scrub') return /scrub|resilver|replace/.test(String(j.kind));
+      // Cache drains are the runs an admin chases when the cache fills up, and
+      // they are the one job kind whose name nobody guesses — so they get a
+      // chip of their own instead of being found by reading the whole history.
+      if (state.filter === 'mover') return /mover/.test(String(j.kind));
       return true;
     });
     jobsTable.rows = rows.map((j) => ({

@@ -16,7 +16,7 @@ use tentaflow_protocol::tentanas::{
 };
 
 use crate::db::DbPool;
-use tentanas_helper::elastic::{ElasticClaim, ElasticCreateSpec, ElasticOwner, ElasticResult};
+use tentanas_helper::elastic::{ElasticClaim, ElasticCreateSpec, ElasticDiskSpec, ElasticOwner, ElasticResult};
 use super::jobs::ElasticJobIntent;
 
 const APP: &str = "tentanas";
@@ -489,6 +489,42 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         cache_min_free_pct INTEGER NOT NULL,
         coupled_sync INTEGER NOT NULL
     ) WITHOUT ROWID;",
+), (
+    14,
+    // An adopted array becomes an operation kind of its own. Rebuilt for the
+    // same reason as migration 12: `kind` is a CHECK constraint and SQLite
+    // cannot widen one in place.
+    //
+    // WHY a kind and not a second 'create' row: the create operation's
+    // `request_json` is where `elastic_spec` reads an array's persisted
+    // intention from, so an adopted array MUST have such a row or every read
+    // of it fails. Writing that row as 'create' would record this node as
+    // having created storage it only took over, with an adoption timestamp
+    // standing in for a creation it never performed. The origin row is
+    // therefore either a create or an import, and the partial unique index
+    // below allows exactly ONE of the two per array.
+    "CREATE TABLE nas_elastic_operations_new (
+        operation_id TEXT PRIMARY KEY,
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        job_id TEXT NOT NULL UNIQUE REFERENCES nas_jobs(job_id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK(kind IN ('create','import','restore','sync','scrub','mover')),
+        state TEXT NOT NULL CHECK(state IN ('running','succeeded','failed','needs_attention')),
+        request_json TEXT NOT NULL,
+        result_json TEXT,
+        error TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    );
+    INSERT INTO nas_elastic_operations_new
+        SELECT operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at
+        FROM nas_elastic_operations;
+    DROP TABLE nas_elastic_operations;
+    ALTER TABLE nas_elastic_operations_new RENAME TO nas_elastic_operations;
+    CREATE INDEX nas_elastic_operation_array ON nas_elastic_operations(array_id, created_at);
+    CREATE UNIQUE INDEX nas_elastic_operation_running
+        ON nas_elastic_operations(array_id) WHERE state = 'running';
+    CREATE UNIQUE INDEX nas_elastic_operation_origin
+        ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -1056,41 +1092,7 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                     VALUES (?1,?2,?3,?4,?5,'creating','',?6,?6)",
                     params![spec.array_id,spec.owner.org_id,spec.owner.addon_id,spec.name,
                         spec.filesystem.as_str(),job.started_at])?;
-                for (role, disks) in [("data", &spec.data), ("parity", &spec.parity)] {
-                    for (index, disk) in disks.iter().enumerate() {
-                        let slot = i64::try_from(index + 1)?;
-                        tx.execute("INSERT INTO nas_elastic_disks
-                            (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
-                            VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                            params![spec.array_id,role,slot,disk.disk_id,disk.wwn,disk.serial,
-                                i64::try_from(disk.bytes)?,disk.expected_uuid])?;
-                        for (kind, value) in [("disk_id", Some(disk.disk_id.as_str())),
-                            ("wwn",disk.wwn.as_deref()),("serial",disk.serial.as_deref())] {
-                            if let Some(value) = value {
-                                tx.execute("INSERT INTO nas_elastic_disk_aliases
-                                    (kind,value,array_id,role,slot) VALUES (?1,?2,?3,?4,?5)",
-                                    params![kind,value,spec.array_id,role,slot])?;
-                            }
-                        }
-                    }
-                }
-                if let Some(disk) = spec.cache.as_ref() {
-                    let role = "cache";
-                    let slot = 1i64;
-                    tx.execute("INSERT INTO nas_elastic_disks
-                        (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
-                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                        params![spec.array_id,role,slot,disk.disk_id,disk.wwn,disk.serial,
-                            i64::try_from(disk.bytes)?,disk.expected_uuid])?;
-                    for (kind, value) in [("disk_id", Some(disk.disk_id.as_str())),
-                        ("wwn",disk.wwn.as_deref()),("serial",disk.serial.as_deref())] {
-                        if let Some(value) = value {
-                            tx.execute("INSERT INTO nas_elastic_disk_aliases
-                                (kind,value,array_id,role,slot) VALUES (?1,?2,?3,?4,?5)",
-                                params![kind,value,spec.array_id,role,slot])?;
-                        }
-                    }
-                }
+                insert_elastic_disks(&tx, spec)?;
                 (&spec.array_id, &spec.operation_id, "create", serde_json::to_string(spec)?)
             }
             ElasticJobIntent::Restore { owner, array_id, operation_id } => {
@@ -1585,10 +1587,13 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
     Ok(changed)
 }
 
+/// The persisted intention of one array, read from its ORIGIN operation — the
+/// create that made it, or the import that adopted it. Migration 14 allows
+/// exactly one of the two per array, so this join still returns a single row.
 fn elastic_spec(conn: &Connection, owner: &ElasticOwner, array_id: &str) -> Result<ElasticCreateSpec> {
     let (name, filesystem, json): (String, String, String) = conn.query_row(
         "SELECT a.name,a.filesystem,o.request_json FROM nas_elastic_arrays a
-         JOIN nas_elastic_operations o ON o.array_id=a.array_id AND o.kind='create'
+         JOIN nas_elastic_operations o ON o.array_id=a.array_id AND o.kind IN ('create','import')
          WHERE a.array_id=?1 AND a.org_id=?2 AND a.addon_id=?3",
         params![array_id,owner.org_id,owner.addon_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     anyhow::ensure!(json.len() < 16 * 1024, "Zapis Elastic przekracza limit");
@@ -1924,6 +1929,134 @@ pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
             ElasticClaim {disk_id:disk.disk_id,wwn:disk.wwn,serial:disk.serial}));
     }
     Ok(claims)
+}
+
+/// Every member of a spec with the role and slot its rows take: the data disks
+/// in order from slot 1, the cache disk at `cache`/1, the parity disks in
+/// order. The create and the import write the same three tables from this, so
+/// the two paths cannot disagree about which slot a disk lands in.
+fn elastic_disk_slots(spec: &ElasticCreateSpec) -> Result<Vec<(&'static str, i64, &ElasticDiskSpec)>> {
+    let mut slots = Vec::new();
+    for (role, disks) in [("data", &spec.data), ("parity", &spec.parity)] {
+        for (index, disk) in disks.iter().enumerate() {
+            slots.push((role, i64::try_from(index + 1)?, disk));
+        }
+    }
+    if let Some(disk) = spec.cache.as_ref() {
+        slots.push(("cache", 1, disk));
+    }
+    Ok(slots)
+}
+
+/// Writes the member rows and their aliases of one array. The UNIQUE columns
+/// (`disk_id`, `expected_uuid`) and the alias primary key are the reservation
+/// itself: two arrays can never hold the same disk, whichever path wrote them.
+fn insert_elastic_disks(tx: &Connection, spec: &ElasticCreateSpec) -> Result<()> {
+    for (role, slot, disk) in elastic_disk_slots(spec)? {
+        tx.execute("INSERT INTO nas_elastic_disks
+            (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![spec.array_id,role,slot,disk.disk_id,disk.wwn,disk.serial,
+                i64::try_from(disk.bytes)?,disk.expected_uuid])?;
+        for (kind, value) in [("disk_id", Some(disk.disk_id.as_str())),
+            ("wwn",disk.wwn.as_deref()),("serial",disk.serial.as_deref())] {
+            if let Some(value) = value {
+                tx.execute("INSERT INTO nas_elastic_disk_aliases
+                    (kind,value,array_id,role,slot) VALUES (?1,?2,?3,?4,?5)",
+                    params![kind,value,spec.array_id,role,slot])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `(array_id, name)` of every array this node has a row for, whatever the
+/// owner and whatever the state of the row.
+///
+/// The import scan needs exactly this and not `elastic_arrays`: an array whose
+/// persisted intention no longer reads back fails that function entirely, and
+/// answering "unknown" for such an array would offer to adopt storage this
+/// node already has a row for — the one thing the `disk_id`/`expected_uuid`
+/// uniqueness is there to prevent. Every owner is included for the same
+/// reason: another addon's row still holds the disks.
+pub fn elastic_array_identities(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let rows = conn
+        .prepare("SELECT array_id,name FROM nas_elastic_arrays ORDER BY name")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Adopts an array whose journal this node holds but whose database record it
+/// has lost. `spec` is the journal's own intention with the owner ALREADY
+/// rewritten by the helper — the re-owning is the point of the operation, and
+/// the row is written under `spec.owner`, never under `previous`.
+///
+/// One immediate transaction, and every uniqueness rule the create path relies
+/// on is re-checked inside it BEFORE the inserts: `nas_elastic_disks.disk_id`
+/// and `expected_uuid` are UNIQUE and the alias table is keyed by
+/// `(kind, value)`, so a member some other array already holds must refuse
+/// with a sentence naming the disk rather than surface as a raw SQL error.
+///
+/// The array arrives `active` — it is complete, its disks are verified and its
+/// union may well be serving already — carrying the reason it arrived with in
+/// `state_detail`, the way an imported target row does.
+pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, previous: &ElasticOwner,
+    started_by: &str) -> Result<()> {
+    spec.validate()?;
+    let at = now();
+    let detail = format!(
+        "adopted from owner {}/{}: the journal and the disks of this array were already on \
+         this node and this instance had no record of it",
+        previous.org_id, previous.addon_id);
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let closing: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_settings WHERE key='elastic_teardown_started')",
+        [], |r| r.get(0))?;
+    anyhow::ensure!(!closing, "Rozpoczęto usuwanie instancji; odmowa adopcji macierzy");
+    let known: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays WHERE array_id=?1)",
+        params![spec.array_id], |r| r.get(0))?;
+    anyhow::ensure!(!known, "Ta macierz jest już zapisana w tej instancji");
+    let name_taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays WHERE name=?1)",
+        params![spec.name], |r| r.get(0))?;
+    anyhow::ensure!(!name_taken, "Nazwa macierzy jest już zajęta w tej instancji");
+    for (_, _, disk) in elastic_disk_slots(spec)? {
+        let claimed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nas_elastic_disks WHERE disk_id=?1 OR expected_uuid=?2)",
+            params![disk.disk_id, disk.expected_uuid], |r| r.get(0))?;
+        anyhow::ensure!(!claimed,
+            "Dysk {} należy już do innej macierzy tej instancji", disk.disk_id);
+        for value in [Some(disk.disk_id.as_str()), disk.wwn.as_deref(), disk.serial.as_deref()]
+            .into_iter().flatten() {
+            let reserved: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nas_elastic_disk_aliases WHERE value=?1)",
+                params![value], |r| r.get(0))?;
+            anyhow::ensure!(!reserved,
+                "Identyfikator {value} jest już zarezerwowany przez inną macierz tej instancji");
+        }
+    }
+    let job_id = uuid::Uuid::now_v7().to_string();
+    tx.execute("INSERT INTO nas_jobs
+        (job_id,kind,subject,status,progress_pct,started_by,started_at,finished_at,log)
+        VALUES (?1,'elastic_import',?2,'succeeded',100,?3,?4,?4,?5)",
+        params![job_id,spec.name,started_by,at,detail])?;
+    tx.execute("INSERT INTO nas_elastic_arrays
+        (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+        VALUES (?1,?2,?3,?4,?5,'active',?6,?7,?7)",
+        params![spec.array_id,spec.owner.org_id,spec.owner.addon_id,spec.name,
+            spec.filesystem.as_str(),detail,at])?;
+    insert_elastic_disks(&tx, spec)?;
+    // The origin operation (migration 14): `elastic_spec` reads the persisted
+    // intention from it, so an adopted array without this row could not be
+    // read back at all.
+    tx.execute("INSERT INTO nas_elastic_operations
+        (operation_id,array_id,job_id,kind,state,request_json,error,created_at,finished_at)
+        VALUES (?1,?2,?3,'import','succeeded',?4,'',?5,?5)",
+        params![spec.operation_id,spec.array_id,job_id,serde_json::to_string(spec)?,at])?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn finish_elastic_operation(pool: &DbPool, owner: &ElasticOwner, operation_id: &str,
@@ -3643,6 +3776,104 @@ mod tests {
             status:"running".into(),started_by:"test".into(),started_at:now(),..Default::default() }
     }
 
+    /// The journal owner of an array created before the addon was
+    /// re-provisioned, and the identity it has now.
+    fn previous_owner() -> ElasticOwner {
+        ElasticOwner { org_id: "orgtentanas-rig11".into(), addon_id: "addontentanas".into() }
+    }
+
+    #[test]
+    fn an_adopted_array_is_stored_under_this_addon_and_reads_back_as_its_own_intention() {
+        let pool = pool();
+        // What the helper answers with: the journal's spec, owner already
+        // rewritten to the adopting instance.
+        let mut spec = super::super::elastic::tests::create_spec("media");
+        let adopting = ElasticOwner { org_id: "org-default".into(), addon_id: "tentanas-8dd19dc4".into() };
+        spec.owner = adopting.clone();
+        spec.cache = Some(ElasticDiskSpec {
+            disk_id: "media-cache".into(), wwn: None, serial: Some("serial-media-cache".into()),
+            bytes: 32 * 1024 * 1024 * 1024, expected_uuid: uuid::Uuid::new_v4().to_string(),
+        });
+
+        elastic_import(&pool, &spec, &previous_owner(), "admin").unwrap();
+
+        // The row belongs to THIS addon, not to the owner the journal carried.
+        let (org, addon, state, detail): (String, String, String, String) = pool.read().unwrap().query_row(
+            "SELECT org_id,addon_id,state,state_detail FROM nas_elastic_arrays WHERE array_id=?1",
+            params![spec.array_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!((org.as_str(), addon.as_str()), ("org-default", "tentanas-8dd19dc4"));
+        assert_eq!(state, "active");
+        // An imported row keeps the reason it arrived with, and that reason
+        // names where it came from.
+        assert!(detail.contains("adopted from owner orgtentanas-rig11/addontentanas"), "{detail}");
+
+        // Nothing is readable without the origin operation row, so the read
+        // back is what proves the adoption is a whole array and not a header.
+        let row = elastic_array(&pool, &adopting, "media").unwrap().expect("adopted array reads back");
+        assert_eq!(row.persisted_spec().unwrap(), &spec);
+        assert_eq!(row.state, "active");
+        assert_eq!(row.cache().count(), 1);
+        assert!(elastic_arrays(&pool, &previous_owner()).unwrap().is_empty(), "the old owner sees nothing");
+
+        // The disks are reserved exactly as a create would have reserved them,
+        // so a later create cannot take one of them.
+        let conn = pool.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM nas_elastic_disks", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM nas_elastic_disk_aliases", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(conn.query_row("SELECT kind FROM nas_elastic_operations", [], |r| r.get::<_, String>(0)).unwrap(), "import");
+        assert_eq!(conn.query_row("SELECT status FROM nas_jobs WHERE kind='elastic_import'", [], |r| r.get::<_, String>(0)).unwrap(), "succeeded");
+        assert!(conn.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
+        drop(conn);
+
+        assert_eq!(
+            elastic_array_identities(&pool).unwrap(),
+            vec![(spec.array_id.clone(), "media".to_string())],
+            "and the scan now reports it as known"
+        );
+    }
+
+    #[test]
+    fn an_adoption_that_collides_refuses_in_words_and_writes_nothing() {
+        let pool = pool();
+        let created = super::super::elastic::tests::create_spec("produkt");
+        insert_job(&pool, &elastic_job(&created), Some(&ElasticJobIntent::Create(created.clone()))).unwrap();
+
+        let rows = |table: &str| pool.read().unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap();
+        let (arrays, disks, aliases, jobs) = (rows("nas_elastic_arrays"), rows("nas_elastic_disks"),
+            rows("nas_elastic_disk_aliases"), rows("nas_jobs"));
+
+        // Same array, offered a second time.
+        let again = elastic_import(&pool, &created, &previous_owner(), "admin").unwrap_err().to_string();
+        assert!(again.contains("już zapisana w tej instancji"), "{again}");
+
+        // A different array that wants a disk this one already holds. The
+        // UNIQUE columns would refuse it as a raw SQL error; the point of the
+        // pre-check is that the admin is told WHICH disk.
+        let mut overlapping = super::super::elastic::tests::create_spec("archiwum");
+        overlapping.data[0] = created.data[0].clone();
+        let taken = elastic_import(&pool, &overlapping, &previous_owner(), "admin").unwrap_err().to_string();
+        assert!(taken.contains(&created.data[0].disk_id), "the refusal names the disk: {taken}");
+
+        // Only the filesystem UUID is shared: still a refusal, because that
+        // UUID is the identity a second array must not be able to claim.
+        let mut same_uuid = super::super::elastic::tests::create_spec("archiwum");
+        same_uuid.data[0].expected_uuid = created.data[0].expected_uuid.clone();
+        assert!(elastic_import(&pool, &same_uuid, &previous_owner(), "admin").is_err());
+
+        // A different array whose NAME is taken.
+        let mut renamed = super::super::elastic::tests::create_spec("produkt");
+        renamed.owner = previous_owner();
+        let name = elastic_import(&pool, &renamed, &previous_owner(), "admin").unwrap_err().to_string();
+        assert!(name.contains("Nazwa macierzy jest już zajęta"), "{name}");
+
+        assert_eq!(
+            (rows("nas_elastic_arrays"), rows("nas_elastic_disks"), rows("nas_elastic_disk_aliases"), rows("nas_jobs")),
+            (arrays, disks, aliases, jobs),
+            "four refusals, and not one row written"
+        );
+    }
+
     #[test]
     fn elastic_reservation_conflicts_roll_back_all_rows_on_independent_connections() {
         for conflict in ["name","disk_id","wwn","serial","uuid"] {
@@ -4110,7 +4341,18 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(after, before, "rebuild zgubił lub zmienił wiersz");
-        assert_eq!(indexes(&conn), indexes_before, "rebuild zgubił indeks");
+        // Migration 14 rebuilds this table once more and renames the create
+        // guard: an array's ORIGIN operation is now either the create that
+        // made it or the import that adopted it, and exactly one of the two
+        // may exist. Every other index survives both rebuilds.
+        let renamed: Vec<String> = indexes_before
+            .iter()
+            .map(|name| match name.as_str() {
+                "nas_elastic_operation_create" => "nas_elastic_operation_origin".to_string(),
+                other => other.to_string(),
+            })
+            .collect();
+        assert_eq!(indexes(&conn), renamed, "rebuild zgubił indeks");
         assert!(
             conn.prepare("PRAGMA foreign_key_check")
                 .unwrap()
@@ -4160,6 +4402,26 @@ mod tests {
                 params![array_id],
             )
             .is_err()
+        );
+        // Migration 14: 'import' is a legal kind, and the origin index allows
+        // ONE origin per array — this one already has its create, so the
+        // adoption row is refused rather than leaving two answers to "where
+        // did this array come from".
+        conn.execute(
+            "INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log)
+             VALUES ('job-import','elastic_import','legacy','succeeded','test','now','')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO nas_elastic_operations
+                 (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+                 VALUES ('op-import',?1,'job-import','import','succeeded','{}','','2026-09-04T00:00:00Z')",
+                params![array_id],
+            )
+            .is_err(),
+            "macierz z operacją create nie może dostać drugiej operacji pochodzenia"
         );
 
         // schema13 against the SAME seeded database: an UPGRADED instance, not

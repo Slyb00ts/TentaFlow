@@ -46,7 +46,7 @@ const IOPS_BASELINE_POINTS: usize = 3600 / TICK.as_secs() as usize;
 // ----- lsblk -------------------------------------------------------------------
 
 const LSBLK_COLUMNS: &str =
-    "NAME,PATH,TYPE,MODEL,SERIAL,WWN,SIZE,TRAN,ROTA,RM,REV,VENDOR,MOUNTPOINTS,FSTYPE,LABEL";
+    "NAME,PATH,TYPE,MODEL,SERIAL,WWN,SIZE,TRAN,ROTA,RM,REV,VENDOR,MOUNTPOINTS,FSTYPE,LABEL,UUID";
 
 /// Device name prefixes that are not physical disks (virtual, optical,
 /// arrays and volumes built ON disks — those belong to the pool views).
@@ -111,6 +111,10 @@ struct Usage {
     /// this says what, so the "used" role can name it instead of being a
     /// catch-all the reader cannot act on.
     fs_hint: Option<String>,
+    /// UUID of the very signature `fs_hint` names — the two are set together
+    /// and never separately, because a disk reporting one filesystem's type
+    /// beside another's UUID is what an import would then adopt.
+    fs_uuid: Option<String>,
 }
 
 fn collect_usage(node: &Value, usage: &mut Usage) {
@@ -131,6 +135,7 @@ fn collect_usage(node: &Value, usage: &mut Usage) {
             // its first partition's, which is what the role should name.
             if usage.fs_hint.is_none() {
                 usage.fs_hint = Some(other.to_string());
+                usage.fs_uuid = node.get("uuid").and_then(json_str);
             }
         }
         None => {}
@@ -234,6 +239,7 @@ pub fn disk_from_lsblk(node: &Value) -> Option<NasDisk> {
         io_history_bps: Vec::new(),
         mountpoints: usage.mountpoints,
         fs_type: usage.fs_hint,
+        fs_uuid: usage.fs_uuid,
         // lsblk knows the pool from the member label, never the vdev inside
         // it; `refresh_inventory` fills these from `zpool status`.
         vdev_role: String::new(),
@@ -1036,7 +1042,12 @@ pub fn advice_for(db: &DbPool, disk: &NasDisk, spares: &[NasDisk]) -> Option<Nas
 /// Every disk of this node that should be replaced while it still works, worst
 /// first. Empty on a healthy node, which is what the UI shows nothing for.
 pub fn advice(db: &DbPool, disks: &[NasDisk]) -> Vec<NasReplacementAdvice> {
-    let spares: Vec<NasDisk> = disks.iter().filter(|d| d.role == "spare").cloned().collect();
+    // `vdev_role`, NOT `role`: a hot spare is attached to the pool, so `role_of`
+    // calls it `pool_member` and has no "spare" verdict to give — the spares
+    // section of `zpool status` is what names it (pools.rs:107), and that lands
+    // in `vdev_role`. Filtering on `role` matched nothing on every real node,
+    // so "brak spare w puli" was advice this code could never not give.
+    let spares: Vec<NasDisk> = disks.iter().filter(|d| d.vdev_role == "spare").cloned().collect();
     let mut out: Vec<NasReplacementAdvice> = disks
         .iter()
         .filter_map(|d| advice_for(db, d, &spares))
@@ -2471,7 +2482,11 @@ mod tests {
             disk_id: "d-spare".to_string(),
             name: "sdz".to_string(),
             health: "ok".to_string(),
-            role: "spare".to_string(),
+            // As the inventory really builds it: a pool member whose GROUP is
+            // the spares section. The old fixture said `role: "spare"`, a value
+            // `role_of` never produces, and so passed while production failed.
+            role: "pool_member".to_string(),
+            vdev_role: "spare".to_string(),
             member_of: Some("tank".to_string()),
             ..Default::default()
         };

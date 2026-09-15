@@ -304,6 +304,7 @@ test('the fleet header is the canonical detail-header and the tab strip has no a
   const tabs = root.querySelector('#nas-tabs');
   assert.equal(tabs.getAttribute('value'), '', 'an empty value means no tab is active');
   assert.equal(tabs.querySelectorAll('tf-tab').length, 6);
+  assert.equal(tabs.querySelector('tf-tab#pools').getAttribute('count'), '1', 'the one pool of the default fixture');
   assert.equal(tabs.querySelectorAll('button.tf-tab.active').length, 0, 'no tab is highlighted on the fleet view');
   Screen.unmount();
 });
@@ -593,18 +594,24 @@ test('"Uzbrój kanał" stays on the arm-channel prompt and never labels a one-sh
   Screen.unmount();
 });
 
-test('zakładka Pule nie używa licznika ZFS, pozostałe badge pozostają pomiarami węzła', async () => {
+// The tab used to carry NO count at all, and deliberately: `poolsTotal` is ZFS
+// pools alone, so a node whose only storage is an Elastic Array would have read
+// as having none — worse than silence. `arraysTotal` is on the wire now, so the
+// count can be what the Pools tab actually lists. The original intent is the
+// assertion that survives: the number must never be the ZFS count on its own.
+test('zakładka Pule liczy pule ZFS RAZEM z macierzami, pozostałe badge pozostają pomiarami węzła', async () => {
   stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL,
-    nodes: [node({ poolsTotal: 0 }), node({ nodeId: REMOTE, isLocal: false, poolsTotal: 7, disksTotal: 9, sharesTotal: 3 })] } });
+    nodes: [node({ poolsTotal: 0, arraysTotal: 2 }), node({ nodeId: REMOTE, isLocal: false, poolsTotal: 7, disksTotal: 9, sharesTotal: 3 })] } });
   const root = await mountScreen({ node: LOCAL, tab: 'pools' });
   try {
-    assert.equal(root.querySelector('tf-tab#pools').hasAttribute('count'), false);
+    assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '2',
+      'no ZFS pool, two arrays — the node is not storage-less');
     assert.equal(root.querySelector('tf-tab#disks').getAttribute('count'), '2');
     assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '1');
     assert.equal(root.querySelector('tf-tab#jobs').getAttribute('count'), '1');
     Screen.selectNode(REMOTE, 'pools');
     await flush();
-    assert.equal(root.querySelector('tf-tab#pools').hasAttribute('count'), false);
+    assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '7', 'pools still count');
     assert.equal(root.querySelector('tf-tab#disks').getAttribute('count'), '9');
     assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '3');
   } finally { Screen.unmount(); }
@@ -638,6 +645,13 @@ test('the overview KPI tiles follow n02 and drill down into pools and disks', as
   // n02:181 — the IOPS tile compares now against the node's hourly mean.
   assert.equal(tiles[2].getAttribute('delta'), '+25% vs śr. godzinowa');
   assert.equal(tiles[2].getAttribute('delta-type'), 'up');
+  // Asserted on the RENDERED delta, not on the attribute alone: tf-stat-card
+  // silently rewrites any value outside its allowlist to `neutral`, so an
+  // attribute-only assertion passes while the tile shows no warning at all.
+  assert.equal(tiles[1].getAttribute('delta-type'), 'warn');
+  const warnDelta = tiles[1].querySelector('.tf-stat-card-delta');
+  assert.ok(warnDelta.classList.contains('warn'), 'the warned health tile keeps its warn tone');
+  assert.match(warnDelta.textContent, /⚠/, 'and its warning glyph');
 
   click(tiles[1]);
   await flush();
@@ -1110,6 +1124,111 @@ test('the fleet view is patched by its poll, never redrawn', async () => {
   assert.equal(same(root.querySelector('#nas-node-grid'), grid), true, 'the node grid is not rebuilt');
   assert.equal(same(root.querySelector('#nas-fleet-alerts'), alertsTable), true, 'nor the alert table');
   [...root.querySelectorAll('.kpi tf-stat-card')].forEach((el, i) => assert.equal(same(el, cards[i]), true, `fleet tile ${i} survives`));
+  Screen.unmount();
+});
+
+// fleet.rs counts warnings and failures apart. A node that had LOST a disk
+// used to arrive here inside `disksWarning`, so the fleet said "warning"
+// about a node whose `health` on the same row already said 'critical'.
+test('a dead disk reads as a failure on the fleet chip, the health tile and its drill-down', async () => {
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+    node({ health: 'warning', disksWarning: 2 }),
+    node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, health: 'critical', disksWarning: 0, disksCritical: 1, features: [] }),
+  ] } });
+  const root = await mountScreen();
+  await flush();
+  const chip = root.querySelector('#nas-fleet-chips tf-chip');
+  assert.equal(chip.getAttribute('status'), 'err', 'a failure is not amber');
+  assert.equal(chip.getAttribute('label'), '1 awaria (vega)');
+
+  const health = [...root.querySelectorAll('.kpi tf-stat-card')][1];
+  assert.equal(health.getAttribute('value'), '1', 'the failure count leads, not the two warnings');
+  assert.equal(health.getAttribute('suffix'), 'awaria');
+  assert.equal(health.getAttribute('accent'), 'danger');
+  assert.match(health.getAttribute('delta'), /vega/);
+  assert.match(health.getAttribute('delta'), /orion/, 'the warned node stays reachable in the delta');
+
+  click(health);
+  await flush();
+  assert.equal(Screen.nodeId, REMOTE, 'the tile opens the node that failed, not the one that warns');
+  assert.equal(Screen.diskFilter, 'problems');
+  Screen.unmount();
+});
+
+test('a fleet with warnings only keeps the warning wording', async () => {
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+    node({ health: 'warning', disksWarning: 2 }),
+  ] } });
+  const root = await mountScreen();
+  await flush();
+  const chip = root.querySelector('#nas-fleet-chips tf-chip');
+  assert.equal(chip.getAttribute('status'), 'warn');
+  assert.match(chip.getAttribute('label'), /^2 ostrzeżenia/);
+  const health = [...root.querySelectorAll('.kpi tf-stat-card')][1];
+  assert.equal(health.getAttribute('value'), '2');
+  assert.equal(health.getAttribute('accent'), 'warning');
+  Screen.unmount();
+});
+
+// `poolsTotal` is ZFS pools alone (fleet.rs), so a node whose only storage is
+// an Elastic Array reported zero pools and read as a share client.
+test('a node whose only storage is an Elastic Array is a fleet NAS and says how many arrays it has', async () => {
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+    node({ poolsTotal: 0, arraysTotal: 2, capacityBytes: 12e12, usedBytes: 3e12 }),
+  ] } });
+  const root = await mountScreen();
+  await flush();
+  const card = root.querySelector('.node-card');
+  assert.match(card.querySelector('.nc-foot').lastElementChild.textContent, /NAS floty/);
+  const stats = [...card.querySelectorAll('.nc-stats .kv-inline')];
+  const arrays = stats.find((kv) => kv.querySelector('.k').textContent === 'Elastic Array');
+  assert.ok(arrays, `the array count is a stat of its own: ${stats.map((kv) => kv.querySelector('.k').textContent)}`);
+  assert.equal(arrays.querySelector('.v').textContent, '2');
+  assert.equal(stats.find((kv) => kv.querySelector('.k').textContent === 'Pule').querySelector('.v').textContent, '0',
+    'and it is not folded into the pool count');
+
+  const badges = [...root.querySelectorAll('#nas-fleet-badges tf-chip')].map((c) => c.getAttribute('label'));
+  assert.match(badges[0], /1× NAS: orion/, 'an array-only node counts as a NAS of the fleet');
+  assert.match(badges[2], /^2 pule · 11 TiB/, 'the capacity badge counts the arrays it is the capacity of');
+  Screen.unmount();
+});
+
+// An array the node could not measure is in NEITHER byte figure (fleet.rs),
+// so the total is knowingly short of its disks and both the tile and the
+// card's fill bar have to say so instead of looking complete.
+test('an unmeasured array is named beside the capacity, not folded into it', async () => {
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+    node({ poolsTotal: 1, arraysTotal: 2, arraysUnmeasured: 1 }),
+  ] } });
+  const root = await mountScreen();
+  await flush();
+  const capacity = [...root.querySelectorAll('.kpi tf-stat-card')][0];
+  assert.match(capacity.getAttribute('delta'), /1 bez pomiaru pojemności/);
+  assert.match(root.querySelector('.node-card .split-bar').getAttribute('title'), /1 bez pomiaru pojemności/);
+  Screen.unmount();
+});
+
+test('a fleet that measured every array says nothing about unmeasured ones', async () => {
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+    node({ poolsTotal: 1, arraysTotal: 1, arraysUnmeasured: 0 }),
+  ] } });
+  const root = await mountScreen();
+  await flush();
+  const capacity = [...root.querySelectorAll('.kpi tf-stat-card')][0];
+  assert.ok(!/bez pomiaru/.test(capacity.getAttribute('delta')), capacity.getAttribute('delta'));
+  assert.equal(root.querySelector('.node-card .split-bar').getAttribute('title'), '25%');
+  Screen.unmount();
+});
+
+test('the node header chip calls a dead disk a failure, not a warning', async () => {
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+    node({ health: 'critical', disksCritical: 1, disksWarning: 0 }),
+  ] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const chip = root.querySelector('#nas-head-chips tf-chip');
+  assert.equal(chip.getAttribute('status'), 'err');
+  assert.equal(chip.getAttribute('label'), '1 awaria');
   Screen.unmount();
 });
 

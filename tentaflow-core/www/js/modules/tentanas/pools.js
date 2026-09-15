@@ -1,4 +1,4 @@
-// ===== File: modules/tentanas/pools.js — the Pools tab (n05): pool cards with capacity, protection and scrub state, the free-disk and spare shelf, and the import dialog =====
+// ===== File: modules/tentanas/pools.js — the Pools tab (n05): pool cards with capacity, protection and scrub state, the free-disk and spare shelf, and the two import dialogs (ZFS pool, Elastic Array) =====
 //
 // One card per pool answers the three questions an admin asks at a glance:
 // is it healthy, how full is it, when was it last scrubbed. Everything
@@ -10,9 +10,9 @@ import {
   T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS,
   fmtDate, fmtIn, fmtBytes, fmtRatio, pct, healthClass, healthChip, errMessage, layoutLabel, stateChipHtml, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList } from '/js/modules/tentanas/dom-patch.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
-import { followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { followResponse, warningHtml, openRetypeDialog } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
@@ -34,6 +34,7 @@ export async function drawPools(screen, body) {
         <div class="title">${sprite('layers')} ${escapeHtml(T('pools.title', { node: node ? node.nodeName : '' }))} <tf-chip size="sm" status="neutral" id="nas-pools-count" label="0"></tf-chip></div>
         <div class="actions">
           <tf-button variant="secondary" icon="download" data-act="import" ${screen.isAdmin ? '' : 'disabled'}>${escapeHtml(T('pools.import'))}</tf-button>
+          <tf-button variant="secondary" icon="download" data-act="import-array" ${screen.isAdmin ? '' : 'disabled'}>${escapeHtml(T('pools.import_array'))}</tf-button>
           <tf-button variant="primary" icon="plus" data-act="create" ${screen.isAdmin ? '' : 'disabled'}>${escapeHtml(T('pools.create'))}</tf-button>
         </div>
       </div>
@@ -70,6 +71,10 @@ export async function drawPools(screen, body) {
   body.querySelector('[data-act="import"]').addEventListener('click', () => {
     if (!screen.isAdmin) { toast(T('elevation.admin_only'), 'warning'); return; }
     openImportDialog(screen, refresh);
+  });
+  body.querySelector('[data-act="import-array"]').addEventListener('click', () => {
+    if (!screen.isAdmin) { toast(T('elevation.admin_only'), 'warning'); return; }
+    openElasticImportDialog(screen, refresh);
   });
 
   const list = body.querySelector('#nas-pools-list');
@@ -436,5 +441,154 @@ export function openImportDialog(screen, onDone) {
   draw();
   document.body.appendChild(win);
   scan();
+  return win;
+}
+
+// ---------------------------------------------------------------------------
+// Elastic Array import (§5.3 recovery)
+// ---------------------------------------------------------------------------
+//
+// WHY it is a second dialog and not a tab of the ZFS one: the two answer
+// different questions from different sources. `zpool import` reads disk
+// labels; this reads the root-only journals under /var/lib/tentanas and
+// compares each member's recorded filesystem UUID against the live one.
+//
+// The scan is behind an explicit button rather than firing on open, because
+// it needs sudo: opening a dialog must never be what makes a node ask for a
+// root password.
+export function openElasticImportDialog(screen, onDone) {
+  const win = document.createElement('tf-window');
+  win.className = 'nas-modal';
+  win.setAttribute('title', T('elastic_import.title'));
+  win.setAttribute('icon', 'download');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('width', '680');
+  win.setAttribute('min-width', '520');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+  // `candidates: null` is "nothing has been scanned yet" and is NOT an empty
+  // result: the two say different things and the dialog must not print "no
+  // array found" before it has looked.
+  const state = { candidates: null, scanning: false, error: '' };
+
+  win.innerHTML = `
+    <div slot="body" class="stack">
+      <div class="explain-box">${T('elastic_import.explain')}</div>
+      <div class="row" style="align-items:center">
+        <div style="flex:1"><span class="muted" id="nas-eimport-status"></span></div>
+        <tf-button size="sm" variant="secondary" icon="refresh" data-act="scan">${escapeHtml(T('elastic_import.scan'))}</tf-button>
+      </div>
+      <div id="nas-eimport-list" class="stack"></div>
+      <div class="num-err" id="nas-eimport-error" hidden></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+    </div>`;
+  const statusEl = win.querySelector('#nas-eimport-status');
+  const listHost = win.querySelector('#nas-eimport-list');
+  const errEl = win.querySelector('#nas-eimport-error');
+  const scanBtn = win.querySelector('[data-act="scan"]');
+
+  const CHIP = {
+    importable: ['ok', 'status_importable'],
+    incomplete: ['warn', 'status_incomplete'],
+    already_known: ['neutral', 'status_already_known'],
+  };
+
+  const candidateHtml = (c) => {
+    const [tone, label] = CHIP[c.status] || CHIP.incomplete;
+    const total = (c.disksMatched || 0) + (c.disksMissing || []).length + (c.disksReused || []).length;
+    return `
+      <div class="vdev-group ${c.status === 'importable' ? 'picked' : ''}" data-array="${escapeAttr(c.arrayId)}" title="${escapeAttr(c.detail || '')}">
+        <div class="vg-head">
+          <span class="vg-type">${escapeHtml(T('elastic_import.vg_type', { fs: c.filesystem || '' }))}</span>
+          <span class="mono fw-800">${escapeHtml(c.name)}</span>
+          <tf-chip size="sm" status="${escapeAttr(tone)}" dot label="${escapeAttr(T('elastic_import.' + label))}"></tf-chip>
+          <span class="hint">${escapeHtml(T('elastic_import.counts', { data: c.dataDisks || 0, parity: c.parityDisks || 0, cache: c.cacheDisks || 0 }))}</span>
+        </div>
+        <div class="hint">${escapeHtml(T('elastic_import.owner', { owner: `${c.ownerOrgId || '—'}/${c.ownerAddonId || '—'}` }))}</div>
+        <div class="hint">${escapeHtml(T('elastic_import.matched', { n: c.disksMatched || 0, total }))}${c.unionMounted ? ` · ${escapeHtml(T('elastic_import.union_mounted'))}` : ''}</div>
+        ${(c.disksMissing || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.missing', { disks: c.disksMissing.join(', ') }))}</div>` : ''}
+        ${(c.disksReused || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.reused', { disks: c.disksReused.join(', ') }))}</div>` : ''}
+        <div class="row">
+          <tf-button size="sm" variant="primary" icon="download" data-act="adopt" ${c.status === 'importable' ? '' : 'disabled'}>${escapeHtml(T('elastic_import.adopt'))}</tf-button>
+        </div>
+      </div>`;
+  };
+
+  // Only what changed: the status line, the scan button's state and the rows
+  // whose own markup differs. A row an admin is reading keeps its node.
+  const paint = () => {
+    setText(statusEl, state.scanning
+      ? T('elastic_import.scanning')
+      : state.candidates === null
+        ? T('elastic_import.idle')
+        : state.candidates.length
+          ? T('elastic_import.found', { n: state.candidates.length })
+          : T('elastic_import.none'));
+    setAttr(scanBtn, 'disabled', state.scanning);
+    patchKeyedList(listHost, (state.candidates || []).map((c) => ({ key: c.arrayId, html: candidateHtml(c) })));
+    setText(errEl, state.error);
+    errEl.hidden = !state.error;
+  };
+
+  const scan = async () => {
+    if (state.scanning) return;
+    state.scanning = true;
+    state.error = '';
+    paint();
+    try {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArrayImportScanRequest', { sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic_import.title'));
+      if (!win.isConnected) return;
+      // `null` is a cancelled sudo prompt: nothing was scanned, so the dialog
+      // keeps saying it has not looked yet.
+      if (res) state.candidates = res.candidates || [];
+    } catch (err) {
+      state.error = errMessage(err);
+    } finally {
+      state.scanning = false;
+      if (win.isConnected) paint();
+    }
+  };
+
+  // Retyping the name, exactly as destroying a pool demands it: an adoption
+  // re-owns storage that belongs to another identity, and the journal owner
+  // is on the dialog so nobody re-owns somebody else's array by accident.
+  const openAdopt = (c) => openRetypeDialog({
+    title: T('elastic_import.adopt_title', { name: c.name }),
+    icon: 'download',
+    confirmIcon: 'download',
+    name: c.name,
+    bodyHtml: `
+      ${warningHtml('danger', T('elastic_import.reown_warning', { owner: `${c.ownerOrgId || '—'}/${c.ownerAddonId || '—'}` }))}
+      <div class="explain-box">${T('elastic_import.adopt_explain', { n: c.disksMatched || 0, name: escapeHtml(c.name) })}</div>`,
+    retypeLabel: `${escapeHtml(T('elastic_import.retype'))} <span class="mono num-err">${escapeHtml(c.name)}</span>`,
+    confirmLabel: T('elastic_import.confirm'),
+    onConfirm: async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArrayImportRequest', { arrayId: c.arrayId, confirmName: c.name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic_import.adopt_title', { name: c.name }));
+      if (res === null) return false;
+      win.close(true);
+      followResponse(screen, res, onDone, T('elastic_import.done', { name: c.name }));
+      return true;
+    },
+  });
+
+  scanBtn.addEventListener('click', scan);
+  // One delegated listener for every row, so a re-scan that replaces a card
+  // never has to re-wire anything.
+  listHost.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-act="adopt"]');
+    if (!btn || btn.hasAttribute('disabled')) return;
+    const row = btn.closest('[data-array]');
+    const candidate = (state.candidates || []).find((c) => c.arrayId === row?.dataset.array);
+    if (candidate) openAdopt(candidate);
+  });
+  win.addEventListener('action', (e) => {
+    if (e.detail?.action === 'cancel') win.close(true);
+  });
+
+  paint();
+  document.body.appendChild(win);
   return win;
 }

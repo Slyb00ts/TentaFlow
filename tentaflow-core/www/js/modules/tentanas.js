@@ -325,7 +325,7 @@ const TentaNasScreen = {
       <tf-tabs variant="underline" value="${escapeAttr(active || '')}" id="nas-tabs">
         <tf-tab id="overview" icon="bar-chart">${escapeHtml(T('tabs.overview'))}</tf-tab>
         <tf-tab id="disks" icon="cylinder" count="${Number(n.disksTotal) || 0}">${escapeHtml(T('tabs.disks'))}</tf-tab>
-        <tf-tab id="pools" icon="layers">${escapeHtml(T('tabs.pools'))}</tf-tab>
+        <tf-tab id="pools" icon="layers" count="${(Number(n.poolsTotal) || 0) + (Number(n.arraysTotal) || 0)}">${escapeHtml(T('tabs.pools'))}</tf-tab>
         <tf-tab id="shares" icon="share" count="${Number(n.sharesTotal) || 0}">${escapeHtml(T('tabs.shares'))}</tf-tab>
         <tf-tab id="jobs" icon="list" ${running ? `count="${running}" count-tone="accent"` : ''}>${escapeHtml(T('tabs.jobs'))}</tf-tab>
         <tf-tab id="environment" icon="os">${escapeHtml(T('tabs.environment'))}</tf-tab>
@@ -526,12 +526,23 @@ const TentaNasScreen = {
     if (!grid) return;
     const nodes = this.nodes;
     const ready = nodes.filter((n) => n.instanceStatus === 'ready');
+    // Warnings and failures are counted apart, because a node that has LOST a
+    // disk must not reach this screen as a warning. `disksWarning` counts
+    // warnings only (fleet.rs) and the worst state leads everywhere below.
     const warnNodes = nodes.filter((n) => n.disksWarning > 0);
     const warnDisks = nodes.reduce((a, n) => a + n.disksWarning, 0);
+    const critNodes = nodes.filter((n) => n.disksCritical > 0);
+    const critDisks = nodes.reduce((a, n) => a + n.disksCritical, 0);
     const cap = nodes.reduce((a, n) => a + n.capacityBytes, 0);
     const used = nodes.reduce((a, n) => a + n.usedBytes, 0);
+    // An Elastic Array is storage the node serves, so it is counted beside the
+    // ZFS pools the capacity spans — and `arraysUnmeasured` says how many
+    // arrays that capacity is MISSING, because a node leaves an array it
+    // could not measure out of both figures rather than half of one.
     const pools = nodes.reduce((a, n) => a + n.poolsTotal, 0);
-    const nasNodes = ready.filter((n) => n.poolsTotal > 0);
+    const arrays = nodes.reduce((a, n) => a + n.arraysTotal, 0);
+    const unmeasured = nodes.reduce((a, n) => a + n.arraysUnmeasured, 0);
+    const nasNodes = ready.filter((n) => n.poolsTotal + n.arraysTotal > 0);
     const unarmed = ready.filter((n) => channelMode(n.elevationMode) === 'unarmed');
     const shares = this.fleetShares();
     const loaded = Boolean(this.fleet);
@@ -546,10 +557,15 @@ const TentaNasScreen = {
       .map((p) => T('fleet.kpi_protocol', { n: shares.filter((s) => s.share.protocol === p).length, protocol: p.toUpperCase() }))
       .join(' · ');
 
-    patchHtml(root.querySelector('#nas-fleet-chips'), [
-      `<tf-chip status="${warnDisks ? 'warn' : 'ok'}" dot label="${escapeAttr(warnDisks
+    // The worst state leads: a failure is `err` and says "failures", and only
+    // a fleet with no failure at all falls back to the warning wording.
+    const diskChip = critDisks
+      ? { status: 'err', label: `${critDisks} ${T('kpi.failures_suffix', { n: critDisks })} (${critNodes.map((n) => n.nodeName).join(', ')})` }
+      : { status: warnDisks ? 'warn' : 'ok', label: warnDisks
         ? T('fleet.chip_warnings', { n: warnDisks, nodes: warnNodes.map((n) => n.nodeName).join(', ') })
-        : T('fleet.chip_ok'))}"></tf-chip>`,
+        : T('fleet.chip_ok') };
+    patchHtml(root.querySelector('#nas-fleet-chips'), [
+      `<tf-chip status="${diskChip.status}" dot label="${escapeAttr(diskChip.label)}"></tf-chip>`,
       loaded ? `<tf-chip status="${this.fleetServicesUp() ? 'ok' : 'warn'}" dot label="${escapeAttr(this.fleetServicesUp() ? T('fleet.chip_services') : T('fleet.chip_services_down'))}"></tf-chip>` : '',
     ].join(''));
 
@@ -564,7 +580,7 @@ const TentaNasScreen = {
     patchHtml(root.querySelector('#nas-fleet-badges'), [
       `<tf-chip status="accent" label="${escapeAttr(T('fleet.badge_nas', { n: nasNodes.length, nodes: nasNodes.map((n) => n.nodeName).join(' · ') }))}"></tf-chip>`,
       `<tf-chip status="${unarmed.length ? 'warn' : 'ok'}" icon="shield" label="${escapeAttr(T('fleet.badge_channels', { parts: channelParts || '—' }))}"></tf-chip>`,
-      `<tf-chip label="${escapeAttr(T('fleet.badge_pools', { n: pools, capacity: fmtBytes(cap) }))}"></tf-chip>`,
+      `<tf-chip label="${escapeAttr(T('fleet.badge_pools', { n: pools + arrays, capacity: fmtBytes(cap) }))}"></tf-chip>`,
       `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: nodes.length }))}"></tf-chip>`,
     ].join(''));
 
@@ -572,14 +588,25 @@ const TentaNasScreen = {
     const built = paintStatCards(kpi, [
       { key: 'capacity', attrs: {
         label: T('kpi.fleet_capacity'), value: fmtBytes(cap), icon: 'database',
-        delta: T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools }),
+        // An array the fleet could not measure is named, not folded in: the
+        // total above is then knowingly short of that array's disks, and a
+        // percentage the reader trusts has to say so.
+        delta: [
+          T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools + arrays }),
+          unmeasured ? T('kpi.capacity_unmeasured', { n: unmeasured }) : null,
+        ].filter(Boolean).join(' · '),
       } },
       { key: 'health', className: 'clickable', attrs: {
-        id: 'nas-fleet-health', label: T('kpi.fleet_health'), value: String(warnDisks),
-        suffix: T('kpi.warnings_suffix', { n: warnDisks }), icon: 'cylinder',
-        accent: warnDisks ? 'warning' : null,
-        delta: warnDisks ? T('kpi.fleet_health_on', { nodes: warnNodes.map((n) => n.nodeName).join(', ') }) : T('kpi.fleet_health_ok'),
-        'delta-type': warnDisks ? 'negative' : null,
+        // The worst state leads, as on the node's own disk tile: a failure
+        // counts as a failure and colours the tile `danger`, never `warning`.
+        id: 'nas-fleet-health', label: T('kpi.fleet_health'), value: String(critDisks || warnDisks),
+        suffix: critDisks ? T('kpi.failures_suffix', { n: critDisks }) : T('kpi.warnings_suffix', { n: warnDisks }),
+        icon: 'cylinder',
+        accent: critDisks ? 'danger' : warnDisks ? 'warning' : null,
+        delta: critDisks || warnDisks
+          ? T('kpi.fleet_health_on', { nodes: [...new Set([...critNodes, ...warnNodes])].map((n) => n.nodeName).join(', ') })
+          : T('kpi.fleet_health_ok'),
+        'delta-type': critDisks || warnDisks ? 'warn' : null,
       } },
       { key: 'resources', className: 'clickable', attrs: {
         id: 'nas-fleet-res', label: T('kpi.fleet_resources'), value: loaded ? String(shares.length) : '—', icon: 'share',
@@ -588,14 +615,18 @@ const TentaNasScreen = {
       { key: 'nodes', attrs: {
         label: T('kpi.nodes'), value: String(ready.length), suffix: T('kpi.fleet_nodes_suffix', { total: nodes.length }), icon: 'network',
         delta: unarmed.length ? T('kpi.node_unarmed', { node: unarmed[0].nodeName }) : null,
-        'delta-type': unarmed.length ? 'negative' : null,
+        'delta-type': unarmed.length ? 'warn' : null,
       } },
     ]);
     if (built) {
       // Wired once, so both read the fleet at CLICK time — a later poll must
       // not leave a tile pointing at a node that has since changed.
       kpi.querySelector('[data-kpi="health"]').addEventListener('click', () => {
-        const target = this.nodes.find((n) => n.disksWarning > 0) || this.nodes.find((n) => n.instanceStatus === 'ready');
+        // The failed node first: the tile that shows a failure must open the
+        // node that HAS it, not whichever node merely warns.
+        const target = this.nodes.find((n) => n.disksCritical > 0)
+          || this.nodes.find((n) => n.disksWarning > 0)
+          || this.nodes.find((n) => n.instanceStatus === 'ready');
         if (target) this.selectNode(target.nodeId, 'disks', { diskFilter: 'problems' });
       });
       kpi.querySelector('[data-kpi="resources"]').addEventListener('click', () => {
@@ -710,7 +741,11 @@ const TentaNasScreen = {
       n.uptimeSecs ? T('uptime', { d: fmtDuration(n.uptimeSecs) }) : null,
       n.isLocal ? T('this_node') : null,
     ].filter(Boolean).join(' · ');
-    const role = unsupported ? T('fleet.role_unsupported') : n.poolsTotal ? T('fleet.role_nas') : T('fleet.role_client');
+    // A node whose only storage is an Elastic Array serves the fleet exactly
+    // as a node with a ZFS pool does; reading `poolsTotal` alone called it a
+    // client.
+    const role = unsupported ? T('fleet.role_unsupported')
+      : n.poolsTotal + n.arraysTotal ? T('fleet.role_nas') : T('fleet.role_client');
     const kv = (k, v) => `<span class="kv-inline"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></span>`;
     return `
       <div class="${cls}" data-node="${escapeAttr(n.nodeId)}">
@@ -722,11 +757,12 @@ const TentaNasScreen = {
           </div>
           ${statusChip}
         </div>
-        <div class="split-bar" title="${usedPct}%"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
+        <div class="split-bar" title="${escapeAttr([usedPct + '%', n.arraysUnmeasured ? T('kpi.capacity_unmeasured', { n: n.arraysUnmeasured }) : null].filter(Boolean).join(' · '))}"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
         <div class="nc-stats">
           ${kv(T('kpi.capacity_total'), `${escapeHtml(fmtBytes(n.usedBytes))} / ${escapeHtml(fmtBytes(n.capacityBytes))}`)}
-          ${kv(T('kpi.disks'), `${n.disksTotal}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}`)}
+          ${kv(T('kpi.disks'), `${n.disksTotal}${n.disksCritical ? ` · <span class="num-err">${n.disksCritical}!</span>` : ''}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}`)}
           ${kv(T('kpi.pools'), String(n.poolsTotal))}
+          ${n.arraysTotal ? kv('Elastic Array', String(n.arraysTotal)) : ''}
           ${kv(T('kpi.shares'), String(n.sharesTotal))}
         </div>
         <div class="nc-foot">
@@ -806,7 +842,11 @@ const TentaNasScreen = {
       const zfs = (env.features || []).find((f) => f.id === 'zfs');
       const servicesUp = (env.features || []).some((f) => ['samba', 'nfs', 'iscsi', 'nvmet'].includes(f.id) && f.status === 'ok');
       this.root.querySelector('#nas-head-chips').innerHTML = [
-        `<tf-chip status="${node.disksWarning ? 'warn' : 'ok'}" dot label="${escapeAttr(node.disksWarning ? T('node.chip_disks_warn', { n: node.disksWarning }) : T('node.chip_ok'))}"></tf-chip>`,
+        // A failed disk is a failure on this chip too: reading `disksWarning`
+        // alone left a node that had lost a disk wearing an amber "warning".
+        `<tf-chip status="${node.disksCritical ? 'err' : node.disksWarning ? 'warn' : 'ok'}" dot label="${escapeAttr(node.disksCritical
+          ? `${node.disksCritical} ${T('kpi.failures_suffix', { n: node.disksCritical })}`
+          : node.disksWarning ? T('node.chip_disks_warn', { n: node.disksWarning }) : T('node.chip_ok'))}"></tf-chip>`,
         `<tf-chip status="${servicesUp ? 'ok' : 'warn'}" dot label="${escapeAttr(servicesUp ? T('fleet.chip_services') : T('fleet.chip_services_down'))}"></tf-chip>`,
       ].join('');
       const badges = [
@@ -1303,7 +1343,11 @@ const TentaNasScreen = {
         delta: warned.length
           ? warned.slice(0, 3).map((d) => `${d.name}: ${d.healthReason}`).join(' · ')
           : T('kpi.disk_health_ok'),
-        'delta-type': warned.length ? 'negative' : null,
+        // Same trap one field down, and it had caught us: `delta-type` has its
+        // OWN allowlist (up | down | warn | neutral, tf-stat-card.js:11) and
+        // 'negative' is not in it, so the tile fell back to `neutral` — no ⚠,
+        // no warn colour — on three of the eight KPI tiles.
+        'delta-type': warned.length ? 'warn' : null,
       } },
       { key: 'iops', attrs: { label: T('kpi.iops'), value: String(iops), icon: 'trend', ...iopsBaseline(iops, disksRes.iopsHourAvg) } },
       { key: 'throughput', attrs: {
@@ -3006,7 +3050,10 @@ function normalizeNode(n) {
     ...n,
     disksTotal: Number(n.disksTotal) || 0,
     disksWarning: Number(n.disksWarning) || 0,
+    disksCritical: Number(n.disksCritical) || 0,
     poolsTotal: Number(n.poolsTotal) || 0,
+    arraysTotal: Number(n.arraysTotal) || 0,
+    arraysUnmeasured: Number(n.arraysUnmeasured) || 0,
     sharesTotal: Number(n.sharesTotal) || 0,
     alertsActive: Number(n.alertsActive) || 0,
     capacityBytes: Number(n.capacityBytes) || 0,

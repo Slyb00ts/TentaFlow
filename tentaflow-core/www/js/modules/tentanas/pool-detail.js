@@ -859,6 +859,14 @@ export function openAddVdevDialog(screen, pool, initialRole, freeDisks, onDone) 
   win.setAttribute('initial-y', 'center');
   const state = { role: initialRole || 'data', diskIds: new Set(), layout: '', busy: false };
   const roles = ['data', 'cache', 'log', 'spare', 'special'];
+  // A log or special vdev only pays for itself on flash: a SLOG exists to cut
+  // write latency and a special vdev to serve metadata, and a spinning disk
+  // does neither. `pool.hint_special` already promises "metadane + małe bloki
+  // na NVMe" — nothing enforced it, so the dialog would happily build either
+  // out of HDDs, and neither can be removed from a raidz pool afterwards.
+  // Only 'hdd' is refused, never 'unknown': a disk whose media the inventory
+  // could not read may well be flash, and refusing it would be a guess.
+  const FLASH_ROLES = new Set(['log', 'special']);
 
   win.innerHTML = `
     <div slot="body" class="stack">
@@ -892,7 +900,15 @@ export function openAddVdevDialog(screen, pool, initialRole, freeDisks, onDone) 
     const layouts = vdevLayouts(state.role, state.diskIds.size);
     if (!layouts.includes(state.layout)) state.layout = layouts[layouts.length - 1] || '';
     layoutSel.setOptions(layouts.map((l) => ({ value: l, label: layoutLabel(l) })), state.layout);
-    if (state.diskIds.size && state.layout && !state.busy) btn.removeAttribute('disabled');
+    const spinning = FLASH_ROLES.has(state.role)
+      ? freeDisks.filter((d) => state.diskIds.has(d.diskId) && d.kind === 'hdd')
+      : [];
+    const err = win.querySelector('#nas-av-error');
+    err.textContent = spinning.length
+      ? T('add_vdev.flash_only', { role: T('pool.role_' + state.role), disks: spinning.map((d) => d.name).join(', ') })
+      : '';
+    err.hidden = spinning.length === 0;
+    if (state.diskIds.size && state.layout && !state.busy && !spinning.length) btn.removeAttribute('disabled');
     else btn.setAttribute('disabled', '');
   };
   roleSel.addEventListener('change', (e) => { state.role = e.detail.value; sync(); });

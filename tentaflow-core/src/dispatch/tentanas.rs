@@ -418,7 +418,7 @@ fn disk_get(ctx: &HandlerContext, disk_id: &str) -> Result<MessageBody, Protocol
     let history = store::history_since(&g.db, disk_id, &since).map_err(|e| internal("samples", e))?;
     let alerts = store::alerts_for_subject(&g.db, "disk", disk_id).map_err(|e| internal("alerts", e))?;
     let (all, telemetry) = tentanas::disks::snapshot();
-    let spares: Vec<NasDisk> = all.into_iter().filter(|d| d.role == "spare").collect();
+    let spares: Vec<NasDisk> = all.into_iter().filter(|d| d.vdev_role == "spare").collect();
     let advice = tentanas::disks::advice_for(&g.db, &disk, &spares);
     Ok(tn(P::DiskGetResponse {
         disk,
@@ -1805,7 +1805,8 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let datasets = tentanas::datasets::list("")
         .await
         .map_err(|e| broker_error("datasets", e))?;
-    let source = tentanas::shares::resolve_source(&datasets, source_path)
+    let arrays = store::elastic_arrays_all(&g.db).map_err(|e| internal("elastic arrays", e))?;
+    let source = tentanas::shares::resolve_source(&datasets, &arrays, source_path)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let now = store::now();
     let row = store::ShareRow {
@@ -3252,6 +3253,66 @@ async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSec
     Ok(job_response(job))
 }
 
+/// A refusal from the import path is an answer the admin has to read — "this
+/// member no longer carries the UUID its journal recorded" — and not a server
+/// fault. Only the privilege channel failing is, and that arrives as a
+/// `BrokerError`, so it keeps `broker_error`'s classification.
+fn import_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    match error.downcast::<BrokerError>() {
+        Ok(broker) => broker_error(scope, broker),
+        Err(other) => ProtocolError::bad_request(other.to_string()),
+    }
+}
+
+/// Arrays this node holds on disk but has no database record of. Read-only,
+/// and privileged for the same reason `pool_import_scan` is: the journals live
+/// under `/var/lib/tentanas`, which is `0700 root`, while the service runs
+/// unprivileged — so there is no unprivileged way to learn that a lost array
+/// exists at all.
+async fn elastic_import_scan(
+    ctx: &HandlerContext,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_destructive(ctx)?;
+    let explicit = secret.map(token);
+    let candidates =
+        tentanas::elastic::import_scan(&g.db, &elastic_owner(&g), explicit.as_deref())
+            .await
+            .map_err(|e| privileged_error("elastic import scan", e))?;
+    Ok(tn(P::ElasticArrayImportScanResponse { candidates }))
+}
+
+/// Adopts one scanned array into THIS addon's database, and re-owns its
+/// journal so the adopted array can actually be operated. Answers with the
+/// adopted array, so the screen that asked can show what it now has.
+async fn elastic_import(
+    ctx: &HandlerContext,
+    array_id: &str,
+    confirm_name: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_destructive(ctx)?;
+    tentanas_helper::elastic::validate_elastic_uuid(array_id)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let owner = elastic_owner(&g);
+    let explicit = secret.map(token);
+    let name = tentanas::elastic::import_apply(
+        &g.db,
+        &owner,
+        array_id,
+        confirm_name,
+        &g.user_id,
+        explicit.as_deref(),
+    )
+    .await
+    .map_err(|e| import_error("elastic import", e))?;
+    let array = tentanas::elastic::get(&g.db, &owner, &name)
+        .await
+        .map_err(|e| internal("elastic get", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    Ok(tn(P::ElasticArrayGetResponse { array }))
+}
+
 async fn elastic_snapraid(
     ctx: &HandlerContext,
     name: &str,
@@ -4127,6 +4188,14 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 .map_err(|e| internal("elastic get",e))?.ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
             Ok(tn(P::ElasticArrayGetResponse {array}))
         }
+        P::ElasticArrayImportScanRequest { sudo_password } => {
+            elastic_import_scan(ctx, sudo_password.as_ref()).await
+        }
+        P::ElasticArrayImportRequest {
+            array_id,
+            confirm_name,
+            sudo_password,
+        } => elastic_import(ctx, array_id, confirm_name, sudo_password.as_ref()).await,
         P::ElasticCapabilitiesRequest {} => elastic_capabilities(ctx).await,
         P::ElasticArrayPlanRequest {
             name,
@@ -4190,6 +4259,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::ElasticCapabilitiesResponse { .. }
         | P::ElasticArrayPlanResponse { .. }
         | P::ElasticArraysListResponse { .. }
+        | P::ElasticArrayImportScanResponse { .. }
         | P::ElasticArrayGetResponse { .. } => {
             Err(ProtocolError::bad_request("response variant sent as request"))
         }
@@ -4445,6 +4515,14 @@ register_tentanas_variant!(
     "tentaflow_ws_handler_nas_elastic_array_plan"
 );
 register_tentanas_variant!("TentaNasElasticArrayCreateRequest", "tentaflow_ws_handler_nas_elastic_create");
+register_tentanas_variant!(
+    "TentaNasElasticArrayImportScanRequest",
+    "tentaflow_ws_handler_nas_elastic_import_scan"
+);
+register_tentanas_variant!(
+    "TentaNasElasticArrayImportRequest",
+    "tentaflow_ws_handler_nas_elastic_import"
+);
 register_tentanas_variant!("TentaNasElasticArraysListRequest", "tentaflow_ws_handler_nas_elastic_list");
 register_tentanas_variant!("TentaNasElasticArrayGetRequest", "tentaflow_ws_handler_nas_elastic_get");
 register_tentanas_variant!("TentaNasElasticArrayRestoreRequest", "tentaflow_ws_handler_nas_elastic_restore");
@@ -4629,6 +4707,46 @@ mod registration_tests {
         assert!(store::list_jobs(&g.db,100).unwrap().is_empty());
         assert!(store::elastic_claims(&g.db).unwrap().is_empty());
         assert_eq!(tentanas::elevation::audit_entries(&g.db),0);
+    }
+
+    /// The recovery path is admin-only and validates what it was given before
+    /// it asks for root, and a node with no privilege channel says what to do
+    /// about it rather than failing opaquely — the journals are unreachable
+    /// without that channel, so this is the first thing an admin meets.
+    #[tokio::test]
+    async fn the_array_import_gates_and_validates_before_it_ever_asks_for_root() {
+        let mut fixture = dispatch_fixture();
+        let array_id = "11111111-1111-4111-8111-111111111111";
+        for denied in [
+            elastic_import_scan(&fixture.ctx, None).await.unwrap_err(),
+            elastic_import(&fixture.ctx, array_id, "media", None).await.unwrap_err(),
+        ] {
+            assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        }
+
+        elastic_admin(&mut fixture);
+        // An array is addressed by its journal id. Anything that is not one is
+        // refused in the handler, never handed to the privilege channel.
+        let bad = elastic_import(&fixture.ctx, "media", "media", None).await.unwrap_err();
+        assert_eq!(bad.code, ProtocolErrorCode::BadRequest);
+
+        for (scope, error) in [
+            ("scan", elastic_import_scan(&fixture.ctx, None).await.unwrap_err()),
+            ("adopt", elastic_import(&fixture.ctx, array_id, "media", None).await.unwrap_err()),
+        ] {
+            assert_eq!(error.code, ProtocolErrorCode::NotAvailable, "{scope}: {}", error.message);
+            assert!(
+                error.message.contains("TentaNas") && error.message.contains("konfiguracji kanału"),
+                "{scope} musi nazwać lekarstwo: {}",
+                error.message
+            );
+        }
+
+        // And nothing was written on the way to any of those refusals.
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty());
+        assert!(store::elastic_array_identities(&g.db).unwrap().is_empty());
+        assert_eq!(tentanas::elevation::audit_entries(&g.db), 0);
     }
 
     #[tokio::test]

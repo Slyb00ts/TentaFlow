@@ -122,13 +122,36 @@ test('the history filters narrow the finished jobs', async () => {
   filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'errors' } }));
   await flush();
   assert.deepEqual(history.rows.map((r) => r._job.jobId), ['j3']);
-  assert.deepEqual(filters.filters.map((f) => f.id), ['all', 'errors', 'scrub'], 'n15 offers three history filters');
+  assert.deepEqual(filters.filters.map((f) => f.id), ['all', 'errors', 'scrub', 'mover'], 'n15 offers four history filters');
   filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'scrub' } }));
   await flush();
   assert.deepEqual(history.rows.map((r) => r._job.jobId), ['j3'], 'replace counts as a scrub-family job');
   filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'all' } }));
   await flush();
   assert.equal(history.rows.length, 2);
+  screen.dispose();
+});
+
+test('the mover filter finds the cache drains and nothing else', async () => {
+  const moverJobs = [
+    ...jobs,
+    { jobId: 'j4', kind: 'elastic_mover', subject: 'media', status: 'succeeded', startedBy: 'scheduler', startedAt: '2026-09-02 01:00:00', finishedAt: '2026-09-02 01:04:00' },
+  ];
+  const screen = fakeScreen(fixtures({ tentaNasJobsListRequest: { jobs: moverJobs } }));
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  const filters = body.querySelector('#nas-jobs-filters');
+  const history = body.querySelector('#nas-jobs-table');
+  assert.equal(filters.filters.find((f) => f.id === 'mover').label, 'Przenoszenie (Mover)');
+  filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'mover' } }));
+  await flush();
+  assert.deepEqual(history.rows.map((r) => r._job.jobId), ['j4']);
+  assert.match(history.rows[0].task, /Mover · Uruchom teraz/, 'the row keeps the job-history spelling');
+  // The scrub family must not swallow the mover, nor the mover the scrubs.
+  filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'scrub' } }));
+  await flush();
+  assert.deepEqual(history.rows.map((r) => r._job.jobId), ['j3']);
   screen.dispose();
 });
 
@@ -305,7 +328,7 @@ test('n15 lists the Elastic cadences and the mover toggle never overwrites its r
   await drawTasks(screen, body);
   await flush();
   const rows = scheduleRows(body);
-  assert.match(rows[0].textContent, /Mover macierzy media/);
+  assert.match(rows[0].textContent, /Przenoszenie z cache: media \(Mover\)/);
   assert.match(rows[1].textContent, /SnapRAID sync media/);
 
   flipToggle(rows[0], false);

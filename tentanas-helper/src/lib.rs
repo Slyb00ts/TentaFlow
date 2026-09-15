@@ -329,6 +329,14 @@ pub enum HelperCommand {
     ElasticScrub { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticInspect { array_id: String, owner: elastic::ElasticOwner },
     ElasticClaims { name: Option<String> },
+    /// Every Elastic journal on this node, whatever its owner. Owner-blind on
+    /// purpose: a journal whose owner no longer matches the addon asking is
+    /// exactly what an import scan exists to find.
+    ElasticJournals {},
+    /// Re-owns one journal so the adopting addon can operate the array. The
+    /// ONLY command that changes a persisted spec, and it changes nothing but
+    /// the owner.
+    ElasticAdopt { array_id: String, owner: elastic::ElasticOwner },
     /// `smartctl --json=c -x <device>`: identity, health, attributes, NVMe log
     /// and the self-test log in one JSON document.
     SmartctlInfo { device: String },
@@ -1965,6 +1973,8 @@ impl HelperCommand {
             Self::ElasticScrub { .. } => Some("elastic_scrub"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
             Self::ElasticClaims { .. } => Some("elastic_claims"),
+            Self::ElasticJournals {} => Some("elastic_journals"),
+            Self::ElasticAdopt { .. } => Some("elastic_adopt"),
             Self::SmbIncludeEnsure {} => Some("smb_include_ensure"),
             Self::SmbIncludeRemove {} => Some("smb_include_remove"),
             Self::SmbConfigWrite {} => Some("smb_config_write"),
@@ -2040,6 +2050,11 @@ impl HelperCommand {
                 Some(name) => elastic::validate_array_name(name),
                 None => Ok(()),
             },
+            Self::ElasticJournals {} => Ok(()),
+            Self::ElasticAdopt { array_id, owner } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                owner.validate()
+            }
             Self::SmbIncludeEnsure {}
             | Self::SmbIncludeRemove {}
             | Self::SmbConfigWrite {}
@@ -2691,6 +2706,8 @@ impl HelperCommand {
             Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
+            Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym węźle."),
+            Self::ElasticAdopt { .. } => ("builtin", "Przepisuje właściciela dziennika macierzy Elastic na przejmującą instancję."),
             Self::SmartctlInfo { .. } => (
                 "smartctl",
                 "Read one disk's SMART/NVMe health document (identity, attributes, self-test log).",
@@ -2873,6 +2890,8 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ElasticScrub { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::ElasticClaims { name: Some(s()) },
+        HelperCommand::ElasticJournals {},
+        HelperCommand::ElasticAdopt { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::SmartctlInfo { device: s() },
         HelperCommand::SmartctlSelfTest {
             device: s(),
