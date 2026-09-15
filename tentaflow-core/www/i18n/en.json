@@ -7923,6 +7923,17 @@
       "badge_channel": "Permission channel: {mode}",
       "badge_ram": "{v} RAM"
     },
+    "tiering": {
+      "title": "Tiering and write cache",
+      "subtitle": "{name} — fast tier (cache) and data disks",
+      "cache_tier": "Cache (fast tier)",
+      "data_tier": "Data disks",
+      "waiting": "Waiting for the mover",
+      "waiting_hint": "SnapRAID does not cover the cache, so data waiting for the mover is not protected by parity.",
+      "bar_title": "cache {cache} · data disks {data}",
+      "files": "{n} files",
+      "no_runs": "no runs recorded"
+    },
     "arc": {
       "title": "ZFS RAM cache (ARC)",
       "change_limit": "Change limit ({pct}% RAM)",

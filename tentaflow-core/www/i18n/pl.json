@@ -7974,6 +7974,17 @@
       "badge_channel": "Kanał uprawnień: {mode}",
       "badge_ram": "{v} RAM"
     },
+    "tiering": {
+      "title": "Tiering i cache zapisu",
+      "subtitle": "{name} — szybka warstwa (cache) i dyski danych",
+      "cache_tier": "Cache (szybka warstwa)",
+      "data_tier": "Dyski danych",
+      "waiting": "Czeka na mover",
+      "waiting_hint": "SnapRAID nie obejmuje cache'u, więc dane czekające na movera nie są chronione parzystością.",
+      "bar_title": "cache {cache} · dyski danych {data}",
+      "files": "{n} plików",
+      "no_runs": "brak zapisanych przebiegów"
+    },
     "arc": {
       "title": "Cache ZFS w RAM (ARC)",
       "change_limit": "Zmień limit ({pct}% RAM)",

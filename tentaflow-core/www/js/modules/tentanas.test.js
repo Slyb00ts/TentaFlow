@@ -2267,3 +2267,59 @@ test('with warnings only, the health tile stays a warning', async () => {
     Screen.unmount();
   }
 });
+
+// n02's "Tiering i cache zapisu". Every figure it shows was already measured
+// and already on the wire; `cacheUnprotectedBytes` in particular is the
+// canonical "18 GiB na cache bez parity" that the spec asks for in several
+// places and that no screen had ever read.
+const tieredArray = (overrides) => elasticArray({
+  cacheSizeBytes: 1 * TIB, cacheUsedBytes: 0.25 * TIB,
+  protection: { status: 'window_open', cacheUnprotectedBytes: 18 * 1024 ** 3 },
+  moverHistory: [{ startedAt: '2026-09-15 14:00:00', outcome: 'ok', movedBytes: 42 * 1024 ** 3, movedFiles: 118 }],
+  ...overrides,
+});
+
+test('the tiering card names both tiers, what waits for the mover, and the last run', async () => {
+  stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: { arrays: [tieredArray()] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+
+  const card = root.querySelector('#nas-ov-tier-card');
+  assert.equal(card.hidden, false, 'a node with a cache tier has tiering to show');
+  assert.equal(root.querySelector('#nas-ov-arc-row').getAttribute('data-single'), null,
+    'the row is two columns when both cards are there');
+
+  const block = root.querySelector('#nas-ov-tier .tier-block[data-array="produkt"]');
+  assert.ok(block, 'one block per tiered array');
+  const text = block.textContent;
+  assert.match(text, /Cache \(szybka warstwa\)/);
+  assert.match(text, /Dyski danych/);
+  assert.match(text, /18(\.0)? GiB/, 'the bytes waiting for the mover are finally on a screen');
+  assert.match(text, /118 plików/, 'the last mover run carries its file count');
+  assert.match(text, /nie są chronione parzystością/, 'and it says why those bytes are at risk');
+  assert.ok(block.querySelector('.split-bar'), 'both sides measured, so the bar is drawn');
+  Screen.unmount();
+});
+
+test('a node with no cache tier hides the tiering card and gives ARC the whole row', async () => {
+  stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: { arrays: [elasticArray()] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  assert.equal(root.querySelector('#nas-ov-tier-card').hidden, true,
+    'an array without a cache disk has no tiering to describe');
+  assert.equal(root.querySelector('#nas-ov-arc-row').getAttribute('data-single'), '1');
+  assert.equal(root.querySelector('#nas-ov-tier .tier-block'), null);
+  Screen.unmount();
+});
+
+test('the tiering bar is omitted when only one side was measured', async () => {
+  stubTransport({ ...fixtures,
+    tentaNasElasticArraysListRequest: { arrays: [tieredArray({ cacheUsedBytes: null })] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const block = root.querySelector('#nas-ov-tier .tier-block');
+  assert.ok(block, 'the rows are still there');
+  assert.equal(block.querySelector('.split-bar'), null,
+    'half a split drawn as a bar would read as a measurement');
+  Screen.unmount();
+});

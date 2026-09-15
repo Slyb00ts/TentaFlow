@@ -6707,6 +6707,17 @@
       "badge_channel": "Rechtekanal: {mode}",
       "badge_ram": "{v} RAM"
     },
+    "tiering": {
+      "title": "Tiering und Schreibcache",
+      "subtitle": "{name} — schnelle Schicht (Cache) und Datenlaufwerke",
+      "cache_tier": "Cache (schnelle Schicht)",
+      "data_tier": "Datenlaufwerke",
+      "waiting": "Wartet auf den Mover",
+      "waiting_hint": "SnapRAID deckt den Cache nicht ab, daher sind Daten, die auf den Mover warten, nicht durch Parität geschützt.",
+      "bar_title": "Cache {cache} · Datenlaufwerke {data}",
+      "files": "{n} Dateien",
+      "no_runs": "keine Durchläufe aufgezeichnet"
+    },
     "arc": {
       "title": "ZFS-Cache im RAM (ARC)",
       "change_limit": "Limit ändern ({pct}% RAM)",

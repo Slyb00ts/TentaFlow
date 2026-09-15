@@ -1064,12 +1064,24 @@ const TentaNasScreen = {
         <div id="nas-ov-error"></div>
         <div class="kpi" id="nas-ov-kpi"></div>
         <div id="nas-ov-telemetry"></div>
-        <div class="section-card">
-          <div class="section-card-head">
-            <div class="title">${sprite('cpu')} ${escapeHtml(T('arc.title'))}</div>
-            <div class="actions" id="nas-ov-arc-actions"></div>
+        <div class="grid-2" id="nas-ov-arc-row" data-single="1">
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title">${sprite('cpu')} ${escapeHtml(T('arc.title'))}</div>
+              <div class="actions" id="nas-ov-arc-actions"></div>
+            </div>
+            <div id="nas-ov-arc"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
           </div>
-          <div id="nas-ov-arc"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
+          <!-- n02's "Tiering i cache zapisu", beside ARC as the mockup draws
+               it. Hidden, and the row collapses to one column, on a node with
+               no cache tier to describe: a permanently empty card next to a
+               populated one reads as a broken panel. -->
+          <div class="section-card" id="nas-ov-tier-card" hidden>
+            <div class="section-card-head">
+              <div class="title">${sprite('zap')} ${escapeHtml(T('tiering.title'))}</div>
+            </div>
+            <div id="nas-ov-tier"></div>
+          </div>
         </div>
         <div class="grid-2">
           <div class="section-card">
@@ -1367,6 +1379,7 @@ const TentaNasScreen = {
 
     this.paintArcCard(body, arcRes.arc);
     this.paintPoolsMini(body, pools, arrays);
+    this.paintTiering(body, arrays);
 
     // tf-chip._update() empties its span and rebuilds it, so a raw setAttribute
     // with an unchanged value blinked this counter on every 5 s poll.
@@ -1427,6 +1440,70 @@ const TentaNasScreen = {
   // Both kinds of pool live here, ZFS first and then the Elastic Arrays, in
   // ONE patched string: an unchanged poll compares equal and writes nothing,
   // so every row on screen survives it as the same node.
+  // n02's tiering card. Every figure here was already measured, already on
+  // the wire and read by NOTHING: `cacheUnprotectedBytes` in particular is the
+  // canonical "18 GiB na cache bez parity" the spec asks for in several
+  // places and no screen has ever shown.
+  //
+  // What the mockup draws and this does NOT: a share spanning a fast ZFS
+  // dataset and an archive pool, and a write-cache hit ratio. Neither exists
+  // in the product — cross-pool tiering is a storage model, not a panel, and
+  // nothing measures the hit ratio. Inventing either here would put a number
+  // on the dashboard that no code stands behind.
+  paintTiering(body, arrays = []) {
+    const row = body.querySelector('#nas-ov-arc-row');
+    const card = body.querySelector('#nas-ov-tier-card');
+    const host = body.querySelector('#nas-ov-tier');
+    if (!card || !host) return;
+    // Only an array with a cache tier has tiering to describe.
+    const tiered = arrays.filter((a) => a && Number(a.cacheSizeBytes) > 0);
+    card.hidden = tiered.length === 0;
+    setAttr(row, 'data-single', tiered.length ? null : '1');
+    if (!tiered.length) {
+      patchKeyedList(host, []);
+      return;
+    }
+    patchKeyedList(host, tiered.map((a) => ({ key: a.name, html: this.tierBlockHtml(a) })));
+  },
+
+  tierBlockHtml(a) {
+    // `Number(null)` is 0, not NaN, so an `Number.isFinite` guard alone turns
+    // "not measured" into "zero used" — the one conflation this protocol has
+    // its own test for. Absence is checked BEFORE the conversion.
+    const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+    const cacheUsed = num(a.cacheUsedBytes);
+    const dataUsed = num(a.usedBytes);
+    // A bar drawn from a half-known split is worse than no bar: it looks like
+    // a measurement. Both sides or neither, the rule this file already applies
+    // to the capacity KPI.
+    const bar = cacheUsed !== null && dataUsed !== null && cacheUsed + dataUsed > 0
+      ? (() => {
+        const total = cacheUsed + dataUsed;
+        const cachePct = Math.round((cacheUsed / total) * 100);
+        return `<div class="split-bar" title="${escapeAttr(T('tiering.bar_title', {
+          cache: fmtBytes(cacheUsed), data: fmtBytes(dataUsed),
+        }))}"><span style="width:${cachePct}%"></span><span class="warn" style="width:${100 - cachePct}%"></span></div>`;
+      })()
+      : '';
+    const waiting = a.protection?.cacheUnprotectedBytes;
+    const run = (a.moverHistory || [])[0] || null;
+    const runText = run
+      ? `${fmtAgo(run.startedAt)} · ${fmtBytes(Number(run.movedBytes) || 0)} · ${T('tiering.files', { n: Number(run.movedFiles) || 0 })}`
+      : T('tiering.no_runs');
+    const sr = (k, v, cls = '') => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v ${cls}">${escapeHtml(v)}</span></div>`;
+    return `<div class="tier-block" data-array="${escapeAttr(a.name)}">
+      <div class="text-3">${escapeHtml(T('tiering.subtitle', { name: a.name }))}</div>
+      ${bar}
+      <div class="stat-rows mt-sm">
+        ${sr(T('tiering.cache_tier'), `${fmtOptionalBytes(a.cacheUsedBytes)} / ${fmtOptionalBytes(a.cacheSizeBytes)}`)}
+        ${sr(T('tiering.data_tier'), `${fmtOptionalBytes(a.usedBytes)} / ${fmtOptionalBytes(a.usableBytes)}`)}
+        ${sr(T('tiering.waiting'), fmtOptionalBytes(waiting), Number(waiting) > 0 ? 'num-warn' : '')}
+        ${sr(T('elastic.mover_last_run'), runText)}
+      </div>
+      <div class="muted mt-sm">${escapeHtml(T('tiering.waiting_hint'))}</div>
+    </div>`;
+  },
+
   paintPoolsMini(body, pools, arrays = []) {
     const host = body.querySelector('#nas-ov-pools');
     if (!host) return;

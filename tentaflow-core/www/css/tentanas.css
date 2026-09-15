@@ -24,6 +24,10 @@
    while its cards were 380-407px wide and ran off-screen with no way to scroll
    to them. The two-column rule above already uses minmax(0, 1fr). */
 @media (max-width: 960px) { .nas-root .grid-2 { grid-template-columns: minmax(0, 1fr); } }
+/* A two-column row whose second card is hidden must not leave its track empty:
+   the visible card would sit at half width beside nothing. */
+.nas-root .grid-2[data-single="1"] { grid-template-columns: minmax(0, 1fr); }
+.nas-root .tier-block + .tier-block { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
 
 .nas-root .section-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .nas-root .section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }

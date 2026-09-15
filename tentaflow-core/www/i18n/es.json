@@ -6707,6 +6707,17 @@
       "badge_channel": "Canal de privilegios: {mode}",
       "badge_ram": "{v} RAM"
     },
+    "tiering": {
+      "title": "Tiering y caché de escritura",
+      "subtitle": "{name}: capa rápida (caché) y discos de datos",
+      "cache_tier": "Caché (capa rápida)",
+      "data_tier": "Discos de datos",
+      "waiting": "Esperando al mover",
+      "waiting_hint": "SnapRAID no cubre la caché, así que los datos que esperan al mover no están protegidos por paridad.",
+      "bar_title": "caché {cache} · discos de datos {data}",
+      "files": "{n} archivos",
+      "no_runs": "sin ejecuciones registradas"
+    },
     "arc": {
       "title": "Caché ZFS en RAM (ARC)",
       "change_limit": "Cambiar el límite ({pct}% de RAM)",
