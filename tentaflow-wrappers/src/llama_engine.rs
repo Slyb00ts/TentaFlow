@@ -53,6 +53,7 @@ pub enum SpeculativeMode {
     },
 }
 
+#[cfg(feature = "llama")]
 impl SpeculativeMode {
     // Liczba snapshotów stanu rekurencyjnego wymagana, by rollback (seq_rm) działał
     // dla modeli rekurencyjnych. Musi być >= maksymalnej długości draftu. Dotyczy

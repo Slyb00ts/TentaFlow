@@ -2688,7 +2688,7 @@ pub(crate) mod execution {
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
                 || (metadata.uid() != 0 && metadata.uid() != uid)
-                || (metadata.mode() & 0o022 != 0 && metadata.mode() & libc::S_ISVTX as u32 == 0)
+                || (metadata.mode() & 0o022 != 0 && metadata.mode() as libc::mode_t & libc::S_ISVTX == 0)
                 || (private
                     && current == path
                     && (metadata.uid() != uid || metadata.mode() & 0o777 != 0o700))
@@ -3690,29 +3690,17 @@ pub(crate) mod execution {
             .map_err(|e| e.to_string())?;
         let key = CString::new(format!("user.mergerfs.{option}")).map_err(|e| e.to_string())?;
         let mut bytes = vec![0u8; 16384];
-        // Apple's getxattr carries two extra trailing arguments (position, options);
-        // this path only ever runs on Linux, the cfg exists so the crate builds on macOS.
         let size = unsafe {
-            #[cfg(target_os = "linux")]
-            {
-                libc::getxattr(
-                    path.as_ptr(),
-                    key.as_ptr(),
-                    bytes.as_mut_ptr().cast(),
-                    bytes.len(),
-                )
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                libc::getxattr(
-                    path.as_ptr(),
-                    key.as_ptr(),
-                    bytes.as_mut_ptr().cast(),
-                    bytes.len(),
-                    0,
-                    0,
-                )
-            }
+            libc::getxattr(
+                path.as_ptr(),
+                key.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                #[cfg(target_os = "macos")]
+                0,
+                #[cfg(target_os = "macos")]
+                0,
+            )
         };
         if size < 0 {
             return Err(format!(
@@ -3770,6 +3758,8 @@ pub(crate) mod execution {
                 key.as_ptr(),
                 value.as_ptr().cast(),
                 value.len(),
+                #[cfg(target_os = "macos")]
+                0,
                 0,
             )
         } != 0
@@ -3796,7 +3786,11 @@ pub(crate) mod execution {
     /// busy mountpoint has to be an error the admin reads.
     fn unmount_path(mountpoint: &Path) -> Result<(), String> {
         let path = cpath_at(mountpoint)?;
-        if unsafe { libc::umount2(path.as_ptr(), 0) } == 0 {
+        #[cfg(target_os = "macos")]
+        let result = unsafe { libc::unmount(path.as_ptr(), 0) };
+        #[cfg(not(target_os = "macos"))]
+        let result = unsafe { libc::umount2(path.as_ptr(), 0) };
+        if result == 0 {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -8738,8 +8732,8 @@ pub(crate) mod execution {
             if metadata.file_type().is_block_device()
                 && numbers.contains(&format!(
                     "{}:{}",
-                    libc::major(metadata.rdev()),
-                    libc::minor(metadata.rdev())
+                    libc::major(metadata.rdev() as libc::dev_t),
+                    libc::minor(metadata.rdev() as libc::dev_t)
                 ))
             {
                 return Ok(true);
@@ -9007,7 +9001,7 @@ pub(crate) mod execution {
         )?)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) mod tests {
         use super::*;
         use std::os::fd::FromRawFd;
