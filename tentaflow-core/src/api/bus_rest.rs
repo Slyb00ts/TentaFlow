@@ -43,7 +43,6 @@ use crate::api::openai::server::OpenAIBody;
 use crate::auth::acl::Principal;
 use crate::bus::groups::CommitMode;
 use crate::bus::instance::BusInstanceId;
-use crate::bus::topics::TopicOptions;
 use crate::bus::{
     self, BusCallContext, BusServiceError, ConsumerConfig, FetchedRecordMeta, PublishBatch,
     PublishRecord, TopicPartition,
@@ -205,7 +204,10 @@ fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
         BusServiceError::TopicNotFound { .. } => {
             error_response(StatusCode::NOT_FOUND, "not_found_error", e.to_string())
         }
-        BusServiceError::PermissionDenied { .. } => {
+        // PLAN §7.2: the org's `bus.autocreate` ceiling refused the
+        // auto-creation this request opted into — a policy denial about the
+        // org, the same class as an ACL one, not a malformed request.
+        BusServiceError::PermissionDenied { .. } | BusServiceError::AutocreateDisabled { .. } => {
             error_response(StatusCode::FORBIDDEN, "permission_error", e.to_string())
         }
         BusServiceError::QuotaExceeded { retry_after_ms }
@@ -223,7 +225,8 @@ fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
         }
         BusServiceError::QuotaRequestTooLarge { .. }
         | BusServiceError::MaxTopicsExceeded { .. }
-        | BusServiceError::MaxPartitionsExceeded { .. } => error_response(
+        | BusServiceError::MaxPartitionsExceeded { .. }
+        | BusServiceError::MaxBytesTotalExceeded { .. } => error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "quota_exceeded",
             e.to_string(),
@@ -665,7 +668,7 @@ pub async fn handle_publish(
     let result = tokio::task::block_in_place(|| match svc.publish(&ctx, &topic, batch.clone()) {
         Ok(r) => Ok(r),
         Err(BusServiceError::TopicNotFound { .. }) if create_if_missing => svc
-            .create_topic(&ctx, &topic, TopicOptions::default())
+            .autocreate_topic(&ctx, &topic)
             .and_then(|_| svc.publish(&ctx, &topic, batch)),
         Err(e) => Err(e),
     });
@@ -856,6 +859,10 @@ pub async fn handle_consume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests still provision topics explicitly; the handler's own
+    // auto-create path goes through `BusService::autocreate_topic`, which
+    // picks the options itself.
+    use crate::bus::topics::TopicOptions;
 
     #[test]
     fn parse_bus_records_path_matches_the_legacy_shape() {

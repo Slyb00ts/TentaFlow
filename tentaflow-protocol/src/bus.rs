@@ -53,7 +53,11 @@ pub struct BusTopicOptionsWire {
     /// 'delete' | 'compact'.
     #[serde(default)]
     pub cleanup_policy: Option<String>,
-    /// 'at_least_once' | 'fire_and_forget'.
+    /// 'at_least_once'. `'fire_and_forget'` still parses (topics persisted
+    /// before the server started refusing it carry the string), but a
+    /// create/update that SENDS it is rejected — the mode is not
+    /// implemented and every topic is served at-least-once. See
+    /// `bus::topics::reject_fire_and_forget` in tentaflow-core.
     #[serde(default)]
     pub delivery: Option<String>,
     #[serde(default)]

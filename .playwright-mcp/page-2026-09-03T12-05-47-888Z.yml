@@ -1,0 +1,3 @@
+- generic [active] [ref=e1]:
+  - paragraph [ref=e3]: starting…
+  - paragraph [ref=e4]: "F1 cpu · F2 gpu · F3 hybrid · F4 deferred · F5/F6 backend · Esc stop. Click the canvas first: the host only reads the keyboard while the canvas holds the focus."

@@ -960,6 +960,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "tentavm_access_requests",
             MigrationStep::Sql(TENTAVM_ACCESS_REQUESTS),
         ),
+        (154, "bus_org_quotas", MigrationStep::Sql(BUS_ORG_QUOTAS)),
     ]
 }
 
@@ -9065,6 +9066,49 @@ CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject
     ON bus_schema_versions(instance_id, org_id, subject, version DESC);
 "#;
 
+/// v154 — PLAN §7.1 per-org quotas. `bus::quota::QuotaManager` is pure
+/// in-memory state (`DashMap<org_id, OrgBuckets>` plus its token buckets),
+/// so before this table every `QuotaSet` an operator issued was lost on the
+/// next restart and the org silently fell back to `QuotaConfig::default()`
+/// — the configured ceiling reverting to the default without any signal is
+/// worse than never having accepted the setting. `bus::quota::
+/// load_persisted_quotas` reads this table back into the manager at
+/// `BusService::new` time; `bus::quota::persist_org_quota` writes it.
+///
+/// `instance_id` leads the PK for the same reason it does in `bus_topics`
+/// (plan-app-platform §1.4/W3): each TentaBus instance carries its own
+/// quota for the same org, and instance teardown removes exactly its own
+/// rows (`bus_quotas_delete_by_instance`). No separate index — the PK
+/// prefix already serves both the per-instance startup scan and the
+/// per-(instance, org) lookup.
+///
+/// Node-local, deliberately NOT a sync-ledger materialization like
+/// `bus_topics`/`bus_field_policies`: a quota is a ceiling on what THIS
+/// node's engine admits (its token buckets, its disk), and the mesh has no
+/// `CoreSyncResourceKind` for it. An operator who wants the same ceiling on
+/// every node sets it on every node, exactly as they did before this table
+/// existed — the change here is durability, not replication.
+///
+/// Byte columns are `INTEGER` (SQLite has no u64): `bus::quota` clamps at
+/// `i64::MAX` on the way in rather than wrapping, see `quota_bytes_to_i64`.
+/// No FK to `organizations`, same rationale as `bus_topics`' own DDL
+/// comment above (`bus/mod.rs` tests run under an `org_id` that never
+/// exists in that table).
+const BUS_ORG_QUOTAS: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_org_quotas (
+    instance_id            TEXT NOT NULL,
+    org_id                 TEXT NOT NULL,
+    max_topics             INTEGER NOT NULL,
+    max_partitions         INTEGER NOT NULL,
+    max_bytes_total        INTEGER NOT NULL,
+    produce_msgs_per_sec   INTEGER NOT NULL,
+    produce_bytes_per_sec  INTEGER NOT NULL,
+    max_groups             INTEGER NOT NULL,
+    updated_at_ms          INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id)
+);
+"#;
+
 /// v144 (SUM/tentabus/PLAN-F3.md, second review pass, finding #1): creates
 /// the two schema-registry tables above, then normalizes any PRE-EXISTING
 /// `bus_topics` row whose `validation` is not `'off'`.
@@ -11294,21 +11338,21 @@ mod tests {
                 name TEXT NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            INSERT INTO _migrations (version, name) VALUES (150, 'from_a_newer_build');",
+            INSERT INTO _migrations (version, name) VALUES (155, 'from_a_newer_build');",
         )
         .unwrap();
 
         let err =
             run(&conn).expect_err("a database ahead of this build's ladder head must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("150"), "{msg}");
-        assert!(msg.contains("head 149"), "{msg}");
+        assert!(msg.contains("155"), "{msg}");
+        assert!(msg.contains("head 154"), "{msg}");
     }
 
     /// The counterpart of the guard test above, and the reason 145/146 are
     /// `retired_migration` rather than renumbered-away: a database left at 146
     /// by a build that still carried the ORIGINAL 145/146 is NOT ahead of this
-    /// ladder (head 149), so the guard must let it through to be upgraded the
+    /// ladder (head 154), so the guard must let it through to be upgraded the
     /// rest of the way. Before the rungs were retired the head was 144 and the
     /// very same database was refused.
     #[test]
@@ -11337,12 +11381,12 @@ mod tests {
     #[test]
     fn a_database_exactly_at_this_builds_ladder_head_still_passes() {
         let conn = Connection::open_in_memory().unwrap();
-        run(&conn).expect("fresh install migrates cleanly to head 149");
-        run(&conn).expect("a database already at head 149 must still pass the guard");
+        run(&conn).expect("fresh install migrates cleanly to head 154");
+        run(&conn).expect("a database already at head 154 must still pass the guard");
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 153);
+        assert_eq!(head, 154);
     }
 
     #[test]
@@ -11374,7 +11418,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 153, "153 must be the highest applied migration");
+        assert_eq!(head, 154, "154 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -11382,7 +11426,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 153);
+        assert_eq!(head_again, 154);
     }
 
     /// Capacity is registry data, usage is telemetry, and the split is the whole
@@ -11484,7 +11528,7 @@ mod tests {
         // authorizer rewrite and the instance-db handle that made them dead.
         // Their NUMBERS stay occupied by `retired_migration` so the rungs
         // above them keep the versions databases already recorded.
-        assert_eq!(*sorted.last().unwrap(), 153);
+        assert_eq!(*sorted.last().unwrap(), 154);
 
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();

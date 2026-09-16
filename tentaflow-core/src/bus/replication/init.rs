@@ -109,6 +109,30 @@ impl ReplicationInitConfig {
 /// tunable production knob.
 const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+#[cfg(test)]
+type PreWiringHook = Arc<dyn Fn(&BusInstanceId) + Send + Sync>;
+
+/// Test-only interleave hook for `init`'s wiring-point re-validation (see
+/// that call site's own comment). It fires in the one window a test cannot
+/// reach any other way deterministically: everything `init` builds is built
+/// and its background loops are already spawned, and the engine it resolved
+/// at the top has not been wired yet. `#[cfg(test)]` throughout, so neither
+/// this cell nor its call site exists in a release build.
+#[cfg(test)]
+static PRE_WIRING_HOOK: parking_lot::Mutex<Option<PreWiringHook>> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+fn fire_pre_wiring_hook(id: &BusInstanceId) {
+    // Cloned out from under the lock before the call: a hook exists to call
+    // back into `bus`/`replication` (stopping the instance is the whole
+    // point of the only one there is), and holding this cell's lock across
+    // that would be a lock-ordering hazard for no benefit.
+    let hook = PRE_WIRING_HOOK.lock().clone();
+    if let Some(hook) = hook {
+        hook(id);
+    }
+}
+
 /// Brings M2 replication up on this node: builds the production
 /// `ReplicationManager` wiring, installs the `ALPN_BUS` accept handler,
 /// replays this node's existing partition assignments, spawns the
@@ -129,6 +153,26 @@ const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// coordinator. Failing before any allocation also means an error return
 /// leaks nothing: no router registration, no background loop, no ledger
 /// handle to clean up.
+///
+/// That first lookup is a check, not a hold. The wiring at the bottom of
+/// this function therefore re-resolves the same id and installs the
+/// coordinator only while the registry entry it resolved is still the very
+/// `Arc` looked up here — under the registry's own shard guard, so a
+/// `bus::stop_instance` cannot slip between that re-check and the two
+/// `set_*` calls it guards. Read that call site's own comment for the
+/// bound on what this covers: it says nothing about a stop landing after
+/// this function RETURNS, which is `bus::native::ENABLE_DISABLE_LOCK`'s job
+/// and not this function's.
+///
+/// An engine that disappeared (or was stopped and restarted) inside the
+/// build window makes this function `bail!` instead of wiring. The "an
+/// error return leaks nothing" contract above is weaker on THAT path than
+/// on the two early ones: `stop` has run, so nothing stays routable to this
+/// manager and nothing is wired into a `BusService` — but cancellation is
+/// asynchronous (the three spawned loops, and the `ledger_store` clone the
+/// assignment poll holds, live until each task next polls its `select!`)
+/// and the mesh's shared `ALPN_BUS` accept handler stays installed for the
+/// other instances. The teardown is complete, not instantaneous.
 pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationManager>> {
     if cfg.provider.instance_id() != cfg.instance_id.as_str() {
         anyhow::bail!(
@@ -232,19 +276,100 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         cfg.local_node_id.clone(),
     );
 
-    // `svc` was resolved by `cfg.instance_id` at the very top of this
-    // function — THIS manager's own engine, never `bus::global()`
-    // (`ReplicationInitConfig::instance_id`'s doc explains why that would
-    // be wrong here). Without `set_assignment_store`, `create_topic`'s
-    // assignment-proposal block (`bus::mod`'s `self.assignment_store()`)
-    // is permanently `None` on every production node — `set_replication`
-    // alone wires the coordinator (role/preflight/snapshot), not the store
-    // `create_topic` proposes new partition assignments into. A live
-    // krytyk pass on M2 found the registry never got its first row on a
-    // real cluster even after the `local_node_id` bootstrap fix landed,
-    // because this call was simply missing.
-    svc.set_replication(Arc::clone(&manager) as Arc<dyn ReplicationCoordinator>);
-    svc.set_assignment_store(ledger_store.clone());
+    #[cfg(test)]
+    fire_pre_wiring_hook(&cfg.instance_id);
+
+    // W6 review finding (TOCTOU): `svc` was resolved by `cfg.instance_id`
+    // at the very top of this function, and everything between there and
+    // here — transport, ledger store, manager, the fallible
+    // `list_for_node` read, `router::register`, the assignment replay, the
+    // three background loops — runs without any hold on the engine
+    // registry, so the engine `svc` names may have been stopped meanwhile.
+    // Holding the registry across all of that setup would be its own,
+    // worse defect (a registry lock spanning fjall/SQLite I/O and a mesh
+    // await), so the check moves down here instead — and is taken TOGETHER
+    // with the wiring it guards, not before it:
+    //
+    // `instances().get(..)` hands back that entry's shard read guard, and
+    // `bus::stop_instance` removes through `instances().remove(..)`, a
+    // write on the same shard. So a stop cannot land between this check
+    // and the two `set_*` calls below: either it completed first (this
+    // `get` then sees no entry, or a different `Arc` for a re-enabled
+    // instance, and the wiring aborts) or it waits until the guard drops,
+    // by which point the coordinator is installed and the caller is about
+    // to be told so. Nothing fallible or blocking runs under the guard —
+    // both setters are plain in-memory `parking_lot::RwLock` writes on
+    // `BusService` (`bus::mod`'s `set_replication`/`set_assignment_store`)
+    // and neither reads the engine registry, so this cannot deadlock
+    // against `init_instance`/`stop_instance`.
+    //
+    // Identity, not mere presence: `bus::init_instance` builds a BRAND-NEW
+    // `BusService` for a re-enabled instance, so a stop→start cycle inside
+    // the window must fail this check too — the manager was built for the
+    // engine that is now gone, not for its replacement. `Arc::ptr_eq`
+    // decides that correctly here because our own `svc` clone keeps the old
+    // allocation alive for the whole call, so a later `Arc::new(BusService
+    // ::new(..))` cannot be handed its address.
+    //
+    // What this does NOT do, and must not be read as doing: it says nothing
+    // about a `bus::stop_instance` landing AFTER this function returns.
+    // That one still stops an engine this manager is wired into, and the
+    // caller has not yet put the manager anywhere `native_on_disable` can
+    // find it (`native.rs`'s `try_start_replication` only inserts into
+    // `REPLICATION_MANAGERS` once `init` returns). What rules that out in
+    // production is `bus::native::ENABLE_DISABLE_LOCK`, held for the entire
+    // body of `native_on_enable`,
+    // `start_replication_for_already_enabled_instances` and
+    // `native_on_disable` — outside `#[cfg(test)]` those are the only
+    // callers of `bus::stop_instance` and the only path into this function.
+    // This block is defense in depth UNDER that lock, never a replacement
+    // for it: deleting `ENABLE_DISABLE_LOCK` on the strength of what is
+    // written here would reopen the race on the caller's side of the
+    // return, where this function has no reach at all.
+    let wired = {
+        let registered = crate::bus::instances().get(&cfg.instance_id);
+        let same_engine = registered
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current.value(), &svc));
+        if same_engine {
+            // `svc` is `cfg.instance_id`'s OWN engine — never
+            // `bus::global()` (`ReplicationInitConfig::instance_id`'s doc
+            // explains why that would be wrong here). Without
+            // `set_assignment_store`, `create_topic`'s assignment-proposal
+            // block (`bus::mod`'s `self.assignment_store()`) is permanently
+            // `None` on every production node — `set_replication` alone
+            // wires the coordinator (role/preflight/snapshot), not the
+            // store `create_topic` proposes new partition assignments into.
+            // A live krytyk pass on M2 found the registry never got its
+            // first row on a real cluster even after the `local_node_id`
+            // bootstrap fix landed, because this call was simply missing.
+            svc.set_replication(Arc::clone(&manager) as Arc<dyn ReplicationCoordinator>);
+            svc.set_assignment_store(ledger_store.clone());
+        }
+        drop(registered);
+        same_engine
+    };
+    if !wired {
+        // `stop` tears down what this function built: it removes the
+        // manager from `router`'s demux table (identity-checked, so it
+        // cannot unregister a manager some concurrent re-enable already
+        // installed under the same id) and cancels the shutdown token the
+        // three loops spawned above select on. Two things it deliberately
+        // does not do, and the doc on this function says so too:
+        // cancellation is asynchronous, so those tasks — and with them the
+        // `ledger_store` clone `spawn_assignment_poll_loop` captured — run
+        // until each next polls its `select!`; and the `ALPN_BUS` accept
+        // handler `router::register` installed on `cfg.mesh` stays
+        // installed, which is correct, since it is shared by every instance
+        // and routes on the frame's own id (`router::register`'s own doc).
+        stop(&manager);
+        anyhow::bail!(
+            "replication::init: instance '{}' stopped (or restarted) while its replication \
+             manager was being built — wiring aborted and the half-built manager torn down \
+             rather than left driving an engine that is no longer registered",
+            cfg.instance_id
+        );
+    }
 
     Ok(manager)
 }
@@ -603,6 +728,139 @@ mod tests {
         assert!(
             err.to_string().contains(ID),
             "error must name the missing instance id: {err}"
+        );
+    }
+
+    /// Permissive `BusAuthorizer` for the registry-backed test below —
+    /// mirrors `bus::mod`'s own test-only `AllowAllAuthorizer`, duplicated
+    /// here for the reason `bus::reactor`'s copy already documents (that one
+    /// is private to `bus::mod`'s test module).
+    struct AllowAllAuthorizer;
+    impl crate::bus::BusAuthorizer for AllowAllAuthorizer {
+        fn authorize(
+            &self,
+            _ctx: &crate::bus::BusCallContext,
+            _action: crate::bus::BusAction,
+            _topic: &str,
+        ) -> Result<(), crate::bus::BusServiceError> {
+            Ok(())
+        }
+        fn authorize_group(
+            &self,
+            _ctx: &crate::bus::BusCallContext,
+            _action: crate::bus::BusAction,
+            _topic: &str,
+            _group: &str,
+        ) -> Result<(), crate::bus::BusServiceError> {
+            Ok(())
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Starts a REAL engine for `id` in the process-global `bus` registry.
+    /// The wiring-point re-validation resolves against that registry and
+    /// compares `Arc` identity, so nothing short of a registered
+    /// `BusService` exercises it. Returns the temp dir (must outlive the
+    /// engine), the platform `DbPool` the engine and `ReplicationInitConfig`
+    /// share, and the registered engine.
+    fn start_registered_engine(
+        id: &BusInstanceId,
+    ) -> (tempfile::TempDir, DbPool, Arc<crate::bus::BusService>) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let local_conn = rusqlite::Connection::open_in_memory().expect("open in-memory local db");
+        crate::bus::db::migrate(&local_conn).expect("migrate local db");
+        let svc = crate::bus::init_instance(crate::bus::BusInitConfig {
+            instance_id: id.clone(),
+            bus_dir: dir.path().join("bus"),
+            db: db.clone(),
+            local_db: Arc::new(Db::from_connection(local_conn)),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("init_instance must start the test engine");
+        (dir, db, svc)
+    }
+
+    /// W6 TOCTOU: `init` resolves its engine at the top and wires the
+    /// manager into it ~100 lines later, holding nothing on the registry in
+    /// between. `PRE_WIRING_HOOK` puts a `bus::stop_instance` exactly inside
+    /// that window — the only way to reach it deterministically — and the
+    /// wiring must then abort instead of installing a coordinator into an
+    /// engine that is no longer registered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn init_aborts_the_wiring_when_its_engine_is_stopped_mid_setup() {
+        // Own id, never shared with another test in this binary: the engine
+        // registry is a real process-global `static` (same reasoning
+        // `bus::mod`'s own registry tests document for their ids).
+        const ID: &str = "tentabus-de000002";
+        let id = BusInstanceId::parse(ID).expect("valid id");
+        let (_tmp, db, svc) = start_registered_engine(&id);
+        let mesh = make_test_mesh_manager().await;
+
+        // Cleared by `Drop`, so a panic anywhere below — a failed
+        // assertion, or `init` itself — cannot leave this process-global
+        // cell installed for the rest of the test binary. Same drop-guard
+        // shape as `router.rs`'s own `with_decoy_manager` fixture.
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                *PRE_WIRING_HOOK.lock() = None;
+            }
+        }
+        let _hook_guard = HookGuard;
+        {
+            // Id-filtered: this cell is process-global and the hook stays
+            // installed for the duration of `init`, which other tests in
+            // this binary may enter concurrently with their OWN instances.
+            let hook_id = id.clone();
+            let hook: PreWiringHook = Arc::new(move |fired_for: &BusInstanceId| {
+                if fired_for == &hook_id {
+                    crate::bus::stop_instance(&hook_id);
+                }
+            });
+            *PRE_WIRING_HOOK.lock() = Some(hook);
+        }
+
+        let cfg = ReplicationInitConfig {
+            db,
+            mesh,
+            instance_id: id.clone(),
+            local_node_id: "n1".to_string(),
+            local_env: NodeEnvironment::Prod,
+            provider: Arc::new(FakeProvider(ID.to_string())),
+            lease_check_interval: ReplicationInitConfig::DEFAULT_LEASE_CHECK_INTERVAL,
+        };
+        let result = init(cfg).await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "init must refuse to wire a manager into an engine that was stopped while \
+                 that manager was being built"
+            ),
+        };
+        assert!(
+            err.to_string().contains(ID),
+            "error must name the instance whose wiring was aborted: {err}"
+        );
+        assert!(
+            svc.replication().is_none(),
+            "an aborted init must leave the stopped engine with no coordinator installed"
+        );
+        // The abort must leave nothing half-built behind: a manager still in
+        // the demux table would keep answering inbound Hello/LeoQuery frames
+        // for an instance that is down.
+        assert!(
+            !router::is_registered_for_test(&id),
+            "an aborted init must unregister its half-built manager from the router"
         );
     }
 }

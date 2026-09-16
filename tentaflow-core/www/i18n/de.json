@@ -8497,6 +8497,7 @@
       "quota_request_too_large": "Die Anfrage übersteigt die Kapazität des Organisationskontingents.",
       "max_topics_exceeded": "Die maximale Anzahl an Themen für die Organisation wurde erreicht.",
       "max_partitions_exceeded": "Die maximale Anzahl an Partitionen für die Organisation wurde erreicht.",
+      "max_bytes_total_exceeded": "Die Organisation hat ihr gesamtes Speicherlimit für den Bus erreicht.",
       "throttled": "Anfrage gedrosselt — später erneut versuchen.",
       "payload_too_large": "Der Nachrichteninhalt überschreitet die zulässige Inline-Größe.",
       "dedup_key_required": "Dieses Thema erfordert einen Deduplizierungsschlüssel für jeden Datensatz.",

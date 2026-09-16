@@ -9732,6 +9732,7 @@
       "quota_request_too_large": "Żądanie przekracza pojemność limitu organizacji.",
       "max_topics_exceeded": "Osiągnięto maksymalną liczbę topików dla organizacji.",
       "max_partitions_exceeded": "Osiągnięto maksymalną liczbę partycji dla organizacji.",
+      "max_bytes_total_exceeded": "Organizacja osiągnęła łączny limit miejsca na dane magistrali.",
       "throttled": "Żądanie ograniczone (throttling) — spróbuj ponownie później.",
       "payload_too_large": "Treść komunikatu przekracza dozwolony rozmiar inline.",
       "dedup_key_required": "Ten topik wymaga klucza deduplikacji dla każdego rekordu.",

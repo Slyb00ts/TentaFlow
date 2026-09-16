@@ -1763,6 +1763,14 @@ function openTopicWizard(existing) {
     replicationFactor: existing?.replicationFactor ?? 3,
     schemaId: existing?.schemaId ?? '',
     validation: existing?.validation ?? 'off',
+    // Seeded from the topic so a row persisted before the server started
+    // refusing `fire_and_forget` still shows what it actually stores; the
+    // wizard's own `fire_and_forget` <option> is `disabled`, because a
+    // create/update sending that value is rejected (the mode is not
+    // implemented — every topic is served at_least_once). Such a legacy
+    // topic still stays editable: `submitTopicWizard` leaves `delivery` out
+    // of the payload while the select is still holding the stored
+    // `fire_and_forget`, and an omitted field means "leave unchanged".
     delivery: existing?.delivery ?? 'at_least_once',
     dedupWindowMs: existing?.dedupWindowMs ?? RETENTION_PRESETS_MS['24h'],
     maxDeliveryAttempts: existing?.maxDeliveryAttempts ?? 5,
@@ -1866,7 +1874,7 @@ function openTopicWizard(existing) {
         </tf-select>
         <tf-select id="tb-w-delivery" label="${escapeAttr(T('wizard_field_delivery'))}" value="${escapeAttr(form.delivery)}">
           <option value="at_least_once">${escapeHtml(T('wizard_delivery_at_least_once'))}</option>
-          <option value="fire_and_forget">${escapeHtml(T('wizard_delivery_fire_and_forget'))}</option>
+          <option value="fire_and_forget" disabled>${escapeHtml(T('wizard_delivery_fire_and_forget'))}</option>
         </tf-select>
       </div>
 
@@ -2114,13 +2122,22 @@ async function submitTopicWizard(modal, body, form, isEdit) {
   const durabilityWireValue = durabilitySelectValue === 'fsync_interval'
     ? formatFsyncIntervalDurability(body.querySelector('#tb-w-durability-fsync-ms')?.value)
     : durabilitySelectValue;
+  // The `fire_and_forget` <option> is `disabled`, so the operator can never
+  // PICK it — but a topic persisted before the server started refusing that
+  // mode seeds the select with its stored value, and resending it would get
+  // the whole edit rejected over a field the operator never touched.
+  // `delivery` is optional on the wire (absent = "leave unchanged" on
+  // update), so it is dropped instead of resent; picking `at_least_once`
+  // still sends that and normalizes the row.
+  const deliverySelectValue = body.querySelector('#tb-w-delivery')?.value;
+  const deliveryWireValue = deliverySelectValue === 'fire_and_forget' ? undefined : deliverySelectValue;
   const wireForm = {
     partitions: body.querySelector('#tb-w-partitions')?.value,
     retentionMs: RETENTION_PRESETS_MS[retentionPreset] ?? RETENTION_PRESETS_MS['7d'],
     replicationFactor: form.replicationFactor,
     schemaId: body.querySelector('#tb-w-schema')?.value,
     validation: body.querySelector('#tb-w-validation')?.value,
-    delivery: body.querySelector('#tb-w-delivery')?.value,
+    delivery: deliveryWireValue,
     dedupWindowMs: Number(body.querySelector('#tb-w-dedup')?.value || 0) * 3_600_000,
     maxDeliveryAttempts: body.querySelector('#tb-w-attempts')?.value,
     retryBackoffMs: body.querySelector('#tb-w-backoff')?.value,

@@ -684,6 +684,40 @@ pub enum BusServiceError {
         current: u32,
         requested: u32,
     },
+    /// PLAN §7.1 `max_bytes`: the org's stored log bytes plus this publish's
+    /// payload would cross its `max_bytes_total` ceiling. Same
+    /// resource-quota class as `MaxTopicsExceeded`/`MaxPartitionsExceeded`
+    /// (and mapped alongside them by every error mapper), NOT the retryable
+    /// `QuotaExceeded`: waiting does not free disk, so this must never carry
+    /// a `retry_after_ms` — the producer has to stop, retention has to
+    /// reclaim, or the ceiling has to be raised.
+    #[error(
+        "org '{org_id}' max_bytes_total quota ({max}) would be exceeded: {current} bytes stored + {requested} requested"
+    )]
+    MaxBytesTotalExceeded {
+        org_id: String,
+        max: u64,
+        current: u64,
+        requested: u64,
+    },
+    /// PLAN §7.2: a publish named a topic that does not exist and the caller
+    /// opted into auto-creation (`create_if_missing`), but the org's
+    /// `bus.autocreate` setting is off — the default outside Dev. An
+    /// org-wide ceiling in the same family as `MaxTopicsExceeded` above, not
+    /// a second per-call switch: the opt-in only decides whether to ask.
+    /// Distinct from `TopicNotFound` on purpose, so the caller learns which
+    /// knob to turn instead of being told the topic merely does not exist.
+    ///
+    /// The message names BOTH keys `autocreate_enabled` reads and the order
+    /// it reads them in: the org-scoped row wins, so an operator who
+    /// followed a message naming only the node-wide key would flip that key
+    /// and hit this identical refusal again.
+    #[error(
+        "topic '{topic}' does not exist and auto-creation is off for org '{org_id}' (off by default outside Dev); create the topic explicitly, or set setting '{}:{org_id}' to 'on' — that org-scoped key is read before the node-wide '{}' key, so changing only the node-wide key has no effect for an org that has a row of its own",
+        AUTOCREATE_SETTING_KEY,
+        AUTOCREATE_SETTING_KEY
+    )]
+    AutocreateDisabled { org_id: String, topic: String },
     #[error("producer throttled, retry after {retry_after_ms} ms")]
     Throttled { retry_after_ms: u32 },
     #[error(
@@ -1104,6 +1138,50 @@ fn deny(action: BusAction, topic: &str) -> BusServiceError {
 /// than a string literal duplicated at both ends) so the two files agree on
 /// the exact code without either one importing the other's error type.
 pub const MAX_GROUPS_EXCEEDED_PREFIX: &str = "bus.max_groups_exceeded";
+
+/// `settings` key carrying PLAN §7.2's `bus.autocreate` switch: may a
+/// publish to a topic that does not exist create it with defaults?
+///
+/// This platform has no per-org settings store, so the org-scoped value
+/// lives under `bus.autocreate:<org_id>` (`autocreate_setting_key`) in the
+/// same generic key-value table `services::environment` reads the node's own
+/// environment identity from — the `<key>:<id>` shape `mesh::security`
+/// already writes there for `pending_pubkey:<node_id>`. This bare key is the
+/// node-wide fallback for every org with no row of its own; with neither
+/// present, `autocreate_default_for` decides.
+pub const AUTOCREATE_SETTING_KEY: &str = "bus.autocreate";
+
+/// The org-scoped `settings` key for `org_id` — see `AUTOCREATE_SETTING_KEY`.
+fn autocreate_setting_key(org_id: &str) -> String {
+    format!("{AUTOCREATE_SETTING_KEY}:{org_id}")
+}
+
+/// PLAN §7.2's environment defaults when neither `bus.autocreate` key is
+/// set: on in Dev, off in Test and Prod. Auto-creation is a convenience for
+/// a developer iterating on a flow; a Test or Prod node must not grow its
+/// topic set behind an operator's back.
+fn autocreate_default_for(env: NodeEnvironment) -> bool {
+    matches!(env, NodeEnvironment::Dev)
+}
+
+/// PLAN §7.2's own `on`/`off` spellings plus the `"1"`/`"true"` and
+/// `"0"`/`"false"` pair `mesh::network_interfaces::parse_bool` accepts —
+/// case-insensitively and ignoring surrounding whitespace. There is no one
+/// spelling shared by every boolean `settings` row (`services::environment::
+/// is_isolation_strict` accepts only `"1"`), so this accepts the union of
+/// both shapes an operator plausibly typed for THIS key.
+///
+/// `None` means "present but unrecognized" and is not the same as an absent
+/// row: `autocreate_enabled` refuses on it instead of consulting a level
+/// this org's operator did not write, so a typo in an explicit opt-out
+/// cannot read as an opt-in.
+fn parse_autocreate_setting(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Some(true),
+        "0" | "false" | "off" => Some(false),
+        _ => None,
+    }
+}
 
 /// `BusService::open_consumer` would create at least one brand-new
 /// `bus_groups` row and doing so would exceed `QuotaManager::
@@ -1911,6 +1989,50 @@ pub struct BusService {
     round_robin: DashMap<TopicKey, AtomicU32>,
     dedup_stores: DashMap<TopicKey, Arc<dedup::MmapDedupStore>>,
     quota: quota::QuotaManager,
+    /// Per-org total of stored LOG-SEGMENT bytes, backing PLAN §7.1's
+    /// `max_bytes_total` ceiling. `publish` reads it as one `DashMap`
+    /// lookup plus one atomic load and measures nothing itself — the hot
+    /// path never touches the filesystem for this figure.
+    ///
+    /// ONE unit on every side: the bytes `Partition::append_batch` actually
+    /// wrote into the active segment file, i.e. the length of the batch
+    /// buffer `publish` handed it (batch header and per-record framing
+    /// included). That is the same quantity `Partition::sealed_segments()`
+    /// reports as `SealedSegmentInfo::len` and `active_segment_len()`
+    /// reports for the open one — so the same quantity
+    /// `retention::sweep_partition` hands back as `deleted_bytes`, and the
+    /// same one `partition_stats` publishes as `PartitionStats::size_bytes`.
+    /// Credits and debits therefore cancel exactly; charging payload bytes
+    /// in and segment bytes out would make a topic with a rolling retention
+    /// window converge on zero and quietly stop enforcing anything.
+    ///
+    /// Segment `.log` files only. The `.oidx`/`.tidx` indexes next to them
+    /// and a dedup-enabled topic's `dedup.bin` are deliberately NOT counted:
+    /// `dedup::MmapDedupStore::open` preallocates `dedup.bin` to its full
+    /// derived capacity (up to `MAX_DERIVED_CAPACITY` slots), so counting it
+    /// would charge a brand-new topic holding no messages hundreds of
+    /// megabytes against a ceiling an operator sets to cap STORED MESSAGES.
+    ///
+    /// Exactly four places move it:
+    /// - `seed_org_stored_bytes` (once, from `BusService::new`) measures
+    ///   every org that already has topics, through the engine's own
+    ///   per-partition accounting;
+    /// - `publish` adds each batch it appended durably;
+    /// - `run_retention_sweep` subtracts what it unlinked, once per org;
+    /// - `delete_topic` subtracts the topic's own segment bytes before the
+    ///   directory is removed, and `purge_org` drops the entry.
+    ///
+    /// A missing entry means ZERO, not "unknown": the startup seed covers
+    /// every org that has topics, and an org created afterwards genuinely
+    /// has no segments yet.
+    ///
+    /// Known blind spot: bytes a REPLICATION FOLLOWER appends
+    /// (`bus::replication::follower` calls `Partition::append_replicated_
+    /// async` directly, never `publish`) are not credited here, so a node
+    /// that only follows a partition under-counts it until the next
+    /// restart's seed picks those segments up. Every write this engine
+    /// admits itself is exact.
+    org_stored_bytes: DashMap<String, AtomicU64>,
     /// `publish`'s hot path must not touch SQLite once warm — one query per
     /// message at any real throughput would serialize on the single shared
     /// application database. Invalidated (removed) by `update_topic`/
@@ -2125,6 +2247,22 @@ fn environment_from_u8(v: u8) -> NodeEnvironment {
     }
 }
 
+/// One partition's stored log bytes, read straight out of the engine's own
+/// segment bookkeeping: every sealed segment's length plus the still-growing
+/// active one's. Both accessors read an in-memory `RwLock`ed descriptor list
+/// and an `AtomicU64` — no `stat()`, no `read_dir` — and both report the
+/// segments' LOGICAL length, the exact quantity `Partition::append_batch`
+/// grows by and `retention::sweep_partition` reports as `deleted_bytes`.
+///
+/// The same expression `partition_stats` builds `PartitionStats::size_bytes`
+/// from; index files and `dedup.bin` are not segments and are not included
+/// (see `BusService::org_stored_bytes`'s field doc for why that matters to a
+/// user-facing byte ceiling).
+fn partition_stored_bytes(part: &tentaflow_bus::Partition) -> u64 {
+    let sealed: u64 = part.sealed_segments().iter().map(|s| s.len).sum();
+    sealed.saturating_add(part.active_segment_len())
+}
+
 impl BusService {
     pub fn new(cfg: BusInitConfig) -> Result<Self, BusServiceError> {
         // plan-app-platform §7 W4 finding 4: refuse to start an engine whose
@@ -2185,7 +2323,29 @@ impl BusService {
         // "legacy critical, needs repair" signal again, this sweep's
         // premise can no longer be satisfied by any row, so it is dead
         // code rather than a sweep that would just always find zero rows.
-        Ok(Self {
+
+        // PLAN §7.1 durability (`bus_org_quotas`, migration v154): a
+        // `QuotaManager` starts empty, so without this replay every org an
+        // operator ever configured silently falls back to
+        // `QuotaConfig::default()` on restart. Best-effort and logged, like
+        // the probe-group cleanup above: a database that cannot be read here
+        // must not stop the engine from starting, and the defaults it falls
+        // back to are the same ones it would have had anyway.
+        let quota = quota::QuotaManager::new();
+        match quota::load_persisted_quotas(&cfg.db, cfg.instance_id.as_str(), &quota) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                instance_id = %cfg.instance_id,
+                orgs = n,
+                "bus init: restored persisted org quota(s)"
+            ),
+            Err(e) => tracing::warn!(
+                instance_id = %cfg.instance_id,
+                error = %e,
+                "bus init: failed to restore persisted org quotas; orgs fall back to defaults"
+            ),
+        }
+        let svc = Self {
             instance_id: cfg.instance_id.to_string(),
             bus_dir: cfg.bus_dir,
             db: cfg.db,
@@ -2198,7 +2358,8 @@ impl BusService {
             partitions: DashMap::new(),
             round_robin: DashMap::new(),
             dedup_stores: DashMap::new(),
-            quota: quota::QuotaManager::new(),
+            quota,
+            org_stored_bytes: DashMap::new(),
             topic_config_cache: DashMap::new(),
             schema_cache: DashMap::new(),
             schema_violations_total: AtomicU64::new(0),
@@ -2228,7 +2389,15 @@ impl BusService {
             publish_ack_timeout: cfg.publish_ack_timeout,
             #[cfg(test)]
             test_open_consumer_after_phase1: std::sync::Mutex::new(None),
-        })
+        };
+        // PLAN §7.1 `max_bytes`: measure what is already on disk before the
+        // first publish can be admitted. `publish` reads `org_stored_bytes`
+        // as a plain map lookup and treats a missing entry as zero, so
+        // WITHOUT this a restarted engine would let every org re-publish its
+        // entire ceiling before the counter caught up. Best-effort and off
+        // any request path — see `seed_org_stored_bytes`'s own doc.
+        svc.seed_org_stored_bytes();
+        Ok(svc)
     }
 
     /// The TentaBus instance every table this service touches is scoped to.
@@ -2515,6 +2684,167 @@ impl BusService {
 
     pub fn quota(&self) -> &quota::QuotaManager {
         &self.quota
+    }
+
+    /// Log-segment bytes this org currently stores (see `org_stored_bytes`'s
+    /// field doc). A `DashMap` lookup plus one atomic load — it measures
+    /// nothing and touches no file, which is what makes it safe to call
+    /// from `publish`. An org with no entry stores nothing.
+    pub fn org_stored_bytes(&self, org_id: &str) -> u64 {
+        self.org_stored_bytes
+            .get(org_id)
+            .map(|e| e.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Adds `bytes` that were just appended to a segment, creating the org's
+    /// entry if this is its first ever write (a missing entry means zero,
+    /// not "unknown" — the startup seed already covered every org that had
+    /// topics when this process began).
+    fn add_org_stored_bytes(&self, org_id: &str, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.org_stored_bytes
+            .entry(org_id.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Subtracts segment bytes that no longer exist (a retention sweep's
+    /// reclaim, a deleted topic's logs). `saturating_sub` is a floor against
+    /// the one accounting hole the field doc names — segments a replication
+    /// FOLLOWER appended were never credited here, so a sweep that deletes
+    /// them can report more than this counter was ever told about. It is not
+    /// a unit mismatch: credits and debits are both segment bytes.
+    fn sub_org_stored_bytes(&self, org_id: &str, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(entry) = self.org_stored_bytes.get(org_id) {
+            let _ = entry.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes))
+            });
+        }
+    }
+
+    /// Drops `org_id`'s entry, which — since a missing entry reads as zero —
+    /// means "this org now stores nothing". Only `purge_org` may use it: it
+    /// removes the org's WHOLE log tree, so zero is the exact answer. A
+    /// partial deletion (`delete_topic`) subtracts what it removed instead,
+    /// because dropping the entry there would forgive every OTHER topic's
+    /// bytes as well.
+    fn clear_org_stored_bytes(&self, org_id: &str) {
+        self.org_stored_bytes.remove(org_id);
+    }
+
+    /// Stored log bytes of ONE topic, summed over its partitions through the
+    /// engine (`partition_stored_bytes`). Best-effort: a partition that
+    /// cannot be opened is skipped and logged rather than aborting the
+    /// caller, which under-counts — the direction that admits publishes
+    /// rather than locking an org out.
+    ///
+    /// Opens (through `partition_handle`, so it joins any handle already
+    /// open) every partition of the topic, and is therefore an ADMIN-path
+    /// helper only: `delete_topic` calls it while it is about to detach and
+    /// remove those same handles anyway. Never called from `publish`.
+    fn topic_stored_bytes(&self, org_id: &str, topic: &str, cfg: &topics::TopicConfig) -> u64 {
+        let mut total: u64 = 0;
+        for p in 0..cfg.partitions {
+            match self.partition_handle(org_id, topic, p, cfg) {
+                Ok(part) => total = total.saturating_add(partition_stored_bytes(&part)),
+                Err(e) => tracing::warn!(
+                    org_id, topic, partition = p, error = %e,
+                    "topic_stored_bytes: partition unreadable; its bytes stay on the org's storage counter"
+                ),
+            }
+        }
+        total
+    }
+
+    /// One-shot startup measurement of `org_stored_bytes` for every org that
+    /// already has topics, called at the end of `BusService::new`. Without
+    /// it a restarted engine would believe every org stores zero bytes and
+    /// `max_bytes_total` would not bite again until the org had re-published
+    /// its whole ceiling.
+    ///
+    /// Measures through the engine, not the filesystem: one
+    /// `Partition::open` per partition directory that actually exists, then
+    /// `partition_stored_bytes`. Partitions whose directory has never been
+    /// created hold nothing and are skipped without opening (which also
+    /// keeps this from creating log directories for topics nobody has
+    /// published to yet). The handles are local to this function and dropped
+    /// as it goes, so nothing is left in `self.partitions` — `new` runs
+    /// before any caller can hold a handle, so there is no live partition to
+    /// rejoin or disturb here.
+    ///
+    /// Cost is O(partitions with data) partition opens, once per process —
+    /// the same work `run_retention_sweep` already does on every tick — and
+    /// it is entirely off the publish path. Best-effort: every failure is
+    /// logged and skipped, because an unmeasurable org must start the engine
+    /// under-counted, never refuse to start.
+    ///
+    /// Orgs come from `list_all_org_ids` (the `organizations` table), exactly
+    /// as `run_retention_sweep` enumerates them: an org with `bus_topics`
+    /// rows but no `organizations` row is neither seeded here nor swept
+    /// there, and starts this process at zero.
+    fn seed_org_stored_bytes(&self) {
+        let org_ids = match crate::db::repository::list_all_org_ids(&self.db) {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = %e, "bus init: failed to list orgs for the storage-quota seed; every org starts at 0 bytes");
+                return;
+            }
+        };
+        for org_id in &org_ids {
+            if topics::validate_org_id(org_id).is_err() {
+                continue;
+            }
+            let topic_rows = match crate::db::repository::bus_topic_list(
+                &self.db,
+                &self.instance_id,
+                org_id,
+            ) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(org_id, error = %e, "bus init: failed to list topics for the storage-quota seed");
+                    continue;
+                }
+            };
+            let mut total: u64 = 0;
+            for row in topic_rows {
+                let topic_name = row.name.clone();
+                let cfg = match topics::TopicConfig::try_from(row) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        tracing::warn!(org_id, topic = %topic_name, error = %e, "bus init: corrupt topic row, skipped by the storage-quota seed");
+                        continue;
+                    }
+                };
+                for p in 0..cfg.partitions {
+                    let dir = topics::partition_dir(&self.bus_dir, org_id, &cfg.name, p);
+                    if !dir.is_dir() {
+                        continue;
+                    }
+                    match tentaflow_bus::Partition::open(
+                        &dir,
+                        tentaflow_bus::RollPolicy::default(),
+                        cfg.durability.to_engine(),
+                        256,
+                    ) {
+                        Ok(part) => total = total.saturating_add(partition_stored_bytes(&part)),
+                        Err(e) => tracing::warn!(
+                            org_id, topic = %cfg.name, partition = p, error = %e,
+                            "bus init: partition unreadable; its bytes are missing from the storage-quota seed"
+                        ),
+                    }
+                }
+            }
+            if total > 0 {
+                self.org_stored_bytes
+                    .insert(org_id.clone(), AtomicU64::new(total));
+            }
+        }
     }
 
     /// Number of times `topic_config` actually hit SQLite (as opposed to
@@ -3051,6 +3381,21 @@ impl BusService {
     /// peers this way and settles for RF=1 on this node alone — but unlike
     /// the identity check, this self-corrects, since every topic after that
     /// first one sees the growing registry).
+    ///
+    /// Closing that gap needs a registry of the nodes that actually run
+    /// THIS bus instance, together with a liveness signal for them. The
+    /// mesh trust table (`trusted_nodes`, db/migrations.rs) is NOT that
+    /// registry and must not be substituted for it: it records platform-wide
+    /// pairing with no instance column, no org column and no liveness, so a
+    /// paired node that never runs this bus instance would be written into
+    /// `PartitionAssignment.replicas`. `election::min_isr_required(rf)` =
+    /// `floor(rf/2)+1` is computed from the replica set, so that seat raises
+    /// the write quorum permanently and every publish is refused with
+    /// `NotEnoughReplicas` — a worse outcome than the RF=1 placement above.
+    /// The snapshot cannot supply the missing liveness either:
+    /// `ReplicationManager::snapshot` stamps `reachable: true` and
+    /// `environment: self.local_env` on every node it builds, so the filter
+    /// below really means "holds an assignment for this org", live or not.
     fn resolve_topic_placement(
         &self,
         org_id: &str,
@@ -3223,6 +3568,102 @@ impl BusService {
         }
     }
 
+    /// Admin-plane topic creation, audited as `bus.topic.create`. The
+    /// publish-time auto-creation path is `autocreate_topic` below: the same
+    /// work under a different audit action and an extra org-level gate.
+    pub fn create_topic(
+        &self,
+        ctx: &BusCallContext,
+        name: &str,
+        opts: topics::TopicOptions,
+    ) -> Result<topics::TopicConfig, BusServiceError> {
+        self.create_topic_audited(ctx, name, opts, "bus.topic.create")
+    }
+
+    /// PLAN §7.2's auto-creation path: a publish named a topic that does not
+    /// exist and the caller opted in (the `bus_publish` node's
+    /// `create_if_missing`, the REST query/CBOR field of the same name, the
+    /// addon SDK argument). The topic is created with defaults and audited
+    /// as `bus.topic.autocreate` — never also as `bus.topic.create`, so the
+    /// trail distinguishes a topic a producer conjured from one an operator
+    /// deliberately provisioned.
+    ///
+    /// The org's `bus.autocreate` setting is a CEILING over that opt-in, not
+    /// a second switch ANDed with it as an equal: the per-call flag only
+    /// decides whether to ask at all, and can never take an org past what
+    /// the setting allows. With the setting off (the default outside Dev)
+    /// the publish fails with `AutocreateDisabled` rather than the plain
+    /// `TopicNotFound` it would otherwise have got.
+    ///
+    /// Reserved `__`-prefixed topics never come through here — they are
+    /// broker infrastructure created by `ensure_internal_topic`, and
+    /// `topics::create_topic`'s user-name validation would reject them
+    /// anyway — so this gate can never stop a DLQ or `__bus.metrics` write.
+    pub fn autocreate_topic(
+        &self,
+        ctx: &BusCallContext,
+        name: &str,
+    ) -> Result<topics::TopicConfig, BusServiceError> {
+        self.check_instance(ctx)?;
+        if !self.autocreate_enabled(&ctx.org_id) {
+            return Err(BusServiceError::AutocreateDisabled {
+                org_id: ctx.org_id.clone(),
+                topic: name.to_string(),
+            });
+        }
+        self.create_topic_audited(
+            ctx,
+            name,
+            topics::TopicOptions::default(),
+            "bus.topic.autocreate",
+        )
+    }
+
+    /// Resolves `bus.autocreate` for `org_id`: the org's own `settings` row
+    /// first, then the node-wide one, then `autocreate_default_for` on the
+    /// node's declared environment. Read live rather than through
+    /// `cached_environment` — this only ever runs on a publish that already
+    /// missed its topic and is about to pay for a whole topic creation, so
+    /// the reads are free by comparison and an operator who just flipped the
+    /// setting does not have to restart the engine to see it take effect.
+    ///
+    /// Only an ABSENT row moves on to the next level. A row that is present
+    /// but does not parse, and a `get_setting` that returns an error, both
+    /// refuse here (after a `warn!`) instead of falling through: the levels
+    /// below were not written for this org, and the chain ends in
+    /// `autocreate_default_for`, which is on for a Dev node — so treating a
+    /// typo or a transient `SQLITE_BUSY` as "no row" could widen a ceiling
+    /// an operator had written down. Same fail-closed direction
+    /// `services::environment::get_node_environment` takes when it reads an
+    /// unreadable environment as Prod.
+    fn autocreate_enabled(&self, org_id: &str) -> bool {
+        let org_key = autocreate_setting_key(org_id);
+        for key in [org_key.as_str(), AUTOCREATE_SETTING_KEY] {
+            match crate::db::repository::get_setting(&self.db, key) {
+                Ok(None) => continue,
+                Ok(Some(raw)) => {
+                    return parse_autocreate_setting(&raw).unwrap_or_else(|| {
+                        tracing::warn!(
+                            setting = key,
+                            value = %raw,
+                            "unrecognized bus.autocreate value; refusing auto-creation"
+                        );
+                        false
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        setting = key,
+                        error = %e,
+                        "cannot read bus.autocreate; refusing auto-creation"
+                    );
+                    return false;
+                }
+            }
+        }
+        autocreate_default_for(crate::services::environment::get_node_environment(&self.db))
+    }
+
     /// M2 (PLAN-M2 §1e): replica placement. `replication_factor` defaults
     /// to `min(3, healthy same-environment nodes)` — PLAN §7.1's own
     /// intended default, meaningless in M1 (no coordinator, no mesh) and
@@ -3243,11 +3684,12 @@ impl BusService {
     /// coordinator wired yet) skips placement entirely: the topic row is
     /// still created with whatever `replication_factor` it resolved to,
     /// just with no assignments proposed for it yet.
-    pub fn create_topic(
+    fn create_topic_audited(
         &self,
         ctx: &BusCallContext,
         name: &str,
         mut opts: topics::TopicOptions,
+        audit_action: &'static str,
     ) -> Result<topics::TopicConfig, BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
@@ -3313,7 +3755,7 @@ impl BusService {
             &self.db,
             ctx.actor.as_deref(),
             None,
-            "bus.topic.create",
+            audit_action,
             Some(name),
             Some(&audit_details(
                 &ctx.org_id,
@@ -3423,6 +3865,28 @@ impl BusService {
         self.authorizer
             .authorize(ctx, BusAction::Admin, name)
             .map_err(|_| deny(BusAction::Admin, name))?;
+        // PLAN §7.1 `max_bytes`: measured BEFORE the `bus_topics` row goes,
+        // while `topic_config` can still say how many partitions to sum, and
+        // before the handles are detached below. SUBTRACTED, not "drop the
+        // org's entry": a missing entry reads as zero, so dropping it here
+        // would forgive every OTHER topic of this org at the same time.
+        // `0` when the topic's config cannot be read — the deletion still
+        // proceeds, the counter just keeps bytes it should have released
+        // until the next restart's seed.
+        let released_bytes = match self.topic_config(&ctx.org_id, name) {
+            Ok(cfg) => self.topic_stored_bytes(&ctx.org_id, name, &cfg),
+            // A topic that does not exist is `topics::delete_topic`'s error
+            // to report (it does, a few lines below): nothing to measure and
+            // nothing to warn about here.
+            Err(BusServiceError::TopicNotFound { .. }) => 0,
+            Err(e) => {
+                tracing::warn!(
+                    org_id = %ctx.org_id, topic = name, error = %e,
+                    "delete_topic: topic config unreadable; its bytes stay on the org's storage counter"
+                );
+                0
+            }
+        };
         topics::delete_topic(&self.db, &self.instance_id, &ctx.org_id, name)?;
         // M2 (PLAN-M2 §1e): stop replication and drop this topic's
         // assignments BEFORE detaching local handles/removing the
@@ -3492,6 +3956,8 @@ impl BusService {
             crate::db::repository::bus_groups_delete_by_topic(&self.local_db, &ctx.org_id, name)?;
         let dir = topics::topic_dir(&self.bus_dir, &ctx.org_id, name);
         let _ = std::fs::remove_dir_all(&dir);
+        // The segments measured at the top of this call are gone now.
+        self.sub_org_stored_bytes(&ctx.org_id, released_bytes);
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -3824,6 +4290,34 @@ impl BusService {
             .flat_map(|(_, recs)| recs.iter())
             .map(|r| r.payload.len() as u64)
             .sum();
+        // PLAN §7.1 `max_bytes`: the org-wide STORAGE ceiling, checked
+        // before the rate buckets below so a publish rejected for disk never
+        // spends this call's rate tokens (the same reasoning that puts
+        // `resolve_partitions`/`preflight` ahead of the quota check).
+        //
+        // `org_stored_bytes` is a map lookup plus an atomic load — no
+        // filesystem access on this path at all (see its field doc). The
+        // `requested` term is this call's PAYLOAD bytes, a lower bound on
+        // the segment bytes the appends below would actually add (batch
+        // header + per-record framing push the real figure higher, lz4 can
+        // push it lower), so the check admits a batch that lands exactly on
+        // the ceiling and may overshoot it by one batch's framing before the
+        // NEXT publish is refused. Deliberate: the exact figure is only
+        // known once the batches are built per partition group, and a coarse
+        // "one org must not fill the node's disk" ceiling must not reject a
+        // publish over framing bytes it cannot show the operator.
+        let max_bytes_total = self.quota.max_bytes_total(&ctx.org_id);
+        let stored_bytes = self.org_stored_bytes(&ctx.org_id);
+        if stored_bytes.saturating_add(total_bytes) > max_bytes_total {
+            self.audit_windowed(ctx, "bus.quota.exceeded", Some(topic), None);
+            self.throttled_total.fetch_add(1, Ordering::Relaxed);
+            return Err(BusServiceError::MaxBytesTotalExceeded {
+                org_id: ctx.org_id.clone(),
+                max: max_bytes_total,
+                current: stored_bytes,
+                requested: total_bytes,
+            });
+        }
         if let Err(e) = self
             .quota
             .try_consume(&ctx.org_id, total_records, total_bytes)
@@ -4030,9 +4524,24 @@ impl BusService {
             let part = self
                 .partition_handle(&ctx.org_id, topic, partition, &cfg)
                 .map_err(|e| wrap_err(&acks, e))?;
+            // PLAN §7.1 `max_bytes`: the exact number of bytes this append
+            // is about to add to the active segment file. `Partition::
+            // append_batch` writes this buffer verbatim (the leader path's
+            // `patch_base_offset` rewrites 8 header bytes in place and
+            // returns the same length), and `Segment::append` advances the
+            // segment's length by exactly the buffer's own length — so this
+            // is the same unit `sealed_segments()`/`active_segment_len()`
+            // report and the same unit `run_retention_sweep` subtracts.
+            // Read before `wire` is moved into the append.
+            let appended_segment_bytes = wire.len() as u64;
             let append = part
                 .append_batch(wire)
                 .map_err(|e| wrap_err(&acks, map_engine_error(e, topic, partition)))?;
+            // Credited HERE, not after the loop: these bytes are durably on
+            // this leader's disk from this point on, so a later failure in
+            // this same call (`await_acks`, the producer-sequence record)
+            // must not make the org's storage counter forget them.
+            self.add_org_stored_bytes(&ctx.org_id, appended_segment_bytes);
 
             // Record the ack IMMEDIATELY once the append is durable, before
             // either the dedup-key commit or the producer-sequence record
@@ -5261,6 +5770,16 @@ impl BusService {
             // repeat for each of an org's (up to `MAX_PARTITIONS` x
             // `max_topics`) partitions.
             let compliance_floor_ms = self.compliance_retention_floor_ms(org_id);
+            // PLAN §7.1 `max_bytes`: reclaimed bytes have to come back off
+            // this org's storage counter, or an org that publishes and
+            // expires at a steady rate would drift up to its ceiling and
+            // stay there forever. `RetentionOutcome::deleted_bytes` sums the
+            // unlinked segments' `SealedSegmentInfo::len` — the same unit
+            // `publish` credits (`bus/retention.rs`'s `sweep_partition`), so
+            // this subtracts exactly what was added. Accumulated per org and
+            // applied once, rather than per partition, so the counter is
+            // touched once per sweep instead of once per (topic × partition).
+            let mut reclaimed_bytes: u64 = 0;
             for row in topic_rows {
                 let topic_name = row.name.clone();
                 let cfg = match topics::TopicConfig::try_from(row) {
@@ -5294,6 +5813,7 @@ impl BusService {
                         Ok(outcome) => {
                             report.deleted_segments += outcome.deleted_segments;
                             report.deleted_bytes += outcome.deleted_bytes;
+                            reclaimed_bytes = reclaimed_bytes.saturating_add(outcome.deleted_bytes);
                         }
                         Err(e) => {
                             tracing::warn!(org_id, topic = %cfg.name, partition = p, error = %e, "bus retention sweep: sweep_partition failed");
@@ -5301,6 +5821,7 @@ impl BusService {
                     }
                 }
             }
+            self.sub_org_stored_bytes(org_id, reclaimed_bytes);
         }
         // Close every handle this sweep opened for itself (dropping the
         // last `Partition` clone stops its writer thread and releases its
@@ -5445,10 +5966,18 @@ impl BusService {
         self.audit_windows.remove_org(org_id);
         self.commit_locks.retain(|k, _| k.0 != org_id);
         self.quota.remove_org(org_id);
+        // The org's whole log tree is removed below, so zero is the exact
+        // new total, not an "unknown" this would have to re-measure.
+        self.clear_org_stored_bytes(org_id);
 
         let topics_deleted =
             crate::db::repository::bus_topics_delete_by_org(&self.db, &self.instance_id, org_id)?
                 as u32;
+        // The persisted quota row too (migration v154), not just the
+        // in-memory buckets `remove_org` above dropped — otherwise the next
+        // restart would replay a purged org's ceiling straight back into the
+        // manager.
+        crate::db::repository::bus_quota_delete_by_org(&self.db, &self.instance_id, org_id)?;
         let groups_deleted =
             crate::db::repository::bus_groups_delete_by_org(&self.local_db, org_id)? as u32;
         // Review finding #9: the DB rows themselves (admin schema text,
@@ -7113,6 +7642,335 @@ mod tests {
             "the 1/s bucket never refused across 4 attempts — each accepted attempt \
              proved a >=1 s gap, so this is a pathologically stalled host, not a \
              quota bug"
+        );
+    }
+
+    /// PLAN §7.1 `max_bytes`: the storage ceiling admits a publish that fits
+    /// and refuses the one that would cross it. Timing-free, unlike the rate
+    /// buckets above — nothing refills a disk. Deleting the check from
+    /// `publish` makes the `unwrap_err` below panic.
+    ///
+    /// Also pins the counter's UNIT: a brand-new org is at exactly `0` (the
+    /// counter measures nothing on `create_topic`, so an empty topic's
+    /// preallocated files can never be charged against the ceiling), and one
+    /// 512-byte record costs MORE than 512 bytes because what is counted is
+    /// what the engine wrote into the segment file.
+    #[test]
+    fn max_bytes_total_admits_a_publish_below_the_ceiling_and_refuses_the_one_crossing_it() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "storage.topic",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            svc.org_stored_bytes("org-1"),
+            0,
+            "an org that has published nothing stores nothing — creating a topic \
+             must not charge it for empty/preallocated files"
+        );
+
+        let payload = "x".repeat(512);
+        let publish_one = |svc: &BusService| {
+            svc.publish(
+                &ctx,
+                "storage.topic",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(&payload)],
+                },
+            )
+        };
+
+        // First publish under the default (1 TiB) ceiling, purely to learn
+        // what one batch costs in the unit the counter keeps.
+        publish_one(&svc).expect("the default ceiling admits the first publish");
+        let one_batch = svc.org_stored_bytes("org-1");
+        assert!(
+            one_batch > 512,
+            "the counter must charge the SEGMENT bytes the engine wrote (batch \
+             header + per-record framing), not the 512 payload bytes; got {one_batch}"
+        );
+
+        // Room for exactly one more record's payload on top of what is
+        // already stored: the next publish still fits, the one after it
+        // cannot (the check compares stored + payload bytes).
+        svc.quota().set_org_quota(
+            "org-1",
+            quota::QuotaConfig {
+                max_bytes_total: one_batch + 512,
+                ..Default::default()
+            },
+        );
+
+        publish_one(&svc).expect("a publish that fits under max_bytes_total must be admitted");
+        let two_batches = svc.org_stored_bytes("org-1");
+        assert!(
+            two_batches > one_batch,
+            "the second publish must have been charged too: {two_batches} vs {one_batch}"
+        );
+
+        let err = publish_one(&svc).unwrap_err();
+        match err {
+            BusServiceError::MaxBytesTotalExceeded {
+                org_id,
+                max,
+                current,
+                requested,
+            } => {
+                assert_eq!(org_id, "org-1");
+                assert_eq!(max, one_batch + 512);
+                assert_eq!(current, two_batches);
+                assert_eq!(requested, 512, "`requested` is this call's payload bytes");
+            }
+            other => panic!("expected MaxBytesTotalExceeded, got {other:?}"),
+        }
+        // A refused publish appends nothing, so it must not move the
+        // counter either.
+        assert_eq!(svc.org_stored_bytes("org-1"), two_batches);
+        assert_eq!(
+            svc.bus_metrics_snapshot().3,
+            1,
+            "a storage-quota refusal counts as a throttled publish, same as a \
+             rate-bucket one"
+        );
+
+        // A different org has its own (default, practically unlimited)
+        // ceiling and is unaffected.
+        let ctx2 = test_ctx("org-2");
+        svc.create_topic(&ctx2, "storage.topic", topics::TopicOptions::default())
+            .unwrap();
+        svc.publish(
+            &ctx2,
+            "storage.topic",
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![record(&payload)],
+            },
+        )
+        .expect("org-2 must not be charged for org-1's storage");
+    }
+
+    /// PLAN §7.1 `max_bytes`, the two halves `publish` cannot cover on its
+    /// own:
+    ///
+    /// 1. `BusService::new` seeds the counter from the ENGINE's per-partition
+    ///    segment accounting, so a restarted engine enforces against what is
+    ///    really on disk instead of letting every org re-publish its whole
+    ///    ceiling. The segments here are appended straight through
+    ///    `tentaflow_bus::Partition`, never through `publish`, so ONLY the
+    ///    seed can account for them.
+    /// 2. `run_retention_sweep` debits exactly what it unlinked, in that same
+    ///    unit — the property that keeps a topic with a rolling retention
+    ///    window from driving the counter to zero and silently disabling the
+    ///    ceiling.
+    ///
+    /// Both are asserted against `partition_stored_bytes`, computed
+    /// independently from the engine. A seed that measured the org DIRECTORY
+    /// instead (which would also count the `.lock` file, the `.oidx`/`.tidx`
+    /// indexes and a dedup topic's preallocated `dedup.bin`) fails the first
+    /// assertion; a debit in any other unit fails the last one.
+    #[test]
+    fn org_stored_bytes_is_seeded_from_the_engine_and_debited_in_the_same_unit() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let bus_dir = tmp.path().join("bus");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        insert_test_org(&db, "org-1");
+
+        // The topic row is written directly, before any engine exists, so
+        // the whole of this org's on-disk data predates the `BusService`
+        // whose seed is under test.
+        topics::create_topic(
+            &db,
+            test_instance_id().as_str(),
+            "org-1",
+            "seeded.topic",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+            crate::services::environment::get_node_environment(&db),
+            now_ms(),
+        )
+        .expect("create the topic row");
+
+        // Pre-seal several segments straight through the engine, bypassing
+        // the fixed `RollPolicy::default()` `partition_handle` uses in
+        // production — same technique as `retention.rs`'s own tests and
+        // `run_retention_sweep_deletes_sealed_segments_and_keeps_the_active_one`.
+        let part_dir = topics::partition_dir(&bus_dir, "org-1", "seeded.topic", 0);
+        let (on_disk_bytes, one_segment_bytes) = {
+            let policy = tentaflow_bus::RollPolicy {
+                max_batches: 1,
+                ..Default::default()
+            };
+            let part =
+                tentaflow_bus::Partition::open(&part_dir, policy, tentaflow_bus::Durability::Os, 8)
+                    .unwrap();
+            for _ in 0..5 {
+                let mut b = tentaflow_bus::BatchBuilder::new(0, 1);
+                b.push(tentaflow_bus::RecordInput::new(
+                    Bytes::from(vec![7u8; 512]),
+                    now_ms(),
+                ))
+                .unwrap();
+                part.append_batch(b.build().unwrap()).unwrap();
+            }
+            let sealed = part.sealed_segments();
+            assert_eq!(sealed.len(), 4);
+            (partition_stored_bytes(&part), sealed[0].len as i64)
+        }; // dropped: releases the directory flock before the engine opens it.
+
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: bus_dir.clone(),
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+
+        assert!(on_disk_bytes > 0, "the fixture must have written something");
+        assert_eq!(
+            svc.org_stored_bytes("org-1"),
+            on_disk_bytes,
+            "the startup seed must report exactly the engine's own segment total"
+        );
+
+        // Budget for 1.5 segments of sealed data: three of the four sealed
+        // segments go, the active one is never touched.
+        let mut row = crate::db::repository::bus_topic_get(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "seeded.topic",
+        )
+        .unwrap()
+        .unwrap();
+        row.retention_bytes = one_segment_bytes + one_segment_bytes / 2;
+        crate::db::repository::bus_topic_update(&svc.db, &row).unwrap();
+
+        let report = svc.run_retention_sweep();
+        assert_eq!(report.deleted_segments, 3);
+        assert!(report.deleted_bytes > 0);
+        assert_eq!(
+            svc.org_stored_bytes("org-1"),
+            on_disk_bytes - report.deleted_bytes,
+            "the sweep must debit exactly the segment bytes it unlinked"
+        );
+
+        let cfg = svc.topic_config("org-1", "seeded.topic").unwrap();
+        let part = svc
+            .partition_handle("org-1", "seeded.topic", 0, &cfg)
+            .unwrap();
+        assert_eq!(
+            svc.org_stored_bytes("org-1"),
+            partition_stored_bytes(&part),
+            "counter and engine must still agree once the sweep is done"
+        );
+    }
+
+    /// `delete_topic` subtracts the topic it removed, and ONLY that topic.
+    /// Dropping the org's whole entry instead would read back as zero (a
+    /// missing entry means "stores nothing"), forgiving every surviving
+    /// topic's bytes and switching the ceiling off for a whole org's worth
+    /// of writes.
+    #[test]
+    fn delete_topic_subtracts_only_the_deleted_topics_stored_bytes() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        for name in ["keep.topic", "drop.topic"] {
+            svc.create_topic(
+                &ctx,
+                name,
+                topics::TopicOptions {
+                    partitions: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            svc.publish(
+                &ctx,
+                name,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(&"y".repeat(256))],
+                },
+            )
+            .unwrap();
+        }
+        let both = svc.org_stored_bytes("org-1");
+        assert!(both > 0);
+
+        let kept_cfg = svc.topic_config("org-1", "keep.topic").unwrap();
+        let kept_bytes = svc.topic_stored_bytes("org-1", "keep.topic", &kept_cfg);
+        assert!(kept_bytes > 0 && kept_bytes < both);
+
+        svc.delete_topic(&ctx, "drop.topic").unwrap();
+        assert_eq!(
+            svc.org_stored_bytes("org-1"),
+            kept_bytes,
+            "only the deleted topic's bytes come off; the surviving topic keeps its own"
+        );
+    }
+
+    /// C4: `BusService::new` replays `bus_org_quotas`, so a quota an
+    /// operator configured survives an engine restart instead of silently
+    /// reverting to `QuotaConfig::default()`. The restart is simulated the
+    /// way it really happens — a brand-new engine over the SAME platform
+    /// database (a fresh `bus_dir`, since the previous engine's fjall lock
+    /// is only released when it is dropped).
+    #[test]
+    fn a_persisted_org_quota_is_restored_when_the_engine_restarts() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        quota::persist_org_quota(
+            &db,
+            test_instance_id().as_str(),
+            "org-1",
+            quota::QuotaConfig {
+                max_topics: 5,
+                max_bytes_total: 4096,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: dir.path().join("bus"),
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+
+        assert_eq!(svc.quota().max_topics("org-1"), 5);
+        assert_eq!(svc.quota().max_bytes_total("org-1"), 4096);
+        // An org with no persisted row still falls back to the defaults.
+        assert_eq!(
+            svc.quota().max_topics("org-2"),
+            quota::QuotaConfig::default().max_topics
         );
     }
 
@@ -9656,6 +10514,190 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, BusServiceError::MaxPartitionsExceeded { .. }));
+    }
+
+    // ---- bus.autocreate (PLAN §7.2) ---------------------
+
+    /// Up to ten `audit_log` rows for `action`, newest first — enough to
+    /// assert that an action WAS or was NOT written. `latest_audit_details`
+    /// above is the "read the newest one's details" variant.
+    fn audit_rows_for(
+        db: &crate::db::DbPool,
+        action: &str,
+    ) -> Vec<crate::db::models::AuditLogEntry> {
+        crate::db::repository::list_audit_logs(
+            db,
+            &crate::db::models::AuditLogFilters {
+                action: Some(action.to_string()),
+                ..Default::default()
+            },
+            0,
+            10,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn autocreate_is_allowed_by_the_dev_default_and_audited_as_bus_topic_autocreate() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        crate::services::environment::set_node_environment(&svc.db, NodeEnvironment::Dev).unwrap();
+        svc.invalidate_environment_cache();
+
+        let cfg = svc
+            .autocreate_topic(&ctx, "orders.auto")
+            .expect("bus.autocreate is on by default in Dev");
+        assert_eq!(cfg.partitions, topics::DEFAULT_PARTITIONS);
+
+        let details = latest_audit_details(&svc.db, "bus.topic.autocreate");
+        assert!(details.contains("org_id=org-1"), "{details}");
+        assert!(
+            details.contains(&format!("partitions={}", topics::DEFAULT_PARTITIONS)),
+            "{details}"
+        );
+        // An auto-creation must be distinguishable from an operator's own
+        // provisioning, so it writes ONE row under its own action rather
+        // than also (or instead) the admin one.
+        assert!(
+            audit_rows_for(&svc.db, "bus.topic.create").is_empty(),
+            "an auto-creation must not also log the admin bus.topic.create action"
+        );
+    }
+
+    #[test]
+    fn autocreate_is_refused_under_the_test_and_prod_defaults() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+
+        // A fresh node has no `node_environment` row, which
+        // `services::environment` reads as Prod.
+        let err = svc.autocreate_topic(&ctx, "orders.prod-auto").unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::AutocreateDisabled { .. }),
+            "expected the Prod default to refuse, got {err:?}"
+        );
+        // The refusal has to name the setting the operator must flip —
+        // `TopicNotFound` would leave them guessing.
+        assert!(err.to_string().contains(AUTOCREATE_SETTING_KEY), "{err}");
+        assert!(
+            topics::get_topic(&svc.db, svc.instance_id(), "org-1", "orders.prod-auto")
+                .unwrap()
+                .is_none(),
+            "a refused auto-creation must leave no topic row behind"
+        );
+        assert!(audit_rows_for(&svc.db, "bus.topic.autocreate").is_empty());
+
+        crate::services::environment::set_node_environment(&svc.db, NodeEnvironment::Test).unwrap();
+        svc.invalidate_environment_cache();
+        let err = svc.autocreate_topic(&ctx, "orders.test-auto").unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::AutocreateDisabled { .. }),
+            "expected the Test default to refuse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn autocreate_setting_is_per_org_and_overrides_the_environment_default() {
+        let (_tmp, svc) = test_service();
+        // Prod default (off) everywhere; exactly one org is opted in.
+        crate::db::repository::set_setting(&svc.db, &autocreate_setting_key("org-1"), "true")
+            .unwrap();
+
+        svc.autocreate_topic(&test_ctx("org-1"), "orders.auto")
+            .expect("org-1 has bus.autocreate on");
+        let err = svc
+            .autocreate_topic(&test_ctx("org-2"), "orders.auto")
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::AutocreateDisabled { .. }),
+            "one org's opt-in must not enable auto-creation for another, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn per_org_autocreate_setting_wins_over_the_node_wide_one() {
+        let (_tmp, svc) = test_service();
+        crate::services::environment::set_node_environment(&svc.db, NodeEnvironment::Dev).unwrap();
+        svc.invalidate_environment_cache();
+        // Node-wide on (also the Dev default), this one org explicitly off.
+        crate::db::repository::set_setting(&svc.db, AUTOCREATE_SETTING_KEY, "1").unwrap();
+        crate::db::repository::set_setting(&svc.db, &autocreate_setting_key("org-1"), "0").unwrap();
+
+        let err = svc
+            .autocreate_topic(&test_ctx("org-1"), "orders.auto")
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::AutocreateDisabled { .. }),
+            "{err:?}"
+        );
+        svc.autocreate_topic(&test_ctx("org-2"), "orders.auto")
+            .expect("org-2 falls through to the node-wide setting");
+    }
+
+    #[test]
+    fn autocreate_reads_on_off_and_fails_closed_on_an_unparseable_row() {
+        let (_tmp, svc) = test_service();
+        crate::services::environment::set_node_environment(&svc.db, NodeEnvironment::Dev).unwrap();
+        svc.invalidate_environment_cache();
+        // Node-wide "on" (PLAN §7.2's own spelling), so every fall-through
+        // below lands on "allowed": only a row that decides on its own level
+        // can refuse here.
+        crate::db::repository::set_setting(&svc.db, AUTOCREATE_SETTING_KEY, "on").unwrap();
+
+        crate::db::repository::set_setting(&svc.db, &autocreate_setting_key("org-1"), " OFF ")
+            .unwrap();
+        let err = svc
+            .autocreate_topic(&test_ctx("org-1"), "orders.auto")
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::AutocreateDisabled { .. }),
+            "'off' is PLAN §7.2's own spelling of the opt-out, got {err:?}"
+        );
+        // An operator who follows the message must land on the key that
+        // actually refused, not on the node-wide one it outranks.
+        assert!(
+            err.to_string().contains(&autocreate_setting_key("org-1")),
+            "{err}"
+        );
+
+        // A row that exists but says nothing recognizable must not escalate
+        // to the more permissive node-wide value.
+        crate::db::repository::set_setting(&svc.db, &autocreate_setting_key("org-2"), "yes-please")
+            .unwrap();
+        let err = svc
+            .autocreate_topic(&test_ctx("org-2"), "orders.auto")
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::AutocreateDisabled { .. }),
+            "an unparseable row must fail closed, got {err:?}"
+        );
+
+        // An org with no row of its own still falls through to node-wide.
+        svc.autocreate_topic(&test_ctx("org-3"), "orders.auto")
+            .expect("org-3 falls through to the node-wide 'on'");
+    }
+
+    #[test]
+    fn reserved_topics_are_created_even_when_autocreate_is_off() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        // Explicitly off node-wide, on top of the Prod default this fixture
+        // already runs under.
+        crate::db::repository::set_setting(&svc.db, AUTOCREATE_SETTING_KEY, "0").unwrap();
+
+        // Admin provisioning is not gated either — only the publish-time
+        // auto-create path is.
+        let source = svc
+            .create_topic(&ctx, "orders.reserved", topics::TopicOptions::default())
+            .expect("bus.autocreate must not gate admin create_topic");
+
+        let dlq_cfg = svc
+            .ensure_dlq_topic(&ctx, "orders.reserved", &source)
+            .expect("a __-prefixed topic is broker infrastructure, not a user topic");
+        assert_eq!(dlq_cfg.name, dlq::dlq_topic_name("orders.reserved"));
+
+        svc.ensure_metrics_topic(&ctx)
+            .expect("__bus.metrics must be reachable with bus.autocreate off");
     }
 
     // ---- system-wide retention sweep --------------------

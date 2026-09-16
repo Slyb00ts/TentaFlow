@@ -95,6 +95,13 @@ fn shared_env() -> &'static SharedEnv {
     static ENV: OnceLock<SharedEnv> = OnceLock::new();
     ENV.get_or_init(|| {
         let db = db::init(Path::new(":memory:")).expect("init db");
+        // PLAN §7.2: `create_if_missing` is only an opt-in under the org's
+        // `bus.autocreate` ceiling, which defaults to off outside Dev — and a
+        // fresh `:memory:` db declares no environment at all, i.e. Prod. The
+        // publish tests below rely on auto-creation, so this fixture enables
+        // it explicitly rather than depending on an environment default.
+        db::repository::set_setting(&db, bus::AUTOCREATE_SETTING_KEY, "1")
+            .expect("enable bus.autocreate");
         let tmp = tempfile::tempdir().expect("create temp dir");
         let bus_dir = tmp.path().join("bus");
         // Leaked deliberately: this dir must outlive every test in the

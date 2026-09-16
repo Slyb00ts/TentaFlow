@@ -5817,7 +5817,9 @@ mod bus_chain_tests {
     /// `bus_publish::tests` + `bus::reactor::tests`). Both nodes carry a
     /// syntactically valid `instance_id` (required since plan-app-platform
     /// §3.3) even though `bus_consume`'s own `execute` never parses
-    /// `ConsumeConfig` (only `bus::reactor` does, on save/reactor-scan) and
+    /// `ConsumeConfig` (the two places that do are
+    /// `FlowDispatcher::validate_flow` on save and
+    /// `bus::reactor::build_subscriptions` on the reconcile scan) and
     /// `bus_transform` only validates the field's shape — this test still
     /// needs a well-formed value to exercise the CEL reshape path.
     #[tokio::test]

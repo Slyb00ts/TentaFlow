@@ -108,6 +108,61 @@ impl From<anyhow::Error> for DispatchError {
     }
 }
 
+/// What [`FlowDispatcher::validate_flow`] can reject. Wider than
+/// [`FlowValidationError`] because the save path checks two things the
+/// registry-only `validation::validate` cannot: the DB-backed list of
+/// installed TentaBus instances, and each `bus_consume` node's
+/// `ConsumeConfig`, whose parser lives in the bus-aware node adapter.
+/// Outside its own tests `validation.rs` reaches for neither the DB nor
+/// `crate::bus` — it is also the per-load check `CompiledFlow::compile` runs
+/// — so the extra variant lives here, next to the caller that produces it,
+/// the same way `validate_bus_instances` takes its installed-instance set as
+/// an argument instead of querying for it.
+#[derive(Debug, thiserror::Error)]
+pub enum FlowSaveValidationError {
+    /// Everything `validation::validate` and `validation::
+    /// validate_bus_instances` already report, forwarded verbatim so the
+    /// message `dispatch::handlers::validate_flow_json_str` puts in its
+    /// `bad_request` is unchanged.
+    #[error("{0}")]
+    Validation(#[from] FlowValidationError),
+    /// A `bus_consume` node whose `config` does not parse into a
+    /// `ConsumeConfig`: missing `topic`/`group`, an `instance_id` that is not
+    /// a bus instance id, an unknown `on_error`, or a `commit_mode` no flow
+    /// can honour (`explicit` — no flow node commits offsets). `detail` is
+    /// the parser's own message, which names the field and the accepted
+    /// values.
+    #[error("node '{node_id}': {detail}")]
+    BusConsumeConfig { node_id: String, detail: String },
+}
+
+/// Parses every `bus_consume` node's `config` with the same
+/// `ConsumeConfig::from_config` that `bus::reactor::build_subscriptions` uses
+/// to build the subscription, so a config the reactor would refuse to run is
+/// refused at SAVE instead of being stored as an active flow that silently
+/// never runs (the reactor's own signal is one `tracing::warn` per reconcile
+/// cycle in the server log).
+///
+/// DB-free, and deliberately NOT part of `validation::validate`: that one has
+/// no `crate::bus` dependency and runs on every flow LOAD from the DB
+/// (`CompiledFlow::compile`), where re-rejecting an already-stored flow would
+/// turn a config mistake into a load failure instead of a save failure.
+fn validate_bus_consume_configs(def: &FlowDefinition) -> Result<(), FlowSaveValidationError> {
+    use crate::flow_engine::node_adapters::bus_consume::{ConsumeConfig, NODE_TYPE};
+    for node in &def.nodes {
+        if node.node_type != NODE_TYPE {
+            continue;
+        }
+        if let Err(e) = ConsumeConfig::from_config(&node.config) {
+            return Err(FlowSaveValidationError::BusConsumeConfig {
+                node_id: node.id.clone(),
+                detail: e.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Wynik resolve_cached — rozróżnia 3 stany żeby caller wiedział czy wykonać
 /// model bezpośrednio (NotFound) czy zwrócić błąd kompilacji (CompileFailed).
 enum ResolvedFlow {
@@ -735,13 +790,23 @@ impl FlowDispatcher {
     /// through that one function, so this method has exactly one caller by
     /// design rather than four call sites duplicating the DB lookup.
     ///
-    /// Runs the generic port/graph rules (`validation::validate`) PLUS every
-    /// `bus_consume`/`bus_publish`/`bus_transform` node's `instance_id` must
-    /// name an INSTALLED TentaBus instance (`validation::
-    /// validate_bus_instances`). `validation::validate` alone (no DB access)
-    /// is still what `CompiledFlow::compile` runs on every load — this
-    /// wrapper is for the save path specifically, which has a DB handle and
-    /// runs far less often than a flow load/execution.
+    /// Runs the generic port/graph rules (`validation::validate`) PLUS two
+    /// bus-specific checks `validation::validate` cannot make on its own:
+    /// every `bus_consume`/`bus_publish`/`bus_transform` node's `instance_id`
+    /// must name an INSTALLED TentaBus instance (`validation::
+    /// validate_bus_instances`, which needs the DB-backed instance list), and
+    /// every `bus_consume` node's `config` must parse into a `ConsumeConfig`
+    /// (`validate_bus_consume_configs`, which needs the bus-aware node
+    /// adapter). `validation::validate` alone (no DB access, no `crate::bus`
+    /// dependency) is still what `CompiledFlow::compile` runs on every load —
+    /// this wrapper is for the save path specifically, which has a DB handle
+    /// and runs far less often than a flow load/execution.
+    ///
+    /// The `ConsumeConfig` parse runs LAST so the two instance-specific
+    /// errors keep their better wording: the palette ships `"instance_id":""`
+    /// as a fresh `bus_consume` node's default, and `MissingBusInstance`
+    /// ("no TentaBus instance selected") says more about it than the parser's
+    /// generic required-field message would.
     ///
     /// Two guarantees kept deliberately separate:
     /// - a flow with NO `bus_*` node (`validation::
@@ -754,24 +819,26 @@ impl FlowDispatcher {
     ///   so the caller does not go hunting for the wrong problem) — the same
     ///   fail-closed posture `dispatch::app_gate` uses for its own DB
     ///   lookups.
-    pub fn validate_flow(&self, def: &FlowDefinition) -> Result<(), FlowValidationError> {
+    pub fn validate_flow(&self, def: &FlowDefinition) -> Result<(), FlowSaveValidationError> {
         validation::validate(def, &self.registry)?;
-        if !validation::flow_references_a_bus_instance(def) {
-            return Ok(());
+        if validation::flow_references_a_bus_instance(def) {
+            let installed: std::collections::HashSet<String> =
+                match repository::list_package_instances(
+                    &self.db,
+                    crate::bus::instance::BusInstanceId::PACKAGE_ID,
+                ) {
+                    Ok(rows) => rows.into_iter().map(|(addon_id, _, _)| addon_id).collect(),
+                    Err(e) => {
+                        tracing::warn!(
+                            "flow save validation: TentaBus instance list failed, failing \
+                             closed: {e}"
+                        );
+                        return Err(FlowValidationError::BusInstanceLookupFailed.into());
+                    }
+                };
+            validation::validate_bus_instances(def, &installed)?;
         }
-        let installed: std::collections::HashSet<String> = match repository::list_package_instances(
-            &self.db,
-            crate::bus::instance::BusInstanceId::PACKAGE_ID,
-        ) {
-            Ok(rows) => rows.into_iter().map(|(addon_id, _, _)| addon_id).collect(),
-            Err(e) => {
-                tracing::warn!(
-                    "flow save validation: TentaBus instance list failed, failing closed: {e}"
-                );
-                return Err(FlowValidationError::BusInstanceLookupFailed);
-            }
-        };
-        validation::validate_bus_instances(def, &installed)
+        validate_bus_consume_configs(def)
     }
 
     /// Wpina addon manager jako resolver custom flow blocks. Wołane raz
@@ -2340,5 +2407,130 @@ mod tests {
         assert_eq!(chunk.mime, "audio/wav");
         assert_eq!(chunk.sample_rate, Some(22_050));
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
+    }
+
+    // -------------------------------------------------------------------
+    // Save-path `bus_consume` config validation (PLAN §6.3)
+    // -------------------------------------------------------------------
+
+    const TEST_BUS_INSTANCE: &str = "tentabus-aaaaaaaa";
+
+    /// The REAL save-path object, built the way `dispatch::handlers`' own
+    /// save-validation tests build it: `AppState::for_test` wires a `Router`
+    /// WITH a DB, so `flow_dispatcher()` is `Some` and `validate_flow` can run
+    /// its DB-backed instance lookup instead of being skipped.
+    fn save_validation_fixture() -> (Arc<crate::dispatch::state::AppState>, Arc<FlowDispatcher>) {
+        let state = crate::dispatch::state::AppState::for_test();
+        let dispatcher = state
+            .router
+            .flow_dispatcher()
+            .expect("AppState::for_test builds a Router with a DB")
+            .clone();
+        (state, dispatcher)
+    }
+
+    /// Minimal `addons` row for an installed TentaBus instance — the shape
+    /// `repository::list_package_instances` reads. Without it
+    /// `validate_bus_instances` rejects the flow first and the config check
+    /// under test is never reached.
+    fn install_bus_instance(state: &Arc<crate::dispatch::state::AppState>) {
+        let conn = state.db.write().expect("db lock");
+        conn.execute(
+            "INSERT INTO addons (addon_id, name, version, package_id, is_enabled) \
+             VALUES (?1, ?1, '1.0.0', 'tentabus', 1)",
+            rusqlite::params![TEST_BUS_INSTANCE],
+        )
+        .expect("seed bus instance row");
+    }
+
+    /// `bus_consume` -> `bus_transform` (not `output`): `bus_consume`'s
+    /// `message` port is `FlowDataType::Json` and `bus_transform`'s `in` port
+    /// is `Any`, while every `output` input port is typed for a specific
+    /// modality — an edge into `output` would fail R8 port-type validation
+    /// before any bus-specific check ran.
+    fn bus_consume_flow(consume_config: serde_json::Value) -> FlowDefinition {
+        let json = serde_json::json!({
+            "nodes": [
+                {"id": "c", "type": "bus_consume", "config": consume_config},
+                {"id": "t", "type": "bus_transform", "config": {
+                    "instance_id": TEST_BUS_INSTANCE, "expression": "payload"
+                }}
+            ],
+            "edges": [
+                {"from": "c", "to": "t", "from_port": "message", "to_port": "in"}
+            ]
+        });
+        serde_json::from_value(json).expect("fixture parses as a FlowDefinition")
+    }
+
+    /// `commit_mode: "explicit"` has no commit path in a flow — no node
+    /// commits offsets — so `bus::reactor::build_subscriptions` refuses to
+    /// build the subscription. Rejecting it there ALONE would leave the flow
+    /// stored and listed as active while never consuming anything, the only
+    /// signal being one `tracing::warn` per reconcile cycle in the server
+    /// log, so the save itself has to fail.
+    #[test]
+    fn save_validation_rejects_explicit_commit_mode_on_a_bus_consume_node() {
+        let (state, dispatcher) = save_validation_fixture();
+        install_bus_instance(&state);
+        let def = bus_consume_flow(serde_json::json!({
+            "instance_id": TEST_BUS_INSTANCE,
+            "topic": "orders.raw",
+            "group": "g1",
+            "commit_mode": "explicit"
+        }));
+        let err = dispatcher
+            .validate_flow(&def)
+            .expect_err("commit_mode 'explicit' must not pass flow save validation");
+        assert!(
+            matches!(
+                &err,
+                FlowSaveValidationError::BusConsumeConfig { node_id, .. }
+                    if node_id.as_str() == "c"
+            ),
+            "expected BusConsumeConfig on node 'c', got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("explicit"), "error must name the value: {msg}");
+        assert!(
+            msg.contains("auto_after_success") && msg.contains("at_most_once"),
+            "error must name the supported modes: {msg}"
+        );
+    }
+
+    /// The same save-path parse also catches the other `ConsumeConfig`
+    /// mistakes the reactor would otherwise skip-and-warn on — this one is a
+    /// subscription addressing no topic.
+    #[test]
+    fn save_validation_rejects_a_bus_consume_node_without_a_topic() {
+        let (state, dispatcher) = save_validation_fixture();
+        install_bus_instance(&state);
+        let def = bus_consume_flow(serde_json::json!({
+            "instance_id": TEST_BUS_INSTANCE,
+            "group": "g1"
+        }));
+        let err = dispatcher
+            .validate_flow(&def)
+            .expect_err("a bus_consume node with no topic must not save");
+        let msg = err.to_string();
+        assert!(msg.contains("topic"), "error must name the field: {msg}");
+    }
+
+    /// The two modes the reactor can actually honour still save.
+    #[test]
+    fn save_validation_accepts_the_supported_commit_modes() {
+        let (state, dispatcher) = save_validation_fixture();
+        install_bus_instance(&state);
+        for mode in ["auto_after_success", "at_most_once"] {
+            let def = bus_consume_flow(serde_json::json!({
+                "instance_id": TEST_BUS_INSTANCE,
+                "topic": "orders.raw",
+                "group": "g1",
+                "commit_mode": mode
+            }));
+            dispatcher
+                .validate_flow(&def)
+                .unwrap_or_else(|e| panic!("commit_mode '{mode}' must save, got: {e}"));
+        }
     }
 }

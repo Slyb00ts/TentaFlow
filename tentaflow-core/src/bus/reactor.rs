@@ -33,11 +33,15 @@
 // outright) — data is gone on failure regardless of `on_error`; only the DLQ
 // side-effect of `Dlq` still runs (harmlessly degrading to
 // `DlqOutcome::SentToDlqOffsetMismatch`, per `note_delivery_failure`'s own
-// mismatch guard) for operator visibility. `Explicit` has no commit path in
-// M3a at all — no flow node exposes one yet (that lands with M3b's host
-// functions) — so an `Explicit` subscription is redelivered every cycle
-// regardless of dispatch outcome until that mechanism exists; a flow author
-// choosing `Explicit` today is opting into that.
+// mismatch guard) for operator visibility. `Explicit` never reaches this
+// reactor at all: no flow node commits offsets, so an `Explicit` subscription
+// could only redeliver the same batch every cycle forever —
+// `ConsumeConfig::from_config` rejects the value outright and
+// `build_subscriptions` skips the flow with a warning rather than starting a
+// silent redelivery loop. The flow-save path runs that same parse
+// (`FlowDispatcher::validate_flow`), so a flow choosing it is refused before
+// it can be stored — the skip here only catches rows that bypassed that
+// check.
 //
 // `batch_size` vs `fetch`'s byte bound: `ConsumerHandle::fetch` has no
 // message-count parameter, only `max_bytes` — round-robining every subscribed
@@ -170,11 +174,22 @@ impl SubscriptionRegistry {
 /// Parses each active flow's JSON and keeps those whose entry node is
 /// `bus_consume` with a well-formed config. A malformed config (missing or
 /// malformed `instance_id`, missing `topic`/`group`, unknown `commit_mode`/
-/// `on_error`) or unparseable flow is skipped with a warning — it cannot have
-/// passed save validation, so this only guards hand-edited rows. No special
-/// case needed for `instance_id` specifically: `ConsumeConfig::from_config`
-/// already returns `Err` for it exactly like any other required field, and
-/// the `match` below already skips-and-warns on any `Err`.
+/// `on_error`) or unparseable flow is skipped with a warning.
+///
+/// The four flow-save handlers run this SAME parse before storing anything
+/// (`dispatch::handlers::validate_flow_json_str` ->
+/// `FlowDispatcher::validate_flow` -> `validate_bus_consume_configs`), so a
+/// flow that still reaches here malformed is one that bypassed that check —
+/// e.g. a row written straight through `repository::create_flow` (integration
+/// fixtures do exactly that), or a row stored before the check existed. For
+/// those the warning below is the operator's ONLY signal: the flow stays
+/// `status='active'` and simply never consumes. That is why the save path
+/// rejects instead of relying on it.
+///
+/// No special case needed for `instance_id` specifically:
+/// `ConsumeConfig::from_config` already returns `Err` for it exactly like any
+/// other required field, and the `match` below already skips-and-warns on any
+/// `Err`.
 fn build_subscriptions(flows: &[(String, String)]) -> Vec<Subscription> {
     let mut subs = Vec::new();
     for (flow_id, flow_json) in flows {
@@ -597,7 +612,9 @@ async fn run_cycle(
                 }
             }
             // `AtMostOnce` already committed inside `fetch()`; `Explicit`
-            // has no commit path in M3a — see this module's doc.
+            // cannot reach here — `ConsumeConfig::from_config` rejects it, so
+            // `build_subscriptions` never builds such a subscription. See
+            // this module's doc.
             AfterFailure::Continue
         }
         Err(e) => {

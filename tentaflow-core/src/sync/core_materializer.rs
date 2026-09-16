@@ -3419,7 +3419,7 @@ fn apply_bus_topic(
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
     let row_json = field_string(operation, "row_json")?;
-    let row: crate::db::repository::DbBusTopic = serde_json::from_str(&row_json)
+    let mut row: crate::db::repository::DbBusTopic = serde_json::from_str(&row_json)
         .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_topic payload: {e}")))?;
     // Defensive: the op's own resource_id must match the composite key
     // embedded in the payload (mirrors `apply_resource_permission`'s
@@ -3445,6 +3445,32 @@ fn apply_bus_topic(
     // core resource — so the row this function writes is always an
     // same-environment row, and `row.environment` is the environment being
     // recorded rather than a second thing to verify against.
+    //
+    // C7: `delivery = 'fire_and_forget'` is refused at the local admin
+    // boundary (`bus::topics::reject_fire_and_forget`) because nothing in
+    // this build implements the mode — every topic is served at-least-once
+    // whatever the column says. Replication is the same trust boundary: the
+    // upsert below writes the payload's `delivery` verbatim, so without this
+    // a peer on an older build would still land the value on this node.
+    // Coerced rather than rejected deliberately — the field drives no
+    // runtime behaviour here, so dropping a whole synced topic over it would
+    // cost far more than storing the mode this node actually serves. Rows
+    // already on disk are untouched (this only rewrites what an INCOMING op
+    // persists) and `DeliveryMode::parse` still accepts the old string, so
+    // such a row keeps loading.
+    if row.delivery == crate::bus::topics::DeliveryMode::FireAndForget.as_str() {
+        tracing::warn!(
+            "core sync: bus topic '{}/{}' from node '{}' asks for \
+             delivery=fire_and_forget, which this build does not implement — \
+             storing at_least_once instead",
+            row.org_id,
+            row.name,
+            operation.body.actor_node_id
+        );
+        row.delivery = crate::bus::topics::DeliveryMode::AtLeastOnce
+            .as_str()
+            .to_string();
+    }
     match operation.body.action {
         ActionType::Insert | ActionType::Update => tx
             .execute(
@@ -6064,6 +6090,31 @@ mod tests {
         assert!(
             result.is_err(),
             "an op whose row_json.instance_id disagrees with resource_id must be rejected"
+        );
+    }
+
+    /// C7: `create_topic`/`update_topic` refuse `delivery =
+    /// 'fire_and_forget'` (the mode is not implemented — every topic is
+    /// served at-least-once), so replication must not be the way around
+    /// that check. The op still APPLIES — dropping a whole synced topic
+    /// over a field that drives no runtime behaviour would cost more than
+    /// storing the mode this node actually serves.
+    #[test]
+    fn bus_topic_fire_and_forget_is_coerced_to_at_least_once() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+
+        let mut row = bus_topic_row("org-1", "orders.legacy");
+        row.delivery = "fire_and_forget".to_string();
+        let op = bus_topic_op(&row, ActionType::Insert);
+        assert_eq!(apply_core_operation(&db, &cipher, &op).unwrap(), 1);
+
+        let fetched = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.legacy")
+            .unwrap()
+            .expect("topic materialized");
+        assert_eq!(
+            fetched.delivery, "at_least_once",
+            "a replicated fire_and_forget must be stored as the mode this build serves"
         );
     }
 

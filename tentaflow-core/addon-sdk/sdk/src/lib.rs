@@ -3512,7 +3512,11 @@ fn bus_publish_input(
 /// Publishes a batch of records to `topic` in one call (PLAN §6.4: "nigdy
 /// per komunikat" — up to 1000 records / 8 MiB total per call, enforced by
 /// the host). `create_if_missing` mirrors the `bus_publish` flow node's own
-/// config field. Returns the number of records actually appended.
+/// config field: it opts INTO auto-creating a missing topic, and the host
+/// still weighs that against the org's `bus.autocreate` setting (PLAN §7.2,
+/// off by default outside Dev) — a refusal comes back as
+/// `AbiError::GateNotSatisfied`, not `AbiError::NotFound`. Returns the number
+/// of records actually appended.
 ///
 /// Does not surface `schema_rejected` (PLAN-F3 §4.5) — kept as a stable,
 /// narrow `u32` return for existing callers; use [`bus_publish_ex`] for the

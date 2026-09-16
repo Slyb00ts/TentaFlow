@@ -352,7 +352,8 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         BusServiceError::QuotaExceeded { .. }
         | BusServiceError::QuotaRequestTooLarge { .. }
         | BusServiceError::MaxTopicsExceeded { .. }
-        | BusServiceError::MaxPartitionsExceeded { .. } => AbiError::QuotaExceeded,
+        | BusServiceError::MaxPartitionsExceeded { .. }
+        | BusServiceError::MaxBytesTotalExceeded { .. } => AbiError::QuotaExceeded,
         BusServiceError::Throttled { .. } => AbiError::Backpressure,
         BusServiceError::PayloadTooLarge { .. } => AbiError::PayloadTooLarge,
         // SUM/tentabus/POLITYKI-POL.md: a field policy blocked this
@@ -361,6 +362,10 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         BusServiceError::FieldNotAllowed { .. }
         | BusServiceError::RequiredFieldMissing { .. }
         | BusServiceError::FieldPolicyPayloadMalformed { .. } => AbiError::GateNotSatisfied,
+        // PLAN §7.2: the org's `bus.autocreate` ceiling refused the
+        // auto-creation this call opted into — "blocked by policy", the same
+        // category as the field-policy group above.
+        BusServiceError::AutocreateDisabled { .. } => AbiError::GateNotSatisfied,
         // SUM/tentabus/PLAN-F3.md: a bound schema subject/version vanished
         // out from under a topic.
         BusServiceError::SchemaNotFound { .. } | BusServiceError::SchemaVersionNotFound { .. } => {
@@ -528,7 +533,7 @@ pub fn bus_publish_v1(
         match svc.publish(&bctx, &topic, batch.clone()) {
             Ok(r) => Ok(r),
             Err(BusServiceError::TopicNotFound { .. }) if create_if_missing => {
-                svc.create_topic(&bctx, &topic, bus::topics::TopicOptions::default())?;
+                svc.autocreate_topic(&bctx, &topic)?;
                 svc.publish(&bctx, &topic, batch)
             }
             Err(e) => Err(e),

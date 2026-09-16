@@ -9732,6 +9732,7 @@
       "quota_request_too_large": "The request exceeds the organization quota's capacity.",
       "max_topics_exceeded": "The organization's maximum number of topics has been reached.",
       "max_partitions_exceeded": "The organization's maximum number of partitions has been reached.",
+      "max_bytes_total_exceeded": "The organization has reached its total storage limit for the bus.",
       "throttled": "Request throttled — try again later.",
       "payload_too_large": "The message body exceeds the allowed inline size.",
       "dedup_key_required": "This topic requires a deduplication key on every record.",

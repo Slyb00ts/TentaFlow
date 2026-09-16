@@ -8,9 +8,9 @@
 // table exists with the shape `DbBusTopic`/the SQL in
 // `db/repository.rs`'s `bus_topic_*` functions describe; it does not create
 // it (`db/migrations.rs` is off-limits per this task's file ownership).
-// Until v141 lands, tests here build their own fixture connection with an
-// identical `CREATE TABLE` (see `db/repository.rs` bus tests) instead of
-// going through `crate::db::migrations::run`.
+// v141 has since landed, so the DB-backed tests here open a `:memory:`
+// pool through `crate::db::init` (which runs the migration ladder) rather
+// than hand-rolling a fixture table.
 
 use tentaflow_protocol::environment::NodeEnvironment;
 
@@ -325,9 +325,44 @@ fn reject_idempotency_key(opts: &TopicOptions) -> Result<(), BusServiceError> {
     Ok(())
 }
 
+/// Fail-closed rejection of `delivery = fire_and_forget`. PLAN §3.1 defines
+/// the mode as skipping offset tracking, ACKs and DLQ; nothing in this build
+/// does any of that — `publish`/`open_consumer`/`fetch`/`commit`/
+/// `note_delivery_failure` never read `TopicConfig::delivery`, so the topic
+/// pays for and receives full at-least-once machinery whatever the field
+/// says. Honoring it is not a local branch either: every consumer path opens
+/// a SHORT-LIVED `ConsumerHandle` and re-seeds its cursor from the durable
+/// `committed_offset` (`bus::reactor` opens a fresh one per poll cycle,
+/// `dispatch::bus` one per request), so a consumer that tracks no offsets
+/// has nothing to resume from between calls — the mode needs consumer
+/// session state that does not exist. Until it does, accepting the value
+/// only lets an operator configure a guarantee the broker does not give,
+/// the same trap `reject_idempotency_key` above exists to close.
+/// Deserialization is deliberately untouched: a row persisted before this
+/// rejection still loads and is served at-least-once.
+fn reject_fire_and_forget(opts: &TopicOptions) -> Result<(), BusServiceError> {
+    if matches!(opts.delivery, Some(DeliveryMode::FireAndForget)) {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: "delivery=fire_and_forget is not implemented in this build; every topic is \
+                     served at_least_once (offset tracking, ACK and DLQ always run)"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryMode {
     AtLeastOnce,
+    /// PLAN §3.1's at-most-once tier. Two boundaries refuse it: the admin
+    /// API (`create_topic`/`update_topic` return `InvalidTopicConfig` via
+    /// `reject_fire_and_forget`) and replication
+    /// (`sync::core_materializer::apply_bus_topic` rewrites a replicated
+    /// row's `delivery` to `at_least_once` before persisting it, so an op
+    /// from a peer on an older build no longer lands the mode here). The
+    /// variant and its `parse`/`as_str` stay because a row written before
+    /// those checks existed must keep loading; it is served at-least-once
+    /// like every other topic.
     FireAndForget,
 }
 
@@ -601,10 +636,16 @@ pub struct TopicConfig {
     /// regardless of this value; `compact` is accepted and persisted today
     /// so a topic never needs a config migration to opt in once M5 lands.
     pub cleanup_policy: CleanupPolicy,
-    /// Read starting M3a's `bus_consume` flow block: `fire_and_forget` is
-    /// meant to skip offset tracking, ACKs, and DLQ entirely (PLAN §3.1). M1
-    /// always treats every topic as `at_least_once` end-to-end regardless
-    /// of this value — `publish`/`open_consumer`/`fetch` never read it.
+    /// No `create_topic`/`update_topic` call can SET this to
+    /// `FireAndForget`: both reject the value outright (see
+    /// `reject_fire_and_forget` for why the mode is refused rather than
+    /// silently ignored). It can still READ back as `FireAndForget` on a
+    /// row persisted before that rejection existed — `delivery: None` means
+    /// "leave unchanged", so an update touching any other field keeps the
+    /// stored value, and only an update that re-sends `fire_and_forget` is
+    /// rejected. Nothing on the publish or consume path reads this field:
+    /// it is persisted config for a tier the broker does not serve yet, and
+    /// such a topic is served at-least-once like every other one.
     pub delivery: DeliveryMode,
     /// CEL expression selecting the per-record idempotency key (PLAN §3.1
     /// layer 2). Evaluating CEL against a record is `flow_engine/expr.rs`
@@ -1199,6 +1240,7 @@ pub fn create_topic(
 ) -> Result<TopicConfig, BusServiceError> {
     validate_user_topic_name(name)?;
     reject_idempotency_key(&opts)?;
+    reject_fire_and_forget(&opts)?;
     if repository::bus_topic_get(db, instance_id, org_id, name)?.is_some() {
         return Err(BusServiceError::TopicAlreadyExists {
             name: name.to_string(),
@@ -1260,6 +1302,7 @@ pub fn update_topic(
     now_ms: i64,
 ) -> Result<TopicConfig, BusServiceError> {
     reject_idempotency_key(&opts)?;
+    reject_fire_and_forget(&opts)?;
     let row = repository::bus_topic_get(db, instance_id, org_id, name)?.ok_or_else(|| {
         BusServiceError::TopicNotFound {
             name: name.to_string(),
@@ -2161,6 +2204,165 @@ mod tests {
         .is_err());
         // `None` means "leave unchanged" on update — must NOT be rejected.
         assert!(reject_idempotency_key(&TopicOptions::default()).is_ok());
+    }
+
+    // ---- delivery=fire_and_forget fail-closed ---------
+
+    fn delivery_test_db() -> DbPool {
+        crate::db::init(std::path::Path::new(":memory:")).expect("test db")
+    }
+
+    /// Drives the real `create_topic` entry point, not the helper it calls:
+    /// deleting `reject_fire_and_forget(&opts)?` from `create_topic` must
+    /// make this test fail.
+    #[test]
+    fn create_topic_rejects_fire_and_forget_and_persists_no_row() {
+        let db = delivery_test_db();
+        let err = create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.ff",
+            TopicOptions {
+                delivery: Some(DeliveryMode::FireAndForget),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect_err("create_topic must refuse a delivery mode the broker does not serve");
+        match err {
+            BusServiceError::InvalidTopicConfig { reason } => {
+                assert!(reason.contains("fire_and_forget"), "{reason}");
+                assert!(reason.contains("at_least_once"), "{reason}");
+            }
+            other => panic!("expected InvalidTopicConfig, got {other:?}"),
+        }
+        assert!(
+            get_topic(&db, "tentabus-00000001", "org-1", "orders.ff")
+                .expect("get_topic")
+                .is_none(),
+            "a rejected create must not have written a row"
+        );
+
+        // The one mode this build actually serves stays accepted.
+        let cfg = create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.ff",
+            TopicOptions {
+                delivery: Some(DeliveryMode::AtLeastOnce),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("at_least_once must stay accepted");
+        assert_eq!(cfg.delivery, DeliveryMode::AtLeastOnce);
+    }
+
+    /// Same for `update_topic`, and the rejection happens before any other
+    /// field of the same call is applied.
+    #[test]
+    fn update_topic_rejects_fire_and_forget_and_leaves_the_row_untouched() {
+        let db = delivery_test_db();
+        let created = create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.upd",
+            TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+
+        let err = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.upd",
+            TopicOptions {
+                delivery: Some(DeliveryMode::FireAndForget),
+                partitions: Some(created.partitions + 1),
+                ..Default::default()
+            },
+            2_000,
+        )
+        .expect_err("update_topic must refuse a delivery mode the broker does not serve");
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+
+        let stored = get_topic(&db, "tentabus-00000001", "org-1", "orders.upd")
+            .expect("get_topic")
+            .expect("topic still exists");
+        assert_eq!(
+            stored.partitions, created.partitions,
+            "a rejected update must not have applied its other fields either"
+        );
+        assert_eq!(stored.delivery, DeliveryMode::AtLeastOnce);
+
+        // `None` means "leave unchanged" on update and stays a no-op.
+        let updated = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.upd",
+            TopicOptions {
+                partitions: Some(created.partitions + 1),
+                ..Default::default()
+            },
+            3_000,
+        )
+        .expect("an update that leaves delivery unset must be accepted");
+        assert_eq!(updated.partitions, created.partitions + 1);
+    }
+
+    /// The rejection is a write-boundary check only. A row persisted before
+    /// it must still LOAD, or every read of that topic's config would start
+    /// failing (`TopicConfig::try_from`'s `bad(...)`) instead of the topic
+    /// simply being served at-least-once — and an edit that does not touch
+    /// `delivery` must still go through, or an operator would be locked out
+    /// of a legacy topic they could edit before this change.
+    #[test]
+    fn a_persisted_fire_and_forget_row_still_loads_and_stays_editable() {
+        let db = delivery_test_db();
+        let cfg = TopicConfig::from_options(
+            "tentabus-00000001",
+            "org-1",
+            "orders.legacy",
+            TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("build config");
+        let mut row = DbBusTopic::from(&cfg);
+        row.delivery = DeliveryMode::FireAndForget.as_str().to_string();
+        repository::bus_topic_create(&db, &row).expect("persist a pre-rejection row");
+
+        let loaded = get_topic(&db, "tentabus-00000001", "org-1", "orders.legacy")
+            .expect("get_topic")
+            .expect("legacy row present");
+        assert_eq!(loaded.delivery, DeliveryMode::FireAndForget);
+
+        let updated = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.legacy",
+            TopicOptions {
+                partitions: Some(cfg.partitions + 1),
+                ..Default::default()
+            },
+            2_000,
+        )
+        .expect("an unrelated edit of a legacy row must still be accepted");
+        assert_eq!(updated.partitions, cfg.partitions + 1);
+        assert_eq!(
+            updated.delivery,
+            DeliveryMode::FireAndForget,
+            "delivery left unset keeps whatever the row already stored"
+        );
     }
 
     // ---- validate_org_id --------------------

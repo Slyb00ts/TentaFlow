@@ -13,6 +13,9 @@ use std::time::Instant;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
+use crate::db::repository::{self, DbBusQuota};
+use crate::db::DbPool;
+
 use super::BusServiceError;
 
 #[derive(Debug, Clone, Copy)]
@@ -210,20 +213,15 @@ impl QuotaManager {
         Ok(())
     }
 
-    /// Configured per-org on-disk byte ceiling (PLAN §7.1 `max_bytes`).
-    ///
-    /// Not enforced anywhere yet, deliberately: checking it would mean
-    /// summing every sealed+active segment's size across every partition of
-    /// every topic an org owns, on a hot path (`publish`) that must not
-    /// touch the filesystem beyond the one partition it is actually
-    /// appending to. That aggregate is exactly what M2's disk-usage metric
-    /// (`_disk_bytes`, PLAN §8.4) is meant to maintain incrementally as
-    /// segments are created/rolled/deleted — once that counter exists,
-    /// enforcing this quota is a single cheap read instead of an
-    /// O(topics × partitions × segments) `stat()` walk on every publish
-    /// call. Kept as a getter (config plumbing, not enforcement) so a
-    /// caller setting an org's quota today does not need to change when M2
-    /// wires the check in.
+    /// Configured per-org stored-bytes ceiling (PLAN §7.1 `max_bytes`),
+    /// enforced by `BusService::publish` against
+    /// `BusService::org_stored_bytes` — a running per-org total of LOG
+    /// SEGMENT bytes, seeded once at startup from the engine's own
+    /// per-partition segment accounting and then moved by publish and the
+    /// retention sweep in that same unit. `publish` reads it as a map
+    /// lookup; it never walks the filesystem. See that field's doc for what
+    /// is counted (segments only — not the indexes, not the preallocated
+    /// `dedup.bin`) and for its one blind spot.
     pub fn max_bytes_total(&self, org_id: &str) -> u64 {
         self.buckets_or_default(org_id).config.max_bytes_total
     }
@@ -287,6 +285,93 @@ impl TokenBucket {
         let mut guard = self.state.lock();
         guard.0 = (guard.0 + amount).min(self.rate_per_sec);
     }
+}
+
+// ---- Durability (`bus_org_quotas`, migration v154) ----------------------
+//
+// `QuotaManager` above is pure in-memory state and stays that way — it holds
+// no `DbPool` and never reads one. Persistence is two free functions the
+// layers that DO own a pool call: `dispatch/bus.rs`'s `quota_set_v1` writes
+// (through `BusService::db`, the engine's own pool), and `BusService::new`
+// reads back from that same pool at startup. Keeping the pool out of the
+// manager leaves the publish hot path — `try_consume`, the getters — exactly
+// as cheap as it was, and leaves the manager usable in tests with no
+// database at all.
+
+/// `QuotaConfig`'s byte fields are `u64`; SQLite's `INTEGER` is signed
+/// 64-bit. Values above `i64::MAX` are CLAMPED rather than wrapped: a quota
+/// of `i64::MAX` bytes (8 EiB) is already unlimited for any real
+/// deployment, while a wrapped negative row would read back through
+/// `quota_bytes_from_i64` as `0` — a ceiling no publish could ever satisfy.
+fn quota_bytes_to_i64(bytes: u64) -> i64 {
+    bytes.min(i64::MAX as u64) as i64
+}
+
+/// Inverse of `quota_bytes_to_i64`. A negative row (only reachable by hand-
+/// editing the database) reads as `0`, not as a huge `u64` — the
+/// conservative direction for a ceiling.
+fn quota_bytes_from_i64(bytes: i64) -> u64 {
+    bytes.max(0) as u64
+}
+
+fn config_from_row(row: &DbBusQuota) -> QuotaConfig {
+    QuotaConfig {
+        max_topics: row.max_topics,
+        max_partitions: row.max_partitions,
+        max_bytes_total: quota_bytes_from_i64(row.max_bytes_total),
+        produce_msgs_per_sec: row.produce_msgs_per_sec,
+        produce_bytes_per_sec: quota_bytes_from_i64(row.produce_bytes_per_sec),
+        max_groups: row.max_groups,
+    }
+}
+
+/// Writes `cfg` as `(instance_id, org_id)`'s durable quota. Called by the
+/// admin path (`dispatch/bus.rs`'s `quota_set_v1`) BEFORE it applies `cfg`
+/// in memory, and fatal to that request if it fails: a quota live on this
+/// engine but missing from `bus_org_quotas` would silently revert to
+/// `QuotaConfig::default()` at the next restart. Writing first means a
+/// failed write leaves BOTH the table and the manager on the previous
+/// value rather than only the table.
+pub fn persist_org_quota(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    cfg: QuotaConfig,
+) -> Result<(), BusServiceError> {
+    repository::bus_quota_set(
+        db,
+        &DbBusQuota {
+            instance_id: instance_id.to_string(),
+            org_id: org_id.to_string(),
+            max_topics: cfg.max_topics,
+            max_partitions: cfg.max_partitions,
+            max_bytes_total: quota_bytes_to_i64(cfg.max_bytes_total),
+            produce_msgs_per_sec: cfg.produce_msgs_per_sec,
+            produce_bytes_per_sec: quota_bytes_to_i64(cfg.produce_bytes_per_sec),
+            max_groups: cfg.max_groups,
+            updated_at_ms: super::now_ms(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Replays every persisted quota for `instance_id` into `mgr`, returning how
+/// many orgs were restored. Each row goes through `set_org_quota`, so a
+/// restored org starts with full token buckets — the same state a freshly
+/// applied `QuotaSet` leaves behind, and the only honest one available
+/// after a restart (rate buckets are per-second windows, not durable state).
+/// An org with no row keeps falling back to `QuotaConfig::default()`,
+/// exactly as before this table existed.
+pub fn load_persisted_quotas(
+    db: &DbPool,
+    instance_id: &str,
+    mgr: &QuotaManager,
+) -> Result<usize, BusServiceError> {
+    let rows = repository::bus_quota_list_for_instance(db, instance_id)?;
+    for row in &rows {
+        mgr.set_org_quota(&row.org_id, config_from_row(row));
+    }
+    Ok(rows.len())
 }
 
 #[cfg(test)]
@@ -535,5 +620,140 @@ mod tests {
         // to the default, exactly like any other `QuotaConfig` field would.
         mgr.configure_org("org-1", QuotaConfig::default());
         assert_eq!(mgr.max_groups("org-1"), DEFAULT_MAX_GROUPS);
+    }
+
+    // ---- durability (`bus_org_quotas`) ---------------------------------
+
+    const TEST_INSTANCE: &str = "tentabus-00000001";
+    const OTHER_INSTANCE: &str = "tentabus-00000002";
+
+    fn test_db() -> crate::db::DbPool {
+        crate::db::init(std::path::Path::new(":memory:")).expect("test db")
+    }
+
+    /// The C4 gap: before `bus_org_quotas` existed, a `QuotaSet` lived only
+    /// in `QuotaManager`'s `DashMap` and every configured ceiling silently
+    /// reverted to `QuotaConfig::default()` on the next start. A restart is
+    /// simulated the way it really happens — a brand-new `QuotaManager`,
+    /// exactly what `BusService::new` constructs — reading back the same
+    /// database.
+    #[test]
+    fn a_persisted_quota_survives_a_simulated_restart() {
+        let db = test_db();
+        let cfg = QuotaConfig {
+            max_topics: 7,
+            max_partitions: 9,
+            max_bytes_total: 4096,
+            produce_msgs_per_sec: 11,
+            produce_bytes_per_sec: 2048,
+            max_groups: 3,
+        };
+        let mgr = QuotaManager::new();
+        mgr.set_org_quota("org-1", cfg);
+        persist_org_quota(&db, TEST_INSTANCE, "org-1", cfg).unwrap();
+
+        let restarted = QuotaManager::new();
+        assert_eq!(
+            restarted.max_topics("org-1"),
+            QuotaConfig::default().max_topics,
+            "a fresh manager must start from the defaults"
+        );
+        assert_eq!(
+            load_persisted_quotas(&db, TEST_INSTANCE, &restarted).unwrap(),
+            1
+        );
+        assert_eq!(restarted.max_topics("org-1"), 7);
+        assert_eq!(restarted.max_partitions("org-1"), 9);
+        assert_eq!(restarted.max_bytes_total("org-1"), 4096);
+        assert_eq!(restarted.produce_msgs_per_sec("org-1"), 11);
+        assert_eq!(restarted.produce_bytes_per_sec("org-1"), 2048);
+        assert_eq!(restarted.max_groups("org-1"), 3);
+        // The restored rate is really installed in the token bucket, not
+        // just reported by the getter: a batch wider than the restored
+        // capacity is rejected as oversized. Asserted through the
+        // capacity check rather than by draining the bucket, so the test
+        // depends on no timing at all (see `buckets_refill_over_time`'s
+        // own note on how little a drained bucket can be trusted between
+        // two statements).
+        assert!(matches!(
+            restarted.try_consume("org-1", 12, 10).unwrap_err(),
+            BusServiceError::QuotaRequestTooLarge {
+                unit: "messages",
+                capacity: 11,
+                ..
+            }
+        ));
+
+        // plan-app-platform §1.4/W3: rows are instance-scoped — another
+        // instance's engine must not inherit this one's ceilings.
+        let other_instance = QuotaManager::new();
+        assert_eq!(
+            load_persisted_quotas(&db, OTHER_INSTANCE, &other_instance).unwrap(),
+            0
+        );
+        assert_eq!(
+            other_instance.max_topics("org-1"),
+            QuotaConfig::default().max_topics
+        );
+    }
+
+    /// A later `QuotaSet` for the same org replaces the row rather than
+    /// accumulating a second one, and an org that was never configured is
+    /// simply absent from the table.
+    #[test]
+    fn persisting_the_same_org_twice_replaces_the_stored_quota() {
+        let db = test_db();
+        persist_org_quota(
+            &db,
+            TEST_INSTANCE,
+            "org-1",
+            QuotaConfig {
+                max_topics: 7,
+                ..QuotaConfig::default()
+            },
+        )
+        .unwrap();
+        persist_org_quota(
+            &db,
+            TEST_INSTANCE,
+            "org-1",
+            QuotaConfig {
+                max_topics: 12,
+                ..QuotaConfig::default()
+            },
+        )
+        .unwrap();
+
+        let mgr = QuotaManager::new();
+        assert_eq!(load_persisted_quotas(&db, TEST_INSTANCE, &mgr).unwrap(), 1);
+        assert_eq!(mgr.max_topics("org-1"), 12);
+        assert_eq!(
+            mgr.max_topics("org-never-configured"),
+            QuotaConfig::default().max_topics
+        );
+    }
+
+    /// SQLite has no unsigned 64-bit integer: a byte ceiling above
+    /// `i64::MAX` must clamp, never wrap into a negative row that would read
+    /// back as a limit nothing can satisfy.
+    #[test]
+    fn a_byte_ceiling_above_i64_max_clamps_instead_of_wrapping() {
+        let db = test_db();
+        persist_org_quota(
+            &db,
+            TEST_INSTANCE,
+            "org-1",
+            QuotaConfig {
+                max_bytes_total: u64::MAX,
+                produce_bytes_per_sec: u64::MAX,
+                ..QuotaConfig::default()
+            },
+        )
+        .unwrap();
+
+        let mgr = QuotaManager::new();
+        load_persisted_quotas(&db, TEST_INSTANCE, &mgr).unwrap();
+        assert_eq!(mgr.max_bytes_total("org-1"), i64::MAX as u64);
+        assert_eq!(mgr.produce_bytes_per_sec("org-1"), i64::MAX as u64);
     }
 }

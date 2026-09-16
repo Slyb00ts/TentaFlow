@@ -217,6 +217,61 @@ pub fn get(
     Ok((info, row.schema_text))
 }
 
+/// Test-only interleave hooks for `register`. `#[cfg(test)]` throughout, so
+/// neither this cell nor any of the call sites below exist in a release
+/// build. They exist because `register`'s `VersionSlotTaken` retry — and,
+/// past it, the double-loss arm that is the only way two concurrent
+/// `register` calls reach `compensate` — is reachable only when callers sit
+/// inside the same window at the same time, and nothing outside this module
+/// can park a caller there.
+#[cfg(test)]
+mod test_hooks {
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// The two points inside `register` a hook is called at.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Stage {
+        /// The next version slot has been decided from
+        /// `bus_schema_version_latest` and nothing has been written yet.
+        /// Two callers held here both compute the SAME slot, which is what
+        /// forces one of them onto the retry.
+        SlotDecided,
+        /// The version insert came back `VersionSlotTaken`: this caller lost
+        /// the slot and is about to re-read `latest` and try once more.
+        SlotTaken,
+        /// The RETRY's slot has been decided from a freshly re-read
+        /// `bus_schema_version_latest` and the retried insert has not run
+        /// yet. A caller held here loses that slot too if anything else
+        /// claims it meanwhile, which is the only interleave that reaches
+        /// `register`'s double-loss `compensate` arm.
+        RetrySlotDecided,
+    }
+
+    pub type Hook = Arc<dyn Fn(Stage, &str, u32) + Send + Sync>;
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub fn install(hook: Hook) {
+        *HOOK.lock() = Some(hook);
+    }
+
+    pub fn clear() {
+        *HOOK.lock() = None;
+    }
+
+    /// Cloned out from under the lock before the call: a hook parks its
+    /// caller at a rendezvous by design, and holding this cell's lock
+    /// across that would stop the very thread it is waiting for from
+    /// reading its own hook.
+    pub fn fire(stage: Stage, subject: &str, version: u32) {
+        let hook = HOOK.lock().clone();
+        if let Some(hook) = hook {
+            hook(stage, subject, version);
+        }
+    }
+}
+
 /// Registers a new version (or returns the existing one, content-addressed
 /// dedup) for `subject`, creating the subject on first write. See this
 /// module's frozen contract (SUM/tentabus/PLAN-F3.md) for the exact
@@ -348,6 +403,12 @@ pub fn register(
     let next_version = latest.as_ref().map(|v| v.version + 1).unwrap_or(1);
     let schema_ref_id = schema_ref_id_for(org_id, subject, &hash);
 
+    // The slot is decided, nothing is written yet — the exact window a
+    // concurrent registration has to be inside for both to claim the same
+    // version number (`test_hooks`' own doc).
+    #[cfg(test)]
+    test_hooks::fire(test_hooks::Stage::SlotDecided, subject, next_version);
+
     // Not transactional (review finding #7): `db/repository.rs` has no
     // helper that spans a subject upsert, a version insert, AND both their
     // sync write-captures in one atomic unit — every repository function
@@ -469,6 +530,8 @@ pub fn register(
             };
         }
         Err(BusSchemaVersionInsertError::VersionSlotTaken { .. }) => {
+            #[cfg(test)]
+            test_hooks::fire(test_hooks::Stage::SlotTaken, subject, next_version);
             // Review finding #2: lost a race for this exact version slot —
             // most often two concurrent registrations of a brand-new
             // subject both computing "version 1" from the same
@@ -484,6 +547,18 @@ pub fn register(
                 check_compat(latest_row)?;
             }
             let retried_version = retried_latest.map(|v| v.version + 1).unwrap_or(1);
+
+            // The retry's slot is decided and still unwritten — the window
+            // a further concurrent registration has to claim
+            // `retried_version` in for this call to lose twice and reach
+            // `compensate` below (`test_hooks`' own doc).
+            #[cfg(test)]
+            test_hooks::fire(
+                test_hooks::Stage::RetrySlotDecided,
+                subject,
+                retried_version,
+            );
+
             let retried_row = DbBusSchemaVersion {
                 version: retried_version,
                 ..version_row
@@ -1225,6 +1300,432 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a version-less subject must not survive a failed first registration"
+        );
+    }
+
+    /// Serializes every test that installs a `test_hooks` hook. That cell is
+    /// process-global and the lib test binary runs its tests in parallel, so
+    /// two tests installing at once would each silently overwrite the
+    /// other's hook — and a `register` that never meets its hook simply
+    /// stops reproducing the interleave its test was written for, which
+    /// surfaces as a baffling assertion failure rather than as a race.
+    /// Poisoning is recovered rather than propagated: one failing hook test
+    /// must fail alone, not take every other one down with it.
+    static HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Installs `hook` and guarantees it is cleared again — on the normal
+    /// path AND on the unwind from a failed assertion or a panicking worker
+    /// thread, so a red test can never leave the process-global cell
+    /// installed for the rest of the binary. Holds `HOOK_TEST_LOCK` for the
+    /// guard's whole lifetime. Same drop-guard shape as
+    /// `bus::replication::router`'s own `with_decoy_manager` fixture.
+    fn install_hook_for_test(hook: test_hooks::Hook) -> impl Drop {
+        struct Guard {
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                test_hooks::clear();
+            }
+        }
+        let lock = HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        test_hooks::install(hook);
+        Guard { _lock: lock }
+    }
+
+    /// Ceiling on every rendezvous in the two concurrency tests below. Far
+    /// above what parking two threads through a handful of in-memory SQLite
+    /// statements can cost even on a loaded machine, and finite so that a
+    /// party which never arrives fails the test instead of wedging the whole
+    /// binary.
+    const GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A meeting point for `parties` threads that CANNOT hang the test
+    /// binary. `std::sync::Barrier::wait` has no timed form: if one
+    /// `register` call returns before reaching its fire point — any `?`
+    /// above it — its peer blocks in the barrier forever, the `join` below
+    /// blocks with it, and `cargo test` never terminates. A hung suite that
+    /// no per-test timeout can break is strictly worse than a red test, so
+    /// this gate panics on timeout instead: the waiting thread fails, `join`
+    /// hands back `Err`, and the test reports it.
+    struct TimedGate {
+        arrived: std::sync::Mutex<usize>,
+        released: std::sync::Condvar,
+        parties: usize,
+    }
+
+    impl TimedGate {
+        fn new(parties: usize) -> Self {
+            Self {
+                arrived: std::sync::Mutex::new(0),
+                released: std::sync::Condvar::new(),
+                parties,
+            }
+        }
+
+        /// Blocks until `parties` callers have arrived, or panics after
+        /// `GATE_TIMEOUT`. `what` names the rendezvous in that panic, so a
+        /// failure says which interleave never formed.
+        fn wait(&self, what: &str) {
+            let mut arrived = self
+                .arrived
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *arrived += 1;
+            if *arrived >= self.parties {
+                self.released.notify_all();
+                return;
+            }
+            let parties = self.parties;
+            let (_arrived, wait_result) = self
+                .released
+                .wait_timeout_while(arrived, GATE_TIMEOUT, |count| *count < parties)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                !wait_result.timed_out(),
+                "gate '{what}': fewer than {parties} parties arrived within {GATE_TIMEOUT:?} — \
+                 the interleave under test never formed, most likely because a concurrent \
+                 register returned before reaching its fire point"
+            );
+        }
+    }
+
+    #[test]
+    fn two_concurrent_registrations_of_a_new_subject_settle_on_versions_1_and_2() {
+        // PLAN-F3's own outstanding item: `register`'s `VersionSlotTaken`
+        // retry is reachable only while two callers sit in the same window,
+        // so it had only ever run single-threaded. Two real threads are
+        // parked at the slot decision until both have computed version 1
+        // from the same "subject does not exist yet" read; exactly one then
+        // loses the insert, retries against the winner's committed row, and
+        // lands on version 2.
+        //
+        // What this test does NOT cover: the new-subject compensation. The
+        // retry here SUCCEEDS, and every `compensate` call site sits on a
+        // failure arm, so that closure never runs for the whole duration of
+        // this test and the final-state assertions below are satisfied by
+        // the winner plus the retry alone. The interleave that does reach
+        // `compensate` is the test immediately below this one.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const SUBJECT: &str = "orders-slot-race";
+        let db = fresh_db();
+
+        let gate = Arc::new(TimedGate::new(2));
+        let decided_slots = Arc::new(Mutex::new(Vec::new()));
+        let slot_taken_hits = Arc::new(AtomicUsize::new(0));
+        let _hook = {
+            let gate = Arc::clone(&gate);
+            let decided_slots = Arc::clone(&decided_slots);
+            let slot_taken_hits = Arc::clone(&slot_taken_hits);
+            let hook: test_hooks::Hook = Arc::new(move |stage, subject: &str, version| {
+                // The hook cell is process-global and this binary runs its
+                // tests in parallel — react only to THIS test's subject.
+                if subject != SUBJECT {
+                    return;
+                }
+                match stage {
+                    test_hooks::Stage::SlotDecided => {
+                        decided_slots
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(version);
+                        gate.wait("both callers decide the same first slot");
+                    }
+                    test_hooks::Stage::SlotTaken => {
+                        slot_taken_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // The retry is expected to succeed on this interleave.
+                    test_hooks::Stage::RetrySlotDecided => {}
+                }
+            });
+            install_hook_for_test(hook)
+        };
+
+        // Two DIFFERENT texts on purpose: identical content collides on the
+        // content-hash index instead, which is the dedup path, not the
+        // version-slot race under test. `Compatibility::None` keeps the
+        // retry's re-run compatibility check out of the picture, so the
+        // outcome cannot depend on which text happens to win version 1.
+        let mut handles = Vec::new();
+        for text in [V1, V2_ADD_OPTIONAL] {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                register(
+                    &db,
+                    "tentabus-00000001",
+                    "org-1",
+                    SUBJECT,
+                    SchemaType::JsonSchema,
+                    text,
+                    Some(Compatibility::None),
+                    Some("alice"),
+                )
+            }));
+        }
+        let outcomes: Vec<RegisterOutcome> = handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .expect("register thread panicked")
+                    .expect("both concurrent registrations must succeed")
+            })
+            .collect();
+
+        let decided = decided_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            decided,
+            vec![1u32, 1],
+            "this test only proves anything if BOTH callers decided on the same version slot \
+             before either of them wrote"
+        );
+        assert_eq!(
+            slot_taken_hits.load(Ordering::SeqCst),
+            1,
+            "exactly one caller must have lost the slot and taken the VersionSlotTaken retry"
+        );
+
+        let mut versions: Vec<u32> = outcomes.iter().map(|o| o.version).collect();
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            vec![1, 2],
+            "the loser must retry onto the NEXT slot, never reuse or skip one"
+        );
+        assert!(
+            outcomes.iter().all(|o| !o.deduplicated),
+            "two different schema texts must never be reported as a dedup hit"
+        );
+
+        // Final state of a race both callers survived: one subject row, two
+        // contiguous versions, both texts intact. These say nothing about
+        // `compensate` — see this test's own doc for why.
+        let subjects = list_subjects(&db, "tentabus-00000001", "org-1").unwrap();
+        assert_eq!(
+            subjects.len(),
+            1,
+            "the race must leave exactly one subject row, not one per writer and not zero"
+        );
+        assert_eq!(subjects[0].subject, SUBJECT);
+        assert_eq!(subjects[0].latest_version, Some(2));
+
+        let stored: Vec<u32> = list_versions(&db, "tentabus-00000001", "org-1", SUBJECT)
+            .unwrap()
+            .iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(
+            stored,
+            vec![1, 2],
+            "stored versions must be contiguous and ordered, with no gap left by the loser"
+        );
+
+        // Both writers' content survived — neither row was lost, replaced,
+        // or overwritten by the other.
+        let mut texts: Vec<String> = stored
+            .iter()
+            .map(|v| {
+                get(&db, "tentabus-00000001", "org-1", SUBJECT, Some(*v))
+                    .unwrap()
+                    .1
+            })
+            .collect();
+        texts.sort();
+        let mut expected = vec![V1.to_string(), V2_ADD_OPTIONAL.to_string()];
+        expected.sort();
+        assert_eq!(texts, expected);
+    }
+
+    #[test]
+    fn a_loser_whose_retry_also_loses_leaves_the_winners_rows_alone() {
+        // Review finding #2b, in the interleave it was written for.
+        // `register` upserts the subject row before inserting its first
+        // version and deletes that row again if the insert fails — but
+        // `is_new_subject` only records what THIS call read at the START.
+        // Here both callers read "subject does not exist", the winner then
+        // commits version 1 under it, and the loser's own retry fails.
+        // `bus_schema_versions` references `bus_schema_subjects(instance_id,
+        // org_id, subject)` `ON DELETE CASCADE` (`db/repository.rs`'s DDL),
+        // so an unconditional delete at that point would take the winner's
+        // committed row with it. The re-check inside `compensate` must find
+        // the subject no longer version-less and leave it in place.
+        //
+        // How the arm that calls `compensate` is reached deterministically:
+        // the loser is parked once more after it has re-read `latest` and
+        // computed its retry slot (`Stage::RetrySlotDecided`), and the hook
+        // writes into exactly that slot the row a further concurrent
+        // registration would have committed. The retried insert then comes
+        // back `VersionSlotTaken` a second time — the one arm that runs
+        // `compensate` and then returns the "taken concurrently twice in a
+        // row" error, so a call returning that error is itself the proof
+        // that compensation ran.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const SUBJECT: &str = "orders-compensation-race";
+        // A third text, distinct from both racers': a different
+        // `content_hash`, and therefore a different `schema_ref_id`, so the
+        // loser's retried insert violates the version PRIMARY KEY alone and
+        // maps to `VersionSlotTaken` rather than to either UNIQUE index.
+        const INTERLOPER: &str = r#"{"type":"object","properties":{"c":{"type":"string"}},
+            "additionalProperties":false}"#;
+
+        let db = fresh_db();
+        let gate = Arc::new(TimedGate::new(2));
+        let slot_taken_hits = Arc::new(AtomicUsize::new(0));
+        let retry_slots = Arc::new(Mutex::new(Vec::new()));
+        let _hook = {
+            let gate = Arc::clone(&gate);
+            let hook_db = Arc::clone(&db);
+            let slot_taken_hits = Arc::clone(&slot_taken_hits);
+            let retry_slots = Arc::clone(&retry_slots);
+            let hook: test_hooks::Hook = Arc::new(move |stage, subject: &str, version| {
+                if subject != SUBJECT {
+                    return;
+                }
+                match stage {
+                    test_hooks::Stage::SlotDecided => {
+                        gate.wait("both callers decide the same first slot");
+                    }
+                    test_hooks::Stage::SlotTaken => {
+                        slot_taken_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    test_hooks::Stage::RetrySlotDecided => {
+                        // Stands in for a third concurrent registration
+                        // committing `version` between the loser's re-read
+                        // of `latest` and its own retried insert. Written
+                        // through the same repository function `register`
+                        // itself uses, so it lands as a real row under real
+                        // constraints, not as a fixture shortcut.
+                        let hash = content_hash(INTERLOPER);
+                        let schema_ref_id = schema_ref_id_for("org-1", SUBJECT, &hash);
+                        repository::bus_schema_version_insert(
+                            &hook_db,
+                            &DbBusSchemaVersion {
+                                instance_id: "tentabus-00000001".to_string(),
+                                org_id: "org-1".to_string(),
+                                subject: SUBJECT.to_string(),
+                                version,
+                                schema_text: INTERLOPER.to_string(),
+                                content_hash: hash,
+                                schema_ref_id,
+                                created_by: None,
+                                created_at_ms: 1,
+                            },
+                        )
+                        .expect("the stand-in registration must claim the retry slot");
+                        retry_slots
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(version);
+                    }
+                }
+            });
+            install_hook_for_test(hook)
+        };
+
+        let mut handles = Vec::new();
+        for text in [V1, V2_ADD_OPTIONAL] {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                let outcome = register(
+                    &db,
+                    "tentabus-00000001",
+                    "org-1",
+                    SUBJECT,
+                    SchemaType::JsonSchema,
+                    text,
+                    Some(Compatibility::None),
+                    Some("alice"),
+                );
+                (text, outcome)
+            }));
+        }
+        let results: Vec<(&str, Result<RegisterOutcome, BusServiceError>)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("register thread panicked"))
+            .collect();
+
+        assert_eq!(
+            slot_taken_hits.load(Ordering::SeqCst),
+            1,
+            "exactly one caller must have lost the first slot and entered the retry"
+        );
+        assert_eq!(
+            retry_slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            vec![2u32],
+            "the loser must have retried onto slot 2 — the slot the stand-in registration \
+             then took from it"
+        );
+
+        let winners: Vec<(&str, u32)> = results
+            .iter()
+            .filter_map(|(text, outcome)| outcome.as_ref().ok().map(|o| (*text, o.version)))
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one of the two racers must have committed; got {results:?}"
+        );
+        assert_eq!(winners[0].1, 1, "the winner must own version 1");
+
+        let loser_err = results
+            .iter()
+            .find_map(|(_, outcome)| outcome.as_ref().err())
+            .expect("the other racer must have failed its retry");
+        match loser_err {
+            BusServiceError::Db(msg) => assert!(
+                msg.contains("twice in a row"),
+                "the loser must fail through the double-loss arm — the only arm that runs \
+                 `compensate` on this interleave: {msg}"
+            ),
+            other => panic!("expected the double-loss Db error, got {other:?}"),
+        }
+
+        // The point of the test: compensation ran (the error above is only
+        // returned after it does) and did NOT delete the subject, so neither
+        // the winner's version nor the stand-in's was cascaded away with it.
+        let subjects = list_subjects(&db, "tentabus-00000001", "org-1").unwrap();
+        assert_eq!(
+            subjects.len(),
+            1,
+            "the compensating loser must leave the subject row it found already populated"
+        );
+        assert_eq!(subjects[0].subject, SUBJECT);
+        assert_eq!(subjects[0].latest_version, Some(2));
+
+        let stored: Vec<u32> = list_versions(&db, "tentabus-00000001", "org-1", SUBJECT)
+            .unwrap()
+            .iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(
+            stored,
+            vec![1, 2],
+            "both already-committed versions must survive the loser's compensation"
+        );
+        assert_eq!(
+            get(&db, "tentabus-00000001", "org-1", SUBJECT, Some(1))
+                .unwrap()
+                .1,
+            winners[0].0,
+            "version 1 must still hold the winner's own text"
+        );
+        assert_eq!(
+            get(&db, "tentabus-00000001", "org-1", SUBJECT, Some(2))
+                .unwrap()
+                .1,
+            INTERLOPER,
+            "version 2 must still hold the stand-in registration's text"
         );
     }
 }

@@ -30101,6 +30101,125 @@ pub fn bus_field_policies_delete_by_instance(pool: &DbPool, instance_id: &str) -
 }
 
 // =============================================================================
+// PLAN §7.1 per-org quotas — `bus_org_quotas` repository functions
+// (migration v154). Unlike every other bus table in this module, these rows
+// are NOT a sync-ledger materialization and publish no capture: a quota is a
+// ceiling on what one node's engine admits, and the mesh has no
+// `CoreSyncResourceKind` for it (see the `BUS_ORG_QUOTAS` DDL comment in
+// `db/migrations.rs`). Plain local reads/writes, the same shape as the
+// `bus_groups_delete_by_*` helpers above. `bus::quota` owns the conversion
+// between these rows and `QuotaConfig`, including the u64 -> INTEGER
+// clamping; this struct stays a plain row mirror, same division of labor as
+// `DbBusTopic`/`DbBusFieldPolicy`.
+// =============================================================================
+
+/// Mirrors one row of `bus_org_quotas`. Byte-valued quotas are `i64` here
+/// because SQLite has no unsigned 64-bit integer — `bus::quota::
+/// quota_bytes_to_i64` clamps on the way in, `quota_bytes_from_i64` widens
+/// on the way out.
+#[derive(Debug, Clone)]
+pub struct DbBusQuota {
+    pub instance_id: String,
+    pub org_id: String,
+    pub max_topics: u32,
+    pub max_partitions: u32,
+    pub max_bytes_total: i64,
+    pub produce_msgs_per_sec: u32,
+    pub produce_bytes_per_sec: i64,
+    pub max_groups: u32,
+    pub updated_at_ms: i64,
+}
+
+const BUS_QUOTA_COLUMNS: &str = "instance_id, org_id, max_topics, max_partitions, \
+     max_bytes_total, produce_msgs_per_sec, produce_bytes_per_sec, max_groups, updated_at_ms";
+
+fn map_bus_quota_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusQuota> {
+    Ok(DbBusQuota {
+        instance_id: row.get(0)?,
+        org_id: row.get(1)?,
+        max_topics: row.get(2)?,
+        max_partitions: row.get(3)?,
+        max_bytes_total: row.get(4)?,
+        produce_msgs_per_sec: row.get(5)?,
+        produce_bytes_per_sec: row.get(6)?,
+        max_groups: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
+/// Upsert — one row per `(instance_id, org_id)`. `QuotaSet` is a full
+/// replace at the `QuotaManager` level, so it is a full replace here too:
+/// every column except the PK is overwritten.
+pub fn bus_quota_set(pool: &DbPool, row: &DbBusQuota) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO bus_org_quotas ({BUS_QUOTA_COLUMNS}) VALUES \
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+             ON CONFLICT(instance_id, org_id) DO UPDATE SET \
+             max_topics = excluded.max_topics, \
+             max_partitions = excluded.max_partitions, \
+             max_bytes_total = excluded.max_bytes_total, \
+             produce_msgs_per_sec = excluded.produce_msgs_per_sec, \
+             produce_bytes_per_sec = excluded.produce_bytes_per_sec, \
+             max_groups = excluded.max_groups, \
+             updated_at_ms = excluded.updated_at_ms"
+        ),
+        rusqlite::params![
+            row.instance_id,
+            row.org_id,
+            row.max_topics,
+            row.max_partitions,
+            row.max_bytes_total,
+            row.produce_msgs_per_sec,
+            row.produce_bytes_per_sec,
+            row.max_groups,
+            row.updated_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Every persisted quota belonging to `instance_id`, across every org —
+/// read once at engine startup (`bus::quota::load_persisted_quotas`) to
+/// repopulate the in-memory `QuotaManager`.
+pub fn bus_quota_list_for_instance(pool: &DbPool, instance_id: &str) -> Result<Vec<DbBusQuota>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_QUOTA_COLUMNS} FROM bus_org_quotas WHERE instance_id = ?1 ORDER BY org_id"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![instance_id], map_bus_quota_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Drops `(instance_id, org_id)`'s persisted quota, returning how many rows
+/// were removed — called by `BusService::purge_org` next to
+/// `QuotaManager::remove_org`, so a purged org's ceiling does not come back
+/// from this table on the next restart.
+pub fn bus_quota_delete_by_org(pool: &DbPool, instance_id: &str, org_id: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let count = conn.execute(
+        "DELETE FROM bus_org_quotas WHERE instance_id = ?1 AND org_id = ?2",
+        rusqlite::params![instance_id, org_id],
+    )?;
+    Ok(count)
+}
+
+/// Drops EVERY persisted quota for `instance_id`, across every org —
+/// plan-app-platform §7 W6 instance teardown, alongside
+/// `bus_topics_delete_by_instance` and its siblings.
+pub fn bus_quotas_delete_by_instance(pool: &DbPool, instance_id: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let count = conn.execute(
+        "DELETE FROM bus_org_quotas WHERE instance_id = ?1",
+        rusqlite::params![instance_id],
+    )?;
+    Ok(count)
+}
+
+// =============================================================================
 // SUM/tentabus/PLAN-F3.md §2 (schema registry, decided 02.09.2026) —
 // `bus_schema_subjects`/`bus_schema_versions` repository functions
 // (migration v146). Same MATERIALIZATION shape as `bus_field_policies`
@@ -30765,16 +30884,18 @@ pub fn bus_schema_versions_delete_by_instance(pool: &DbPool, instance_id: &str) 
     Ok(rows.len())
 }
 
-/// Test-only fixture. The five core tables' `CREATE TABLE IF NOT EXISTS`
-/// statements below are effectively inert for every caller: every one of
+/// Test-only fixture. The six core tables' `CREATE TABLE IF NOT EXISTS`
+/// statements below (`bus_topics`, `bus_partition_assignments`,
+/// `bus_field_policies`, `bus_schema_subjects`, `bus_schema_versions`,
+/// `bus_org_quotas`) are effectively inert for every caller: every one of
 /// them opens its pool through `crate::db::init`, which already runs the
 /// real migration ladder (`db::migrations::run`) and creates these tables
 /// for real (with `instance_id`, plan-app-platform §1.4/W3) before this
-/// function ever runs — `IF NOT EXISTS` makes this a no-op for those five.
+/// function ever runs — `IF NOT EXISTS` makes this a no-op for those six.
 ///
 /// `bus_groups` is DIFFERENT (plan-app-platform §7 W4): its production home
 /// is the per-instance `tentabus.db` (`bus::db::migrate`), never this main
-/// pool, so the `CREATE TABLE` below is NOT inert the way the other five
+/// pool, so the `CREATE TABLE` below is NOT inert the way the other six
 /// are — this fixture is the only thing that creates it here. That is
 /// intentional and scoped: `bus_repository_tests` below exercises
 /// `bus_group_*` as plain pool-agnostic SQL round-trip functions (no
@@ -30889,7 +31010,19 @@ pub mod bus_test_support {
                 UNIQUE (instance_id, org_id, schema_ref_id)
             );
             CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject
-                ON bus_schema_versions(instance_id, org_id, subject, version DESC);",
+                ON bus_schema_versions(instance_id, org_id, subject, version DESC);
+            CREATE TABLE IF NOT EXISTS bus_org_quotas (
+                instance_id TEXT NOT NULL,
+                org_id TEXT NOT NULL,
+                max_topics INTEGER NOT NULL,
+                max_partitions INTEGER NOT NULL,
+                max_bytes_total INTEGER NOT NULL,
+                produce_msgs_per_sec INTEGER NOT NULL,
+                produce_bytes_per_sec INTEGER NOT NULL,
+                max_groups INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (instance_id, org_id)
+            );",
         )?;
         Ok(())
     }

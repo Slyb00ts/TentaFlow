@@ -172,9 +172,22 @@ impl ConsumeConfig {
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_WAIT_MS);
         let commit_mode = match config.get("commit_mode").and_then(|v| v.as_str()) {
-            Some("explicit") => CommitMode::Explicit,
             Some("at_most_once") => CommitMode::AtMostOnce,
             Some("auto_after_success") | None => CommitMode::AutoAfterSuccess,
+            // `CommitMode::Explicit` stays valid on the bus API itself — an
+            // addon consumer commits through the `bus_consume_commit` host
+            // function — but NO flow node commits offsets, so an `Explicit`
+            // subscription would never advance its committed offset and
+            // `bus::reactor` would redeliver the same batch every cycle,
+            // forever, with no error and no log. Rejecting here turns that
+            // silent loop into a warning at reactor scan time.
+            Some("explicit") => {
+                return Err(anyhow!(
+                    "bus_consume: commit_mode 'explicit' has no commit path in a flow — no node \
+                     commits offsets, so the subscription would redeliver the same batch \
+                     forever; use 'auto_after_success' or 'at_most_once'"
+                ));
+            }
             Some(other) => {
                 return Err(anyhow!("bus_consume: unknown commit_mode '{other}'"));
             }
@@ -358,13 +371,47 @@ mod tests {
     fn config_clamps_batch_size_and_overrides() {
         let c = ConsumeConfig::from_config(&json!({
             "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g", "batch_size": 5000,
-            "org_id": "org-2", "commit_mode": "explicit", "on_error": "halt",
+            "org_id": "org-2", "commit_mode": "at_most_once", "on_error": "halt",
         }))
         .unwrap();
         assert_eq!(c.batch_size, MAX_BATCH_SIZE);
         assert_eq!(c.org_id, "org-2");
-        assert_eq!(c.commit_mode, CommitMode::Explicit);
+        assert_eq!(c.commit_mode, CommitMode::AtMostOnce);
         assert_eq!(c.on_error, OnError::Halt);
+    }
+
+    /// `explicit` is a valid `CommitMode` on the bus API, but no flow node
+    /// commits offsets — accepting it here would hand the author an unbounded
+    /// silent redelivery loop, so the flow config boundary rejects it. The two
+    /// modes the reactor can actually honour stay accepted.
+    #[test]
+    fn config_rejects_explicit_commit_mode() {
+        let err = ConsumeConfig::from_config(&json!({
+            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g",
+            "commit_mode": "explicit"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("explicit"),
+            "error should name the value: {err}"
+        );
+        assert!(
+            err.contains("auto_after_success") && err.contains("at_most_once"),
+            "error should name the supported modes: {err}"
+        );
+
+        for (mode, expected) in [
+            ("auto_after_success", CommitMode::AutoAfterSuccess),
+            ("at_most_once", CommitMode::AtMostOnce),
+        ] {
+            let c = ConsumeConfig::from_config(&json!({
+                "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g",
+                "commit_mode": mode
+            }))
+            .unwrap();
+            assert_eq!(c.commit_mode, expected);
+        }
     }
 
     #[test]

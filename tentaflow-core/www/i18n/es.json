@@ -8497,6 +8497,7 @@
       "quota_request_too_large": "La solicitud supera la capacidad de la cuota de la organización.",
       "max_topics_exceeded": "Se alcanzó el número máximo de temas de la organización.",
       "max_partitions_exceeded": "Se alcanzó el número máximo de particiones de la organización.",
+      "max_bytes_total_exceeded": "La organización alcanzó su límite total de almacenamiento del bus.",
       "throttled": "Solicitud limitada — inténtelo más tarde.",
       "payload_too_large": "El cuerpo del mensaje supera el tamaño en línea permitido.",
       "dedup_key_required": "Este tema requiere una clave de deduplicación en cada registro.",

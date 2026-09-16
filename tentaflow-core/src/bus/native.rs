@@ -541,7 +541,7 @@ pub fn native_on_disable(ctx: &NativeAppContext) {
     crate::bus::stop_instance(&instance_id);
 }
 
-/// Counts rows of one of the five instance-scoped core tables
+/// Counts rows of one of the six instance-scoped core tables
 /// (`table` is always one of this module's own literals, never caller
 /// input) for `instance_id`.
 fn count_core_rows(db: &DbPool, table: &str, instance_id: &str) -> Result<u32> {
@@ -657,6 +657,7 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
     let field_policies = count_core_rows(ctx.db, "bus_field_policies", ctx.addon_id)?;
     let schema_subjects = count_core_rows(ctx.db, "bus_schema_subjects", ctx.addon_id)?;
     let schema_versions = count_core_rows(ctx.db, "bus_schema_versions", ctx.addon_id)?;
+    let org_quotas = count_core_rows(ctx.db, "bus_org_quotas", ctx.addon_id)?;
     // Amendment 9f: NOT a hand-rolled `"<instance>/"` prefix — the same
     // length-prefixed codec the ACL write side keys with
     // (`services::bus_authorizer::topic_acl_resource_id`), whose first
@@ -674,7 +675,8 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
          (consumer groups: {groups}, pause state); core rows tracked separately in the \
          platform database: {topics} topics, {assignments} partition assignments, \
          {field_policies} field policies, {schema_subjects} schema subjects, \
-         {schema_versions} schema versions, {acl_rows} topic ACL rows"
+         {schema_versions} schema versions, {acl_rows} topic ACL rows, \
+         {org_quotas} org quotas"
     );
     Ok(vec![TeardownEntry {
         path: ctx.data_dir.clone(),
@@ -692,13 +694,14 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
 /// 2. `app_db::close` — MANDATORY before the platform's `remove_dir_all`:
 ///    an open WAL handle blocks it on Windows (`lifecycle.rs:461-463`'s own
 ///    comment);
-/// 3. delete this instance's rows in the five core tables, CHILDREN FIRST
+/// 3. delete this instance's rows in the six core tables, CHILDREN FIRST
 ///    (`bus_schema_versions` before `bus_schema_subjects` — the one real
-///    FK/cascade relationship among these five, see `bus_schema_versions_
+///    FK/cascade relationship among them, see `bus_schema_versions_
 ///    delete_by_instance`'s doc for why each version still gets its own op
 ///    instead of relying solely on the cascade), each publishing a sync
 ///    Delete tombstone so the uninstall propagates fleet-wide instead of
-///    resurrecting on the next reconcile;
+///    resurrecting on the next reconcile — except `bus_org_quotas`, which
+///    is node-local and has no ledger resource to tombstone;
 /// 4. delete this instance's topic ACL rows the same way (amendment 9f's
 ///    prefix, not a literal slash-join);
 /// 5. bump the schema-registry generation — every node's cached validator
@@ -721,6 +724,10 @@ pub fn native_teardown(ctx: &NativeAppContext) -> Result<()> {
         crate::db::repository::bus_schema_versions_delete_by_instance(ctx.db, instance_id)?;
     let schema_subjects =
         crate::db::repository::bus_schema_subjects_delete_by_instance(ctx.db, instance_id)?;
+    // Migration v154: this instance's persisted org quotas. No sync
+    // tombstone to publish — `bus_org_quotas` is node-local by design (see
+    // its DDL comment), so an uninstall only has to erase the local rows.
+    let quotas = crate::db::repository::bus_quotas_delete_by_instance(ctx.db, instance_id)?;
 
     let acl_prefix = crate::sync::resource_id::composite_resource_id(&[instance_id]);
     let acl_rows =
@@ -745,7 +752,8 @@ pub fn native_teardown(ctx: &NativeAppContext) -> Result<()> {
         Some(&format!(
             "topics={topics} partition_assignments={assignments} \
              field_policies={field_policies} schema_subjects={schema_subjects} \
-             schema_versions={schema_versions} topic_acl_rows={acl_rows}"
+             schema_versions={schema_versions} topic_acl_rows={acl_rows} \
+             org_quotas={quotas}"
         )),
         None,
         None,

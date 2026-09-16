@@ -307,6 +307,25 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         } => ProtocolError::bad_request(format!(
             "bus.max_partitions_exceeded: {current} existing + {requested} requested > {max}"
         )),
+        BusServiceError::MaxBytesTotalExceeded {
+            org_id: _,
+            max,
+            current,
+            requested,
+        } => ProtocolError::bad_request(format!(
+            "bus.max_bytes_total_exceeded: {current} stored + {requested} requested > {max}"
+        )),
+        // PLAN §7.2: `bus.autocreate` is off for this org, so a publish that
+        // opted into auto-creation may not have it. `PolicyDenied` rather
+        // than `bad_request`: the request itself was well-formed, an
+        // org-level setting refused it — same class as `PermissionDenied`.
+        BusServiceError::AutocreateDisabled { org_id: _, topic } => ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!(
+                "bus.autocreate_disabled: '{topic}' (org setting '{}' is off)",
+                bus::AUTOCREATE_SETTING_KEY
+            ),
+        ),
         BusServiceError::Throttled { retry_after_ms } => ProtocolError::new(
             ProtocolErrorCode::RateLimited,
             format!("bus.throttled: retry after {retry_after_ms} ms"),
@@ -3238,17 +3257,23 @@ fn quota_set_v1(
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
     let max_groups = max_groups.unwrap_or_else(|| g.svc.quota().max_groups(&g.org_id));
-    g.svc.quota().set_org_quota(
-        &g.org_id,
-        quota::QuotaConfig {
-            max_topics,
-            max_partitions,
-            max_bytes_total,
-            produce_msgs_per_sec,
-            produce_bytes_per_sec,
-            max_groups,
-        },
-    );
+    let cfg = quota::QuotaConfig {
+        max_topics,
+        max_partitions,
+        max_bytes_total,
+        produce_msgs_per_sec,
+        produce_bytes_per_sec,
+        max_groups,
+    };
+    // Persisted BEFORE it is applied in memory, and fatal if it fails: a
+    // quota that is live on this engine but absent from `bus_org_quotas`
+    // reverts to `QuotaConfig::default()` at the next restart with nothing
+    // to signal it did — the exact silent regression this table exists to
+    // close. Written through the ENGINE's own pool (`BusService::db`), the
+    // one `BusService::new` reads back at startup.
+    quota::persist_org_quota(g.svc.db(), g.svc.instance_id(), &g.org_id, cfg)
+        .map_err(map_bus_error)?;
+    g.svc.quota().set_org_quota(&g.org_id, cfg);
     // Not in PLAN §8.2's literal audit-action list (quotas are absent from
     // it entirely) — added anyway because every OTHER admin mutation in
     // this file has an audit row, and a silent quota change would be the
@@ -3592,6 +3617,70 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    /// C4's WRITE half: `quota_set_v1` must leave a `bus_org_quotas` row
+    /// behind, not only an in-memory `QuotaManager` entry — otherwise a
+    /// restart silently reverts the org to `QuotaConfig::default()`, which
+    /// is the whole regression the table exists to close. Deleting the
+    /// `quota::persist_org_quota` call from the handler makes this fail.
+    ///
+    /// Asserted through the ENGINE's own pool (`BusService::db`) and then
+    /// replayed with the very function `BusService::new` uses, so this
+    /// covers "the handler wrote the row" and "the row is the one startup
+    /// reads back" together.
+    #[tokio::test]
+    async fn quota_set_persists_the_org_row_and_it_replays_at_startup() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db.clone(), org);
+
+        let response = quota_set_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            7,
+            70,
+            700_000,
+            7_000,
+            70_000,
+            Some(77),
+        )
+        .expect("quota set must succeed for an org_admin");
+        match response {
+            BusPayload::QuotaSetResponse { quota } => {
+                assert_eq!(quota.max_topics, 7);
+                assert_eq!(quota.max_bytes_total, 700_000);
+                assert_eq!(quota.max_groups, 77);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let rows = repository::bus_quota_list_for_instance(&db, fixture_instance_id().as_str())
+            .expect("read bus_org_quotas back");
+        let row = rows
+            .iter()
+            .find(|r| r.org_id == org_id)
+            .expect("quota_set_v1 must have written a bus_org_quotas row for this org");
+        assert_eq!(row.max_topics, 7);
+        assert_eq!(row.max_partitions, 70);
+        assert_eq!(row.max_bytes_total, 700_000);
+        assert_eq!(row.produce_msgs_per_sec, 7_000);
+        assert_eq!(row.produce_bytes_per_sec, 70_000);
+        assert_eq!(row.max_groups, 77);
+
+        // What a restart does: a brand-new, empty manager fed from the same
+        // table has to come back with exactly what the operator set.
+        let replayed = quota::QuotaManager::new();
+        quota::load_persisted_quotas(&db, fixture_instance_id().as_str(), &replayed)
+            .expect("replay persisted quotas");
+        assert_eq!(replayed.max_topics(&org_id), 7);
+        assert_eq!(replayed.max_partitions(&org_id), 70);
+        assert_eq!(replayed.max_bytes_total(&org_id), 700_000);
+        assert_eq!(replayed.produce_msgs_per_sec(&org_id), 7_000);
+        assert_eq!(replayed.produce_bytes_per_sec(&org_id), 70_000);
+        assert_eq!(replayed.max_groups(&org_id), 77);
     }
 
     /// Owner decision B: `durability_class: "critical"` in a create request

@@ -14,7 +14,9 @@
 // `content_type` (optional — folded into a `content-type` header rather than
 // a dedicated `PublishRecord` field, since the wire record has none),
 // `create_if_missing` (bool, default false — on `TopicNotFound`, calls
-// `create_topic` with default options and retries once).
+// `autocreate_topic` with default options and retries once; that call is
+// itself subject to the org's `bus.autocreate` ceiling, PLAN §7.2, so this
+// flag opts in rather than decides).
 //
 // Payload: `expr::flow_value_to_json` on the inbound payload gives a uniform
 // JSON projection for EVERY `FlowValue` variant (Text -> string, Json ->
@@ -236,7 +238,7 @@ impl NodeAdapter for BusPublishNodeAdapter {
             match svc.publish(&bctx, &topic, batch.clone()) {
                 Ok(r) => Ok(r),
                 Err(bus::BusServiceError::TopicNotFound { .. }) if create_if_missing => {
-                    svc.create_topic(&bctx, &topic, crate::bus::topics::TopicOptions::default())?;
+                    svc.autocreate_topic(&bctx, &topic)?;
                     svc.publish(&bctx, &topic, batch)
                 }
                 Err(e) => Err(e),

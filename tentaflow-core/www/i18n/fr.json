@@ -8497,6 +8497,7 @@
       "quota_request_too_large": "La requête dépasse la capacité du quota de l'organisation.",
       "max_topics_exceeded": "Le nombre maximal de sujets de l'organisation est atteint.",
       "max_partitions_exceeded": "Le nombre maximal de partitions de l'organisation est atteint.",
+      "max_bytes_total_exceeded": "L'organisation a atteint sa limite totale de stockage du bus.",
       "throttled": "Requête limitée — réessayez plus tard.",
       "payload_too_large": "Le corps du message dépasse la taille en ligne autorisée.",
       "dedup_key_required": "Ce sujet nécessite une clé de déduplication pour chaque enregistrement.",
