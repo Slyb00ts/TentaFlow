@@ -489,6 +489,11 @@ cargo install wasm-bindgen-cli --version "$(python3 scripts/workspace-version.py
 ./scripts/setup.sh
 ```
 
+Na Arch/CachyOS skrypt wykonuje pełną aktualizację systemu i instalację zależności
+w jednej transakcji `pacman -Syu --needed`. Dzięki temu aktualizuje
+również zainstalowane wtyczki GStreamera wymagające zgodnych wersji bibliotek.
+Pacman wymaga potwierdzenia aktualizacji i decyzji użytkownika przy konfliktach pakietów.
+
 > On macOS 26+ (Xcode 26) the Metal compiler is a separate component. Without it, MLX models return
 > gibberish with no build error — `setup.sh` installs it and `build.rs` fails loudly if it's missing.
 

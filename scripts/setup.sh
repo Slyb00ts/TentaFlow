@@ -332,9 +332,6 @@ install_base() {
 
     case "$DISTRO" in
         arch)
-            log_info "Aktualizacja bazy pakietow pacman..."
-            run_privileged pacman -Sy --noconfirm
-
             local pkgs=(
                 base-devel
                 cmake
@@ -380,14 +377,13 @@ install_base() {
                 pkgs+=(tesseract tesseract-data-pol)
                 INSTALLED+=("tesseract" "tesseract-data-pol")
             fi
+            log_info "Pelna aktualizacja systemu Arch/CachyOS i instalacja zaleznosci w jednej transakcji pacman..."
+            log_info "Pacman poprosi o potwierdzenie aktualizacji i rozstrzygniecie konfliktow pakietow."
             log_info "Instalacja: ${pkgs[*]}"
-            run_privileged pacman -S --needed --noconfirm "${pkgs[@]}"
+            run_privileged pacman -Syu --needed "${pkgs[@]}"
 
             # protoc (prost-build, feature vector-milvus) to narzedzie build-time.
-            # Na rolling-release repo'wy protobuf moze wyprzedzac wersje wymagana
-            # przez AUR python-protobuf (protobuf=34.1) — wymuszenie upgrade'u przez
-            # --needed wywala transakcje. Instalujemy tylko gdy protoc faktycznie
-            # brakuje, zamiast bumpic juz dzialajaca wersje.
+            # Moze byc dostepne spoza pakietow systemowych, dlatego sprawdzamy PATH.
             if ! command -v protoc &>/dev/null; then
                 run_privileged pacman -S --needed --noconfirm protobuf
                 INSTALLED+=("protobuf")
