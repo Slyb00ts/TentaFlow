@@ -92,6 +92,46 @@ test('the author of a request gets no approve button, only the reason why', asyn
   screen.dispose();
 });
 
+test('etykiety Elastic opisują operację zatwierdzenia', () => {
+  assert.equal(operationLabel('elastic_create'), 'Tworzenie Elastic Array');
+  assert.equal(operationLabel('elastic_restore'), 'Przywracanie montowania Elastic Array');
+  // Uzbrojenie harmonogramu jest osobną operacją od pojedynczego przebiegu —
+  // bez tej pozycji etykieta degraduje się do ogólnego „Operacja", które nie
+  // mówi zatwierdzającemu nic o tym, na co się zgadza.
+  assert.equal(operationLabel('elastic_schedule'), 'Uzbrojenie harmonogramu Elastic');
+  assert.notEqual(operationLabel('elastic_schedule'), operationLabel('nonsense'));
+});
+
+for (const change of ['node', 'surface', 'sudo']) {
+  test(`zatwierdzenie Elastic nie wysyła starego requestId po zmianie ${change}`, async () => {
+    const screen = fakeScreen({ tentaNasApprovalsListRequest: { approvals: [pending({ operation: 'elastic_create' })], settings: settings() } });
+    const body = mount();
+    const { refresh } = wireApprovals(screen, body);
+    await refresh();
+    await flush();
+    const table = body.querySelector('#nas-approvals-table');
+    let releaseSudo;
+    if (change === 'sudo') screen.withSudo = async (fn, title, isCurrent) => {
+      assert.equal(typeof isCurrent, 'function');
+      await new Promise((resolve) => { releaseSudo = resolve; });
+      return isCurrent() ? fn(null) : null;
+    };
+    click(table.rowActions(table.rows[0]).querySelector('tf-button'));
+    await flush();
+    if (change === 'node') screen.currentNode = () => ({ nodeId: 'other' });
+    if (change === 'surface') body.innerHTML = approvalsCardHtml(true);
+    await confirmDecision();
+    if (change === 'sudo') {
+      assert.equal(typeof releaseSudo, 'function');
+      screen.currentNode = () => ({ nodeId: 'other' });
+      releaseSudo();
+      await flush();
+    }
+    assert.equal(screen.calls.filter((call) => call.kind === 'tentaNasApprovalDecideRequest').length, 0);
+    screen.dispose();
+  });
+}
+
 test('a second admin approves: the decision carries the approver sudo password and the list comes back', async () => {
   let sent = null;
   const after = { approvals: [pending({ status: 'approved', decidedBy: 'u-piotr', decisionJobId: 'job-9' })], settings: settings() };
@@ -235,6 +275,43 @@ test('a parked answer reports that nothing ran instead of opening a job log', as
   const win = [...document.querySelectorAll('tf-window')].pop();
   assert.match(win.textContent, /Nic jeszcze nie zostało wykonane/);
   assert.match(win.textContent, /Zniszczenie puli/);
+  screen.dispose();
+});
+
+// The purest form of the defect the owner complained about: the settings line
+// is rebuilt from byte-identical markup on every 30 s poll, so it flickers for
+// nothing and a selection inside it cannot survive one tick.
+test('an unchanged poll leaves the approvals settings line alone', async () => {
+  const screen = fakeScreen({ tentaNasApprovalsListRequest: { approvals: [pending()], settings: settings() } });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const el = body.querySelector('#nas-approvals-settings');
+  const span = el.querySelector('.text-3');
+  assert.ok(span, 'the line names where the rule comes from');
+
+  await refresh();
+  await flush();
+  assert.equal(el.querySelector('.text-3') === span, true, 'the settings line is not rewritten every poll');
+  screen.dispose();
+});
+
+// …and it still has to follow the setting when it really moves.
+test('a changed approvals setting is still repainted', async () => {
+  let adminCount = 2;
+  const screen = fakeScreen({ tentaNasApprovalsListRequest: () => ({ approvals: [pending()], settings: settings({ adminCount }) }) });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const el = body.querySelector('#nas-approvals-settings');
+  assert.doesNotMatch(el.textContent, /Tylko jeden administrator/, 'two admins need no single-admin warning');
+
+  adminCount = 1;
+  await refresh();
+  await flush();
+  assert.match(el.textContent, /Tylko jeden administrator/, 'dropping to one admin is reported');
   screen.dispose();
 });
 

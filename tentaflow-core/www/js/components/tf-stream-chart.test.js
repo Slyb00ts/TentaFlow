@@ -105,6 +105,84 @@ test('x axis labels are relative offsets ending at 0', () => {
   el.remove();
 });
 
+test('the slide is paced by the measured interval, not by a fixed sprint', async () => {
+  const el = makeChart();
+  const layer = el.querySelector('.tf-chart__stream-layer');
+  // One 5 s poll: the layer is placed one sample to the right and eased back.
+  el.push(T0 + 5_000, { read: 25, write: 2 });
+  assert.equal(el.querySelector('.tf-chart__stream-layer') === layer, true, 'the layer is re-projected, not rebuilt');
+  assert.match(layer.style.transform, /^translateX\([\d.]+px\)$/, 'starts one sample to the right');
+  await new Promise((r) => requestAnimationFrame(r));
+  // Nearly the whole measured interval, not a sprint followed by a freeze —
+  // only the wait for this animation frame is deducted (see below).
+  const ms = Number(/transform ([\d.]+)ms linear/.exec(layer.style.transition)[1]);
+  assert.equal(ms > 4_000 && ms <= 5_000, true, `paced by the 5 s interval, got ${ms}ms`);
+  assert.equal(layer.style.transform, 'translateX(0)');
+  el.remove();
+});
+
+// The transition cannot begin until the next animation frame, and that frame
+// is up to a refresh period away. Charging the full interval to a slide that
+// starts late overruns the next sample by exactly that much on every cycle, so
+// the wait is measured and deducted from both the duration and the distance
+// still to travel.
+test('the wait for the animation frame is deducted from the slide, not added to it', async () => {
+  const el = makeChart();
+  const layer = el.querySelector('.tf-chart__stream-layer');
+  const raf = globalThis.requestAnimationFrame;
+  // A frame that arrives 40 ms late, which is what a busy tab really does.
+  globalThis.requestAnimationFrame = (cb) => setTimeout(cb, 40);
+  try {
+    el.push(T0 + 5_000, { read: 25, write: 2 });
+    const startOffset = Number(/translateX\(([\d.]+)px\)/.exec(layer.style.transform)[1]);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(startOffset > 0, true, 'the layer is placed one sample to the right');
+    const ms = Number(/transform ([\d.]+)ms linear/.exec(layer.style.transition)[1]);
+    assert.equal(ms < 5_000 - 30, true, `the lost frame is subtracted, got ${ms}ms`);
+    assert.equal(ms > 4_000, true, `but only the lost frame, got ${ms}ms`);
+    assert.equal(layer.style.transform, 'translateX(0)');
+  } finally {
+    globalThis.requestAnimationFrame = raf;
+    el.remove();
+  }
+});
+
+test('a gap wider than the window places the samples instead of crawling across the plot', () => {
+  const el = makeChart({ windowSecs: 60 });
+  const layer = el.querySelector('.tf-chart__stream-layer');
+  // Two windows without a sample (a hidden tab): nothing on screen carries
+  // over, so there is no continuous motion to show.
+  el.push(T0 + 120_000, { read: 25, write: 2 });
+  assert.equal(el.querySelector('.tf-chart__stream-layer') === layer, true, 'still the same layer');
+  assert.equal(layer.style.transform, '', 'no slide at all');
+  el.remove();
+});
+
+// The wide-gap return used to fire BEFORE the pending frame was cancelled, so
+// a slide queued by the previous push stayed armed and still applied a
+// transform computed from the OLD delta — in exactly the hidden-tab case the
+// return exists for. The frame is now dropped and the layer put back at rest
+// before any decision not to slide.
+test('a wide gap drops the frame a previous push queued instead of sliding on it', async () => {
+  const el = makeChart({ windowSecs: 60 });
+  const layer = el.querySelector('.tf-chart__stream-layer');
+  // A normal 5 s sample arms a slide…
+  el.push(T0 + 5_000, { read: 25, write: 2 });
+  assert.match(layer.style.transform, /^translateX\([\d.]+px\)$/, 'the slide is armed');
+
+  // …and the tab is hidden for two windows before the next one arrives, so the
+  // queued frame never ran.
+  el.push(T0 + 200_000, { read: 26, write: 2 });
+  assert.equal(el.querySelector('.tf-chart__stream-layer') === layer, true, 'still the same layer');
+  assert.equal(layer.style.transform, '', 'the pending slide is dropped, not applied');
+
+  await new Promise((r) => requestAnimationFrame(r));
+  await new Promise((r) => requestAnimationFrame(r));
+  assert.equal(layer.style.transform, '', 'and no stale frame moves the layer afterwards');
+  assert.equal(/transform [\d.]+ms/.test(layer.style.transition || ''), false, 'no transition was started');
+  el.remove();
+});
+
 test('push() with a value for one series only extends that series', () => {
   const el = makeChart({ seed: false });
   el.push(T0, { read: 1 });

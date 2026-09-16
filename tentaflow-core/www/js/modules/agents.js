@@ -2324,22 +2324,28 @@ function renderAgentRunsTable() {
     prompt: runPromptCell(r),
     initiator: runInitiator(r),
   }));
-  table.rowActions = (row) => buildRunRowActions(row, 'agent');
+  table.rowActions = (row, idx, currentRow) => buildRunRowActions(row, 'agent', currentRow);
   table.addEventListener('row-click', (e) => {
     const id = e.detail?.row?._id;
     if (id) openRunDetail(id, 'agent-runs-detail-host', 'agent');
   });
 }
 
-async function cancelRun(runId, reload) {
+// `scope` is the same 'global' | 'agent' vocabulary openRunDetail uses: it says
+// WHICH list to refresh after the cancel, because the two tabs own separate
+// hosts and state. The parameter used to be called `reload`, which reads like a
+// boolean — a caller passing `true` would have refreshed nothing at all, with
+// no error and no visible symptom. Anything outside the two values refreshes
+// nothing on purpose (a cancel driven from somewhere with no list to update).
+async function cancelRun(runId, scope) {
   if (!runId) return;
   try {
     const resp = await ApiBinary.action('agentRunCancelRequest', { runId });
     if (resp && (resp.cancelled === true || resp.cancelled === 'true')) {
       toast(t('run_cancel_ok'), 'success');
     }
-    if (reload === 'global') await loadRunsTab();
-    else if (reload === 'agent') await loadAgentRuns();
+    if (scope === 'global') await loadRunsTab();
+    else if (scope === 'agent') await loadAgentRuns();
   } catch (err) {
     toast(`${t('run_cancel_failed')}: ${err.message}`, 'error');
   }
@@ -2792,7 +2798,7 @@ function renderRunsTable() {
       initiator: runInitiator(r),
     };
   });
-  table.rowActions = (row) => buildRunRowActions(row, 'global');
+  table.rowActions = (row, idx, currentRow) => buildRunRowActions(row, 'global', currentRow);
   table.addEventListener('row-click', (e) => {
     const id = e.detail?.row?._id;
     if (id) openRunDetail(id);
@@ -2807,20 +2813,21 @@ function renderTableFooter(hostId, shown, total) {
   host.textContent = total ? t('runs_footer', { shown, total }) : '';
 }
 
-function buildRunRowActions(row, scope = 'global') {
+function buildRunRowActions(row, scope = 'global', currentRow) {
+  const live = () => currentRow?.() ?? row;
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', 'secondary');
   btn.setAttribute('size', 'sm');
   if (TERMINAL_RUN_STATUSES.includes(row._status)) {
     btn.textContent = t('action_details');
     btn.addEventListener('click', () => (scope === 'agent'
-      ? openRunDetail(row._id, 'agent-runs-detail-host', 'agent')
-      : openRunDetail(row._id)));
+      ? openRunDetail(live()._id, 'agent-runs-detail-host', 'agent')
+      : openRunDetail(live()._id)));
     return btn;
   }
   btn.setAttribute('variant', 'danger-outline');
   btn.textContent = t('action_cancel');
-  btn.addEventListener('click', () => cancelRun(row._id, scope));
+  btn.addEventListener('click', () => cancelRun(live()._id, scope));
   return btn;
 }
 

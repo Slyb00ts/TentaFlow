@@ -382,6 +382,296 @@ test('tf-table: actions-label names the trailing actions column', () => {
   assert.equal(after.getAttribute('aria-label'), null);
 });
 
+// ---------------------------------------------------------------------------
+// tf-table — the actions cell is not rebuilt on every render
+// ---------------------------------------------------------------------------
+//
+// `_updateRowCells` recycles the <tr> but called `_writeActionsCell`
+// unconditionally, and that did `td.replaceChildren(el)` with a freshly built
+// element every time. On a polled screen every action button in every row was
+// therefore destroyed and recreated on a poll that moved nothing — a click
+// target vanishing out from under the cursor mid-gesture.
+//
+// A guard on object identity cannot fix it: each poll builds brand-new row
+// objects from fresh API data, so `row === lastRow` is never true.
+// `rowActionsKey` let the host declare a signature instead — but that is an
+// opt-in PROMISE: the caller lists the fields its markup and handlers read, and
+// one left off the list silently leaves a kept element working on stale data.
+// Measured: 42 rowActions call sites, exactly one of which supplied a key.
+//
+// So the staleness is made impossible rather than guarded. The builder receives
+// a third argument, `currentRow()`, resolving the row in THIS slot at CALL
+// time; handlers read through it instead of closing over the row they were
+// built from. A rebuild producing identical markup can then be discarded — an
+// element whose handlers resolve the current row is already correct for
+// whatever row now sits there. `rowActionsKey` survives as an optional fast
+// path that skips the build itself.
+//
+// Elements are compared by `===` and the result asserted as a BOOLEAN — see the
+// note on `absent` in modules/tentanas.test.js for why a failing element
+// comparison must never reach assert's differ.
+
+test('tf-table: an unchanged actions signature keeps the very same element', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
+  let built = 0;
+  t.rowActionsKey = (row) => `${row.id}|${row.v}`;
+  // A complete key is no longer sufficient on its own: the builder must also
+  // have asked for the live row. Completeness of a key is a promise tf-table
+  // cannot verify, and a key that omitted the identity was shown to strand a
+  // handler on a stale row. A caller with a complete key but an old-style
+  // builder now loses this optimisation, never correctness.
+  t.rowActions = (row, idx, currentRow) => {
+    built += 1;
+    const b = document.createElement('button');
+    b.dataset.row = (currentRow?.() ?? row).id;
+    return b;
+  };
+  const el = bodyCells(t).at(-1).firstChild;
+  assert.ok(el, 'the actions cell is filled on the first render');
+  assert.equal(built, 1, 'built once');
+
+  // A brand-new row OBJECT carrying identical values — what every poll hands in.
+  t.rows = [{ a: '1', id: 'r1', v: 1 }];
+  assert.equal(built, 1, 'the builder is not called again for an unchanged row');
+  assert.equal(bodyCells(t).at(-1).firstChild === el, true, 'and the node is the same one');
+});
+
+test('tf-table: a new rowActions builder replaces the cells the old one produced', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
+  t.rowActionsKey = (row) => `${row.id}|${row.v}`;
+  t.rowActions = () => {
+    const b = document.createElement('button');
+    b.dataset.from = 'A';
+    return b;
+  };
+  assert.equal(bodyCells(t).at(-1).firstChild.dataset.from, 'A');
+
+  // Swapping the builder is how a host rewires handlers against new state — an
+  // `isAdmin` that just changed, a fresh permission check. The cached signature
+  // describes the ROW, not which builder made the element, so without
+  // invalidating it the old element and its stale closure would live forever.
+  t.rowActions = () => {
+    const b = document.createElement('button');
+    b.dataset.from = 'B';
+    return b;
+  };
+  assert.equal(bodyCells(t).at(-1).firstChild.dataset.from, 'B', 'the new builder owns the cell');
+});
+
+test('tf-table: a signature that is neither a string nor a number keeps rebuilding', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  let built = 0;
+  // A builder that returns nothing usable must count as "no signature" and NOT
+  // as a match — otherwise every such cell would freeze on its first element.
+  t.rowActionsKey = () => undefined;
+  t.rowActions = () => {
+    built += 1;
+    return document.createElement('button');
+  };
+  assert.equal(built, 1, 'built on the first render');
+  t.rows = [{ a: '1', id: 'r1' }];
+  assert.equal(built, 2, 'and again, exactly as before the guard existed');
+});
+
+test('tf-table: an unchanged chip cell keeps its span, a changed one replaces it', () => {
+  const t = table(
+    [{ key: 'r', label: 'R', renderer: 'chip' }],
+    [{ r: { status: 'ok', label: 'Zajety' } }],
+  );
+  const span = bodyCells(t)[0].firstElementChild;
+  assert.ok(span, 'the chip is rendered');
+
+  // A poll hands the same value in as a NEW object. Rewriting the cell anyway
+  // swapped one span per row on every tick: measured on the live disks table,
+  // 319 of the 329 DOM mutations left after the row-actions fix came from here.
+  t.rows = [{ r: { status: 'ok', label: 'Zajety' } }];
+  assert.equal(bodyCells(t)[0].firstElementChild === span, true, 'the same span survives a no-op poll');
+
+  t.rows = [{ r: { status: 'warn', label: 'Zajety' } }];
+  assert.equal(bodyCells(t)[0].firstElementChild === span, false, 'a changed status does replace it');
+  assert.equal(bodyCells(t)[0].firstElementChild.className, 'tf-chip warn');
+});
+
+test('tf-table: a moved signature rebuilds the cell and binds it to the CURRENT row', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
+  const fired = [];
+  t.rowActionsKey = (row) => `${row.id}|${row.v}`;
+  t.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
+    const b = document.createElement('button');
+    b.dataset.v = String(row.v);
+    b.addEventListener('click', () => fired.push(`${live().id}:${live().v}`));
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+
+  t.rows = [{ a: '1', id: 'r1', v: 2 }];
+  const second = bodyCells(t).at(-1).firstChild;
+  assert.equal(second === first, false, 'the markup moved with the signature, so the node is replaced');
+  second.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['r1:2'], 'the handler reads the row as it is NOW');
+});
+
+test('tf-table: a signature that omits the row identity can no longer strand a handler', () => {
+  // Exactly the hazard rowActionsKey put on the caller: <tr> 0 is recycled but
+  // now shows a DIFFERENT logical row, and a key that left the identity out
+  // reads as "unchanged", so the builder never runs again. That used to strand
+  // the handler on the row it was built for — a delete button quietly pointing
+  // at the wrong record. Reading through currentRow() makes the bad key
+  // harmless: the kept element still acts on the row that is actually there.
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', v: 1 }]);
+  const fired = [];
+  t.rowActionsKey = (row) => `v:${row.v}`;
+  t.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push(live().id));
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+
+  // Same rendered actions, same `v`, different row.
+  t.rows = [{ a: '2', id: 'r2', v: 1 }];
+  assert.equal(bodyCells(t).at(-1).firstChild === first, true, 'the stale signature does keep the node');
+  first.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['r2'], 'and it still acts on the row now in that position');
+});
+
+test('tf-table: with no signature at all, a no-op poll still touches no node', () => {
+  // The default path — 41 of the 42 rowActions call sites declare no signature.
+  // The builder still RUNS on every render (the guard is on the DOM write, not
+  // on the call), but an identical result is discarded and the element the user
+  // may be reaching for is left exactly where it is.
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1' }]);
+  let built = 0;
+  // Three parameters: only a builder that asked for the live row may have its
+  // element kept. The zero-parameter shape this test first used is
+  // indistinguishable from a rest-parameter builder that CAN read the row, so
+  // tf-table no longer trusts it. The point of the test — no SIGNATURE, yet an
+  // identical result is discarded — is unchanged.
+  t.rowActions = (row, idx, currentRow) => { built += 1; return document.createElement('span'); };
+  const el = bodyCells(t).at(-1).firstChild;
+  assert.ok(el, 'the actions cell is filled on the first render');
+  assert.equal(built, 1);
+
+  t.rows = [{ a: '1' }];
+  assert.equal(built, 2, 'the builder runs again, exactly as before');
+  assert.equal(bodyCells(t).at(-1).firstChild === el, true, 'but its identical output is discarded');
+});
+
+test('tf-table: a kept actions element acts on the row that is in its slot NOW', () => {
+  // Markup identical for every row — the case a markup comparison alone cannot
+  // tell apart, and the one a kebab menu really produces. A filter then drops
+  // r1, so r2 slides into slot 0 underneath the very same element.
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }, { a: '2', id: 'r2' }]);
+  const fired = [];
+  t.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push(live().id));
+    return b;
+  };
+  const first = bodyCells(t, 0).at(-1).firstChild;
+
+  t.rows = [{ a: '2', id: 'r2' }];
+  assert.equal(bodyCells(t, 0).at(-1).firstChild === first, true, 'the node is kept');
+  first.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['r2'], 'and it acts on the row now in that slot');
+});
+
+test('tf-table: a kept actions element reads the row object a poll just replaced', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', n: 1 }]);
+  let seen = null;
+  t.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
+    const b = document.createElement('button');
+    b.addEventListener('click', () => { seen = live(); });
+    return b;
+  };
+  const el = bodyCells(t).at(-1).firstChild;
+
+  // Equal VALUES, brand-new object — what every poll hands in, and what object
+  // identity can never distinguish from the row before it.
+  const polled = { a: '1', id: 'r1', n: 1 };
+  t.rows = [polled];
+  assert.equal(bodyCells(t).at(-1).firstChild === el, true, 'nothing moved, so nothing is written');
+  el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.equal(seen === polled, true, 'the handler holds the row object that is live now');
+});
+
+test('tf-table: a kept actions element follows a sort that moved another row into its slot', () => {
+  // currentRow() has to resolve through the SORTED view, the same one
+  // _renderTbody wrote from — reading the unsorted `.rows` by index would hand
+  // the handler a different record than the one its own <tr> displays.
+  const t = table(
+    [{ key: 'a', label: 'A', sortable: '' }],
+    [{ a: 'b', id: 'r1' }, { a: 'a', id: 'r2' }],
+    { sortable: '' },
+  );
+  const fired = [];
+  t.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push(live().id));
+    return b;
+  };
+  const first = bodyCells(t, 0).at(-1).firstChild;
+
+  headerCells(t)[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.equal(bodyCells(t, 0).at(-1).firstChild === first, true, 'sorting writes no actions node');
+  first.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['r2'], 'the top slot now belongs to r2 and the handler knows it');
+});
+
+test('tf-table: an actions element whose markup moved IS replaced', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1', paused: false }]);
+  t.rowActions = (row) => {
+    const b = document.createElement('button');
+    b.setAttribute('icon', row.paused ? 'play' : 'pause');
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+
+  t.rows = [{ a: '1', id: 'r1', paused: true }];
+  const second = bodyCells(t).at(-1).firstChild;
+  assert.equal(second === first, false, 'a changed icon is a changed cell');
+  assert.equal(second.getAttribute('icon'), 'play');
+});
+
+test('tf-table: a new builder replaces the element even when the markup is identical', () => {
+  // How a host rewires handlers against state that just moved — an `isAdmin`
+  // flipping, a fresh permission check. The markup can be identical while the
+  // closure is not, so the markup comparison alone must NOT keep the old node.
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  const fired = [];
+  t.rowActions = () => {
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push('old'));
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+
+  t.rowActions = () => {
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push('new'));
+    return b;
+  };
+  const second = bodyCells(t).at(-1).firstChild;
+  assert.equal(second === first, false, 'the new builder owns the cell');
+  second.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['new'], 'and the old closure is gone with it');
+});
+
+test('tf-table: a signature builder that throws falls back to rebuilding', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1' }]);
+  let built = 0;
+  t.rowActionsKey = () => { throw new Error('boom'); };
+  t.rowActions = () => { built += 1; return document.createElement('span'); };
+  assert.equal(built, 1);
+  t.rows = [{ a: '1' }];
+  assert.equal(built, 2, 'a broken signature must never read as "unchanged"');
+});
+
 test('tf-table: the actions column header is right-aligned in controls.css', () => {
   const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
   const idx = css.indexOf('.tf-table th.tf-table__actions-col');
@@ -747,6 +1037,65 @@ test('tf-filter-chips: controls.css fades the side that actually has more', () =
   }
 });
 
+// A poll chain hands the same filters back every few seconds — TentaNas
+// rebuilds its disk bar every 5 s because the counts live in the chip labels.
+// Rewriting innerHTML there destroys and recreates every button: the one under
+// the cursor loses its hover and :active styling mid-press, and a click landing
+// in that window is delivered to a node already detached from the document.
+test('tf-filter-chips: an identical render leaves the chips alone', async () => {
+  const { TfFilterChips } = await import('./tf-filter-chips.js');
+  const chips = mount(new TfFilterChips());
+  const bar = [{ id: 'all', label: 'Wszystkie 12', active: true }, { id: 'problems', label: 'Problemy 2' }];
+  chips.filters = bar;
+  const buttons = [...chips.querySelectorAll('.tf-filter-chip')];
+  assert.equal(buttons.length, 2);
+
+  chips.filters = bar.map((f) => ({ ...f }));
+  const after = [...chips.querySelectorAll('.tf-filter-chip')];
+  assert.equal(after.length, 2);
+  after.forEach((el, i) => assert.equal(el === buttons[i], true, `chip ${i} is the same element`));
+
+  // A count that genuinely moved must still re-render.
+  chips.filters = [{ id: 'all', label: 'Wszystkie 13', active: true }, { id: 'problems', label: 'Problemy 2' }];
+  assert.equal(chips.querySelector('.tf-filter-chip') === buttons[0], false, 'a changed label rebuilds the bar');
+  assert.equal(chips.querySelectorAll('.tf-filter-chip')[0].textContent, 'Wszystkie 13');
+  chips.remove();
+});
+
+test('tf-filter-chips: the guard does not freeze the selection a click makes', async () => {
+  const { TfFilterChips } = await import('./tf-filter-chips.js');
+  const chips = mount(new TfFilterChips(), { mode: 'single' });
+  chips.filters = [{ id: 'all', label: 'A', active: true }, { id: 'open', label: 'B' }];
+  chips.querySelectorAll('.tf-filter-chip')[1].dispatchEvent(new window.Event('click', { bubbles: true }));
+  const after = [...chips.querySelectorAll('.tf-filter-chip')];
+  assert.equal(after[1].classList.contains('active'), true, 'the clicked chip became active');
+  assert.equal(after[0].classList.contains('active'), false, 'and the previous one gave it up');
+  chips.remove();
+});
+
+// disconnectedCallback drops the ResizeObserver, but connectedCallback only
+// built one when there was no container yet — and a re-attached element still
+// has its container, because it moved with the element. A bar that is detached
+// and put back (a tab switch that re-parents its toolbar) therefore never
+// regained overflow tracking, and its edge fade froze on whatever the last
+// resize before the detach happened to say.
+test('tf-filter-chips: a re-attached bar regains its overflow tracking', async () => {
+  const { TfFilterChips } = await import('./tf-filter-chips.js');
+  const chips = mount(new TfFilterChips(), { scroll: '' });
+  chips.filters = [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }];
+  const box = chips.querySelector('.tf-filter-chips');
+  assert.ok(chips._observer, 'the bar tracks its own width while attached');
+
+  chips.remove();
+  assert.equal(chips._observer, null, 'and lets the observer go while detached');
+
+  document.body.appendChild(chips);
+  assert.equal(chips.querySelector('.tf-filter-chips') === box, true, 'the container came back with the element');
+  assert.ok(chips._observer, 'a re-attached bar observes its width again');
+  assert.equal(box.getAttribute('data-overflow'), 'none', 'and still publishes its overflow state');
+  chips.remove();
+});
+
 // ---------------------------------------------------------------------------
 // 9. tf-menu — the compact panel for a row-anchored menu
 // ---------------------------------------------------------------------------
@@ -885,4 +1234,76 @@ test('tf-select: markup options still reach the select when nothing replaces the
   assert.deepEqual([...select.querySelectorAll('option')].map((o) => o.value), ['a', 'b']);
   assert.equal(select.value, 'b');
   host.remove();
+});
+
+// The guarantee that vanished when the markup comparison replaced the opt-in
+// signature: a builder written the OLD way never asked for the live row, so it
+// closes over the row it was built from. Keeping its element would hand its
+// handlers data from a poll ago with no visible symptom. tf-table therefore
+// asks whether the builder requested the accessor at all.
+test('tf-table: a builder that never asked for the live row keeps being rebuilt', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  let built = 0;
+  // Two declared parameters — the shape every caller had before the accessor.
+  t.rowActions = (row, idx) => {
+    built += 1;
+    const b = document.createElement('button');
+    b.dataset.row = row.id;
+    b.dataset.idx = String(idx);
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+  assert.ok(first, 'the actions cell is filled');
+  assert.equal(built, 1, 'built once');
+
+  // A fresh row object carrying identical values: the markup comparison alone
+  // would keep the node here, which is exactly what must NOT happen.
+  t.rows = [{ a: '1', id: 'r1' }];
+  assert.equal(built, 2, 'the builder ran again');
+  assert.equal(bodyCells(t).at(-1).firstChild === first, false, 'and its element was replaced');
+});
+
+// The other half: the check must not cost a MIGRATED caller its guard, or the
+// whole refactor is undone without a single test noticing.
+test('tf-table: a builder that asked for the live row still keeps its element', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  let built = 0;
+  t.rowActions = (row, idx, currentRow) => {
+    built += 1;
+    const b = document.createElement('button');
+    b.dataset.row = (currentRow?.() ?? row).id;
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+  assert.equal(built, 1, 'built once');
+
+  t.rows = [{ a: '1', id: 'r1' }];
+  assert.equal(bodyCells(t).at(-1).firstChild === first, true, 'the node survives for a migrated builder');
+});
+
+// The fast path for a declared signature used to run BEFORE any check on the
+// builder, so a hand-rolled key that omits the row identity, paired with a
+// builder that never asked for the live row, kept a node whose handlers fired
+// on the row that used to sit in this slot. A critic reproduced that against
+// the shipped code; this pins the gate that closes it.
+test('tf-table: a declared signature cannot keep a node for an unmigrated builder', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1', id: 'r1' }]);
+  const fired = [];
+  // A key that deliberately omits the row identity: the caller's promise is
+  // incomplete, which is precisely the case that must not be trusted.
+  t.rowActionsKey = () => 'constant';
+  t.rowActions = (row) => {
+    const b = document.createElement('button');
+    b.addEventListener('click', () => fired.push(row.id));
+    return b;
+  };
+  const first = bodyCells(t).at(-1).firstChild;
+  assert.ok(first, 'the actions cell is filled on the first render');
+
+  // A different logical row slides into the slot.
+  t.rows = [{ a: '1', id: 'r2' }];
+  const second = bodyCells(t).at(-1).firstChild;
+  assert.equal(second === first, false, 'the node is not kept for an unmigrated builder');
+  second.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(fired, ['r2'], 'and the handler acts on the row now in that slot');
 });

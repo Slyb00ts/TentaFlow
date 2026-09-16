@@ -37,6 +37,12 @@ const VOLBLOCK = ['16K', '8K', '32K', '64K', '128K'];
 const PRESETS = { docs: '128K', media: '1M', db: '16K', custom: '' };
 
 export async function drawDatasets(screen, host, { pool, onChange = null }) {
+  // ONE HOST, ONE WRITER: `host` is `#nas-pool-tab-body`, and this direct
+  // write is legal only because `drawInner` (pool-detail.js) nulls its
+  // `__tfHtml` on every tab switch and this is the first synchronous
+  // statement here, before any await. Reached from anywhere else — a poll, a
+  // refresh — it would leave that cache describing markup that is gone, and
+  // the next `patchHtml` with the same string would be skipped as a no-op.
   host.innerHTML = `
     <div class="stack">
       <div class="section-card">
@@ -89,8 +95,9 @@ export async function drawDatasets(screen, host, { pool, onChange = null }) {
     host.querySelector('#nas-ds-table').rows = treeRows(state).map((d) => datasetRow(d, state));
   };
 
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
     if (!screen.isAdmin) return null;
+    const live = () => currentRow?.() ?? row;
     const d = row._ds;
     const root = d.name === pool;
     const wrap = document.createElement('div');
@@ -100,9 +107,9 @@ export async function drawDatasets(screen, host, { pool, onChange = null }) {
       ${root ? '' : `
       <tf-button size="sm" variant="ghost" icon="save" data-act="snap" title="${escapeAttr(T('snapshots.now'))}"></tf-button>
       <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="destroy" title="${escapeAttr(T('datasets.destroy'))}"></tf-button>`}`;
-    wrap.querySelector('[data-act="props"]').addEventListener('click', (e) => { e.stopPropagation(); select(d.name, true); });
-    wrap.querySelector('[data-act="snap"]')?.addEventListener('click', (e) => { e.stopPropagation(); openSnapshotNowDialog(screen, { dataset: d.name, onDone: reload }); });
-    wrap.querySelector('[data-act="destroy"]')?.addEventListener('click', (e) => { e.stopPropagation(); openDatasetDestroyDialog(screen, d, state.datasets, reload); });
+    wrap.querySelector('[data-act="props"]').addEventListener('click', (e) => { e.stopPropagation(); select(live()._ds.name, true); });
+    wrap.querySelector('[data-act="snap"]')?.addEventListener('click', (e) => { e.stopPropagation(); openSnapshotNowDialog(screen, { dataset: live()._ds.name, onDone: reload }); });
+    wrap.querySelector('[data-act="destroy"]')?.addEventListener('click', (e) => { e.stopPropagation(); openDatasetDestroyDialog(screen, live()._ds, state.datasets, reload); });
     return wrap;
   };
   const select = (name, force = false) => {
@@ -274,11 +281,12 @@ async function drawDatasetDetail(screen, el, name, onChange) {
 
   const table = el.querySelector('#nas-ds-props');
   const editable = new Set(['compression', 'atime', 'relatime', 'recordsize', 'sync', 'xattr', 'acltype', 'quota', 'refquota', 'reservation', 'mountpoint', 'readonly', 'volsize', 'snapdir', 'exec', 'setuid']);
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
     if (!admin || !editable.has(row._prop.name)) return null;
+    const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.innerHTML = `<tf-button size="sm" variant="ghost" icon="edit" data-act="edit" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>`;
-    wrap.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); openPropertyEditor(screen, d.name, row._prop, onChange, { dataset: true }); });
+    wrap.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); openPropertyEditor(screen, d.name, live()._prop, onChange, { dataset: true }); });
     return wrap;
   };
   table.rows = props.map((pr) => ({

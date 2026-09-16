@@ -13,6 +13,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtAgo, fmtIn, fmtDate, errMessage, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { setAttr, setText, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
@@ -23,7 +24,7 @@ import '/js/components/tf-window.js';
 // Every `OP_*` constant of `tentanas/approvals.rs`. A parked operation missing
 // from this list degrades to the generic "Operacja" label, which tells the
 // approving admin nothing about what they are approving.
-const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import'];
+const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import', 'elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'elastic_schedule'];
 
 export const operationLabel = (op) => T('approvals.op_' + (OPERATIONS.includes(op) ? op : 'unknown'));
 
@@ -73,7 +74,8 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
 
   const paint = () => {
     const open = state.approvals.filter((a) => a.status === 'pending');
-    body.querySelector('#nas-approvals-count').setAttribute('label', String(open.length));
+    // `setAttribute` with an identical value still re-renders the chip.
+    setAttr(body.querySelector('#nas-approvals-count'), 'label', String(open.length));
     // The card stays out of the way while nothing waits and the switch is off:
     // an empty list plus a disabled feature is noise, not information.
     card.hidden = !open.length && !state.settings?.enabled;
@@ -88,7 +90,8 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
     }));
   };
 
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const a = row._approval;
     const wrap = document.createElement('div');
     wrap.className = 'row-actions';
@@ -109,7 +112,7 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
       b.setAttribute('variant', variant);
       b.setAttribute('icon', icon);
       b.textContent = label;
-      b.addEventListener('click', (e) => { e.stopPropagation(); decide(a, act === 'approve'); });
+      b.addEventListener('click', (e) => { e.stopPropagation(); decide(live()._approval, act === 'approve'); });
       wrap.appendChild(b);
     }
     return wrap;
@@ -118,18 +121,26 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
   const paintSettings = () => {
     const s = state.settings;
     const el = body.querySelector('#nas-approvals-settings');
-    if (!s) { el.textContent = ''; return; }
+    // `setText` rather than `textContent =`: it also drops the patch cache, so
+    // the same markup coming back later is not mistaken for "already there".
+    if (!s) { setText(el, ''); return; }
     const toggle = body.querySelector('#nas-approvals-enabled');
-    if (toggle) toggle.checked = Boolean(s.enabled);
+    // Assigning `checked` writes the attribute unconditionally, and tf-toggle
+    // re-renders in its attributeChangedCallback — so guard it.
+    if (toggle) setAttr(toggle, 'checked', Boolean(s.enabled));
     const ttl = body.querySelector('#nas-approvals-ttl');
     // Only while the admin is not mid-edit: a poll must not overwrite what is
-    // being typed.
-    if (ttl && document.activeElement !== ttl) ttl.value = String(s.ttlHours);
+    // being typed — and only when the number actually moved.
+    if (ttl && document.activeElement !== ttl && String(ttl.value) !== String(s.ttlHours)) ttl.value = String(s.ttlHours);
     const origin = s.byDefault
       ? T(s.enabled ? 'approvals.settings_default_on' : 'approvals.settings_default_off', { n: s.adminCount })
       : T('approvals.settings_admins', { n: s.adminCount });
-    el.innerHTML = `${escapeHtml(T('approvals.settings_sub'))} <span class="text-3">${escapeHtml(origin)}</span>${
-      s.adminCount < 2 ? `<div class="text-3">${escapeHtml(T('approvals.single_admin'))}</div>` : ''}`;
+    // This line is the same sentence on almost every poll — the settings
+    // change when an admin changes them, not every 30 s. Rewriting it
+    // destroyed and recreated it for nothing, which is exactly the flicker
+    // the mockups forbid ("nigdy pełne odświeżenie całości").
+    patchHtml(el, `${escapeHtml(T('approvals.settings_sub'))} <span class="text-3">${escapeHtml(origin)}</span>${
+      s.adminCount < 2 ? `<div class="text-3">${escapeHtml(T('approvals.single_admin'))}</div>` : ''}`);
   };
 
   const apply = (res) => {
@@ -152,27 +163,32 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
   };
 
   const decide = async (approval, approve) => {
+    const nodeId = screen.currentNode()?.nodeId;
+    const surface = body.querySelector('#nas-approvals-table');
+    const isCurrent = () => !screen.disposed && body.isConnected && surface?.isConnected && screen.currentNode()?.nodeId === nodeId;
+    if (!isCurrent()) return;
     const detail = `${operationLabel(approval.operation)} — ${approval.subject}`;
     const note = await askDecision(approve, detail);
-    if (note === null) return;
+    if (note === null || !isCurrent()) return;
     // Approving RUNS the operation, so it needs the approver's own sudo
     // password in mode B; rejecting touches nothing on the node.
-    const send = (sudoPassword) => screen.nas(
+    const send = (sudoPassword) => isCurrent() ? screen.nas(
       'tentaNasApprovalDecideRequest',
       { requestId: approval.requestId, approve, note, sudoPassword },
       { timeoutMs: ADMIN_TIMEOUT_MS },
-    );
+    ) : null;
     let res;
     try {
       res = approve
-        ? await screen.withSudo(send, T('approvals.approve_title'))
+        ? await screen.withSudo(send, T('approvals.approve_title'), isCurrent)
         : await send(undefined);
     } catch (e) {
+      if (!isCurrent()) return;
       toast(errMessage(e), 'error');
       refresh();
       return;
     }
-    if (res === null) return;
+    if (res === null || !isCurrent()) return;
     apply(res);
     toast(approve ? T('approvals.approved_done') : T('approvals.rejected_done'), 'success');
     if (approve && onExecuted) onExecuted();

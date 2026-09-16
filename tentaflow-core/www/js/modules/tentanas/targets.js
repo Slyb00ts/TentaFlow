@@ -13,6 +13,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage } from '/js/modules/tentanas/format.js';
+import { setAttr, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns } from '/js/modules/tentanas/target-wizard.js';
 import '/js/components/tf-table.js';
@@ -198,27 +199,28 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
   const paint = () => {
     // The kernel side of each protocol, when it is not there. A node that
     // cannot serve NVMe-oF says so here instead of only inside the wizard.
-    host.querySelector('#nas-tg-services').innerHTML = state.services
+    patchHtml(host.querySelector('#nas-tg-services'), state.services
       .filter((s) => !s.installed)
       .map((s) => `<div class="muted">${escapeHtml(T('targets.service_missing', { proto: protocolLabel(s.protocol), detail: s.detail }))}</div>`)
-      .join('');
+      .join(''));
     const list = host.querySelector('#nas-tg-list');
-    host.querySelector('#nas-tg-count').setAttribute('label', String(state.targets.length));
+    setAttr(host.querySelector('#nas-tg-count'), 'label', String(state.targets.length));
     if (state.error && !state.targets.length) {
-      list.innerHTML = `<div class="num-err">${escapeHtml(state.error)}</div>`;
+      patchHtml(list, `<div class="num-err">${escapeHtml(state.error)}</div>`);
       return;
     }
     if (!state.targets.length) {
-      list.innerHTML = `
+      if (patchHtml(list, `
         <tf-empty-state icon="target" title="${escapeAttr(T('targets.empty_title'))}" message="${escapeAttr(T('targets.empty_msg'))}">
           ${screen.isAdmin ? `<tf-button variant="secondary" icon="plus" data-act="create-empty">${escapeHtml(T('targets.create'))}</tf-button>` : ''}
-        </tf-empty-state>`;
-      list.querySelector('[data-act="create-empty"]')?.addEventListener('click', openCreate);
+        </tf-empty-state>`)) {
+        list.querySelector('[data-act="create-empty"]')?.addEventListener('click', openCreate);
+      }
       return;
     }
-    let table = list.querySelector('#nas-tg-table');
-    if (!table) {
-      list.innerHTML = `
+    // One host, one writer (see the file-share table): the shell is written and
+    // wired exactly once, every later poll only hands over new rows.
+    const shell = `
         <tf-table id="nas-tg-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('targets.none_match'))}">
           <tf-column key="name" label="${escapeAttr(T('targets.col_name'))}" renderer="html" fill></tf-column>
           <tf-column key="protocol" label="${escapeAttr(T('targets.col_protocol'))}" renderer="html" nowrap></tf-column>
@@ -226,8 +228,10 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
           <tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html" nowrap></tf-column>
           <tf-column key="portal" label="${escapeAttr(T('targets.col_portal'))}" renderer="html" hide-below="1000"></tf-column>
         </tf-table>`;
-      table = list.querySelector('#nas-tg-table');
-      table.rowActions = (row) => {
+    if (patchHtml(list, shell)) {
+      const table = list.querySelector('#nas-tg-table');
+      table.rowActions = (row, idx, currentRow) => {
+        const live = () => currentRow?.() ?? row;
         const t = row._target;
         const wrap = document.createElement('div');
         wrap.className = 'tf-table__cell-row';
@@ -236,15 +240,15 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
           <tf-button size="sm" variant="ghost" icon="${t.enabled ? 'pause' : 'play'}" data-act="pause" title="${escapeAttr(t.enabled ? T('targets.pause') : T('targets.resume'))}"></tf-button>
           <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(T('targets.delete'))}"></tf-button>`
           : `<tf-button size="sm" variant="ghost" icon="eye" data-act="details" title="${escapeAttr(T('targets.details'))}"></tf-button>`;
-        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); screen.openTarget(t.targetId); });
-        wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(t); });
-        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); setTargetEnabled(screen, t, !t.enabled, refresh, isCurrent); });
-        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openTargetDeleteDialog(screen, t, refresh, isCurrent); });
+        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); screen.openTarget(live()._target.targetId); });
+        wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(live()._target); });
+        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._target; setTargetEnabled(screen, cur, !cur.enabled, refresh, isCurrent); });
+        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openTargetDeleteDialog(screen, live()._target, refresh, isCurrent); });
         return wrap;
       };
       table.addEventListener('row-click', (e) => screen.openTarget(e.detail.row._target.targetId));
     }
-    table.rows = visible().map(targetRow);
+    list.querySelector('#nas-tg-table').rows = visible().map(targetRow);
     // Nazwa z alertu zostaje rozwiązana do trwałego identyfikatora targetu.
     const wanted = screen.targetName;
     if (wanted) {
@@ -531,7 +535,8 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     };
     const interfaceTable = win.querySelector('#nas-td-interfaces');
     if (interfaceTable) {
-      if (screen.isAdmin) interfaceTable.rowActions = (row) => {
+      if (screen.isAdmin) interfaceTable.rowActions = (row, idx, currentRow) => {
+        const live = () => currentRow?.() ?? row;
         const button = document.createElement('tf-button');
         button.setAttribute('size', 'sm');
         button.setAttribute('variant', 'secondary');
@@ -541,7 +546,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
           button.setAttribute('disabled', '');
           button.setAttribute('title', T('targets.portal_available_note'));
         }
-        button.addEventListener('click', () => openPortalSelection(row.interface));
+        button.addEventListener('click', () => openPortalSelection(live().interface));
         return button;
       };
       interfaceTable.rows = interfaces.map((i) => ({ address: i.address, interface: i.name, network: T(i.shared ? 'targets.portal_network_shared' : 'targets.portal_network_storage'), _supported: i.supported }));
@@ -557,7 +562,8 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       }));
       win.querySelector('#nas-td-shared').innerHTML = sharedWarningHtml(t);
     };
-    if (screen.isAdmin) hostsTable.rowActions = (row) => {
+    if (screen.isAdmin) hostsTable.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const button = document.createElement('tf-button');
       button.setAttribute('variant', 'ghost');
       button.setAttribute('tone', 'critical');
@@ -565,7 +571,8 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       button.setAttribute('icon', 'trash');
       button.textContent = T('targets.remove_initiator');
       button.addEventListener('click', () => {
-        state.initiatorsText = parseInitiators(state.initiatorsText).filter((host) => host !== row.identity).join('\n');
+        const identity = live().identity;
+        state.initiatorsText = parseInitiators(state.initiatorsText).filter((host) => host !== identity).join('\n');
         win.querySelector('#nas-td-initiators').value = state.initiatorsText;
         updateHosts();
       });

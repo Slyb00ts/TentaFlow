@@ -9,7 +9,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel, transportLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, channelMode, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel, transportLabel } from '/js/modules/tentanas/format.js';
 import { openShareUsersDialog } from '/js/modules/tentanas/share-users.js';
 import { pathCrumbsHtml, wirePathCrumbs } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-window.js';
@@ -72,7 +72,7 @@ export function fleetPlan(nodes, currentNodeId) {
     let outcome;
     if (n.nodeId === currentNodeId) outcome = 'source';
     else if (n.instanceStatus !== 'ready') outcome = 'unsupported';
-    else if ((n.elevationMode || 'unarmed') === 'unarmed') outcome = 'after_arm';
+    else if (channelMode(n.elevationMode) === 'unarmed') outcome = 'after_arm';
     else outcome = 'will_mount';
     return { nodeId: n.nodeId, nodeName: n.nodeName, outcome };
   });

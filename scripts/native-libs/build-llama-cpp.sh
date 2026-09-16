@@ -9,9 +9,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 PLATFORM="${1:-$(detect_platform)}"
-# Pinowany commit llama.cpp — wszyscy budują dokładnie tę samą wersję jako prebuilt
-# biblioteki w native-libs. Świeży master da się wymusić przez LLAMA_CPP_REF=origin/master.
-LLAMA_CPP_REF="${LLAMA_CPP_REF:-689e227db485c6b33d061555e74034c93a867649}"
 BACKENDS="${LLAMA_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake

@@ -14,11 +14,15 @@ import assert from 'node:assert/strict';
 const { drawShares, openShareDetail, openShareDeleteDialog, fleetSummary, mountStateTone, mountStateLabel } = await import('./shares.js');
 
 const mount = (nodeId, nodeName, state, detail = '', transport = '') => ({ nodeId, nodeName, state, detail, mountpoint: state === 'mounted' ? `/mnt/tentanas/x` : '', checkedAt: null, transport });
+// The detail a node publishes when its channel is not armed, verbatim from
+// `fleet_mounts.rs`. The fixture used to say 'channel unarmed', a string the
+// wire never carries.
+const NOT_ARMED = 'privilege channel not armed';
 const share = (overrides = {}) => ({
   shareId: 'sh-1', name: 'dokumenty', protocol: 'smb', sourcePath: '/tank/dokumenty', dataset: 'tank/dokumenty', enabled: true,
   smb: { guests: false, previousVersions: true, recycleBin: true, timeMachine: false, users: [{ user: 'anna', mode: 'rw' }] }, nfs: null,
   fleetMount: true,
-  mounts: [mount('node-helios', 'helios', 'source'), mount('node-atlas', 'atlas', 'mounted'), mount('node-orion', 'orion', 'pending', 'channel unarmed'), mount('node-tabbie', 'tabbie', 'unsupported')],
+  mounts: [mount('node-helios', 'helios', 'source'), mount('node-atlas', 'atlas', 'mounted'), mount('node-orion', 'orion', 'pending', NOT_ARMED), mount('node-tabbie', 'tabbie', 'unsupported')],
   sessions: 2, state: 'active', stateDetail: '', createdAt: '2026-08-01T10:00:00Z', updatedAt: '2026-08-01T10:00:00Z', ...overrides,
 });
 const nfsShare = share({ shareId: 'sh-2', name: 'media', protocol: 'nfs', sourcePath: '/tank/media', dataset: 'tank/media', smb: null, nfs: { networks: ['10.10.0.0/24'], readOnly: false, rootSquash: true, asyncWrites: false }, sessions: 0, mounts: [mount('node-helios', 'helios', 'source'), mount('node-atlas', 'atlas', 'error', 'mount.nfs: timed out')] });
@@ -126,7 +130,7 @@ test('renders the share table with fleet chips, filters by protocol and searches
   assert.match(table.rows[0].name, /i-share/, 'the name cell carries the share glyph');
   assert.match(table.rows[0].fleet, /orion/);
   assert.match(table.rows[0].fleet, /status="warn"/);
-  assert.match(table.rows[0].fleet, /title="helios ✓ · atlas ✓ · orion ⏳ channel unarmed · tabbie n\/d"/);
+  assert.match(table.rows[0].fleet, new RegExp(`title="helios ✓ · atlas ✓ · orion ⏳ ${NOT_ARMED} · tabbie n/d"`));
   assert.match(table.rows[1].fleet, /status="err"/);
   assert.equal(table.rows[0].sessions, 2);
   assert.match(table.rows[0].source, /tank\/dokumenty/);
@@ -196,7 +200,7 @@ test('the detail window shows access, per-node mounts and sessions, and refreshe
   assert.ok(rows.some((r) => /\/mnt\/tentanas\/dokumenty/.test(r)), 'fleet path row');
   assert.ok(rows.some((r) => /anna \(RW\)/.test(r)), 'grant row');
   assert.deepEqual([...win.querySelectorAll('#nas-sd-mounts .sr')].map((r) => r.dataset.node), ['node-helios', 'node-atlas', 'node-orion', 'node-tabbie']);
-  assert.match(win.querySelector('#nas-sd-mounts [data-node="node-orion"]').textContent, /channel unarmed/);
+  assert.match(win.querySelector('#nas-sd-mounts [data-node="node-orion"]').textContent, new RegExp(NOT_ARMED));
   assert.equal(win.querySelector('#nas-sd-sessions').rows.length, 2);
   click(win.querySelector('[data-act="refresh-mounts"]'));
   await flush();
@@ -330,5 +334,41 @@ test('the Sharing tab carries both n12 tables and the five segments switch betwe
   // The toolbar carries n12's two create buttons.
   assert.ok(body.querySelector('[data-act="create"]'));
   assert.ok(body.querySelector('[data-act="create-target"]'));
+  screen.dispose();
+});
+
+// n12 polls every 5 s. The mount hint, the explain box and the block-services
+// note were rewritten on every one of those polls, and the two counts were
+// re-set as attributes — which re-renders a tf-chip even when the value is
+// identical to the one already showing.
+test('an unchanged poll leaves the hint lines and the block-services note alone', async () => {
+  const services = [{ protocol: 'nvmet', installed: false, running: false, version: '', configPath: '', detail: 'brak modułu nvmet' }];
+  const screen = screenWith({
+    tentaNasSharesListRequest: listResponse,
+    tentaNasTargetsListRequest: { ...emptyTargets, services },
+  });
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+  const hint = body.querySelector('#nas-sh-mount-hint .mono');
+  const explain = body.querySelector('#nas-sh-explain .mono');
+  const note = body.querySelector('#nas-tg-services .muted');
+  const table = body.querySelector('#nas-sh-table');
+  const filter = body.querySelector('#nas-sh-filter');
+  assert.ok(hint, 'the mount hint is painted');
+  assert.ok(explain, 'the explain box is painted');
+  assert.ok(note, 'the missing nvmet service is named');
+  assert.ok(table && filter, 'the table and the protocol filter are painted');
+
+  assert.ok(scheduled.length, 'the tab armed its poll');
+  await scheduled[0]();
+  await flush();
+  assert.equal(body.querySelector('#nas-sh-mount-hint .mono') === hint, true, 'the mount hint survives the poll');
+  assert.equal(body.querySelector('#nas-sh-explain .mono') === explain, true, 'the explain box survives the poll');
+  assert.equal(body.querySelector('#nas-tg-services .muted') === note, true, 'the block-services note survives the poll');
+  assert.equal(body.querySelector('#nas-sh-table') === table, true, 'and the share table is not rebuilt');
+  assert.equal(body.querySelector('#nas-sh-filter') === filter, true, 'nor the protocol filter');
   screen.dispose();
 });

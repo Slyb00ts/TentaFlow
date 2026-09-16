@@ -6,7 +6,7 @@
 
 module.exports = {
   testDir: '.',
-  testMatch: ['tentanas-targets.spec.js', 'tentanas-environment.spec.js', 'tentanas-snapshots.spec.js'],
+  testMatch: ['tentanas-targets.spec.js', 'tentanas-environment.spec.js', 'tentanas-snapshots.spec.js', 'tentanas-elastic-ui.spec.js'],
   timeout: 30000,
   workers: 1,
   reporter: 'list',

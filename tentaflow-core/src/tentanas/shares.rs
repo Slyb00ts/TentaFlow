@@ -9,11 +9,12 @@
 //       is one marker-delimited `include` line, so a hand-written share of the
 //       admin's can never be lost by a rewrite of ours.
 //
-//       A section is materialized ONLY after the source path is verified to be
-//       a mounted dataset (§3.4 "Materializacja configów"): a share pointing
-//       at an unmounted mountpoint is an empty, writable directory on the
-//       rootfs, and the writes that land there disappear the moment the pool
-//       mounts over them.
+//       A section is materialized ONLY after the source path is verified to
+//       be mounted — a dataset of a pool, or the union of an ACTIVE Elastic
+//       Array (§3.4 "Materializacja configów"): a share pointing at an
+//       unmounted mountpoint is an empty, writable directory on the rootfs,
+//       and the writes that land there disappear the moment the pool or the
+//       union mounts over them.
 //
 //       Generation is pure text over rows, so the fixtures below exercise the
 //       whole config surface on a host with neither Samba nor NFS.
@@ -32,6 +33,7 @@ use tentaflow_protocol::tentanas::{
 use tentanas_helper::HelperCommand;
 
 use super::db::{self as store, ShareRow};
+use super::elastic::ElasticArrayRow;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
 
@@ -183,8 +185,10 @@ pub fn smb_document(shares: &[ShareRow], ksmbd_interfaces: &[String]) -> String 
 // exports generation
 // =============================================================================
 
-/// The option list of one export as the share configured it.
-pub fn export_options(nfs: &NasNfsOptions) -> String {
+/// The option list of one export as the share configured it. `fsid` is the
+/// identity the path has to be exported under when the kernel cannot derive
+/// one (`export_fsid`), and `None` for every path that needs no help.
+pub fn export_options(nfs: &NasNfsOptions, fsid: Option<&str>) -> String {
     let mut opts = vec![if nfs.read_only { "ro" } else { "rw" }];
     opts.push(if nfs.async_writes { "async" } else { "sync" });
     opts.push(if nfs.root_squash {
@@ -192,10 +196,74 @@ pub fn export_options(nfs: &NasNfsOptions) -> String {
     } else {
         "no_root_squash"
     });
-    // Subtree checks break on a renamed open file and buy nothing on a
-    // whole-dataset export, which is the only shape this app produces.
+    // Subtree checks break on a renamed open file — the handle a client holds
+    // encodes where the file sits under the export root, so a rename by
+    // another client turns it stale — and the app takes that trade on every
+    // shape it produces. Since Elastic Arrays became shareable that is no
+    // longer only the whole-dataset export it once was: a source may be a
+    // directory inside a dataset, an array union, or a directory inside one
+    // (`source_owner`). Subtree checking those would cost the renames without
+    // buying anything the app needs, because the isolation it is for is
+    // already decided before the line is written — every exported path was
+    // resolved against this node's own pools and unions, never taken from a
+    // client.
     opts.push("no_subtree_check");
-    opts.join(",")
+    let mut out = opts.join(",");
+    if let Some(fsid) = fsid {
+        // LAST, and only for a path that needs it: a dataset export's option
+        // string stays byte-for-byte what it has always been, so an apply
+        // that adds an array share does not rewrite the entry of every
+        // dataset share the node already serves.
+        out.push_str(",fsid=");
+        out.push_str(fsid);
+    }
+    out
+}
+
+/// The identity NFS has to be given for an export it cannot identify on its
+/// own, or `None` when it can.
+///
+/// A ZFS dataset answers `statfs` with a filesystem id of its own and the
+/// kernel's export code can identify it without help, so its line needs
+/// nothing — and must keep needing nothing, because rewriting the entry of a
+/// path clients are using buys nobody anything. An Elastic Array union has no
+/// such identity at all: mergerfs is a FUSE mount whose filesystem id is 0,
+/// which has no device id, and which `blkid` knows nothing about.
+/// `man 5 exports` is explicit
+/// about that case — "not all filesystems are stored on devices, and not all
+/// filesystems have UUIDs … it is sometimes necessary to explicitly tell NFS
+/// how to identify a filesystem. This is done with the fsid= option" — so
+/// without it `exportfs` refuses the line and an array stays reachable over
+/// SMB only.
+///
+/// The value is the array's OWN `array_id`: the UUID every other Elastic table
+/// already keys on, generated once when the array was created, unchanged by a
+/// remount, a rename or a reboot, and unique per node without a counter this
+/// app would have to keep in step with the exports file. A share on a
+/// DIRECTORY inside the union gets a UUID derived from that id and the
+/// directory's path inside the union, because two exports of ONE filesystem
+/// must not carry the same fsid — nfsd would then resolve a handle of one
+/// export into the other. v5 keeps the derivation a pure function of the two,
+/// so the same share is exported under the same identity on every apply.
+///
+/// `None` for a row whose persisted intention could not be read at all, or
+/// whose id is not a UUID: there is then no stable identity to hand the
+/// kernel, and inventing one would give clients handles that break the next
+/// time the array is applied. The line is generated as it was before arrays
+/// were shareable and `exportfs` refuses it by name, which is the loud failure
+/// that case deserves.
+pub fn export_fsid(arrays: &[ElasticArrayRow], path: &str) -> Option<String> {
+    let array = arrays.iter().find(|a| at_or_below(&a.union_path(), path))?;
+    let namespace = uuid::Uuid::parse_str(array.array_id()?).ok()?;
+    let inside = path
+        .strip_prefix(&array.union_path())
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    Some(if inside.is_empty() {
+        namespace.to_string()
+    } else {
+        uuid::Uuid::new_v5(&namespace, inside.as_bytes()).to_string()
+    })
 }
 
 /// The options a FLEET mount gets. Fleet traffic is node-to-node over the LAN
@@ -203,15 +271,39 @@ pub fn export_options(nfs: &NasNfsOptions) -> String {
 /// root, hence `root_squash` regardless of what the share itself allows.
 pub const FLEET_EXPORT_OPTIONS: &str = "rw,sync,root_squash,no_subtree_check";
 
+/// The fleet options of one path: the constant above plus the `fsid=` the path
+/// needs. A fleet export of an Elastic Array union needs it for exactly the
+/// reason the share's own export does — it is the same mergerfs mount, offered
+/// to the peers instead of to the LAN — and a fleet-mounted array whose line
+/// lacked it would take the whole exports file down with it (`exportfs -ra`
+/// applies the file as a whole).
+fn fleet_export_options(fsid: Option<&str>) -> String {
+    match fsid {
+        Some(fsid) => format!("{FLEET_EXPORT_OPTIONS},fsid={fsid}"),
+        None => FLEET_EXPORT_OPTIONS.to_string(),
+    }
+}
+
 /// The whole exports file: one line per exported path with every client of
 /// that path, because `exportfs` warns about a directory listed twice. The
 /// share's own clients win over the fleet clients when both name the same
 /// address — the admin's intent for that address is the explicit one.
-pub fn exports_document(shares: &[ShareRow], fleet_clients: &[String]) -> String {
+///
+/// `arrays` is the node's Elastic Arrays, and it is the only authority on
+/// whether a path is an array union: a share on one carries no dataset, but
+/// neither does a share on a directory INSIDE a dataset, and that one must not
+/// be given an fsid. Pass the arrays of the NODE (`elastic_arrays_all`), not
+/// of one owner — the union is a mountpoint of the node, and an array missing
+/// from the list produces an export the kernel refuses.
+pub fn exports_document(
+    shares: &[ShareRow],
+    fleet_clients: &[String],
+    arrays: &[ElasticArrayRow],
+) -> String {
     let mut by_path: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
     for share in shares {
         if let Some(nfs) = share.nfs.as_ref() {
-            let opts = export_options(nfs);
+            let opts = export_options(nfs, export_fsid(arrays, &share.source_path).as_deref());
             let clients: Vec<String> = if nfs.networks.is_empty() {
                 vec!["*".to_string()]
             } else {
@@ -226,10 +318,11 @@ pub fn exports_document(shares: &[ShareRow], fleet_clients: &[String]) -> String
         }
     }
     for share in shares.iter().filter(|s| s.fleet_mount) {
+        let opts = fleet_export_options(export_fsid(arrays, &share.source_path).as_deref());
         let entry = by_path.entry(share.source_path.as_str()).or_default();
         for client in fleet_clients {
             if !entry.iter().any(|(c, _)| c == client) {
-                entry.push((client.clone(), FLEET_EXPORT_OPTIONS.to_string()));
+                entry.push((client.clone(), opts.clone()));
             }
         }
     }
@@ -258,13 +351,17 @@ pub fn exports_document(shares: &[ShareRow], fleet_clients: &[String]) -> String
 // source paths
 // =============================================================================
 
-/// A source path resolved against the node's datasets.
+/// A source path resolved against the node's datasets and Elastic Arrays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub path: String,
-    /// The dataset that owns the path, when one does.
+    /// The dataset that owns the path, when one does. An Elastic Array union
+    /// has none: it is a mergerfs mount over branches, not a ZFS dataset.
     pub dataset: Option<String>,
-    /// Whether that dataset is mounted right now.
+    /// Whether the filesystem behind the path is mounted right now — this is
+    /// what decides whether the share reaches the generated config at all
+    /// (`share_state`), so an array union may only report `true` when the node
+    /// knows the union is up.
     pub mounted: bool,
 }
 
@@ -281,11 +378,36 @@ pub fn owning_dataset<'a>(datasets: &'a [NasDataset], path: &str) -> Option<&'a 
         .max_by_key(|d| d.mountpoint.as_deref().unwrap_or_default().len())
 }
 
-/// Validates a share source: it must be an existing directory under a POOL
-/// mountpoint, and the canonical path must equal what was asked for — a
-/// symlink under the pool that points at `/etc` would otherwise export `/etc`.
-pub fn resolve_source(datasets: &[NasDataset], raw: &str) -> Result<Source> {
-    tentanas_helper::validate_share_path(raw).map_err(|e| anyhow!(e.to_string()))?;
+/// Whether `path` is `root` itself or below it. Spelled out because a plain
+/// `starts_with` on the string would read `/mnt/tank-old` as being inside
+/// `/mnt/tank`.
+fn at_or_below(root: &str, path: &str) -> bool {
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// What of this node's storage a share source belongs to.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceOwner<'a> {
+    /// A ZFS pool of this node — the path is the pool root or below it.
+    Pool,
+    /// The union of one of this node's Elastic Arrays, or a directory in it.
+    Array(&'a ElasticArrayRow),
+}
+
+/// The pool or Elastic Array `raw` belongs to, or the sentence that refuses it.
+///
+/// `arrays` is passed in rather than read from the database for the same
+/// reason `datasets` is: the rule is then decided entirely by its arguments,
+/// and the fixtures below exercise every verdict on a host that has neither a
+/// pool nor an array. It is also a function of its own because it is the only
+/// half of `resolve_source` a fixture can reach at all — a share path must
+/// start with `/mnt/` (`validate_share_path`), so no test can put a real
+/// directory where the filesystem half of `resolve_source` would find one.
+fn source_owner<'a>(
+    datasets: &[NasDataset],
+    arrays: &'a [ElasticArrayRow],
+    raw: &str,
+) -> Result<SourceOwner<'a>> {
     // An Elastic Array BRANCH is a valid path under /mnt and is the one thing
     // here that must never be exported (§5.3). A share on
     // `/mnt/tentanas-branches/media/data/sdg` would show a client one disk of
@@ -300,19 +422,63 @@ pub fn resolve_source(datasets: &[NasDataset], raw: &str) -> Result<Source> {
              the client"
         ));
     }
+    // And the union itself, which is what that sentence sends the admin to.
+    // The address is taken from the array's own accessor, never rebuilt from
+    // its name: `union_path()` is what mounts the mergerfs and what n11 shows,
+    // so a share can only be pointed at the place the array actually lives.
+    // Only an array this node HAS A ROW FOR is accepted — `/mnt/<anything>`
+    // is otherwise just a directory on the root filesystem.
+    if let Some(array) = arrays.iter().find(|a| at_or_below(&a.union_path(), raw)) {
+        // `active` is the only state in which the union is mounted over
+        // mounted branches (`array_state`), and that is exactly the question
+        // a share has to ask. An array that has not been mounted yet still
+        // HAS a `/mnt/<name>` directory — an empty one on the rootfs — so a
+        // share created on it would look perfectly healthy while serving an
+        // empty tree and putting every client write on the root filesystem.
+        // The node's own recorded verdict answers this without a probe.
+        if array.state != "active" {
+            let detail = if array.state_detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", array.state_detail)
+            };
+            return Err(anyhow!(
+                "'{raw}' is on the Elastic Array '{}', which is not serving on this node \
+                 right now (state '{}'{detail}): until the union is mounted, '{}' is an \
+                 empty directory on the root filesystem, so the share would export nothing \
+                 and send client writes there — wait for the array to become active, then \
+                 create the share",
+                array.name,
+                array.state,
+                array.union_path()
+            ));
+        }
+        return Ok(SourceOwner::Array(array));
+    }
     let pool_roots: Vec<&str> = datasets
         .iter()
         .filter(|d| !d.name.contains('/'))
         .filter_map(|d| d.mountpoint.as_deref())
         .collect();
-    if !pool_roots
-        .iter()
-        .any(|m| raw == *m || raw.starts_with(&format!("{m}/")))
-    {
+    if !pool_roots.iter().any(|m| at_or_below(m, raw)) {
         return Err(anyhow!(
-            "'{raw}' is not under a pool mountpoint of this node"
+            "'{raw}' is not under a pool mountpoint or an Elastic Array union of this node"
         ));
     }
+    Ok(SourceOwner::Pool)
+}
+
+/// Validates a share source: it must be an existing directory under a POOL
+/// mountpoint or on an Elastic Array's union, and the canonical path must
+/// equal what was asked for — a symlink under the pool that points at `/etc`
+/// would otherwise export `/etc`.
+pub fn resolve_source(
+    datasets: &[NasDataset],
+    arrays: &[ElasticArrayRow],
+    raw: &str,
+) -> Result<Source> {
+    tentanas_helper::validate_share_path(raw).map_err(|e| anyhow!(e.to_string()))?;
+    let owner = source_owner(datasets, arrays, raw)?;
     let path = Path::new(raw);
     if !path.is_dir() {
         return Err(anyhow!("'{raw}' is not a directory on this node"));
@@ -325,14 +491,31 @@ pub fn resolve_source(datasets: &[NasDataset], raw: &str) -> Result<Source> {
             canonical.display()
         ));
     }
-    let owner = owning_dataset(datasets, raw);
-    Ok(Source {
-        dataset: owner
+    Ok(source_of(datasets, &owner, raw))
+}
+
+/// The `Source` an accepted path resolves to. Separate from `resolve_source`
+/// for the same reason `source_owner` is, and it carries the second half of
+/// the answer: `mounted` is what `share_state` uses to decide whether the
+/// share reaches the generated config at all, so a union that resolved fine
+/// and reported `false` here would be a share that can be created and can
+/// never be exported.
+fn source_of(datasets: &[NasDataset], owner: &SourceOwner<'_>, raw: &str) -> Source {
+    let dataset = owning_dataset(datasets, raw);
+    Source {
+        dataset: dataset
             .filter(|d| d.mountpoint.as_deref() == Some(raw))
             .map(|d| d.name.clone()),
-        mounted: owner.is_some_and(|d| d.mounted),
+        // A union has no dataset to ask, so `owning_dataset` says nothing
+        // about it and the array's state has to answer instead — and it
+        // already did: `source_owner` returns `Array` only for an active one,
+        // and active means the union is mounted over mounted branches.
+        mounted: match owner {
+            SourceOwner::Array(_) => true,
+            SourceOwner::Pool => dataset.is_some_and(|d| d.mounted),
+        },
         path: raw.to_string(),
-    })
+    }
 }
 
 // =============================================================================
@@ -462,6 +645,11 @@ pub async fn apply(
     explicit: Option<&ElevationToken>,
 ) -> Result<Vec<String>> {
     let datasets = super::datasets::list("").await.unwrap_or_default();
+    // Every owner's arrays, not this request's: the union is a mountpoint of
+    // the NODE, and whether a path is one is not a question about who asked.
+    // Read with `?` — an unreadable array table would otherwise silently put
+    // every array share into "error" with a sentence about pool mountpoints.
+    let arrays = store::elastic_arrays_all(db)?;
     let mut shares = store::list_shares(db)?;
     let mut log = Vec::new();
 
@@ -472,7 +660,7 @@ pub async fn apply(
     let refusal = (!ksmbd.ready()).then(|| super::ksmbd::refusal(&ksmbd));
 
     for share in shares.iter_mut() {
-        let source = resolve_source(&datasets, &share.source_path);
+        let source = resolve_source(&datasets, &arrays, &share.source_path);
         let (state, detail) = share_state(share, &source, &service_installed, refusal.as_deref());
         if share.state != state || share.state_detail != detail {
             store::set_share_state(db, &share.share_id, state, &detail)?;
@@ -537,7 +725,7 @@ pub async fn apply(
     // mounted fleet-wide.
     if service_installed("nfs") {
         let clients = super::fleet_mounts::fleet_client_addresses(main_db, addon_id);
-        let document = exports_document(&active, &clients);
+        let document = exports_document(&active, &clients, &arrays);
         run(
             db,
             &HelperCommand::NfsExportsWrite {},
@@ -759,7 +947,7 @@ pub async fn remove_all(db: &DbPool, explicit: Option<&ElevationToken>) -> Vec<S
         }
     }
     if Path::new(tentanas_helper::NFS_EXPORTS_PATH).exists() {
-        let empty = exports_document(&[], &[]);
+        let empty = exports_document(&[], &[], &[]);
         if let Err(e) = run(
             db,
             &HelperCommand::NfsExportsWrite {},
@@ -943,11 +1131,12 @@ pub fn holds_data(source_path: &str) -> bool {
 // source browser
 // =============================================================================
 
-/// The share source browser. An empty `path` lists the pool mountpoints; any
-/// other path must be one of them or below it, so the browser can never walk
-/// out of the pools.
+/// The share source browser. An empty `path` lists the pool mountpoints and
+/// the Elastic Array unions; any other path must be one of them or below it,
+/// so the browser can never walk out of the node's storage.
 pub async fn browse(db: &DbPool, path: &str) -> Result<(String, Vec<NasDirEntry>)> {
     let datasets = super::datasets::list("").await.map_err(|e| anyhow!("{e}"))?;
+    let arrays = store::elastic_arrays_all(db)?;
     let shares = store::list_shares(db)?;
     let shared_as = |p: &str| -> Vec<String> {
         shares
@@ -963,7 +1152,7 @@ pub async fn browse(db: &DbPool, path: &str) -> Result<(String, Vec<NasDirEntry>
             .map(|d| d.name.clone())
     };
     if path.is_empty() {
-        let entries = datasets
+        let mut entries: Vec<NasDirEntry> = datasets
             .iter()
             .filter(|d| !d.name.contains('/'))
             .filter_map(|d| d.mountpoint.as_ref().map(|m| (d, m)))
@@ -974,9 +1163,22 @@ pub async fn browse(db: &DbPool, path: &str) -> Result<(String, Vec<NasDirEntry>
                 path: mountpoint.clone(),
             })
             .collect();
+        // An array stands beside the pools here for the same reason it does in
+        // n05's list: the union is a first-class place to put a share, and a
+        // browser that omitted it would leave the wizard unable to reach the
+        // only address the array has. An array that is not serving is listed
+        // too, on purpose — entering it answers with `source_owner`'s sentence,
+        // which is how the admin learns why, instead of the row being missing
+        // and the array looking unshareable.
+        entries.extend(arrays.iter().map(|a| NasDirEntry {
+            name: a.name.clone(),
+            dataset: None,
+            shared_as: shared_as(&a.union_path()),
+            path: a.union_path(),
+        }));
         return Ok((String::new(), entries));
     }
-    let source = resolve_source(&datasets, path)?;
+    let source = resolve_source(&datasets, &arrays, path)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&source.path)
         .map_err(|e| anyhow!("'{}' cannot be listed: {e}", source.path))?
@@ -1318,27 +1520,219 @@ mod tests {
     #[test]
     fn export_options_follow_the_wizard_toggles() {
         assert_eq!(
-            export_options(&NasNfsOptions {
-                networks: vec![],
+            export_options(
+                &NasNfsOptions {
+                    networks: vec![],
+                    read_only: false,
+                    root_squash: true,
+                    async_writes: false,
+                    rdma: false,
+                    audit: false,
+                },
+                None
+            ),
+            "rw,sync,root_squash,no_subtree_check"
+        );
+        assert_eq!(
+            export_options(
+                &NasNfsOptions {
+                    networks: vec![],
+                    read_only: true,
+                    root_squash: false,
+                    async_writes: true,
+                    rdma: false,
+                    audit: false,
+                },
+                None
+            ),
+            "ro,async,no_root_squash,no_subtree_check"
+        );
+        // The same toggles on an Elastic Array union: the identity the kernel
+        // cannot derive is appended, and nothing before it moves.
+        assert_eq!(
+            export_options(
+                &NasNfsOptions {
+                    networks: vec![],
+                    read_only: false,
+                    root_squash: true,
+                    async_writes: false,
+                    rdma: false,
+                    audit: false,
+                },
+                Some(MEDIA_ARRAY_ID)
+            ),
+            format!("rw,sync,root_squash,no_subtree_check,fsid={MEDIA_ARRAY_ID}")
+        );
+    }
+
+    /// The `array_id` of an Elastic Array: the UUID the node generated when the
+    /// array was created (`nas_elastic_arrays.array_id`), which is what an
+    /// export of the array's union is identified by.
+    const MEDIA_ARRAY_ID: &str = "01a099b1-800b-7e01-9d10-8cac34a2257d";
+    const ARCHIVE_ARRAY_ID: &str = "0ba4f7c2-9d31-7b44-8f70-2c1d7e9a5b06";
+
+    /// An array with its persisted intention, so `array_id()` answers. The
+    /// `array()` fixture below deliberately has none — a row whose intention
+    /// could not be read — so the two cover both halves of `export_fsid`.
+    fn shared_array(name: &str, array_id: &str) -> ElasticArrayRow {
+        let mut spec = crate::tentanas::elastic::tests::create_spec(name);
+        spec.array_id = array_id.to_string();
+        ElasticArrayRow {
+            create_spec: Some(spec),
+            ..array(name, "active")
+        }
+    }
+
+    fn nfs_share(name: &str, source_path: &str, networks: &[&str]) -> ShareRow {
+        ShareRow {
+            share_id: format!("s-{name}"),
+            name: name.to_string(),
+            protocol: "nfs".into(),
+            source_path: source_path.to_string(),
+            dataset: None,
+            smb: None,
+            nfs: Some(NasNfsOptions {
+                networks: networks.iter().map(|n| (*n).to_string()).collect(),
                 read_only: false,
                 root_squash: true,
                 async_writes: false,
                 rdma: false,
                 audit: false,
             }),
-            "rw,sync,root_squash,no_subtree_check"
+            fleet_mount: false,
+            ..smb_share(NasSmbOptions::default())
+        }
+    }
+
+    #[test]
+    fn an_array_union_is_exported_under_the_array_uuid_and_a_dataset_is_not() {
+        let arrays = vec![shared_array("media", MEDIA_ARRAY_ID)];
+        let document = exports_document(
+            &[
+                nfs_share("media", "/mnt/media", &["10.10.0.0/24"]),
+                nfs_share("backups", "/mnt/tank/backups", &["10.10.0.0/24"]),
+            ],
+            &[],
+            &arrays,
         );
+        let lines: Vec<String> = document
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(str::to_string)
+            .collect();
         assert_eq!(
-            export_options(&NasNfsOptions {
-                networks: vec![],
-                read_only: true,
-                root_squash: false,
-                async_writes: true,
-                rdma: false,
-                audit: false,
-            }),
-            "ro,async,no_root_squash,no_subtree_check"
+            lines,
+            vec![
+                // mergerfs has no device and no filesystem UUID, so this line
+                // is the whole reason an array could not be exported at all.
+                format!(
+                    "/mnt/media 10.10.0.0/24(rw,sync,root_squash,no_subtree_check,fsid={MEDIA_ARRAY_ID})"
+                ),
+                // And the dataset keeps the option string it has always had:
+                // changing it would re-export a path every client is using.
+                "/mnt/tank/backups 10.10.0.0/24(rw,sync,root_squash,no_subtree_check)".to_string(),
+            ]
         );
+        // The line the generator writes is the line the privileged side
+        // accepts — `exportfs` has no dry run, so this parser is the only
+        // check before the kernel.
+        for line in document.lines() {
+            assert!(
+                tentanas_helper::validate_export_line(line).is_ok(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_whole_dataset_is_exported_without_an_fsid() {
+        // The shape the option comment used to say this app never produces. It
+        // carries no dataset either, exactly like an array union — which is
+        // why the array list decides the fsid and the missing dataset does not.
+        let arrays = vec![shared_array("media", MEDIA_ARRAY_ID)];
+        let share = nfs_share("zdjecia", "/mnt/tank/projekty/zdjecia", &["10.10.0.5"]);
+        assert_eq!(share.dataset, None);
+        assert_eq!(export_fsid(&arrays, &share.source_path), None);
+        let document = exports_document(&[share], &[], &arrays);
+        assert!(
+            document.contains(
+                "/mnt/tank/projekty/zdjecia 10.10.0.5(rw,sync,root_squash,no_subtree_check)\n"
+            ),
+            "{document}"
+        );
+        assert!(!document.contains("fsid"), "{document}");
+    }
+
+    #[test]
+    fn every_export_of_one_union_gets_an_identity_of_its_own() {
+        let arrays = vec![
+            shared_array("media", MEDIA_ARRAY_ID),
+            shared_array("archiwum", ARCHIVE_ARRAY_ID),
+        ];
+        let union = export_fsid(&arrays, "/mnt/media").unwrap();
+        let films = export_fsid(&arrays, "/mnt/media/filmy").unwrap();
+        let music = export_fsid(&arrays, "/mnt/media/muzyka").unwrap();
+        let second = export_fsid(&arrays, "/mnt/archiwum").unwrap();
+        assert_eq!(union, MEDIA_ARRAY_ID);
+        assert_eq!(second, ARCHIVE_ARRAY_ID);
+        // Two exports of ONE filesystem may not share an fsid: nfsd would
+        // resolve a handle of one of them inside the other.
+        let mut all = vec![&union, &films, &music, &second];
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 4);
+        // Derived, not invented: the same directory is exported under the same
+        // identity on every apply, so the handles a client cached survive one.
+        assert_eq!(films, export_fsid(&arrays, "/mnt/media/filmy").unwrap());
+        // And a derived value is a UUID too, so the boundary accepts it.
+        for value in [&films, &music] {
+            let line =
+                format!("/mnt/media/x 10.10.0.5(rw,sync,root_squash,no_subtree_check,fsid={value})");
+            assert!(tentanas_helper::validate_export_line(&line).is_ok(), "{line}");
+        }
+        // A directory that merely starts like the union is not on the array,
+        // and a row whose intention could not be read has no identity to give.
+        assert_eq!(export_fsid(&arrays, "/mnt/media-old"), None);
+        assert_eq!(export_fsid(&arrays, "/mnt/tank/media"), None);
+        assert_eq!(export_fsid(&[array("media", "active")], "/mnt/media"), None);
+    }
+
+    #[test]
+    fn a_fleet_export_of_an_array_union_is_identified_too() {
+        // The fleet export is the same mergerfs mount offered to the peers, so
+        // it needs the same identity; without it the line the peers get would
+        // make `exportfs -ra` refuse the whole file.
+        let arrays = vec![shared_array("media", MEDIA_ARRAY_ID)];
+        let on_array = ShareRow {
+            source_path: "/mnt/media".into(),
+            dataset: None,
+            fleet_mount: true,
+            ..smb_share(NasSmbOptions::default())
+        };
+        let document = exports_document(
+            &[on_array, smb_share(NasSmbOptions::default())],
+            &["10.10.0.6".to_string()],
+            &arrays,
+        );
+        assert!(
+            document.contains(&format!(
+                "/mnt/media 10.10.0.6({FLEET_EXPORT_OPTIONS},fsid={MEDIA_ARRAY_ID})"
+            )),
+            "{document}"
+        );
+        // The dataset share's fleet line keeps the constant it always had.
+        assert!(
+            document.contains(&format!(
+                "/mnt/tank/projekty 10.10.0.6({FLEET_EXPORT_OPTIONS})"
+            )),
+            "{document}"
+        );
+        for line in document.lines() {
+            assert!(
+                tentanas_helper::validate_export_line(line).is_ok(),
+                "{line}"
+            );
+        }
     }
 
     #[test]
@@ -1365,6 +1759,7 @@ mod tests {
         let document = exports_document(
             &[smb_share(NasSmbOptions::default()), nfs],
             &["10.10.0.6".to_string(), "10.10.0.7".to_string()],
+            &[],
         );
         let lines: Vec<&str> = document.lines().filter(|l| !l.starts_with('#')).collect();
         assert_eq!(
@@ -1398,6 +1793,7 @@ mod tests {
                 ..smb_share(NasSmbOptions::default())
             }],
             &["10.10.0.6".to_string()],
+            &[],
         );
         assert!(single.contains("10.10.0.6(ro,sync,root_squash,no_subtree_check)"));
         assert_eq!(single.matches("10.10.0.6(").count(), 1);
@@ -1405,7 +1801,7 @@ mod tests {
 
     #[test]
     fn an_empty_fleet_and_no_shares_still_produce_a_valid_file() {
-        let document = exports_document(&[], &[]);
+        let document = exports_document(&[], &[], &[]);
         assert!(document.lines().all(|l| l.starts_with('#')));
         assert!(tentanas_helper::validate_smb_config(&smb_document(&[], &[])).is_ok());
     }
@@ -1442,12 +1838,99 @@ mod tests {
         assert_eq!(owning_dataset(&datasets, "/mnt/other"), None);
     }
 
+    /// An array row as the share rules read it: a name, from which the union
+    /// address comes, and the state its last reconcile recorded.
+    fn array(name: &str, state: &str) -> ElasticArrayRow {
+        ElasticArrayRow {
+            name: name.to_string(),
+            enabled: true,
+            state: state.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn a_source_outside_every_pool_is_refused_before_anything_is_written() {
         let datasets = vec![dataset("tank", "/mnt/tank", true)];
-        assert!(resolve_source(&datasets, "/etc/samba").is_err());
-        assert!(resolve_source(&datasets, "/mnt/other/x").is_err());
-        assert!(resolve_source(&datasets, "/mnt/../etc").is_err());
+        let arrays = vec![array("media", "active")];
+        assert!(resolve_source(&datasets, &arrays, "/etc/samba").is_err());
+        assert!(resolve_source(&datasets, &arrays, "/mnt/other/x").is_err());
+        assert!(resolve_source(&datasets, &arrays, "/mnt/../etc").is_err());
+        // `/mnt/<something>` is not an address on its own: with no row for it,
+        // an array name this node never created is just a directory on the
+        // root filesystem, and a share there would serve the rootfs.
+        assert!(source_owner(&datasets, &arrays, "/mnt/archiwum").is_err());
+        // And a name that merely starts like the union is not the union.
+        assert!(source_owner(&datasets, &arrays, "/mnt/media-old").is_err());
+    }
+
+    /// The union is the array's address, so it is a share source — the case
+    /// the branch refusal above sends the admin to.
+    #[test]
+    fn the_union_of_an_active_array_is_a_share_source() {
+        let datasets = vec![dataset("tank", "/mnt/tank", true)];
+        let arrays = vec![array("media", "active")];
+        let union = arrays[0].union_path();
+        assert_eq!(
+            source_owner(&datasets, &arrays, &union).expect("the union is shareable"),
+            SourceOwner::Array(&arrays[0])
+        );
+        assert_eq!(
+            source_owner(&datasets, &arrays, &format!("{union}/filmy"))
+                .expect("a folder of the array is shareable"),
+            SourceOwner::Array(&arrays[0])
+        );
+        // The pools answer exactly as they did before.
+        assert_eq!(
+            source_owner(&datasets, &arrays, "/mnt/tank/projekty").expect("pool source"),
+            SourceOwner::Pool
+        );
+        // And the union resolves MOUNTED. Without that, `share_state` keeps
+        // the share out of every generated config and the array stays
+        // unshareable with no error anybody can act on.
+        assert_eq!(
+            source_of(&datasets, &SourceOwner::Array(&arrays[0]), &union),
+            Source { path: union.clone(), dataset: None, mounted: true }
+        );
+    }
+
+    /// `/mnt/<name>` exists as an empty rootfs directory whenever the union is
+    /// not mounted, so a share created on it would look healthy, serve an
+    /// empty tree, and put every client write on the root filesystem. The
+    /// array's own recorded state answers that without probing anything.
+    #[test]
+    fn a_share_on_an_array_that_is_not_serving_is_refused_with_the_reason() {
+        let datasets = vec![dataset("tank", "/mnt/tank", true)];
+        for state in ["pending", "creating", "disabled", "error", "unknown"] {
+            let mut arrays = vec![array("media", state)];
+            arrays[0].state_detail = "branch sdg is present and not mounted yet".to_string();
+            let union = arrays[0].union_path();
+            let err = source_owner(&datasets, &arrays, &union)
+                .expect_err("a union that is not mounted is not a share source")
+                .to_string();
+            assert!(err.contains(state), "the state has to be in the sentence: {err}");
+            assert!(err.contains(&union), "{err}");
+            assert!(err.contains("branch sdg"), "the recorded reason travels with it: {err}");
+            assert!(err.contains("active"), "the remedy has to be in the sentence: {err}");
+        }
+    }
+
+    /// The path the wizard is given is checked against the array rows and then
+    /// against the filesystem. The union of a fixture array exists nowhere, so
+    /// this pins the first half: the ownership rule accepts it and the only
+    /// thing left to refuse it is the missing directory.
+    #[test]
+    fn resolve_source_sends_an_accepted_union_on_to_the_filesystem() {
+        let datasets = vec![dataset("tank", "/mnt/tank", true)];
+        let arrays = vec![array("fixture-absent-union", "active")];
+        let union = arrays[0].union_path();
+        let err = resolve_source(&datasets, &arrays, &union)
+            .expect_err("no such directory on the host running these tests")
+            .to_string();
+        assert!(
+            err.contains("is not a directory on this node"),
+            "the union passed the ownership rule; only the filesystem refused it: {err}"
+        );
     }
 
     /// One disk of an Elastic Array is not the array, and may not be shared.
@@ -1465,15 +1948,23 @@ mod tests {
         // It really does pass the generic path rule — so the refusal below
         // is the array's, not a side effect of some other check.
         assert!(tentanas_helper::validate_share_path(&branch).is_ok());
-        let err = resolve_source(&datasets, &branch)
+        let arrays = vec![array("media", "active")];
+        let err = resolve_source(&datasets, &arrays, &branch)
             .expect_err("a branch of an Elastic Array is not shareable")
             .to_string();
         assert!(err.contains("union"), "the fix has to be in the sentence: {err}");
         assert!(err.contains("mover"), "{err}");
-        // The union path itself is refused here only because this fixture has
-        // no such pool — not by the branch rule, which is what this asserts.
-        let union = tentanas_helper::elastic::union_path("media");
+        // Knowing the array does not soften the branch rule: the row that
+        // makes the union shareable is the same row the branch belongs to.
+        assert!(source_owner(&datasets, &arrays, &branch).is_err());
+        // The union the sentence sends the admin to is not a branch, and this
+        // node accepts it — that is the whole point of the refusal above.
+        let union = arrays[0].union_path();
         assert!(!tentanas_helper::elastic::is_branch_path(&union));
+        assert_eq!(
+            source_owner(&datasets, &arrays, &union).expect("the union is the array's address"),
+            SourceOwner::Array(&arrays[0])
+        );
     }
 
     #[test]
@@ -1642,7 +2133,7 @@ mod tests {
             fleet_mount: false,
             ..smb_share(NasSmbOptions::default())
         };
-        let document = exports_document(&[share], &[]);
+        let document = exports_document(&[share], &[], &[]);
         assert!(!document.contains("rdma"), "{document}");
         for line in document.lines() {
             assert!(tentanas_helper::validate_export_line(line).is_ok(), "{line}");

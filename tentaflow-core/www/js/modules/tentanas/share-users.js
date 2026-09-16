@@ -109,14 +109,15 @@ export function openShareUsersDialog(screen, { users = [], onChange = null } = {
       shares: (u.shares || []).length ? u.shares.map((s) => `<tf-chip size="sm" status="neutral" label="${escapeAttr(s)}"></tf-chip>`).join(' ') : `<span class="muted">${escapeHtml(T('share_users.no_shares'))}</span>`,
       created: u.createdAt ? fmtAgo(u.createdAt) : '',
     }));
-    table.rowActions = (row) => {
+    table.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const box = document.createElement('div');
       box.className = 'tf-table__cell-row';
       box.innerHTML = `
         <tf-button size="sm" variant="ghost" icon="key" data-act="password" title="${escapeAttr(T('share_users.set_password'))}" ${screen.isAdmin ? '' : 'disabled'}></tf-button>
         <tf-button size="sm" variant="ghost" icon="trash" tone="critical" data-act="delete" title="${escapeAttr(T('share_users.delete'))}" ${screen.isAdmin ? '' : 'disabled'}></tf-button>`;
-      box.querySelector('[data-act="password"]').addEventListener('click', (e) => { e.stopPropagation(); state.form = { editing: true, name: row._user.name, description: row._user.description || '' }; draw(); });
-      box.querySelector('[data-act="delete"]').addEventListener('click', (e) => { e.stopPropagation(); deleteUser(row._user); });
+      box.querySelector('[data-act="password"]').addEventListener('click', (e) => { e.stopPropagation(); const user = live()._user; state.form = { editing: true, name: user.name, description: user.description || '' }; draw(); });
+      box.querySelector('[data-act="delete"]').addEventListener('click', (e) => { e.stopPropagation(); deleteUser(live()._user); });
       return box;
     };
   };

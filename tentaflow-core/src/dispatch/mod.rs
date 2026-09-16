@@ -2417,6 +2417,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::DiskSmartTestRequest { .. } => "TentaNasDiskSmartTestRequest",
                 Tn::DiskLocateRequest { .. } => "TentaNasDiskLocateRequest",
                 Tn::DiskLocateResponse { .. } => "TentaNasDiskLocateResponse",
+                Tn::DiskWipePlanRequest { .. } => "TentaNasDiskWipePlanRequest",
+                Tn::DiskWipePlanResponse { .. } => "TentaNasDiskWipePlanResponse",
+                Tn::DiskWipeRequest { .. } => "TentaNasDiskWipeRequest",
                 Tn::AlertsListRequest { .. } => "TentaNasAlertsListRequest",
                 Tn::AlertsListResponse { .. } => "TentaNasAlertsListResponse",
                 Tn::AlertAckRequest { .. } => "TentaNasAlertAckRequest",
@@ -2524,11 +2527,30 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElasticArrayPlanRequest { .. } => "TentaNasElasticArrayPlanRequest",
                 Tn::ElasticArrayPlanResponse { .. } => "TentaNasElasticArrayPlanResponse",
                 Tn::ElasticArrayCreateRequest { .. } => "TentaNasElasticArrayCreateRequest",
+                Tn::ElasticArrayImportScanRequest { .. } => "TentaNasElasticArrayImportScanRequest",
+                Tn::ElasticArrayImportScanResponse { .. } => "TentaNasElasticArrayImportScanResponse",
+                Tn::ElasticArrayImportRequest { .. } => "TentaNasElasticArrayImportRequest",
                 Tn::ElasticArraysListRequest {} => "TentaNasElasticArraysListRequest",
                 Tn::ElasticArraysListResponse { .. } => "TentaNasElasticArraysListResponse",
                 Tn::ElasticArrayGetRequest { .. } => "TentaNasElasticArrayGetRequest",
                 Tn::ElasticArrayGetResponse { .. } => "TentaNasElasticArrayGetResponse",
                 Tn::ElasticArrayRestoreRequest { .. } => "TentaNasElasticArrayRestoreRequest",
+                Tn::ElasticArraySyncRequest { .. } => "TentaNasElasticArraySyncRequest",
+                Tn::ElasticArrayScrubRequest { .. } => "TentaNasElasticArrayScrubRequest",
+                Tn::ElasticArrayFixRequest { .. } => "TentaNasElasticArrayFixRequest",
+                Tn::ElasticArrayAddDiskRequest { .. } => "TentaNasElasticArrayAddDiskRequest",
+                Tn::ElasticArrayDestroyRequest { .. } => "TentaNasElasticArrayDestroyRequest",
+                Tn::ElasticArrayMoverRequest { .. } => "TentaNasElasticArrayMoverRequest",
+                Tn::ElasticMoverScheduleSetRequest { .. } => {
+                    "TentaNasElasticMoverScheduleSetRequest"
+                }
+                Tn::ElasticSyncScheduleSetRequest { .. } => "TentaNasElasticSyncScheduleSetRequest",
+                Tn::ElasticScrubScheduleSetRequest { .. } => {
+                    "TentaNasElasticScrubScheduleSetRequest"
+                }
+                Tn::ElasticFolderCacheSetRequest { .. } => {
+                    "TentaNasElasticFolderCacheSetRequest"
+                }
             }
         }
         MessageBody::TentaVmBody(p) => {
@@ -3474,13 +3496,22 @@ mod tests {
             org_context: None,
         };
         assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
-        let change = |current: &str| MessageBody::AuthPasswordChangeRequest {
+        let change = |current: &str, new: &str| MessageBody::AuthPasswordChangeRequest {
             current_password: current.into(),
-            new_password: "replacement-password".into(),
+            new_password: new.into(),
         };
-        assert!(is_sensitive_variant(&change("initial-password")));
-        assert!(handlers::auth_password_change(&change("incorrect"), &ctx).is_err());
-        assert!(handlers::auth_password_change(&change("initial-password"), &ctx).is_ok());
+        assert!(is_sensitive_variant(&change(
+            "initial-password",
+            "repl-pw8"
+        )));
+        assert!(handlers::auth_password_change(&change("incorrect", "repl-pw8"), &ctx).is_err());
+        // Minimum length boundary: 7 characters are rejected, exactly 8 are accepted.
+        assert!(
+            handlers::auth_password_change(&change("initial-password", "repl-pw"), &ctx).is_err()
+        );
+        assert!(
+            handlers::auth_password_change(&change("initial-password", "repl-pw8"), &ctx).is_ok()
+        );
         let user = crate::db::repository::get_user_account_by_id(&ctx.state.db, &id)
             .unwrap()
             .unwrap();
@@ -3490,7 +3521,7 @@ mod tests {
             &user.password_hash
         ));
         assert!(crate::api::dashboard::auth::verify_password(
-            "replacement-password",
+            "repl-pw8",
             &user.password_hash
         ));
         assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());

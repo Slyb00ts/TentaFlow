@@ -99,16 +99,45 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_upstream_manifests_are_not_rewritten(self):
         self.write("vendor/external/Cargo.toml", '[package]\nname="external"\n[dependencies]\nserde="1"\n[profile.release]\nlto=true\n')
+        self.write("vendor/external/Cargo.lock", "version=4\n")
         self.assertEqual(self.errors(), [])
 
-    def test_deleted_old_lockfiles_do_not_fail(self):
+    def test_untracked_old_lockfiles_do_not_fail(self):
         self.write("app/Cargo.lock", "version=4\n")
-        (self.root / "app/Cargo.lock").unlink()
+        subprocess.run(["git", "rm", "--cached", "-q", "app/Cargo.lock"], cwd=self.root, check=True)
         self.assertEqual(self.errors(), [])
+        self.assertTrue((self.root / "app/Cargo.lock").is_file())
 
     def test_existing_child_lockfile_is_rejected(self):
         self.write("app/Cargo.lock", "version=4\n")
         self.assertTrue(any("lockfile poza korzeniem" in error for error in self.errors()))
+
+    def test_deleting_tracked_output_only_from_disk_is_not_enough(self):
+        self.write("app/Cargo.lock", "version=4\n")
+        (self.root / "app/Cargo.lock").unlink()
+        self.assertTrue(any("lockfile poza korzeniem" in error for error in self.errors()))
+
+    def test_root_lockfile_must_remain_tracked(self):
+        subprocess.run(["git", "rm", "--cached", "-q", "Cargo.lock"], cwd=self.root, check=True)
+        self.assertTrue(any("musi być śledzony" in error for error in self.errors()))
+
+    def test_generated_browser_outputs_are_local_even_when_ignored(self):
+        paths = [
+            "tentaflow-core/www/js/protocol/wasm_glue.js",
+            "tentaflow-core/www/js/voxel/voxel_glue.js",
+            "tentaflow-core/www/js/quantum/quantum_glue_bg.wasm",
+            "tentaflow-core/www/js/generated/services-manifest.js",
+        ]
+        for name in paths:
+            self.write(name, "lokalny wynik generatora")
+        self.write(".gitignore", "tentaflow-core/www/js/\n")
+        errors = self.errors()
+        for name in paths:
+            self.assertTrue(any(name in error for error in errors), name)
+        subprocess.run(["git", "rm", "--cached", "-q", "--", *paths], cwd=self.root, check=True)
+        self.assertEqual(self.errors(), [])
+        for name in paths:
+            self.assertEqual((self.root / name).read_text(encoding="utf-8"), "lokalny wynik generatora")
 
 
 if __name__ == "__main__":

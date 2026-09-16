@@ -2,6 +2,13 @@
  * TentaNas screen — everything is scoped under `.nas-root` so the shared
  * component styles (tf-*) stay untouched. Class names mirror the approved
  * mockups (mockups/tentanas/shared/tentanas.css) so the screen reads 1:1.
+ *
+ * NOTE: the cell-scoped rules here (.trend, .health-dot, .health-cell,
+ * .disk-kind, .cell-2, .mono, .text-2, .text-3, .muted, .num-*) are duplicated
+ * WITHOUT the `.nas-root` prefix in css/tentanas-cells.css. That copy exists
+ * because a selector cannot cross a shadow boundary: tf-table renders
+ * `renderer="html"` cells inside its shadow root, where nothing matches
+ * `.nas-root ...`. Change one, change the other.
  * ========================================================================== */
 
 .nas-root { display: flex; flex-direction: column; gap: 16px; }
@@ -11,7 +18,16 @@
 .nas-root .kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
 .nas-root tf-stat-card.clickable { cursor: pointer; }
 .nas-root .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
-@media (max-width: 960px) { .nas-root .grid-2 { grid-template-columns: 1fr; } }
+/* minmax(0, 1fr), not a bare 1fr: `1fr` means `minmax(auto, 1fr)`, and an auto
+   minimum is the item's MIN-CONTENT width, so a card refuses to shrink below it
+   and overflows the track. Measured at 360px: the row itself fitted in 346px
+   while its cards were 380-407px wide and ran off-screen with no way to scroll
+   to them. The two-column rule above already uses minmax(0, 1fr). */
+@media (max-width: 960px) { .nas-root .grid-2 { grid-template-columns: minmax(0, 1fr); } }
+/* A two-column row whose second card is hidden must not leave its track empty:
+   the visible card would sit at half width beside nothing. */
+.nas-root .grid-2[data-single="1"] { grid-template-columns: minmax(0, 1fr); }
+.nas-root .tier-block + .tier-block { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
 
 .nas-root .section-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .nas-root .section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
@@ -192,7 +208,12 @@
 
 /* Chart cards (n02 live streams, n04 history): title row with a live readout
    on the right, the chart itself, and the "live · window" caption. */
-.nas-root .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+/* flex-wrap so the head can drop `.ch-val` onto its own line: that value is
+   `white-space: nowrap` (below) and measured 229px, which together with the
+   title cannot fit a 360px phone — it was the last element left running off
+   the screen once .grid-2 stopped forcing min-content width. Wrapping costs
+   nothing on wide screens, where the row never runs out of room. */
+.nas-root .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
 .nas-root .chart-head .ch-title { font-size: 12px; font-weight: 700; color: var(--text-2); display: flex; align-items: center; gap: 7px; }
 .nas-root .chart-head .ch-title .icon { width: 13px; height: 13px; color: var(--accent-2); }
 .nas-root .chart-head .ch-val { font-size: 11px; color: var(--text-3); font-family: var(--font-mono, ui-monospace, monospace); white-space: nowrap; }
@@ -252,6 +273,82 @@
 .nas-root .legend-rows .v { font-weight: 600; color: var(--text); }
 .nas-root .pool-card .stat-rows .sr { padding: 5px 0; }
 .nas-root .pool-card .stat-rows .k { flex-basis: 120px; }
+
+/* Lista i detal Elastic zachowują rytm kart oraz rozróżnienie nieznanych pomiarów. */
+.nas-root .nas-elastic-card { padding: 18px 20px; background: var(--bg-2); gap: 12px; }
+.nas-root .nas-elastic-card:hover { background: var(--bg-card); border-color: var(--accent-1); }
+.nas-root .nas-elastic-card .pc-ico { width: 40px; height: 40px; border-radius: var(--radius-sm); background: var(--bg-3); border: 1px solid var(--border); color: var(--accent-2); }
+.nas-root .nas-elastic-card .pc-name { font-size: 16px; font-weight: 800; }
+.nas-root .nas-elastic-card .pc-meta { min-width: 0; }
+.nas-root #nas-pools-list tf-menu:not([open]) { display: none; }
+.nas-root .nas-pools-heading, .nas-root .nas-pools-heading .actions { flex-wrap: wrap; }
+.nas-root .nas-elastic-card .pc-meta tf-chip { margin-left: 4px; }
+.nas-root .nas-elastic-card .pc-desc { margin-top: 3px; font-size: 11px; color: var(--text-3); }
+.nas-root .nas-elastic-card .pc-body { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 20px; }
+.nas-root .nas-elastic-card .pc-cap { font-size: 11px; flex-wrap: wrap; }
+.nas-root .nas-elastic-card .pc-cap .v { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; font-weight: 700; }
+.nas-root .nas-elastic-card .legend-rows { display: grid; gap: 4px; font-size: 11px; }
+.nas-root .nas-elastic-card .legend-rows .v { margin-left: auto; font-family: var(--font-mono, ui-monospace, monospace); }
+.nas-root .nas-elastic-card .data { background: var(--info); }
+.nas-root .nas-elastic-card .free { background: var(--bg-card-hover); }
+.nas-root .nas-elastic-card .parity { background: rgba(96, 165, 250, .35); }
+.nas-root .nas-unmeasured { border: 1px dashed var(--border); }
+.nas-root .nas-elastic-detail .kpi { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.nas-root .nas-elastic-detail .tf-stat-card { background: var(--bg-2); padding: 14px 16px; }
+.nas-root .nas-elastic-detail .tf-stat-card-value { font-size: 26px; overflow-wrap: anywhere; }
+.nas-root .nas-elastic-detail .tf-stat-card-value .suffix { font-size: 13px; }
+.nas-root .nas-elastic-detail .tf-stat-card-delta { white-space: normal; }
+.nas-root .nas-elastic-detail .section-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; }
+.nas-root .nas-elastic-detail .section-card .vdev-group { background: var(--bg-card); }
+.nas-root .nas-elastic-detail .stat-rows .v, .nas-root .nas-elastic-card .stat-rows .v { font-size: 11.5px; font-family: var(--font-mono, ui-monospace, monospace); overflow-wrap: anywhere; min-width: 0; }
+.nas-root .nas-elastic-detail .stat-rows .v, .nas-root .nas-elastic-card .stat-rows .v { margin-left: auto; text-align: right; justify-content: flex-end; font-weight: 700; }
+.nas-root .nas-elastic-detail .vdev-group + .vdev-group { margin-top: 12px; }
+.nas-root .nas-elastic-detail .disk-cell .dc-sub { white-space: normal; overflow-wrap: anywhere; }
+.nas-root .nas-elastic-detail .disk-cell > tf-button { flex: 0 0 auto; }
+.nas-root .nas-elastic-detail .vg-head > .mono { overflow-wrap: anywhere; min-width: 0; }
+.nas-root .nas-elastic-heading { flex-wrap: wrap; }
+.nas-root .nas-snapraid > .section-card-head, .nas-root .nas-snapraid .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.nas-root .nas-snapraid-history ol { list-style: none; padding: 0; margin: 8px 0 0; }
+.nas-root .nas-snapraid-history li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; border-top: 1px solid var(--border); padding: 8px 0; overflow-wrap: anywhere; }
+.nas-root .nas-snapraid-history summary { cursor: pointer; padding: 5px 0; font-size: 12px; }
+.nas-root .nas-snapraid-history summary > * { margin-right: 6px; }
+.nas-root .nas-snapraid-history summary:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
+.nas-root .nas-snapraid-history .stat-rows .k { flex: 1; }
+.nas-root .nas-snapraid-history .stat-rows .v { flex: 0 1 auto; }
+.nas-root .nas-mover > .section-card-head, .nas-root .nas-mover .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.nas-root .mover-hist { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; font-size: 11px; color: var(--text-2); }
+.nas-root .mover-hist span { padding: 2px 8px; border-radius: 999px; background: var(--bg-3); white-space: nowrap; }
+/* Foldery (n11): the union's top level, one row per folder, the Cache cell
+   being the control. A grid and not a tf-table on purpose — this pane is
+   written as ONE patched string (dom-patch.js), and a tf-table takes its rows
+   through a property the string cannot carry. */
+.nas-root .nas-folder-rows { display: flex; flex-direction: column; margin-top: 8px; }
+.nas-root .nas-folder-rows .fr { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); font-size: 12px; min-width: 0; }
+.nas-root .nas-folder-rows .fr-head { border-top: 0; padding-top: 0; color: var(--text-3); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.nas-root .nas-folder-rows .fr-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.nas-root .nas-folder-rows .fr-sub { font-weight: 400; font-size: 11px; color: var(--text-3); overflow-wrap: anywhere; }
+.nas-root .nas-folder-rows .fr-share { color: var(--text-2); overflow-wrap: anywhere; min-width: 0; }
+.nas-root .nas-folder-rows .fr-cache { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.nas-root .nas-folders .nas-folders-pinned { margin-top: 12px; }
+@media (max-width: 720px) {
+  .nas-root .nas-folder-rows .fr { grid-template-columns: minmax(0, 1fr); }
+  .nas-root .nas-folder-rows .fr-head { display: none; }
+  .nas-root .nas-folder-rows .fr-cache { justify-content: flex-start; }
+}
+
+.nas-elastic-wizard { max-width: min(760px, calc(100vw - 24px)); }
+.nas-elastic-wizard .nas-elastic-preview { overflow-wrap: anywhere; }
+.nas-elastic-wizard .install-header, .nas-elastic-wizard .install-progress { margin-bottom: 12px; }
+@media (max-width: 1100px) { .nas-root .nas-elastic-card .pc-body { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .nas-root .nas-elastic-detail .kpi { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) {
+  .nas-elastic-wizard .install-progress { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .nas-elastic-wizard .install-progress .install-step { min-width: 0; }
+  .nas-elastic-wizard .install-progress .label { white-space: normal; overflow-wrap: anywhere; }
+  .nas-root .nas-elastic-detail .kpi { grid-template-columns: 1fr; }
+  .nas-root .nas-elastic-card .pc-actions { margin-left: 0; }
+  .nas-root .nas-elastic-detail .disk-cells { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* Schedule pill — a cadence shown inline ("weekly · Sun 02:00"). */
 .nas-root .sched-pill, .nas-modal .sched-pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--bg-3); color: var(--text-2); font-size: 11px; white-space: nowrap; }

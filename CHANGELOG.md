@@ -1,10 +1,74 @@
 # Changelog
 
-All notable changes to TentaFlow are documented here.
+Najważniejsze zmiany w TentaFlow.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.2.0-beta] — 2026-09-08
+
+Najważniejsze zmiany względem ostatniego opublikowanego wydania `0.1.0-beta`.
+
+### TentaNAS i pamięć masowa
+
+- Nowa aplikacja do zarządzania dyskami, pulami ZFS, datasetami, snapshotami,
+  udziałami sieciowymi i magazynem blokowym we flocie. Obejmuje harmonogramy,
+  audyt dostępu, ograniczony helper uprzywilejowany i zatwierdzanie wybranych
+  operacji przez drugiego administratora.
+- Elastic Array łączy dyski danych i cache przez mergerfs z okresową parzystością
+  SnapRAID. Dodano wykonywanie operacji z trwałym zapisem zamiaru, przenoszenie
+  danych z cache, ręczne sync/scrub, odtwarzanie montowań oraz widoczność danych
+  oczekujących na objęcie ochroną.
+
+### Aplikacje, TentaBus i konta agentów
+
+- Wiele instancji aplikacji z osobnymi danymi, uprawnieniami i cyklem życia.
+  TentaBus otrzymał trwały log, replikację, rejestr schematów, polityki pól
+  oraz integrację z flow, REST i SDK. Poprawiono izolację instancji i odtwarzanie
+  po zmianie lidera.
+- Code Studio obsługuje zarządzane konta agentów CLI, odseparowane katalogi pracy
+  i przenoszenie kont między węzłami. Dodano podstawy TentaVM: rejestr hostów,
+  sondowanie możliwości oraz nadawanie i wnioskowanie o dostęp.
+
+### TentaQuant
+
+- Nowe studio obwodów kwantowych i notatnik z parserem podzbioru OpenQASM 3,
+  symulacją CPU/WGPU, wykonaniem w przeglądarce przez WASM i eksportem Qiskit.
+  Zadania obsługują anulowanie, strumieniowanie wyników, wizualizację stanu
+  oraz porównywanie i eksport rezultatów.
+
+### Mesh, klastry i przetwarzanie
+
+- Lista Mesh pokazuje lokalny węzeł, urządzenia wykryte przez mDNS i zaufane
+  węzły, zachowując zaufanie przechodnie; relay nie tworzy globalnego katalogu urządzeń.
+- Aktualizacja iroh i poprawki ponownego łączenia po restarcie lub zmianie adresu.
+  Synchronizacja klastrów korzysta z dziennika zmian, a odtwarzanie modeli
+  uwzględnia dostępność peerów i czas rozruchu.
+- Ujednolicono obsługę domyślnego flow rozmów. Poprawiono odświeżanie konfiguracji
+  node'ów w edytorze oraz wybrane ścieżki głosu i przetwarzania obrazu.
+
+### Budowanie, zależności i cache
+
+- Jeden workspace Cargo, wspólny lockfile oraz centralne wersje zależności
+  i profile, sprawdzane przez CI. Eksport źródeł zachowuje samodzielne konteksty
+  kontenerów i SDK; usunięto nieużywane zależności i dostosowano kod do nowych API.
+- ThinLTO w wydaniu, przyrostowy `release-fast` i automatyczna retencja artefaktów
+  we wspólnych skryptach. Ograniczono powielanie zasobów i zbędne przebudowy.
+  [Pomiary i zasady cache](docs/build-performance.md) opisano oddzielnie.
+
+### Dodatki i integracje
+
+- Outlook, SharePoint RAG i Teams przeniesiono do wspólnego katalogu addonów.
+  Usunięto osobny addon WASM `teams-bot`; natywna aplikacja Meeting Bot pozostaje.
+
+### Instalacja i dystrybucja
+
+- Jawny wybór Full/Slim także przy instalacji z potoku. Nowa konfiguracja ma
+  włączony mesh i dostęp HTTPS z LAN; systemowy instalator Linuxa ustawia porty
+  w aktywnych UFW/firewalld, zachowując istniejący config i ostrzegając o loopback.
+- Archiwum macOS Metal wymaga Meeting Bota. Przed publikacją workflow sprawdza
+  jego obecność, uprawnienia wykonania, architekturę, zależności i start `--help`.
 
 ## [0.1.0-beta] - 2026-09-02
 
@@ -44,10 +108,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - Mesh peer trust survives pairing, boot prune and `persisted_version` domains.
 
 ## [0.0.2-alpha] - 2026-04-23
-
-### Added
-- TBD — describe the changes before tagging.
-
 
 ### Added
 - Added the new `www/` dashboard SPA and migrated the app to the binary WebSocket protocol with generated browser codecs.

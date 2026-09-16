@@ -32,7 +32,7 @@
 //   t.rows = [{ name: 'x', status: 'ok' }, ...];
 // =============================================================================
 
-import { adoptControlsInto, injectSpriteIntoShadow } from './shared-styles.js';
+import { adoptControlsInto, adoptScopedSheetsInto, injectSpriteIntoShadow } from './shared-styles.js';
 
 class TfColumn extends HTMLElement {
   // rola pamietaj-tagu — dane czerpane z atrybutow przez parenta
@@ -60,7 +60,7 @@ const STICKY_COLUMN_WIDTH = 160;
 
 class TfTable extends HTMLElement {
   static get observedAttributes() {
-    return ['sortable', 'selectable', 'variant', 'density', 'narrow', 'page-size', 'total', 'page', 'actions-label'];
+    return ['sortable', 'selectable', 'variant', 'density', 'narrow', 'page-size', 'total', 'page', 'actions-label', 'empty-message'];
   }
 
   constructor() {
@@ -73,11 +73,28 @@ class TfTable extends HTMLElement {
     this._rows = [];
     this._sortKey = null;
     this._sortDir = 'asc';
-    // Optional per-row actions builder: (row, index) => Element | null.
+    // Optional per-row actions builder:
+    //   (row, index, currentRow) => Element | null
     // When set, tf-table renders a trailing actions column hosting the
-    // returned element (e.g. a kebab tf-menu). Cells are rebuilt on every
-    // render so the element stays bound to its current row object.
+    // returned element (e.g. a kebab tf-menu). `currentRow()` returns the row
+    // occupying this slot AT CALL TIME, so a handler that reads through it
+    // acts on the row that is actually there rather than on the one the
+    // element was built from. Builders read every row value their HANDLERS
+    // need through it; MARKUP may still come from `row`, which is rendered at
+    // once and therefore can never be stale. That split is what lets
+    // _writeActionsCell keep an existing node whenever a rebuild would have
+    // produced identical markup.
     this._rowActions = null;
+    // Optional signature of the actions cell: (row, index) => string | number.
+    // Rows are rebuilt from fresh API data on every poll, so `row === lastRow`
+    // is never true and object identity cannot tell "unchanged" from "changed".
+    // The host declares the signature instead; while it holds, the element
+    // already in the cell is KEPT rather than rebuilt — which is what stops a
+    // 5 s poll from swapping a click target out from under the user's cursor.
+    // The signature must cover every row field the builder RENDERS and every
+    // field its handlers CLOSE OVER, including the row's identity. A field left
+    // out keeps the values captured when the element was built.
+    this._rowActionsKey = null;
     // Count of leading columns pinned with position:sticky. Per-column sticky
     // flags (<tf-column sticky>) extend this for explicitly marked columns.
     this._stickyColumns = 0;
@@ -117,9 +134,28 @@ class TfTable extends HTMLElement {
   get rowActions() { return this._rowActions; }
   set rowActions(fn) {
     this._rowActions = typeof fn === 'function' ? fn : null;
+    // A NEW builder means every cached actions element was produced by the OLD
+    // one and still closes over its values (an `isAdmin` that has since
+    // changed, a stale permission check). The cached signature describes the
+    // ROW, so on its own it would keep those elements alive for good. Bumping a
+    // generation invalidates every stored signature at once.
+    this._rowActionsGen = (this._rowActionsGen || 0) + 1;
     // Column count changes when actions toggle on/off — force thead rebuild.
     this._lastColsSig = null;
     this._render();
+  }
+
+  get rowActionsKey() { return this._rowActionsKey; }
+  set rowActionsKey(fn) {
+    this._rowActionsKey = typeof fn === 'function' ? fn : null;
+    // A different key function can return the SAME string for a different
+    // notion of "unchanged", so signatures cached under the previous one are
+    // meaningless and must not match.
+    this._rowActionsGen = (this._rowActionsGen || 0) + 1;
+    // Deliberately does NOT render: this is bookkeeping about how to refresh
+    // the actions cell, not a change to anything already on screen. Rendering
+    // here would cost a second full pass whenever a host assigns both this and
+    // `rowActions` while drawing a tab.
   }
 
   get stickyColumns() { return this._stickyColumns; }
@@ -222,7 +258,23 @@ class TfTable extends HTMLElement {
   }
 
   _build() {
-    adoptControlsInto(this._shadow);
+    // `renderer="html"` cells are written with td.innerHTML INSIDE this shadow
+    // root, where the screen's own stylesheet cannot reach them. Adopt the
+    // sheets scoped to the screen this table sits in (see shared-styles.js).
+    //
+    // Sequenced, not raced: adoptedStyleSheets is ordered, so letting the two
+    // adoptions resolve in whatever order the network returns would leave the
+    // cascade order up to chance. controls.css is the base, the screen sheet
+    // refines it, so the screen sheet must always come second.
+    //
+    // Each adoption carries its OWN catch. A shared trailing catch would let a
+    // single failed controls.css fetch skip the screen sheet entirely and
+    // swallow the reason — silently restoring the very defect this exists to
+    // fix (unstyled cells, black sparklines, nothing in the console).
+    adoptControlsInto(this._shadow)
+      .catch(() => { /* base styles unavailable — the screen sheet must still load */ })
+      .then(() => adoptScopedSheetsInto(this._shadow, this))
+      .catch(() => { /* styling is best-effort; the table still renders */ });
     // Row-action tf-buttons render <use href="#i-*"> — the document sprite is
     // not reachable from inside the shadow root, so clone it in.
     injectSpriteIntoShadow(this._shadow);
@@ -425,6 +477,21 @@ class TfTable extends HTMLElement {
   // burzyc. Eliminuje pelen rebuild tbody przy kazdym set rows / sort i
   // pozwala browserowi zachowac focus/selection w komorkach.
   _renderTbody(cols, rows) {
+    // An empty table has to say WHY it is empty. `empty-message` was passed by
+    // 19 call sites across 11 screens and every one of them was inert: the
+    // attribute was never read here and was not in `observedAttributes`, so a
+    // table with no rows rendered as nothing at all and the caller's sentence
+    // went nowhere. Handled before the expandable split, because both paths
+    // produce the same empty tbody.
+    if (rows.length === 0 && this.hasAttribute('empty-message')) {
+      this._renderEmptyRow(cols);
+      return;
+    }
+    // A leftover empty row must never survive into the recycling path below:
+    // that path updates `<tr>`s by index and would write data cells into it.
+    if (this._tbody.firstElementChild?.classList.contains('tf-table__empty-row')) {
+      this._tbody.textContent = '';
+    }
     // Tabela rozwijalna wstawia dodatkowe wiersze ekspansji miedzy wierszami
     // danych, wiec recykling po indeksie sie nie zgadza — odbudowujemy w calosci.
     // To NIE jest sciezka czestego odswiezania (rozwijalne tabele sa rzadkie).
@@ -457,6 +524,34 @@ class TfTable extends HTMLElement {
     while (tbody.children.length > target) {
       tbody.removeChild(tbody.lastChild);
     }
+  }
+
+  // The span comes from the RENDERED header rather than a second copy of the
+  // lead/actions arithmetic: selection, expansion and the actions column all
+  // already appear there, so the two can never drift apart.
+  //
+  // Patched in place when the row is already there: an unchanged poll on an
+  // empty table must not replace the node, for the same reason the data path
+  // recycles its rows.
+  _renderEmptyRow(cols) {
+    const tbody = this._tbody;
+    const text = this.getAttribute('empty-message') || '';
+    const span = this._thead?.querySelector('tr')?.children.length || Math.max(1, cols.length);
+    const current = tbody.firstElementChild;
+    if (tbody.children.length === 1 && current?.classList.contains('tf-table__empty-row')) {
+      const td = current.firstElementChild;
+      if (td.colSpan !== span) td.colSpan = span;
+      if (td.textContent !== text) td.textContent = text;
+      return;
+    }
+    const tr = document.createElement('tr');
+    tr.className = 'tf-table__empty-row';
+    const td = document.createElement('td');
+    td.className = 'tf-table__empty-cell';
+    td.colSpan = span;
+    td.textContent = text;
+    tr.appendChild(td);
+    tbody.replaceChildren(tr);
   }
 
   _renderTbodyExpandable(cols, rows) {
@@ -578,17 +673,106 @@ class TfTable extends HTMLElement {
       this._writeCell(td, cols[i], row[cols[i].key]);
     }
     if (this._rowActions) {
-      // Recyklowany wiersz wskazuje teraz na inny obiekt row — odbuduj
-      // element akcji, zeby byl zbindowany do aktualnego wiersza.
+      // A recycled <tr> may now show a different logical row. The actions
+      // element is replaced only when that changes the markup it builds;
+      // otherwise the node stays put and its handlers follow the current row
+      // by themselves (see _writeActionsCell).
       this._writeActionsCell(tds[cols.length], row, idx);
     }
   }
 
+  // Signature of the actions cell for `row`, or null when the host declared
+  // none — then the builder runs on every render and the markup comparison in
+  // _writeActionsCell decides whether anything is written. A builder that
+  // throws, or returns anything but a string/number, counts as "no signature"
+  // rather than as a false match.
+  _rowActionsSignature(row, idx) {
+    if (!this._rowActionsKey) return null;
+    let key = null;
+    try { key = this._rowActionsKey(row, idx); } catch { return null; }
+    return typeof key === 'string' || typeof key === 'number'
+      ? `k:${this._rowActionsGen || 0}:${key}`
+      : null;
+  }
+
+  // Builds the actions element for `row` and puts it in `td` — unless the cell
+  // already holds the markup that was just built, in which case the NEW
+  // element is DISCARDED and the existing node is left untouched. Not writing
+  // the DOM at all is the point: it is what keeps a click target alive under
+  // the user's cursor across a 5 s poll.
+  //
+  // Keeping a node is sound because the builder is handed `currentRow`, so its
+  // handlers resolve the row occupying this slot at CLICK time rather than the
+  // one they were built from. Identical markup therefore also means identical
+  // behaviour, even after a sort, a filter or a poll moved a different row
+  // into this position — which is why the guard needs no promise from the
+  // caller, unlike `rowActionsKey`.
+  //
+  // The comparison is against the markup AS BUILT, recorded here, and never
+  // against the live node: a tf-menu the user has opened carries an `open`
+  // attribute, and a button with an action in flight carries `disabled`.
+  // Comparing against the live DOM would read those as "changed" and destroy
+  // precisely the element being interacted with.
   _writeActionsCell(td, row, idx) {
+    // Whether an existing element may be KEPT at all — decided before either
+    // path that could keep one. A builder is trusted only when it declared the
+    // live accessor (three parameters), because then its handlers resolve the
+    // row occupying this slot at click time. One that took `(row)` or
+    // `(row, idx)` closes over the row it was built from, so reusing its
+    // element would fire its handlers on data from a poll ago with no visible
+    // symptom. Those are rebuilt, exactly as tf-table behaved before any of
+    // this existed: such a caller loses performance, never correctness.
+    //
+    // `Function.length` stops counting at the first defaulted or rest
+    // parameter, so `(row = x, idx, cur) => {}` and `(...args) => {}` both
+    // report 0. Requiring >= 3 is therefore sound BY CONSTRUCTION rather than
+    // by convention: every shape that could hide a row read fails the test
+    // instead of passing it.
+    const cannotHoldStaleRow = typeof this._rowActions === 'function' && this._rowActions.length >= 3;
+    const key = this._rowActionsSignature(row, idx);
+    // A declared signature that still holds skips the build entirely — the
+    // optional fast path, gated on the SAME condition. A hand-rolled key that
+    // omits the row identity, paired with an unmigrated builder, would
+    // otherwise keep a node whose handlers fire on the row that used to sit
+    // here (reproduced against the shipped code during review). `null` never
+    // matches itself, so a table without a signature always builds and falls
+    // through to the markup comparison below.
+    if (key !== null && cannotHoldStaleRow && td._tfActionsKey === key) return;
+    const gen = this._rowActionsGen || 0;
     let el = null;
-    try { el = this._rowActions(row, idx); } catch { el = null; }
+    try {
+      el = this._rowActions(row, idx, () => this._sortedRows()[idx] ?? row);
+    } catch { el = null; }
+    // `outerHTML` is read off the element, not through `instanceof Element`:
+    // the test harness does not export that global, and a text node simply has
+    // no outerHTML and so can never match.
+    const html = el instanceof Node && typeof el.outerHTML === 'string' ? el.outerHTML : null;
+    const held = td.childNodes.length === 1 ? td.firstChild : null;
+    // The generation is part of the match: a NEW builder closes over new
+    // values (an `isAdmin` that has since changed), so its output has to
+    // replace the old element even when the two render the same markup.
+    //
+    // `html !== null` below is defensive, not decisive: no mutation of it can
+    // fail a test, because a builder returning a Text or Comment node is
+    // already stopped by `typeof held.outerHTML === 'string'` on the next
+    // render. Kept as a guard against a future path that records a non-null
+    // html for a node that has none, and said plainly here so the redundancy
+    // is not mistaken for untested logic.
+    if (html !== null
+      && cannotHoldStaleRow
+      && held != null && typeof held.outerHTML === 'string'
+      && td._tfActionsGen === gen
+      && td._tfActionsHtml === html) {
+      td._tfActionsKey = key;
+      return;
+    }
     if (el instanceof Node) td.replaceChildren(el);
     else td.replaceChildren();
+    // Recorded even when null, so a cell whose builder returned nothing is not
+    // mistaken for one that was never written.
+    td._tfActionsHtml = html;
+    td._tfActionsGen = gen;
+    td._tfActionsKey = key;
   }
 
   _writeCell(td, col, value, keepExisting = false) {
@@ -607,15 +791,30 @@ class TfTable extends HTMLElement {
         ? value
         : { status: 'info', label: String(value ?? '') };
       const status = String(chip.status || 'info').replace(/[^a-zA-Z0-9_-]/g, '');
-      const span = document.createElement('span');
-      span.className = `tf-chip ${status}`;
-      if (chip.dot) {
-        const dot = document.createElement('span');
-        dot.className = 'tf-chip-dot';
-        span.appendChild(dot);
+      const cls = `tf-chip ${status}`;
+      const label = chip.label == null ? '' : String(chip.label);
+      // Skip an identical write, the way the `html` renderer below already
+      // does. Without this the cell swapped one <span> per row on EVERY poll:
+      // measured on the live disks table, 319 of the 329 remaining DOM
+      // mutations per 21 s came from here, long after the row-actions churn
+      // had been fixed.
+      const current = td.firstElementChild;
+      const unchanged = td.childNodes.length === 1
+        && current instanceof HTMLElement
+        && current.className === cls
+        && current.textContent === label
+        && !!current.querySelector('.tf-chip-dot') === !!chip.dot;
+      if (!unchanged) {
+        const span = document.createElement('span');
+        span.className = cls;
+        if (chip.dot) {
+          const dot = document.createElement('span');
+          dot.className = 'tf-chip-dot';
+          span.appendChild(dot);
+        }
+        span.appendChild(document.createTextNode(label));
+        td.replaceChildren(span);
       }
-      span.appendChild(document.createTextNode(chip.label == null ? '' : String(chip.label)));
-      td.replaceChildren(span);
     } else if (col.renderer === 'html') {
       const next = value ?? '';
       // Skip jesli identyczne — eliminuje koszt parsowania HTML komorki gdy

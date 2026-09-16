@@ -155,7 +155,7 @@ function renderUsesTable(host, rows, kind) {
   // Admin-only approve/deny on pending rows. Non-admins and resolved rows
   // (granted/auto_granted/denied) render no action cell content.
   if (isAdminView) {
-    table.rowActions = (row) => buildUseActions(row, kind);
+    table.rowActions = (row, idx, currentRow) => buildUseActions(row, kind, currentRow);
   }
 }
 
@@ -194,8 +194,11 @@ function visibilityChip(visibility) {
   return { status, label: I18n.t('addon_access.visibility.' + v) };
 }
 
-function buildUseActions(row, kind) {
+function buildUseActions(row, kind, currentRow) {
   if (row._grantStatus !== 'pending') return null;
+  // The actions cell can be kept across re-renders, so the decision must name
+  // the target of the row sitting in this slot at click time.
+  const live = () => currentRow?.() ?? row;
   const wrap = document.createElement('div');
   wrap.style.display = 'flex';
   wrap.style.gap = '6px';
@@ -206,14 +209,14 @@ function buildUseActions(row, kind) {
   approve.setAttribute('size', 'sm');
   approve.setAttribute('icon', 'check');
   approve.textContent = I18n.t('addon_access.action_approve');
-  approve.addEventListener('click', () => decide(kind, row._target, 'approve'));
+  approve.addEventListener('click', () => decide(kind, live()._target, 'approve'));
 
   const deny = document.createElement('tf-button');
   deny.setAttribute('variant', 'danger');
   deny.setAttribute('size', 'sm');
   deny.setAttribute('icon', 'x');
   deny.textContent = I18n.t('addon_access.action_deny');
-  deny.addEventListener('click', () => decide(kind, row._target, 'deny'));
+  deny.addEventListener('click', () => decide(kind, live()._target, 'deny'));
 
   wrap.appendChild(approve);
   wrap.appendChild(deny);

@@ -196,26 +196,38 @@ pub async fn helper_status() -> HelperStatus {
             version: Some(version),
         };
     }
-    if !std::path::Path::new(tentanas_helper::SUDOERS_INSTALL_PATH).is_file() {
-        return HelperStatus {
-            state: "sudoers_missing",
-            version: Some(version),
-        };
+    HelperStatus {
+        state: passwordless_helper_state(path, tentanas_helper::SUDOERS_INSTALL_PATH, "sudo").await,
+        version: Some(version),
     }
-    // `sudo -n` fails instead of prompting; `--version` is answered before the
-    // helper's root check, so this proves the NOPASSWD line without running
-    // any catalog command.
+}
+
+async fn passwordless_helper_state(
+    path: &str,
+    sudoers_path: &str,
+    sudo_program: &str,
+) -> &'static str {
+    match std::fs::metadata(sudoers_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return "sudoers_missing",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "sudoers_missing",
+        // Brak dostępu do katalogu sudoers nie przesądza o skuteczności reguły.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(_) => return "broken",
+    }
+    // Sonda ignoruje cache hasła, nie pyta o sekret i nie wykonuje polecenia katalogu.
     let passwordless = super::broker::run_unprivileged(
-        "sudo",
-        &["-n", "--", path, "--version"],
+        sudo_program,
+        &["-k", "-n", "-u", "root", "--", path, "--version"],
         Duration::from_secs(5),
     )
     .await
-    .map(|o| o.success())
+    .map(|o| o.success() && o.stdout.trim() == tentanas_helper::VERSION)
     .unwrap_or(false);
-    HelperStatus {
-        state: if passwordless { "ok" } else { "not_passwordless" },
-        version: Some(version),
+    if passwordless {
+        "ok"
+    } else {
+        "not_passwordless"
     }
 }
 
@@ -398,6 +410,134 @@ mod tests {
         assert_eq!(
             line,
             "tentaflow ALL=(root) NOPASSWD: /usr/local/libexec/tentanas-helper\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_fixture(dir: &std::path::Path, output: &str, code: u8) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join("sudo-probe");
+        let quoted = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' {}\nexit {code}\n",
+            quoted(dir.join("argv").to_str().unwrap()),
+            quoted(output)
+        );
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        program
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inaccessible_sudoers_requires_real_successful_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "Test EACCES wymaga użytkownika nie-root"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        let sudoers = protected.join("rule");
+        std::fs::write(&sudoers, "reguła testowa").unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let metadata = std::fs::metadata(&sudoers);
+        let mut observed = Vec::new();
+        for (output, code) in [
+            (tentanas_helper::VERSION, 0),
+            (tentanas_helper::VERSION, 1),
+            ("wrong-version", 0),
+            ("", 0),
+        ] {
+            let program = probe_fixture(dir.path(), output, code);
+            observed.push(
+                passwordless_helper_state(
+                    "/test/helper",
+                    sudoers.to_str().unwrap(),
+                    program.to_str().unwrap(),
+                )
+                .await,
+            );
+        }
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            metadata.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            observed,
+            [
+                "ok",
+                "not_passwordless",
+                "not_passwordless",
+                "not_passwordless"
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("argv")).unwrap(),
+            "-k\n-n\n-u\nroot\n--\n/test/helper\n--version\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn missing_nonfile_and_ambiguous_sudoers_never_execute_probe() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let program = probe_fixture(dir.path(), tentanas_helper::VERSION, 0);
+        let missing = dir.path().join("missing");
+        let cycle = dir.path().join("cycle");
+        symlink(&cycle, &cycle).unwrap();
+        for (path, expected) in [
+            (missing.as_path(), "sudoers_missing"),
+            (dir.path(), "sudoers_missing"),
+            (cycle.as_path(), "broken"),
+        ] {
+            assert_eq!(
+                passwordless_helper_state(
+                    "/test/helper",
+                    path.to_str().unwrap(),
+                    program.to_str().unwrap()
+                )
+                .await,
+                expected
+            );
+            assert!(!dir.path().join("argv").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn readable_sudoers_still_requires_successful_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let sudoers = dir.path().join("rule");
+        std::fs::write(&sudoers, "reguła testowa").unwrap();
+        for (output, code, expected) in [
+            (tentanas_helper::VERSION, 0, "ok"),
+            (tentanas_helper::VERSION, 1, "not_passwordless"),
+            ("wrong-version", 0, "not_passwordless"),
+        ] {
+            let program = probe_fixture(dir.path(), output, code);
+            assert_eq!(
+                passwordless_helper_state(
+                    "/test/helper",
+                    sudoers.to_str().unwrap(),
+                    program.to_str().unwrap()
+                )
+                .await,
+                expected
+            );
+        }
+        assert_eq!(
+            passwordless_helper_state(
+                "/test/helper",
+                sudoers.to_str().unwrap(),
+                dir.path().join("absent-program").to_str().unwrap()
+            )
+            .await,
+            "not_passwordless"
         );
     }
 }

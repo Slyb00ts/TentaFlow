@@ -18,16 +18,18 @@ import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
-  T, sprite, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
+  T, sprite, channelMode, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
+  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
   layoutLabel, stateChipHtml, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
+import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards } from '/js/modules/tentanas/dom-patch.js';
 import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
 import { drawTasks, openSmartScheduleEditor } from '/js/modules/tentanas/tasks.js';
 import { drawShares, protocolChipHtml } from '/js/modules/tentanas/shares.js';
 import { warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { openDiskWipeDialog } from '/js/modules/tentanas/disk-wipe.js';
 import { exportConfig, mountImportPicker, applyImport, planBlocked } from '/js/modules/tentanas/config-transfer.js';
 import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-slider.js';
@@ -52,10 +54,24 @@ import '/js/components/tf-choice-card.js';
 import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
 import { openTargetDetail } from '/js/modules/tentanas/targets.js';
+import { drawElasticDetail, elasticState, elasticProtection, elasticCapacity } from '/js/modules/tentanas/elastic-detail.js';
+import { jobCanCancel } from '/js/modules/tentanas/format.js';
 
 // -----------------------------------------------------------------------------
 // Screen-local helpers
 // -----------------------------------------------------------------------------
+
+// The in-place patching helpers (`setAttr`, `setText`, `patchHtml`,
+// `paintStatCards`) live in modules/tentanas/dom-patch.js, imported above —
+// the tab modules this file imports need them too, and a leaf module both
+// sides import avoids the cycle that exporting them from here would create.
+
+// The feature that backs SMART on a node. The telemetry banner may offer an
+// install only when the environment probe reports THIS absent — the banner
+// itself is never the evidence (a working smartctl can still fail on single
+// disks, and offering "Doinstaluj" then names a cause that does not exist).
+const SMART_FEATURE_ID = 'smartmontools';
+const FEATURE_ABSENT = new Set(['missing_package', 'missing', 'missing_module']);
 
 function sparklineSvg(points, cls = '', w = 90, h = 22) {
   const pts = (points || []).map(Number).filter((v) => Number.isFinite(v));
@@ -110,6 +126,34 @@ function mountDotsHtml(mounts, nodes) {
   }).join('')}</span>`;
 }
 
+// One Elastic Array as a `.pool-mini` row of the node dashboard (n02:297) —
+// the same shape a ZFS pool gets, so the dashboard shows every pool the Pools
+// tab lists instead of only the ZFS half. Two chips carry the two questions an
+// array raises: is it up, and is what it holds protected.
+//
+// The fill bar is rendered ONLY for a measured array: `pct` reads a missing
+// capacity as 0, and a bar drawn at 0% claims an empty array where the node
+// merely never measured one. The used/usable pair says "—" there instead.
+function arrayMiniHtml(a) {
+  const state = elasticState(a);
+  const protection = elasticProtection(a);
+  const fs = a.filesystem ? String(a.filesystem).toUpperCase() : T('elastic.unknown');
+  const topology = T('elastic.topology', { data: (a.dataDisks || []).length, parity: (a.parityDisks || []).length, fs });
+  const bar = elasticCapacity(a).measured
+    ? `<tf-progress-bar value="${pct(a.usedBytes, a.usableBytes)}" size="sm" tone="accent"></tf-progress-bar>`
+    : '';
+  return `
+      <div class="pool-mini" data-array="${escapeAttr(a.name)}">
+        <div class="pm-ico">${sprite('cylinder')}</div>
+        <div class="pm-main">
+          <div class="pm-name"><span class="mono">${escapeHtml(a.name)}</span> <tf-chip status="${escapeAttr(state.tone)}" dot label="${escapeAttr(state.label)}"></tf-chip> <tf-chip size="sm" status="${escapeAttr(protection.tone)}" label="${escapeAttr(protection.label)}"></tf-chip></div>
+          <div class="pm-sub">Elastic Array · ${escapeHtml(topology)}</div>
+          ${bar}
+        </div>
+        <div class="kv-inline"><span class="v">${escapeHtml(fmtOptionalBytes(a.usedBytes))} / ${escapeHtml(fmtOptionalBytes(a.usableBytes))}</span></div>
+      </div>`;
+}
+
 // -----------------------------------------------------------------------------
 // Screen
 // -----------------------------------------------------------------------------
@@ -136,9 +180,11 @@ const TentaNasScreen = {
     this.sharesQuery = '';
     // Pools tab: the open pool, its inner tab and the dataset it focuses on
     // survive a reload through the hash (n06/n09).
-    this.pool = params.pool || null;
+    this.array = params.array || null;
+    this.pool = this.array ? null : params.pool || null;
+    if (this.array) this.tab = 'pools';
     this.poolTab = params.ptab || 'topology';
-    this.dataset = params.dataset || null;
+    this.dataset = this.array ? null : params.dataset || null;
     this.diskFilter = 'all';
     this.diskQuery = '';
     this.diskPool = 'all';
@@ -150,9 +196,18 @@ const TentaNasScreen = {
     // change must re-ask every node instead of painting the old fold.
     this.fleet = null;
     this.fleetVersion = null;
+    // The last environment probe's error, so the tab body can state a FAILED
+    // probe instead of painting a dashboard over a node that cannot answer.
+    // An undefined `environment` means "not asked yet" — a different state
+    // from "asked, and it failed".
+    this.environmentError = null;
+    // `?setup=1` — the admin has just installed TentaNas and the shell sent
+    // them straight here (addons.js). Install is fleet-wide; the privilege
+    // channel is per node, so this forces the setup step for ONE node.
+    this.forceSetup = params.setup === '1' || params.setup === true;
 
     try {
-      const me = await ApiBinary.one('authMeRequest', {});
+      const me = await ApiBinary.one('authMeRequest');
       this.me = me;
       this.isAdmin = Boolean(me && (me.role === 'admin' || me.isAdmin));
     } catch (e) {
@@ -163,6 +218,12 @@ const TentaNasScreen = {
     await this.loadNodes();
     if (this.disposed) return;
     if (this.nodeId && !this.nodes.some((n) => n.nodeId === this.nodeId)) this.nodeId = null;
+    // Straight after an install the route names no node, and the fleet list is
+    // not where a channel gets configured: open the node the admin is on.
+    if (this.forceSetup && !this.nodeId) {
+      const local = this.nodes.find((n) => n.nodeId === this.localNodeId && n.instanceStatus === 'ready');
+      if (local) this.nodeId = local.nodeId;
+    }
     this.draw();
   },
 
@@ -220,7 +281,8 @@ const TentaNasScreen = {
     if (this.nodeId && this.tab !== 'overview') q.set('tab', this.tab);
     if (this.nodeId && this.diskId) q.set('disk', this.diskId);
     if (this.nodeId && this.tab === 'shares' && this.targetId) q.set('target', this.targetId);
-    if (this.nodeId && this.tab === 'pools' && this.pool) {
+    if (this.nodeId && this.tab === 'pools' && this.array) q.set('array', this.array);
+    if (this.nodeId && this.tab === 'pools' && this.pool && !this.array) {
       q.set('pool', this.pool);
       if (this.poolTab && this.poolTab !== 'topology') q.set('ptab', this.poolTab);
       if (this.dataset) q.set('dataset', this.dataset);
@@ -240,12 +302,14 @@ const TentaNasScreen = {
   },
 
   selectNode(nodeId, tab = null, extra = {}) {
+    if (nodeId !== this.nodeId) document.querySelector('tf-window.nas-elastic-wizard')?.close();
     this.nodeId = nodeId;
     this.diskId = extra.disk || null;
     this.targetId = null;
     this.sharesFilter = 'all';
     this.sharesQuery = '';
-    this.pool = extra.pool || null;
+    this.array = extra.array || null;
+    this.pool = this.array ? null : extra.pool || null;
     this.dataset = null;
     this.diskFilter = extra.diskFilter || 'all';
     this.tab = tab || this.tab || 'overview';
@@ -262,7 +326,7 @@ const TentaNasScreen = {
       <tf-tabs variant="underline" value="${escapeAttr(active || '')}" id="nas-tabs">
         <tf-tab id="overview" icon="bar-chart">${escapeHtml(T('tabs.overview'))}</tf-tab>
         <tf-tab id="disks" icon="cylinder" count="${Number(n.disksTotal) || 0}">${escapeHtml(T('tabs.disks'))}</tf-tab>
-        <tf-tab id="pools" icon="layers" count="${Number(n.poolsTotal) || 0}">${escapeHtml(T('tabs.pools'))}</tf-tab>
+        <tf-tab id="pools" icon="layers" count="${(Number(n.poolsTotal) || 0) + (Number(n.arraysTotal) || 0)}">${escapeHtml(T('tabs.pools'))}</tf-tab>
         <tf-tab id="shares" icon="share" count="${Number(n.sharesTotal) || 0}">${escapeHtml(T('tabs.shares'))}</tf-tab>
         <tf-tab id="jobs" icon="list" ${running ? `count="${running}" count-tone="accent"` : ''}>${escapeHtml(T('tabs.jobs'))}</tf-tab>
         <tf-tab id="environment" icon="os">${escapeHtml(T('tabs.environment'))}</tf-tab>
@@ -275,7 +339,10 @@ const TentaNasScreen = {
       const value = e.detail.value;
       if (!this.nodeId) {
         el.setAttribute('value', '');
-        if (defaultNode) this.selectNode(defaultNode.nodeId, value);
+        // The fleet view passes a getter: the strip is wired once, and its
+        // default node is whatever is ready at CLICK time.
+        const target = typeof defaultNode === 'function' ? defaultNode() : defaultNode;
+        if (target) this.selectNode(target.nodeId, value);
         return;
       }
       if (value === this.tab) return;
@@ -283,6 +350,7 @@ const TentaNasScreen = {
       this.diskId = null;
       this.targetId = null;
       this.pool = null;
+      this.array = null;
       this.dataset = null;
       this.clearTimers();
       this.setLocation();
@@ -296,7 +364,13 @@ const TentaNasScreen = {
     this.runningJobs = (jobs || []).filter((j) => j.status === 'running' || j.status === 'queued').length;
     const tab = this.root?.querySelector('#nas-tabs tf-tab#jobs');
     if (!tab) return;
-    if (this.runningJobs) { tab.setAttribute('count', String(this.runningJobs)); tab.setAttribute('count-tone', 'accent'); } else tab.removeAttribute('count');
+    // Through setAttr, never a raw setAttribute: this runs on the 5 s overview
+    // poll, `count` is in TfTab.observedAttributes, and an identical value
+    // still reaches attributeChangedCallback — which rebuilds the tab's button
+    // wholesale. The badge blinked twelve times a minute for a number that had
+    // not moved.
+    setAttr(tab, 'count', this.runningJobs || null);
+    if (this.runningJobs) setAttr(tab, 'count-tone', 'accent');
   },
 
   // ---------------------------------------------------------------------------
@@ -331,56 +405,22 @@ const TentaNasScreen = {
     return (this.fleet?.rows || []).some((r) => typeof r.shares !== 'string' && (r.shares.services || []).some((s) => s.running));
   },
 
+  // Builds the fleet screen ONCE. Every value that a poll can move lives in a
+  // host this leaves empty and `paintFleet` fills in — the screen is never
+  // rebuilt from here on.
   drawFleet() {
     this.clearTimers();
     const nodes = this.nodes;
     const ready = nodes.filter((n) => n.instanceStatus === 'ready');
-    const warnNodes = nodes.filter((n) => n.disksWarning > 0);
-    const warnDisks = nodes.reduce((a, n) => a + n.disksWarning, 0);
-    const cap = nodes.reduce((a, n) => a + n.capacityBytes, 0);
-    const used = nodes.reduce((a, n) => a + n.usedBytes, 0);
-    const pools = nodes.reduce((a, n) => a + n.poolsTotal, 0);
-    const nasNodes = ready.filter((n) => n.poolsTotal > 0);
-    const unarmed = ready.filter((n) => (n.elevationMode || 'unarmed') === 'unarmed');
-    const shares = this.fleetShares();
-    const loaded = Boolean(this.fleet);
-
-    const channelParts = ['helper', 'interactive', 'unarmed']
-      .map((mode) => ({ mode, n: ready.filter((n) => (n.elevationMode || 'unarmed') === mode).length }))
-      .filter((p) => p.n > 0)
-      .map((p) => T('fleet.badge_channel_part', { n: p.n, mode: T('elevation.short_' + p.mode) }))
-      .join(' · ');
-
-    const sub = [
-      T('fleet.head_scope'),
-      T('fleet.head_nodes', { n: nodes.length }),
-      T('fleet.head_supported', { n: ready.length }),
-      this.fleetVersion ? T('fleet.head_version', { v: this.fleetVersion }) : null,
-      this.fleet ? T('refreshed', { t: fmtAgo(this.fleet.at) }) : null,
-    ].filter(Boolean).join(' · ');
-
-    const protoCounts = [...new Set(shares.map((s) => s.share.protocol))]
-      .map((p) => T('fleet.kpi_protocol', { n: shares.filter((s) => s.share.protocol === p).length, protocol: p.toUpperCase() }))
-      .join(' · ');
 
     this.root.innerHTML = `
       ${crumbsHtml([{ label: T('title') }])}
       <div class="tf-detail-header">
         <div class="big-ico">${sprite('cylinder')}</div>
         <div class="d-meta">
-          <div class="d-name">${escapeHtml(T('title'))}
-            <tf-chip status="${warnDisks ? 'warn' : 'ok'}" dot label="${escapeAttr(warnDisks
-              ? T('fleet.chip_warnings', { n: warnDisks, nodes: warnNodes.map((n) => n.nodeName).join(', ') })
-              : T('fleet.chip_ok'))}"></tf-chip>
-            ${loaded ? `<tf-chip status="${this.fleetServicesUp() ? 'ok' : 'warn'}" dot label="${escapeAttr(this.fleetServicesUp() ? T('fleet.chip_services') : T('fleet.chip_services_down'))}"></tf-chip>` : ''}
-          </div>
-          <div class="d-sub">${escapeHtml(sub)}</div>
-          <div class="d-badges">
-            <tf-chip status="accent" label="${escapeAttr(T('fleet.badge_nas', { n: nasNodes.length, nodes: nasNodes.map((n) => n.nodeName).join(' · ') }))}"></tf-chip>
-            <tf-chip status="${unarmed.length ? 'warn' : 'ok'}" icon="shield" label="${escapeAttr(T('fleet.badge_channels', { parts: channelParts || '—' }))}"></tf-chip>
-            <tf-chip label="${escapeAttr(T('fleet.badge_pools', { n: pools, capacity: fmtBytes(cap) }))}"></tf-chip>
-            <tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: nodes.length }))}"></tf-chip>
-          </div>
+          <div class="d-name">${escapeHtml(T('title'))} <span id="nas-fleet-chips"></span></div>
+          <div class="d-sub" id="nas-fleet-sub"></div>
+          <div class="d-badges" id="nas-fleet-badges"></div>
         </div>
         <div class="d-actions">
           <tf-button variant="ghost" icon="download" data-act="export-config">${escapeHtml(T('config.export'))}</tf-button>
@@ -388,29 +428,20 @@ const TentaNasScreen = {
         </div>
       </div>
       ${this.tabsHtml(null, ready[0] || null)}
-      <div class="kpi">
-        <tf-stat-card label="${escapeAttr(T('kpi.fleet_capacity'))}" value="${escapeAttr(fmtBytes(cap))}" icon="database"
-          delta="${escapeAttr(T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools }))}"></tf-stat-card>
-        <tf-stat-card id="nas-fleet-health" class="clickable" label="${escapeAttr(T('kpi.fleet_health'))}" value="${warnDisks}" suffix="${escapeAttr(T('kpi.warnings_suffix', { n: warnDisks }))}" icon="cylinder"
-          ${warnDisks ? `accent="warning" delta="${escapeAttr(T('kpi.fleet_health_on', { nodes: warnNodes.map((n) => n.nodeName).join(', ') }))}" delta-type="negative"` : `delta="${escapeAttr(T('kpi.fleet_health_ok'))}"`}></tf-stat-card>
-        <tf-stat-card id="nas-fleet-res" class="clickable" label="${escapeAttr(T('kpi.fleet_resources'))}" value="${loaded ? shares.length : '—'}" icon="share"
-          ${protoCounts ? `delta="${escapeAttr(protoCounts)}"` : ''}></tf-stat-card>
-        <tf-stat-card label="${escapeAttr(T('kpi.nodes'))}" value="${ready.length}" suffix="${escapeAttr(T('kpi.fleet_nodes_suffix', { total: nodes.length }))}" icon="network"
-          ${unarmed.length ? `delta="${escapeAttr(T('kpi.node_unarmed', { node: unarmed[0].nodeName }))}" delta-type="negative"` : ''}></tf-stat-card>
-      </div>
+      <div class="kpi" id="nas-fleet-kpi"></div>
       <div class="section-card">
         <div class="section-card-head">
           <div class="title">${sprite('desktop')} ${escapeHtml(T('fleet.nodes_title'))}</div>
           <span class="hint">${escapeHtml(T('fleet.nodes_hint'))}</span>
         </div>
-        <div class="node-grid" id="nas-node-grid">${nodes.map((n) => this.nodeCardHtml(n)).join('')}</div>
+        <div class="node-grid" id="nas-node-grid"></div>
       </div>
       <div class="section-card">
         <div class="section-card-head">
-          <div class="title">${sprite('alert')} ${escapeHtml(T('fleet.alerts_title'))} <tf-chip size="sm" status="${this.fleetAlertRows().length ? 'err' : 'neutral'}" label="${this.fleetAlertRows().length}"></tf-chip></div>
+          <div class="title">${sprite('alert')} ${escapeHtml(T('fleet.alerts_title'))} <tf-chip size="sm" id="nas-fleet-alerts-count" status="neutral" label="0"></tf-chip></div>
           <div class="actions"><tf-button variant="ghost" size="sm" icon="clock" data-act="alert-history">${escapeHtml(T('alerts.history'))}</tf-button></div>
         </div>
-        <tf-table id="nas-fleet-alerts" empty-message="${escapeAttr(loaded ? T('fleet.alerts_none') : I18n.t('common.loading'))}">
+        <tf-table id="nas-fleet-alerts" empty-message="${escapeAttr(I18n.t('common.loading'))}">
           <tf-column key="level" label="${escapeAttr(T('fleet.col_level'))}" renderer="html" width="110"></tf-column>
           <tf-column key="node" label="${escapeAttr(T('fleet.col_node'))}" renderer="html" width="120"></tf-column>
           <tf-column key="alert" label="${escapeAttr(T('fleet.col_alert'))}" renderer="html" fill></tf-column>
@@ -422,7 +453,7 @@ const TentaNasScreen = {
           <div class="title">${sprite('share')} ${escapeHtml(T('fleet.resources_title'))}</div>
           <span class="hint">${escapeHtml(T('fleet.resources_hint'))}</span>
         </div>
-        <tf-table id="nas-fleet-res-table" empty-message="${escapeAttr(loaded ? T('fleet.resources_none') : I18n.t('common.loading'))}">
+        <tf-table id="nas-fleet-res-table" empty-message="${escapeAttr(I18n.t('common.loading'))}">
           <tf-column key="resource" label="${escapeAttr(T('fleet.col_resource'))}" renderer="html" fill></tf-column>
           <tf-column key="protocol" label="${escapeAttr(T('fleet.col_protocol'))}" renderer="html" nowrap></tf-column>
           <tf-column key="source" label="${escapeAttr(T('fleet.col_source'))}" renderer="html"></tf-column>
@@ -438,31 +469,202 @@ const TentaNasScreen = {
       const target = this.fleetAlertRows().find((r) => r.node)?.node || ready[0];
       if (target) this.selectNode(target.nodeId, 'jobs');
     });
-    this.root.querySelector('#nas-fleet-health').addEventListener('click', () => {
-      const target = warnNodes[0] || ready[0];
-      if (target) this.selectNode(target.nodeId, 'disks', { diskFilter: 'problems' });
-    });
-    this.root.querySelector('#nas-fleet-res').addEventListener('click', () => {
-      const target = shares[0]?.node || ready[0];
-      if (target) this.selectNode(target.nodeId, 'shares');
-    });
-    this.wireTabs(this.root.querySelector('#nas-tabs'), ready[0] || null);
+    this.wireTabs(this.root.querySelector('#nas-tabs'), () => this.nodes.find((n) => n.instanceStatus === 'ready') || null);
     this.root.querySelector('#nas-node-grid').addEventListener('click', (e) => {
       const card = e.target.closest('.node-card[data-node]');
       if (!card || card.classList.contains('unsupported')) return;
       this.selectNode(card.dataset.node);
     });
+    // Row actions are a function OF THE ROW, so they are wired once, here.
+    // Re-assigning them on every poll (which is what the paint methods used to
+    // do) is not merely redundant: `set rowActions` calls the table's
+    // `_render()`, so setting `.rows` and `.rowActions` together ran TWO full
+    // render passes per poll over both fleet tables.
+    this.root.querySelector('#nas-fleet-alerts').rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
+      const { node, alert } = row._row;
+      const wrap = document.createElement('div');
+      wrap.className = 'row-actions';
+      const target = alertTarget(alert);
+      wrap.innerHTML = `<tf-button size="sm" variant="secondary" icon="chevron-right" data-act="go">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>`;
+      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const now = live()._row;
+        const t = alertTarget(now.alert);
+        this.selectNode(now.node.nodeId, t.tab, t.extra);
+      });
+      return wrap;
+    };
+    this.root.querySelector('#nas-fleet-res-table').rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
+      const wrap = document.createElement('div');
+      wrap.className = 'row-actions';
+      wrap.innerHTML = `<tf-button size="sm" variant="secondary" icon="chevron-right" data-act="go">${escapeHtml(T('fleet.act_manage'))}</tf-button>`;
+      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(live()._node.nodeId, 'shares'); });
+      return wrap;
+    };
+    this.paintFleet();
+
+    if (!this.fleet) this.loadFleetData().then(() => { if (!this.disposed && !this.nodeId) this.paintFleet(); });
+    this.later(() => this.refreshFleet(), POLL_FLEET_MS);
+  },
+
+  // Everything on n01 that a poll can move, written into the screen that is
+  // already there: header chips, the KPI attributes, the node grid and the two
+  // tables. The KPI tiles and the table rows keep their elements and take only
+  // the values that moved. The chip strips are patched as ONE string each, so
+  // an unchanged poll touches nothing; a single value crossing a rounding
+  // boundary does rebuild a whole strip, which is bearable for a handful of
+  // chips that change together.
+  //
+  // The node GRID is not bearable that way and is patched PER CARD, keyed by
+  // node id: on a live fleet some node's uptime or used-bytes ticks on nearly
+  // every 10 s poll, and a joined-string compare rebuilt every card on the
+  // screen each time — the biggest blink surface this screen had.
+  paintFleet() {
+    const root = this.root;
+    const grid = root.querySelector('#nas-node-grid');
+    if (!grid) return;
+    const nodes = this.nodes;
+    const ready = nodes.filter((n) => n.instanceStatus === 'ready');
+    // Warnings and failures are counted apart, because a node that has LOST a
+    // disk must not reach this screen as a warning. `disksWarning` counts
+    // warnings only (fleet.rs) and the worst state leads everywhere below.
+    const warnNodes = nodes.filter((n) => n.disksWarning > 0);
+    const warnDisks = nodes.reduce((a, n) => a + n.disksWarning, 0);
+    const critNodes = nodes.filter((n) => n.disksCritical > 0);
+    const critDisks = nodes.reduce((a, n) => a + n.disksCritical, 0);
+    const cap = nodes.reduce((a, n) => a + n.capacityBytes, 0);
+    const used = nodes.reduce((a, n) => a + n.usedBytes, 0);
+    // An Elastic Array is storage the node serves, so it is counted beside the
+    // ZFS pools the capacity spans — and `arraysUnmeasured` says how many
+    // arrays that capacity is MISSING, because a node leaves an array it
+    // could not measure out of both figures rather than half of one.
+    const pools = nodes.reduce((a, n) => a + n.poolsTotal, 0);
+    const arrays = nodes.reduce((a, n) => a + n.arraysTotal, 0);
+    const unmeasured = nodes.reduce((a, n) => a + n.arraysUnmeasured, 0);
+    const nasNodes = ready.filter((n) => n.poolsTotal + n.arraysTotal > 0);
+    const unarmed = ready.filter((n) => channelMode(n.elevationMode) === 'unarmed');
+    const shares = this.fleetShares();
+    const loaded = Boolean(this.fleet);
+    const alertRows = this.fleetAlertRows();
+
+    const channelParts = ['helper', 'interactive', 'unarmed']
+      .map((mode) => ({ mode, n: ready.filter((n) => channelMode(n.elevationMode) === mode).length }))
+      .filter((p) => p.n > 0)
+      .map((p) => T('fleet.badge_channel_part', { n: p.n, mode: T('elevation.short_' + p.mode) }))
+      .join(' · ');
+    const protoCounts = [...new Set(shares.map((s) => s.share.protocol))]
+      .map((p) => T('fleet.kpi_protocol', { n: shares.filter((s) => s.share.protocol === p).length, protocol: p.toUpperCase() }))
+      .join(' · ');
+
+    // The worst state leads: a failure is `err` and says "failures", and only
+    // a fleet with no failure at all falls back to the warning wording.
+    const diskChip = critDisks
+      ? { status: 'err', label: `${critDisks} ${T('kpi.failures_suffix', { n: critDisks })} (${critNodes.map((n) => n.nodeName).join(', ')})` }
+      : { status: warnDisks ? 'warn' : 'ok', label: warnDisks
+        ? T('fleet.chip_warnings', { n: warnDisks, nodes: warnNodes.map((n) => n.nodeName).join(', ') })
+        : T('fleet.chip_ok') };
+    patchHtml(root.querySelector('#nas-fleet-chips'), [
+      `<tf-chip status="${diskChip.status}" dot label="${escapeAttr(diskChip.label)}"></tf-chip>`,
+      loaded ? `<tf-chip status="${this.fleetServicesUp() ? 'ok' : 'warn'}" dot label="${escapeAttr(this.fleetServicesUp() ? T('fleet.chip_services') : T('fleet.chip_services_down'))}"></tf-chip>` : '',
+    ].join(''));
+
+    setText(root.querySelector('#nas-fleet-sub'), [
+      T('fleet.head_scope'),
+      T('fleet.head_nodes', { n: nodes.length }),
+      T('fleet.head_supported', { n: ready.length }),
+      this.fleetVersion ? T('fleet.head_version', { v: this.fleetVersion }) : null,
+      this.fleet ? T('refreshed', { t: fmtAgo(this.fleet.at) }) : null,
+    ].filter(Boolean).join(' · '));
+
+    patchHtml(root.querySelector('#nas-fleet-badges'), [
+      `<tf-chip status="accent" label="${escapeAttr(T('fleet.badge_nas', { n: nasNodes.length, nodes: nasNodes.map((n) => n.nodeName).join(' · ') }))}"></tf-chip>`,
+      `<tf-chip status="${unarmed.length ? 'warn' : 'ok'}" icon="shield" label="${escapeAttr(T('fleet.badge_channels', { parts: channelParts || '—' }))}"></tf-chip>`,
+      `<tf-chip label="${escapeAttr(T('fleet.badge_pools', { n: pools + arrays, capacity: fmtBytes(cap) }))}"></tf-chip>`,
+      `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: nodes.length }))}"></tf-chip>`,
+    ].join(''));
+
+    const kpi = root.querySelector('#nas-fleet-kpi');
+    const built = paintStatCards(kpi, [
+      { key: 'capacity', attrs: {
+        label: T('kpi.fleet_capacity'), value: fmtBytes(cap), icon: 'database',
+        // An array the fleet could not measure is named, not folded in: the
+        // total above is then knowingly short of that array's disks, and a
+        // percentage the reader trusts has to say so.
+        delta: [
+          T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools + arrays }),
+          unmeasured ? T('kpi.capacity_unmeasured', { n: unmeasured }) : null,
+        ].filter(Boolean).join(' · '),
+      } },
+      { key: 'health', className: 'clickable', attrs: {
+        // The worst state leads, as on the node's own disk tile: a failure
+        // counts as a failure and colours the tile `danger`, never `warning`.
+        id: 'nas-fleet-health', label: T('kpi.fleet_health'), value: String(critDisks || warnDisks),
+        suffix: critDisks ? T('kpi.failures_suffix', { n: critDisks }) : T('kpi.warnings_suffix', { n: warnDisks }),
+        icon: 'cylinder',
+        accent: critDisks ? 'danger' : warnDisks ? 'warning' : null,
+        delta: critDisks || warnDisks
+          ? T('kpi.fleet_health_on', { nodes: [...new Set([...critNodes, ...warnNodes])].map((n) => n.nodeName).join(', ') })
+          : T('kpi.fleet_health_ok'),
+        'delta-type': critDisks || warnDisks ? 'warn' : null,
+      } },
+      { key: 'resources', className: 'clickable', attrs: {
+        id: 'nas-fleet-res', label: T('kpi.fleet_resources'), value: loaded ? String(shares.length) : '—', icon: 'share',
+        delta: protoCounts || null,
+      } },
+      { key: 'nodes', attrs: {
+        label: T('kpi.nodes'), value: String(ready.length), suffix: T('kpi.fleet_nodes_suffix', { total: nodes.length }), icon: 'network',
+        delta: unarmed.length ? T('kpi.node_unarmed', { node: unarmed[0].nodeName }) : null,
+        'delta-type': unarmed.length ? 'warn' : null,
+      } },
+    ]);
+    if (built) {
+      // Wired once, so both read the fleet at CLICK time — a later poll must
+      // not leave a tile pointing at a node that has since changed.
+      kpi.querySelector('[data-kpi="health"]').addEventListener('click', () => {
+        // The failed node first: the tile that shows a failure must open the
+        // node that HAS it, not whichever node merely warns.
+        const target = this.nodes.find((n) => n.disksCritical > 0)
+          || this.nodes.find((n) => n.disksWarning > 0)
+          || this.nodes.find((n) => n.instanceStatus === 'ready');
+        if (target) this.selectNode(target.nodeId, 'disks', { diskFilter: 'problems' });
+      });
+      kpi.querySelector('[data-kpi="resources"]').addEventListener('click', () => {
+        const target = this.fleetShares()[0]?.node || this.nodes.find((n) => n.instanceStatus === 'ready');
+        if (target) this.selectNode(target.nodeId, 'shares');
+      });
+    }
+
+    // One card is rebuilt only when ITS node's markup changed; a node that
+    // joins or leaves the fleet adds or removes exactly its own card. The
+    // click handler is delegated on the grid itself (see drawFleet), so a
+    // rebuilt card needs no re-wiring.
+    patchKeyedList(grid, nodes.map((n) => ({ key: n.nodeId, html: this.nodeCardHtml(n) })));
+
+    const count = root.querySelector('#nas-fleet-alerts-count');
+    setAttr(count, 'label', String(alertRows.length));
+    setAttr(count, 'status', alertRows.length ? 'err' : 'neutral');
+    setAttr(root.querySelector('#nas-fleet-alerts'), 'empty-message', loaded ? T('fleet.alerts_none') : I18n.t('common.loading'));
+    setAttr(root.querySelector('#nas-fleet-res-table'), 'empty-message', loaded ? T('fleet.resources_none') : I18n.t('common.loading'));
+
+    const first = ready[0] || {};
+    setAttr(root.querySelector('#nas-tabs tf-tab#disks'), 'count', String(Number(first.disksTotal) || 0));
+    setAttr(root.querySelector('#nas-tabs tf-tab#shares'), 'count', String(Number(first.sharesTotal) || 0));
+
     this.paintFleetAlerts();
     this.paintFleetResources();
-
-    if (!this.fleet) this.loadFleetData().then(() => { if (!this.disposed && !this.nodeId) this.drawFleet(); });
-    this.later(() => this.refreshFleet(), POLL_FLEET_MS);
   },
 
   async refreshFleet() {
     await this.loadNodes();
     await this.loadFleetData();
-    if (!this.disposed && !this.nodeId) this.drawFleet();
+    if (this.disposed || this.nodeId) return;
+    // A poll patches; it never redraws. Only a screen that is not there yet
+    // gets built ("nigdy pełne odświeżenie całości").
+    if (!this.root.querySelector('#nas-node-grid')) { this.drawFleet(); return; }
+    this.paintFleet();
+    this.later(() => this.refreshFleet(), POLL_FLEET_MS);
   },
 
   // One row per active alert plus one row per node that did not answer.
@@ -491,15 +693,6 @@ const TentaNasScreen = {
       alert: `<div class="cell-2"><div class="l1">${escapeHtml(r.alert.title)}</div><div class="l2">${escapeHtml(r.alert.detail)}</div></div>`,
       since: fmtAgo(r.alert.raisedAt),
     }));
-    table.rowActions = (row) => {
-      const { node, alert } = row._row;
-      const wrap = document.createElement('div');
-      wrap.className = 'row-actions';
-      const target = alertTarget(alert);
-      wrap.innerHTML = `<tf-button size="sm" variant="secondary" icon="chevron-right" data-act="go">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>`;
-      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(node.nodeId, target.tab, target.extra); });
-      return wrap;
-    };
   },
 
   paintFleetResources() {
@@ -525,13 +718,6 @@ const TentaNasScreen = {
         sessions: 0,
       })),
     ];
-    table.rowActions = (row) => {
-      const wrap = document.createElement('div');
-      wrap.className = 'row-actions';
-      wrap.innerHTML = `<tf-button size="sm" variant="secondary" icon="chevron-right" data-act="go">${escapeHtml(T('fleet.act_manage'))}</tf-button>`;
-      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(row._node.nodeId, 'shares'); });
-      return wrap;
-    };
   },
 
   // n01 node card: health dot + identity + status chip, the fill bar, four
@@ -556,7 +742,11 @@ const TentaNasScreen = {
       n.uptimeSecs ? T('uptime', { d: fmtDuration(n.uptimeSecs) }) : null,
       n.isLocal ? T('this_node') : null,
     ].filter(Boolean).join(' · ');
-    const role = unsupported ? T('fleet.role_unsupported') : n.poolsTotal ? T('fleet.role_nas') : T('fleet.role_client');
+    // A node whose only storage is an Elastic Array serves the fleet exactly
+    // as a node with a ZFS pool does; reading `poolsTotal` alone called it a
+    // client.
+    const role = unsupported ? T('fleet.role_unsupported')
+      : n.poolsTotal + n.arraysTotal ? T('fleet.role_nas') : T('fleet.role_client');
     const kv = (k, v) => `<span class="kv-inline"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></span>`;
     return `
       <div class="${cls}" data-node="${escapeAttr(n.nodeId)}">
@@ -568,15 +758,16 @@ const TentaNasScreen = {
           </div>
           ${statusChip}
         </div>
-        <div class="split-bar" title="${usedPct}%"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
+        <div class="split-bar" title="${escapeAttr([usedPct + '%', n.arraysUnmeasured ? T('kpi.capacity_unmeasured', { n: n.arraysUnmeasured }) : null].filter(Boolean).join(' · '))}"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
         <div class="nc-stats">
           ${kv(T('kpi.capacity_total'), `${escapeHtml(fmtBytes(n.usedBytes))} / ${escapeHtml(fmtBytes(n.capacityBytes))}`)}
-          ${kv(T('kpi.disks'), `${n.disksTotal}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}`)}
+          ${kv(T('kpi.disks'), `${n.disksTotal}${n.disksCritical ? ` · <span class="num-err">${n.disksCritical}!</span>` : ''}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}`)}
           ${kv(T('kpi.pools'), String(n.poolsTotal))}
+          ${n.arraysTotal ? kv('Elastic Array', String(n.arraysTotal)) : ''}
           ${kv(T('kpi.shares'), String(n.sharesTotal))}
         </div>
         <div class="nc-foot">
-          <tf-chip size="sm" status="${(n.elevationMode || 'unarmed') === 'unarmed' ? 'warn' : 'ok'}" icon="${(n.elevationMode || 'unarmed') === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('elevation.short_' + (n.elevationMode || 'unarmed')))}"></tf-chip>
+          <tf-chip size="sm" status="${channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok'}" icon="${channelMode(n.elevationMode) === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('elevation.short_' + channelMode(n.elevationMode)))}"></tf-chip>
           <span>${escapeHtml(role)}</span>
         </div>
       </div>`;
@@ -619,7 +810,14 @@ const TentaNasScreen = {
     this.root.querySelector('[data-act="export-config"]').addEventListener('click', () => exportConfig(this));
     this.wireTabs(this.root.querySelector('#nas-tabs'), node);
 
-    this.refreshHeader();
+    // Awaited: the tab body below decides whether this node may show a
+    // dashboard at all, and that decision needs the channel state. On a fresh
+    // install `cached_or_probe` has no cache and runs a full live probe, so
+    // the body says what it is waiting for instead of sitting empty under a
+    // header that has already painted.
+    this.drawProbePending(this.root.querySelector('#nas-tab-body'));
+    await this.refreshHeader();
+    if (this.disposed || !this.root.isConnected) return;
     this.refreshJobsBadge();
     this.drawTab();
   },
@@ -633,19 +831,28 @@ const TentaNasScreen = {
   async refreshHeader(refresh = false) {
     try {
       const res = await this.nas('tentaNasEnvironmentRequest', { refresh });
-      if (this.disposed || !this.root.querySelector('#nas-head-badges')) return;
+      if (this.disposed) return;
+      // Recorded before the header guard: the tab body's gate reads these two
+      // and must not depend on whether the header happened to still be on
+      // screen when the probe came back.
       this.environment = res.environment;
+      this.environmentError = null;
+      if (!this.root.querySelector('#nas-head-badges')) return;
       const env = res.environment;
       const node = this.currentNode();
       const zfs = (env.features || []).find((f) => f.id === 'zfs');
       const servicesUp = (env.features || []).some((f) => ['samba', 'nfs', 'iscsi', 'nvmet'].includes(f.id) && f.status === 'ok');
       this.root.querySelector('#nas-head-chips').innerHTML = [
-        `<tf-chip status="${node.disksWarning ? 'warn' : 'ok'}" dot label="${escapeAttr(node.disksWarning ? T('node.chip_disks_warn', { n: node.disksWarning }) : T('node.chip_ok'))}"></tf-chip>`,
+        // A failed disk is a failure on this chip too: reading `disksWarning`
+        // alone left a node that had lost a disk wearing an amber "warning".
+        `<tf-chip status="${node.disksCritical ? 'err' : node.disksWarning ? 'warn' : 'ok'}" dot label="${escapeAttr(node.disksCritical
+          ? `${node.disksCritical} ${T('kpi.failures_suffix', { n: node.disksCritical })}`
+          : node.disksWarning ? T('node.chip_disks_warn', { n: node.disksWarning }) : T('node.chip_ok'))}"></tf-chip>`,
         `<tf-chip status="${servicesUp ? 'ok' : 'warn'}" dot label="${escapeAttr(servicesUp ? T('fleet.chip_services') : T('fleet.chip_services_down'))}"></tf-chip>`,
       ].join('');
       const badges = [
         zfs && zfs.version ? `<tf-chip status="accent" label="${escapeAttr(T('node.badge_zfs', { v: zfs.version }))}"></tf-chip>` : `<tf-chip status="warn" label="${escapeAttr(T('env.no_zfs'))}"></tf-chip>`,
-        `<tf-chip status="${env.elevation.mode === 'unarmed' ? 'warn' : 'ok'}" icon="${env.elevation.mode === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('node.badge_channel', { mode: T('elevation.short_' + env.elevation.mode) }))}"></tf-chip>`,
+        `<tf-chip status="${channelMode(env.elevation.mode) === 'unarmed' ? 'warn' : 'ok'}" icon="${channelMode(env.elevation.mode) === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('node.badge_channel', { mode: T('elevation.short_' + channelMode(env.elevation.mode)) }))}"></tf-chip>`,
         `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: this.nodes.length }))}"></tf-chip>`,
       ];
       this.root.querySelector('#nas-head-badges').innerHTML = badges.join('');
@@ -657,7 +864,13 @@ const TentaNasScreen = {
       ];
       this.root.querySelector('#nas-head-sub').textContent = sub.filter(Boolean).join(' · ');
     } catch (e) {
-      if (!this.disposed) toast(T('env.failed', { error: errMessage(e) }), 'error');
+      if (this.disposed) return;
+      // A FAILED probe is a fact the tab body has to state. This used to only
+      // toast: `environment` stayed undefined, `channelUnusable()` answered
+      // false, and the full dashboard rendered anyway — every tile then
+      // failing separately against the same node that had just gone silent.
+      this.environmentError = errMessage(e);
+      toast(T('env.failed', { error: this.environmentError }), 'error');
     }
   },
 
@@ -670,13 +883,174 @@ const TentaNasScreen = {
     const body = this.root.querySelector('#nas-tab-body');
     if (!body) return;
     body.innerHTML = '';
+    // The one home for the rule, and the order is the rule. A probe that
+    // FAILED is an error state with a retry, never a dashboard that would
+    // fail tile by tile. A probe that has not answered yet is "not known
+    // yet", not "broken". Only then does the channel state decide: a node
+    // that cannot run a privileged command opens on the setup step, whichever
+    // tab was asked for, because every tab below would otherwise render the
+    // same refusal in its own shape.
+    if (this.environmentError) return this.drawProbeFailed(body);
+    if (!this.environment) return this.drawProbePending(body);
+    if (this.forceSetup || this.channelUnusable()) return this.drawSetupStep(body);
     switch (this.tab) {
       case 'disks': return this.diskId ? this.drawDiskDetail(body) : this.drawDisks(body);
-      case 'pools': return this.pool ? drawPoolDetail(this, body) : drawPools(this, body);
+      case 'pools': return this.array ? drawElasticDetail(this, body) : this.pool ? drawPoolDetail(this, body) : drawPools(this, body);
       case 'shares': return this.targetId ? openTargetDetail(this, this.targetId, { body }) : drawShares(this, body);
       case 'jobs': return drawTasks(this, body);
       case 'environment': return this.drawEnvironment(body);
       default: return this.drawOverview(body);
+    }
+  },
+
+  // ---------------------------------------------------------------------------
+  // Forced setup step (n16): installation carries no secret, so this is where
+  // the node learns how to become root
+  // ---------------------------------------------------------------------------
+
+  // Whether the panel may show a dashboard at all. A channel that was never
+  // configured, a helper that is not "ok", or a helper whose build the core's
+  // catalog does not match all refuse every privileged command — a dashboard
+  // over that is a grid of tiles reporting the same refusal.
+  //
+  // A node whose environment is not known YET is not unusable: that is its own
+  // state, decided in `drawTab` before this is ever asked.
+  channelUnusable() {
+    const el = this.environment?.elevation;
+    if (!el) return false;
+    if (channelMode(el.mode) === 'unarmed') return true;
+    if (el.mode === 'helper') return el.helperState !== 'ok' || el.coreCompatible === false;
+    return false;
+  },
+
+  // The probe has not answered yet. On a fresh install it has no cache and
+  // runs live, so this is the first thing the admin sees on the very node this
+  // feature exists for.
+  drawProbePending(body) {
+    if (!body) return;
+    body.innerHTML = `
+      <div class="stack" id="nas-probe-pending">
+        <div class="section-card"><div class="muted">${escapeHtml(T('setup.probing'))}</div></div>
+      </div>`;
+  },
+
+  // The probe FAILED. Deliberately not a dashboard: every tile would ask the
+  // same silent node and fail on its own, which is the symptom this change
+  // set out to remove.
+  drawProbeFailed(body) {
+    body.innerHTML = `
+      <div class="stack" id="nas-probe-failed">
+        <tf-alert tone="danger" title="${escapeAttr(T('setup.probe_failed_title'))}" message="${escapeAttr(T('setup.probe_failed_msg', { error: this.environmentError }))}"></tf-alert>
+        <div class="section-card">
+          <p class="wizard-section-sub">${escapeHtml(T('setup.probe_failed_hint'))}</p>
+          <tf-button variant="primary" icon="refresh" data-act="probe-retry">${escapeHtml(T('setup.probe_retry'))}</tf-button>
+        </div>
+      </div>`;
+    body.querySelector('[data-act="probe-retry"]')?.addEventListener('click', async () => {
+      this.drawProbePending(body);
+      await this.refreshHeader(true);
+      if (!this.disposed) this.drawTab();
+    });
+  },
+
+  // States what is missing, shows the commands mode A would run verbatim (n16
+  // promises exactly that), and offers both modes through the existing wizard
+  // — there is no second password dialog. Cancelling returns here, never to a
+  // half-rendered dashboard, because the channel is still not configured.
+  async drawSetupStep(body) {
+    const el = this.environment?.elevation || {};
+    const admin = this.isAdmin;
+    const node = this.currentNode();
+    // Forced straight after an install, the channel may already be fine (a
+    // reinstall, or a node someone configured earlier). Saying "the helper is
+    // from a different version" there would be a lie, so the working case gets
+    // its own sentence and a calmer tone.
+    const unusable = this.channelUnusable();
+    const missing = !unusable
+      ? T('setup.configured_already', { mode: T('elevation.short_' + channelMode(el.mode)) })
+      : channelMode(el.mode) === 'unarmed'
+        ? T('setup.missing_unset')
+        : el.helperState === 'ok'
+          ? T('setup.missing_incompatible')
+          : T('setup.missing_helper', { state: T('elevation.helper_' + el.helperState) });
+
+    body.innerHTML = `
+      <div class="stack" id="nas-setup">
+        <tf-alert tone="${unusable ? 'warning' : 'info'}" title="${escapeAttr(this.forceSetup ? T('setup.post_install_title') : T('setup.title'))}" message="${escapeAttr(missing)}"></tf-alert>
+        <div class="section-card">
+          <div class="section-card-head"><div class="title">${sprite('key')} ${escapeHtml(T('elevation.title'))}</div><span class="hint">${escapeHtml(T('elevation.hint'))}</span></div>
+          <p class="wizard-section-sub" id="nas-setup-scope">${escapeHtml(T('setup.node_scope', { node: node?.nodeName || '—' }))}</p>
+          <p class="wizard-section-sub">${escapeHtml(T('setup.lead'))}</p>
+          ${admin ? `
+          <div class="grid-2 mt-md">
+            <div class="explain-box" id="nas-setup-mode-a">
+              <p><b>${escapeHtml(T('setup.mode_a_title'))}</b></p>
+              <p>${escapeHtml(T('setup.mode_a_desc'))}</p>
+              <p class="wizard-section-sub">${escapeHtml(T('setup.plan_intro'))}</p>
+              <pre class="cmd mono" id="nas-setup-plan">${escapeHtml(T('elevation.plan_loading'))}</pre>
+              <div id="nas-setup-mode-a-blocked"></div>
+              <tf-button variant="primary" icon="shield" data-act="setup-mode-a" disabled>${escapeHtml(T('setup.mode_a_button'))}</tf-button>
+            </div>
+            <div class="explain-box" id="nas-setup-mode-b">
+              <p><b>${escapeHtml(T('setup.mode_b_title'))}</b></p>
+              <p>${escapeHtml(T('setup.mode_b_desc'))}</p>
+              <tf-button variant="secondary" icon="key" data-act="setup-mode-b">${escapeHtml(T('setup.mode_b_button'))}</tf-button>
+            </div>
+          </div>
+          <div class="row mt-md">
+            <tf-button variant="ghost" size="sm" icon="refresh" data-act="setup-recheck">${escapeHtml(T('setup.recheck'))}</tf-button>
+            ${this.forceSetup ? `<tf-button variant="ghost" size="sm" data-act="setup-dismiss">${escapeHtml(T('setup.dismiss'))}</tf-button>` : ''}
+          </div>`
+          : `
+          <div id="nas-setup-viewer" class="mt-md">
+            ${warningHtml('info', T('setup.viewer_msg'))}
+            <div class="muted mt-md">${escapeHtml(T('elevation.admin_only'))}</div>
+          </div>`}
+        </div>
+      </div>`;
+
+    body.querySelector('[data-act="setup-mode-a"]')?.addEventListener('click', () => this.openChannelWizard('helper'));
+    body.querySelector('[data-act="setup-mode-b"]')?.addEventListener('click', () => this.openChannelWizard('interactive'));
+    body.querySelector('[data-act="setup-recheck"]')?.addEventListener('click', async () => {
+      await this.refreshHeader(true);
+      if (!this.disposed) this.drawTab();
+    });
+    // Dismissing is allowed — mode B is a deliberate downgrade and nobody is
+    // trapped here. It drops only the post-install forcing: a node with no
+    // channel still fails `channelUnusable()` and is held on this step, so it
+    // goes on reading as not configured exactly as before.
+    body.querySelector('[data-act="setup-dismiss"]')?.addEventListener('click', () => {
+      this.forceSetup = false;
+      if (!this.disposed) this.drawTab();
+    });
+    // A viewer can do nothing here and must not be shown a plan box that will
+    // never fill: the plan request below is admin-only, so for anyone else the
+    // box used to sit on "Pobieranie planu…" forever under a heading that
+    // promised the commands.
+    if (!admin) return;
+
+    // Mode A copies a helper binary that ships next to the core. Measured on a
+    // real install: it was not there (`helperSourcePresent: false`), and
+    // provisioning would have died on its first command — so the step says
+    // that instead of offering a button that cannot work.
+    let plan = null;
+    try {
+      plan = (await this.nas('tentaNasElevationPlanRequest', {})).plan;
+    } catch (e) {
+      const host = body.querySelector('#nas-setup-plan');
+      if (host && host.isConnected) host.textContent = T('setup.plan_failed', { error: errMessage(e) });
+      return;
+    }
+    if (this.disposed || !body.isConnected) return;
+    const pre = body.querySelector('#nas-setup-plan');
+    if (pre) pre.textContent = (plan.commands || []).map((c) => c.join(' ')).join('\n');
+    const modeA = body.querySelector('[data-act="setup-mode-a"]');
+    if (plan.helperSourcePresent) {
+      modeA?.removeAttribute('disabled');
+    } else {
+      modeA?.remove();
+      const blocked = body.querySelector('#nas-setup-mode-a-blocked');
+      if (blocked) blocked.innerHTML = warningHtml('danger', T('setup.helper_missing', { path: plan.helperSource }));
     }
   },
 
@@ -687,14 +1061,27 @@ const TentaNasScreen = {
   async drawOverview(body) {
     body.innerHTML = `
       <div class="stack">
+        <div id="nas-ov-error"></div>
         <div class="kpi" id="nas-ov-kpi"></div>
         <div id="nas-ov-telemetry"></div>
-        <div class="section-card">
-          <div class="section-card-head">
-            <div class="title">${sprite('cpu')} ${escapeHtml(T('arc.title'))}</div>
-            <div class="actions" id="nas-ov-arc-actions"></div>
+        <div class="grid-2" id="nas-ov-arc-row" data-single="1">
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title">${sprite('cpu')} ${escapeHtml(T('arc.title'))}</div>
+              <div class="actions" id="nas-ov-arc-actions"></div>
+            </div>
+            <div id="nas-ov-arc"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
           </div>
-          <div id="nas-ov-arc"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
+          <!-- n02's "Tiering i cache zapisu", beside ARC as the mockup draws
+               it. Hidden, and the row collapses to one column, on a node with
+               no cache tier to describe: a permanently empty card next to a
+               populated one reads as a broken panel. -->
+          <div class="section-card" id="nas-ov-tier-card" hidden>
+            <div class="section-card-head">
+              <div class="title">${sprite('zap')} ${escapeHtml(T('tiering.title'))}</div>
+            </div>
+            <div id="nas-ov-tier"></div>
+          </div>
         </div>
         <div class="grid-2">
           <div class="section-card">
@@ -730,7 +1117,17 @@ const TentaNasScreen = {
       </div>`;
     body.querySelector('[data-act="alert-history"]').addEventListener('click', () => this.switchTab('jobs'));
     body.querySelector('[data-act="create-pool"]').addEventListener('click', () => {
-      openPoolWizard(this, { freeDisks: this.overviewFreeDisks || [], pools: this.overviewPools || [], onDone: () => this.refreshOverview(body) });
+      const nodeId = this.currentNode()?.nodeId;
+      const surface = body.querySelector('#nas-ov-pools');
+      const isCurrent = () => !this.disposed && surface?.isConnected && this.currentNode()?.nodeId === nodeId;
+      openPoolWizard(this, { freeDisks: this.overviewFreeDisks || [], pools: this.overviewPools || [], isCurrent,
+        onDone: () => { if (isCurrent()) this.refreshOverview(body); },
+        onCreated: ({ name, outcome }) => {
+          if (!isCurrent()) return;
+          if (outcome === 'approval') this.switchTab('jobs');
+          else this.openArray(outcome === 'job' ? name : null);
+        },
+      });
     });
 
     const io = body.querySelector('#nas-ov-io');
@@ -764,8 +1161,12 @@ const TentaNasScreen = {
     const io = body.querySelector('#nas-ov-io');
     if (io) {
       io.push(now, { read, write });
-      body.querySelector('#nas-ov-io-val').innerHTML =
-        `<span class="sw primary"></span>${escapeHtml(T('disk.legend_read'))} ${escapeHtml(fmtMBps(read))} MB/s&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('disk.legend_write'))} ${escapeHtml(fmtMBps(write))} MB/s`;
+      // Swatches once, numbers as text: the readout under the chart must not
+      // be torn down and rebuilt on every sample either.
+      const val = body.querySelector('#nas-ov-io-val');
+      patchHtml(val, '<span class="sw primary"></span><span class="v-read"></span><span class="sw info"></span><span class="v-write"></span>');
+      setText(val.querySelector('.v-read'), `${T('disk.legend_read')} ${fmtMBps(read)} MB/s  `);
+      setText(val.querySelector('.v-write'), `${T('disk.legend_write')} ${fmtMBps(write)} MB/s`);
     }
     const temp = body.querySelector('#nas-ov-temp');
     if (temp) {
@@ -775,9 +1176,15 @@ const TentaNasScreen = {
       if (maxTemp != null) sample.max = maxTemp;
       if (avg != null) sample.avg = avg;
       temp.push(now, sample);
-      body.querySelector('#nas-ov-temp-val').innerHTML = maxTemp == null
-        ? escapeHtml(T('overview.temp_none'))
-        : `<span class="sw warning"></span>${escapeHtml(T('overview.temp_max'))} ${maxTemp}°C${hottest ? ` (${escapeHtml(hottest)})` : ''}&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('overview.temp_avg'))} ${Math.round(avg)}°C`;
+      const tval = body.querySelector('#nas-ov-temp-val');
+      if (maxTemp == null) {
+        patchHtml(tval, '<span class="v-max"></span>');
+        setText(tval.querySelector('.v-max'), T('overview.temp_none'));
+      } else {
+        patchHtml(tval, '<span class="sw warning"></span><span class="v-max"></span><span class="sw info"></span><span class="v-avg"></span>');
+        setText(tval.querySelector('.v-max'), `${T('overview.temp_max')} ${maxTemp}°C${hottest ? ` (${hottest})` : ''}  `);
+        setText(tval.querySelector('.v-avg'), `${T('overview.temp_avg')} ${Math.round(avg)}°C`);
+      }
     }
   },
 
@@ -792,6 +1199,7 @@ const TentaNasScreen = {
     this.targetName = target;
     this.targetId = null;
     this.pool = null;
+    this.array = null;
     this.dataset = null;
     this.clearTimers();
     this.setLocation();
@@ -814,6 +1222,7 @@ const TentaNasScreen = {
   // "member of" link); `poolTab` picks the inner tab, `dataset` focuses one
   // row of the datasets/snapshots tab.
   openPool(name, poolTab = 'topology', dataset = null) {
+    this.array = null;
     this.pool = name;
     this.poolTab = poolTab;
     this.dataset = dataset;
@@ -828,25 +1237,63 @@ const TentaNasScreen = {
     this.drawTab();
   },
 
+  openArray(name) {
+    this.array = name || null;
+    this.pool = null;
+    this.dataset = null;
+    this.diskId = null;
+    this.targetId = null;
+    this.tab = 'pools';
+    this.clearTimers();
+    this.setLocation();
+    this.root.querySelector('#nas-tabs')?.setAttribute('value', 'pools');
+    this.drawTab();
+  },
+
   async refreshOverview(body) {
-    let disksRes, jobsRes, alertsRes, poolsRes, arcRes;
+    let disksRes, jobsRes, alertsRes, poolsRes, arcRes, arraysRes;
     try {
-      [disksRes, jobsRes, alertsRes, poolsRes, arcRes] = await Promise.all([
+      [disksRes, jobsRes, alertsRes, poolsRes, arcRes, arraysRes] = await Promise.all([
         this.nas('tentaNasDisksListRequest', {}),
         this.nas('tentaNasJobsListRequest', { limit: 20 }),
         this.nas('tentaNasAlertsListRequest', { includeAcked: false }),
         this.nas('tentaNasPoolsListRequest', {}),
         this.nas('tentaNasArcStatsRequest', {}).catch(() => ({ arc: null })),
+        // An Elastic Array is a pool on this screen: the Pools tab lists both,
+        // and a dashboard that showed only the ZFS half hid a whole pool, its
+        // capacity and its protection state from the screen the admin lands
+        // on. Degraded like ARC and for the same reason: a node without
+        // Elastic support, or one whose array probe fails, must lose the array
+        // rows and NOT the dashboard.
+        this.nas('tentaNasElasticArraysListRequest', {}).catch(() => ({ arrays: [] })),
       ]);
     } catch (e) {
-      if (this.disposed) return;
-      body.innerHTML = `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>`;
+      if (this.disposed || !body.isConnected) return;
+      // A failed poll is a transient fact about ONE request, not a reason to
+      // throw the dashboard away: replacing the body destroyed the charts and
+      // their accumulated history, and returning without re-arming the timer
+      // stopped the overview refreshing for good — the tiles then sat on
+      // whatever the last good poll left until the user changed tabs. Say
+      // what failed in a banner above the dashboard, keep the dashboard, and
+      // keep asking.
+      patchHtml(body.querySelector('#nas-ov-error'),
+        `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>`);
+      this.later(() => this.refreshOverview(body), POLL_OVERVIEW_MS);
       return;
     }
     if (this.disposed || !body.isConnected) return;
+    // The node answered, so retract the banner the last failure raised.
+    patchHtml(body.querySelector('#nas-ov-error'), '');
 
     const disks = disksRes.disks || [];
-    const warned = disks.filter((d) => d.health === 'warning' || d.health === 'critical');
+    // Split, because collapsing them is what made this screen lie: the disks
+    // table and the fleet card both call nvme0n1 an "Awaria", while this tile
+    // announced it as one of "6 ostrzeżeń". Two screens contradicting each
+    // other about the same failing disk is worse than either wording alone.
+    const critical = disks.filter((d) => d.health === 'critical');
+    const warnings = disks.filter((d) => d.health === 'warning');
+    // Failures first, so the delta line below names the worst disk first.
+    const warned = critical.concat(warnings);
     const read = disks.reduce((a, d) => a + (Number(d.io?.readBps) || 0), 0);
     const write = disks.reduce((a, d) => a + (Number(d.io?.writeBps) || 0), 0);
     const iops = Math.round(disks.reduce((a, d) => a + (Number(d.io?.readIops) || 0) + (Number(d.io?.writeIops) || 0), 0));
@@ -859,43 +1306,92 @@ const TentaNasScreen = {
     const running = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
     const alerts = alertsRes.alerts || [];
     const pools = poolsRes.pools || [];
+    // A malformed answer is not a reason to throw the dashboard away, but it is
+    // also not an array list: anything that is not a list counts as none.
+    const arrays = Array.isArray(arraysRes.arrays) ? arraysRes.arrays : [];
     this.overviewPools = pools;
+    this.overviewArrays = arrays;
     this.overviewFreeDisks = poolsRes.freeDisks || [];
-    const cap = pools.reduce((a, p) => a + (Number(p.usableBytes) || 0), 0) || disks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0);
-    const used = pools.reduce((a, p) => a + (Number(p.usedBytes) || 0), 0);
+    // An array reports `usableBytes` / `usedBytes` in the same unit a pool
+    // does, so the two belong in the same total — but only once the node has
+    // actually measured them. `elasticCapacity().measured` is the single test
+    // for that, and an unmeasured array contributes no bytes and is named
+    // separately in the delta line instead of being silently read as zero.
+    const measured = arrays.filter((a) => elasticCapacity(a).measured);
+    const unmeasured = arrays.length - measured.length;
+    const poolCap = pools.reduce((a, p) => a + (Number(p.usableBytes) || 0), 0)
+      + measured.reduce((a, x) => a + Number(x.usableBytes), 0);
+    const cap = poolCap || disks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0);
+    const used = pools.reduce((a, p) => a + (Number(p.usedBytes) || 0), 0)
+      + measured.reduce((a, x) => a + Number(x.usedBytes), 0);
     this.setJobsBadge(jobs);
 
     const kpi = body.querySelector('#nas-ov-kpi');
     if (!kpi) return;
-    kpi.innerHTML = `
-      <tf-stat-card data-kpi="pools" class="clickable" label="${escapeAttr(T('kpi.capacity_total'))}" value="${escapeAttr(fmtBytes(cap))}" icon="database"
-        delta="${escapeAttr(T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools.length }))}"></tf-stat-card>
-      <tf-stat-card data-kpi="disks" class="clickable" label="${escapeAttr(T('kpi.disk_health'))}" value="${warned.length}" suffix="${escapeAttr(T('kpi.warnings_suffix', { n: warned.length }))}" icon="cylinder"
-        ${warned.length
-          ? `accent="warning" delta="${escapeAttr(warned.slice(0, 3).map((d) => `${d.name}: ${d.healthReason}`).join(' · '))}" delta-type="negative"`
-          : `delta="${escapeAttr(T('kpi.disk_health_ok'))}"`}></tf-stat-card>
-      <tf-stat-card label="${escapeAttr(T('kpi.iops'))}" value="${iops}" icon="trend"
-        ${iopsBaseline(iops, disksRes.iopsHourAvg)}></tf-stat-card>
-      <tf-stat-card label="${escapeAttr(T('kpi.throughput'))}" value="${escapeAttr(fmtMBps(read))}" suffix="${escapeAttr(T('kpi.throughput_suffix'))}" icon="zap"
-        delta="${escapeAttr(T('kpi.throughput_delta', { w: fmtMBps(write), lat: latency.toFixed(1) }))}"></tf-stat-card>`;
-    kpi.querySelector('[data-kpi="pools"]').addEventListener('click', () => this.switchTab('pools'));
-    kpi.querySelector('[data-kpi="disks"]').addEventListener('click', () => { this.diskFilter = warned.length ? 'problems' : 'all'; this.switchTab('disks'); });
+    // Read by the tile's click handler, which is wired once and must not
+    // close over the disk list of whichever poll happened to build it.
+    this.overviewWarned = warned.length;
+    const built = paintStatCards(kpi, [
+      { key: 'pools', className: 'clickable', attrs: {
+        label: T('kpi.capacity_total'), value: fmtBytes(cap), icon: 'database',
+        delta: [
+          T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools.length + arrays.length }),
+          unmeasured ? T('kpi.capacity_unmeasured', { n: unmeasured }) : null,
+        ].filter(Boolean).join(' · '),
+      } },
+      { key: 'disks', className: 'clickable', attrs: {
+        label: T('kpi.disk_health'), icon: 'cylinder',
+        // The worst state leads. The rest stays reachable: the delta line below
+        // names up to three problem disks with their reasons, and the tile is
+        // clickable straight into the disks tab filtered to problems.
+        value: String(critical.length || warnings.length),
+        suffix: critical.length
+          ? T('kpi.failures_suffix', { n: critical.length })
+          : T('kpi.warnings_suffix', { n: warnings.length }),
+        // `danger` is one of the FOUR accents tf-stat-card accepts
+        // (success | danger | warning | info, tf-stat-card.js:10). Any other
+        // word is silently dropped and the tile renders with no accent at all,
+        // which is how a red state would quietly become an ordinary one.
+        accent: critical.length ? 'danger' : warnings.length ? 'warning' : null,
+        delta: warned.length
+          ? warned.slice(0, 3).map((d) => `${d.name}: ${d.healthReason}`).join(' · ')
+          : T('kpi.disk_health_ok'),
+        // Same trap one field down, and it had caught us: `delta-type` has its
+        // OWN allowlist (up | down | warn | neutral, tf-stat-card.js:11) and
+        // 'negative' is not in it, so the tile fell back to `neutral` — no ⚠,
+        // no warn colour — on three of the eight KPI tiles.
+        'delta-type': warned.length ? 'warn' : null,
+      } },
+      { key: 'iops', attrs: { label: T('kpi.iops'), value: String(iops), icon: 'trend', ...iopsBaseline(iops, disksRes.iopsHourAvg) } },
+      { key: 'throughput', attrs: {
+        label: T('kpi.throughput'), value: fmtMBps(read), suffix: T('kpi.throughput_suffix'), icon: 'zap',
+        delta: T('kpi.throughput_delta', { w: fmtMBps(write), lat: latency.toFixed(1) }),
+      } },
+    ]);
+    if (built) {
+      kpi.querySelector('[data-kpi="pools"]').addEventListener('click', () => this.switchTab('pools'));
+      kpi.querySelector('[data-kpi="disks"]').addEventListener('click', () => { this.diskFilter = this.overviewWarned ? 'problems' : 'all'; this.switchTab('disks'); });
+    }
 
     this.pushOverviewSamples(body, disks, read, write, maxTemp, hottest);
 
-    body.querySelector('#nas-ov-telemetry').innerHTML = this.telemetryAlertHtml(disksRes.telemetry);
-    this.wireTelemetryAlert(body.querySelector('#nas-ov-telemetry'));
+    this.paintTelemetryAlert(body.querySelector('#nas-ov-telemetry'), disksRes.telemetry);
 
     this.paintArcCard(body, arcRes.arc);
-    this.paintPoolsMini(body, pools);
+    this.paintPoolsMini(body, pools, arrays);
+    this.paintTiering(body, arrays);
 
-    body.querySelector('#nas-ov-alerts-count').setAttribute('label', String(alerts.length));
-    body.querySelector('#nas-ov-alerts-count').setAttribute('status', alerts.length ? 'err' : 'neutral');
+    // tf-chip._update() empties its span and rebuilds it, so a raw setAttribute
+    // with an unchanged value blinked this counter on every 5 s poll.
+    const alertsCount = body.querySelector('#nas-ov-alerts-count');
+    setAttr(alertsCount, 'label', String(alerts.length));
+    setAttr(alertsCount, 'status', alerts.length ? 'err' : 'neutral');
     this.renderAlertList(body.querySelector('#nas-ov-alerts'), alerts, () => this.refreshOverview(body));
 
     const jobsEl = body.querySelector('#nas-ov-jobs');
-    jobsEl.innerHTML = running.map((j) => this.jobRowHtml(j)).join('');
-    this.wireJobRows(jobsEl, () => this.refreshOverview(body));
+    if (patchHtml(jobsEl, running.map((j) => this.jobRowHtml(j)).join(''))) {
+      this.wireJobRows(jobsEl, () => this.refreshOverview(body));
+    }
 
     this.later(() => this.refreshOverview(body), POLL_OVERVIEW_MS);
   },
@@ -907,8 +1403,8 @@ const TentaNasScreen = {
     const actions = body.querySelector('#nas-ov-arc-actions');
     if (!host || !actions) return;
     if (!arc) {
-      host.innerHTML = `<div class="muted">${escapeHtml(T('arc.unavailable'))}</div>`;
-      actions.innerHTML = '';
+      patchHtml(host, `<div class="muted">${escapeHtml(T('arc.unavailable'))}</div>`);
+      patchHtml(actions, '');
       return;
     }
     const ramPct = arc.ramBytes ? Math.round((Number(arc.maxBytes) || 0) / Number(arc.ramBytes) * 100) : 0;
@@ -929,25 +1425,93 @@ const TentaNasScreen = {
           ? `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))} — <a data-act="arc-l2arc">${escapeHtml(T('arc.l2arc_add', { pool: biggest.name }))}</a></span>`
           : `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))}</span>`],
     ];
-    host.innerHTML = `
+    const changed = patchHtml(host, `
       <div class="arc-flex">
         ${donutHtml(arc.hitRatio, T('arc.hit_ratio'))}
         <div class="stat-rows" style="flex:1">${rows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('')}</div>
-      </div>`;
-    actions.innerHTML = `<tf-button variant="ghost" size="sm" icon="settings" data-act="arc-limit">${escapeHtml(T('arc.change_limit', { pct: ramPct }))}</tf-button>`;
-    actions.querySelector('[data-act="arc-limit"]').addEventListener('click', () => this.switchTab('environment'));
-    host.querySelector('[data-act="arc-l2arc"]')?.addEventListener('click', () => this.openPool(biggest.name));
+      </div>`);
+    if (changed) host.querySelector('[data-act="arc-l2arc"]')?.addEventListener('click', () => this.openPool(biggest.name));
+    if (patchHtml(actions, `<tf-button variant="ghost" size="sm" icon="settings" data-act="arc-limit">${escapeHtml(T('arc.change_limit', { pct: ramPct }))}</tf-button>`)) {
+      actions.querySelector('[data-act="arc-limit"]').addEventListener('click', () => this.switchTab('environment'));
+    }
   },
 
   // n02 pool mini-list: name + state, the one-line topology and the fill bar.
-  paintPoolsMini(body, pools) {
-    const host = body.querySelector('#nas-ov-pools');
-    if (!host) return;
-    if (!pools.length) {
-      host.innerHTML = `<div class="muted">${escapeHtml(T('pools.empty_title'))}</div>`;
+  // Both kinds of pool live here, ZFS first and then the Elastic Arrays, in
+  // ONE patched string: an unchanged poll compares equal and writes nothing,
+  // so every row on screen survives it as the same node.
+  // n02's tiering card. Every figure here was already measured, already on
+  // the wire and read by NOTHING: `cacheUnprotectedBytes` in particular is the
+  // canonical "18 GiB na cache bez parity" the spec asks for in several
+  // places and no screen has ever shown.
+  //
+  // What the mockup draws and this does NOT: a share spanning a fast ZFS
+  // dataset and an archive pool, and a write-cache hit ratio. Neither exists
+  // in the product — cross-pool tiering is a storage model, not a panel, and
+  // nothing measures the hit ratio. Inventing either here would put a number
+  // on the dashboard that no code stands behind.
+  paintTiering(body, arrays = []) {
+    const row = body.querySelector('#nas-ov-arc-row');
+    const card = body.querySelector('#nas-ov-tier-card');
+    const host = body.querySelector('#nas-ov-tier');
+    if (!card || !host) return;
+    // Only an array with a cache tier has tiering to describe.
+    const tiered = arrays.filter((a) => a && Number(a.cacheSizeBytes) > 0);
+    card.hidden = tiered.length === 0;
+    setAttr(row, 'data-single', tiered.length ? null : '1');
+    if (!tiered.length) {
+      patchKeyedList(host, []);
       return;
     }
-    host.innerHTML = pools.map((p) => `
+    patchKeyedList(host, tiered.map((a) => ({ key: a.name, html: this.tierBlockHtml(a) })));
+  },
+
+  tierBlockHtml(a) {
+    // `Number(null)` is 0, not NaN, so an `Number.isFinite` guard alone turns
+    // "not measured" into "zero used" — the one conflation this protocol has
+    // its own test for. Absence is checked BEFORE the conversion.
+    const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+    const cacheUsed = num(a.cacheUsedBytes);
+    const dataUsed = num(a.usedBytes);
+    // A bar drawn from a half-known split is worse than no bar: it looks like
+    // a measurement. Both sides or neither, the rule this file already applies
+    // to the capacity KPI.
+    const bar = cacheUsed !== null && dataUsed !== null && cacheUsed + dataUsed > 0
+      ? (() => {
+        const total = cacheUsed + dataUsed;
+        const cachePct = Math.round((cacheUsed / total) * 100);
+        return `<div class="split-bar" title="${escapeAttr(T('tiering.bar_title', {
+          cache: fmtBytes(cacheUsed), data: fmtBytes(dataUsed),
+        }))}"><span style="width:${cachePct}%"></span><span class="warn" style="width:${100 - cachePct}%"></span></div>`;
+      })()
+      : '';
+    const waiting = a.protection?.cacheUnprotectedBytes;
+    const run = (a.moverHistory || [])[0] || null;
+    const runText = run
+      ? `${fmtAgo(run.startedAt)} · ${fmtBytes(Number(run.movedBytes) || 0)} · ${T('tiering.files', { n: Number(run.movedFiles) || 0 })}`
+      : T('tiering.no_runs');
+    const sr = (k, v, cls = '') => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v ${cls}">${escapeHtml(v)}</span></div>`;
+    return `<div class="tier-block" data-array="${escapeAttr(a.name)}">
+      <div class="text-3">${escapeHtml(T('tiering.subtitle', { name: a.name }))}</div>
+      ${bar}
+      <div class="stat-rows mt-sm">
+        ${sr(T('tiering.cache_tier'), `${fmtOptionalBytes(a.cacheUsedBytes)} / ${fmtOptionalBytes(a.cacheSizeBytes)}`)}
+        ${sr(T('tiering.data_tier'), `${fmtOptionalBytes(a.usedBytes)} / ${fmtOptionalBytes(a.usableBytes)}`)}
+        ${sr(T('tiering.waiting'), fmtOptionalBytes(waiting), Number(waiting) > 0 ? 'num-warn' : '')}
+        ${sr(T('elastic.mover_last_run'), runText)}
+      </div>
+      <div class="muted mt-sm">${escapeHtml(T('tiering.waiting_hint'))}</div>
+    </div>`;
+  },
+
+  paintPoolsMini(body, pools, arrays = []) {
+    const host = body.querySelector('#nas-ov-pools');
+    if (!host) return;
+    if (!pools.length && !arrays.length) {
+      patchHtml(host, `<div class="muted">${escapeHtml(T('pools.empty_title'))}</div>`);
+      return;
+    }
+    const html = pools.map((p) => `
       <div class="pool-mini" data-pool="${escapeAttr(p.name)}">
         <div class="pm-ico">${sprite('layers')}</div>
         <div class="pm-main">
@@ -956,23 +1520,104 @@ const TentaNasScreen = {
           <tf-progress-bar value="${pct(p.usedBytes, p.usableBytes)}" size="sm" tone="accent"></tf-progress-bar>
         </div>
         <div class="kv-inline"><span class="v">${escapeHtml(fmtBytes(p.usedBytes))} / ${escapeHtml(fmtBytes(p.usableBytes))}</span></div>
-      </div>`).join('');
+      </div>`).join('') + arrays.map((a) => arrayMiniHtml(a)).join('');
+    if (!patchHtml(host, html)) return;
     host.querySelectorAll('.pool-mini[data-pool]').forEach((el) => el.addEventListener('click', () => this.openPool(el.dataset.pool)));
+    // `data-array`, so the click lands on the ARRAY detail (n11) and not on a
+    // ZFS pool route that has no such pool to open.
+    host.querySelectorAll('.pool-mini[data-array]').forEach((el) => el.addEventListener('click', () => this.openArray(el.dataset.array)));
   },
 
-  telemetryAlertHtml(t) {
-    if (!t || t.smartState === 'live') return '';
-    if (t.smartState === 'stale_unarmed') {
-      return `<tf-alert tone="warning" title="${escapeAttr(T('telemetry.stale_title'))}" message="${escapeAttr(T('telemetry.stale_msg', { t: t.smartReadAt ? fmtAgo(t.smartReadAt) : T('never') }))}">
-        ${this.isAdmin ? `<div slot="actions"><tf-button size="sm" variant="primary" icon="unlock" data-act="arm">${escapeHtml(T('elevation.arm'))}</tf-button></div>` : ''}
-      </tf-alert>`;
+  // What the disk-telemetry banner should say, or null when SMART is live and
+  // there is nothing to say. Kept apart from the painting so a poll compares
+  // STATES instead of comparing markup.
+  telemetryAlertSpec(t) {
+    // The wire says `pending` | `unarmed` | `ok` | `partial` (disks.rs:900,
+    // :1104, :1142, :1145). This screen compared against 'live' and
+    // 'stale_unarmed', which the server never emits, so the first test never
+    // matched, the second was dead code, and every poll fell through to
+    // "SMART niedostępny" — on a machine whose SMART was entirely healthy.
+    if (!t) return null;
+    // `ok` = every disk was read. `pending` = the first probe has not run yet,
+    // so there is nothing to report and saying so would itself blink.
+    if (t.smartState === 'ok' || t.smartState === 'pending') return null;
+    if (t.smartState === 'unarmed') {
+      return {
+        kind: this.isAdmin ? 'stale:arm' : 'stale',
+        tone: 'warning',
+        title: T('telemetry.stale_title'),
+        message: T('telemetry.stale_msg', { t: t.smartReadAt ? fmtAgo(t.smartReadAt) : T('never') }),
+        action: this.isAdmin
+          ? { variant: 'primary', icon: 'unlock', label: T('elevation.arm'), run: () => this.openChannelWizard() }
+          : null,
+      };
     }
-    return `<tf-alert tone="info" title="${escapeAttr(T('telemetry.unavailable_title'))}" message="${escapeAttr(t.detail || '')}"></tf-alert>`;
+    const missing = this.missingSmartFeature();
+    return {
+      kind: missing ? `unavailable:install:${missing.id}` : 'unavailable',
+      tone: 'info',
+      // `partial` means SMART read the rest of the disks and failed only on the
+      // ones `detail` names — calling that "unavailable" overstates it, because
+      // the tab is not blind, it is blind to part of the fleet. Any other value
+      // is genuinely unknown to this screen and keeps the blunt title.
+      // `kind` deliberately stays as it is: it drives the element rebuild, and
+      // only the ACTION may force one. The title is written through setAttr,
+      // which skips an unchanged value, so varying it costs no churn.
+      title: T(t.smartState === 'partial' ? 'telemetry.partial_title' : 'telemetry.unavailable_title'),
+      message: t.detail || '',
+      // "Jak brakuje pakietu, to powinna być możliwość doinstalowania" — the
+      // same route the Environment tab's per-feature button takes, so there is
+      // one install path, not two.
+      action: missing
+        ? { variant: 'primary', icon: 'download', label: T('env.install_sudo'), run: () => this.installFeature(missing) }
+        : null,
+    };
   },
 
-  wireTelemetryAlert(el) {
-    const btn = el && el.querySelector('[data-act="arm"]');
-    if (btn) btn.addEventListener('click', () => this.openChannelWizard());
+  // The SMART package, but only when the node's own probe reports it absent
+  // AND the node has a package manager to install it with (n16). Anything
+  // else — including SMART failing on part of the disks — is not a missing
+  // package and gets no install button.
+  missingSmartFeature() {
+    if (!this.isAdmin || !this.environment?.packageManager) return null;
+    return (this.environment.features || []).find((f) => f.id === SMART_FEATURE_ID
+      && FEATURE_ABSENT.has(f.status)
+      && (f.packages || []).length > 0) || null;
+  },
+
+  // The banner is ONE <tf-alert> that lives in `host`: an unchanged poll
+  // writes nothing at all, and a changed one sets attributes on the element
+  // already on screen. Rebuilding it every 5 s is what made it blink.
+  paintTelemetryAlert(host, t) {
+    if (!host) return;
+    const spec = this.telemetryAlertSpec(t);
+    if (!spec) {
+      if (host.firstChild) { host.replaceChildren(); host.__tfAlertKind = null; }
+      return;
+    }
+    let alert = host.firstElementChild;
+    // tf-alert captures its slotted actions once, at build time, so only a
+    // change of KIND (which decides the action) rebuilds the element.
+    if (!alert || host.__tfAlertKind !== spec.kind) {
+      host.__tfAlertKind = spec.kind;
+      alert = document.createElement('tf-alert');
+      if (spec.action) {
+        const actions = document.createElement('div');
+        actions.setAttribute('slot', 'actions');
+        const btn = document.createElement('tf-button');
+        btn.setAttribute('size', 'sm');
+        btn.setAttribute('variant', spec.action.variant);
+        btn.setAttribute('icon', spec.action.icon);
+        btn.textContent = spec.action.label;
+        btn.addEventListener('click', spec.action.run);
+        actions.appendChild(btn);
+        alert.appendChild(actions);
+      }
+      host.replaceChildren(alert);
+    }
+    setAttr(alert, 'tone', spec.tone);
+    setAttr(alert, 'title', spec.title);
+    setAttr(alert, 'message', spec.message);
   },
 
   // Every row ends with the same drill-down the fleet alert table offers
@@ -980,10 +1625,10 @@ const TentaNasScreen = {
   // "Potwierdź" staying the ghost action next to it (n02).
   renderAlertList(el, alerts, onChange) {
     if (!alerts.length) {
-      el.innerHTML = `<div class="muted">${escapeHtml(T('alerts.none'))}</div>`;
+      patchHtml(el, `<div class="muted">${escapeHtml(T('alerts.none'))}</div>`);
       return;
     }
-    el.innerHTML = alerts.map((a, i) => {
+    const html = alerts.map((a, i) => {
       const target = alertTarget(a);
       return `
       <div class="alert-row ${escapeAttr(a.severity)} ${a.ackedAt ? 'acked' : ''}">
@@ -996,6 +1641,7 @@ const TentaNasScreen = {
         <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${i}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
       </div>`;
     }).join('');
+    if (!patchHtml(el, html)) return;
     el.querySelectorAll('[data-ack]').forEach((b) => b.addEventListener('click', async () => {
       try {
         await this.nas('tentaNasAlertAckRequest', { alertId: b.dataset.ack });
@@ -1060,7 +1706,19 @@ const TentaNasScreen = {
     body.querySelector('[data-act="smart-bulk"]').addEventListener('click', () => this.startSmartTestBulk());
 
     const table = body.querySelector('#nas-disk-table');
-    table.rowActions = (row) => {
+    // The disk poll runs every 5 s and moves temperature, throughput and
+    // latency — none of which the action buttons render or their handlers read.
+    // This signature lists everything they DO depend on: `diskId` (the row's
+    // identity, and what every handler sends to the core), `name` (the toasts),
+    // `role` (which of the "use in pool" and "clear disk" buttons exists) and
+    // `locateActive` (the locate icon). Nothing the builder below touches is
+    // missing, so a kept element can never act on a stale disk.
+    table.rowActionsKey = (row) => {
+      const d = row._disk;
+      return `${d.diskId}|${d.name}|${d.role}|${d.locateActive ? 1 : 0}`;
+    };
+    table.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const d = row._disk;
       const wrap = document.createElement('div');
       wrap.className = 'row-actions';
@@ -1068,11 +1726,17 @@ const TentaNasScreen = {
         <tf-button size="sm" variant="ghost" icon="${d.locateActive ? 'eye' : 'search'}" data-act="locate" title="${escapeAttr(T('disks.locate'))}"></tf-button>
         <tf-button size="sm" variant="ghost" icon="play" data-act="smart" title="${escapeAttr(T('disks.smart_test'))}"></tf-button>
         ${d.role === 'free' ? `<tf-button size="sm" variant="ghost" icon="layers" data-act="use" title="${escapeAttr(T('disks.use_in_pool'))}"></tf-button>` : ''}
+        ${d.role === 'used' ? `<tf-button size="sm" variant="ghost" icon="trash" data-act="wipe" title="${escapeAttr(T('disks.wipe'))}"></tf-button>` : ''}
         <tf-button size="sm" variant="secondary" icon="chevron-right" data-act="details">${escapeHtml(T('disks.details'))}</tf-button>`;
-      wrap.querySelector('[data-act="details"]').addEventListener('click', (e) => { e.stopPropagation(); this.openDisk(d.diskId); });
-      wrap.querySelector('[data-act="locate"]').addEventListener('click', (e) => { e.stopPropagation(); this.locateDisk(d, !d.locateActive); });
-      wrap.querySelector('[data-act="smart"]').addEventListener('click', (e) => { e.stopPropagation(); this.startSmartTest(d); });
+      wrap.querySelector('[data-act="details"]').addEventListener('click', (e) => { e.stopPropagation(); this.openDisk(live()._disk.diskId); });
+      wrap.querySelector('[data-act="locate"]').addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._disk; this.locateDisk(cur, !cur.locateActive); });
+      wrap.querySelector('[data-act="smart"]').addEventListener('click', (e) => { e.stopPropagation(); this.startSmartTest(live()._disk); });
       wrap.querySelector('[data-act="use"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.openPoolWizardForDisk(); });
+      // `live()` and not `d`: the plan is read for the disk sitting in THIS
+      // row at click time. A kept actions cell survives a sort or a filter,
+      // and a wipe is the one action where acting on the row a poll ago would
+      // erase the wrong device.
+      wrap.querySelector('[data-act="wipe"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.wipeDisk(live()._disk); });
       return wrap;
     };
     table.addEventListener('row-click', (e) => this.openDisk(e.detail.row._disk.diskId));
@@ -1094,18 +1758,51 @@ const TentaNasScreen = {
     await this.refreshDisks(body);
   },
 
+  // n03 row action for a disk whose role is the catch-all `used`: it carries
+  // a filesystem signature, belongs to no pool and no array this node records,
+  // and therefore cannot be offered to either until it is cleared.
+  async wipeDisk(disk) {
+    if (!disk?.diskId) return;
+    try {
+      // The Disks tab is repainted from a fresh list so the cleared disk
+      // reads as free without waiting out a poll — but only while the tab is
+      // still on screen, because `refreshDisks` reads the surface it paints.
+      await openDiskWipeDialog(this, disk, () => {
+        const surface = this.root.querySelector('#nas-tab-body')?.firstElementChild;
+        if (surface?.isConnected) this.refreshDisks(surface);
+      });
+    } catch (e) {
+      toast(T('wipe_disk.failed', { error: errMessage(e) }), 'error');
+    }
+  },
+
   async openPoolWizardForDisk() {
+    const nodeId = this.currentNode()?.nodeId;
+    const surface = this.root.querySelector('#nas-tab-body')?.firstElementChild;
+    const isCurrent = () => !this.disposed && surface?.isConnected && this.currentNode()?.nodeId === nodeId;
     const res = await this.nas('tentaNasPoolsListRequest', {}).catch((e) => { toast(errMessage(e), 'error'); return null; });
-    if (!res) return;
-    openPoolWizard(this, { freeDisks: res.freeDisks || [], pools: res.pools || [], onDone: () => this.drawTab() });
+    if (!isCurrent()) return;
+    openPoolWizard(this, { freeDisks: res?.freeDisks || [], pools: res?.pools || [], isCurrent,
+      onDone: () => { if (isCurrent()) this.drawTab(); },
+      onCreated: ({ name, outcome }) => {
+        if (!isCurrent()) return;
+        if (outcome === 'approval') this.switchTab('jobs');
+        else this.openArray(outcome === 'job' ? name : null);
+      },
+    });
   },
 
   paintSmartBulkButton() {
     const btn = this.root.querySelector('[data-act="smart-bulk"]');
     if (!btn) return;
     const n = this.diskSelection.size;
-    btn.textContent = T('disks.smart_selected', { n });
-    if (n) btn.removeAttribute('disabled'); else btn.setAttribute('disabled', '');
+    // This runs on every disks poll (applyDiskRows), and both writes used to be
+    // unconditional: `textContent =` replaces the text node, and an identical
+    // `setAttribute` still fires attributeChangedCallback, so tf-button rebuilt
+    // its insides every tick. Measured on the live page: the toolbar label
+    // appeared under 6 different node identities in 21 s.
+    setText(btn, T('disks.smart_selected', { n }));
+    setAttr(btn, 'disabled', n ? null : true);
   },
 
   // One password for the whole batch: the prompt appears once and every
@@ -1130,9 +1827,7 @@ const TentaNasScreen = {
       if (this.disposed || !body.isConnected) return;
       this.disks = res.disks || [];
       this.telemetry = res.telemetry;
-      const tel = body.querySelector('#nas-disks-telemetry');
-      tel.innerHTML = this.telemetryAlertHtml(res.telemetry);
-      this.wireTelemetryAlert(tel);
+      this.paintTelemetryAlert(body.querySelector('#nas-disks-telemetry'), res.telemetry);
       this.paintReplacementAdvice(body.querySelector('#nas-disk-advice'), res.advice || []);
       this.applyDiskRows();
     } catch (e) {
@@ -1150,8 +1845,8 @@ const TentaNasScreen = {
    */
   paintReplacementAdvice(host, advice) {
     if (!host) return;
-    if (!advice.length) { host.innerHTML = ''; return; }
-    host.innerHTML = `
+    if (!advice.length) { patchHtml(host, ''); return; }
+    const html = `
       <div class="section-card">
         <div class="section-card-head">
           <div class="title">${sprite('alert')} ${escapeHtml(T('replace_advice.title'))} <tf-chip size="sm" status="warn" label="${escapeAttr(String(advice.length))}"></tf-chip></div>
@@ -1170,6 +1865,7 @@ const TentaNasScreen = {
             </span>
           </div>`).join('')}</div>
       </div>`;
+    if (!patchHtml(host, html)) return;
     host.querySelectorAll('[data-advice]').forEach((row) => {
       row.querySelector('[data-act="advice-open"]')?.addEventListener('click', () => this.openDisk(row.dataset.advice));
     });
@@ -1177,6 +1873,12 @@ const TentaNasScreen = {
 
   // The filter chips carry their own counts and the pool selector is built
   // from what the node actually reports, so an empty pool never gets a segment.
+  //
+  // This runs on EVERY disk poll (5 s), not once per entry: `applyDiskRows`
+  // calls it, and the counts in the chip labels are exactly what a poll moves.
+  // Neither half may rebuild its DOM on an unchanged poll — the pool selector
+  // is guarded by `diskPoolSig` below, and the chip bar by tf-filter-chips
+  // itself, which skips a render identical to the one already on screen.
   paintDiskFilters() {
     const all = this.disks || [];
     const counts = {
@@ -1246,8 +1948,15 @@ const TentaNasScreen = {
 
   openDisk(diskId) {
     this.diskId = diskId;
+    this.array = null;
+    this.pool = null;
+    this.dataset = null;
+    this.targetId = null;
+    this.tab = 'disks';
     this.clearTimers();
     this.setLocation();
+    const tabs = this.root.querySelector('#nas-tabs');
+    if (tabs) tabs.value = 'disks';
     this.drawTab();
   },
 
@@ -1281,11 +1990,28 @@ const TentaNasScreen = {
   // Disk detail (n04)
   // ---------------------------------------------------------------------------
 
+  // Builds n04 ONCE — the split drawDisks/refreshDisks already use. This method
+  // owns the markup and the listeners; every value a poll can move lives in a
+  // host it leaves empty for the paint to write. It is the screen the admin
+  // watches SMART and temperature on, so it polls like every other live view
+  // instead of standing still until the user navigates away and back.
+  //
+  // The SMART self-test cadence is read HERE and nowhere else: it is
+  // configuration, it moves only through the schedule editor, and that editor
+  // redraws the tab. Re-asking for it every five seconds buys nothing.
   async drawDiskDetail(body) {
     body.innerHTML = `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`;
-    let res;
+    // Nothing is described yet, and the pool read kept for the disk left
+    // behind must not be adopted by this one.
+    this.diskDetail = null;
+    let res, schedRes;
     try {
-      res = await this.nas('tentaNasDiskGetRequest', { diskId: this.diskId });
+      [res, schedRes] = await Promise.all([
+        this.nas('tentaNasDiskGetRequest', { diskId: this.diskId }),
+        // The cadence pills are an ornament: a node that cannot answer this
+        // still gets the whole disk.
+        this.nas('tentaNasSchedulesListRequest', {}).catch(() => null),
+      ]);
     } catch (e) {
       if (this.disposed || !body.isConnected) return;
       body.innerHTML = `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>`;
@@ -1293,34 +2019,12 @@ const TentaNasScreen = {
     }
     if (this.disposed || !body.isConnected) return;
     const d = res.disk;
-    const attrs = res.attributes || [];
-    const tests = res.selfTests || [];
-    const history = res.history || [];
-    const historyDays = Number(res.historyDays) || 0;
-    // The pool's own error counters and the SMART self-test cadence come from
-    // two more reads; neither is fatal for the page.
-    const [poolRes, schedRes] = await Promise.all([
-      d.memberOf ? this.nas('tentaNasPoolGetRequest', { name: d.memberOf }).catch(() => null) : Promise.resolve(null),
-      this.nas('tentaNasSchedulesListRequest', {}).catch(() => null),
-    ]);
-    if (this.disposed || !body.isConnected) return;
-    const pool = poolRes?.pool || null;
-    const vdev = pool ? (pool.vdevs || []).find((v) => (v.disks || []).some((x) => x.diskId === d.diskId || x.name === d.name)) : null;
-    const leaf = vdev ? (vdev.disks || []).find((x) => x.diskId === d.diskId || x.name === d.name) : null;
     const smart = schedRes?.smart || null;
-    // The replacement recommendation for THIS disk (§5.10), computed by the
-    // node from its own history; `null` when there is nothing to recommend.
-    const advice = res.advice || null;
 
-    const field = (k, v) => `<div class="f"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div></div>`;
-    const counter = (n) => `<span class="${Number(n) > 0 ? 'num-err' : 'num-ok'}">${Number(n) || 0}</span>`;
-    // n04:175 names the symptom next to the status ("Uwaga: realokacje"). The
-    // core joins several symptoms with "; " — only the first one fits a chip,
-    // the whole list stays in the "Dlaczego status…" box below.
-    const health = healthChip(d.health);
-    const healthLabel = d.healthReason
-      ? T('disk.health_chip', { status: health.label, reason: String(d.healthReason).split(';')[0].trim() })
-      : health.label;
+    // Labels are fixed, values are not: every field is a `k`/`v` pair whose
+    // `v` is addressed by name and written by the paint, so one counter moving
+    // cannot rebuild the grid it sits in.
+    const field = (label, id) => `<div class="f"><div class="k">${escapeHtml(label)}</div><div class="v" data-f="${escapeAttr(id)}"></div></div>`;
 
     body.innerHTML = `
       <div class="stack">
@@ -1328,29 +2032,30 @@ const TentaNasScreen = {
           { label: T('tabs.disks'), act: 'disks', query: `node=${this.nodeId}&tab=disks` },
           { label: d.name },
         ])}
+        <div id="nas-dd-error"></div>
         <div class="section-card">
           <div class="section-card-head">
             <div class="title">${sprite('cylinder')} ${escapeHtml(T('disk.identification'))}</div>
-            <tf-chip status="${health.status}" dot label="${escapeAttr(healthLabel)}"></tf-chip>
+            <tf-chip id="nas-dd-health" dot></tf-chip>
           </div>
           <div class="id-grid">
             <div class="id-badge">${sprite('cylinder')}<span class="k">${escapeHtml(d.kind)}</span></div>
             <div class="id-fields">
-              ${field(T('disks.col_device'), d.name)}
-              ${field(T('disk.serial'), d.serial || '—')}
-              ${field('WWN', d.wwn || '—')}
-              ${field(T('disk.model'), `${d.model || '—'} · ${fmtBytes(d.sizeBytes)}`)}
-              ${field(T('disk.path'), d.path)}
-              ${field(T('disk.firmware'), d.firmware || '—')}
-              ${field(T('disk.transport'), `${d.transport}${d.rotational ? ` · ${T('disk.rotational')}` : ''}${d.removable ? ` · ${T('disk.removable')}` : ''}`)}
-              ${field(T('disks.col_role'), roleChipLabel(d))}
-              ${field(T('disk.power_on'), d.powerOnHours == null ? '—' : fmtDuration(d.powerOnHours * 3600))}
-              ${field(T('disk.mountpoints'), d.mountpoints && d.mountpoints.length ? d.mountpoints.join(', ') : '—')}
-              ${field(T('disk.reallocated'), d.reallocatedSectors == null ? '—' : String(d.reallocatedSectors))}
-              ${field(T('disk.pending'), d.pendingSectors == null ? '—' : String(d.pendingSectors))}
-              ${field(T('disk.crc'), d.crcErrors == null ? '—' : String(d.crcErrors))}
-              ${field(T('disk.media_errors'), d.mediaErrors == null ? '—' : String(d.mediaErrors))}
-              ${field(T('disks.col_wear'), d.wearPct == null ? '—' : `${d.wearPct}%`)}
+              ${field(T('disks.col_device'), 'device')}
+              ${field(T('disk.serial'), 'serial')}
+              ${field('WWN', 'wwn')}
+              ${field(T('disk.model'), 'model')}
+              ${field(T('disk.path'), 'path')}
+              ${field(T('disk.firmware'), 'firmware')}
+              ${field(T('disk.transport'), 'transport')}
+              ${field(T('disks.col_role'), 'role')}
+              ${field(T('disk.power_on'), 'power_on')}
+              ${field(T('disk.mountpoints'), 'mountpoints')}
+              ${field(T('disk.reallocated'), 'reallocated')}
+              ${field(T('disk.pending'), 'pending')}
+              ${field(T('disk.crc'), 'crc')}
+              ${field(T('disk.media_errors'), 'media_errors')}
+              ${field(T('disks.col_wear'), 'wear')}
             </div>
             <div class="row">
               <tf-button variant="primary" icon="search" data-act="locate">${escapeHtml(T('disks.locate'))}</tf-button>
@@ -1361,56 +2066,32 @@ const TentaNasScreen = {
         </div>
         <div class="grid-2">
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('info')} ${escapeHtml(T('disk.why_title', { status: health.label }))}</div></div>
-            <div class="explain-box">${escapeHtml(d.healthReason || T('disk.why_ok'))}</div>
-            ${advice ? warningHtml(advice.severity === 'urgent' ? 'danger' : 'info', T('replace_advice.disk_' + advice.severity, {
-              reason: advice.reason,
-              spare: advice.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare'),
-            })) : ''}
-            <div class="row mt-md">
-              ${d.memberOf ? `<tf-button variant="danger" icon="refresh" data-act="replace">${escapeHtml(T('disk.replace'))}</tf-button>` : ''}
-              <tf-button variant="secondary" icon="play" data-act="smart-short">${escapeHtml(T('disks.smart_short'))}</tf-button>
-              <tf-button variant="secondary" icon="clock" data-act="smart-long">${escapeHtml(T('disks.smart_long'))}</tf-button>
-            </div>
+            <div class="section-card-head"><div class="title">${sprite('info')} <span id="nas-dd-why-title"></span></div></div>
+            <div class="explain-box" id="nas-dd-why"></div>
+            <div id="nas-dd-advice"></div>
+            <div class="row mt-md" id="nas-dd-acts"></div>
           </div>
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('alert')} ${escapeHtml(T('disk.pool_errors_title', { pool: d.memberOf || '—' }))}</div></div>
-            ${pool && leaf ? `
-              <div class="stat-rows">
-                <div class="sr"><span class="k">READ</span><span class="v">${counter(leaf.readErrors)}</span></div>
-                <div class="sr"><span class="k">WRITE</span><span class="v">${counter(leaf.writeErrors)}</span></div>
-                <div class="sr"><span class="k">CKSUM</span><span class="v">${counter(leaf.cksumErrors)}</span></div>
-                <div class="sr"><span class="k">${escapeHtml(T('disk.pool_vdev_state'))}</span><span class="v">${stateChipHtml(leaf.state)} <span class="mono text-3">${escapeHtml(vdev.id)} · ${escapeHtml(layoutLabel(vdev.kind))}</span></span></div>
-                <div class="sr"><span class="k">${escapeHtml(T('disk.pool_last_scrub'))}</span><span class="v">${escapeHtml(pool.lastScrubAt ? T('disk.pool_scrub_value', { t: fmtDate(pool.lastScrubAt), n: Number(pool.scan?.errors) || 0 }) : T('disk.pool_no_scrub'))}</span></div>
-              </div>
-              ${warningHtml('info', T('disk.pool_errors_info'))}
-              <div class="row mt-md"><tf-button variant="ghost" size="sm" icon="layers" data-act="open-pool">${escapeHtml(T('disk.pool_open', { pool: pool.name }))}</tf-button></div>
-            ` : `<div class="muted">${escapeHtml(T('disk.pool_none'))}</div>`}
+            <div class="section-card-head"><div class="title">${sprite('alert')} <span id="nas-dd-pool-title"></span></div></div>
+            <div id="nas-dd-pool"></div>
           </div>
         </div>
         <div class="section-card">
           <div class="section-card-head"><div class="title">${sprite('audit')} ${escapeHtml(T('disk.smart_attributes'))}</div>
-            <span class="hint">${d.smartReadAt ? escapeHtml(T('disk.smart_read', { t: fmtAgo(d.smartReadAt) })) : escapeHtml(T('disk.smart_never'))}${d.smartPassed === false ? ' · ' + escapeHtml(T('disk.smart_failed')) : ''} · ${escapeHtml(T('disk.attr_hint'))}</span></div>
-          ${attrs.length ? `<tf-table id="nas-attr-table">
-            <tf-column key="id" label="ID" renderer="text" width="60"></tf-column>
-            <tf-column key="name" label="${escapeAttr(T('disk.attr_name'))}" renderer="text" fill></tf-column>
-            <tf-column key="value" label="${escapeAttr(T('disk.attr_value'))}" renderer="num"></tf-column>
-            <tf-column key="raw" label="${escapeAttr(T('disk.attr_raw'))}" renderer="text" nowrap></tf-column>
-            <tf-column key="trend" label="${escapeAttr(T('disk.attr_trend'))}" renderer="html" nowrap hide-below="1000"></tf-column>
-            <tf-column key="status" label="${escapeAttr(T('disks.col_health'))}" renderer="chip"></tf-column>
-          </tf-table>` : `<div class="muted">${escapeHtml(d.smartAvailable ? T('disk.smart_no_attrs') : T('disk.smart_unavailable'))}</div>`}
+            <span class="hint" id="nas-dd-smart-hint"></span></div>
+          <div id="nas-dd-attrs"></div>
         </div>
         <div class="grid-2">
           <div class="section-card">
             <div class="chart-head">
-              <div class="ch-title">${sprite('zap')} ${escapeHtml(T('disk.temp_history', { d: historyDays }))}</div>
+              <div class="ch-title">${sprite('zap')} <span id="nas-dd-temp-title"></span></div>
               <div class="ch-val" id="nas-disk-temp-val"></div>
             </div>
             <div id="nas-disk-temp-chart"></div>
           </div>
           <div class="section-card">
             <div class="chart-head">
-              <div class="ch-title">${sprite('alert')} ${escapeHtml(T('disk.realloc_history', { d: historyDays }))}</div>
+              <div class="ch-title">${sprite('alert')} <span id="nas-dd-realloc-title"></span></div>
               <div class="ch-val" id="nas-disk-realloc-val"></div>
             </div>
             <div id="nas-disk-realloc-chart"></div>
@@ -1424,54 +2105,232 @@ const TentaNasScreen = {
               <tf-button variant="ghost" size="sm" icon="edit" data-act="smart-schedule" ${smart ? '' : 'disabled'}>${escapeHtml(T('disk.edit_schedule'))}</tf-button>
             </div>
           </div>
-          ${tests.length ? `<tf-table id="nas-st-table">
-            <tf-column key="date" label="${escapeAttr(T('disk.st_col_date'))}" renderer="text" nowrap width="170"></tf-column>
-            <tf-column key="kind" label="${escapeAttr(T('disk.st_col_kind'))}" renderer="chip" width="100"></tf-column>
-            <tf-column key="result" label="${escapeAttr(T('disk.st_col_result'))}" renderer="html" fill></tf-column>
-            <tf-column key="hours" label="${escapeAttr(T('disk.st_col_hours'))}" renderer="text" nowrap width="150"></tf-column>
-          </tf-table>` : `<div class="muted">${escapeHtml(T('disk.no_self_tests'))}</div>`}
+          <div id="nas-dd-tests"></div>
         </div>
       </div>`;
 
     // The shell header already says "TentaNas › node"; this tail adds
     // "Dyski › sdd", the same shape pool-detail.js uses for "Pule › tank".
     wireCrumbs(body, { disks: () => { this.diskId = null; this.clearTimers(); this.setLocation(); this.drawTab(); } });
-    body.querySelector('[data-act="locate"]').addEventListener('click', () => this.locateDisk(d, !this.locateState?.[d.diskId]));
+    // Wired once, and every handler reads the disk the LATEST poll described —
+    // never the one the button happened to be built with.
+    const live = () => this.diskDetail?.res.disk || d;
+    body.querySelector('[data-act="locate"]').addEventListener('click', () => { const cur = live(); this.locateDisk(cur, !this.locateState?.[cur.diskId]); });
     body.querySelector('[data-act="copy-serial"]').addEventListener('click', async () => {
-      await navigator.clipboard?.writeText(d.serial || '');
+      await navigator.clipboard?.writeText(live().serial || '');
       toast(T('disk.serial_copied'), 'success');
     });
-    body.querySelector('[data-act="smart-short"]').addEventListener('click', () => this.startSmartTest(d, 'short'));
-    body.querySelector('[data-act="smart-long"]').addEventListener('click', () => this.startSmartTest(d, 'long'));
-    body.querySelector('[data-act="replace"]')?.addEventListener('click', () => this.openReplaceForDisk(d));
-    body.querySelector('[data-act="open-pool"]')?.addEventListener('click', () => this.openPool(pool.name));
     body.querySelector('[data-act="smart-schedule"]')?.addEventListener('click', () => openSmartScheduleEditor(this, smart, () => this.drawTab()));
     this.locateState = this.locateState || {};
 
-    const attrTable = body.querySelector('#nas-attr-table');
-    if (attrTable) {
-      attrTable.rows = attrs.map((a) => ({
-        id: String(a.id),
-        name: a.name,
-        value: a.value,
-        raw: a.rawText || String(a.raw),
-        trend: a.rawWeekAgo == null ? '<span class="text-3">—</span>' : trendHtml(a.raw, a.rawWeekAgo),
-        status: { status: a.status === 'ok' ? 'ok' : a.status === 'critical' ? 'err' : a.status === 'warning' ? 'warn' : 'info', label: T('health.' + (['ok', 'warning', 'critical'].includes(a.status) ? a.status : 'unknown')), dot: true },
-      }));
+    // `res` is the read this draw already made: opening a disk must not ask
+    // the same question twice, so the first paint runs on it and only the
+    // polls after it read for themselves.
+    await this.refreshDiskDetail(body, res);
+  },
+
+  // The poll of n04. It re-reads the disk and — when the disk is in a pool —
+  // the pool, because that is where its READ/WRITE/CKSUM counters live; the
+  // SMART cadence read by the draw cannot move underneath it. Then it patches
+  // and re-arms itself, at the cadence of the disks tab it belongs to.
+  async refreshDiskDetail(body, seed = null) {
+    // The screen this chain was armed for is gone (unmounted, or the body now
+    // belongs to another view): there is nothing to patch and nothing to
+    // re-arm. A poll patches; it never redraws what it did not build.
+    if (this.disposed || !body.isConnected || !body.querySelector('#nas-dd-health')) return;
+    let res = seed;
+    if (!res) {
+      try {
+        res = await this.nas('tentaNasDiskGetRequest', { diskId: this.diskId });
+      } catch (e) {
+        if (this.disposed || !body.isConnected) return;
+        // A failed poll is a transient fact about one request, not a reason to
+        // throw a good screen away: the last temperature, health chip and
+        // counters stay exactly where they are, the banner says what failed,
+        // and the screen keeps asking.
+        patchHtml(body.querySelector('#nas-dd-error'),
+          `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>`);
+        this.later(() => this.refreshDiskDetail(body), POLL_DISKS_MS);
+        return;
+      }
+      if (this.disposed || !body.isConnected) return;
     }
-    const stTable = body.querySelector('#nas-st-table');
-    if (stTable) {
-      stTable.rows = tests.map((t) => ({
-        date: t.startedAt ? fmtDate(t.startedAt) : '—',
-        kind: { status: t.kind.toLowerCase().includes('extended') || t.kind.toLowerCase().includes('long') ? 'accent' : 'neutral', label: t.kind },
-        result: `<tf-chip size="sm" status="${t.status === 'passed' ? 'ok' : t.status === 'running' ? 'info' : t.status === 'failed' ? 'err' : 'warn'}" dot label="${escapeAttr(T('disk.st_status_' + (['passed', 'failed', 'running'].includes(t.status) ? t.status : 'unknown')))}"></tf-chip> <span class="text-3">${escapeHtml(t.detail || '')}</span>`,
-        // The SMART self-test log carries the disk's power-on counter at the
-        // test, never the test's own duration — the column says so, and a log
-        // row without the counter shows nothing instead of a bogus "0 h".
-        hours: t.lifetimeHours ? `${t.lifetimeHours} h` : '—',
-      }));
+    const d = res.disk;
+    const poolRes = d.memberOf
+      ? await this.nas('tentaNasPoolGetRequest', { name: d.memberOf }).catch(() => null)
+      : null;
+    if (this.disposed || !body.isConnected) return;
+    // A pool read that failed keeps the counters of the last one that worked:
+    // reading it as "not in a pool" would announce a lost membership that
+    // nothing has reported. A disk that really left its pool has no `memberOf`
+    // any more, and then the kept snapshot goes with it.
+    const prev = this.diskDetail;
+    let pool = poolRes?.pool || null;
+    if (!pool && d.memberOf && prev?.pool?.name === d.memberOf) pool = prev.pool;
+    const vdev = pool ? (pool.vdevs || []).find((v) => (v.disks || []).some((x) => x.diskId === d.diskId || x.name === d.name)) : null;
+    const leaf = vdev ? (vdev.disks || []).find((x) => x.diskId === d.diskId || x.name === d.name) : null;
+    this.diskDetail = { res, pool, vdev, leaf };
+    patchHtml(body.querySelector('#nas-dd-error'), '');
+    this.paintDiskDetail(body);
+    this.later(() => this.refreshDiskDetail(body), POLL_DISKS_MS);
+  },
+
+  // Everything on n04 that a poll can move, written into the screen that is
+  // already there. Values go through setText/setAttr; the two blocks whose
+  // SHAPE depends on the answer (the pool card, the two tables) are patched as
+  // one string each, so their skeleton is written once and only the values
+  // inside it move afterwards.
+  paintDiskDetail(body) {
+    const { res, pool, vdev, leaf } = this.diskDetail;
+    const d = res.disk;
+    const attrs = res.attributes || [];
+    const tests = res.selfTests || [];
+    // The replacement recommendation for THIS disk (§5.10), computed by the
+    // node from its own history; `null` when there is nothing to recommend.
+    const advice = res.advice || null;
+    const setField = (id, value) => setText(body.querySelector(`[data-f="${id}"]`), value);
+
+    // n04:175 names the symptom next to the status ("Uwaga: realokacje"). The
+    // core joins several symptoms with "; " — only the first one fits a chip,
+    // the whole list stays in the "Dlaczego status…" box below.
+    const health = healthChip(d.health);
+    const chip = body.querySelector('#nas-dd-health');
+    setAttr(chip, 'status', health.status);
+    setAttr(chip, 'label', d.healthReason
+      ? T('disk.health_chip', { status: health.label, reason: String(d.healthReason).split(';')[0].trim() })
+      : health.label);
+
+    setField('device', d.name);
+    setField('serial', d.serial || '—');
+    setField('wwn', d.wwn || '—');
+    setField('model', `${d.model || '—'} · ${fmtBytes(d.sizeBytes)}`);
+    setField('path', d.path);
+    setField('firmware', d.firmware || '—');
+    setField('transport', `${d.transport}${d.rotational ? ` · ${T('disk.rotational')}` : ''}${d.removable ? ` · ${T('disk.removable')}` : ''}`);
+    setField('role', roleChipLabel(d));
+    setField('power_on', d.powerOnHours == null ? '—' : fmtDuration(d.powerOnHours * 3600));
+    setField('mountpoints', d.mountpoints && d.mountpoints.length ? d.mountpoints.join(', ') : '—');
+    setField('reallocated', d.reallocatedSectors == null ? '—' : String(d.reallocatedSectors));
+    setField('pending', d.pendingSectors == null ? '—' : String(d.pendingSectors));
+    setField('crc', d.crcErrors == null ? '—' : String(d.crcErrors));
+    setField('media_errors', d.mediaErrors == null ? '—' : String(d.mediaErrors));
+    setField('wear', d.wearPct == null ? '—' : `${d.wearPct}%`);
+
+    setText(body.querySelector('#nas-dd-why-title'), T('disk.why_title', { status: health.label }));
+    setText(body.querySelector('#nas-dd-why'), d.healthReason || T('disk.why_ok'));
+    patchHtml(body.querySelector('#nas-dd-advice'), advice
+      ? warningHtml(advice.severity === 'urgent' ? 'danger' : 'info', T('replace_advice.disk_' + advice.severity, {
+        reason: advice.reason,
+        spare: advice.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare'),
+      }))
+      : '');
+
+    // "Wymień dysk…" exists only for a disk that is IN a pool, so this row is
+    // patched as one string and re-wired exactly when it was rebuilt.
+    const acts = body.querySelector('#nas-dd-acts');
+    if (patchHtml(acts, `
+      ${d.memberOf ? `<tf-button variant="danger" icon="refresh" data-act="replace">${escapeHtml(T('disk.replace'))}</tf-button>` : ''}
+      <tf-button variant="secondary" icon="play" data-act="smart-short">${escapeHtml(T('disks.smart_short'))}</tf-button>
+      <tf-button variant="secondary" icon="clock" data-act="smart-long">${escapeHtml(T('disks.smart_long'))}</tf-button>`)) {
+      acts.querySelector('[data-act="replace"]')?.addEventListener('click', () => this.openReplaceForDisk(this.diskDetail.res.disk));
+      acts.querySelector('[data-act="smart-short"]').addEventListener('click', () => this.startSmartTest(this.diskDetail.res.disk, 'short'));
+      acts.querySelector('[data-act="smart-long"]').addEventListener('click', () => this.startSmartTest(this.diskDetail.res.disk, 'long'));
     }
-    this.drawDiskHistory(body, history);
+
+    setText(body.querySelector('#nas-dd-pool-title'), T('disk.pool_errors_title', { pool: d.memberOf || '—' }));
+    this.paintDiskPoolErrors(body, pool, vdev, leaf);
+
+    setText(body.querySelector('#nas-dd-smart-hint'), [
+      d.smartReadAt ? T('disk.smart_read', { t: fmtAgo(d.smartReadAt) }) : T('disk.smart_never'),
+      d.smartPassed === false ? T('disk.smart_failed') : null,
+      T('disk.attr_hint'),
+    ].filter(Boolean).join(' · '));
+
+    // tf-table has no empty state of its own, so an empty list is a muted
+    // line and the table is not on screen at all; the skeleton is a constant
+    // string, which is why it is written once and the rows then flow into the
+    // element that is already there.
+    const attrsHost = body.querySelector('#nas-dd-attrs');
+    patchHtml(attrsHost, attrs.length ? `<tf-table id="nas-attr-table">
+      <tf-column key="id" label="ID" renderer="text" width="60"></tf-column>
+      <tf-column key="name" label="${escapeAttr(T('disk.attr_name'))}" renderer="text" fill></tf-column>
+      <tf-column key="value" label="${escapeAttr(T('disk.attr_value'))}" renderer="num"></tf-column>
+      <tf-column key="raw" label="${escapeAttr(T('disk.attr_raw'))}" renderer="text" nowrap></tf-column>
+      <tf-column key="trend" label="${escapeAttr(T('disk.attr_trend'))}" renderer="html" nowrap hide-below="1000"></tf-column>
+      <tf-column key="status" label="${escapeAttr(T('disks.col_health'))}" renderer="chip"></tf-column>
+    </tf-table>` : `<div class="muted">${escapeHtml(d.smartAvailable ? T('disk.smart_no_attrs') : T('disk.smart_unavailable'))}</div>`);
+    setTableRows(attrsHost.querySelector('#nas-attr-table'), attrs.map((a) => ({
+      id: String(a.id),
+      name: a.name,
+      value: a.value,
+      raw: a.rawText || String(a.raw),
+      trend: a.rawWeekAgo == null ? '<span class="text-3">—</span>' : trendHtml(a.raw, a.rawWeekAgo),
+      status: { status: a.status === 'ok' ? 'ok' : a.status === 'critical' ? 'err' : a.status === 'warning' ? 'warn' : 'info', label: T('health.' + (['ok', 'warning', 'critical'].includes(a.status) ? a.status : 'unknown')), dot: true },
+    })));
+
+    const testsHost = body.querySelector('#nas-dd-tests');
+    patchHtml(testsHost, tests.length ? `<tf-table id="nas-st-table">
+      <tf-column key="date" label="${escapeAttr(T('disk.st_col_date'))}" renderer="text" nowrap width="170"></tf-column>
+      <tf-column key="kind" label="${escapeAttr(T('disk.st_col_kind'))}" renderer="chip" width="100"></tf-column>
+      <tf-column key="result" label="${escapeAttr(T('disk.st_col_result'))}" renderer="html" fill></tf-column>
+      <tf-column key="hours" label="${escapeAttr(T('disk.st_col_hours'))}" renderer="text" nowrap width="150"></tf-column>
+    </tf-table>` : `<div class="muted">${escapeHtml(T('disk.no_self_tests'))}</div>`);
+    setTableRows(testsHost.querySelector('#nas-st-table'), tests.map((t) => ({
+      date: t.startedAt ? fmtDate(t.startedAt) : '—',
+      kind: { status: t.kind.toLowerCase().includes('extended') || t.kind.toLowerCase().includes('long') ? 'accent' : 'neutral', label: t.kind },
+      result: `<tf-chip size="sm" status="${t.status === 'passed' ? 'ok' : t.status === 'running' ? 'info' : t.status === 'failed' ? 'err' : 'warn'}" dot label="${escapeAttr(T('disk.st_status_' + (['passed', 'failed', 'running'].includes(t.status) ? t.status : 'unknown')))}"></tf-chip> <span class="text-3">${escapeHtml(t.detail || '')}</span>`,
+      // The SMART self-test log carries the disk's power-on counter at the
+      // test, never the test's own duration — the column says so, and a log
+      // row without the counter shows nothing instead of a bogus "0 h".
+      hours: t.lifetimeHours ? `${t.lifetimeHours} h` : '—',
+    })));
+
+    const historyDays = Number(res.historyDays) || 0;
+    setText(body.querySelector('#nas-dd-temp-title'), T('disk.temp_history', { d: historyDays }));
+    setText(body.querySelector('#nas-dd-realloc-title'), T('disk.realloc_history', { d: historyDays }));
+    this.drawDiskHistory(body, res.history || []);
+  },
+
+  // The pool's own view of this disk (n04): its READ/WRITE/CKSUM counters, the
+  // leaf state inside its vdev and the last scrub. The five rows are a shape
+  // that depends only on whether the disk is in a pool at all, so the shape is
+  // written once and each counter then moves on its own — an error that
+  // appears must not rebuild the scrub line next to it.
+  paintDiskPoolErrors(body, pool, vdev, leaf) {
+    const host = body.querySelector('#nas-dd-pool');
+    if (!pool || !vdev || !leaf) {
+      patchHtml(host, `<div class="muted">${escapeHtml(T('disk.pool_none'))}</div>`);
+      return;
+    }
+    const row = (key, label) => `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v" data-c="${key}"></span></div>`;
+    if (patchHtml(host, `
+      <div class="stat-rows">
+        ${row('read', 'READ')}
+        ${row('write', 'WRITE')}
+        ${row('cksum', 'CKSUM')}
+        ${row('state', T('disk.pool_vdev_state'))}
+        ${row('scrub', T('disk.pool_last_scrub'))}
+      </div>
+      ${warningHtml('info', T('disk.pool_errors_info'))}
+      <div class="row mt-md"><tf-button variant="ghost" size="sm" icon="layers" data-act="open-pool"></tf-button></div>`)) {
+      host.querySelector('[data-act="open-pool"]').addEventListener('click', () => this.openPool(this.diskDetail.pool.name));
+    }
+    const cell = (key) => host.querySelector(`[data-c="${key}"]`);
+    // A counter above zero is the whole point of this card, so the tone rides
+    // on the cell itself instead of a span this would have to rebuild.
+    const counter = (key, n) => {
+      const el = cell(key);
+      setText(el, String(Number(n) || 0));
+      setAttr(el, 'class', `v ${Number(n) > 0 ? 'num-err' : 'num-ok'}`);
+    };
+    counter('read', leaf.readErrors);
+    counter('write', leaf.writeErrors);
+    counter('cksum', leaf.cksumErrors);
+    patchHtml(cell('state'), `${stateChipHtml(leaf.state)} <span class="mono text-3">${escapeHtml(vdev.id)} · ${escapeHtml(layoutLabel(vdev.kind))}</span>`);
+    setText(cell('scrub'), pool.lastScrubAt
+      ? T('disk.pool_scrub_value', { t: fmtDate(pool.lastScrubAt), n: Number(pool.scan?.errors) || 0 })
+      : T('disk.pool_no_scrub'));
+    setText(host.querySelector('[data-act="open-pool"]'), T('disk.pool_open', { pool: pool.name }));
   },
 
   // The replace wizard needs the pool topology and the free disks of the node;
@@ -1500,11 +2359,29 @@ const TentaNasScreen = {
   // The disk's sample history (n04): temperature and the reallocated-sector
   // counter. Each card is a tf-line-chart on a time axis; fewer than two
   // samples shows the empty note instead of an empty plot.
+  //
+  // These two are NOT live streams: the node samples the disk itself and
+  // publishes days of history, so a poll that brings the same series has
+  // nothing to draw. It must then leave both charts alone — mounting a new
+  // <tf-line-chart> every five seconds restarts the line's draw animation and
+  // drops whatever the pointer was hovering. The series the node appends to is
+  // what moves them, so the signature is the sample count plus the ends of the
+  // window: history only ever grows at the back.
   drawDiskHistory(body, history) {
     const samples = (history || [])
       .map((h) => ({ ...h, t: parseServerTs(h.at)?.getTime() }))
       .filter((h) => h.t != null)
       .sort((a, b) => a.t - b.t);
+    const last = samples[samples.length - 1];
+    const sig = samples.length
+      ? `${samples.length}|${samples[0].t}|${last.t}|${last.temperatureC}|${last.reallocatedSectors}`
+      : '0';
+    // The signature is remembered on the chart HOST, not on the tab body: the
+    // body outlives this view, and a key left on it would tell a freshly drawn
+    // screen that it has already plotted a series it has never seen.
+    const temp = body.querySelector('#nas-disk-temp-chart');
+    if (!temp || temp.__tfHistory === sig) return;
+    temp.__tfHistory = sig;
     // A multi-day window is unreadable with clock ticks; the axis follows the
     // span the backend actually returned.
     const spanDays = samples.length ? (samples[samples.length - 1].t - samples[0].t) / 86400000 : 0;
@@ -1561,7 +2438,7 @@ const TentaNasScreen = {
         </div>
         <div class="job-actions">
           <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
-          <tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+          ${jobCanCancel(j) ? `<tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>` : ''}
         </div>
       </div>`;
   },
@@ -1570,7 +2447,7 @@ const TentaNasScreen = {
     el.querySelectorAll('.job-row').forEach((row) => {
       const id = row.dataset.job;
       row.querySelector('[data-act="log"]').addEventListener('click', () => this.openJobLog(id));
-      row.querySelector('[data-act="cancel"]').addEventListener('click', async () => {
+      row.querySelector('[data-act="cancel"]')?.addEventListener('click', async () => {
         const ok = await TfWindow.confirm({ title: T('jobs.cancel'), message: T('jobs.cancel_confirm'), confirmLabel: T('jobs.cancel'), cancelLabel: I18n.t('common.cancel'), danger: true });
         if (!ok) return;
         try {
@@ -1629,7 +2506,7 @@ const TentaNasScreen = {
 
     const actions = [];
     if (admin) {
-      if (el.mode === 'unarmed') {
+      if (channelMode(el.mode) === 'unarmed') {
         actions.push(`<tf-button variant="primary" icon="unlock" data-act="wizard">${escapeHtml(T('elevation.configure'))}</tf-button>`);
       } else if (el.mode === 'helper') {
         actions.push(`<tf-button variant="secondary" size="sm" icon="refresh" data-act="wizard-helper">${escapeHtml(T('elevation.reprovision'))}</tf-button>`);
@@ -1739,7 +2616,8 @@ const TentaNasScreen = {
         f.detail || '',
       ].filter(Boolean).join(' · ') || '—')}</span>`,
     }));
-    ftable.rowActions = (row) => {
+    ftable.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const f = row._feature;
       const installable = admin && f.status !== 'ok' && f.status !== 'unsupported_platform' && (f.packages || []).length > 0;
       if (!installable) return null;
@@ -1752,7 +2630,7 @@ const TentaNasScreen = {
         b.setAttribute('disabled', '');
         b.title = T('env.package_manager_none');
       }
-      b.addEventListener('click', (e) => { e.stopPropagation(); this.installFeature(f); });
+      b.addEventListener('click', (e) => { e.stopPropagation(); this.installFeature(live()._feature); });
       return b;
     };
 
@@ -1761,20 +2639,21 @@ const TentaNasScreen = {
       _node: n,
       name: `<div class="cell-2"><div class="l1">${escapeHtml(n.nodeName)}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div><div class="l2 mono">${escapeHtml(n.nodeId.slice(0, 16))}…</div></div>`,
       platform: n.instanceStatus === 'ready' ? (n.osName || '—') : T('instance.' + n.instanceStatus),
-      channel: { status: n.elevationMode === 'unarmed' ? 'warn' : 'ok', label: T('elevation.mode_' + (n.elevationMode || 'unarmed')), dot: true },
+      channel: { status: channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok', label: T('elevation.mode_' + channelMode(n.elevationMode)), dot: true },
       features: (n.features || []).join(' · ') || (n.instanceStatus === 'ready' ? T('env.features_unknown') : T('instance.' + n.instanceStatus)),
     }));
-    otable.rowActions = (row) => {
+    otable.rowActions = (row, idx, currentRow) => {
+      const live = () => currentRow?.() ?? row;
       const n = row._node;
       if (n.instanceStatus !== 'ready') return null;
       const wrap = document.createElement('div');
       wrap.className = 'row-actions';
-      const unarmed = (n.elevationMode || 'unarmed') === 'unarmed';
+      const unarmed = channelMode(n.elevationMode) === 'unarmed';
       wrap.innerHTML = unarmed && admin
         ? `<tf-button size="sm" variant="secondary" icon="unlock" data-act="arm-node">${escapeHtml(T('env.arm_node'))}</tf-button>`
         : `<tf-button size="sm" variant="ghost" icon="chevron-right" data-act="go">${escapeHtml(T('env.go_to_node'))}</tf-button>`;
-      wrap.querySelector('[data-act="go"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(n.nodeId); });
-      wrap.querySelector('[data-act="arm-node"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.armNode(n); });
+      wrap.querySelector('[data-act="go"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(live()._node.nodeId); });
+      wrap.querySelector('[data-act="arm-node"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.armNode(live()._node); });
       return wrap;
     };
     otable.addEventListener('row-click', (e) => { if (e.detail.row._node.instanceStatus === 'ready') this.selectNode(e.detail.row._node.nodeId); });
@@ -1947,7 +2826,7 @@ const TentaNasScreen = {
       checkContext();
       const el = this.environment?.elevation;
       const armed = el && el.armedUntil && parseServerTs(el.armedUntil) && parseServerTs(el.armedUntil).getTime() > Date.now();
-      const needsPassword = !el || el.mode === 'unarmed' || (el.mode === 'interactive' && !armed) || (el.mode === 'helper' && el.helperState !== 'ok');
+      const needsPassword = !el || channelMode(el.mode) === 'unarmed' || (el.mode === 'interactive' && !armed) || (el.mode === 'helper' && el.helperState !== 'ok');
       if (!needsPassword) return await fn(undefined);
       const creds = await this.promptSudo(title);
       if (!creds) return null;
@@ -2225,7 +3104,23 @@ const TentaNasScreen = {
         state.result = { ok: false, detail: errMessage(e) };
         draw();
       }
-      this.refreshHeader(false).then(() => { if (this.tab === 'environment' && !this.disposed) this.drawTab(); });
+      // The post-install step has to retire itself. It is raised by `forceSetup`
+      // and the wizard is the only thing that resolves it, so leaving it up
+      // after a successful run tells an admin who just configured the node that
+      // nothing happened — at the exact moment the feature should show it
+      // worked. Judge on the REFRESHED environment, not on the wizard's own
+      // result: a wizard can report success while the channel still fails
+      // `channelUnusable()`, and in that case the step must stay.
+      //
+      // Redraw whenever the step was on screen, not only on the environment
+      // tab: the post-install route lands on `overview`, so a tab-conditional
+      // redraw left the stale "not configured" panel in place.
+      const wasForced = this.forceSetup;
+      this.refreshHeader(false).then(() => {
+        if (this.disposed) return;
+        if (this.forceSetup && !this.channelUnusable()) this.forceSetup = false;
+        if (this.tab === 'environment' || wasForced) this.drawTab();
+      });
     };
 
     const pollJob = async () => {
@@ -2260,6 +3155,9 @@ const TentaNasScreen = {
   // Job log viewer; polls while the job runs so a package install streams
   // its output line by line.
   openJobLog(jobId, onFinish = null) {
+    const sourceNodeId = this.nodeId;
+    const sourceRoot = this.root;
+    const isCurrent = () => !this.disposed && this.nodeId === sourceNodeId && this.root === sourceRoot && sourceRoot.isConnected;
     const win = document.createElement('tf-window');
     win.className = 'nas-modal';
     win.setAttribute('title', T('jobs.log'));
@@ -2276,19 +3174,22 @@ const TentaNasScreen = {
     let notified = false;
     const poll = async () => {
       if (!win.isConnected) return;
+      if (!isCurrent()) { win.close(true); return; }
       try {
         const r = await this.nas('tentaNasJobGetRequest', { jobId });
+        if (!isCurrent() || !win.isConnected) return;
         const j = r.job;
         const head = win.querySelector('#nas-joblog-head');
         const pre = win.querySelector('#nas-joblog');
         if (!head || !pre) return;
-        head.innerHTML = `${escapeHtml(jobKindLabel(j.kind))} <span class="mono">${escapeHtml(j.subject)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · ${escapeHtml(T('jobs.started_by', { by: j.startedBy, t: fmtAgo(j.startedAt) }))}${j.error ? `<div class="num-err mt-sm">${escapeHtml(j.error)}</div>` : ''}`;
+        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span class="mono">${escapeHtml(j.subject)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · ${escapeHtml(T('jobs.started_by', { by: j.startedBy, t: fmtAgo(j.startedAt) }))}${j.error ? `<div class="num-err mt-sm">${escapeHtml(j.error)}</div>` : ''}`);
         const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
         pre.textContent = (j.log || []).join('\n');
         if (atBottom) pre.scrollTop = pre.scrollHeight;
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }
       } catch (e) {
+        if (!isCurrent() || !win.isConnected) return;
         const head = win.querySelector('#nas-joblog-head');
         if (head) head.textContent = errMessage(e);
       }
@@ -2353,10 +3254,12 @@ function alertTarget(alert) {
 // show, so the tile names the mean instead of dividing by zero.
 function iopsBaseline(now, hourAvg) {
   const avg = Number(hourAvg) || 0;
-  if (avg <= 0) return `delta="${escapeAttr(T('kpi.iops_avg', { n: Math.round(avg) }))}"`;
+  if (avg <= 0) return { delta: T('kpi.iops_avg', { n: Math.round(avg) }), 'delta-type': null };
   const change = Math.round((now - avg) / avg * 100);
-  const label = T('kpi.iops_delta', { pct: `${change > 0 ? '+' : ''}${change}` });
-  return `delta="${escapeAttr(label)}" delta-type="${change > 0 ? 'up' : change < 0 ? 'down' : 'neutral'}"`;
+  return {
+    delta: T('kpi.iops_delta', { pct: `${change > 0 ? '+' : ''}${change}` }),
+    'delta-type': change > 0 ? 'up' : change < 0 ? 'down' : 'neutral',
+  };
 }
 
 function roleTone(role) {
@@ -2366,10 +3269,54 @@ function roleTone(role) {
 // n03 role chip: pool first, then the concrete layout or group role
 // ("tank · RAIDZ2", "tank · Special"). The inventory carries the owning vdev
 // on the disk row, so the chip needs no pool topology of its own.
+// The parts of an Elastic Array this build can name, `NasDisk.arrayRole` →
+// locale key.
+const ARRAY_PART_KEYS = {
+  data: 'role.array_data',
+  cache: 'role.array_cache',
+  parity: 'role.array_parity',
+};
+
 function roleChipLabel(disk) {
-  if (!disk.memberOf) return T('role.' + disk.role);
+  // "used" is the catch-all `role_of` falls back to: not system, not in a pool
+  // or array, not mounted, but carrying a filesystem signature. On a real
+  // machine it covers 23 of 29 disks, and on its own ("Zajęty") it tells the
+  // reader nothing they can act on — so name what occupies the disk whenever
+  // the inventory knows it.
+  if (!disk.memberOf) {
+    const base = T('role.' + disk.role);
+    return disk.role === 'used' && disk.fsType ? `${base} · ${disk.fsType}` : base;
+  }
+  // An Elastic Array is not a pool: it is a union mount over per-disk
+  // filesystems, so it has no vdev and no RAID layout. `vdevRole`/`vdevKind`
+  // therefore may NOT carry its members — `vdevRole === 'data'` would send the
+  // label through `layoutLabel(vdevKind)` and print a RAID layout for a union
+  // branch. The array carries its own field, and the second half names the
+  // PART the disk plays, because that is what differs in what the admin does
+  // next: data, cache (unprotected bytes) or parity (no data at all).
+  if (disk.arrayRole) {
+    // Listed, not derived: a part this build has no word for must stay
+    // readable as the plain membership ("produkt · W macierzy"), and `T` of a
+    // missing key answers with the key itself, which is not a label.
+    const part = ARRAY_PART_KEYS[disk.arrayRole];
+    return `${disk.memberOf} · ${T(part || ('role.' + disk.role))}`;
+  }
   if (!disk.vdevRole) return `${disk.memberOf} · ${T('role.' + disk.role)}`;
   return `${disk.memberOf} · ${disk.vdevRole === 'data' ? layoutLabel(disk.vdevKind) : T('pool.role_' + disk.vdevRole)}`;
+}
+
+// Writes a tf-table's rows, but only when the rendered rows really differ.
+// tf-table recycles its <tr> elements, yet `set rows` still re-renders every
+// cell — and `_writeCell` rebuilds a chip span unconditionally. The tables on
+// a disk (SMART attributes, the self-test log) move only when the node
+// re-reads SMART, minutes apart, so an unchanged poll must not pay for a
+// full render pass over them.
+function setTableRows(table, rows) {
+  if (!table) return;
+  const sig = JSON.stringify(rows);
+  if (table.__tfRows === sig) return;
+  table.__tfRows = sig;
+  table.rows = rows;
 }
 
 function trendHtml(now, weekAgo) {
@@ -2387,7 +3334,10 @@ function normalizeNode(n) {
     ...n,
     disksTotal: Number(n.disksTotal) || 0,
     disksWarning: Number(n.disksWarning) || 0,
+    disksCritical: Number(n.disksCritical) || 0,
     poolsTotal: Number(n.poolsTotal) || 0,
+    arraysTotal: Number(n.arraysTotal) || 0,
+    arraysUnmeasured: Number(n.arraysUnmeasured) || 0,
     sharesTotal: Number(n.sharesTotal) || 0,
     alertsActive: Number(n.alertsActive) || 0,
     capacityBytes: Number(n.capacityBytes) || 0,

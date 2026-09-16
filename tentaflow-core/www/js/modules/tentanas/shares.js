@@ -8,6 +8,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml } from '/js/modules/tentanas/format.js';
+import { setAttr, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openShareWizard } from '/js/modules/tentanas/share-wizard.js';
 import { mountTargetsSection } from '/js/modules/tentanas/targets.js';
@@ -99,7 +100,7 @@ export async function drawShares(screen, body) {
     </div>`;
 
   const view = body.firstElementChild;
-  const state = { shares: [], users: [], targets: [], mountRoot: '/mnt/tentanas', filter: screen.sharesFilter || 'all', query: screen.sharesQuery || '', loaded: false, error: '', counts: '' };
+  const state = { shares: [], users: [], targets: [], mountRoot: '/mnt/tentanas', filter: screen.sharesFilter || 'all', query: screen.sharesQuery || '', loaded: false, error: '' };
 
   // The block half of n12 lives in its own module and answers its own request;
   // the tab owns the toolbar both halves share.
@@ -117,7 +118,13 @@ export async function drawShares(screen, body) {
       if (!view.isConnected) return;
       state.shares = (list.shares || []).slice().sort((a, b) => a.name.localeCompare(b.name));
       state.users = list.users || [];
-      state.mountRoot = list.mountRoot || state.mountRoot;
+      // The wire carries FLEET_MOUNT_ROOT verbatim and that constant ENDS in a
+      // slash (tentanas-helper/src/lib.rs:866) — load-bearing there, because the
+      // helper validates mountpoints with strip_prefix() on it. Every render
+      // site here appends "/<name>", so passing it through unchanged printed
+      // /mnt/tentanas//<name>. Normalize once, at the boundary.
+      const root = list.mountRoot || state.mountRoot;
+      state.mountRoot = root.length > 1 && root.endsWith('/') ? root.slice(0, -1) : root;
       state.error = '';
     } catch (e) {
       state.error = errMessage(e);
@@ -180,18 +187,18 @@ export async function drawShares(screen, body) {
     const iscsi = state.targets.filter((t) => t.protocol === 'iscsi').length;
     const nvmet = state.targets.filter((t) => t.protocol === 'nvmet').length;
     const total = state.shares.length + state.targets.length;
-    const sig = `${total}/${smb}/${nfs}/${iscsi}/${nvmet}`;
-    if (sig === state.counts) return;
-    state.counts = sig;
     const host = body.querySelector('#nas-sh-filter-host');
-    host.innerHTML = `
+    // The counts live in the option labels, so the markup itself is the
+    // signature: patchHtml rebuilds the control exactly when a count moved and
+    // re-wires it in the same breath.
+    if (!patchHtml(host, `
       <tf-segmented id="nas-sh-filter" value="${escapeAttr(state.filter)}" size="sm">
         <option value="all">${escapeHtml(T('shares.filter_all', { n: total }))}</option>
         <option value="smb">SMB ${smb}</option>
         <option value="nfs">NFS ${nfs}</option>
         <option value="iscsi">iSCSI ${iscsi}</option>
         <option value="nvmet">NVMe-oF ${nvmet}</option>
-      </tf-segmented>`;
+      </tf-segmented>`)) return;
     host.querySelector('#nas-sh-filter').addEventListener('change', (e) => {
       state.filter = e.detail.value || 'all';
       screen.sharesFilter = state.filter;
@@ -220,24 +227,26 @@ export async function drawShares(screen, body) {
   const paintList = () => {
     const list = body.querySelector('#nas-sh-list');
     const pattern = `<span class="mono">${escapeHtml(T('shares.mount_path_pattern', { root: state.mountRoot }))}</span>`;
-    body.querySelector('#nas-sh-count').setAttribute('label', String(state.shares.length));
-    body.querySelector('#nas-sh-mount-hint').innerHTML = T('shares.mount_hint', { path: pattern });
-    body.querySelector('#nas-sh-explain').innerHTML = T('shares.explain', { path: pattern });
+    setAttr(body.querySelector('#nas-sh-count'), 'label', String(state.shares.length));
+    patchHtml(body.querySelector('#nas-sh-mount-hint'), T('shares.mount_hint', { path: pattern }));
+    patchHtml(body.querySelector('#nas-sh-explain'), T('shares.explain', { path: pattern }));
     if (state.error && !state.shares.length) {
-      list.innerHTML = `<div class="num-err">${escapeHtml(state.error)}</div>`;
+      patchHtml(list, `<div class="num-err">${escapeHtml(state.error)}</div>`);
       return;
     }
     if (!state.shares.length) {
-      list.innerHTML = `
+      if (patchHtml(list, `
         <tf-empty-state icon="share" title="${escapeAttr(T('shares.empty_title'))}" message="${escapeAttr(T('shares.empty_msg'))}">
           <tf-button variant="primary" icon="plus" data-act="create-empty">${escapeHtml(T('shares.create'))}</tf-button>
-        </tf-empty-state>`;
-      list.querySelector('[data-act="create-empty"]').addEventListener('click', openCreate);
+        </tf-empty-state>`)) {
+        list.querySelector('[data-act="create-empty"]').addEventListener('click', openCreate);
+      }
       return;
     }
-    let table = list.querySelector('#nas-sh-table');
-    if (!table) {
-      list.innerHTML = `
+    // One host, one writer: every branch above patches `list`, so the table
+    // shell is written — and wired — exactly once, and the rows that follow
+    // are handed to the table that is already on screen.
+    const shell = `
         <tf-table id="nas-sh-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('shares.none_match'))}">
           <tf-column key="name" label="${escapeAttr(T('shares.col_name'))}" renderer="html" fill></tf-column>
           <tf-column key="protocol" label="${escapeAttr(T('shares.col_protocol'))}" renderer="html" nowrap></tf-column>
@@ -245,8 +254,10 @@ export async function drawShares(screen, body) {
           <tf-column key="fleet" label="${escapeAttr(T('shares.col_fleet'))}" renderer="html" nowrap></tf-column>
           <tf-column key="sessions" label="${escapeAttr(T('shares.col_sessions'))}" renderer="num" hide-below="1000"></tf-column>
         </tf-table>`;
-      table = list.querySelector('#nas-sh-table');
-      table.rowActions = (row) => {
+    if (patchHtml(list, shell)) {
+      const table = list.querySelector('#nas-sh-table');
+      table.rowActions = (row, idx, currentRow) => {
+        const live = () => currentRow?.() ?? row;
         const s = row._share;
         const wrap = document.createElement('div');
         wrap.className = 'tf-table__cell-row';
@@ -255,15 +266,15 @@ export async function drawShares(screen, body) {
           <tf-button size="sm" variant="ghost" icon="${s.enabled ? 'pause' : 'play'}" data-act="pause" title="${escapeAttr(s.enabled ? T('shares.pause') : T('shares.resume'))}"></tf-button>
           <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(T('shares.delete'))}"></tf-button>`
           : `<tf-button size="sm" variant="ghost" icon="eye" data-act="details" title="${escapeAttr(T('shares.details'))}"></tf-button>`;
-        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDetail(screen, s.shareId, detailOpts()); });
-        wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(s); });
-        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); setShareEnabled(screen, s, !s.enabled, refresh); });
-        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDeleteDialog(screen, s, refresh); });
+        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDetail(screen, live()._share.shareId, detailOpts()); });
+        wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(live()._share); });
+        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._share; setShareEnabled(screen, cur, !cur.enabled, refresh); });
+        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDeleteDialog(screen, live()._share, refresh); });
         return wrap;
       };
       table.addEventListener('row-click', (e) => openShareDetail(screen, e.detail.row._share.shareId, detailOpts()));
     }
-    table.rows = visibleShares().map((s) => shareRow(s));
+    list.querySelector('#nas-sh-table').rows = visibleShares().map((s) => shareRow(s));
   };
 
   await refresh();

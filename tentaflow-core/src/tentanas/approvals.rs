@@ -36,6 +36,41 @@ pub const OP_SHARE_DELETE: &str = "share_delete";
 pub const OP_TARGET_DELETE: &str = "target_delete";
 pub const OP_CONFIG_IMPORT: &str = "config_import";
 pub const OP_ELASTIC_CREATE: &str = "elastic_create";
+pub const OP_ELASTIC_SYNC: &str = "elastic_sync";
+pub const OP_ELASTIC_SCRUB: &str = "elastic_scrub";
+/// Running the mover by hand. It moves files off the cache and then syncs
+/// parity, so it is a red path for the same reason a sync is.
+pub const OP_ELASTIC_MOVER: &str = "elastic_mover";
+/// Rebuilding one data disk from parity. Red for the reason a restore is not:
+/// it WRITES the named disk, overwriting whatever it currently holds with what
+/// the parity checkpoint says it should hold.
+pub const OP_ELASTIC_FIX: &str = "elastic_fix";
+/// Adding a data disk to a live array. The disk is formatted before it joins,
+/// so this destroys whatever was on it — the same blast radius as one disk of
+/// a create.
+pub const OP_ELASTIC_ADD_DISK: &str = "elastic_add_disk";
+/// Dissolving the array.
+///
+/// It joins the four-eyes list even though it is REVERSIBLE — the disks keep
+/// their filesystems and the array import takes the array back — because what
+/// is at stake is not the bytes: dissolving is what takes an array's shares
+/// off every client at once, and it is the one operation that lets the addon be
+/// uninstalled (`db::block_elastic_teardown` refuses while any array row
+/// stands). One admin alone taking a fleet's storage offline, and unlocking the
+/// uninstall that follows it, is exactly what the second pair of eyes is for.
+/// The plan's list already carries `destroy pool` for a ZFS pool; this is the
+/// same decision for the other kind of array.
+pub const OP_ELASTIC_DESTROY: &str = "elastic_destroy";
+
+/// ARMING one of an array's cadences (E2-10).
+///
+/// Its own operation rather than the per-kind ones above, because what is
+/// approved here is not the run: approving `elastic_mover` and getting a saved
+/// schedule instead of a mover would make the audit row say something that did
+/// not happen. It is a red path all the same — a schedule is a cheaper door to
+/// exactly the privileged work the per-kind operations guard, deferred and
+/// repeating, so one admin alone must not be able to arm one.
+pub const OP_ELASTIC_SCHEDULE: &str = "elastic_schedule";
 
 /// How long a parked operation stays approvable when nobody configured it.
 /// A day is long enough for a colleague in another timezone and short enough
@@ -400,8 +435,16 @@ fn alert_key(request_id: &str) -> String {
 fn without_secret(payload: &TentaNasPayload) -> TentaNasPayload {
     use TentaNasPayload as P;
     match payload.clone() {
-        P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,.. } =>
-            P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password:None },
+        P::ElasticArraySyncRequest { name, .. } => P::ElasticArraySyncRequest { name, sudo_password: None },
+        P::ElasticArrayScrubRequest { name, .. } => P::ElasticArrayScrubRequest { name, sudo_password: None },
+        P::ElasticArrayFixRequest { name, disk, confirm_disk, .. } =>
+            P::ElasticArrayFixRequest { name, disk, confirm_disk, sudo_password: None },
+        P::ElasticArrayAddDiskRequest { name, disk_id, confirm_name, .. } =>
+            P::ElasticArrayAddDiskRequest { name, disk_id, confirm_name, sudo_password: None },
+        P::ElasticArrayDestroyRequest { name, confirm_name, .. } =>
+            P::ElasticArrayDestroyRequest { name, confirm_name, sudo_password: None },
+        P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,.. } =>
+            P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,sudo_password:None },
         P::PoolDestroyRequest {
             name, confirm_name, ..
         } => P::PoolDestroyRequest {
@@ -729,6 +772,23 @@ mod tests {
         // release, which grew a password with the single-admin red path.
         for payload in [
             destroy_request(),
+            TentaNasPayload::ElasticArraySyncRequest {
+                name: "media".into(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+            },
+            TentaNasPayload::ElasticArrayScrubRequest {
+                name: "media".into(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+            },
+            TentaNasPayload::ElasticArrayCreateRequest {
+                name: "media".into(),
+                filesystem: "xfs".into(),
+                data_disk_ids: vec!["data".into()],
+                parity_disk_ids: Vec::new(),
+                cache_disk_ids: vec!["cache".into()],
+                confirm_name: "media".into(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+            },
             TentaNasPayload::SnapshotProtectionReleaseRequest {
                 snapshot: "tank/p@przed-migracja".to_string(),
                 reason: "koniec projektu".to_string(),
@@ -753,6 +813,19 @@ mod tests {
         ] {
             let stored = serde_json::to_string(&without_secret(&payload)).expect("encode");
             assert!(!stored.contains("hunter2"), "{stored}");
+        }
+        let cache_payload = TentaNasPayload::ElasticArrayCreateRequest {
+            name: "media".into(), filesystem: "xfs".into(), data_disk_ids: vec!["data".into()],
+            parity_disk_ids: Vec::new(), cache_disk_ids: vec!["cache".into()],
+            confirm_name: "media".into(),
+            sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+        };
+        let redacted = without_secret(&cache_payload);
+        if let TentaNasPayload::ElasticArrayCreateRequest { cache_disk_ids, sudo_password, .. } = redacted {
+            assert_eq!(cache_disk_ids, vec!["cache".to_string()]);
+            assert!(sudo_password.is_none());
+        } else {
+            panic!("oczekiwano zanonimizowanego Create");
         }
 
         finish(&f.actor("u-piotr"), &parked.request_id, Some("job-1"));

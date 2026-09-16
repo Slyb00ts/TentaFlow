@@ -40,7 +40,11 @@ fn record_discovered_peer(
     hostname: &str,
 ) {
     // Separate node identities can share an IP (multiple daemons or NAT).
-    if node_id == local_node_id || peer_store.is_quic_connected(node_id) {
+    if node_id == local_node_id {
+        return;
+    }
+    peer_store.mark_lan_discovered(node_id);
+    if peer_store.is_quic_connected(node_id) {
         return;
     }
     peer_store.set_addresses(
@@ -4022,6 +4026,25 @@ mod tests {
     use crate::code_studio::mesh_stream::{self, StreamOpen, KIND_DATA, REASON_TRUST_LOST};
 
     #[test]
+    fn lan_discovery_marks_connected_peer_without_replacing_live_hints() {
+        let peers = super::MeshPeerStore::new();
+        let local = hex::encode([31; 32]);
+        let remote = hex::encode([32; 32]);
+        let live: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        peers.set_addresses(&remote, vec![live]);
+        peers.set_quic_connected(&remote, true);
+        super::record_discovered_peer(
+            &peers,
+            &local,
+            &remote,
+            &["192.168.1.30:8090".parse().unwrap()],
+            "new-mdns-name",
+        );
+        assert!(peers.is_lan_discovered(&remote));
+        assert_eq!(peers.get(&remote).unwrap().addresses, vec![live]);
+    }
+
+    #[test]
     fn discovery_of_another_node_on_the_same_host_preserves_its_identity_and_hints() {
         use crate::mesh::peer_registry::persistence::PersistOp;
         use crate::mesh::peer_registry::{PeerRegistry, TransportHints, TrustState};
@@ -4051,6 +4074,7 @@ mod tests {
             .expect("distinct identity must survive");
         assert!(remote.hints.addresses.contains(&address));
         assert!(peers.get(&remote_id).is_some());
+        assert!(peers.is_lan_discovered(&remote_id));
         while let Ok(operation) = receiver.try_recv() {
             assert!(
                 !matches!(operation, PersistOp::Delete { .. }),
@@ -4059,6 +4083,7 @@ mod tests {
         }
         super::record_discovered_peer(&peers, &local_id, &local_id, &[address], "wrong-local-name");
         assert_ne!(peers.get(&local_id).unwrap().hostname, "wrong-local-name");
+        assert!(!peers.is_lan_discovered(&local_id));
     }
 
     /// Zapis przez `token_usage_cache` BEZ flusha musi natychmiast podbijac

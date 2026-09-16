@@ -13,7 +13,7 @@ import { fakeScreen, flush, click, window } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { drawPoolDetail } = await import('./pool-detail.js');
+const { drawPoolDetail, openAddVdevDialog } = await import('./pool-detail.js');
 
 const TB = 1024 ** 4;
 const disk = (name, overrides = {}) => ({ diskId: name, name, path: `/dev/${name}`, kind: 'hdd', model: 'WD Red', serial: `WD-${name}`, sizeBytes: 4 * TB, state: 'online', health: 'ok', readErrors: 0, writeErrors: 0, cksumErrors: 0, note: '', ...overrides });
@@ -246,4 +246,90 @@ test('a failed load shows the error with the breadcrumb back to the pools', asyn
   assert.equal(screen.pool, null);
   assert.equal(screen.locations, 1);
   screen.dispose();
+});
+
+// "nigdy pełne odświeżenie całości" (research/03-ui-wzorce-mockupy.md). The
+// topology pane was rebuilt by every 5 s poll, destroying every vdev cell,
+// every button in it and the live chart. The three IO numbers are the only
+// part a poll moves on an otherwise idle pool, so they are written as TEXT
+// into slots the pane keeps instead of being baked into its markup.
+test('a poll that only moves the IO numbers leaves the topology pane standing', async () => {
+  let readBps = 1_000_000;
+  const screen = makeScreen({
+    tentaNasPoolGetRequest: () => ({ ...poolGet, pool: { ...poolGet.pool, io: { readBps, writeBps: 0, readIops: 12, writeIops: 0 } } }),
+  });
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = mount();
+  await drawPoolDetail(screen, body);
+  await flush();
+  const pane = body.querySelector('#nas-pool-tab-body');
+  const cells = [...pane.querySelectorAll('.disk-cell')];
+  const chart = pane.querySelector('#nas-pool-io-live');
+  const throughput = pane.querySelector('[data-io="throughput"]');
+  const tiles = [...body.querySelectorAll('#nas-pool-kpi tf-stat-card')];
+  assert.equal(cells.length, 4, 'one cell per pool disk');
+  assert.equal(tiles.length, 4, 'four KPI tiles');
+  assert.ok(chart, 'the live chart is mounted');
+  const before = throughput.textContent;
+  assert.match(before, /MB\/s/, 'the readout is written as text');
+
+  readBps = 8_000_000;
+  assert.equal(scheduled.length, 1, 'exactly one polling chain');
+  await scheduled[0]();
+  await flush();
+  [...pane.querySelectorAll('.disk-cell')].forEach((el, i) => assert.equal(el === cells[i], true, `disk cell ${i} survives the poll`));
+  [...body.querySelectorAll('#nas-pool-kpi tf-stat-card')].forEach((el, i) => assert.equal(el === tiles[i], true, `KPI tile ${i} survives the poll`));
+  assert.equal(pane.querySelector('#nas-pool-io-live') === chart, true, 'the chart keeps the points it accumulated');
+  assert.equal(pane.querySelector('[data-io="throughput"]') === throughput, true, 'the readout element survives');
+  assert.equal(throughput.textContent !== before, true, 'and its number still moved');
+  screen.dispose();
+});
+
+// A log or special vdev on a spinning disk buys nothing — a SLOG exists to cut
+// write latency, a special vdev to serve metadata — and neither can be removed
+// from a raidz pool afterwards. The dialog offered both roles against any free
+// disk, which is the opposite of what `pool.hint_special` promises.
+const pickDisk = (win, diskId, checked) => {
+  const cell = win.querySelector(`.disk-cell[data-disk="${diskId}"]`);
+  cell.querySelector('tf-checkbox').dispatchEvent(
+    new window.CustomEvent('change', { bubbles: true, detail: { checked } }),
+  );
+};
+
+test('a special or log vdev refuses a spinning disk and says which one', async () => {
+  const free = [disk('sdd'), disk('nvme1n1', { kind: 'nvme', sizeBytes: 0.5 * TB })];
+  const screen = fakeScreen({});
+  const win = openAddVdevDialog(screen, poolGet.pool, 'special', free, () => {});
+  await flush();
+
+  const err = win.querySelector('#nas-av-error');
+  const confirm = win.querySelector('[data-action="confirm"]');
+  assert.ok(err.hidden, 'nothing is wrong before a disk is picked');
+
+  pickDisk(win, 'sdd', true);
+  await flush();
+  assert.equal(err.hidden, false, 'picking an HDD for a special vdev is refused');
+  assert.match(err.textContent, /sdd/, 'the refusal names the offending disk');
+  assert.match(err.textContent, /SSD|NVMe/, 'and what the role actually needs');
+  assert.ok(confirm.hasAttribute('disabled'), 'there is no "add anyway"');
+
+  pickDisk(win, 'sdd', false);
+  pickDisk(win, 'nvme1n1', true);
+  await flush();
+  assert.ok(err.hidden, 'flash clears the refusal');
+  assert.ok(!confirm.hasAttribute('disabled'), 'and the vdev can be added');
+
+  win.close(true);
+});
+
+test('a data vdev still accepts spinning disks', async () => {
+  const free = [disk('sdd')];
+  const win = openAddVdevDialog(fakeScreen({}), poolGet.pool, 'data', free, () => {});
+  await flush();
+  pickDisk(win, 'sdd', true);
+  await flush();
+  assert.ok(win.querySelector('#nas-av-error').hidden, 'the gate is only for log and special');
+  assert.ok(!win.querySelector('[data-action="confirm"]').hasAttribute('disabled'));
+  win.close(true);
 });

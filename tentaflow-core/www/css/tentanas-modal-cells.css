@@ -1,0 +1,85 @@
+/* =============================================================================
+ * TentaNas cell styles for Shadow DOM, `.nas-modal` scope — a DELIBERATE,
+ * prefix-less copy of the `.nas-modal ...` rules in css/tentanas.css that can
+ * reach a table cell. Keep the two in sync.
+ *
+ * Why a SECOND sheet next to css/tentanas-cells.css: a TentaNas dialog is a
+ * `tf-window.nas-modal` appended to document.body, so a table inside it has no
+ * `.nas-root` ancestor at all — `closest('.nas-root')` is null and the
+ * `.nas-root` sheet is (correctly) never adopted. 12 of the 13 TentaNas modules
+ * that render a <tf-table> also open such windows, so without this sheet every
+ * one of those tables rendered its html cells unstyled.
+ *
+ * Why not ONE shared sheet: tentanas.css deliberately gives the two scopes
+ * different declarations. `.nas-modal .mono.fw-700` (below) is modal-only, and
+ * `.nas-modal .stat-rows .k` is 150px against the main screen's 160px. Merging
+ * the scopes would leak modal-only rules onto `.nas-root`. `data-shadow-scope`
+ * exists precisely so each scope can carry its own sheet.
+ *
+ * Rules tentanas.css defines for BOTH scopes (`.nas-root .mono, .nas-modal
+ * .mono`) appear in both sheets, verbatim, as they do in the source.
+ *
+ * Linked with `media="not all"` in index.html — its selectors are unprefixed
+ * and generic, so it must stay out of the document cascade. It is adopted only
+ * into shadow roots whose host sits inside `.nas-modal` (see
+ * js/components/shared-styles.js, adoptScopedSheetsInto).
+ * ========================================================================== */
+
+/* Stat rows shared with the main screen (tentanas.css defines these for both
+   scopes), then the modal's own tighter overrides further down. */
+.stat-rows { display: flex; flex-direction: column; }
+.stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.stat-rows .sr:last-child { border-bottom: 0; }
+.stat-rows .k { color: var(--text-2); flex: 0 0 160px; }
+.stat-rows .v { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+
+/* Toggle card. */
+.toggle-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-2); font-size: 13px; }
+.toggle-card .tc-text { display: flex; flex-direction: column; gap: 2px; }
+.toggle-card .tc-sub { font-size: 12px; color: var(--text-3); }
+
+/* Explainer box — the modal variant tints its body text. */
+.explain-box { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; font-size: 13px; color: var(--text-2); }
+.explain-box b { color: var(--text); }
+
+/* Layout and typography helpers. */
+.stack { display: flex; flex-direction: column; gap: 12px; }
+.mt-md { margin-top: 16px; }
+.mt-sm { margin-top: 8px; }
+.num-ok { color: var(--success); font-weight: 600; }
+.num-err { color: var(--danger); font-weight: 600; font-size: 12px; }
+.muted { color: var(--text-3); font-size: 12px; }
+.mono { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.text-3 { color: var(--text-3); }
+
+/* Schedule pill. */
+.sched-pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--bg-3); color: var(--text-2); font-size: 11px; white-space: nowrap; }
+
+/* Modal-only stat-row overrides — these must come AFTER the shared block, as
+   they do in tentanas.css, so the tighter padding and 150px key column win. */
+.stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.stat-rows .k { color: var(--text-2); flex: 0 0 150px; }
+
+/* "What you lose" lists. */
+.loss-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.loss-list .ll { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--text-2); }
+.loss-list .ll .icon { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 1px; }
+.loss-list .ll.bad .icon { color: var(--danger); }
+.loss-list .ll.good .icon { color: var(--success); }
+
+/* Breadcrumbs and section heads inside the share/snapshot browsers. */
+.nas-crumbs { display: block; font-size: 13px; }
+.section-card-head { display: flex; align-items: center; gap: 12px; }
+.section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.section-card-head .actions { display: flex; gap: 8px; margin-left: auto; }
+.text-2 { color: var(--text-2); }
+.num-warn { color: var(--warning); font-weight: 600; }
+
+/* Typography helpers the mockups use inline. */
+.text-sm { font-size: 12px; }
+.text-xs { font-size: 11px; }
+.fw-700 { font-weight: 700; }
+.fw-800 { font-weight: 800; }
+.mb-sm { margin-bottom: 8px; }
+/* Modal-only: a bold mono value gets the brightest text colour. */
+.mono.fw-700, .mono.fw-800 { color: var(--text); }

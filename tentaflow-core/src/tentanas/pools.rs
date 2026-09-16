@@ -1108,7 +1108,7 @@ async fn follow_scan(h: &super::jobs::JobHandle, pool: &str, kind: &str) -> anyh
 /// The scheduler's unattended scrub: the node's own channel, no password.
 pub fn spawn_scheduled_scrub(db: &DbPool, pool: &str) -> anyhow::Result<NasJob> {
     let name = pool.to_string();
-    super::jobs::spawn(db, "pool_scrub", pool, super::scheduler::STARTED_BY, None, move |h| {
+    super::jobs::spawn(db, "pool_scrub", pool, super::scheduler::STARTED_BY, None, None, move |h| {
         scrub_job(h, name, None)
     })
 }
@@ -1235,7 +1235,7 @@ pub async fn trim_job(
 /// The scheduler's unattended trim: the node's own channel, no password.
 pub fn spawn_scheduled_trim(db: &DbPool, pool: &str) -> anyhow::Result<NasJob> {
     let name = pool.to_string();
-    super::jobs::spawn(db, "pool_trim", pool, super::scheduler::STARTED_BY, None, move |h| {
+    super::jobs::spawn(db, "pool_trim", pool, super::scheduler::STARTED_BY, None, None, move |h| {
         trim_job(h, name, None)
     })
 }

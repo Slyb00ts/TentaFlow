@@ -24,8 +24,17 @@ import '/js/components/tf-breadcrumb.js';
  * escaped by the caller); `secondary` adds a middle footer button
  * (`{ label, icon, onClick }`) for the safer alternative the mockups offer
  * next to a destructive action ("Zrób Clone zamiast").
+ *
+ * `alsoArmed()` is a SECOND condition the confirm button waits for, on top of
+ * the retyped name. It exists because a retyped name answers one question —
+ * "did you mean this object" — and some destructive actions have a second
+ * victim the object's name does not mention: clearing a disk that a dissolved
+ * Elastic Array's journal still claims also ends that array's recoverability,
+ * and an admin typing a device name is not thinking about an array. Callers
+ * that pass it must re-run `syncButton` (handed to `wire`) whenever their own
+ * condition changes, or the button never unlocks.
  */
-export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, bodyHtml = '', confirmLabel, confirmIcon = 'trash', width = 560, wire = null, retypeLabel = '', secondary = null, onConfirm }) {
+export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, bodyHtml = '', confirmLabel, confirmIcon = 'trash', width = 560, wire = null, retypeLabel = '', secondary = null, alsoArmed = null, onConfirm }) {
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
   win.setAttribute('title', title);
@@ -58,7 +67,7 @@ export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, b
   const btn = win.querySelector('[data-action="confirm"]');
   if (secondary) win.querySelector('[data-act="secondary"]').addEventListener('click', () => { win.close(true); secondary.onClick(); });
   let busy = false;
-  const armed = () => input.value.trim() === name;
+  const armed = () => input.value.trim() === name && (!alsoArmed || alsoArmed() === true);
   const syncButton = () => {
     if (armed() && !busy) btn.removeAttribute('disabled');
     else btn.setAttribute('disabled', '');

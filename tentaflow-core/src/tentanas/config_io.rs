@@ -359,6 +359,11 @@ pub struct LiveState {
     pub serials: Vec<String>,
     pub datasets: Vec<String>,
     pub pool_mountpoints: Vec<String>,
+    /// Union paths of this node's Elastic Arrays. A share may sit on one since
+    /// `resolve_source` began accepting the union, and this module carried its
+    /// OWN copy of the pool-only rule — so an imported config marked every
+    /// array share `conflict` and `apply_with` then skipped creating it.
+    pub array_unions: Vec<String>,
     pub shares: Vec<ShareRow>,
     pub targets: Vec<store::TargetRow>,
     pub share_users: Vec<String>,
@@ -387,6 +392,10 @@ pub async fn live_state(db: &DbPool) -> Result<LiveState> {
             .iter()
             .filter(|d| !d.name.contains('/'))
             .filter_map(|d| d.mountpoint.clone())
+            .collect(),
+        array_unions: store::elastic_arrays_all(db)?
+            .into_iter()
+            .map(|a| a.union_path())
             .collect(),
         datasets: datasets.into_iter().map(|d| d.name).collect(),
         shares: store::list_shares(db)?,
@@ -536,18 +545,24 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
             ));
             continue;
         }
-        let under_pool = live
-            .pool_mountpoints
-            .iter()
-            .any(|m| share.source_path == *m || share.source_path.starts_with(&format!("{m}/")));
-        if under_pool {
+        // Either owner counts. The trailing slash is what keeps the boundary
+        // honest: `/mnt/media-old` is not inside `/mnt/media`.
+        let owned_by = |roots: &[String]| {
+            roots
+                .iter()
+                .any(|m| share.source_path == *m || share.source_path.starts_with(&format!("{m}/")))
+        };
+        if owned_by(&live.pool_mountpoints) || owned_by(&live.array_unions) {
             items.push(item("share", &share.name, "create", &share.protocol));
         } else {
             items.push(item(
                 "share",
                 &share.name,
                 "conflict",
-                format!("{} is not under a pool of this node", share.source_path),
+                format!(
+                    "{} is under neither a pool mountpoint nor an Elastic Array union of this node",
+                    share.source_path
+                ),
             ));
         }
     }
@@ -1274,6 +1289,7 @@ mod tests {
             datasets: vec!["tank".to_string(), "tank/vm-store".to_string()],
             targets: Vec::new(),
             pool_mountpoints: vec!["/mnt/tank".to_string()],
+            array_unions: vec!["/mnt/media".to_string()],
             shares: vec![ShareRow {
                 share_id: "s9".into(),
                 name: "backups".into(),
@@ -1347,6 +1363,36 @@ mod tests {
         let existing = find(&items, "share", "backups");
         assert_eq!(existing.action, "skip");
         assert!(existing.detail.contains("/mnt/tank/backups"), "{}", existing.detail);
+    }
+
+    // `resolve_source` began accepting an Elastic Array union as a share
+    // source, but this module kept its OWN pool-only copy of that rule, so an
+    // imported config marked every array share `conflict` and `apply_with`
+    // then skipped creating it. A union is a legal source here for exactly the
+    // reason it is legal there.
+    #[test]
+    fn a_share_on_an_array_union_is_planned_and_a_lookalike_path_is_not() {
+        let mut doc = document();
+        doc.shares[0].name = "media-nfs".into();
+        doc.shares[0].source_path = "/mnt/media".into();
+        let (items, _) = plan(&doc, &live());
+        assert_eq!(find(&items, "share", "media-nfs").action, "create", "the union itself");
+
+        // A directory inside the union belongs to the array too.
+        doc.shares[0].source_path = "/mnt/media/filmy".into();
+        let (items, _) = plan(&doc, &live());
+        assert_eq!(find(&items, "share", "media-nfs").action, "create", "below the union");
+
+        // A path that merely starts with the union's name does not.
+        doc.shares[0].source_path = "/mnt/media-old".into();
+        let (items, _) = plan(&doc, &live());
+        let refused = find(&items, "share", "media-nfs");
+        assert_eq!(refused.action, "conflict", "{}", refused.detail);
+        assert!(
+            refused.detail.contains("Elastic Array"),
+            "the refusal has to name both owners it looked for: {}",
+            refused.detail
+        );
     }
 
     #[test]

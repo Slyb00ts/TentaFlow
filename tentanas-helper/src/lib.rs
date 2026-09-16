@@ -35,9 +35,41 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// One line to the system log from anywhere in this library. The wrapper
+/// binary logs every command the same way; facts that no bounded journal field
+/// may drop — an evicted skip-set entry, say — are written here as well, where
+/// nothing rotates them away but the system's own log policy.
+#[cfg(target_os = "linux")]
+pub(crate) fn syslog_notice(message: &str) {
+    // The identifier outlives the process, so a static C string is correct.
+    static IDENT: &[u8] = b"tentanas-helper\0";
+    let Ok(text) = std::ffi::CString::new(message.replace('\0', " ")) else {
+        return;
+    };
+    unsafe {
+        // Mover bookkeeping, not the privilege channel's own audit trail:
+        // AUTHPRIV belongs to the wrapper binary, this belongs to DAEMON.
+        libc::openlog(
+            IDENT.as_ptr() as *const libc::c_char,
+            libc::LOG_PID,
+            libc::LOG_DAEMON,
+        );
+        libc::syslog(
+            libc::LOG_NOTICE,
+            b"%s\0".as_ptr() as *const libc::c_char,
+            text.as_ptr(),
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn syslog_notice(_message: &str) {}
+
 pub mod actions;
 pub mod block;
 pub mod elastic;
+mod elastic_namespace;
+mod elastic_transfer;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
 /// a wrapper built from a different catalog. Bumps with the crate version.
@@ -290,8 +322,62 @@ impl PackageManager {
 pub enum HelperCommand {
     ElasticCreate { operation: elastic::ElasticCreateSpec },
     ElasticRestore { array_id: String, owner: elastic::ElasticOwner },
+    ElasticEnterService { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    ElasticResume { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    ElasticMover { array_id: String, owner: elastic::ElasticOwner, operation_id: String, resume_operation_id: String, rules: elastic::MoverRules, coupled_sync: bool },
+    ElasticSync { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    ElasticScrub { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    /// Rebuilds one data disk of an array from its parity (`snapraid fix -d`).
+    /// `disk` is the array's own branch name (`d1`, `d2`, …), not a device:
+    /// the disk being repaired may well be the one that is failing, and the
+    /// only name that survives a kernel rename is the array's.
+    ElasticFix { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: String },
+    /// One more data disk, on a LIVE array. The union is never taken down.
+    ElasticAddDisk { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: elastic::ElasticDiskSpec },
+    /// Stops serving the array and releases its mounts. Formats nothing and
+    /// removes nothing: the journal, the configs and every filesystem stay, so
+    /// the array import can take the array back whole.
+    ElasticDestroy { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticInspect { array_id: String, owner: elastic::ElasticOwner },
     ElasticClaims { name: Option<String> },
+    /// Every Elastic journal on this node, whatever its owner. Owner-blind on
+    /// purpose: a journal whose owner no longer matches the addon asking is
+    /// exactly what an import scan exists to find.
+    ElasticJournals {},
+    /// Re-owns one journal so the adopting addon can operate the array. The
+    /// ONLY command that changes a persisted spec, and it changes nothing but
+    /// the owner.
+    ElasticAdopt { array_id: String, owner: elastic::ElasticOwner },
+    /// Clears every filesystem, RAID and partition-table signature off ONE
+    /// whole disk, so it reads as free again. The only command in the catalog
+    /// that erases a disk outside a create.
+    ///
+    /// It carries the disk's IDENTITY beside the device path and re-resolves
+    /// the two against this node's own inventory, because a device name is
+    /// not an identity: a kernel rename between reboots is how a wipe reaches
+    /// a disk nobody meant. `bytes` is part of that identity — a disk that
+    /// came back with a different size is a different disk.
+    ///
+    /// `release_journal` is the array_id of the Elastic Array whose kept
+    /// journal claims this disk, when the caller has acknowledged losing it.
+    /// `None` means no acknowledgement, and a claimed disk is then refused.
+    /// The wrapper checks that the journal it is about to drop really is the
+    /// one claiming this device, so an acknowledgement for one array can
+    /// never release another's.
+    ///
+    /// The last gate before anything is written is an exclusive open of the
+    /// block device. The kernel refuses it whenever the device carries a
+    /// filesystem mounted in ANY mount namespace, which is the only check
+    /// that sees an Elastic Array branch — those live in the union process's
+    /// private namespace and are invisible to `lsblk` and to `/proc/mounts`
+    /// on the host. There is no force flag: that refusal is the answer.
+    DiskWipe {
+        device: String,
+        wwn: Option<String>,
+        serial: Option<String>,
+        bytes: u64,
+        release_journal: Option<String>,
+    },
     /// `smartctl --json=c -x <device>`: identity, health, attributes, NVMe log
     /// and the self-test log in one JSON document.
     SmartctlInfo { device: String },
@@ -1096,6 +1182,11 @@ pub fn validate_nfs_network(value: &str) -> Result<(), CatalogError> {
 
 /// Export options the channel is willing to write. Everything that runs code
 /// or reshapes identity mapping outside the squash flags stays out.
+///
+/// Every option listed here is a BARE FLAG. The options that carry a value are
+/// in `validate_export_option` instead, each with the rule that checks the
+/// value: a value is as much a part of the line the kernel will act on as the
+/// name is, and nothing downstream reads it — `exportfs` has no dry run.
 const EXPORT_OPTIONS: &[&str] = &[
     "rw",
     "ro",
@@ -1110,6 +1201,52 @@ const EXPORT_OPTIONS: &[&str] = &[
     "wdelay",
     "no_wdelay",
 ];
+
+/// The `fsid=` value of an export: a UUID and nothing else.
+///
+/// `fsid=` is how a filesystem with neither a device nor a UUID of its own is
+/// given an identity nfsd can put in a file handle (`man 5 exports`), and an
+/// Elastic Array's mergerfs union is exactly that filesystem. The app emits
+/// the array's own id, which is a UUID, so a UUID is the only shape accepted
+/// here: `exportfs` would also take a small decimal number, but nothing in
+/// this app writes one, and an allowance nobody exercises is an allowance
+/// nobody checks. Case-insensitive hex in 8-4-4-4-12 groups — no braces, no
+/// `urn:uuid:` prefix, no `0x`, which is also what keeps a path, a comma or a
+/// shell character out of the option list.
+fn validate_fsid(value: &str) -> Result<(), CatalogError> {
+    let groups: Vec<&str> = value.split('-').collect();
+    let shaped = groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(g, len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()));
+    if shaped {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "export option 'fsid={value}' is not a UUID"
+        )))
+    }
+}
+
+/// One option of an export's client list: a flag from the catalog, or one of
+/// the `name=value` options with its value checked.
+fn validate_export_option(opt: &str) -> Result<(), CatalogError> {
+    match opt.split_once('=') {
+        Some(("fsid", value)) => validate_fsid(value),
+        // A flag with a value is not the flag it looks like: `exportfs` reads
+        // `ro=0` as an option of its own and refuses it, and accepting the
+        // spelling here would let anything at all ride into the file behind a
+        // catalogued name.
+        Some((name, _)) if EXPORT_OPTIONS.contains(&name) => Err(invalid(format!(
+            "export option '{opt}' takes no value"
+        ))),
+        Some(_) | None if !EXPORT_OPTIONS.contains(&opt) => Err(invalid(format!(
+            "export option '{opt}' is not in the catalog"
+        ))),
+        _ => Ok(()),
+    }
+}
 
 /// One line of `/etc/exports.d/tentanas.exports`:
 /// `<path> <client>(<opts>) [<client>(<opts>) …]`. `exportfs` has no dry run,
@@ -1132,10 +1269,7 @@ pub fn validate_export_line(line: &str) -> Result<(), CatalogError> {
         };
         validate_nfs_network(&entry[..open])?;
         for opt in rest[open + 1..].split(',') {
-            let name = opt.split_once('=').map(|(k, _)| k).unwrap_or(opt);
-            if !EXPORT_OPTIONS.contains(&name) {
-                return Err(invalid(format!("export option '{opt}' is not in the catalog")));
-            }
+            validate_export_option(opt)?;
         }
         clients += 1;
     }
@@ -1921,8 +2055,19 @@ impl HelperCommand {
         match self {
             Self::ElasticCreate { .. } => Some("elastic_create"),
             Self::ElasticRestore { .. } => Some("elastic_restore"),
+            Self::ElasticEnterService { .. } => Some("elastic_enter_service"),
+            Self::ElasticResume { .. } => Some("elastic_resume"),
+            Self::ElasticMover { .. } => Some("elastic_mover"),
+            Self::ElasticSync { .. } => Some("elastic_sync"),
+            Self::ElasticScrub { .. } => Some("elastic_scrub"),
+            Self::ElasticFix { .. } => Some("elastic_fix"),
+            Self::ElasticAddDisk { .. } => Some("elastic_add_disk"),
+            Self::ElasticDestroy { .. } => Some("elastic_destroy"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
             Self::ElasticClaims { .. } => Some("elastic_claims"),
+            Self::ElasticJournals {} => Some("elastic_journals"),
+            Self::ElasticAdopt { .. } => Some("elastic_adopt"),
+            Self::DiskWipe { .. } => Some("disk_wipe"),
             Self::SmbIncludeEnsure {} => Some("smb_include_ensure"),
             Self::SmbIncludeRemove {} => Some("smb_include_remove"),
             Self::SmbConfigWrite {} => Some("smb_config_write"),
@@ -1971,6 +2116,42 @@ impl HelperCommand {
         if self.guards_storage() { return self.resolve_exec().map(|_| ()); }
         match self {
             Self::ElasticCreate { operation } => operation.validate(),
+            Self::ElasticFix { array_id, owner, operation_id, disk } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                elastic::validate_data_branch_name(disk)?;
+                owner.validate()
+            }
+            Self::ElasticAddDisk { array_id, owner, operation_id, disk } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                elastic::validate_elastic_uuid(&disk.expected_uuid)?;
+                if !matches!(disk.bytes, 1..=u64::MAX) {
+                    return Err(CatalogError::InvalidArgument("dodawany dysk bez rozmiaru".into()));
+                }
+                owner.validate()
+            }
+            Self::ElasticDestroy { array_id, owner, operation_id }
+            | Self::ElasticSync { array_id, owner, operation_id }
+            | Self::ElasticScrub { array_id, owner, operation_id } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                owner.validate()
+            }
+            Self::ElasticEnterService { array_id, owner, operation_id }
+            | Self::ElasticResume { array_id, owner, operation_id } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                owner.validate()
+            }
+            Self::ElasticMover { array_id, owner, operation_id, resume_operation_id, rules, .. } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                elastic::validate_elastic_uuid(resume_operation_id)?;
+                if operation_id == resume_operation_id { return Err(CatalogError::InvalidArgument("mover UUID i resume UUID muszą być różne".into())); }
+                rules.validate()?;
+                owner.validate()
+            }
             Self::ElasticRestore { array_id, owner } | Self::ElasticInspect { array_id, owner } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 owner.validate()
@@ -1979,6 +2160,35 @@ impl HelperCommand {
                 Some(name) => elastic::validate_array_name(name),
                 None => Ok(()),
             },
+            Self::ElasticJournals {} => Ok(()),
+            Self::ElasticAdopt { array_id, owner } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                owner.validate()
+            }
+            Self::DiskWipe { device, wwn, serial, bytes, release_journal } => {
+                validate_device(device)?;
+                // A disk with neither a WWN nor a serial cannot be
+                // re-identified after a rename, and the wipe's whole
+                // protection against hitting the wrong device is that
+                // re-identification. Refusing is the only honest answer.
+                if wwn.is_none() && serial.is_none() {
+                    return Err(CatalogError::InvalidArgument(
+                        "czyszczenie wymaga WWN albo numeru seryjnego dysku".into(),
+                    ));
+                }
+                for value in [wwn, serial].into_iter().flatten() {
+                    elastic::validate_identity_text(value)?;
+                }
+                if *bytes == 0 {
+                    return Err(CatalogError::InvalidArgument(
+                        "czyszczony dysk bez rozmiaru".into(),
+                    ));
+                }
+                match release_journal {
+                    Some(array_id) => elastic::validate_elastic_uuid(array_id),
+                    None => Ok(()),
+                }
+            }
             Self::SmbIncludeEnsure {}
             | Self::SmbIncludeRemove {}
             | Self::SmbConfigWrite {}
@@ -2623,8 +2833,19 @@ impl HelperCommand {
         match self {
             Self::ElasticCreate { .. } => ("builtin", "Tworzy Elastic Array z trwałym dziennikiem i kontrolą nośników."),
             Self::ElasticRestore { .. } => ("builtin", "Odtwarza potwierdzone montowania Elastic bez formatowania."),
+            Self::ElasticEnterService { .. } => ("builtin", "Trwale zatrzymuje publikację Elastic przed przejściem unii w RO."),
+            Self::ElasticResume { .. } => ("builtin", "Wznawia autoryzowaną publikację Elastic po potwierdzeniu RW."),
+            Self::ElasticMover { .. } => ("builtin", "Przenosi pliki cache do data z trwałym dziennikiem i synchronizacją parity."),
+            Self::ElasticSync { .. } => ("builtin", "Synchronizuje parity własnej macierzy Elastic z trwałym wynikiem."),
+            Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
+            Self::ElasticFix { .. } => ("builtin", "Odbudowuje wskazany dysk danych własnej macierzy Elastic z parity."),
+            Self::ElasticAddDisk { .. } => ("builtin", "Dodaje dysk danych do działającej unii własnej macierzy Elastic."),
+            Self::ElasticDestroy { .. } => ("builtin", "Zatrzymuje udostępnianie własnej macierzy Elastic bez formatowania dysków."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
+            Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym węźle."),
+            Self::ElasticAdopt { .. } => ("builtin", "Przepisuje właściciela dziennika macierzy Elastic na przejmującą instancję."),
+            Self::DiskWipe { .. } => ("builtin", "Usuwa sygnatury systemów plików i tablicy partycji z jednego dysku po wyłącznym otwarciu urządzenia."),
             Self::SmartctlInfo { .. } => (
                 "smartctl",
                 "Read one disk's SMART/NVMe health document (identity, attributes, self-test log).",
@@ -2797,11 +3018,23 @@ fn catalog_examples() -> Vec<HelperCommand> {
     vec![
         HelperCommand::ElasticCreate { operation: elastic::ElasticCreateSpec {
             array_id: s(), operation_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() },
-            name: s(), filesystem: elastic::ElasticFilesystem::Xfs, data: Vec::new(), parity: Vec::new(),
+            name: s(), filesystem: elastic::ElasticFilesystem::Xfs, data: Vec::new(), cache: None, parity: Vec::new(),
         } },
         HelperCommand::ElasticRestore { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
+        HelperCommand::ElasticEnterService { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticResume { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticMover { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), resume_operation_id: s(), rules: elastic::MoverRules::default(), coupled_sync: true },
+        HelperCommand::ElasticSync { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticScrub { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticFix { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), disk: s() },
+        HelperCommand::ElasticAddDisk { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(),
+            disk: elastic::ElasticDiskSpec { disk_id: s(), wwn: None, serial: None, bytes: 0, expected_uuid: s() } },
+        HelperCommand::ElasticDestroy { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::ElasticClaims { name: Some(s()) },
+        HelperCommand::ElasticJournals {},
+        HelperCommand::ElasticAdopt { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
+        HelperCommand::DiskWipe { device: "/dev/sda".into(), wwn: Some(s()), serial: Some(s()), bytes: 1, release_journal: None },
         HelperCommand::SmartctlInfo { device: s() },
         HelperCommand::SmartctlSelfTest {
             device: s(),
@@ -3041,6 +3274,26 @@ mod tests {
         assert_eq!(back, cmd);
         // Unknown variants are refused, not mapped to something else.
         assert!(serde_json::from_str::<HelperCommand>(r#"{"cmd":"exec","argv":["sh"]}"#).is_err());
+    }
+
+    #[test]
+    fn elastic_manual_commands_are_typed_builtins_with_distinct_operation_identity() {
+        let array_id = "11111111-1111-4111-8111-111111111111".to_string();
+        let operation_id = "22222222-2222-4222-8222-222222222222".to_string();
+        let owner = elastic::ElasticOwner { org_id: "org-default".into(), addon_id: "nas-owned".into() };
+        for (command, label) in [
+            (HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: operation_id.clone() }, "elastic_sync"),
+            (HelperCommand::ElasticScrub { array_id: array_id.clone(), owner: owner.clone(), operation_id: operation_id.clone() }, "elastic_scrub"),
+        ] {
+            assert_eq!(command.plan(), Ok(Plan::Builtin(label)));
+            assert_eq!(serde_json::from_str::<HelperCommand>(&command.to_json_line()).unwrap(), command);
+        }
+        for invalid_id in ["", "../state", "00000000-0000-0000-0000-000000000000"] {
+            assert!(HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: invalid_id.into() }.plan().is_err());
+            assert!(HelperCommand::ElasticScrub { array_id: invalid_id.into(), owner: owner.clone(), operation_id: operation_id.clone() }.plan().is_err());
+        }
+        assert!(HelperCommand::ElasticSync { array_id, operation_id,
+            owner: elastic::ElasticOwner { org_id: "".into(), addon_id: "nas-owned".into() } }.plan().is_err());
     }
 
     #[test]
@@ -3592,6 +3845,42 @@ mod tests {
     }
 
     #[test]
+    fn an_elastic_array_union_is_exported_under_a_uuid_and_nothing_else() {
+        // The exact line core generates for a share on an array union: the
+        // mergerfs mount has no device and no filesystem UUID, so `fsid=` is
+        // what gives NFS an identity to put in a file handle.
+        assert!(validate_export_line(
+            "/mnt/media 10.10.0.0/24(rw,sync,root_squash,no_subtree_check,fsid=01a099b1-800b-7e01-9d10-8cac34a2257d)"
+        )
+        .is_ok());
+        assert!(validate_export_line(
+            "/mnt/media 10.10.0.6(rw,sync,root_squash,no_subtree_check,fsid=0BA4F7C2-9D31-7B44-8F70-2C1D7E9A5B06)"
+        )
+        .is_ok());
+        // `exportfs` has no dry run: a value that is not a UUID has to die
+        // here, because the next thing that would read it is the kernel.
+        for bad in [
+            "/mnt/media 10.10.0.0/24(rw,fsid=)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=0)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=17)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=01a099b1-800b-7e01-9d10-8cac34a2257)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=01a099b1800b7e019d108cac34a2257d)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=01a099b1-800b-7e01-9d10-8cac34a2257z)",
+            "/mnt/media 10.10.0.0/24(rw,fsid={01a099b1-800b-7e01-9d10-8cac34a2257d})",
+            "/mnt/media 10.10.0.0/24(rw,fsid=urn:uuid:01a099b1-800b-7e01-9d10-8cac34a2257d)",
+            "/mnt/media 10.10.0.0/24(rw,fsid=/etc/passwd)",
+            // A name the catalog knows is not an option the catalog allows a
+            // value on, and `fsid` alone is not a flag.
+            "/mnt/media 10.10.0.0/24(rw,fsid)",
+            "/mnt/media 10.10.0.0/24(rw=1,sync)",
+            "/mnt/media 10.10.0.0/24(no_subtree_check=0)",
+            "/mnt/media 10.10.0.0/24(sync,uuid=01a099b1-800b-7e01-9d10-8cac34a2257d)",
+        ] {
+            assert!(validate_export_line(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn the_smb_fragment_allowlist_refuses_everything_that_runs_a_program() {
         let good = "[projekty]\n\tpath = /mnt/tank/projekty\n\tguest ok = no\n\tvfs objects = shadow_copy2 recycle\n\tshadow:snapdir = .zfs/snapshot\n";
         assert!(validate_smb_config(good).is_ok(), "{good}");
@@ -4128,6 +4417,62 @@ mod tests {
                 Some(snake(name[..end].trim()))
             })
             .collect()
+    }
+
+    /// EVERY Elastic command is a builtin, and every one of the five tables
+    /// that decide what happens to it knows it.
+    ///
+    /// `describe` and `validate_builtin` are exhaustive matches, so the
+    /// compiler holds those two. `builtin_label` ends in `_ => None` and
+    /// `catalog_examples` is a hand-written list — so a new Elastic variant
+    /// missing from either would compile, and would then be routed to the
+    /// EXEC channel: the wrapper would look for a program named after it,
+    /// fail to find one, and the array operation would surface as a missing
+    /// tool. That is the failure this test exists to make impossible.
+    #[test]
+    fn every_elastic_command_is_a_builtin_the_five_tables_know() {
+        let elastic: Vec<String> = declared_variant_names()
+            .into_iter()
+            .filter(|name| name.starts_with("elastic_"))
+            .collect();
+        assert!(
+            elastic.len() >= 14,
+            "parsed {} Elastic variants: {elastic:?}",
+            elastic.len()
+        );
+        for name in ["elastic_fix", "elastic_add_disk", "elastic_destroy"] {
+            assert!(elastic.contains(&name.to_string()), "{name} is not declared");
+        }
+        let listed: Vec<String> = catalog().into_iter().map(|e| e.name).collect();
+        let examples = catalog_examples();
+        for name in &elastic {
+            // `catalog()` is built from `catalog_examples`, so this is the
+            // hand-written list being checked against the enum.
+            assert!(listed.contains(name), "{name} is missing from catalog_examples()");
+            let example = examples
+                .iter()
+                .find(|command| command.variant_name() == *name)
+                .unwrap_or_else(|| panic!("{name} has no example"));
+            assert_eq!(
+                example.builtin_label(),
+                Some(name.as_str()),
+                "{name} fell through builtin_label to the exec channel"
+            );
+            assert_eq!(
+                example.describe().0,
+                "builtin",
+                "{name} is not described as a builtin"
+            );
+            // `validate_builtin` is reached through `plan()`, which is what the
+            // wrapper actually calls. The example specs are placeholders, so
+            // the verdict is not asserted — only that the command resolves to
+            // its OWN builtin rather than to an exec entry.
+            match example.plan() {
+                Ok(Plan::Builtin(label)) => assert_eq!(label, name.as_str()),
+                Ok(Plan::Exec(r)) => panic!("{name} resolved to exec {:?}", r.args),
+                Err(_) => (),
+            }
+        }
     }
 
     #[test]

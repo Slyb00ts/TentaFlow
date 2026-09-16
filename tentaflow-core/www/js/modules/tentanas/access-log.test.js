@@ -255,3 +255,46 @@ test('a viewer sees the log but not the forwarding button', async () => {
   assert.equal(body.querySelector('#nas-access-table').rows.length, 2);
   screen.dispose();
 });
+
+// The Tasks tab polls this card every 30 s. Rewriting the state block destroys
+// and recreates lines whose text did not change: a selection the admin made
+// inside "Audytowane udostępnienia SMB: …" is dropped on the next tick. The
+// truncation line is part of the same block, so the guard has to cover it too
+// — it used to arrive through a second `innerHTML +=`.
+test('an unchanged poll leaves the access-log state lines alone', async () => {
+  const screen = fakeScreen({ tentaNasAccessLogRequest: answer({ total: 5 }) });
+  const body = mount();
+  const view = wireAccessLog(screen, body);
+  await view.refresh();
+  await flush();
+  const stateEl = body.querySelector('#nas-access-state');
+  const lines = [...stateEl.children];
+  assert.ok(lines.length > 1, 'the card states what is audited');
+  assert.match(stateEl.textContent, /Pokazano 2 z 5 pasujących wpisów/, 'and that the page is not the whole answer');
+
+  await view.refresh();
+  await flush();
+  const after = [...stateEl.children];
+  assert.equal(after.length, lines.length, 'the same lines are on screen');
+  after.forEach((el, i) => assert.equal(el === lines[i], true, `state line ${i} survives the poll`));
+  screen.dispose();
+});
+
+// …but a line that genuinely changed still has to be written, or the card
+// would freeze on whatever the first poll happened to say.
+test('a changed access-log state line is still repainted', async () => {
+  let detail = '';
+  const screen = fakeScreen({ tentaNasAccessLogRequest: () => answer({ audit: { ...answer().audit, detail } }) });
+  const body = mount();
+  const view = wireAccessLog(screen, body);
+  await view.refresh();
+  await flush();
+  const stateEl = body.querySelector('#nas-access-state');
+  assert.doesNotMatch(stateEl.textContent, /kolektor zatrzymany/);
+
+  detail = 'kolektor zatrzymany';
+  await view.refresh();
+  await flush();
+  assert.match(stateEl.textContent, /kolektor zatrzymany/, 'the new line reached the card');
+  screen.dispose();
+});

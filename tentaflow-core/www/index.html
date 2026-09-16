@@ -43,6 +43,18 @@
   <link rel="stylesheet" href="/css/events.css">
   <link rel="stylesheet" href="/css/benchmark-studio.css">
   <link rel="stylesheet" href="/css/tentanas.css">
+  <!-- Cell styles for TentaNas content that lives inside a component's shadow
+       root (tf-table renderer="html"). media="not all" keeps these sheets OUT
+       of the document cascade — their selectors are unprefixed and generic
+       (.mono, .text-3, .muted) and would otherwise hit every other screen's
+       light DOM. They are adopted only into shadow roots whose host matches the
+       data-shadow-scope selector; see js/components/shared-styles.js.
+       Two sheets, because a TentaNas dialog is a tf-window.nas-modal appended
+       to document.body and so has no .nas-root ancestor, and because
+       tentanas.css gives the two scopes different declarations in places
+       (.nas-modal .mono.fw-700 is modal-only). -->
+  <link rel="stylesheet" href="/css/tentanas-cells.css" media="not all" data-shadow-scope=".nas-root">
+  <link rel="stylesheet" href="/css/tentanas-modal-cells.css" media="not all" data-shadow-scope=".nas-modal">
   <link rel="stylesheet" href="/css/tentaquant.css">
   <link rel="stylesheet" href="/css/ml-studio.css">
   <link rel="stylesheet" href="/css/robots.css">

@@ -393,3 +393,46 @@ test('protection covers the coarse tiers only, so the shortfall never blames a 1
   assert.equal(protectsNothing(fineOnly), true);
   assert.equal(protectsNothing({ ...fineOnly, protectDays: 0 }), false);
 });
+
+// Switching the dataset used to paint the cards from the PREVIOUS dataset's
+// rows: `reloadList` is async and was called beside `paintCards` rather than
+// before it. The card then looked for the newest snapshot of the newly picked
+// dataset among the old one's snapshots, found none, and printed "—" — a
+// dataset with snapshots reading as having none, and reading as current.
+test('switching the dataset paints the cards from the new dataset, not the previous one', async () => {
+  const home = [snap('home-nowa', '2026-09-01 02:00:00'), snap('home-stara', '2026-08-30 02:00:00')];
+  const media = [{
+    name: 'tank/media@media-nowa', shortName: 'media-nowa', dataset: 'tank/media',
+    createdAt: '2026-09-02 03:00:00', usedBytes: 0, referencedBytes: 0, origin: 'auto', holds: 0, clones: [],
+  }];
+  const screen = fakeScreen({
+    tentaNasSnapshotsListRequest: (p) => p.dataset === 'tank/media'
+      ? { snapshots: media, total: 1, totalUsedBytes: 5_000_000_000 }
+      : { snapshots: home, total: 2, totalUsedBytes: 1_000_000_000 },
+    tentaNasSnapshotSchedulesListRequest: { schedules: [] },
+    tentaNasSharesListRequest: { shares: [] },
+  });
+  screen.dataset = 'tank/home';
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  await drawSnapshots(screen, host, {
+    pool: 'tank',
+    datasets: [{ name: 'tank/home', snapshotCount: 2 }, { name: 'tank/media', snapshotCount: 1 }],
+  });
+  await flush();
+
+  const card = () => host.querySelector('#nas-snap-schedule').textContent;
+  assert.match(card(), /home-nowa/, 'the card starts on the selected dataset');
+
+  host.querySelector('#nas-snap-dataset').dispatchEvent(
+    new window.CustomEvent('change', { detail: { value: 'tank/media' } }),
+  );
+  // 15 s, not the 3 s default: under the full suite this wait measured ~3015 ms
+  // against a 3000 ms budget and failed as a flake. The assertion is about
+  // WHICH dataset the card shows, never about how fast a loaded run gets there.
+  const shown = await waitFor(() => (/media-nowa/.test(card()) ? card() : null), 15000);
+
+  assert.match(shown, /media-nowa/, "the newly picked dataset's own newest snapshot is shown");
+  assert.doesNotMatch(shown, /home-nowa/, "the previous dataset's snapshot is gone");
+  assert.match(shown, /4[.,]7 GiB/, 'the space row was reloaded too, not left behind');
+});

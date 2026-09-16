@@ -70,6 +70,22 @@ pub struct NasNodeInfo {
     pub ram_bytes: u64,
     #[serde(default)]
     pub uptime_secs: u64,
+    /// Disks in 'critical', counted APART from `disks_warning` — which counts
+    /// warnings and nothing else. One shared counter made a node that had
+    /// lost a disk read as a warning on a screen that never looked at
+    /// `health`; a reader that wants "disks with a problem" adds the two.
+    #[serde(default)]
+    pub disks_critical: u32,
+    /// Elastic Arrays on the node, beside `pools_total` (ZFS pools) rather
+    /// than inside it: a node whose only storage is an array answered zero
+    /// pools, which read as "not a NAS".
+    #[serde(default)]
+    pub arrays_total: u32,
+    /// Arrays the node could not measure, left out of `capacity_bytes` AND
+    /// `used_bytes` both. Non-zero means those two are partial — say so
+    /// rather than showing a confident total with a disk shelf missing.
+    #[serde(default)]
+    pub arrays_unmeasured: u32,
 }
 
 // =============================================================================
@@ -189,7 +205,11 @@ pub struct NasDisk {
     pub rotational: bool,
     pub removable: bool,
     pub firmware: Option<String>,
-    /// 'free' | 'pool' | 'parity' | 'cache' | 'spare' | 'system' | 'partitioned'.
+    /// 'system' | 'pool_member' | 'array_member' | 'mounted' | 'used' | 'free',
+    /// as `role_of` decides it from lsblk. This list used to name values the
+    /// inventory never produces, 'spare' among them, and two call sites filtered
+    /// on `role == "spare"` accordingly and matched nothing. The part a disk
+    /// plays inside its owner is `vdev_role` (ZFS) or `array_role` (Elastic).
     pub role: String,
     /// Pool or array the disk belongs to, when `role` says so.
     pub member_of: Option<String>,
@@ -224,6 +244,45 @@ pub struct NasDisk {
     pub vdev_role: String,
     #[serde(default)]
     pub vdev_kind: String,
+    /// Filesystem signature lsblk reports on the disk (its FSTYPE), when one is
+    /// present. Carried so a disk whose `role` is the catch-all "used" can say
+    /// WHAT occupies it — that role covers 23 of 29 disks on a real machine and
+    /// on its own tells the reader nothing. `member_of` cannot be reused for
+    /// this: it feeds `NasReplacementAdvice.member_of`, where the UI prints a
+    /// pool name.
+    #[serde(default)]
+    pub fs_type: Option<String>,
+    /// The filesystem UUID lsblk reports for that signature, when there is
+    /// one. This is the identity an Elastic Array records as `expected_uuid`
+    /// when it formats a branch, so it is what an import has to match before
+    /// adopting a disk: a serial or a WWN only says "the same hardware came
+    /// back", while the UUID says "this is still the same filesystem and not
+    /// one somebody has since reused".
+    #[serde(default)]
+    pub fs_uuid: Option<String>,
+    /// The filesystem LABEL lsblk reports for that same signature, when there
+    /// is one. Set together with `fs_type` and `fs_uuid` and never on its own:
+    /// a label read off one signature beside another signature's type would
+    /// name the wrong thing in the one place it is used — the wipe plan, which
+    /// has to tell the admin WHICH filesystem is about to be erased. For a
+    /// `zfs_member` or `linux_raid_member` disk the label is the pool or array
+    /// name and goes to `member_of` instead, so this stays empty there.
+    #[serde(default)]
+    pub fs_label: Option<String>,
+    /// Which part of the Elastic Array named by `member_of` this disk is:
+    /// 'data' | 'cache' | 'parity'. Empty when the disk belongs to no array.
+    ///
+    /// Deliberately NOT `vdev_role`/`vdev_kind`: those two describe a ZFS
+    /// top-level vdev and its redundancy, and the Disks tab renders
+    /// `vdev_kind` through the RAID layout names. An Elastic Array is a union
+    /// mount over ordinary per-disk filesystems — it has no vdev and no
+    /// layout — so borrowing that pair would print a RAID layout for a union
+    /// branch. `role`/`member_of` alone cannot carry it either: they say
+    /// "member of produkt" and every member would read the same, while the
+    /// admin's next move differs per part (a cache disk holds unprotected
+    /// bytes, a parity disk holds no data at all).
+    #[serde(default)]
+    pub array_role: String,
 }
 
 /// One SMART attribute (ATA) or NVMe log field, normalized.
@@ -359,6 +418,94 @@ pub struct NasReplacementAdvice {
     /// Whether the pool has a spare standing by, so the UI can say whether the
     /// replacement is a hot swap or needs a disk bought first.
     pub spare_available: bool,
+}
+
+/// One reason the node refuses to clear a disk, with a machine code beside
+/// the sentence so a caller can branch on the cause without parsing prose.
+///
+/// Every refusal here is a HARD stop with one exception, `journal_claim`,
+/// which the request may acknowledge (see `NasDiskWipePlan::journal_claim`).
+/// There is no force flag and no "wipe anyway": the reason a disk reads as
+/// occupied is the reason clearing it would destroy something.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasDiskWipeRefusal {
+    /// 'system' | 'zfs_pool' | 'mdraid' | 'elastic_member' | 'mounted' |
+    /// 'journal_serving' | 'journal_unknown'.
+    ///
+    /// Every code here is produced by `tentanas::disks::plan_wipe`; a code
+    /// documented and never produced is a promise to the frontend that
+    /// nothing keeps.
+    pub code: String,
+    /// The refusal as one sentence naming the cause AND the remedy, which is
+    /// the only form an admin can act on: "sda jest w puli ZFS tank — usuń
+    /// pulę albo odłącz od niej ten dysk" says what to do next, while "disk
+    /// busy" does not.
+    pub detail: String,
+}
+
+/// The Elastic Array journal that still claims a disk left over from a
+/// dissolved array.
+///
+/// A dissolve keeps the journal on purpose, so the array import can take the
+/// array back whole — which means `ElasticClaims` goes on reporting the
+/// members AND the name as reserved, and the disks stay unusable until the
+/// claim is released. Clearing such a disk therefore has a second victim the
+/// device name does not mention: the array's recoverability. That is why this
+/// is reported apart from the refusals and needs its own acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasDiskWipeJournalClaim {
+    pub array_id: String,
+    pub name: String,
+    /// 'data' | 'cache' | 'parity' — what the disk was to the array.
+    pub array_role: String,
+    /// Members the journal lists, so the dialog can say how much of the array
+    /// is being given up ("1 z 9 dysków").
+    pub member_count: u32,
+    /// The owner the journal records. Shown when it is not this instance's
+    /// own, because then the array belongs to another provisioning and
+    /// acknowledging its loss is not this admin's own array to lose.
+    pub owner_org_id: String,
+    pub owner_addon_id: String,
+}
+
+/// What clearing one disk would remove, and everything that stops it.
+///
+/// Read-only: asking for this plan never opens a device for writing, never
+/// runs `wipefs` without `--no-act`, and changes nothing on the node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasDiskWipePlan {
+    pub disk_id: String,
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub model: String,
+    pub serial: String,
+    /// The filesystem signature that would be removed, with its label and
+    /// UUID — the three facts that identify WHAT is being erased, as opposed
+    /// to which device node it currently answers on.
+    pub fs_type: Option<String>,
+    pub fs_label: Option<String>,
+    pub fs_uuid: Option<String>,
+    /// Mountpoints this node can see. ALWAYS incomplete by design: Elastic
+    /// Array branches are mounted inside the union process's own mount
+    /// namespace, so a disk carrying a mounted filesystem can legitimately
+    /// show none here. It is reported because it is useful when non-empty,
+    /// never as evidence that a disk is idle.
+    pub mountpoints: Vec<String>,
+    /// Hard stops. A non-empty list means the confirm button stays disabled;
+    /// there is no "clear anyway".
+    pub refusals: Vec<NasDiskWipeRefusal>,
+    /// Set when a dissolved array's kept journal claims this disk. The wipe
+    /// then needs `DiskWipeRequest::release_journal_array` to carry this
+    /// array's `name`, on top of the retyped device name, and it releases the
+    /// claim by dropping the journal — after which the array can no longer be
+    /// imported back.
+    pub journal_claim: Option<NasDiskWipeJournalClaim>,
+    /// Whether a wipe would be accepted. False whenever `refusals` is
+    /// non-empty. True with a `journal_claim` present still requires the
+    /// acknowledgement: the plan says the wipe MAY proceed, not that it needs
+    /// nothing more.
+    pub allowed: bool,
 }
 
 /// Whether the disk data of the answer is fresh. Mode B between armed
@@ -1287,19 +1434,26 @@ pub struct NasElasticFolder {
 }
 
 /// One mover run, as the Tasks tab lists it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+///
+/// `Eq` like its sibling `NasSnapraidRun`: every field is a String, a u64 or a
+/// bool, and the store row that now carries a Vec of these compares by value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasMoverRun {
     pub started_at: String,
     pub finished_at: Option<String>,
-    /// 'running' | 'ok' | 'partial' | 'failed' | 'cancelled'. 'partial' is
-    /// the normal outcome when files were open: the run did its job and left
-    /// some behind on purpose.
+    /// 'running' | 'ok' | 'partial' | 'needs_attention' | 'failed' |
+    /// 'cancelled'. 'partial' is the normal outcome when files were open or
+    /// refused: the run did its job and left some behind on purpose.
+    /// 'needs_attention' is a run that stopped and still holds the array
+    /// until the same operation is resumed; 'failed' is such a run that was
+    /// closed without finishing.
     pub outcome: String,
     pub moved_bytes: u64,
     pub moved_files: u64,
-    /// Files another process held open. The mover NEVER moves one out from
-    /// under its writer (§5.3), so this is the honest half of every run and
-    /// the UI shows it next to what was moved.
+    /// Files another process held open, or that did not fit the target data
+    /// branch above its minfreespace this run. The mover NEVER moves one out
+    /// from under its writer (§5.3), so this is the honest half of every run
+    /// and the UI shows it next to what was moved.
     pub skipped_files: u64,
     pub skipped_bytes: u64,
     /// Whether the four counters above were actually measured. A run that
@@ -1308,6 +1462,11 @@ pub struct NasMoverRun {
     /// "nothing was left behind" about a walk that never happened.
     #[serde(default)]
     pub counts_known: bool,
+    /// Free text. It also carries what has no field of its own: the first
+    /// refused or skipped paths, and the stuck records the helper keeps
+    /// (path and the operation that left it) — files the mover could neither
+    /// finish nor withdraw, which later runs leave alone until an admin
+    /// acknowledges them.
     pub detail: String,
     /// The `snapraid sync` that ran as part of the SAME job, when the
     /// coupling is on. Its absence in a coupled configuration is a fault, not
@@ -1317,18 +1476,27 @@ pub struct NasMoverRun {
 }
 
 /// One snapraid invocation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasSnapraidRun {
+    pub job_id: Option<String>,
+    pub operation_id: Option<String>,
     /// 'sync' | 'scrub' | 'fix' | 'status' | 'diff'.
     pub kind: String,
     pub started_at: String,
     pub finished_at: Option<String>,
-    /// 'running' | 'ok' | 'failed' | 'cancelled'.
+    /// Stan próby: running, ok, failed, needs_attention, refused lub cancelled.
     pub outcome: String,
     pub detail: String,
     /// Errors this run found. `None` = the run did not get far enough to say,
     /// which is a different sentence from "it found none".
     pub errors: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub total_blocks: Option<u64>,
+    pub checked_blocks: Option<u64>,
+    pub accessed_mb: Option<u64>,
+    pub errors_file: Option<u64>,
+    pub errors_io: Option<u64>,
+    pub errors_data: Option<u64>,
 }
 
 /// The SnapRAID half of an array's status — n11's right-hand card.
@@ -1340,9 +1508,18 @@ pub struct NasSnapraidState {
     pub config_path: String,
     pub last_sync: Option<NasSnapraidRun>,
     pub last_scrub: Option<NasSnapraidRun>,
+    pub history: Vec<NasSnapraidRun>,
     /// The nightly safety net, independent of the sync coupled to the mover.
     pub sync_schedule: Option<NasSchedule>,
     pub scrub_schedule: Option<NasSchedule>,
+    /// Whether each cadence above actually FIRES. A schedule the admin
+    /// switched off stays saved — that is what the editor promises — so
+    /// without these two a disabled cadence would render on n11 exactly like
+    /// a live one and the card would claim a safety net that is not running.
+    #[serde(default)]
+    pub sync_schedule_enabled: bool,
+    #[serde(default)]
+    pub scrub_schedule_enabled: bool,
     /// `snapraid scrub -p` and `-o`: how much of the array is re-read per run
     /// and how old a block has to be to qualify.
     pub scrub_percent: u8,
@@ -1361,14 +1538,25 @@ pub struct NasMoverSettings {
     pub schedule: Option<NasSchedule>,
     /// Move nothing younger than this. 0 = no age limit.
     pub min_age_secs: u64,
-    /// Keep the cache at least this empty. Falling below it starts a run
-    /// outside the schedule.
+    /// A trigger only: falling below this much free cache starts a run
+    /// outside the schedule. Every run moves each aged file regardless.
     pub cache_min_free_pct: u8,
     /// Run `snapraid sync` in the SAME job, immediately after the move.
     /// Default on, and §5.3 explains why in one sentence: without it the
     /// files the mover just moved leave one unprotected window and enter
     /// another.
     pub coupled_sync: bool,
+    /// Whether these settings were ever CHOSEN for this array, as opposed to
+    /// being the built-in defaults a run falls back on. True exactly when n15's
+    /// dialog has saved them, so the panel labels the numbers a run will use as
+    /// defaults rather than presenting them as somebody's decision.
+    ///
+    /// It is NOT the same question as "is there a cadence": a schedule and the
+    /// three rules are saved as separate rows and either can stand alone, so
+    /// the schedule row renders from `schedule` and this flag speaks only for
+    /// the rules.
+    #[serde(default)]
+    pub configured: bool,
     pub last_run: Option<NasMoverRun>,
     /// Recent runs, newest first — n11's "Historia".
     #[serde(default)]
@@ -1413,7 +1601,7 @@ pub struct NasElasticArray {
     /// Always 'elastic-array' — the machine kind of §5.3, next to a ZFS
     /// pool's 'zfs'.
     pub kind: String,
-    /// 'active' | 'pending' | 'error' | 'disabled' | 'unknown'.
+    /// Stany: 'active' | 'pending' | 'creating' | 'needs_attention' | 'error' | 'disabled' | 'unknown'.
     pub state: String,
     pub state_detail: String,
     /// 'ok' | 'warning' | 'critical' | 'unknown'.
@@ -1433,6 +1621,19 @@ pub struct NasElasticArray {
     pub cache_disks: Vec<NasElasticBranch>,
     pub parity_disks: Vec<NasElasticParity>,
     pub folders: Vec<NasElasticFolder>,
+    /// Whether the list above is the array's REAL top-level folders.
+    ///
+    /// `false` is UNKNOWN and never "this array has no folders", and the
+    /// difference is not cosmetic: the folders are discovered by reading the
+    /// union, and §3.4 forbids fstab — so on a node that has not mounted the
+    /// branches yet `/mnt/<array>` is an ordinary empty directory of the root
+    /// filesystem and reads back as zero entries. Publishing that as "no
+    /// folders" would tell an admin their data is gone. The folders whose
+    /// policy this node has STORED are listed either way, because a stored
+    /// policy is an intention and the mover honours it whatever the union
+    /// says; `folders_known` describes the discovery half alone.
+    #[serde(default)]
+    pub folders_known: bool,
     pub mover: NasMoverSettings,
     pub snapraid: NasSnapraidState,
     pub protection: NasElasticProtection,
@@ -1443,6 +1644,13 @@ pub struct NasElasticArray {
     pub used_bytes: Option<u64>,
     pub cache_size_bytes: Option<u64>,
     pub cache_used_bytes: Option<u64>,
+    /// An operation of this array closed as `needs_attention` and nothing has
+    /// resolved it. Maintenance stays refused while it stands (clearing one is
+    /// E2-13), and it SURVIVES a later operation returning the array to
+    /// `active` — a Restore does exactly that. Without this on the wire the UI
+    /// would offer a button whose only possible answer is an error.
+    #[serde(default)]
+    pub unresolved_operation: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1491,6 +1699,50 @@ pub struct NasElasticPlan {
     /// the first sync. Empty when `refusals` is non-empty: there is no plan
     /// for something the node will not do.
     pub steps_preview: String,
+}
+
+/// An Elastic Array this node holds on disk but has no database record of —
+/// what an import offers to adopt.
+///
+/// Losing the record is not hypothetical. Re-provisioning the addon gives it a
+/// new `org_id`/`addon_id`, and an array created under the previous identity
+/// keeps its disks, keeps serving its union and keeps its journal on the host
+/// while the new database starts empty. Nothing in the product could then
+/// reach it: `ConfigExportRequest` does not cover arrays either, so the
+/// members read as "occupied by nothing" and the only action ever offered for
+/// them was to erase them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasElasticImportCandidate {
+    pub array_id: String,
+    pub name: String,
+    /// 'xfs' | 'ext4'.
+    pub filesystem: String,
+    /// The owner the journal records. When it differs from this addon's own,
+    /// adopting re-owns the array, and the dialog has to say so rather than
+    /// quietly reassigning somebody else's storage.
+    pub owner_org_id: String,
+    pub owner_addon_id: String,
+    pub data_disks: u32,
+    pub parity_disks: u32,
+    pub cache_disks: u32,
+    /// Members whose filesystem UUID still matches what the journal recorded.
+    pub disks_matched: u32,
+    /// Members this node cannot find, named as the journal knew them.
+    pub disks_missing: Vec<String>,
+    /// Members that are present but whose filesystem UUID has changed: the
+    /// disk was reused for something else. Kept apart from `disks_missing`
+    /// because the remedy differs — a missing disk may come back, a reused one
+    /// is gone, and adopting it would claim data that is no longer the
+    /// array's.
+    pub disks_reused: Vec<String>,
+    /// The union is still published on the host: the array is live and serving
+    /// right now, even though the database has never heard of it.
+    pub union_mounted: bool,
+    /// 'importable' | 'already_known' | 'incomplete'.
+    pub status: String,
+    /// One sentence naming what adopting this would do, or why it cannot be
+    /// done.
+    pub detail: String,
 }
 
 /// Whether this node can run an Elastic Array at all — probed, never assumed.
@@ -1630,6 +1882,64 @@ pub enum TentaNasPayload {
         method: String,
         active: bool,
         detail: String,
+    },
+    /// What clearing ONE disk would remove, and every reason the node would
+    /// refuse. Read-only: it opens nothing for writing and runs no eraser.
+    ///
+    /// It is a request of its own rather than a field of `DiskGetResponse`
+    /// because answering it consults the privileged channel — the Elastic
+    /// journals this node holds are `0700 root`, and a disk left over from a
+    /// dissolved array is claimed by one of them without anything in the
+    /// database saying so.
+    DiskWipePlanRequest {
+        disk_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    DiskWipePlanResponse {
+        plan: NasDiskWipePlan,
+    },
+    /// Clears one disk: every filesystem, RAID and partition-table signature
+    /// on it goes, and the disk reads as free afterwards. Answers with
+    /// `JobResponse`.
+    ///
+    /// `confirm_device` is the retype gate — the device name as the plan
+    /// reported it (`sda`, not `/dev/sda`), the way a pool destroy makes the
+    /// admin retype the pool name. It is checked again here because the
+    /// dialog is not a security boundary.
+    ///
+    /// THE DEVICE NAME IS NOT THE IDENTITY. `disk_id` is (WWN, else serial),
+    /// and the privileged side re-resolves the device from it and refuses if
+    /// the name, the WWN, the serial or the size has moved since the plan —
+    /// a kernel rename between two reboots is exactly how a wipe reaches the
+    /// disk nobody meant.
+    ///
+    /// There is deliberately NO force or override flag. The last gate is an
+    /// exclusive open of the block device, which the kernel refuses whenever
+    /// the device carries a filesystem mounted in ANY mount namespace, and
+    /// that refusal is final — Elastic Array branches are mounted inside the
+    /// union process's own namespace, so `lsblk` and `/proc/mounts` on the
+    /// host cannot see them and no user-space check can stand in for it.
+    DiskWipeRequest {
+        disk_id: String,
+        confirm_device: String,
+        /// The SECOND, separate acknowledgement: the `name` of the Elastic
+        /// Array whose kept journal claims this disk, when the plan reports
+        /// one. Empty means "not acknowledged", and a disk under a journal
+        /// claim is then refused — a retyped device name alone must never be
+        /// able to make a dissolved array unrecoverable, because the admin
+        /// typing it is thinking about the disk, not about the array.
+        ///
+        /// With it, the wipe drops that journal once the erase is VERIFIED —
+        /// never before it. Released first, a `wipefs` that then failed left
+        /// the array permanently unimportable and disarmed this very
+        /// acknowledgement on every sibling disk, since no journal claimed
+        /// them any more. Dropping it releases the claim on EVERY member of
+        /// the array and on the array's name.
+        #[serde(default)]
+        release_journal_array: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
     },
 
     // ----- alerts -----
@@ -2380,8 +2690,8 @@ pub enum TentaNasPayload {
 
     // ----- Elastic Array: mergerfs + SnapRAID (§5.3) -----
     //
-    // Create/restore zwracają istniejący JobResponse; cache/mover i ręczne
-    // operacje SnapRAID nie są częścią tego przyrostu.
+    // Create/restore zwracają istniejący JobResponse; cache jest częścią
+    // specyfikacji Create, a mover pozostaje osobnym przyrostem.
     /// What this node can do about Elastic Arrays, and which disks are free
     /// for one. The wizard's first question.
     ElasticCapabilitiesRequest {},
@@ -2415,6 +2725,33 @@ pub enum TentaNasPayload {
         data_disk_ids: Vec<String>,
         #[serde(default)]
         parity_disk_ids: Vec<String>,
+        #[serde(default)]
+        cache_disk_ids: Vec<String>,
+        confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Arrays present on this node but absent from its database — the
+    /// recovery path described on `NasElasticImportCandidate`. Read-only: it
+    /// reads journals and disk UUIDs and changes nothing.
+    ///
+    /// Privileged despite being read-only, the way `PoolImportScanRequest` is:
+    /// the journals live under `/var/lib/tentanas`, which is `0700 root`, while
+    /// the service runs unprivileged — so there is no unprivileged way to learn
+    /// that a lost array exists.
+    ElasticArrayImportScanRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    ElasticArrayImportScanResponse {
+        candidates: Vec<NasElasticImportCandidate>,
+    },
+    /// Adopts one scanned array into this addon's database. Refuses unless
+    /// every member's filesystem UUID still matches its journal entry: the
+    /// alternative is claiming a disk somebody has since reused. `confirm_name`
+    /// carries the name the admin typed, as the destroy paths do.
+    ElasticArrayImportRequest {
+        array_id: String,
         confirm_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
@@ -2427,6 +2764,129 @@ pub enum TentaNasPayload {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
+    },
+    ElasticArraySyncRequest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    ElasticArrayScrubRequest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Rebuilds ONE data disk of the array from its parity
+    /// (`snapraid fix -d <disk>`). `disk` is the array's own branch name
+    /// (`d1`, `d2`, …) as `NasElasticBranch::name` reports it, never a device:
+    /// the disk being repaired is by definition the one that is failing, and a
+    /// kernel name can point at a different disk after a reboot.
+    ///
+    /// The retype is the DISK, not the array, and that is deliberate: a repair
+    /// overwrites the named disk's current contents with what parity says they
+    /// should be, so the mistake to make impossible is repairing the wrong
+    /// disk of the right array.
+    ElasticArrayFixRequest {
+        name: String,
+        disk: String,
+        confirm_disk: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// §5.3's headline: one more data disk, added to the array while it keeps
+    /// serving. The union is never taken down — MEASURED, see
+    /// `tentanas_helper::elastic::ElasticStep::AddBranch` — so SMB and NFS
+    /// clients keep their handles throughout.
+    ///
+    /// The disk is ERASED: it is formatted with the array's filesystem before
+    /// it joins, which is why this carries the same retype a create does. It
+    /// comes under parity only after the sync this operation ends with.
+    ElasticArrayAddDiskRequest {
+        name: String,
+        disk_id: String,
+        confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Stops serving the array and forgets it in this instance.
+    ///
+    /// It formats NOTHING. Every data and cache disk keeps its filesystem and
+    /// its files, the parity file and the snapraid config stay, and the node
+    /// keeps the array's journal — so `ElasticArrayImportScanRequest` finds it
+    /// again and the array can be taken back whole. That is what makes this
+    /// the one destructive array operation that is reversible, and the dialog
+    /// has to say so.
+    ///
+    /// The member disks are NOT wiped, so they go on carrying filesystem
+    /// signatures and read as `used` rather than `free` until a wipe exists.
+    ElasticArrayDestroyRequest {
+        name: String,
+        confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// "Uruchom mover teraz" (n11): moves aged cache files down onto the data
+    /// disks and runs the coupled `snapraid sync` in the SAME job.
+    ElasticArrayMoverRequest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// n15's mover dialog (§5.3): the cadence AND the three rules in ONE
+    /// request, because the dialog is one form — saving the cadence but not
+    /// the rules it was chosen alongside would leave a state nobody asked for.
+    /// Answers with `ElasticArrayGetResponse`.
+    ElasticMoverScheduleSetRequest {
+        name: String,
+        enabled: bool,
+        schedule: NasSchedule,
+        /// The three rules are ALL-OR-NOTHING and absent means "leave them as
+        /// they are". n15's row toggle resends the cadence with only `enabled`
+        /// flipped and carries no rules; with these required it would post a
+        /// zero for each and silently overwrite the admin's settings with
+        /// "move everything, never trigger". Absent is the only safe spelling
+        /// of "this request is not about the rules".
+        ///
+        /// Move nothing younger than this. 0 = no age limit.
+        #[serde(default)]
+        min_age_secs: Option<u64>,
+        /// A TRIGGER, never a gate: falling below this much free cache starts
+        /// an EXTRA run outside the cadence. Every scheduled run still moves
+        /// each aged file however roomy the cache is.
+        #[serde(default)]
+        cache_min_free_pct: Option<u8>,
+        /// Run `snapraid sync` in the same job, right after the move.
+        #[serde(default)]
+        coupled_sync: Option<bool>,
+    },
+    /// The recurring parity sync — the nightly safety net, independent of the
+    /// sync coupled to the mover. Answers with `ElasticArrayGetResponse`.
+    ElasticSyncScheduleSetRequest {
+        name: String,
+        enabled: bool,
+        schedule: NasSchedule,
+    },
+    /// The recurring parity scrub. Answers with `ElasticArrayGetResponse`.
+    ElasticScrubScheduleSetRequest {
+        name: String,
+        enabled: bool,
+        schedule: NasSchedule,
+    },
+    /// One folder's cache policy — n11's "Cache" column, per row. Answers with
+    /// `ElasticArrayGetResponse`.
+    ///
+    /// It carries NO `sudo_password` and parks with nobody: it writes one row
+    /// of this node's database and starts no privileged step. What it changes
+    /// is the rules the NEXT mover run is carried out under.
+    ///
+    /// `cache_policy` is 'yes' | 'no' | 'only', and 'yes' is how a folder is
+    /// RETURNED TO THE DEFAULT: the default is the absence of a stored row, so
+    /// storing 'yes' beside it would be a second spelling of the same state
+    /// that could then disagree with it.
+    ElasticFolderCacheSetRequest {
+        name: String,
+        /// One top-level folder of the union, relative to it — never a path.
+        folder: String,
+        cache_policy: String,
     },
 }
 
@@ -2538,6 +2998,118 @@ mod tests {
         );
         // The release request grew the direct red path's fields in N2.5; its
         // minimal decode is pinned in `the_access_audit_and_trim_wire_decodes_from_minimal_json`.
+
+        // The mover request (E2-09) joins the Elastic family: the tag is frozen
+        // like its siblings' and the password decodes from the minimal JSON the
+        // encoders send, because the browser never fills a field it has no value for.
+        let json = serde_json::json!({ "ElasticArrayMoverRequest": { "name": "media" } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ElasticArrayMoverRequest {
+                name: "media".to_string(),
+                sudo_password: None,
+            }
+        );
+        assert_eq!(
+            crate::cbor::encode(&decoded).expect("encode"),
+            hex_bytes(
+                "a17818456c617374696341727261794d6f76657252657175657374a1646e616d65656d65646961"
+            ),
+            "ElasticArrayMoverRequest wire drift"
+        );
+
+        // E2-10's three schedule variants. Appending to the enum cannot move a
+        // tag pinned above — serde's external tagging keys by NAME, not by
+        // position — so what these have to prove is the other half: that every
+        // field survives the CBOR the browser actually sends. The mover request
+        // carries its RULES beside the cadence, and a field silently lost there
+        // would be read as "the admin chose 0".
+        let schedule = NasSchedule {
+            every: "1h".to_string(),
+            hour: 0,
+            minute: 30,
+            weekday: 0,
+            day: 1,
+        };
+        let mover = TentaNasPayload::ElasticMoverScheduleSetRequest {
+            name: "media".to_string(),
+            enabled: true,
+            schedule: schedule.clone(),
+            min_age_secs: Some(7_200),
+            cache_min_free_pct: Some(20),
+            coupled_sync: Some(true),
+        };
+        let back: TentaNasPayload =
+            crate::cbor::decode(&crate::cbor::encode(&mover).expect("encode")).expect("decode");
+        assert_eq!(back, mover, "ElasticMoverScheduleSetRequest wire drift");
+
+        // n15's row toggle: the cadence with `enabled` flipped and NO rules.
+        // Every rule must decode as absent, because a `0` here would be read
+        // as "the admin chose no age limit and no trigger".
+        let json = serde_json::json!({
+            "ElasticMoverScheduleSetRequest": {
+                "name": "media",
+                "enabled": false,
+                "schedule": { "every": "1h", "hour": 0, "minute": 30, "weekday": 0, "day": 1 }
+            }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ElasticMoverScheduleSetRequest {
+                name: "media".to_string(),
+                enabled: false,
+                schedule: schedule.clone(),
+                min_age_secs: None,
+                cache_min_free_pct: None,
+                coupled_sync: None,
+            }
+        );
+
+        for variant in [
+            TentaNasPayload::ElasticSyncScheduleSetRequest {
+                name: "media".to_string(),
+                enabled: true,
+                schedule: schedule.clone(),
+            },
+            // Disabled, because a saved-but-off cadence is a state the dialog
+            // can produce and `false` is exactly what a dropped bool looks like.
+            TentaNasPayload::ElasticScrubScheduleSetRequest {
+                name: "media".to_string(),
+                enabled: false,
+                schedule: schedule.clone(),
+            },
+        ] {
+            let back: TentaNasPayload =
+                crate::cbor::decode(&crate::cbor::encode(&variant).expect("encode"))
+                    .expect("decode");
+            assert_eq!(back, variant, "elastic schedule variant wire drift");
+        }
+
+        // The per-folder cache policy. Every field is required: absent is not
+        // a spelling this request has, because "no policy" is 'yes' and the
+        // handler has to be able to tell that apart from a dropped field.
+        let folder = TentaNasPayload::ElasticFolderCacheSetRequest {
+            name: "media".to_string(),
+            folder: "foto".to_string(),
+            cache_policy: "only".to_string(),
+        };
+        let back: TentaNasPayload =
+            crate::cbor::decode(&crate::cbor::encode(&folder).expect("encode")).expect("decode");
+        assert_eq!(back, folder, "ElasticFolderCacheSetRequest wire drift");
+        let json = serde_json::json!({
+            "ElasticFolderCacheSetRequest": { "name": "media", "folder": "foto", "cache_policy": "yes" }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ElasticFolderCacheSetRequest {
+                name: "media".to_string(),
+                folder: "foto".to_string(),
+                cache_policy: "yes".to_string(),
+            }
+        );
     }
 
     /// The approval answers travel through the same CBOR the browser decodes,
@@ -2670,6 +3242,11 @@ mod tests {
         assert!(node.features.is_empty());
         assert_eq!(node.ram_bytes, 0);
         assert_eq!(node.uptime_secs, 0);
+        // A peer that predates the split publishes one disk counter, and its
+        // row must not claim failures or arrays it never counted.
+        assert_eq!(node.disks_critical, 0);
+        assert_eq!(node.arrays_total, 0);
+        assert_eq!(node.arrays_unmeasured, 0);
 
         let elevation: NasElevation = serde_json::from_value(serde_json::json!({
             "mode": "helper",
@@ -2694,8 +3271,12 @@ mod tests {
         let fields = disk.as_object_mut().expect("object");
         fields.remove("vdev_role");
         fields.remove("vdev_kind");
+        // Same for the Elastic Array part: a node that predates `array_role`
+        // says nothing about arrays, which is the empty string, not a panic.
+        fields.remove("array_role");
         let disk: NasDisk = serde_json::from_value(disk).expect("decode");
         assert!(disk.vdev_role.is_empty() && disk.vdev_kind.is_empty());
+        assert!(disk.array_role.is_empty());
 
         // The §5.5a transport fields: a peer that predates them sends an NFS
         // share without `rdma` and a mount status without `transport`, and
@@ -2846,9 +3427,28 @@ mod tests {
             mountpoints: vec![],
             vdev_role: "data".to_string(),
             vdev_kind: "raidz2".to_string(),
+            fs_type: Some("ext4".to_string()),
+            fs_uuid: Some("2a7f1c30-9e64-4b8d-a5f2-71c3e806d914".to_string()),
+            fs_label: Some("archiwum".to_string()),
+            // A ZFS pool member is in no Elastic Array, so the field that says
+            // which part of one it is stays empty here — the branch below
+            // carries it.
+            array_role: String::new(),
+        };
+        // A second row whose state the first one cannot hold honestly: an
+        // Elastic Array branch has no vdev and no RAID layout, the union owns
+        // it, and the PART it plays there has to survive the wire on its own.
+        let branch = NasDisk {
+            disk_id: "sn-D1".to_string(),
+            name: "sdg".to_string(),
+            path: "/dev/sdg".to_string(),
+            role: "array_member".to_string(),
+            member_of: Some("produkt".to_string()),
+            array_role: "parity".to_string(),
+            ..NasDisk::default()
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::DisksListResponse {
-            disks: vec![disk],
+            disks: vec![disk, branch],
             telemetry: NasTelemetryState {
                 sampled_at: Some("2026-09-01T14:06:00Z".to_string()),
                 smart_read_at: None,
@@ -2871,6 +3471,79 @@ mod tests {
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
         assert_eq!(back, body);
+    }
+
+    /// The wipe plan and its two requests survive the wire whole.
+    ///
+    /// The dialog arms its danger button from `allowed`, `refusals` and
+    /// `journalClaim`, so a field lost in encoding is a button armed over a
+    /// refusal. `releaseJournalArray` defaults to empty on the way in, which
+    /// is what makes "not acknowledged" the state a client cannot omit its
+    /// way past.
+    #[test]
+    fn the_disk_wipe_plan_and_its_requests_round_trip() {
+        let plan = NasDiskWipePlan {
+            disk_id: "wwn-0x5000c500a1b2c3d4".to_string(),
+            name: "sdc".to_string(),
+            path: "/dev/sdc".to_string(),
+            size_bytes: 8_001_563_222_016,
+            model: "ST8000NM000A".to_string(),
+            serial: "ZR9AB12K".to_string(),
+            fs_type: Some("xfs".to_string()),
+            fs_label: Some("d1".to_string()),
+            fs_uuid: Some("2a7f1c30-9e64-4b8d-a5f2-71c3e806d914".to_string()),
+            mountpoints: vec!["/mnt/stare".to_string()],
+            refusals: vec![NasDiskWipeRefusal {
+                code: "mounted".to_string(),
+                detail: "sdc: dysk ma zamontowany system plików (/mnt/stare)".to_string(),
+            }],
+            journal_claim: Some(NasDiskWipeJournalClaim {
+                array_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                name: "produkt".to_string(),
+                array_role: "data".to_string(),
+                member_count: 9,
+                owner_org_id: "org".to_string(),
+                owner_addon_id: "nas".to_string(),
+            }),
+            allowed: false,
+        };
+        let body = MessageBody::TentaNasBody(TentaNasPayload::DiskWipePlanResponse {
+            plan: plan.clone(),
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
+
+        // The acknowledgement is absent by default, and a frame that omits it
+        // decodes as "not acknowledged" rather than failing open.
+        let request: TentaNasPayload =
+            serde_json::from_str(r#"{"DiskWipeRequest":{"disk_id":"wwn-x","confirm_device":"sdc"}}"#)
+                .expect("a request without the acknowledgement is still a request");
+        assert_eq!(
+            request,
+            TentaNasPayload::DiskWipeRequest {
+                disk_id: "wwn-x".to_string(),
+                confirm_device: "sdc".to_string(),
+                release_journal_array: String::new(),
+                sudo_password: None,
+            }
+        );
+        // And the password never appears in a serialized plan request.
+        let plan_request = TentaNasPayload::DiskWipePlanRequest {
+            disk_id: "wwn-x".to_string(),
+            sudo_password: None,
+        };
+        let text = serde_json::to_string(&plan_request).expect("serialize");
+        assert!(!text.contains("sudo_password"), "{text}");
+        let named = TentaNasPayload::DiskWipeRequest {
+            disk_id: "wwn-x".to_string(),
+            confirm_device: "sdc".to_string(),
+            release_journal_array: "produkt".to_string(),
+            sudo_password: Some(SudoSecret("hunter2".to_string())),
+        };
+        let back: TentaNasPayload =
+            crate::cbor::decode(&crate::cbor::encode(&named).expect("encode")).expect("decode");
+        assert_eq!(back, named);
     }
 
     /// The N2.5 additions (§5.10): every optional field of the new requests
@@ -3230,6 +3903,16 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            // One folder with a policy the admin chose, published beside the
+            // flag that says the union WAS readable — so the list is the
+            // array's real top level and not a guess.
+            folders: vec![NasElasticFolder {
+                name: "foto".to_string(),
+                path: "/mnt/media/foto".to_string(),
+                cache_policy: "only".to_string(),
+                ..Default::default()
+            }],
+            folders_known: true,
             usable_bytes: Some(3_998_000_000_000),
             used_bytes: Some(2_300_000_000_000),
             ..Default::default()
@@ -3292,6 +3975,38 @@ mod tests {
         assert_eq!(decoded.cache_disks[0].mounted, None);
         assert_eq!(decoded.data_disks[0].mounted, Some(true));
         assert_eq!(decoded.mover.last_run.expect("a run").skipped_files, 3);
+        assert!(decoded.folders_known, "a readable union stays readable over the wire");
+        assert_eq!(decoded.folders[0].cache_policy, "only");
+
+        // The THIRD state of the folder list, and the one that costs data if
+        // it collapses into the second: an array whose union could not be read
+        // carries no folders AND `folders_known: false`, which is not the same
+        // value as an array that really has none.
+        let unreadable = NasElasticArray {
+            name: "media".to_string(),
+            folders: Vec::new(),
+            folders_known: false,
+            ..Default::default()
+        };
+        let empty = NasElasticArray {
+            name: "media".to_string(),
+            folders: Vec::new(),
+            folders_known: true,
+            ..Default::default()
+        };
+        assert_ne!(unreadable, empty, "unknown folders must not equal zero folders");
+        let back: NasElasticArray =
+            crate::cbor::decode(&crate::cbor::encode(&unreadable).expect("encode")).expect("decode");
+        assert!(!back.folders_known);
+        // A peer that predates the field sends no key at all, and the decode
+        // has to land on UNKNOWN rather than on "this array has no folders".
+        let mut json = serde_json::to_value(&empty).expect("json");
+        assert!(
+            json.as_object_mut().expect("object").remove("folders_known").is_some(),
+            "the field has to be there before the test can take it away"
+        );
+        let old_peer: NasElasticArray = serde_json::from_value(json).expect("decode");
+        assert!(!old_peer.folders_known, "a missing field is unknown, never zero");
 
         // The wizard's step 2 sends only the data disks, so the four
         // defaulted fields have to decode from the encoders' minimal JSON —

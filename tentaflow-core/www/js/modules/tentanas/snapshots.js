@@ -54,6 +54,12 @@ const keepOf = (s, tier) => ({ daily: s.keepDaily, weekly: s.keepWeekly, monthly
 
 export async function drawSnapshots(screen, host, { pool, datasets = [], onChange = null }) {
   const admin = screen.isAdmin;
+  // ONE HOST, ONE WRITER: `host` is `#nas-pool-tab-body`, and this direct
+  // write is legal only because `drawInner` (pool-detail.js) nulls its
+  // `__tfHtml` on every tab switch and this is the first synchronous
+  // statement to touch it, before any await. Reached from anywhere else — a
+  // poll, a refresh — it would leave that cache describing markup that is
+  // gone, and the next `patchHtml` with the same string would be a no-op.
   host.innerHTML = `
     <div class="stack">
       <div class="grid-2">
@@ -89,7 +95,16 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
     { value: '', label: T('snapshots.all_datasets', { n: totalCount }) },
   ], '');
   if (screen.dataset && datasets.some((d) => d.name === screen.dataset)) { state.dataset = screen.dataset; dsSel.value = screen.dataset; }
-  dsSel.addEventListener('change', (e) => { state.dataset = e.detail.value; reloadList(); paintCards(); });
+  // `reloadList` is async and `paintCards` reads `state.snapshots`, so calling
+  // the two side by side painted the cards from the PREVIOUS dataset's list:
+  // `paintCards` looks for the newest snapshot of the newly focused dataset
+  // among rows that belong to the old one, finds none, and says so — a dataset
+  // with hundreds of snapshots reads as having none, and reads as current.
+  dsSel.addEventListener('change', async (e) => {
+    state.dataset = e.detail.value;
+    await reloadList();
+    paintCards();
+  });
   const filters = host.querySelector('#nas-snap-filters');
   filters.addEventListener('change', (e) => { state.filter = e.detail.id; reloadList(); });
   host.querySelector('#nas-snap-search').addEventListener('search', (e) => { state.query = (e.detail.value || '').trim().toLowerCase(); applyRows(); });
@@ -160,7 +175,15 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
       state.total = Number(r.total) || state.snapshots.length;
       state.totalUsed = Number(r.totalUsedBytes) || 0;
     } catch (e) {
+      // Drop what was read for the PREVIOUS selection. Keeping it would let a
+      // later paint present one dataset's snapshots as another's, which is
+      // worse than showing nothing, because nothing in the view says which
+      // dataset the numbers came from.
+      state.snapshots = [];
+      state.total = 0;
+      state.totalUsed = 0;
       toast(errMessage(e), 'error');
+      applyRows();
       return;
     }
     if (screen.disposed || !host.isConnected) return;
@@ -179,7 +202,8 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
     table.rows = rows.map((s) => snapshotRow(s, Boolean(state.dataset)));
   };
 
-  table.rowActions = (row) => {
+  table.rowActions = (row, idx, currentRow) => {
+    const live = () => currentRow?.() ?? row;
     const s = row._snap;
     const wrap = document.createElement('div');
     wrap.className = 'tf-table__cell-row';
@@ -190,11 +214,11 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
       <tf-button size="sm" variant="secondary" data-act="rollback">${escapeHtml(T('snapshots.rollback'))}</tf-button>
       ${isProtected(s) ? `<tf-button size="sm" variant="secondary" icon="unlock" data-act="release">${escapeHtml(T('snapshots.release_action'))}</tf-button>` : ''}
       <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>` : ''}`;
-    wrap.querySelector('[data-act="browse"]').addEventListener('click', (e) => { e.stopPropagation(); openSnapshotBrowser(screen, { snapshot: s }); });
-    wrap.querySelector('[data-act="rollback"]')?.addEventListener('click', (e) => { e.stopPropagation(); openRollbackDialog(screen, { snapshot: s, newer: newerThan(state.snapshots, s), pool, onDone: reloadAll }); });
-    wrap.querySelector('[data-act="clone"]')?.addEventListener('click', (e) => { e.stopPropagation(); openCloneDialog(screen, { snapshot: s, pool, onDone: reloadAll }); });
-    wrap.querySelector('[data-act="release"]')?.addEventListener('click', (e) => { e.stopPropagation(); openReleaseDialog(screen, { snapshot: s, onDone: reloadAll }); });
-    wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); destroySnapshots(screen, [s], reloadAll); });
+    wrap.querySelector('[data-act="browse"]').addEventListener('click', (e) => { e.stopPropagation(); openSnapshotBrowser(screen, { snapshot: live()._snap }); });
+    wrap.querySelector('[data-act="rollback"]')?.addEventListener('click', (e) => { e.stopPropagation(); const cur = live()._snap; openRollbackDialog(screen, { snapshot: cur, newer: newerThan(state.snapshots, cur), pool, onDone: reloadAll }); });
+    wrap.querySelector('[data-act="clone"]')?.addEventListener('click', (e) => { e.stopPropagation(); openCloneDialog(screen, { snapshot: live()._snap, pool, onDone: reloadAll }); });
+    wrap.querySelector('[data-act="release"]')?.addEventListener('click', (e) => { e.stopPropagation(); openReleaseDialog(screen, { snapshot: live()._snap, onDone: reloadAll }); });
+    wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); destroySnapshots(screen, [live()._snap], reloadAll); });
     return wrap;
   };
 

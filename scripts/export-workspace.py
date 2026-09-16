@@ -163,7 +163,8 @@ def export_workspace(root, output, members, archive=None, offline=True, in_place
                     copy_sources(root, root / member, staging / member)
             shutil.copy2(root / "Cargo.lock", staging / "Cargo.lock")
         (staging / "Cargo.toml").write_text(manifest, encoding="utf-8")
-        command = ["cargo", "metadata", "--format-version=1"]
+        # Eksport wymaga podzbioru lockfile, nie pobrania źródeł wszystkich targetów.
+        command = ["cargo", "update", "--workspace", "--quiet"]
         if offline:
             command.append("--offline")
         subprocess.run(command, cwd=staging, env=dict(os.environ, CARGO_TARGET_DIR=str(staging / "target")), check=True, stdout=subprocess.DEVNULL)
