@@ -81,14 +81,14 @@ port-forwarding. First contact is a simple **6-digit PIN pairing** (or QR-code s
 Ed25519 key verification — once two nodes are paired they trust each other. You can even self-host the
 relay (`iroh-relay` ships as a service container).
 
-Lista urządzeń pokazuje ten węzeł, urządzenia wykryte lokalnie przez mDNS
-oraz aktywnie zaufane przez ten węzeł. Relay może działać w tle i przenosić
-połączenia zaufanych urządzeń; nie udostępnia globalnej listy obcych węzłów.
-Same kontakty otrzymane przez gossip lub niezaufane połączenie przychodzące
-nie wystarczają do wyświetlenia urządzenia.
-Zaufanie nadal rozchodzi się w mesh: jeśli A jest sparowany z B i C,
-po synchronizacji zaufanych kluczy również B i C ufają sobie i widzą się
-bez dodatkowego parowania.
+The device list shows this node, devices discovered locally through mDNS,
+and devices currently trusted by this node. The relay can run in the background
+and carry connections between trusted devices; it does not expose a global list
+of unknown nodes. Contacts received through gossip or an untrusted incoming
+connection alone are not enough for a device to appear in the list.
+Trust still propagates through the mesh: if A is paired with B and C,
+after trusted keys synchronize, B and C also trust and see each other
+without additional pairing.
 
 A request sent to any node can be served by a service running on *any other* node: the mesh routes it
 transparently, including multi-hop relays for peers that aren't directly connected. Your phone can use the
@@ -374,18 +374,19 @@ the integrated GB10 in a DGX Spark is a real CUDA target and a Strix Halo a real
 one, while the integrated chip in a thin laptop is neither — and with unified memory the
 reported VRAM does not separate them.
 
-Przy `curl | sh` pytanie i odpowiedź przechodzą przez terminal `/dev/tty`.
-Trzeba wpisać `full` albo `slim`; pusty Enter ponawia pytanie, a koniec wejścia
-przerywa instalację. Na macOS dostępne jest tylko `full`, również wymagające
-potwierdzenia. Bez terminala ustaw edycję jawnie w środowisku procesu `sh`:
+With `curl | sh`, the prompt and response use the `/dev/tty` terminal.
+Enter `full` or `slim`; pressing Enter without a value repeats the prompt,
+and end-of-input aborts installation. On macOS, only `full` is available,
+and it also requires confirmation. Without a terminal, set the edition explicitly
+in the `sh` process environment:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | TENTAFLOW_EDITION=slim sh
 ```
 
-Użyj `TENTAFLOW_EDITION=full` dla pełnej edycji. Brak wyboru bez terminala,
-niepoprawna wartość zmiennej lub `slim` na macOS kończą instalator przed
-pobieraniem archiwum i zmianami systemu.
+Use `TENTAFLOW_EDITION=full` for the full edition. A missing selection without
+a terminal, an invalid variable value, or `slim` on macOS stops the installer
+before it downloads the archive or changes the system.
 
 | Edition | Contains | Catalog |
 |---------|----------|---------|
@@ -402,16 +403,16 @@ an update), registers a systemd unit and starts it. macOS installs a **LaunchDae
 a LaunchAgent would wait for a login, which a server cannot depend on — under
 `/usr/local/{tentaflow,etc,var}`, and is `full` only.
 
-Nowa konfiguracja nasłuchuje domyślnie na `0.0.0.0:8090` i ma włączony mesh.
-Z innego komputera otwórz `https://IP_SERWERA:8090` (adres IP serwera w LAN).
-`0.0.0.0` oznacza nasłuch na wszystkich interfejsach IPv4; nie jest adresem
-wpisywanym do przeglądarki. `localhost` wskazuje komputer, na którym ją uruchomiono.
-Aktualizacja nie nadpisuje istniejącej konfiguracji, także jej ustawień mesh.
+New installations listen on `0.0.0.0:8090` by default with mesh enabled.
+From another computer, open `https://SERVER_IP:8090` (the server's LAN IP address).
+`0.0.0.0` means listening on all IPv4 interfaces; it is not an address to enter
+in the browser. `localhost` refers to the computer running the browser.
+Updates preserve the existing configuration, including its mesh settings.
 
-Systemowy instalator Linuxa dodaje reguły do aktywnych UFW i firewalld:
-TCP dla portu HTTPS oraz UDP dla włączonego mesh, zgodnie z konfiguracją.
-Nie włącza nieaktywnej zapory. Na macOS i przy instalacji użytkownika
-reguły trzeba ustawić ręcznie; inne zapory i ograniczenia sieci pozostają bez zmian.
+The system-wide Linux installer adds rules to active UFW and firewalld instances:
+TCP for the HTTPS port and UDP when mesh is enabled, according to the configuration.
+It does not enable an inactive firewall. On macOS and for per-user installations,
+configure rules manually; other firewalls and network restrictions remain unchanged.
 
 ```bash
 tentaflow status          # service state, autostart, PID, config, /health
@@ -420,25 +421,25 @@ tentaflow update          # newest GitHub release, checksum-verified, atomic swa
 tentaflow update --check  # only report whether one exists
 ```
 
-Opcje instalatora (`TENTAFLOW_EDITION` jest wymagane bez terminala):
+Installer options (`TENTAFLOW_EDITION` is required without a terminal):
 `TENTAFLOW_EDITION=full|slim`, `TENTAFLOW_VERSION=v0.1.0`,
-`TENTAFLOW_BIND=0.0.0.0:8090` (domyślnie; `127.0.0.1:8090` ogranicza dostęp do hosta),
+`TENTAFLOW_BIND=0.0.0.0:8090` (default; `127.0.0.1:8090` restricts access to the host),
 `TENTAFLOW_USER_INSTALL=1` (no sudo, everything under
 `$HOME`, systemd `--user`), `TENTAFLOW_NO_AUTOSTART=1`, `TENTAFLOW_WITH_DOCKER=1`,
 `TENTAFLOW_SKIP_DEPS=1`.
 
-Pierwsze logowanie: **admin / admin** — od razu zmień hasło.
-`uninstall.sh` usuwa aplikację; `--purge` usuwa również dane i konfigurację.
+First login: **admin / admin** — change the password immediately.
+`uninstall.sh` removes the application; `--purge` also removes data and configuration.
 
-#### Dostęp z LAN po wcześniejszej instalacji
+#### LAN access after an earlier installation
 
-Jeżeli wcześniejszy instalator zapisał `127.0.0.1:8090`, ponowne uruchomienie
-instalatora zachowa ten adres. Uruchom `tentaflow status`, sprawdź wskazaną ścieżkę
-konfiguracji i w istniejącej sekcji `[protocols.openai_api]` zmień `bind` na
-`"0.0.0.0:8090"`. Nie zastępuj całego pliku tym polem. Mesh iroh używa oddzielnie
-`[mesh].port` (domyślnie `8090`) oraz ustawień interfejsu sieciowego w Mesh.
+If an earlier installer saved `127.0.0.1:8090`, running the installer again
+preserves that address. Run `tentaflow status`, check the reported configuration
+path, and change `bind` to `"0.0.0.0:8090"` in the existing `[protocols.openai_api]`
+section. Do not replace the entire file with this field. The iroh mesh separately
+uses `[mesh].port` (default `8090`) and the network interface settings in Mesh.
 
-Dla systemowej instalacji na Linuxie po zapisaniu konfiguracji:
+For a system-wide Linux installation, after saving the configuration:
 
 ```bash
 sudo systemctl restart tentaflow.service
@@ -447,15 +448,15 @@ sudo ss -ltnp 'sport = :8090'
 sudo ss -lunp 'sport = :8090'
 ```
 
-Dla instalacji użytkownika użyj `systemctl --user restart tentaflow.service`.
-Na macOS zrestartuj usługę przez `tentaflow restart` (dla usługi systemowej z `sudo`).
-W `ss` sprawdź adres lokalny: `127.0.0.1:8090` oznacza dostęp tylko z tego hosta,
-`0.0.0.0:8090` — nasłuch na wszystkich interfejsach IPv4. TCP służy dashboardowi
-HTTPS, UDP transportowi QUIC/mesh. Przy innym porcie odpowiednio zmień polecenia.
-Brak nasłuchu wymaga sprawdzenia usługi i logów:
-`sudo journalctl -u tentaflow.service -n 80 --no-pager`; sama reguła zapory tego nie naprawi.
-Przy usłudze użytkownika logi odczytaj przez `journalctl --user -u tentaflow.service`.
-Poprawny nasłuch nie potwierdza przejścia przez zaporę lub segmenty sieci.
+For a per-user installation, use `systemctl --user restart tentaflow.service`.
+On macOS, restart the service with `tentaflow restart` (with `sudo` for a system service).
+Check the local address in `ss`: `127.0.0.1:8090` means access from this host only,
+while `0.0.0.0:8090` means listening on all IPv4 interfaces. TCP serves the HTTPS
+dashboard; UDP carries QUIC/mesh traffic. Adjust the commands if you use a different port.
+If nothing is listening, check the service and its logs:
+`sudo journalctl -u tentaflow.service -n 80 --no-pager`; a firewall rule alone cannot fix this.
+For a user service, read the logs with `journalctl --user -u tentaflow.service`.
+A listening socket does not confirm connectivity through firewalls or across network segments.
 
 **Supported:** Linux x86_64 with glibc ≥ 2.35 and GLIBCXX ≥ 3.4.30 — Ubuntu 22.04+,
 Debian 12+, Fedora, Arch/CachyOS, RHEL 10+. The installer checks this floor before it
@@ -489,10 +490,10 @@ cargo install wasm-bindgen-cli --version "$(python3 scripts/workspace-version.py
 ./scripts/setup.sh
 ```
 
-Na Arch/CachyOS skrypt wykonuje pełną aktualizację systemu i instalację zależności
-w jednej transakcji `pacman -Syu --needed`. Dzięki temu aktualizuje
-również zainstalowane wtyczki GStreamera wymagające zgodnych wersji bibliotek.
-Pacman wymaga potwierdzenia aktualizacji i decyzji użytkownika przy konfliktach pakietów.
+On Arch/CachyOS, the script performs a full system upgrade and installs dependencies
+in a single `pacman -Syu --needed` transaction. This also updates installed
+GStreamer plugins that require matching library versions.
+Pacman requires confirmation of the upgrade and user decisions on package conflicts.
 
 > On macOS 26+ (Xcode 26) the Metal compiler is a separate component. Without it, MLX models return
 > gibberish with no build error — `setup.sh` installs it and `build.rs` fails loudly if it's missing.
@@ -502,23 +503,23 @@ drop your own into `certs/cert.pem` + `certs/key.pem` to override.
 
 ### Build from source
 
-Polecenia uruchamiaj z korzenia repozytorium. Wspólny wrapper stosuje profile
-Cargo i automatyczną retencję artefaktów.
+Run these commands from the repository root. The shared wrapper applies Cargo
+profiles and automatic artifact retention.
 
 ```bash
 ./scripts/build.sh --release --features gpu-cuda
 ./target_shared/release/tentaflow --config config.toml
 ```
 
-Na Windows:
+On Windows:
 
 ```bat
 scripts\build.bat --release --features gpu-cuda
 target_shared\release\tentaflow.exe --config config.toml
 ```
 
-Opis profili i limitów cache: [wydajność budowania](docs/build-performance.md).
-Wersje i przeznaczenie zależności: [audyt bibliotek](docs/cargo-dependencies-audit.md).
+Profiles and cache limits: [build performance](docs/build-performance.md).
+Dependency versions and purposes: [dependency audit](docs/cargo-dependencies-audit.md).
 
 Open the dashboard at **https://localhost:8090**.
 
@@ -532,7 +533,7 @@ Variants of the main vision path:
 # NVIDIA: ORT/TensorRT/CUDA
 ./scripts/build.sh --release --features gpu-cuda
 
-# AMD/Intel: Burn przez WGPU/Vulkan
+# AMD/Intel: Burn via WGPU/Vulkan
 ./scripts/build.sh --release --features gpu-vulkan
 ```
 
