@@ -961,6 +961,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             MigrationStep::Sql(TENTAVM_ACCESS_REQUESTS),
         ),
         (154, "bus_org_quotas", MigrationStep::Sql(BUS_ORG_QUOTAS)),
+        (
+            155,
+            "single_code_harness_flow",
+            MigrationStep::Rust(keep_only_the_pinned_code_harness),
+        ),
     ]
 }
 
@@ -2859,6 +2864,31 @@ fn drop_legacy_harness_flows(conn: &Connection) -> Result<()> {
          ('00000000-0000-4000-8000-000000000011', \
           '00000000-0000-4000-8000-000000000013')",
         [],
+    )?;
+    Ok(())
+}
+
+/// Code Studio pins every session to one harness (`seed::CODE_HARNESS_FLOW_ID`),
+/// yet the Flow Builder listed two more seeded variants that nothing ran — so
+/// editing them looked like configuring Code Studio and changed nothing. Their
+/// executions go first: `flow_executions.flow_id` references `flows` without a
+/// cascade. The pinned flow takes over the plain "Code Harness" name only while
+/// it still carries the seeded variant name, so an admin rename survives.
+fn keep_only_the_pinned_code_harness(conn: &Connection) -> Result<()> {
+    const UNUSED: &str = "('cs-harness', 'cs-harness-team')";
+    conn.execute(
+        &format!("DELETE FROM flow_executions WHERE flow_id IN {UNUSED}"),
+        [],
+    )?;
+    conn.execute(&format!("DELETE FROM flows WHERE id IN {UNUSED}"), [])?;
+    conn.execute(
+        "UPDATE flows SET name = ?1, description = ?2, updated_at = datetime('now') \
+         WHERE id = ?3 AND name = 'Code Harness — wymuszony potok z krytykiem'",
+        rusqlite::params![
+            crate::db::seed::CODE_HARNESS_FLOW_NAME,
+            crate::db::seed::CODE_HARNESS_FLOW_DESCRIPTION,
+            crate::db::seed::CODE_HARNESS_FLOW_ID,
+        ],
     )?;
     Ok(())
 }
@@ -11386,7 +11416,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 154);
+        assert_eq!(head, 155);
     }
 
     #[test]
@@ -11418,7 +11448,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 154, "154 must be the highest applied migration");
+        assert_eq!(head, 155, "155 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -11426,7 +11456,76 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 154);
+        assert_eq!(head_again, 155);
+    }
+
+    /// v155 leaves the Flow Builder with the one harness Code Studio pins: the
+    /// unused variants go together with their versions and executions, and the
+    /// pinned row is renamed only while nobody has renamed it already.
+    #[test]
+    fn only_the_pinned_code_harness_survives_and_takes_its_plain_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             INSERT INTO flows (id, name, flow_json, status) VALUES
+                ('cs-harness', 'Code Harness', '{}', 'active'),
+                ('cs-harness-team', 'Code Harness — zespół QA', '{}', 'active'),
+                ('cs-harness-critic', 'Code Harness — wymuszony potok z krytykiem', '{}', 'active');
+             INSERT INTO flow_versions (id, flow_id, version_num, flow_json, name) VALUES
+                ('cs-harness-factory', 'cs-harness', 1, '{}', 'Code Harness'),
+                ('cs-harness-critic-factory', 'cs-harness-critic', 1, '{}', 'critic');
+             INSERT INTO flow_executions (flow_id, status) VALUES
+                ('cs-harness', 'success'), ('cs-harness-critic', 'success');",
+        )
+        .unwrap();
+
+        keep_only_the_pinned_code_harness(&conn).unwrap();
+
+        let flows: Vec<(String, String)> = conn
+            .prepare("SELECT id, name FROM flows WHERE id LIKE 'cs-harness%' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            flows,
+            vec![("cs-harness-critic".to_string(), "Code Harness".to_string())]
+        );
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM flow_versions WHERE flow_id = 'cs-harness') \
+                      + (SELECT COUNT(*) FROM flow_executions WHERE flow_id = 'cs-harness')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_executions WHERE flow_id = 'cs-harness-critic'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "the pinned harness keeps its history");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        conn.execute(
+            "UPDATE flows SET name = 'Nasz harness' WHERE id = 'cs-harness-critic'",
+            [],
+        )
+        .unwrap();
+        keep_only_the_pinned_code_harness(&conn).unwrap();
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM flows WHERE id = 'cs-harness-critic'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Nasz harness", "an admin rename is not overwritten");
     }
 
     /// Capacity is registry data, usage is telemetry, and the split is the whole
@@ -11528,7 +11627,7 @@ mod tests {
         // authorizer rewrite and the instance-db handle that made them dead.
         // Their NUMBERS stay occupied by `retired_migration` so the rungs
         // above them keep the versions databases already recorded.
-        assert_eq!(*sorted.last().unwrap(), 154);
+        assert_eq!(*sorted.last().unwrap(), 155);
 
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();

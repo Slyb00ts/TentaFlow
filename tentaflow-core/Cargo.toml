@@ -613,7 +613,7 @@ required-features = ["test-support"]
 name = "native_app_multi_instance"
 required-features = ["test-support"]
 
-# Code Studio "Code Harness" (§16.5): both graph variants through R1-R11 and
+# Code Studio "Code Harness" (§16.5): the graph through R1-R11 and
 # CompiledFlow, plus the region's structural stop driven over a stub LLM.
 # Needs `stub_ctx` from the test-support surface.
 [[test]]

@@ -59,7 +59,7 @@ use crate::code_studio::{
     artifacts, events, fs as cs_fs, index, operations, patch, paths, project_link, provisioning,
     redact, remote_proxy, repository, sandbox, session, tools, workspace_db,
 };
-use crate::db::seed::CODE_HARNESS_CRITIC_FLOW_ID;
+use crate::db::seed::CODE_HARNESS_FLOW_ID;
 use crate::db::DbPool;
 use crate::services::rbac::OrgContext;
 use rusqlite::OptionalExtension;
@@ -3039,7 +3039,7 @@ async fn resolve_harness_flow(db: &DbPool, account: Option<i64>, user_id: &str) 
         return Ok((flow_id,version.id));
     }
 
-    let flow = crate::db::repository::get_flow(db, CODE_HARNESS_CRITIC_FLOW_ID)
+    let flow = crate::db::repository::get_flow(db, CODE_HARNESS_FLOW_ID)
         .map_err(|e| db_error("get_flow", e))?
         .ok_or_else(|| {
             ProtocolError::new(
@@ -8715,7 +8715,7 @@ mod tests {
         let first=resolve_harness_flow(&db,Some(service_id),"flow-account-admin").await.unwrap();
         let second=resolve_harness_flow(&db,Some(service_id),"flow-account-admin").await.unwrap();
         assert_eq!(first,second);
-        assert_ne!(first.0,CODE_HARNESS_CRITIC_FLOW_ID);
+        assert_ne!(first.0,CODE_HARNESS_FLOW_ID);
         let saved=crate::db::repository::get_flow_version(&db,&first.0,&first.1).unwrap().unwrap();
         let graph: crate::flow_engine::types::FlowDefinition=serde_json::from_str(&saved.flow_json.unwrap()).unwrap();
         crate::flow_engine::validation::validate_structural(&graph).unwrap();
@@ -10074,7 +10074,7 @@ mod tests {
                 conn.execute(
                     "INSERT INTO sessions (id, workspace_id, user_id, title, branch, \
                        autonomy_mode, flow_id, flow_version_id, status, created_at, updated_at) \
-                     VALUES (?1, 'ws-private', ?2, 'Praca', 'cs/x/y', 'normal', 'cs-harness', \
+                     VALUES (?1, 'ws-private', ?2, 'Praca', 'cs/x/y', 'normal', 'cs-harness-critic', \
                        'v1', 'idle', datetime('now'), datetime('now'))",
                     rusqlite::params![id, user],
                 )
@@ -10304,7 +10304,7 @@ mod tests {
                 user_slug: "owner".into(),
                 title: "Praca".into(),
                 autonomy_mode: autonomy,
-                flow_id: "cs-harness".into(),
+                flow_id: "cs-harness-critic".into(),
                 flow_version_id: "v1".into(),
             },
         )
@@ -10651,7 +10651,7 @@ mod tests {
                 user_slug: "owner".into(),
                 title: "Druga".into(),
                 autonomy_mode: AutonomyMode::AutoEdit,
-                flow_id: "cs-harness".into(),
+                flow_id: "cs-harness-critic".into(),
                 flow_version_id: "v1".into(),
             },
         )
@@ -12234,7 +12234,7 @@ mod tests {
                     "INSERT INTO sessions \
                        (id, workspace_id, user_id, title, branch, autonomy_mode, flow_id, \
                         flow_version_id, status, created_at, updated_at) \
-                     VALUES (?1, 'ws-counts', 'u-owner', ?1, 'cs/o/1', 'normal', 'cs-harness', \
+                     VALUES (?1, 'ws-counts', 'u-owner', ?1, 'cs/o/1', 'normal', 'cs-harness-critic', \
                              'v1', ?2, datetime('now'), datetime('now'))",
                     rusqlite::params![id, status],
                 )

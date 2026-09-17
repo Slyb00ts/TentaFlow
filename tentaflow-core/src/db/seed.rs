@@ -1840,13 +1840,11 @@ fn seed_harness_flows(conn: &Connection) -> Result<()> {
 // Code Studio — "Code Harness" (§16.2)
 // =============================================================================
 
-/// Fixed id of the default harness. `dispatch/code_studio.rs` pins a new
-/// session to this flow, so the id is part of the contract, not a detail.
-pub const CODE_HARNESS_FLOW_ID: &str = "cs-harness";
-/// Fixed id of the forced-chain variant. Variant C of §16.2 is this graph with
-/// the last `spawn`/`await` pair deleted in the Flow Builder — deliberately not
-/// a third seed, because it is a preference, not a different mechanism.
-pub const CODE_HARNESS_TEAM_FLOW_ID: &str = "cs-harness-team";
+/// Fixed id of the Code Studio harness. `dispatch/code_studio.rs` pins every
+/// new session to this flow, so the id is part of the contract, not a detail.
+/// The value predates the removal of the other two variants and stays: open
+/// sessions and replicated flow history reference it.
+pub const CODE_HARNESS_FLOW_ID: &str = "cs-harness-critic";
 
 /// Nodes are laid out on a 4-per-row grid (360 px on x with NODE_WIDTH=280
 /// leaves an 80 px gutter; 320 px on y clears the tallest block), mirroring
@@ -1858,7 +1856,7 @@ fn grid_position(index: usize) -> serde_json::Value {
     })
 }
 
-/// The blocks every Code Harness variant shares: the run's context, then the
+/// The head of the Code Harness: the run's context, then the
 /// `code_turn` region that spins while the agent keeps calling tools.
 ///
 /// The region's ONLY structural stop is "the last assistant turn carried no
@@ -1918,7 +1916,7 @@ fn code_harness_prefix_nodes() -> Vec<serde_json::Value> {
     ]
 }
 
-/// The end-of-turn review, shared by both harness variants.
+/// The end-of-turn review that closes the pipeline.
 ///
 /// Wired unconditionally, yet it only stops a turn that CHANGED something: the
 /// review opens the work patch set by scanning the worktree, and a clean tree
@@ -1956,126 +1954,6 @@ fn code_harness_prefix_edges() -> Vec<serde_json::Value> {
         serde_json::json!({"from_node": "x1", "to_node": "k1", "kind": "loop_back"}),
     ]
 }
-
-/// Variant A — "the agent decides" (§16.2), 10 blocks.
-///
-/// Nothing in this graph dictates when to test, review, commit or push: those
-/// are tool calls the agent makes from the conversation. The graph's job is to
-/// give it a context, a loop and a place to put the answer.
-pub fn code_harness_flow_json() -> String {
-    let mut nodes = code_harness_prefix_nodes();
-    nodes.push(code_harness_review_node(7));
-    nodes.push(serde_json::json!({"id": "p1", "type": "persist_turn",
-        "position": grid_position(8), "config": {}}));
-    nodes.push(serde_json::json!({"id": "o1", "type": "output",
-        "position": grid_position(9), "config": {"mode": "stream"}}));
-
-    let mut edges = code_harness_prefix_edges();
-    edges.push(serde_json::json!({"from_node": "x1", "to_node": "r1", "from_port": "full"}));
-    edges.push(serde_json::json!({"from_node": "r1", "to_node": "p1"}));
-    edges.push(
-        serde_json::json!({"from_node": "x1", "to_node": "o1", "from_port": "stream",
-            "to_port": "text"}),
-    );
-    edges.push(serde_json::json!({"from_node": "p1", "to_node": "o1", "to_port": "text"}));
-
-    serde_json::json!({"nodes": nodes, "edges": edges}).to_string()
-}
-
-/// Variant B — "the forced chain" (§16.2).
-///
-/// Review, tests and git run ALWAYS, whatever the agent concluded. `spawn` is
-/// detached by construction, so each delegation is followed by its own
-/// `await_subagents(all)`: without the wait the three would race and the chain
-/// would guarantee only that they STARTED. Each pair carries its own run-id
-/// variable, so a later wait can never collect an earlier spawn's runs.
-///
-/// The price is real and the UI says so: the chain starts immediately after the
-/// main agent's turn, so it cannot correct itself before the result is shown,
-/// and every turn costs three extra sub-runs.
-pub fn code_harness_team_flow_json() -> String {
-    let mut nodes = code_harness_prefix_nodes();
-    let chain: &[(&str, &str, &str, &str, &str)] = &[
-        (
-            "s1",
-            "a1",
-            "code-reviewer",
-            "review_run_ids",
-            "Przejrzyj zmiany tej tury: przeczytaj diff, wskaż realne defekty i ryzyka. Nie zmieniaj plików.",
-        ),
-        (
-            "s2",
-            "a2",
-            "code-tester",
-            "test_run_ids",
-            "Uruchom testy właściwe dla tego repozytorium i zdaj raport: co przeszło, co nie i dlaczego. Nie zmieniaj plików.",
-        ),
-        (
-            "s3",
-            "a3",
-            "code-committer",
-            "commit_run_ids",
-            "Jeśli istnieje zaakceptowany przegląd, złóż commit z zaakceptowanych blobów i napisz wiadomość opisującą DLACZEGO. Nie edytuj kodu.",
-        ),
-    ];
-    let mut index = 7;
-    for (spawn_id, await_id, agent_name, run_ids_var, task) in chain {
-        // Pinned by id, not by name. The adapter resolves either, but the block
-        // schema declares `agent_id` and the Flow Builder validates against the
-        // schema — seeding the name made our own three nodes render as
-        // "missing required: Agent" in the very builder that is supposed to
-        // show the harness.
-        nodes.push(serde_json::json!({"id": spawn_id, "type": "spawn",
-        "position": grid_position(index),
-        "config": {
-            "agent_id": agent_id_of(agent_name),
-            "task": task,
-            "output_variable": run_ids_var
-        }}));
-        index += 1;
-        nodes.push(
-            serde_json::json!({"id": await_id, "type": "await_subagents",
-            "position": grid_position(index),
-            "config": {
-                "run_ids_var": run_ids_var,
-                "mode": "all",
-                "timeout_secs": 1800,
-                "output_variable": format!("{run_ids_var}_results")
-            }}),
-        );
-        index += 1;
-    }
-    // The human review sits between the machines that INSPECT the change and
-    // the one that COMMITS it: the committer is told to act "if an accepted
-    // review exists", and nothing else in this chain produces one.
-    nodes.push(code_harness_review_node(index));
-    index += 1;
-    nodes.push(serde_json::json!({"id": "p1", "type": "persist_turn",
-        "position": grid_position(index), "config": {}}));
-    index += 1;
-    nodes.push(serde_json::json!({"id": "o1", "type": "output",
-        "position": grid_position(index), "config": {"mode": "stream"}}));
-
-    let mut edges = code_harness_prefix_edges();
-    edges.push(serde_json::json!({"from_node": "x1", "to_node": "s1", "from_port": "full"}));
-    edges.push(serde_json::json!({"from_node": "s1", "to_node": "a1"}));
-    edges.push(serde_json::json!({"from_node": "a1", "to_node": "s2"}));
-    edges.push(serde_json::json!({"from_node": "s2", "to_node": "a2"}));
-    edges.push(serde_json::json!({"from_node": "a2", "to_node": "r1"}));
-    edges.push(serde_json::json!({"from_node": "r1", "to_node": "s3"}));
-    edges.push(serde_json::json!({"from_node": "s3", "to_node": "a3"}));
-    edges.push(serde_json::json!({"from_node": "a3", "to_node": "p1"}));
-    edges.push(
-        serde_json::json!({"from_node": "x1", "to_node": "o1", "from_port": "stream",
-            "to_port": "text"}),
-    );
-    edges.push(serde_json::json!({"from_node": "p1", "to_node": "o1", "to_port": "text"}));
-
-    serde_json::json!({"nodes": nodes, "edges": edges}).to_string()
-}
-
-/// Fixed id of the enforced-pipeline harness.
-pub const CODE_HARNESS_CRITIC_FLOW_ID: &str = "cs-harness-critic";
 
 /// One review loop, expressed as blocks: delegate → wait → let a critic judge →
 /// gate. The gate ends the loop when the critic writes the approval marker; the
@@ -2221,7 +2099,7 @@ fn review_loop_nodes(
 /// loop that can never end.
 const CRITIC_APPROVED_MARKER: &str = "BEZ UWAG";
 
-/// Variant C — "the enforced pipeline" (§16.2).
+/// The Code Harness graph — "the enforced pipeline" (§16.2 C).
 ///
 /// What the graph guarantees, whatever the model felt like doing:
 ///   • planning is not a single shot — a planner and a critic argue in their own
@@ -2230,7 +2108,7 @@ const CRITIC_APPROVED_MARKER: &str = "BEZ UWAG";
 ///     behind the tester that judges the whole against the ORIGINAL request;
 ///   • the critic block is present by default and can be deleted by anyone who
 ///     does not want it — that is why it is a block and not engine behaviour.
-pub fn code_harness_critic_flow_json() -> String {
+pub fn code_harness_flow_json() -> String {
     let mut nodes = code_harness_prefix_nodes();
     let mut edges = code_harness_prefix_edges();
     let mut index = 7;
@@ -2326,7 +2204,13 @@ pub fn code_harness_critic_flow_json() -> String {
     serde_json::json!({"nodes": nodes, "edges": edges}).to_string()
 }
 
-/// Seeds both harness variants AND their factory version rows.
+/// Name of the Code Studio harness in the Flow Builder. Shared with the
+/// migration that renames the row seeded under the old variant name.
+pub(crate) const CODE_HARNESS_FLOW_NAME: &str = "Code Harness";
+
+pub(crate) const CODE_HARNESS_FLOW_DESCRIPTION: &str = "Code Studio: za turą agenta stoją DWIE pętle przeglądu zbudowane z widocznych bloków. Najpierw planista i krytyk spierają się o plan, aż krytyk napisze „BEZ UWAG\" albo minie 10 rund. Potem wykonawca pracuje ZAWSZE z testerem za sobą, a za testerem krytyk, który ocenia całość względem pierwotnych wytycznych — i ta pętla też chodzi aż do braku uwag albo 10 rund. Tura, w której agent nie wywołał żadnego narzędzia, omija potok. Każdy blok, łącznie z krytykiem i bramką kończącą pętlę, można w tym edytorze zmienić lub usunąć.";
+
+/// Seeds the Code Studio harness AND its factory version row.
 ///
 /// The version row is not decoration: `dispatch/code_studio.rs` pins every new
 /// session to a `flow_versions` id and refuses to open a session when the flow
@@ -2337,26 +2221,7 @@ pub fn code_harness_critic_flow_json() -> String {
 /// must not discard a user's edits), while the factory version is upserted so a
 /// new binary always leaves the pristine graph available to restore.
 fn seed_code_harness_flows(conn: &Connection) -> Result<()> {
-    let variants: &[(&str, &str, &str, String)] = &[
-        (
-            CODE_HARNESS_FLOW_ID,
-            "Code Harness",
-            "Code Studio, wariant domyślny „agent decyduje\" (§16.2 A): trigger -> conversation_history -> workspace_context -> agent_context -> [region code_turn: compact_context -> llm(tools) -> tool_exec -loop_back->] -> persist_turn -> output. O testach, przeglądzie, commicie i pushu decyduje agent z rozmowy; bramki są polityką (PEP), nie topologią grafu.",
-            code_harness_flow_json(),
-        ),
-        (
-            CODE_HARNESS_TEAM_FLOW_ID,
-            "Code Harness — zespół QA",
-            "Code Studio, wariant „wymuszony łańcuch\" (§16.2 B): jak wariant domyślny, ale za regionem stoją spawn(code-reviewer) -> await -> spawn(code-tester) -> await -> spawn(code-committer) -> await. Przegląd, testy i git wykonają się ZAWSZE, kosztem trzech dodatkowych przebiegów na turę i utraty możliwości poprawienia się przez agenta przed pokazaniem wyniku.",
-            code_harness_team_flow_json(),
-        ),
-        (
-            CODE_HARNESS_CRITIC_FLOW_ID,
-            "Code Harness — wymuszony potok z krytykiem",
-            "Code Studio, wariant „wymuszony potok\" (§16.2 C): za turą agenta stoją DWIE pętle przeglądu zbudowane z widocznych bloków. Najpierw planista i krytyk spierają się o plan, aż krytyk napisze „BEZ UWAG\" albo minie 10 rund. Potem wykonawca pracuje ZAWSZE z testerem za sobą, a za testerem krytyk, który ocenia całość względem pierwotnych wytycznych — i ta pętla też chodzi aż do braku uwag albo 10 rund. Każdy blok, łącznie z krytykiem i bramką kończącą pętlę, można w tym edytorze zmienić lub usunąć.",
-            code_harness_critic_flow_json(),
-        ),
-    ];
+    let flow_json = code_harness_flow_json();
 
     let mut insert_flow = conn.prepare(
         "INSERT INTO flows (id, name, description, service_type, flow_json, status, is_default) \
@@ -2374,22 +2239,24 @@ fn seed_code_harness_flows(conn: &Connection) -> Result<()> {
             status = 'active'",
     )?;
 
-    for (id, name, description, flow_json) in variants {
-        let inserted =
-            insert_flow.execute(rusqlite::params![id, name, description, flow_json.as_str()])?;
-        if inserted > 0 {
-            debug!("Utworzono flow Code Studio: {}", name);
-        }
-        // The factory version id is derived from the flow id, so re-seeding
-        // rewrites the same row instead of stacking a new "version 1" each boot.
-        upsert_version.execute(rusqlite::params![
-            format!("{id}-factory"),
-            id,
-            flow_json.as_str(),
-            name,
-            description
-        ])?;
+    let inserted = insert_flow.execute(rusqlite::params![
+        CODE_HARNESS_FLOW_ID,
+        CODE_HARNESS_FLOW_NAME,
+        CODE_HARNESS_FLOW_DESCRIPTION,
+        flow_json.as_str()
+    ])?;
+    if inserted > 0 {
+        debug!("Utworzono flow Code Studio: {}", CODE_HARNESS_FLOW_NAME);
     }
+    // The factory version id is derived from the flow id, so re-seeding
+    // rewrites the same row instead of stacking a new "version 1" each boot.
+    upsert_version.execute(rusqlite::params![
+        format!("{CODE_HARNESS_FLOW_ID}-factory"),
+        CODE_HARNESS_FLOW_ID,
+        flow_json.as_str(),
+        CODE_HARNESS_FLOW_NAME,
+        CODE_HARNESS_FLOW_DESCRIPTION
+    ])?;
     Ok(())
 }
 
@@ -3418,9 +3285,9 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            total, 10,
-            "oczekiwane 10 flow (Default Chat + Meeting Bot + Camera Analysis + Agent Run \
-             + Code Harness A/B/C + RAG ingest/query/retrieval-round), jest {}",
+            total, 8,
+            "oczekiwane 8 flow (Default Chat + Meeting Bot + Camera Analysis + Agent Run \
+             + Code Harness + RAG ingest/query/retrieval-round), jest {}",
             total
         );
 
@@ -3460,8 +3327,6 @@ mod tests {
                 "Agent Run".to_string(),
                 "Camera Analysis".to_string(),
                 "Code Harness".to_string(),
-                "Code Harness — wymuszony potok z krytykiem".to_string(),
-                "Code Harness — zespół QA".to_string(),
                 "Default Chat".to_string(),
                 "Meeting Bot".to_string(),
                 "RAG — ingest dokumentu".to_string(),
@@ -3573,11 +3438,6 @@ mod tests {
             ),
             ("Agent Run", super::agent_run_flow_json()),
             ("Code Harness", super::code_harness_flow_json()),
-            ("Code Harness — team", super::code_harness_team_flow_json()),
-            (
-                "Code Harness — critic",
-                super::code_harness_critic_flow_json(),
-            ),
         ];
         for (_, published, _, _, flow_json) in super::PLATFORM_RAG_FLOWS {
             graphs.push((published, flow_json.to_string()));
@@ -3942,7 +3802,7 @@ mod tests {
         let flow_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(flow_count, 10, "ponowny seed nie duplikuje flow");
+        assert_eq!(flow_count, 8, "ponowny seed nie duplikuje flow");
 
         let agent_count: i64 = conn
             .query_row(
@@ -3979,7 +3839,7 @@ mod tests {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 10, "rename nie moze tworzyc drugiego flow");
+        assert_eq!(total, 8, "rename nie moze tworzyc drugiego flow");
         let name: String = conn
             .query_row(
                 "SELECT name FROM flows WHERE id = ?1",
@@ -4439,13 +4299,8 @@ mod tests {
                 .filter_map(Result::ok)
                 .collect()
         };
-        // The three graphs the harness contract names by id must be among them.
-        for required in [
-            super::AGENT_RUN_FLOW_ID,
-            super::CODE_HARNESS_FLOW_ID,
-            super::CODE_HARNESS_TEAM_FLOW_ID,
-            super::CODE_HARNESS_CRITIC_FLOW_ID,
-        ] {
+        // The graphs the harness contract names by id must be among them.
+        for required in [super::AGENT_RUN_FLOW_ID, super::CODE_HARNESS_FLOW_ID] {
             assert!(
                 rows.iter().any(|(id, _)| id == required),
                 "seeded flow '{required}' is missing"
@@ -4548,47 +4403,42 @@ mod tests {
     /// version. Seeding the graph without its factory version would leave a node
     /// that lists workspaces but can never start work in one.
     #[test]
-    fn code_harness_flows_are_seeded_with_a_compilable_factory_version() {
+    fn code_harness_is_seeded_with_a_compilable_factory_version() {
         use crate::flow_engine::cache::CompiledFlow;
         use crate::flow_engine::dispatcher::build_registry_for_test;
 
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
         let registry = build_registry_for_test();
 
-        for flow_id in [
-            super::CODE_HARNESS_FLOW_ID,
-            super::CODE_HARNESS_TEAM_FLOW_ID,
-        ] {
-            let (flow_json, versions): (String, Vec<(String, String)>) = {
-                let conn = pool.read().unwrap();
-                let flow_json: String = conn
-                    .query_row(
-                        "SELECT flow_json FROM flows WHERE id = ?1",
-                        rusqlite::params![flow_id],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or_else(|e| panic!("flow '{flow_id}' not seeded: {e}"));
-                let mut stmt = conn
-                    .prepare("SELECT id, flow_json FROM flow_versions WHERE flow_id = ?1")
-                    .unwrap();
-                let rows = stmt
-                    .query_map(rusqlite::params![flow_id], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                    })
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .collect();
-                (flow_json, rows)
-            };
-            CompiledFlow::from_json(flow_id, &flow_json, &registry)
-                .unwrap_or_else(|e| panic!("flow '{flow_id}' does not compile: {e:?}"));
-            assert_eq!(versions.len(), 1, "one factory version for '{flow_id}'");
-            assert_eq!(versions[0].0, format!("{flow_id}-factory"));
-            // The pinned version must run, not merely exist.
-            CompiledFlow::from_json(flow_id, &versions[0].1, &registry).unwrap_or_else(|e| {
-                panic!("factory version of '{flow_id}' does not compile: {e:?}")
-            });
-        }
+        let flow_id = super::CODE_HARNESS_FLOW_ID;
+        let (flow_json, versions): (String, Vec<(String, String)>) = {
+            let conn = pool.read().unwrap();
+            let flow_json: String = conn
+                .query_row(
+                    "SELECT flow_json FROM flows WHERE id = ?1",
+                    rusqlite::params![flow_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("flow '{flow_id}' not seeded: {e}"));
+            let mut stmt = conn
+                .prepare("SELECT id, flow_json FROM flow_versions WHERE flow_id = ?1")
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![flow_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            (flow_json, rows)
+        };
+        CompiledFlow::from_json(flow_id, &flow_json, &registry)
+            .unwrap_or_else(|e| panic!("flow '{flow_id}' does not compile: {e:?}"));
+        assert_eq!(versions.len(), 1, "one factory version for '{flow_id}'");
+        assert_eq!(versions[0].0, format!("{flow_id}-factory"));
+        // The pinned version must run, not merely exist.
+        CompiledFlow::from_json(flow_id, &versions[0].1, &registry)
+            .unwrap_or_else(|e| panic!("factory version of '{flow_id}' does not compile: {e:?}"));
     }
 
     /// Re-seeding must not stack a second "version 1" or duplicate the flow.
@@ -4601,27 +4451,23 @@ mod tests {
             super::seed_code_harness_flows(&conn).expect("reseed twice");
         }
         let conn = pool.read().unwrap();
-        for flow_id in [
-            super::CODE_HARNESS_FLOW_ID,
-            super::CODE_HARNESS_TEAM_FLOW_ID,
-        ] {
-            let flows: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM flows WHERE id = ?1",
-                    rusqlite::params![flow_id],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            let versions: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM flow_versions WHERE flow_id = ?1",
-                    rusqlite::params![flow_id],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(flows, 1, "{flow_id}");
-            assert_eq!(versions, 1, "{flow_id}");
-        }
+        let flow_id = super::CODE_HARNESS_FLOW_ID;
+        let flows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flows WHERE id = ?1",
+                rusqlite::params![flow_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_versions WHERE flow_id = ?1",
+                rusqlite::params![flow_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flows, 1, "{flow_id}");
+        assert_eq!(versions, 1, "{flow_id}");
     }
 
     /// The RUNNABLE Code Studio blocks must reach the palette with a config
@@ -4942,7 +4788,7 @@ mod tests {
         use crate::flow_engine::dispatcher::build_registry_for_test;
         use crate::flow_engine::types::FlowDefinition;
 
-        let json = super::code_harness_critic_flow_json();
+        let json = super::code_harness_flow_json();
         let def: FlowDefinition = serde_json::from_str(&json).expect("graph must parse");
 
         let node_of = |id: &str| {
@@ -5025,12 +4871,9 @@ mod tests {
         // …and the compiler agrees that these are verdict-driven regions. Without
         // `gated` the ordinary "no tool calls" stop would end each loop after a
         // single pass, because delegating produces no assistant tool calls.
-        let compiled = CompiledFlow::compile(
-            super::CODE_HARNESS_CRITIC_FLOW_ID,
-            def,
-            &build_registry_for_test(),
-        )
-        .expect("the enforced pipeline must compile");
+        let compiled =
+            CompiledFlow::compile(super::CODE_HARNESS_FLOW_ID, def, &build_registry_for_test())
+                .expect("the enforced pipeline must compile");
         let mut gated: Vec<&str> = compiled
             .regions
             .iter()

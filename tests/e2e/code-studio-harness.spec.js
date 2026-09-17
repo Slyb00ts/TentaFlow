@@ -149,24 +149,33 @@ async function gotoCodeStudioViaTile(page) {
 
 
 /// Points the PINNED harness at the plain tool loop, the way an operator would:
-/// by editing the graph, which is the seam the product deliberately offers
-/// instead of a setting (`resolve_harness_flow`).
+/// by deleting the pipeline blocks in the graph, which is the seam the product
+/// deliberately offers instead of a setting (`resolve_harness_flow`).
 ///
 /// A session pins `cs-harness-critic`, the enforced pipeline — planner, critic,
 /// implementer, tester, critic. That is five sub-runs per user turn, and it is
 /// built for a strong cloud model: measured against a local 27B it ran 60 model
 /// calls and started 12 sub-runs in 30 minutes without settling, so a test that
 /// waits for a turn to finish would never finish either. The product keeps the
-/// pipeline; this suite verifies the harness itself over the plain loop.
+/// pipeline; this suite verifies the harness itself over the plain loop, with
+/// the end-of-turn review wired straight behind the persisted turn.
 async function usePlainHarness(page) {
   if (!liveModelRequested()) return;
-  const simple = await api(page, 'flowGetRequest', { flowId: 'cs-harness' }).catch(() => null);
-  const json = simple?.flow?.flowJson ?? simple?.flow?.flow_json ?? simple?.flowJson;
+  const pinned = await api(page, 'flowGetRequest', { flowId: 'cs-harness-critic' }).catch(() => null);
+  const json = pinned?.flow?.flowJson ?? pinned?.flow?.flow_json ?? pinned?.flowJson;
   if (!json) {
-    console.warn('[e2e] cs-harness not found — the pinned pipeline stays in place');
+    console.warn('[e2e] cs-harness-critic not found — the pinned pipeline stays in place');
     return;
   }
-  await api(page, 'flowUpdateRequest', { flowId: 'cs-harness-critic', flowJson: json })
+  const graph = JSON.parse(json);
+  const pipeline = new Set(
+    graph.nodes.filter((n) => n.id === 'd1' || n.region === 'plan_review' || n.region === 'build_review')
+      .map((n) => n.id),
+  );
+  graph.nodes = graph.nodes.filter((n) => !pipeline.has(n.id));
+  graph.edges = graph.edges.filter((e) => !pipeline.has(e.from_node) && !pipeline.has(e.to_node));
+  graph.edges.push({ from_node: 'p1', to_node: 'r1' });
+  await api(page, 'flowUpdateRequest', { flowId: 'cs-harness-critic', flowJson: JSON.stringify(graph) })
     .catch((e) => console.warn('[e2e] could not repoint the pinned harness:', String(e)));
 }
 

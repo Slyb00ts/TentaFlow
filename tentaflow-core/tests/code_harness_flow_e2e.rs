@@ -2,18 +2,19 @@
 // File: tests/code_harness_flow_e2e.rs — Code Studio "Code Harness" (§16.2,
 // §16.5, §24 "Flow").
 //
-// §16.5 makes graph validation the FIRST task of the phase: a real `flow_json`
-// for both variants goes through `FlowDefinition` → R1–R11 → `CompiledFlow`
-// before any adapter is written. This file is that gate, plus the behavioural
-// claims the two shapes make:
+// §16.5 makes graph validation the FIRST task of the phase: the real `flow_json`
+// goes through `FlowDefinition` → R1–R11 → `CompiledFlow` before any adapter is
+// written. This file is that gate, plus the behavioural claims the graph makes:
 //
-//   * both variants validate and compile with the production adapter set;
-//   * outside the `code_turn` region the graph is acyclic (a compile that finds
-//     a cycle is a hard error, so compiling IS the proof);
-//   * the region ends on a turn WITHOUT tool calls — the structural stop —
-//     rather than exhausting `max_iterations` (the thesis of §16.1);
-//   * variant B runs all three `spawn` blocks even when the agent changed
-//     nothing, because the chain is topology and not a model decision;
+//   * the harness validates and compiles with the production adapter set;
+//   * every back edge closes its own region, so nothing outside the loops forms
+//     a cycle (a compile that finds one is a hard error, so compiling IS the
+//     proof);
+//   * the `code_turn` region ends on a turn WITHOUT tool calls — the structural
+//     stop — rather than exhausting `max_iterations` (the thesis of §16.1);
+//   * a turn that called tools always walks the planner, implementer, tester
+//     and critics, because the pipeline is topology and not a model decision,
+//     while a turn that called none skips it;
 //   * the roster's separation of duties lives in `tools_json`, not the prompt.
 // =============================================================================
 
@@ -29,10 +30,7 @@ use serde_json::json;
 use tentaflow_core::agents::{
     tool_in_allowlist, AgentPrincipal, AgentService, AgentServiceSlot, CoreToolName, ToolCatalog,
 };
-use tentaflow_core::db::seed::{
-    code_harness_flow_json, code_harness_team_flow_json, CODE_HARNESS_FLOW_ID,
-    CODE_HARNESS_TEAM_FLOW_ID,
-};
+use tentaflow_core::db::seed::{code_harness_flow_json, CODE_HARNESS_FLOW_ID};
 use tentaflow_core::db::{init as db_init, repository, DbPool};
 use tentaflow_core::flow_engine::cache::CompiledFlow;
 use tentaflow_core::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse};
@@ -65,7 +63,7 @@ fn service_slot(pool: DbPool) -> AgentServiceSlot {
     )))))
 }
 
-/// Every adapter the two harness graphs name. Validation and compilation never
+/// Every adapter the harness graph names. Validation and compilation never
 /// enter an adapter's `execute`, so the empty service slot is enough — what is
 /// being checked here is the port contract each block declares.
 fn harness_registry() -> AdapterRegistry {
@@ -77,6 +75,8 @@ fn harness_registry() -> AdapterRegistry {
     r.register(Arc::new(ConversationHistoryNodeAdapter::new()));
     r.register(Arc::new(PersistTurnNodeAdapter::new()));
     r.register(Arc::new(CompactContextNodeAdapter::new()));
+    r.register(Arc::new(ConditionNodeAdapter::new()));
+    r.register(Arc::new(CriticGateNodeAdapter::new()));
     r.register(Arc::new(AwaitSubagentsNodeAdapter::new()));
     r.register(Arc::new(PatchReviewNodeAdapter::new(slot.clone())));
     r.register(Arc::new(ExecCommandNodeAdapter::new(slot.clone())));
@@ -84,6 +84,7 @@ fn harness_registry() -> AdapterRegistry {
     r.register(Arc::new(AgentContextNodeAdapter::new(slot.clone())));
     r.register(Arc::new(ToolExecNodeAdapter::new(slot.clone())));
     r.register(Arc::new(SpawnNodeAdapter::new(slot.clone())));
+    r.register(Arc::new(TaskGateNodeAdapter::new(slot.clone())));
     r.register(Arc::new(WorkspaceContextNodeAdapter::new(slot)));
     r.register_llm(Arc::new(LlmNodeAdapter::new()));
     r
@@ -92,65 +93,6 @@ fn harness_registry() -> AdapterRegistry {
 // -----------------------------------------------------------------------------
 // §16.5 — the graphs, before anything else
 // -----------------------------------------------------------------------------
-
-#[test]
-fn variant_a_validates_and_compiles_with_one_region() {
-    let reg = harness_registry();
-    let json = code_harness_flow_json();
-
-    let def = serde_json::from_str(&json).expect("variant A parses");
-    validate(&def, &reg).expect("variant A must pass R1-R11");
-
-    let compiled =
-        CompiledFlow::from_json(CODE_HARNESS_FLOW_ID, &json, &reg).expect("variant A compiles");
-
-    // Ten blocks: the nine of §16.2 A plus `patch_review`.
-    //
-    // §16.2 A prescribes NINE and lists `patch_review` under "what these
-    // graphs do not have and why", on the grounds that "the review is opened
-    // by gate 5a at `git_commit`". Running the harness against a real model
-    // disproved that premise: an agent told to write something and run it has
-    // no reason to ask for a commit, so gate 5a never fires and the work
-    // reaches the worktree with nothing to accept. `74e12163a` wired the block
-    // into all three seeded harness flows. §16.4 already sanctions exactly
-    // this use — `patch_review` **(optional)** is "for flows that want the
-    // review at a fixed point, regardless of whether the agent reaches for
-    // `git_commit`" — so the graph is right and the prose of §16.2 is stale.
-    assert_eq!(compiled.definition.nodes.len(), 10);
-    assert_eq!(compiled.regions.len(), 1);
-    let region = &compiled.regions[0];
-    assert_eq!(region.id, "code_turn");
-
-    let entry = &compiled.definition.nodes[compiled.execution_order[region.entry_pos]];
-    let exit = &compiled.definition.nodes[compiled.execution_order[region.exit_pos]];
-    assert_eq!(entry.node_type, "compact_context");
-    assert_eq!(exit.node_type, "tool_exec");
-    assert_eq!(region.member_pos.len(), 3);
-
-    // The block order §16.2 A prescribes, workspace_context included, with the
-    // review between the region's exit and the finalizer.
-    let types: Vec<&str> = compiled
-        .definition
-        .nodes
-        .iter()
-        .map(|n| n.node_type.as_str())
-        .collect();
-    assert_eq!(
-        types,
-        vec![
-            "trigger",
-            "conversation_history",
-            "workspace_context",
-            "agent_context",
-            "compact_context",
-            "llm",
-            "tool_exec",
-            "patch_review",
-            "persist_turn",
-            "output",
-        ]
-    );
-}
 
 /// Resolves a seeded spawn target back to its roster name. The harness pins
 /// every spawn by `agent_id`, because the block schema declares `agent_id` and
@@ -168,24 +110,35 @@ fn spawned_agent_name(pool: &DbPool, node: &FlowNode) -> String {
 }
 
 #[test]
-fn variant_b_validates_and_compiles_with_the_forced_chain() {
+fn the_harness_validates_and_compiles_with_its_three_loops() {
     let pool = test_db();
     let reg = harness_registry();
-    let json = code_harness_team_flow_json();
+    let json = code_harness_flow_json();
 
-    let def = serde_json::from_str(&json).expect("variant B parses");
-    validate(&def, &reg).expect("variant B must pass R1-R11");
+    let def = serde_json::from_str(&json).expect("the harness parses");
+    validate(&def, &reg).expect("the harness must pass R1-R11");
 
-    let compiled = CompiledFlow::from_json(CODE_HARNESS_TEAM_FLOW_ID, &json, &reg)
-        .expect("variant B compiles");
+    let compiled =
+        CompiledFlow::from_json(CODE_HARNESS_FLOW_ID, &json, &reg).expect("the harness compiles");
 
-    assert_eq!(compiled.regions.len(), 1);
-    assert_eq!(compiled.regions[0].id, "code_turn");
+    let mut regions: Vec<&str> = compiled.regions.iter().map(|r| r.id.as_str()).collect();
+    regions.sort_unstable();
+    assert_eq!(regions, vec!["build_review", "code_turn", "plan_review"]);
 
-    // Three spawns, each with its OWN wait. `spawn` is detached by
-    // construction, so without the waits the chain would only guarantee that
-    // the three STARTED — the graph would promise review-then-test-then-commit
-    // and deliver three races.
+    let turn = compiled
+        .regions
+        .iter()
+        .find(|r| r.id == "code_turn")
+        .expect("code_turn region");
+    let entry = &compiled.definition.nodes[compiled.execution_order[turn.entry_pos]];
+    let exit = &compiled.definition.nodes[compiled.execution_order[turn.exit_pos]];
+    assert_eq!(entry.node_type, "compact_context");
+    assert_eq!(exit.node_type, "tool_exec");
+    assert_eq!(turn.member_pos.len(), 3);
+
+    // Every delegation is followed by its OWN wait. `spawn` is detached by
+    // construction, so without the waits the pipeline would only guarantee
+    // that its agents STARTED.
     let spawns: Vec<String> = compiled
         .definition
         .nodes
@@ -195,31 +148,13 @@ fn variant_b_validates_and_compiles_with_the_forced_chain() {
         .collect();
     assert_eq!(
         spawns,
-        vec!["code-reviewer", "code-tester", "code-committer"]
-    );
-    assert_eq!(
-        compiled
-            .definition
-            .nodes
-            .iter()
-            .filter(|n| n.node_type == "await_subagents")
-            .count(),
-        3
-    );
-
-    // Each wait reads the run ids of the spawn IN FRONT of it. A shared default
-    // variable would let the committer's wait collect the reviewer's runs and
-    // return immediately.
-    let vars: Vec<&str> = compiled
-        .definition
-        .nodes
-        .iter()
-        .filter(|n| n.node_type == "await_subagents")
-        .map(|n| n.config["run_ids_var"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        vars,
-        vec!["review_run_ids", "test_run_ids", "commit_run_ids"]
+        vec![
+            "code-planner",
+            "code-critic",
+            "code-implementer",
+            "code-tester",
+            "code-critic",
+        ]
     );
     let spawn_vars: Vec<&str> = compiled
         .definition
@@ -228,47 +163,58 @@ fn variant_b_validates_and_compiles_with_the_forced_chain() {
         .filter(|n| n.node_type == "spawn")
         .map(|n| n.config["output_variable"].as_str().unwrap())
         .collect();
-    assert_eq!(spawn_vars, vars);
+    let wait_vars: Vec<&str> = compiled
+        .definition
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "await_subagents")
+        .map(|n| n.config["run_ids_var"].as_str().unwrap())
+        .collect();
+    assert_eq!(wait_vars, spawn_vars);
 }
 
 #[test]
-fn nothing_outside_the_region_forms_a_cycle() {
-    // The compiler's Kahn sort rejects a cycle, and the region's back edge is
+fn nothing_outside_the_regions_forms_a_cycle() {
+    // The compiler's Kahn sort rejects a cycle, and a region's back edge is
     // excluded from the in-degree — so a successful compile of a graph whose
-    // ONLY `loop_back` edge is inside `code_turn` is exactly the property
+    // every `loop_back` edge stays inside one region is exactly the property
     // §16.1 demands. Asserting the edge inventory makes the claim explicit
     // rather than implied by the compile above.
-    for json in [code_harness_flow_json(), code_harness_team_flow_json()] {
-        let def: tentaflow_core::flow_engine::types::FlowDefinition =
-            serde_json::from_str(&json).expect("parses");
-        let back: Vec<_> = def.edges.iter().filter(|e| e.is_loop_back()).collect();
-        assert_eq!(back.len(), 1, "exactly one back edge");
-        let region_of = |id: &str| {
-            def.nodes
-                .iter()
-                .find(|n| n.id == id)
-                .and_then(|n| n.region.clone())
-        };
-        assert_eq!(region_of(&back[0].from).as_deref(), Some("code_turn"));
-        assert_eq!(region_of(&back[0].to).as_deref(), Some("code_turn"));
-    }
+    let def: tentaflow_core::flow_engine::types::FlowDefinition =
+        serde_json::from_str(&code_harness_flow_json()).expect("parses");
+    let region_of = |id: &str| {
+        def.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.region.clone())
+    };
+    let mut closed: Vec<String> = def
+        .edges
+        .iter()
+        .filter(|e| e.is_loop_back())
+        .map(|e| {
+            let region = region_of(&e.from).expect("back edge leaves a region");
+            assert_eq!(region_of(&e.to).as_deref(), Some(region.as_str()));
+            region
+        })
+        .collect();
+    closed.sort_unstable();
+    assert_eq!(closed, vec!["build_review", "code_turn", "plan_review"]);
 }
 
 #[test]
-fn the_region_carries_no_stop_expression() {
-    // §16.1 takes `stop_expr` off the list: the structural stop is the only
-    // condition either variant needs, and a second stop mechanism in the config
-    // would be a promise the executor does not keep.
-    for json in [code_harness_flow_json(), code_harness_team_flow_json()] {
-        let def: tentaflow_core::flow_engine::types::FlowDefinition =
-            serde_json::from_str(&json).expect("parses");
-        for node in def.nodes.iter().filter(|n| n.region.is_some()) {
-            assert!(
-                node.config.get("stop_expr").is_none(),
-                "region node '{}' must not carry a stop expression",
-                node.id
-            );
-        }
+fn the_regions_carry_no_stop_expression() {
+    // §16.1 takes `stop_expr` off the list: the structural stop and the critic
+    // gates are the only exits, and a second stop mechanism in the config would
+    // be a promise the executor does not keep.
+    let def: tentaflow_core::flow_engine::types::FlowDefinition =
+        serde_json::from_str(&code_harness_flow_json()).expect("parses");
+    for node in def.nodes.iter().filter(|n| n.region.is_some()) {
+        assert!(
+            node.config.get("stop_expr").is_none(),
+            "region node '{}' must not carry a stop expression",
+            node.id
+        );
     }
 }
 
@@ -489,7 +435,7 @@ async fn region_ends_on_a_turn_without_tool_calls_not_on_the_budget() {
 // execution on stub adapters`. Validating and compiling proves the graph is
 // well-formed; only running it proves the harness works. The blocks that need a
 // live workspace on disk (`workspace_context`, `agent_context`,
-// `conversation_history`, `persist_turn`, and in variant B `spawn`/`await`) are
+// `conversation_history`, `persist_turn`, `task_gate`, `spawn`/`await`) are
 // stubs that record their visit and pass the envelope through; the LOOP, the
 // region and the wiring are the real ones, straight out of `seed.rs`.
 // -----------------------------------------------------------------------------
@@ -577,8 +523,8 @@ impl tentaflow_core::flow_engine::node_adapter::NodeAdapter for StubAdapter {
     }
 }
 
-/// The stub set both variants share: everything that would touch a workspace,
-/// the conversation store or the run registry.
+/// Stubs for everything that would touch a workspace, the conversation store or
+/// the run registry.
 fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<AdapterRegistry> {
     use tentaflow_core::flow_engine::node_adapters::*;
 
@@ -590,6 +536,10 @@ fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<A
     r.register(Arc::new(CompactContextNodeAdapter::new()));
     r.register(Arc::new(ToolExecNodeAdapter::new(slot)));
     r.register_llm(Arc::new(LlmNodeAdapter::new()));
+    // So are the blocks that decide whether the pipeline runs and when each
+    // review loop ends.
+    r.register(Arc::new(ConditionNodeAdapter::new()));
+    r.register(Arc::new(CriticGateNodeAdapter::new()));
 
     r.register(Arc::new(StubAdapter::passthrough(
         "conversation_history",
@@ -634,11 +584,10 @@ fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<A
     // the two execution tests below would then be asserting something other
     // than what they claim.
     //
-    // Neither graph branches on the outcome: the review has one outgoing edge,
-    // and the committer is steered by its PROMPT ("if an accepted review
-    // exists"), not by a port. So the status this stub reports cannot decide
-    // either test — what the tests get from the block is that it sits in the
-    // chain, runs once, and lets the turn through.
+    // The graph does not branch on the outcome: the review has one outgoing
+    // edge. So the status this stub reports cannot decide a test — what the
+    // tests get from the block is that it sits at the end of the pipeline, runs
+    // once, and lets the turn through.
     r.register(Arc::new(StubAdapter::with(
         "patch_review",
         recorder.clone(),
@@ -668,9 +617,18 @@ fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<A
         "persist_turn",
         recorder.clone(),
     )));
-    // Variant B only: the delegation pair. `spawn` writes ITS OWN run-id
-    // variable, `await_subagents` reads the variable ITS config names — so the
-    // recording proves the pairing comes from the graph, not from the test.
+    // `task_gate` reads the session's plan from a workspace database. With no
+    // open task it leaves the critic's decision untouched, which is what the
+    // stub does by passing the envelope through.
+    r.register(Arc::new(StubAdapter::passthrough(
+        "task_gate",
+        recorder.clone(),
+    )));
+    // The delegation pair. `spawn` writes ITS OWN run-id variable,
+    // `await_subagents` reads the variable ITS config names — so the recording
+    // proves the pairing comes from the graph, not from the test. Every wait
+    // answers with the approval marker, so each critic gate ends its loop
+    // after one round.
     let spawn_pool = pool;
     r.register(Arc::new(StubAdapter::with(
         "spawn",
@@ -705,6 +663,9 @@ fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<A
                     .collect::<Vec<_>>()
                     .join(",")
             ));
+            let out = node.config["output_variable"].as_str().expect("out var");
+            env.variables
+                .insert(out.to_string(), FlowValue::Text("BEZ UWAG".into()));
         }),
     )));
     Arc::new(r)
@@ -720,28 +681,23 @@ fn harness_envelope() -> FlowEnvelope {
     initial
 }
 
-/// §16.5 — the 9-block graph `seed.rs` ships is EXECUTED, not merely compiled.
-///
-/// Until now the only execution test used a hand-built 5-node subgraph without
-/// `workspace_context`, `agent_context`, `conversation_history` or
-/// `persist_turn`, so nothing proved the shipped graph runs at all: every block
-/// outside the region could have been mis-wired and every test would still be
-/// green.
+/// §16.5 — the graph `seed.rs` ships is EXECUTED, not merely compiled: the
+/// loop, the regions, the gates and the wiring are the real ones, and a turn
+/// that called tools walks the whole pipeline in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_seeded_variant_a_graph_runs_end_to_end_on_stub_adapters() {
+async fn the_seeded_harness_runs_the_pipeline_after_a_working_turn() {
     let pool = test_db();
     seed_skill(&pool, "22222222-0000-0000-0000-0000000000aa", "do-thing");
     seed_agent(
         &pool,
-        "agent-seeded-a",
+        "agent-seeded",
         "code-harness-exec-test",
         r#"["core.skill_view"]"#,
-        0,
+        5,
     );
     let recorder = Arc::new(Recorder::default());
-    let reg = stub_registry(pool.clone(), recorder.clone(), "agent-seeded-a");
+    let reg = stub_registry(pool.clone(), recorder.clone(), "agent-seeded");
 
-    // The REAL seeded graph, compiled through the real path.
     let compiled = Arc::new(
         CompiledFlow::from_json(CODE_HARNESS_FLOW_ID, &code_harness_flow_json(), &reg)
             .expect("the seeded graph must compile"),
@@ -758,13 +714,45 @@ async fn the_seeded_variant_a_graph_runs_end_to_end_on_stub_adapters() {
         .expect("the seeded graph must execute");
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
 
-    // Every block outside the region ran, exactly once, in the seeded order.
     let visits = recorder.visits();
     assert_eq!(
         visits,
-        vec!["h1", "w1", "c0", "r1", "p1"],
-        "the seeded prefix, the review and the finalizer must run in graph \
-         order: {visits:?}"
+        vec![
+            "h1",
+            "w1",
+            "c0",
+            // The turn is persisted before the pipeline, so the operator reads
+            // the answer while the agents work behind it.
+            "p1",
+            "pls:spawn:code-planner",
+            "pls",
+            "pla:await:run-of-code-planner",
+            "pla",
+            "pcs:spawn:code-critic",
+            "pcs",
+            "pca:await:run-of-code-critic",
+            "pca",
+            "ims:spawn:code-implementer",
+            "ims",
+            "ima:await:run-of-code-implementer",
+            "ima",
+            "tes:spawn:code-tester",
+            "tes",
+            "tea:await:run-of-code-tester",
+            "tea",
+            "bcs:spawn:code-critic",
+            "bcs",
+            "bca:await:run-of-code-critic",
+            "bca",
+            "build_reviewt",
+            "r1",
+        ],
+        "the pipeline must be the graph's doing: {visits:?}"
+    );
+    assert_eq!(
+        recorder.count("p1"),
+        1,
+        "the turn is persisted exactly once"
     );
 
     // The loop stopped structurally after the prose turn, not on the budget.
@@ -776,15 +764,6 @@ async fn the_seeded_variant_a_graph_runs_end_to_end_on_stub_adapters() {
             .and_then(|v| v.as_str()),
         Some("no_tool_calls")
     );
-    assert_eq!(
-        outcome
-            .final_envelope
-            .meta
-            .get("loop_iterations")
-            .and_then(|v| v.as_i64()),
-        Some(3),
-        "two tool turns plus the answering turn"
-    );
     // And `workspace_context` really did reach the model's system context.
     assert!(outcome
         .final_envelope
@@ -794,39 +773,28 @@ async fn the_seeded_variant_a_graph_runs_end_to_end_on_stub_adapters() {
         .any(|p| p.contains("## Workspace")));
 }
 
-// -----------------------------------------------------------------------------
-// §16.2 B — the chain runs even on an empty turn
-// -----------------------------------------------------------------------------
-
-/// The forced chain is TOPOLOGY: the agent answered in prose on its first turn
-/// and changed nothing, and review/test/commit still run because the graph says
-/// so. This executes variant B's real seeded graph; the previous version of this
-/// test never touched the graph at all — it called `handle_agent_spawn` three
-/// times from a `for` loop of its own, which proves only that the manager works.
+/// A turn in which the agent only answered called no tools, and five sub-runs
+/// over it would review nothing: the condition block routes it past the whole
+/// pipeline, review included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn forced_chain_spawns_all_three_even_when_nothing_changed() {
+async fn a_turn_without_tool_calls_skips_the_pipeline() {
     let pool = test_db();
     seed_agent(
         &pool,
-        "agent-seeded-b",
-        "code-harness-team-test",
+        "agent-seeded-idle",
+        "code-harness-idle-test",
         r#"["core.skill_view"]"#,
         5,
     );
     let recorder = Arc::new(Recorder::default());
-    let reg = stub_registry(pool.clone(), recorder.clone(), "agent-seeded-b");
+    let reg = stub_registry(pool.clone(), recorder.clone(), "agent-seeded-idle");
 
     let compiled = Arc::new(
-        CompiledFlow::from_json(
-            CODE_HARNESS_TEAM_FLOW_ID,
-            &code_harness_team_flow_json(),
-            &reg,
-        )
-        .expect("variant B must compile"),
+        CompiledFlow::from_json(CODE_HARNESS_FLOW_ID, &code_harness_flow_json(), &reg)
+            .expect("the seeded graph must compile"),
     );
 
     let mut ctx = stub_ctx();
-    // Zero tool turns: the agent answers immediately and touches nothing.
     ctx.llm = Arc::new(ScriptedLlm {
         calls: AtomicUsize::new(0),
         tool_turns: 0,
@@ -834,52 +802,14 @@ async fn forced_chain_spawns_all_three_even_when_nothing_changed() {
 
     let outcome = execute_blocking(pool, compiled, harness_envelope(), ctx, reg)
         .await
-        .expect("variant B must execute");
+        .expect("the seeded graph must execute");
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
-    assert_eq!(
-        outcome
-            .final_envelope
-            .meta
-            .get("loop_exit_reason")
-            .and_then(|v| v.as_str()),
-        Some("no_tool_calls"),
-        "the premise: the turn changed nothing"
-    );
 
-    // The chain ran anyway, in order, and each wait collected the run ids of the
-    // spawn IN FRONT of it — a shared variable would let the committer's wait
-    // return on the reviewer's runs.
     let visits = recorder.visits();
     assert_eq!(
         visits,
-        vec![
-            "h1",
-            "w1",
-            "c0",
-            "s1:spawn:code-reviewer",
-            "s1",
-            "a1:await:run-of-code-reviewer",
-            "a1",
-            "s2:spawn:code-tester",
-            "s2",
-            "a2:await:run-of-code-tester",
-            "a2",
-            // The review sits between the machines that INSPECT and the one
-            // that COMMITS: the committer is told to act "if an accepted
-            // review exists", and nothing else in this chain produces one.
-            "r1",
-            "s3:spawn:code-committer",
-            "s3",
-            "a3:await:run-of-code-committer",
-            "a3",
-            "p1",
-        ],
-        "the forced chain must be the graph's doing: {visits:?}"
-    );
-    assert_eq!(
-        recorder.count("p1"),
-        1,
-        "the turn is persisted exactly once"
+        vec!["h1", "w1", "c0", "p1"],
+        "an idle turn must not start a single sub-run: {visits:?}"
     );
 }
 

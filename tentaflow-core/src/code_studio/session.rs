@@ -756,7 +756,7 @@ mod tests {
             user_slug: "Piotr".into(),
             title: "Add the embeddings endpoint".into(),
             autonomy_mode: AutonomyMode::Normal,
-            flow_id: "cs-harness".into(),
+            flow_id: "cs-harness-critic".into(),
             flow_version_id: "v1".into(),
         }
     }
