@@ -1326,6 +1326,9 @@ pub struct AdapterHandle {
     cli_home_dir: PathBuf,
     tickets: Arc<TicketRegistry>,
     task: tokio::task::JoinHandle<()>,
+    /// The host end of the route a sandboxed CLI takes to this adapter. Lives
+    /// exactly as long as the adapter it leads to.
+    transport: super::process_sandbox::ProxyTransport,
 }
 
 impl AdapterHandle {
@@ -1368,6 +1371,14 @@ impl AdapterHandle {
         let ca = self.ca_path.display().to_string();
         let mut env = Vec::new();
         env.push(("TENTAFLOW_AGENT_ADAPTER_ADDR".to_string(), self.local_addr.to_string()));
+        // A route, not a credential: where the sandbox has no path to this
+        // loopback address, its own copy of the endpoint reaches us here.
+        if let Some(socket) = self.transport.endpoint().socket_path() {
+            env.push((
+                "TENTAFLOW_AGENT_ADAPTER_SOCKET".to_string(),
+                socket.to_string_lossy().into_owned(),
+            ));
+        }
         for (name,path) in [
             ("TENTAFLOW_AGENT_PRIVATE_ROOT", self.cli_home_dir.clone()),
             ("HOME", self.cli_home_dir.join("home")),
@@ -1451,6 +1462,7 @@ pub async fn start_adapter(
     )
     .await?;
     let local_addr = adapter.local_addr();
+    let transport = super::process_sandbox::ProxyTransport::open(local_addr)?;
     let task = tokio::spawn(adapter.run());
     Ok(AdapterHandle {
         local_addr,
@@ -1459,6 +1471,7 @@ pub async fn start_adapter(
         cli_home_dir: config.cli_home_dir,
         tickets: config.tickets,
         task,
+        transport,
     })
 }
 
@@ -2473,13 +2486,16 @@ mod tests {
     async fn the_sandbox_environment_carries_a_ticket_and_no_credential() {
         let registry = TicketRegistry::new();
         let ticket = issued(&registry, request());
+        let local_addr: SocketAddr = "127.0.0.1:9443".parse().expect("addr");
         let handle = AdapterHandle {
-            local_addr: "127.0.0.1:9443".parse().expect("addr"),
+            local_addr,
             wiring: EngineWiring::for_engine("claude-code").expect("wiring"),
             ca_path: PathBuf::from("/tmp/session/ca.pem"),
             cli_home_dir: PathBuf::from("/tmp/session/cli-claude-code-home"),
             tickets: Arc::new(TicketRegistry::new()),
             task: tokio::spawn(async {}),
+            transport: crate::code_studio::process_sandbox::ProxyTransport::open(local_addr)
+                .expect("transport"),
         };
         let env: HashMap<String, String> = handle.sandbox_env(&ticket).into_iter().collect();
         assert_eq!(

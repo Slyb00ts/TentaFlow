@@ -10,6 +10,8 @@
 //   2. a non-member gets `Ok(None)`, never a distinguishable error, so the
 //      existence of someone else's workspace does not leak.
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 use rusqlite::{params, OptionalExtension};
 
@@ -191,6 +193,27 @@ pub fn get_workspace(db: &DbPool, workspace_id: &str) -> Result<Option<Workspace
     )
     .optional()
     .map_err(read_err)
+}
+
+/// Batched `workspace_id -> name`; unknown ids are absent. For screens that
+/// label a list of rows by workspace and would otherwise read a full workspace
+/// record per row.
+pub fn lookup_workspace_names(db: &DbPool, ids: &[String]) -> Result<HashMap<String, String>> {
+    let conn = db.read().map_err(read_err)?;
+    let mut out = HashMap::with_capacity(ids.len());
+    crate::db::repository::lookup_in_chunks(
+        &conn,
+        ids,
+        |placeholders| {
+            format!("SELECT id, name FROM code_workspaces WHERE id IN ({placeholders})")
+        },
+        |row| {
+            out.insert(row.get::<_, String>(0)?, row.get::<_, String>(1)?);
+            Ok(())
+        },
+    )
+    .map_err(read_err)?;
+    Ok(out)
 }
 
 /// Returns the workspace only when the caller is a member. A non-member gets

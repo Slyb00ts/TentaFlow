@@ -671,33 +671,36 @@ async fn handle_peer_connected(
         "",
     );
 
-    // Wyslij minimalne Hello (hostname + platform) niezaleznie od trust.
-    let hello = tentaflow_protocol::mesh::MeshHelloPayload {
-        hostname: local_node_info.hostname.clone(),
-        platform: node_info_collector::detect_platform(),
-        os_info: local_node_info.os_info.clone(),
-    };
-    if let Ok(hello_bytes) = crate::mesh::cbor::encode(&hello) {
-        if let Err(e) = qm_events.send_hello(&node_id, &hello_bytes).await {
-            warn!("Blad wysylania Hello do {}: {}", node_id, e);
-        }
-    }
-
-    // KnownPeers — pozwala peerowi polaczyc sie z sasiadami bez mDNS.
-    // known_peers_snapshot omija klonowanie Vec<MeshPeerInfo> — single-pass po DashMap,
-    // wyciagamy 4 pola zamiast ~20. Przy 1000 peerow ~95% mniej alokacji.
-    let known = peer_store.known_peers_snapshot(&node_id, &local_node_id);
-    if !known.is_empty() {
-        let payload = tentaflow_protocol::mesh::KnownPeersPayload { peers: known };
-        if let Ok(kp_bytes) = crate::mesh::cbor::encode(&payload) {
-            if let Err(e) = qm_events.send_known_peers(&node_id, &kp_bytes).await {
-                debug!("Blad wysylania KnownPeers do {}: {}", node_id, e);
+    // Hello + KnownPeers + NodeInfo + TrustedKeysSync — TYLKO do zaufanych
+    // (is_trusted scache'owany powyzej).
+    if is_trusted {
+        // Hello and KnownPeers are trust-gated on the sending side too: the
+        // receiver drops both from an untrusted peer, so sending them pre-trust
+        // only hands our hostname and the fleet's address map to any LAN host.
+        let hello = tentaflow_protocol::mesh::MeshHelloPayload {
+            hostname: local_node_info.hostname.clone(),
+            platform: node_info_collector::detect_platform(),
+            os_info: local_node_info.os_info.clone(),
+        };
+        if let Ok(hello_bytes) = crate::mesh::cbor::encode(&hello) {
+            if let Err(e) = qm_events.send_hello(&node_id, &hello_bytes).await {
+                warn!("Blad wysylania Hello do {}: {}", node_id, e);
             }
         }
-    }
 
-    // NodeInfo + TrustedKeysSync — TYLKO do zaufanych (is_trusted scache'owany powyzej).
-    if is_trusted {
+        // KnownPeers — pozwala peerowi polaczyc sie z sasiadami bez mDNS.
+        // known_peers_snapshot omija klonowanie Vec<MeshPeerInfo> — single-pass po DashMap,
+        // wyciagamy 4 pola zamiast ~20. Przy 1000 peerow ~95% mniej alokacji.
+        let known = peer_store.known_peers_snapshot(&node_id, &local_node_id);
+        if !known.is_empty() {
+            let payload = tentaflow_protocol::mesh::KnownPeersPayload { peers: known };
+            if let Ok(kp_bytes) = crate::mesh::cbor::encode(&payload) {
+                if let Err(e) = qm_events.send_known_peers(&node_id, &kp_bytes).await {
+                    debug!("Blad wysylania KnownPeers do {}: {}", node_id, e);
+                }
+            }
+        }
+
         if let Ok(info_bytes) = crate::mesh::cbor::encode(&local_node_info) {
             if let Err(e) = qm_events.send_node_info(&node_id, &info_bytes).await {
                 warn!("Blad wysylania NodeInfo do {}: {}", node_id, e);
@@ -733,11 +736,12 @@ async fn handle_peer_connected(
                 }
 
                 // Revoked node sync.
-                let revoked = sec.get_revoked_node_ids();
-                for revoked_id in &revoked {
+                let revoked = sec.get_revoked_nodes();
+                for (revoked_id, revoked_at) in &revoked {
                     let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
                         revoked_node_id: revoked_id.clone(),
                         from_node_id: local_node_id.clone(),
+                        revoked_at: Some(revoked_at.clone()),
                     };
                     if let Ok(data) = crate::mesh::cbor::encode(&payload) {
                         let _ = qm_events
@@ -761,6 +765,10 @@ async fn handle_peer_connected(
                 if let Err(e) = qm_events.send_hmac_keys_sync(&node_id, &bytes).await {
                     warn!("Blad wysylania HmacKeysSync do {}: {}", node_id, e);
                 }
+            }
+
+            if let Err(e) = qm_events.send_shared_secrets_sync(&node_id).await {
+                warn!("SharedSecretsSync to {} failed: {}", node_id, e);
             }
         }
 
@@ -1101,6 +1109,15 @@ fn spawn_quic_event_handler(
                             );
                             peer_store.set_hostname(&node_id, &hello.hostname);
                             peer_store.set_platform(&node_id, &hello.platform);
+                            if let Some(ref sec) = mesh_security {
+                                if let Err(e) = crate::db::repository::fill_default_node_kind(
+                                    &sec.db,
+                                    &node_id,
+                                    &hello.platform,
+                                ) {
+                                    debug!(peer_id = %node_id, "node kind default not applied: {}", e);
+                                }
+                            }
                             if !hello.os_info.is_empty() {
                                 peer_store.set_os_info(&node_id, &hello.os_info);
                             }
@@ -1111,10 +1128,15 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(IrohMeshEvent::KnownPeersReceived { from_node_id, data }) => {
-                    // Pre-trust discovery gossip — peer X polaczyl sie z nami i przekazuje
-                    // liste peerow ktorych on widzi (tj. jest z nimi polaczony QUIC-iem).
-                    // Akceptujemy od KAZDEGO peera bo to tylko info dyskawerii, bez
-                    // wrazliwych danych. Probujemy sie polaczyc z kazdym nieznanym.
+                    // Discovery gossip from a trusted peer: the nodes it is connected
+                    // to. What it says about ITSELF is authoritative; what it says
+                    // about others is hearsay that may fill a gap but never replaces
+                    // what we already know, so one peer cannot repoint another
+                    // node's hostname or addresses.
+                    const MAX_KNOWN_PEERS_PER_FRAME: usize = 128;
+                    const MAX_HOSTNAME_LEN: usize = 255;
+                    const MAX_ADDRS_PER_PEER: usize = 8;
+
                     use tentaflow_protocol::mesh::KnownPeersPayload;
                     let payload = match crate::mesh::cbor::decode::<KnownPeersPayload>(&data) {
                         Ok(p) => p,
@@ -1123,15 +1145,24 @@ fn spawn_quic_event_handler(
                             continue;
                         }
                     };
+                    if payload.peers.len() > MAX_KNOWN_PEERS_PER_FRAME {
+                        warn!(
+                            from = %from_node_id,
+                            reported = payload.peers.len(),
+                            limit = MAX_KNOWN_PEERS_PER_FRAME,
+                            "KnownPeers: frame exceeds limit, truncating"
+                        );
+                    }
                     debug!(
                         from = %from_node_id,
                         count = payload.peers.len(),
                         "Otrzymano KnownPeers"
                     );
-                    for entry in &payload.peers {
+                    for entry in payload.peers.iter().take(MAX_KNOWN_PEERS_PER_FRAME) {
                         if entry.node_id == local_node_id {
                             continue;
                         }
+                        let is_self_report = entry.node_id == from_node_id;
                         if peer_store.is_quic_connected(&entry.node_id) {
                             continue;
                         }
@@ -1143,14 +1174,24 @@ fn spawn_quic_event_handler(
                         let addrs: Vec<std::net::IpAddr> = entry
                             .direct_addrs
                             .iter()
+                            .take(MAX_ADDRS_PER_PEER)
                             .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                             .map(|sa| sa.ip())
                             .collect();
-                        if !addrs.is_empty() {
-                            peer_store.set_addresses(&entry.node_id, addrs);
-                        }
-                        if !entry.hostname.is_empty() {
-                            peer_store.set_hostname(&entry.node_id, &entry.hostname);
+                        let hostname = if entry.hostname.len() <= MAX_HOSTNAME_LEN {
+                            entry.hostname.as_str()
+                        } else {
+                            ""
+                        };
+                        if is_self_report {
+                            if !addrs.is_empty() {
+                                peer_store.set_addresses(&entry.node_id, addrs);
+                            }
+                            if !hostname.is_empty() {
+                                peer_store.set_hostname(&entry.node_id, hostname);
+                            }
+                        } else {
+                            peer_store.upsert_gossip_peer(&entry.node_id, hostname, "", "", addrs, 0);
                         }
                         peer_store.set_status(&entry.node_id, "discovered");
                         if !target_trusted {
@@ -1230,6 +1271,9 @@ fn spawn_quic_event_handler(
                         topo_seen.pop_front();
                     }
 
+                    const MAX_TOPOLOGY_ENTRIES_PER_FRAME: usize = 256;
+                    const MAX_ADDRS_PER_ENTRY: usize = 8;
+
                     // Batch DB upsertow: cala TopologyAnnounce w jednej transakcji
                     // zamiast N osobnych COMMITow (N*fsync pod gossip burstem).
                     // Trzymamy tylko owned Stringi dla pol ktore sa SERIALIZOWANE
@@ -1243,14 +1287,30 @@ fn spawn_quic_event_handler(
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
 
+                    let reported_entry_count = payload.entries.len();
+                    if reported_entry_count > MAX_TOPOLOGY_ENTRIES_PER_FRAME {
+                        warn!(
+                            from = %from_node_id,
+                            reported = reported_entry_count,
+                            limit = MAX_TOPOLOGY_ENTRIES_PER_FRAME,
+                            "TopologyAnnounce: frame exceeds limit, truncating"
+                        );
+                    }
+
                     // Aktualizuj peer_store + topologie dla kazdego wpisu
-                    for (entry_idx, entry) in payload.entries.iter().enumerate() {
+                    for (entry_idx, entry) in payload
+                        .entries
+                        .iter()
+                        .take(MAX_TOPOLOGY_ENTRIES_PER_FRAME)
+                        .enumerate()
+                    {
                         if entry.node_id == local_node_id {
                             continue;
                         }
                         let addrs: Vec<std::net::IpAddr> = entry
                             .direct_addrs
                             .iter()
+                            .take(MAX_ADDRS_PER_ENTRY)
                             .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                             .map(|sa| sa.ip())
                             .collect();
@@ -1814,6 +1874,17 @@ fn spawn_quic_event_handler(
                         >(&data)
                         {
                             Ok(val) => {
+                                // VULN-M1: bind tozsamosci — payload nie moze wskazywac
+                                // innego noda niz transport (peer_id). Potwierdzenie pod
+                                // cudzym id to spoofing.
+                                if !val.from_node_id.is_empty() && val.from_node_id != peer_id {
+                                    warn!(
+                                        claimed = %val.from_node_id,
+                                        transport = %peer_id,
+                                        "PairingConfirm: from_node_id niezgodny z transportem — odrzucam"
+                                    );
+                                    continue;
+                                }
                                 let from_node_id = if val.from_node_id.is_empty() {
                                     peer_id.as_str()
                                 } else {
@@ -1823,25 +1894,54 @@ fn spawn_quic_event_handler(
                                 let hostname = val.hostname.as_str();
                                 let received_pin = val.pin.as_str();
 
-                                // Weryfikuj PIN — inicjator sprawdza czy receiver podal poprawny PIN.
+                                // VULN-M1: auto-confirm dotyczy wylacznie parowania, ktore MY
+                                // zainicjowalismy (pending "outgoing" — PIN wygenerowany
+                                // lokalnie). Pending "incoming" tworzy sama ramka
+                                // PairingRequest od obcego noda — zatwierdzanie go tutaj
+                                // pozwoliloby na samoparowanie z PIN-em atakujacego.
+                                // Pusty PIN w potwierdzeniu jest odrzucany, nigdy nie
+                                // pomija weryfikacji.
+                                let expected_pin = match sec.get_pending_outgoing_pin(from_node_id)
+                                {
+                                    Ok(Some(pin)) => pin,
+                                    _ => {
+                                        warn!(
+                                            "PairingConfirm od {} — brak outgoing pending, odrzucam",
+                                            from_node_id
+                                        );
+                                        continue;
+                                    }
+                                };
+                                if received_pin.is_empty() {
+                                    warn!(
+                                        "PairingConfirm od {} — pusty PIN, odrzucam",
+                                        from_node_id
+                                    );
+                                    continue;
+                                }
+                                // This compare is the remote guess at our PIN, so it is
+                                // the step that draws from the attempt budget.
+                                if !sec.check_pin_rate_limit(&peer_id) {
+                                    warn!(
+                                        "PairingConfirm od {} — przekroczony limit prob PIN",
+                                        peer_id
+                                    );
+                                    continue;
+                                }
                                 // Constant-time compare: identical short PIN strings, but keep ct_eq
                                 // for hardening against future variable-length PINs.
-                                if let Ok(Some(expected_pin)) = sec.get_pending_pin(from_node_id) {
-                                    if !received_pin.is_empty() {
-                                        use subtle::ConstantTimeEq;
-                                        let same = received_pin.len() == expected_pin.len()
-                                            && bool::from(
-                                                received_pin
-                                                    .as_bytes()
-                                                    .ct_eq(expected_pin.as_bytes()),
-                                            );
-                                        if !same {
-                                            warn!(
-                                                "PairingConfirm od {} — nieprawidlowy PIN",
-                                                from_node_id
-                                            );
-                                            continue;
-                                        }
+                                {
+                                    use subtle::ConstantTimeEq;
+                                    let same = received_pin.len() == expected_pin.len()
+                                        && bool::from(
+                                            received_pin.as_bytes().ct_eq(expected_pin.as_bytes()),
+                                        );
+                                    if !same {
+                                        warn!(
+                                            "PairingConfirm od {} — nieprawidlowy PIN",
+                                            from_node_id
+                                        );
+                                        continue;
                                     }
                                 }
 
@@ -1995,6 +2095,7 @@ fn spawn_quic_event_handler(
                 Ok(IrohMeshEvent::TrustRevokedReceived {
                     node_id,
                     revoked_node_id,
+                    revoked_at,
                 }) => {
                     if let Some(ref sec) = mesh_security {
                         let sender_trusted = sec.is_trusted(&node_id);
@@ -2041,8 +2142,24 @@ fn spawn_quic_event_handler(
                         }
 
                         // Przypadek 2: ktos inny zostal odlaczony — usun TYLKO jego klucz
+                        if sender_trusted
+                            && sec.is_stale_revocation(&revoked_node_id, revoked_at.as_deref())
+                        {
+                            debug!(
+                                "Pominieto TrustRevoked {} od {} — node sparowany ponownie po tej revokacji",
+                                revoked_node_id, node_id
+                            );
+                            continue;
+                        }
                         if sender_trusted && sec.is_trusted(&revoked_node_id) {
-                            let _ = sec.unpair(&revoked_node_id);
+                            // Durable: a plain unpair would let the next
+                            // TrustedKeysSync from a peer that missed this
+                            // frame re-add the node.
+                            if let Err(e) =
+                                sec.revoke_trust(&revoked_node_id, revoked_at.as_deref())
+                            {
+                                warn!("Blad revoke_trust dla {}: {}", revoked_node_id, e);
+                            }
                             crate::services::mesh_keys::sync::forget_peer(&revoked_node_id);
                             // Drop the revoked node's advertised robots so the
                             // resolver stops routing commands to an untrusted owner.
@@ -2102,8 +2219,21 @@ fn spawn_quic_event_handler(
                     }
 
                     if let Some(ref sec) = mesh_security {
+                        // VULN-M5: limit wpisow na ramke — jedna ramka nie moze
+                        // wstrzyknac nieograniczonej liczby zaufanych tozsamosci.
+                        const MAX_SYNC_TRUST_ENTRIES: usize = 64;
+                        if keys.len() > MAX_SYNC_TRUST_ENTRIES {
+                            warn!(
+                                sender = %node_id,
+                                count = keys.len(),
+                                "TrustedKeysSync przekracza limit wpisow — obcinam do {}",
+                                MAX_SYNC_TRUST_ENTRIES
+                            );
+                        }
                         let mut added = 0u32;
-                        for (remote_node_id, public_key_hex, approved_at) in &keys {
+                        for (remote_node_id, public_key_hex, approved_at) in
+                            keys.iter().take(MAX_SYNC_TRUST_ENTRIES)
+                        {
                             if sec.is_trusted(remote_node_id) {
                                 continue;
                             }
@@ -2169,6 +2299,24 @@ fn spawn_quic_event_handler(
                             scopes = accepted,
                             "HmacKeysSync przyjety — peer keys zalezone do verify pool"
                         );
+                    }
+                }
+                Ok(IrohMeshEvent::SharedSecretsSyncReceived { node_id, payload }) => {
+                    let Some(sec) = &mesh_security else {
+                        continue;
+                    };
+                    let now_ms = crate::mesh::proto_conv::now_unix_ms();
+                    match crate::mesh::shared_secrets::ingest(sec, &node_id, payload, now_ms) {
+                        Ok(0) => {}
+                        Ok(adopted) => {
+                            info!(from = %node_id, adopted, "SharedSecretsSync: adopted newer fleet secrets");
+                            // Not every node is connected to the one where the
+                            // secret was set, so an adopting node passes it on.
+                            // Adoption requires a strictly newer version, which
+                            // ends the relay once the fleet has converged.
+                            qm_events.push_shared_secrets_to_trusted(Some(&node_id)).await;
+                        }
+                        Err(e) => warn!(from = %node_id, "SharedSecretsSync rejected: {e}"),
                     }
                 }
                 Ok(IrohMeshEvent::MeshCommandReceived {

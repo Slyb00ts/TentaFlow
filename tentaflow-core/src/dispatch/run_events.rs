@@ -326,6 +326,7 @@ mod tests {
 
     fn seed_run(state: &AppState, id: &str, owner: Option<&str>) {
         let params = crate::db::models::AgentParams {
+            runtime_json: crate::agents::LLM_RUNTIME_JSON,
             id: "agent-x",
             name: "runner",
             display_name: None,

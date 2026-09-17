@@ -558,7 +558,6 @@ pub enum MeshCommandType {
     /// GPU i nie timeoutowal. Odpowiedz: Empty. Appended at END.
     DistributedStartServe {
         deployment_cluster_id: String,
-        serve_cmd: String,
     },
     /// P0 cluster deploy: upewnij sie, ze model `model_repo` jest kompletny w cache
     /// HF NA TYM nodzie (zwykle head). Jesli brak — odbiorca pobiera go kontenerem
@@ -612,13 +611,6 @@ pub enum MeshCommandType {
     /// Appended at END (ciborium index rule).
     MlTrainCancel {
         run_id: String,
-    },
-    /// Forward a validated coding-agent bridge operation to its owner node.
-    AgentRpc {
-        service_id: i64,
-        operation: String,
-        payload_json: String,
-        user_id: String,
     },
     /// Code Studio (§12.1): one binary-protocol request of a workspace whose
     /// owner node is the receiver. `payload_cbor` is the CBOR of a
@@ -1324,15 +1316,6 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("run_id", run_id)
                 .finish(),
             Self::AgentAccountMove { operation, .. } => f.debug_struct("AgentAccountMove").field("operation",operation).finish_non_exhaustive(),
-            Self::AgentRpc {
-                service_id,
-                operation,
-                ..
-            } => f
-                .debug_struct("AgentRpc")
-                .field("service_id", service_id)
-                .field("operation", operation)
-                .finish(),
             Self::MlDatasetChunk {
                 dataset_hash,
                 seq,
@@ -1420,7 +1403,6 @@ impl std::fmt::Debug for MeshCommandType {
                 .finish(),
             Self::DistributedStartServe {
                 deployment_cluster_id,
-                serve_cmd: _,
             } => f
                 .debug_struct("DistributedStartServe")
                 .field("deployment_cluster_id", deployment_cluster_id)
@@ -1584,6 +1566,10 @@ pub const MESH_MSG_STORAGE_PROXY_REQUEST: u8 = 0x34;
 /// Online authority storage response for central-only addon data.
 pub const MESH_MSG_STORAGE_PROXY_RESPONSE: u8 = 0x35;
 pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
+/// Fleet-wide secret settings, each sealed for the one peer that receives the
+/// frame. Secrets travel here and never through the sync ledger, whose operation
+/// bodies are stored and relayed in plaintext.
+pub const MESH_MSG_SHARED_SECRETS_SYNC: u8 = 0x28;
 pub const MESH_MSG_FORWARD_STREAM_REQ: u8 = 0x38;
 pub const MESH_MSG_ALIAS_SYNC: u8 = 0x39;
 /// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
@@ -1721,6 +1707,13 @@ pub struct LidarStreamFrame {
 pub struct TrustRevokedPayload {
     pub revoked_node_id: String,
     pub from_node_id: String,
+    /// UTC `%Y-%m-%d %H:%M:%S` of the original revocation, carried unchanged
+    /// as the revocation propagates. It orders a revocation against a later
+    /// re-pairing (`approved_at`), so a node that missed the re-pairing cannot
+    /// revoke the identity again fleet-wide. Absent on frames from nodes that
+    /// predate the field; the receiver then stamps its own clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
@@ -1787,6 +1780,28 @@ pub struct HmacKeyEntry {
 pub struct HmacKeysSyncPayload {
     pub from_node_id: String,
     pub keys: Vec<HmacKeyEntry>,
+}
+
+/// One secret setting inside `SharedSecretsSyncPayload`. The HLC is the version
+/// of the value at its origin; the receiver keeps the entry only when it is newer
+/// than what it holds. `sealed` opens only on the addressed peer and is bound to
+/// `key` and the HLC, so an entry cannot be replanted under another key or
+/// version. An empty opened value means the secret was cleared.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct SharedSecretEntry {
+    pub key: String,
+    pub hlc_wall_ms: i64,
+    pub hlc_logical: u32,
+    pub hlc_node: String,
+    #[serde(with = "serde_bytes")]
+    pub sealed: Vec<u8>,
+}
+
+/// Payload of `MESH_MSG_SHARED_SECRETS_SYNC` — every secret the sender holds.
+/// Sending the full set on each connect doubles as anti-entropy.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct SharedSecretsSyncPayload {
+    pub entries: Vec<SharedSecretEntry>,
 }
 
 /// F1b P3.C — wire-stable mirror of `services::frame_storage::FrameMetadata`.
@@ -2548,6 +2563,32 @@ mod tests {
                 assert!(winner.wins_over(e));
             }
         }
+    }
+
+    /// `AgentRpc` carried the acting user's id as a plain field, so any trusted
+    /// node could act as anyone. Remote coding-agent requests now travel as
+    /// `AppRouteOp` with a signed assertion; a frame still naming the old
+    /// variant must not decode into anything executable.
+    #[test]
+    fn a_frame_naming_the_removed_agent_rpc_command_does_not_decode() {
+        #[derive(SerdeSerialize)]
+        enum Removed {
+            AgentRpc {
+                service_id: i64,
+                operation: String,
+                payload_json: String,
+                user_id: String,
+            },
+        }
+        let bytes = crate::cbor::encode(&Removed::AgentRpc {
+            service_id: 1,
+            operation: "auth.start".to_string(),
+            payload_json: "{}".to_string(),
+            user_id: "00000000-0000-0000-0000-000000000001".to_string(),
+        })
+        .expect("encode");
+
+        assert!(crate::cbor::decode::<MeshCommandType>(&bytes).is_err());
     }
 
     #[test]

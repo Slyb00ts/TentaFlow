@@ -21,6 +21,7 @@ import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 import * as Access from '/js/modules/services/access.js';
 import { agentRequest, openAgentLogin, openAgentAccount } from '/js/modules/coding-agent.js';
+import * as AgentAccountsTab from '/js/modules/services/agent-accounts-tab.js';
 
 // Kolumna SILNIK tymczasowo ukryta na zyczenie — flip na true zeby przywrocic.
 const SHOW_ENGINE_COL = false;
@@ -110,6 +111,17 @@ const ServicesScreen = {
     byId('svc-tabs')?.addEventListener('change', handleTabChange);
 
     await loadAll();
+    // Managing agent accounts is administration: the tab is not narrowed for a
+    // plain user, it is absent. The screen itself is already admin-only in the
+    // sidebar, so this only covers a hand-typed route.
+    if (!currentUserIsAdmin) {
+      byId('svc-tabs')?.querySelector('tf-tab#accounts')?.remove();
+      if (currentTab === 'accounts') {
+        currentTab = 'list';
+        byId('svc-tabs')?.setAttribute('value', 'list');
+        renderTab();
+      }
+    }
     refresher = createRefresher({
       run: () => loadForCurrentTab(),
       intervalMs: 5000,
@@ -120,6 +132,7 @@ const ServicesScreen = {
   unmount() {
     if (refresher) refresher.dispose();
     refresher = null;
+    AgentAccountsTab.unmount();
     stopDeployWatchers();
     deletingServices = new Set();
     services = [];
@@ -188,7 +201,11 @@ function modelVisibilityFor(modelId) {
 
 async function loadForCurrentTab() {
   try {
-    if (currentTab === 'list' || currentTab === 'accounts') {
+    // The accounts tab reloads on its own actions, not on a timer: nothing on
+    // it changes without somebody clicking, and a periodic rebuild would drop
+    // the filters and the open row underneath the operator.
+    if (currentTab === 'accounts') return;
+    if (currentTab === 'list') {
       // meshNodes is needed for hostname resolution in the Node column. Both
       // requests run in parallel — peer_store updates land lazily so the local
       // node is always present even when remotes are offline.
@@ -236,7 +253,8 @@ function updateTabCounts() {
   const listTab = tabs.querySelector('tf-tab#list');
   const aliasTab = tabs.querySelector('tf-tab#aliases');
   const modelsTab = tabs.querySelector('tf-tab#models');
-  tabs.querySelector('tf-tab#accounts')?.setAttribute('count', String(codingAgentServices().length));
+  // The accounts count comes from the accounts tab itself (its own request);
+  // this pass must not overwrite it with a number from the services list.
   if (listTab) listTab.setAttribute('count', String(services.length));
   if (aliasTab) aliasTab.setAttribute('count', String(aliases.length));
   if (modelsTab) modelsTab.setAttribute('count', String(collectUniqueModels().length));
@@ -254,18 +272,28 @@ function handleTabChange(e) {
 function renderTab() {
   const body = byId('svc-tab-body');
   if (!body) return;
-  if (currentTab === 'list' || currentTab === 'accounts') body.innerHTML = renderListTab(currentTab === 'accounts' ? codingAgentServices() : services);
-  else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
+  // The accounts tab owns its host: it is a separate module with its own
+  // toolbar state, so it must not be rebuilt by the 5 s service refresher.
+  if (currentTab !== 'accounts') AgentAccountsTab.unmount();
+  if (currentTab === 'list') body.innerHTML = renderListTab(services);
+  else if (currentTab === 'accounts') {
+    body.innerHTML = '';
+    AgentAccountsTab.mount(body, {
+      isAdmin: currentUserIsAdmin,
+      onCount: (count) => byId('svc-tabs')?.querySelector('tf-tab#accounts')?.setAttribute('count', String(count)),
+    });
+    return;
+  } else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
   else if (currentTab === 'models') body.innerHTML = renderModelsTab();
   bindTabEvents();
   syncDeployWatchers();
 }
 
 function patchListTab() {
-  if (currentTab !== 'list' && currentTab !== 'accounts') return;
+  if (currentTab !== 'list') return;
   const body = byId('svc-tab-body');
   if (!body) return;
-  patchInner(body, renderListTab(currentTab === 'accounts' ? codingAgentServices() : services));
+  patchInner(body, renderListTab(services));
   bindTabEvents();
   syncDeployWatchers();
 }
@@ -951,7 +979,7 @@ function clampPct(value) {
 // deployId already in `deployWatchers` (even one whose subscribe() has not
 // resolved yet, even one already ended) is never subscribed twice.
 function syncDeployWatchers() {
-  if (currentTab !== 'list' && currentTab !== 'accounts') {
+  if (currentTab !== 'list') {
     stopDeployWatchers();
     return;
   }

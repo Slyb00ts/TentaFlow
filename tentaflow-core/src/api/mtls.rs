@@ -14,6 +14,7 @@ use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use sha2::{Digest, Sha256};
+use x509_parser::prelude::*;
 
 /// Effective runtime config for mTLS pinning of `/core/frame/pickup`.
 ///
@@ -69,6 +70,39 @@ pub fn fingerprint_hex(der: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Verifies that a DER-encoded certificate is within its validity window
+/// (notBefore <= now <= notAfter). Returns Ok(()) if valid, or Err(reason) if expired/not-yet-valid.
+fn verify_cert_validity(der: &CertificateDer<'_>, now: UnixTime) -> Result<(), String> {
+    let parsed = parse_x509_certificate(der.as_ref())
+        .map_err(|e| format!("Failed to parse certificate: {}", e))?
+        .1;
+
+    let validity = &parsed.validity();
+
+    // Convert ASN1Time to seconds since epoch for comparison with UnixTime.
+    let now_secs = now.as_secs() as i64;
+    let not_before_secs = validity.not_before.timestamp();
+    let not_after_secs = validity.not_after.timestamp();
+
+    // Check notBefore: certificate must not be used before this time.
+    if now_secs < not_before_secs {
+        return Err(format!(
+            "Certificate not yet valid (notBefore: {})",
+            validity.not_before
+        ));
+    }
+
+    // Check notAfter: certificate must not be used after this time.
+    if now_secs > not_after_secs {
+        return Err(format!(
+            "Certificate expired (notAfter: {})",
+            validity.not_after
+        ));
+    }
+
+    Ok(())
+}
+
 /// rustls verifier that accepts any client certificate at the TLS layer. The
 /// application enforces fingerprint pinning afterwards via `PickupMtlsConfig`.
 /// Using this verifier in a TLS 1.3 config makes rustls *request* the client
@@ -113,10 +147,14 @@ impl ClientCertVerifier for AnyClientCertVerifier {
 
     fn verify_client_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
+        // Reject certificates outside their validity window (expired or not-yet-valid).
+        verify_cert_validity(end_entity, now)
+            .map_err(|reason| Error::General(reason))?;
+
         Ok(ClientCertVerified::assertion())
     }
 
@@ -233,6 +271,37 @@ mod tests {
         }
         let cfg = PickupMtlsConfig::new(true, vec![colonised]);
         assert!(cfg.matches(der));
+    }
+
+    // rcgen's default validity runs from 1975 to 4096, so the clock is moved
+    // around the certificate instead of minting one per case.
+    fn test_client_cert() -> CertificateDer<'static> {
+        rcgen::generate_simple_self_signed(vec!["client".to_string()])
+            .expect("generate certificate")
+            .cert
+            .der()
+            .clone()
+    }
+
+    fn at_year(year: u64) -> UnixTime {
+        UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            (year - 1970) * 365 * 24 * 3600,
+        ))
+    }
+
+    #[test]
+    fn a_client_cert_past_its_not_after_is_rejected() {
+        assert!(verify_cert_validity(&test_client_cert(), at_year(4200)).is_err());
+    }
+
+    #[test]
+    fn a_client_cert_before_its_not_before_is_rejected() {
+        assert!(verify_cert_validity(&test_client_cert(), at_year(1971)).is_err());
+    }
+
+    #[test]
+    fn a_client_cert_inside_its_validity_window_is_accepted() {
+        assert!(verify_cert_validity(&test_client_cert(), at_year(2026)).is_ok());
     }
 
     #[test]

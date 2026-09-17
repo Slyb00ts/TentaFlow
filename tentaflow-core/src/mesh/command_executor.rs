@@ -60,6 +60,12 @@ impl CommandResponse {
     }
 }
 
+/// Bounds on what one trusted peer can make this node hold in memory.
+const MAX_CONTAINER_LOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONTAINER_LOG_LINES: u32 = 10_000;
+const MAX_PROFILING_SESSION_BYTES: u64 = 256 * 1024 * 1024;
+const PEER_COMMANDS_PER_MINUTE: u32 = 1200;
+
 /// Executor komend mesh — weryfikuje trust i wykonuje komendy od zdalnych nodow.
 ///
 /// `local_node_id` jest uzywane przez handlery profilowania do lokalizacji
@@ -83,6 +89,9 @@ pub struct MeshCommandExecutor {
     /// this async lock guards the whole critical section across the addon call.
     /// E-stop-class actions BYPASS this lock entirely and execute immediately.
     robot_exec_locks: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Commands per peer in the current minute: (count, window start).
+    /// Rate limit: 100 commands per peer in a 60-second window.
+    peer_command_rate: dashmap::DashMap<String, (u32, std::time::Instant)>,
 }
 
 impl MeshCommandExecutor {
@@ -94,6 +103,7 @@ impl MeshCommandExecutor {
             service_actions: AsyncRwLock::new(None),
             robot_idem: std::sync::Mutex::new(crate::mesh::robot_control::IdempotencyCache::new()),
             robot_exec_locks: dashmap::DashMap::new(),
+            peer_command_rate: dashmap::DashMap::new(),
         }
     }
 
@@ -104,6 +114,67 @@ impl MeshCommandExecutor {
         let recovery=crate::services::account_move::MoveContext{db:ctx.db.clone(),ports:ctx.port_allocator.clone(),mesh:ctx.iroh.clone(),security:self.security.clone()};
         *self.service_actions.write().await = Some(ctx);
         tokio::spawn(async move {if let Err(error)=crate::services::account_move::recover(recovery).await {tracing::error!(%error,"account transfer recovery failed");}});
+    }
+
+    /// Drops robot locks nobody holds or waits on. The map hands out clones
+    /// of the `Arc`, so a count above one means a command is still using it.
+    fn release_idle_robot_locks(&self) {
+        self.robot_exec_locks
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+
+    /// Trust says the sender belongs to the fleet; it does not say the sender
+    /// may reconfigure this node. A node trusted only through `TrustedKeysSync`
+    /// was never vouched for by anyone here, so node-changing commands need the
+    /// sender to be on this node's operator list. A registry that cannot be
+    /// read refuses rather than allows.
+    fn check_command_privilege(
+        &self,
+        from_node_id: &str,
+        command: &MeshCommandType,
+    ) -> Result<(), String> {
+        use super::command_policy::{required_privilege, CommandPrivilege};
+
+        if required_privilege(command) != CommandPrivilege::Operator {
+            return Ok(());
+        }
+        match crate::db::repository::node_is_operator(&self.security.db, from_node_id) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                warn!(from = %from_node_id, command = ?command, "Odrzucono komende: nadawca nie jest operatorem");
+                let _ = crate::db::repository::log_audit(
+                    &self.security.db,
+                    None,
+                    None,
+                    "mesh_command_denied",
+                    None,
+                    Some(&format!("{command:?} from a node that is not an operator")),
+                    None,
+                    Some(from_node_id),
+                );
+                Err(format!(
+                    "node {from_node_id} is not an operator on node {}; an administrator of \
+                     that node can promote it on the Mesh screen",
+                    self.local_node_id
+                ))
+            }
+            Err(e) => Err(format!("operator list unavailable: {e}")),
+        }
+    }
+
+    /// Counts one command against the sending peer. Only trusted peers reach
+    /// this, so the map is bounded by the size of the fleet.
+    fn check_peer_command_rate_limit(&self, peer_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut entry = self
+            .peer_command_rate
+            .entry(peer_id.to_string())
+            .or_insert((0, now));
+        if now.duration_since(entry.1) >= std::time::Duration::from_secs(60) {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        entry.0 <= PEER_COMMANDS_PER_MINUTE
     }
 
     async fn service_action_ctx(&self) -> Option<ServiceActionContext> {
@@ -128,6 +199,17 @@ impl MeshCommandExecutor {
             );
             crate::code_studio::assertion::forget_peer_keys(from_node_id);
             return CommandResponse::fail(format!("Node {} nie jest zaufany", from_node_id));
+        }
+
+        if !self.check_peer_command_rate_limit(from_node_id) {
+            warn!(from = %from_node_id, "Odrzucono komende: przekroczony limit komend");
+            return CommandResponse::fail(
+                "Rate limited: too many commands from this peer".to_string(),
+            );
+        }
+
+        if let Err(refusal) = self.check_command_privilege(from_node_id, &command) {
+            return CommandResponse::fail(refusal);
         }
 
         if matches!(command, MeshCommandType::ProfilingActiveInfo(_)) {
@@ -523,14 +605,15 @@ impl MeshCommandExecutor {
             }
             MeshCommandType::DistributedStartServe {
                 deployment_cluster_id,
-                serve_cmd,
             } => {
-                match crate::services::deploy::distributed::exec_serve_on_head(
-                    &deployment_cluster_id,
-                    &serve_cmd,
-                )
-                .await
-                {
+                use crate::services::deploy::distributed;
+                let started = match distributed::head_serve_command(&deployment_cluster_id) {
+                    Ok(serve_cmd) => {
+                        distributed::exec_serve_on_head(&deployment_cluster_id, &serve_cmd).await
+                    }
+                    Err(e) => Err(e),
+                };
+                match started {
                     Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
                     Err(e) => CommandResponse::fail(e),
                 }
@@ -581,16 +664,6 @@ impl MeshCommandExecutor {
                     Err(error)=>CommandResponse::fail(error.to_string()),
                 }
             }
-            MeshCommandType::AgentRpc {
-                service_id,
-                operation,
-                payload_json,
-                user_id,
-            } => {
-                self.handle_agent_rpc(service_id, operation, payload_json, user_id)
-                    .await
-            }
-
             MeshCommandType::CodeStudioOp {
                 assertion,
                 payload_cbor,
@@ -1315,51 +1388,6 @@ impl MeshCommandExecutor {
         })
     }
 
-    async fn handle_agent_rpc(
-        &self,
-        service_id: i64,
-        operation: String,
-        payload_json: String,
-        user_id: String,
-    ) -> CommandResponse {
-        let Some(ctx) = self.service_action_ctx().await else {
-            return CommandResponse::fail("coding-agent service context is not initialized");
-        };
-        if matches!(operation.as_str(),"account.move"|"account.move.status") {
-            let context=crate::services::account_move::MoveContext{db:ctx.db.clone(),ports:ctx.port_allocator.clone(),mesh:ctx.iroh.clone(),security:self.security.clone()};
-            return match crate::services::account_move::operate(context,service_id,&user_id,&operation,&payload_json).await {
-                Ok(result_json)=>CommandResponse::ok(MeshCommandResponsePayload::AgentRpcResult{result_json}),
-                Err(error)=>CommandResponse::fail(error.to_string()),
-            };
-        }
-        let service = {
-            let conn = match ctx.db.read() {
-                Ok(conn) => conn,
-                Err(_) => return CommandResponse::fail("database pool is poisoned"),
-            };
-            match crate::services_repo::services::get(&conn, service_id) {
-                Ok(Some(service)) => service,
-                Ok(None) => {
-                    return CommandResponse::fail(format!("service id={service_id} not found"))
-                }
-                Err(error) => return CommandResponse::fail(error.to_string()),
-            }
-        };
-        match crate::services::coding_agent::execute_public(&ctx.db, &service, &user_id, &operation, &payload_json).await {
-            Ok(result_json) => {
-                if operation == "models.list" {
-                    if let Err(error) =
-                        crate::services::coding_agent::sync_models(&ctx.db, &service, &result_json)
-                    {
-                        return CommandResponse::fail(error);
-                    }
-                }
-                CommandResponse::ok(MeshCommandResponsePayload::AgentRpcResult { result_json })
-            }
-            Err(error) => CommandResponse::fail(error),
-        }
-    }
-
     /// Owner side of a forwarded Code Studio request (§12.1).
     ///
     /// Everything of substance lives in `code_studio::remote_proxy`: verify the
@@ -1718,6 +1746,8 @@ impl MeshCommandExecutor {
             cache.record(idem_key, &req.action, resp.clone(), now_ms);
             cache.evict_expired(now_ms);
         }
+
+        self.release_idle_robot_locks();
 
         if resp.ok {
             info!(
@@ -2563,6 +2593,7 @@ impl MeshCommandExecutor {
         if !resp.ok {
             return resp;
         }
+        crate::services::deploy::distributed::remember_head_spec(&spec);
         let deploy_id = match &resp.payload {
             MeshCommandResponsePayload::ServiceDeployResult { deploy_id, .. } => deploy_id.clone(),
             _ => String::new(),
@@ -2588,6 +2619,7 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
+        crate::services::deploy::distributed::forget_head_spec(deployment_cluster_id);
         let (removed, errors) = crate::services::deploy::distributed::stop_distributed(
             &actions.db,
             actions.port_allocator.clone(),
@@ -2890,9 +2922,19 @@ impl MeshCommandExecutor {
         let node_id = self.local_node_id.clone();
         let sid = req.session_id.clone();
         let bytes_res = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-            let session_dir = storage.root().join(&node_id).join(&sid);
+            let session_dir = storage
+                .session_dir_path(&node_id, &sid)
+                .map_err(|e| e.to_string())?;
             if !session_dir.exists() {
                 return Err(format!("session {sid} not found"));
+            }
+            // The archive is assembled in memory, so the input is measured
+            // before anything is read.
+            let session_bytes = directory_size(&session_dir).map_err(|e| format!("size: {e}"))?;
+            if session_bytes > MAX_PROFILING_SESSION_BYTES {
+                return Err(format!(
+                    "session holds {session_bytes} bytes, limit is {MAX_PROFILING_SESSION_BYTES}"
+                ));
             }
             let buf: Vec<u8> = Vec::new();
             let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
@@ -3033,13 +3075,14 @@ impl MeshCommandExecutor {
                 Ok(d) => d,
                 Err(e) => return CommandResponse::fail(e),
             };
-            // `tail=0` means ALL lines for the docker daemon; a failed deploy
-            // wants the last handful, so only 0 maps to "all".
-            let tail = if tail_lines == 0 {
-                "0".to_string()
+            // `tail=0` means ALL lines for the docker daemon, so it is capped
+            // like any oversized request.
+            let requested = if tail_lines == 0 || tail_lines > MAX_CONTAINER_LOG_LINES {
+                MAX_CONTAINER_LOG_LINES
             } else {
-                tail_lines.to_string()
+                tail_lines
             };
+            let tail = requested.to_string();
             let opts = bollard::query_parameters::LogsOptionsBuilder::default()
                 .stdout(true)
                 .stderr(true)
@@ -3050,6 +3093,10 @@ impl MeshCommandExecutor {
             let mut stream = docker.logs(container_id, Some(opts));
             let mut logs = String::new();
             while let Some(item) = stream.next().await {
+                if logs.len() >= MAX_CONTAINER_LOG_BYTES {
+                    logs.push_str("\n... (output truncated at size limit)");
+                    break;
+                }
                 match item {
                     Ok(out) => {
                         let line = out.to_string();
@@ -3361,6 +3408,24 @@ pub(crate) fn resolve_robot_addon(
         );
     }
     resolved
+}
+
+/// Total size of the regular files under `dir`.
+fn directory_size(dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                total = total.saturating_add(entry.metadata()?.len());
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]

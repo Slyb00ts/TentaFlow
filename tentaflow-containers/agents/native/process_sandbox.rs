@@ -8,6 +8,240 @@ use std::time::{Duration, Instant};
 #[path = "macos_supervisor.rs"]
 mod macos_supervisor;
 
+#[cfg(target_os = "linux")]
+#[path = "linux_sandbox_net.rs"]
+mod linux_sandbox_net;
+
+/// A private temporary directory whose owner is PROVABLE.
+///
+/// Something that keeps per-run state under `TMPDIR` has to clean up after a
+/// process that was SIGKILLed, and "is anything still using it" cannot be
+/// answered by looking at the directory: a relay that has created its directory
+/// but not yet bound its socket looks exactly like a dead one. Time heuristics
+/// are no better — a slow start is not a death.
+///
+/// So ownership is an exclusive `flock`, and ONE ordering makes the sweep's
+/// question answerable without ever guessing:
+///
+/// 1. the directory is built under a staging name the sweep does not match;
+/// 2. its lock file is created there and locked;
+/// 3. only then is it renamed to `<prefix><nonce>`, the name the sweep matches.
+///
+/// The invariant that follows is the whole design: **a directory has carried a
+/// swept name only since an instant at which its lock was already held.** A
+/// crash before step 3 therefore leaves a staging name, which is out of the
+/// sweep's scope by construction — so the sweep never has to reason about a
+/// half-built root, and a concurrent claim is invisible to it until it is
+/// already locked. The cost of that guarantee is that an interrupted claim
+/// leaks one empty staging directory, which is the OS tmp cleanup's to reclaim;
+/// sweeping staging names is what would put the original defect back.
+#[cfg(unix)]
+mod private_root {
+    use anyhow::{Context, Result};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::path::{Path, PathBuf};
+
+    const LOCK_NAME: &str = "lock";
+
+    pub struct PrivateRoot {
+        path: PathBuf,
+        /// Held open for the whole life of the root. Its lock is the only thing
+        /// that says "live", and the kernel releases it however the process
+        /// dies.
+        _lock: std::fs::File,
+    }
+
+    impl PrivateRoot {
+        pub fn claim(prefix: &str) -> Result<Self> {
+            let parent = std::env::temp_dir();
+            let nonce = nonce()?;
+            // Leading dot: a staged claim must NOT match the sweep's prefix.
+            let staging = parent.join(format!(".{prefix}staging-{nonce}"));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&staging)
+                .with_context(|| format!("create {}", staging.display()))?;
+            let claimed = claim_lock(&staging).and_then(|lock| {
+                let path = parent.join(format!("{prefix}{nonce}"));
+                std::fs::rename(&staging, &path)
+                    .with_context(|| format!("publish {}", path.display()))?;
+                Ok(Self { path, _lock: lock })
+            });
+            if claimed.is_err() {
+                let _ = std::fs::remove_dir_all(&staging);
+            }
+            claimed
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// Removes roots of `prefix` left behind by a process that died without
+        /// dropping them. Only this euid's directories are considered, only
+        /// those carrying the published name, and only those whose lock is free
+        /// — so a live claim, bound or not, survives.
+        pub fn sweep(prefix: &str) {
+            let parent = std::env::temp_dir();
+            let Ok(entries) = std::fs::read_dir(&parent) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                // Published names only. A staging name is deliberately out of
+                // scope: it is the one state in which a lock may not exist yet.
+                if !entry.file_name().to_string_lossy().starts_with(prefix) {
+                    continue;
+                }
+                let root = entry.path();
+                if !owned_directory(&root) {
+                    continue;
+                }
+                // A published root of this build always has a lock file, so the
+                // absence of one means this is not a root this build produced —
+                // a directory from an earlier build, or someone else's naming
+                // collision. Leaving it is the only answer that cannot delete
+                // live state; the OS tmp cleanup reclaims it.
+                let Ok(lock) = std::fs::File::open(root.join(LOCK_NAME)) else {
+                    continue;
+                };
+                if lock_exclusive(&lock).is_ok() {
+                    let _ = std::fs::remove_dir_all(&root);
+                }
+            }
+        }
+    }
+
+    impl Drop for PrivateRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn claim_lock(root: &Path) -> Result<std::fs::File> {
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join(LOCK_NAME))
+            .with_context(|| format!("create the lock of {}", root.display()))?;
+        lock_exclusive(&lock).context("lock a freshly created private root")?;
+        Ok(lock)
+    }
+
+    fn lock_exclusive(lock: &std::fs::File) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    fn owned_directory(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() })
+    }
+
+    fn nonce() -> Result<String> {
+        let mut bytes = [0u8; 12];
+        if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Both halves of the sweep contract, on every unix platform: the
+        /// regression was a sweep that deleted a concurrent relay's directory
+        /// in the window between creating it and binding its socket.
+        #[test]
+        fn a_sweep_removes_an_abandoned_root_and_spares_a_claimed_one() {
+            let prefix = format!("tfroot-test-{}-", nonce().unwrap());
+
+            // Claimed and deliberately EMPTY: no socket, nothing to connect to.
+            // This is exactly the state a starting relay passes through.
+            let live = PrivateRoot::claim(&prefix).unwrap();
+            let live_path = live.path().to_path_buf();
+            assert!(live_path.is_dir());
+
+            // What a SIGKILLed relay leaves: the directory and an unlocked lock
+            // file, because the kernel dropped the lock with the process.
+            let dead = std::env::temp_dir().join(format!("{prefix}dead"));
+            std::fs::create_dir(&dead).unwrap();
+            std::fs::write(dead.join(LOCK_NAME), b"").unwrap();
+
+            // A root with no lock file at all cannot be proved dead.
+            let foreign = std::env::temp_dir().join(format!("{prefix}foreign"));
+            std::fs::create_dir(&foreign).unwrap();
+
+            // A staging name is out of scope even with a free lock: it is the
+            // one state a claim passes through before its lock exists, so the
+            // sweep must not look there at all.
+            let staging = std::env::temp_dir().join(format!(".{prefix}staging-abandoned"));
+            std::fs::create_dir(&staging).unwrap();
+            std::fs::write(staging.join(LOCK_NAME), b"").unwrap();
+
+            PrivateRoot::sweep(&prefix);
+
+            assert!(live_path.is_dir(), "a claimed root must survive a sweep");
+            assert!(!dead.exists(), "an abandoned root must be removed");
+            assert!(foreign.is_dir(), "a root without a lock must be left alone");
+            assert!(staging.is_dir(), "a staging name must be out of scope");
+
+            drop(live);
+            assert!(!live_path.exists(), "dropping a root removes it");
+            std::fs::remove_dir_all(&foreign).unwrap();
+            std::fs::remove_dir_all(&staging).unwrap();
+        }
+
+        /// The ordering the sweep depends on, asserted rather than described: a
+        /// published name never exists without a lock, so an interrupted claim
+        /// can only leave a staging name.
+        #[test]
+        fn an_interrupted_claim_can_only_leave_a_staging_name() {
+            let prefix = format!("tfroot-test-{}-", nonce().unwrap());
+            let root = PrivateRoot::claim(&prefix).unwrap();
+            assert!(
+                root.path().join(LOCK_NAME).is_file(),
+                "a published root always carries its lock"
+            );
+            let published = root
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap()
+                .to_string();
+            assert!(published.starts_with(&prefix));
+            assert!(
+                !published.starts_with('.'),
+                "the published name must be the one the sweep matches"
+            );
+        }
+
+        #[test]
+        fn a_claim_is_private_and_never_visible_unlocked() {
+            let prefix = format!("tfroot-test-{}-", nonce().unwrap());
+            let root = PrivateRoot::claim(&prefix).unwrap();
+            let mode = std::fs::symlink_metadata(root.path())
+                .unwrap()
+                .permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+                0o700
+            );
+            // The lock exists the moment the public name does, which is what
+            // makes the sweep's question answerable.
+            assert!(root.path().join(LOCK_NAME).is_file());
+            let taken = std::fs::File::open(root.path().join(LOCK_NAME)).unwrap();
+            assert!(
+                lock_exclusive(&taken).is_err(),
+                "a live root's lock must not be acquirable"
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn process_birthtime(pid: i32) -> Result<(u64, u64)> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -29,12 +263,20 @@ pub fn process_birthtime(pid: i32) -> Result<(u64, u64)> {
     Ok((info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
 
-pub fn maybe_run_supervisor() -> Option<i32> {
+/// The first thing every binary that can host a sandbox does: this process may
+/// have been started as one of the sandbox's own helpers — the macOS supervisor
+/// or the Linux in-namespace proxy forwarder — rather than as the application.
+/// `Some(code)` means the helper ran and the caller must exit with that code.
+pub fn maybe_run_sandbox_entrypoint() -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
-        return macos_supervisor::maybe_run();
+        macos_supervisor::maybe_run()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_sandbox_net::maybe_run()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
@@ -111,6 +353,121 @@ pub fn cancel_supervisor_launch(argv: &[String]) -> Result<()> {
     std::fs::remove_dir(invocation).context("process launch intent is already active")
 }
 
+/// Where a sandboxed process reaches its egress proxy.
+///
+/// The CLI is given the same credentialed `http://tf:<token>@127.0.0.1:<port>`
+/// URL on every platform. macOS lets the sandboxed process open that host
+/// socket directly; Linux keeps the network namespace unshared, so the same
+/// endpoint is served inside it by a forwarder relaying to `socket`. Obtained
+/// only from `ProxyTransport`, which owns the host end of that route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEndpoint {
+    address: std::net::SocketAddr,
+    #[cfg(target_os = "linux")]
+    socket: PathBuf,
+}
+
+impl ProxyEndpoint {
+    /// Names the endpoint for a process that did not open the transport: the
+    /// bridge is told the loopback address by the component that owns the
+    /// proxy, plus — where the sandbox has no route to the host — the path of
+    /// the unix socket that component opened for it.
+    pub fn from_parts(address: std::net::SocketAddr, socket: Option<PathBuf>) -> Result<Self> {
+        validate_proxy_address(address)?;
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                address,
+                socket: socket.context("sandbox proxy transport socket is required here")?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = socket;
+            Ok(Self { address })
+        }
+    }
+
+    pub fn socket_path(&self) -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.socket.clone())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+}
+
+fn validate_proxy_address(address: std::net::SocketAddr) -> Result<()> {
+    if !address.ip().is_loopback() || address.port() == 0 {
+        bail!("sandbox proxy must be a bound loopback endpoint");
+    }
+    Ok(())
+}
+
+/// The host end of the route sandboxes take to one egress proxy. Held by
+/// whoever owns the proxy: dropping it closes the route before the proxy's own
+/// listener is gone.
+pub struct ProxyTransport {
+    endpoint: ProxyEndpoint,
+    #[cfg(target_os = "linux")]
+    relay: linux_sandbox_net::HostRelay,
+}
+
+impl ProxyTransport {
+    pub fn open(address: std::net::SocketAddr) -> Result<Self> {
+        validate_proxy_address(address)?;
+        #[cfg(target_os = "linux")]
+        {
+            Self::from_relay(address, linux_sandbox_net::HostRelay::open(address)?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self {
+                endpoint: ProxyEndpoint { address },
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_relay(
+        address: std::net::SocketAddr,
+        relay: linux_sandbox_net::HostRelay,
+    ) -> Result<Self> {
+        let socket = relay.socket().to_path_buf();
+        Ok(Self {
+            endpoint: ProxyEndpoint { address, socket },
+            relay,
+        })
+    }
+
+    /// Only a test needs to choose the relay's bounds; production takes the
+    /// ones the transport defines.
+    #[cfg(all(test, target_os = "linux"))]
+    fn open_with(
+        address: std::net::SocketAddr,
+        timeouts: linux_sandbox_net::RelayTimeouts,
+    ) -> Result<Self> {
+        validate_proxy_address(address)?;
+        Self::from_relay(
+            address,
+            linux_sandbox_net::HostRelay::open_with(address, timeouts)?,
+        )
+    }
+
+    /// Connections the sandbox currently has open through this transport.
+    #[cfg(all(test, target_os = "linux"))]
+    fn live_relays(&self) -> usize {
+        self.relay.live_relays()
+    }
+
+    pub fn endpoint(&self) -> ProxyEndpoint {
+        self.endpoint.clone()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSandbox {
     workspace: PathBuf,
@@ -118,12 +475,17 @@ pub struct ProcessSandbox {
     read_only: bool,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
-    proxy: Option<std::net::SocketAddr>,
+    proxy: Option<ProxyEndpoint>,
     #[cfg(target_os = "macos")]
     supervisor_root: PathBuf,
 }
 
 impl ProcessSandbox {
+    /// Where this policy's supervisor keeps its state, on a platform that has
+    /// one. Linux tears a sandbox down through the pid namespace, so the answer
+    /// there is `None` — and the bridge, which never asks, is why this is
+    /// unused on a Linux build of THIS file. Core calls it on both platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn supervisor_root(&self) -> Option<&Path> {
         #[cfg(target_os = "macos")]
         {
@@ -175,14 +537,18 @@ impl ProcessSandbox {
         Ok(policy)
     }
 
-    pub fn with_proxy(mut self, address: std::net::SocketAddr) -> Result<Self> {
-        if !address.ip().is_loopback() || address.port() == 0 {
-            bail!("sandbox proxy must be a bound loopback endpoint");
-        }
-        if !cfg!(target_os = "macos") {
+    pub fn with_proxy(mut self, endpoint: ProxyEndpoint) -> Result<Self> {
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
             bail!("process sandbox proxy transport is unavailable on this platform");
         }
-        self.proxy = Some(address);
+        #[cfg(target_os = "linux")]
+        if !std::fs::symlink_metadata(&endpoint.socket)
+            .map(|metadata| std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()))
+            .unwrap_or(false)
+        {
+            bail!("sandbox proxy transport socket is missing");
+        }
+        self.proxy = Some(endpoint);
         Ok(self)
     }
 
@@ -227,6 +593,10 @@ impl ProcessSandbox {
         }
     }
 
+    /// Same shape as `supervisor_root`: a Linux sandbox has nothing to settle,
+    /// and the bridge never asks, so this is unused on a Linux build of this
+    /// shared file while core calls it on both platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn ensure_quiescent(&self) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
@@ -295,10 +665,10 @@ impl ProcessSandbox {
             "(deny file-write* (subpath {}))\n",
             quote_path(&self.workspace.join(".git"))?
         ));
-        if let Some(proxy) = self.proxy {
+        if let Some(proxy) = &self.proxy {
             profile.push_str(&format!(
                 "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
-                proxy.port()
+                proxy.address.port()
             ));
         }
         Ok(vec![
@@ -360,7 +730,26 @@ impl ProcessSandbox {
                 git.display().to_string(),
             ]);
         }
+        if let Some(proxy) = &self.proxy {
+            // Read-write, because `connect` on a unix socket is not a write to
+            // the filesystem but a read-only mount is a needless difference
+            // from the permissions the host itself enforces on it.
+            let socket = proxy.socket.display().to_string();
+            args.extend(["--bind".into(), socket.clone(), socket]);
+            // The forwarder is this very executable, so it has to be readable
+            // inside. Only the file: binding its directory would hand the
+            // sandbox everything that happens to sit next to the binary, which
+            // on a development machine is the whole build output.
+            let forwarder = linux_sandbox_net::host_executable()?.display().to_string();
+            args.extend(["--ro-bind".into(), forwarder.clone(), forwarder]);
+        }
         args.extend(["--chdir".into(), cwd.display().to_string(), "--".into()]);
+        if let Some(proxy) = &self.proxy {
+            args.extend(linux_sandbox_net::entry_command(
+                proxy.address.port(),
+                &proxy.socket,
+            )?);
+        }
         Ok(args)
     }
 
@@ -509,6 +898,8 @@ fn system_read_roots() -> Vec<PathBuf> {
         "/etc/ld.so.cache",
         "/etc/localtime",
     ];
+    // Only the macOS branch below extends the list.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut roots: Vec<PathBuf> = paths
         .into_iter()
         .filter(|path| Path::new(path).exists())
@@ -547,7 +938,9 @@ mod tests {
                 libc::close(descriptor + 3);
             }
         }
-        std::process::exit(super::maybe_run_supervisor().expect("supervisor test invocation"));
+        std::process::exit(
+            super::maybe_run_sandbox_entrypoint().expect("supervisor test invocation"),
+        );
     }
     use super::*;
 
@@ -860,7 +1253,10 @@ mod tests {
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
                         let mut request = [0; 4096];
-                        connection.read(&mut request).unwrap();
+                        assert!(
+                            connection.read(&mut request).unwrap() > 0,
+                            "the sandbox opened the connection but sent no request"
+                        );
                         connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
                         return;
                     }
@@ -874,7 +1270,8 @@ mod tests {
                 }
             }
         });
-        let proxied = policy.with_proxy(address).unwrap();
+        let transport = ProxyTransport::open(address).unwrap();
+        let proxied = policy.with_proxy(transport.endpoint()).unwrap();
         let output = run(&proxied);
         assert!(
             output.status.success(),
@@ -941,5 +1338,515 @@ mod tests {
             .status
             .success());
         assert!(policy.native_command(&["true".into()], &outside).is_err());
+    }
+
+    /// The Linux forwarder re-enters through this test, because libtest owns
+    /// the argv of a test binary: the sandbox invocation travels in the
+    /// environment instead. Mirrors `supervisor_test_entrypoint` on macOS.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sandbox_network_test_entrypoint() {
+        if std::env::var_os("TENTAFLOW_SANDBOX_NETWORK_TEST_ARGV").is_none() {
+            return;
+        }
+        std::process::exit(
+            super::maybe_run_sandbox_entrypoint().expect("sandbox network test invocation"),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sandbox_test_entry() -> String {
+        format!(
+            "{}::sandbox_network_test_entrypoint",
+            module_path!().split_once("::").unwrap().1
+        )
+    }
+
+    /// Runs a sandboxed command whose forwarder is this test binary.
+    #[cfg(target_os = "linux")]
+    fn run_sandboxed(argv: &[String], private: &Path, cwd: &Path) -> std::process::Output {
+        let mut command = std::process::Command::new(&argv[0]);
+        match argv
+            .iter()
+            .position(|argument| argument == linux_sandbox_net::FORWARDER)
+        {
+            Some(index) => {
+                command.args(&argv[1..index]).args([
+                    "--exact",
+                    &sandbox_test_entry(),
+                    "--nocapture",
+                ]);
+                command.env_clear().env(
+                    "TENTAFLOW_SANDBOX_NETWORK_TEST_ARGV",
+                    argv[index - 1..].join("\u{1}"),
+                );
+            }
+            None => {
+                command.args(&argv[1..]);
+                command.env_clear();
+            }
+        }
+        command
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", private)
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_sandbox_carries_its_proxy_without_sharing_the_network() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        let private = root.path().join("profile");
+        for path in [&workspace, &private] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let transport = ProxyTransport::open(address).unwrap();
+        let socket = transport.endpoint().socket.display().to_string();
+        let policy = ProcessSandbox::new(&workspace, &private, false, &[], &[])
+            .unwrap()
+            .with_proxy(transport.endpoint())
+            .unwrap();
+        let argv = policy
+            .native_command(&["/bin/true".into()], &workspace)
+            .unwrap();
+        assert_eq!(argv[0], "/usr/bin/bwrap");
+        assert!(argv.iter().any(|argument| argument == "--unshare-all"));
+        assert!(!argv.iter().any(|argument| argument == "--share-net"));
+        assert!(argv
+            .windows(3)
+            .any(|window| window == ["--bind".to_string(), socket.clone(), socket.clone()]));
+        // The forwarder enters as a single file. Its directory is the build
+        // output on a development machine and a shared install root on a node;
+        // neither belongs to the sandbox.
+        let forwarder = linux_sandbox_net::host_executable()
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(argv.windows(3).any(|window| window
+            == [
+                "--ro-bind".to_string(),
+                forwarder.clone(),
+                forwarder.clone()
+            ]));
+        let directory = linux_sandbox_net::host_executable()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(
+            !argv.contains(&directory),
+            "the forwarder's directory must not be bound"
+        );
+        let index = argv
+            .iter()
+            .position(|argument| argument == linux_sandbox_net::FORWARDER)
+            .expect("the forwarder is bubblewrap's initial child");
+        assert_eq!(argv[index - 2], "--");
+        assert_eq!(
+            argv[index - 1],
+            linux_sandbox_net::host_executable()
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        let spec: serde_json::Value = serde_json::from_str(&argv[index + 1]).unwrap();
+        assert_eq!(spec["port"].as_u64(), Some(u64::from(address.port())));
+        assert_eq!(spec["socket"].as_str(), Some(socket.as_str()));
+        assert_eq!(argv[index + 2..], ["/bin/true".to_string()]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_host_relay_dials_the_gateway_only_when_the_sandbox_speaks() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let transport = ProxyTransport::open(address).unwrap();
+        let socket = transport.endpoint().socket;
+
+        // A readiness probe opens and closes the transport; the gateway must
+        // not see a connection it would have to screen and log.
+        drop(UnixStream::connect(&socket).unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+
+        let mut client = UnixStream::connect(&socket).unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut gateway = loop {
+            match listener.accept() {
+                Ok((connection, _)) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                other => panic!("the relay never reached the gateway: {other:?}"),
+            }
+        };
+        let mut request = [0u8; 18];
+        gateway.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"GET / HTTP/1.1\r\n\r\n");
+        gateway.write_all(b"ok").unwrap();
+        drop(gateway);
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).unwrap();
+        assert_eq!(answer, "ok");
+
+        drop(transport);
+        assert!(UnixStream::connect(&socket).is_err());
+    }
+
+    /// The transport is the one part of the sandbox a CLI can drive without
+    /// limit, so its cost must be bounded: connections past the cap are closed
+    /// instead of queued as threads, and a connection that never speaks is not
+    /// a permanent thread.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_host_relay_bounds_what_a_sandbox_can_open() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        // Never accepts: a relay is claimed when the connection arrives, before
+        // the gateway is dialled, which is exactly the window being bounded.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let transport = ProxyTransport::open(address).unwrap();
+        let socket = transport.endpoint().socket;
+
+        let held: Vec<UnixStream> = (0..linux_sandbox_net::MAX_RELAYS)
+            .map(|_| UnixStream::connect(&socket).unwrap())
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while transport.live_relays() < linux_sandbox_net::MAX_RELAYS && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(transport.live_relays(), linux_sandbox_net::MAX_RELAYS);
+
+        // One more is accepted by the kernel and then closed by the relay. The
+        // caller finds out at once instead of waiting on a thread that will
+        // never exist; whether the close arrives as an end of stream or as a
+        // reset is the kernel's choice, and both say refused rather than
+        // served.
+        let mut refused = UnixStream::connect(&socket).unwrap();
+        refused
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut answer = Vec::new();
+        match refused.read_to_end(&mut answer) {
+            Ok(_) => assert!(
+                answer.is_empty(),
+                "a refused connection must not be served: {answer:?}"
+            ),
+            Err(error) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "a refused connection must be closed, not left hanging"
+            ),
+        }
+
+        // Releasing the held connections frees the slots again.
+        drop(held);
+        while transport.live_relays() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(transport.live_relays(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_silent_connection_does_not_hold_a_relay_for_ever() {
+        use std::os::unix::net::UnixStream;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let transport = ProxyTransport::open_with(
+            address,
+            linux_sandbox_net::RelayTimeouts {
+                opening: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let client = UnixStream::connect(transport.endpoint().socket).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while transport.live_relays() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(transport.live_relays(), 1);
+        // The client says nothing at all. The relay must let go on its own.
+        while transport.live_relays() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            transport.live_relays(),
+            0,
+            "a silent connection kept its relay"
+        );
+        // The gateway was never dialled for a connection that said nothing.
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        drop(client);
+    }
+
+    /// Relays are opened per sandbox run, so opening one while another is
+    /// starting is ordinary. The sweep that each `open` runs must not touch a
+    /// live relay — including one that has not bound its socket yet, which is
+    /// what a filesystem or connect-based sweep could not tell from a dead one.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn opening_a_relay_never_disturbs_one_that_is_already_live() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let first = ProxyTransport::open(address).unwrap();
+        let socket = first.endpoint().socket;
+
+        // Every one of these runs a sweep. None may remove the first relay's
+        // root, and none may remove each other's.
+        let others: Vec<ProxyTransport> = (0..4)
+            .map(|_| ProxyTransport::open(address).unwrap())
+            .collect();
+        assert!(socket.exists(), "a live relay's socket was swept away");
+        for other in &others {
+            assert!(other.endpoint().socket.exists());
+        }
+
+        // Still functional, not merely present.
+        let gateway = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0u8; 18];
+            connection.read_exact(&mut request).unwrap();
+            connection.write_all(b"ok").unwrap();
+        });
+        let mut client = UnixStream::connect(&socket).unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).unwrap();
+        assert_eq!(answer, "ok");
+        gateway.join().unwrap();
+    }
+
+    /// One byte used to clear the opening deadline for good, so a peer that
+    /// spoke once and went quiet pinned a relay slot, two descriptors and a
+    /// gateway connection until the sandbox ended.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_connection_that_speaks_once_and_goes_quiet_is_not_permanent() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let transport = ProxyTransport::open_with(
+            address,
+            linux_sandbox_net::RelayTimeouts {
+                opening: Duration::from_secs(10),
+                idle: Duration::from_millis(300),
+            },
+        )
+        .unwrap();
+        // The gateway accepts and then says nothing either, which is what makes
+        // this connection idle in BOTH directions.
+        let gateway = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+
+        let mut client = UnixStream::connect(transport.endpoint().socket).unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let held = gateway.join().unwrap().expect("the relay reached upstream");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while transport.live_relays() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(transport.live_relays(), 1);
+        while transport.live_relays() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            transport.live_relays(),
+            0,
+            "a connection idle in both directions kept its relay"
+        );
+        drop(held);
+        drop(client);
+    }
+
+    /// A read deadline alone left the other half unbounded: a peer that stops
+    /// READING parks the pump inside its write, where the idle clock was never
+    /// consulted, pinning the slot, both threads and the gateway connection.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_peer_that_stops_reading_does_not_park_the_relay() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let (client, relay_side) = UnixStream::pair().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::net::TcpStream::connect(address).unwrap();
+        let (mut gateway, _) = listener.accept().unwrap();
+
+        let relayed = std::thread::spawn(move || {
+            linux_sandbox_net::couple(relay_side, upstream, Duration::from_millis(300));
+        });
+
+        // Far more than any socket buffer, from a peer the client never reads:
+        // the pump fills the client's receive buffer and then blocks in write.
+        let flood = std::thread::spawn(move || {
+            let payload = vec![b'x'; 64 * 1024];
+            for _ in 0..256 {
+                if gateway.write_all(&payload).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !relayed.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            relayed.is_finished(),
+            "a client that stopped reading kept the relay for ever"
+        );
+        relayed.join().unwrap();
+        let _ = flood.join();
+        drop(client);
+    }
+
+    /// `couple` itself, driven directly: the inbound direction ends and the
+    /// client keeps its write half open for ever. Before the close of both
+    /// halves, the join at the end of `couple` never returned.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn couple_returns_when_a_keep_alive_client_never_closes_its_write_half() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let (mut client, relay_side) = UnixStream::pair().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = std::net::TcpStream::connect(address).unwrap();
+        let (mut gateway, _) = listener.accept().unwrap();
+
+        let relayed = std::thread::spawn(move || {
+            // A generous idle bound: what ends this call must be the close of
+            // both halves, not a timeout.
+            linux_sandbox_net::couple(relay_side, upstream, Duration::from_secs(600));
+        });
+
+        // The gateway answers and closes, exactly as `Connection: close` means.
+        gateway.write_all(b"ok").unwrap();
+        drop(gateway);
+        let mut answer = Vec::new();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Reads the body, then the end of stream the relay's half close produced.
+        let mut chunk = [0u8; 16];
+        while let Ok(read) = client.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            answer.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(answer, b"ok");
+
+        // The client's write half is still open. `couple` must return anyway.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !relayed.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            relayed.is_finished(),
+            "couple must not wait on a client that never closes its write half"
+        );
+        relayed.join().unwrap();
+        drop(client);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn real_linux_sandbox_only_reaches_its_proxy() {
+        use std::io::{Read, Write};
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        let private = root.path().join("profile");
+        for path in [&workspace, &private] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/");
+        // No extra read root: the forwarder is this test binary and the policy
+        // binds that one file itself.
+        let policy = ProcessSandbox::new(&workspace, &private, false, &[], &[]).unwrap();
+        let run = |policy: &ProcessSandbox| {
+            let argv = policy
+                .native_command(
+                    &[
+                        "/usr/bin/curl".into(),
+                        "--max-time".into(),
+                        "5".into(),
+                        "--silent".into(),
+                        "--output".into(),
+                        "result".into(),
+                        url.clone(),
+                    ],
+                    &workspace,
+                )
+                .unwrap();
+            run_sandboxed(&argv, &private, &workspace)
+        };
+        assert!(!run(&policy).status.success());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        connection
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut request = [0; 4096];
+                        assert!(
+                            connection.read(&mut request).unwrap() > 0,
+                            "the relay opened the connection but forwarded no request"
+                        );
+                        connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                        return;
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    other => panic!("proxy connection failed: {other:?}"),
+                }
+            }
+        });
+        let transport = ProxyTransport::open(address).unwrap();
+        let proxied = policy.with_proxy(transport.endpoint()).unwrap();
+        let output = run(&proxied);
+        assert!(
+            output.status.success(),
+            "{:?}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(workspace.join("result")).unwrap(), b"ok");
+        worker.join().unwrap();
     }
 }

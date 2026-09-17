@@ -610,7 +610,11 @@ pub async fn mesh_node_profile_set(
         .ok_or_else(|| {
             ProtocolError::new(ProtocolErrorCode::AuthRequired, "session user is unknown")
         })?;
-    if !account.is_active || account.role != "admin" {
+    // `is_admin` and `role` both mark an administrator everywhere a session is
+    // minted; accounts seeded before the `role` column was written carry only
+    // the flag, and reading `role` alone locked those admins out of this call.
+    let is_admin = account.is_admin || account.role == "admin";
+    if !account.is_active || !is_admin {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             "editing the node registry requires an active administrator account",
@@ -2701,7 +2705,8 @@ enum ReadyPhase {
 }
 
 /// Odpala `vllm serve` na headzie (local → `exec_serve_on_head`; remote →
-/// `DistributedStartServe` przez mesh). Detached — vLLM laduje model w tle, a
+/// `DistributedStartServe` przez mesh — a remote head builds the command itself
+/// from the spec it was deployed with, `serve_cmd` is used only locally). Detached — vLLM laduje model w tle, a
 /// gotowosc potwierdza pozniejszy `ServeReady`.
 async fn start_serve_on_head(
     ctx: &HandlerContext,
@@ -2720,7 +2725,6 @@ async fn start_serve_on_head(
     }
     let cmd = MeshCommandType::DistributedStartServe {
         deployment_cluster_id: deployment_cluster_id.to_string(),
-        serve_cmd: serve_cmd.to_string(),
     };
     match qm.send_command_and_wait(head_node_id, cmd, 30).await {
         Ok(resp) if resp.ok => Ok(()),
@@ -4262,6 +4266,26 @@ mod node_registry_handler_tests {
             .expect_err("a demoted admin must be refused");
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
         assert_eq!(node_state(&ctx, "node-x"), ("unknown".to_string(), false));
+    }
+
+    /// An installation seeded before `user_accounts.role` was written has an
+    /// administrator with `is_admin = 1` and the column default `role = 'user'`.
+    /// The session layer treats that account as an admin, so this handler must too.
+    #[tokio::test]
+    async fn an_admin_marked_only_by_the_is_admin_flag_may_edit_the_registry() {
+        let ctx = admin_ctx();
+        seed_session_account(&ctx, "user");
+        {
+            let conn = ctx.state.db.write().expect("db lock");
+            conn.execute("UPDATE user_accounts SET is_admin = 1", [])
+                .expect("flag account");
+        }
+        seed_registry_node(&ctx, "node-x");
+
+        mesh_node_profile_set(&profile_request("node-x", Some("phone"), Some(true)), &ctx)
+            .await
+            .expect("edit accepted");
+        assert_eq!(node_state(&ctx, "node-x"), ("phone".to_string(), true));
     }
 
     /// The bootstrap path itself: a local admin session moves both fields, and

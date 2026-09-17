@@ -1565,7 +1565,7 @@ mod tests {
     }
 
     fn apply(db: &DbPool, operation: &SyncOperation) -> LedgerResult<usize> {
-        apply_core_operation(db, &cipher(), operation)
+        apply_core_operation(db, operation)
     }
 
     fn seed_host(db: &DbPool, owner: &str, wall: i64) {

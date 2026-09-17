@@ -160,6 +160,173 @@ pub enum TurnState {
     Failed(String),
 }
 
+/// Reads one raw bridge event into the shape the rest of the system knows.
+///
+/// The ONE place a bridge channel becomes a typed event, so a Code Studio
+/// delegation and a `/v1` chat turn cannot disagree about what a vendor said —
+/// which is exactly how the chat path ended up able to observe two of the four
+/// engines and wait out its timeout on the other two.
+pub fn decode_event(seq: u64, kind: &str, data: Value) -> Result<BridgeEvent> {
+    Ok(match kind {
+        // Claude Code runs as `--print --output-format=stream-json`, so its
+        // channel is a stream of self-describing JSON objects. It keeps its
+        // shape here for the same reason a Codex notification does: the turn's
+        // end is in it.
+        "claude" => BridgeEvent::StreamObject { seq, object: data },
+        "grok" => match data.get("method").and_then(Value::as_str) {
+            Some(method) => BridgeEvent::Notification {
+                seq,
+                method: format!("grok/{method}"),
+                params: data.get("params").cloned().unwrap_or(Value::Null),
+            },
+            None => BridgeEvent::Other {
+                seq,
+                kind: "grok".into(),
+            },
+        },
+        // The PTY channel, which is what the login flow uses.
+        "terminal" => BridgeEvent::Text {
+            seq,
+            text: data
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| data.to_string()),
+        },
+        "muse" => BridgeEvent::Notification {
+            seq,
+            method: format!(
+                "muse/{}",
+                data.get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            ),
+            params: data.get("params").cloned().unwrap_or(Value::Null),
+        },
+        // The Codex app-server speaks JSON-RPC; the bridge forwards the whole
+        // message. A notification keeps its shape here because `turn_state`
+        // reads it, and text is only what actually carries text.
+        "codex" => match data.get("method").and_then(Value::as_str) {
+            Some(method) => BridgeEvent::Notification {
+                seq,
+                method: method.to_string(),
+                params: data.get("params").cloned().unwrap_or(Value::Null),
+            },
+            None => BridgeEvent::Text {
+                seq,
+                text: data
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| data.to_string()),
+            },
+        },
+        "approval_request" => {
+            let request_id = data
+                .get("request_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("approval event without a request id"))?;
+            BridgeEvent::Approval {
+                seq,
+                request: ApprovalRequest {
+                    request_id,
+                    method: data
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    params: data.get("params").cloned().unwrap_or(Value::Null),
+                },
+            }
+        }
+        "vendor_session" => BridgeEvent::VendorSession {
+            seq,
+            vendor_session_id: data
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        other => BridgeEvent::Other {
+            seq,
+            kind: other.to_string(),
+        },
+    })
+}
+
+/// What an event contributes to a transcript, when it carries text at all. An
+/// event without text is a control frame; putting its JSON on the timeline
+/// would be noise nobody reads.
+pub fn event_text(event: &BridgeEvent) -> Option<String> {
+    match event {
+        BridgeEvent::Text { text, .. } => (!text.is_empty()).then(|| text.clone()),
+        BridgeEvent::Notification { method, params, .. } => notification_text(method, params),
+        BridgeEvent::StreamObject { object, .. } => stream_object_text(object),
+        _ => None,
+    }
+}
+
+/// What one object of Claude Code's `stream-json` output contributes: the text
+/// blocks of an assistant message, and nothing else. The closing `result`
+/// object repeats the last assistant text, so taking it too would put every
+/// answer in the transcript twice; its outcome is read by `turn_state` and
+/// lands in the run's status instead.
+fn stream_object_text(object: &Value) -> Option<String> {
+    if object.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let blocks = object.pointer("/message/content")?.as_array()?;
+    let text = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn notification_text(method: &str, params: &Value) -> Option<String> {
+    if method.starts_with("muse/") {
+        return (method == "muse/item/completed"
+            && params.pointer("/item/kind").and_then(Value::as_str) == Some("agentMessage"))
+        .then(|| {
+            params
+                .pointer("/item/text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+        .flatten();
+    }
+    if method.starts_with("grok/") {
+        if method != "grok/session/update"
+            || params
+                .pointer("/update/sessionUpdate")
+                .and_then(Value::as_str)
+                != Some("agent_message_chunk")
+            || params
+                .pointer("/update/content/type")
+                .and_then(Value::as_str)
+                != Some("text")
+        {
+            return None;
+        }
+        return params
+            .pointer("/update/content/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    for field in ["text", "message", "delta", "content"] {
+        if let Some(text) = params.get(field).and_then(Value::as_str) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Reads a bridge event as "the turn is over", or not.
 ///
 /// The ONE place a vendor's event vocabulary is interpreted as a terminal
@@ -795,92 +962,7 @@ impl CliBridge {
             instance.last_seq = instance.last_seq.max(seq);
             let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
             let data = entry.get("data").cloned().unwrap_or(Value::Null);
-            events.push(match kind {
-                // Claude Code runs as `--print --output-format=stream-json`, so
-                // its channel is a stream of self-describing JSON objects. It
-                // keeps its shape here for the same reason a Codex notification
-                // does: the turn's end is in it.
-                "claude" => BridgeEvent::StreamObject { seq, object: data },
-                "grok" => match data.get("method").and_then(Value::as_str) {
-                    Some(method) => BridgeEvent::Notification {
-                        seq,
-                        method: format!("grok/{method}"),
-                        params: data.get("params").cloned().unwrap_or(Value::Null),
-                    },
-                    None => BridgeEvent::Other {
-                        seq,
-                        kind: "grok".into(),
-                    },
-                },
-                // The PTY channel, which is what the login flow uses.
-                "terminal" => BridgeEvent::Text {
-                    seq,
-                    text: data
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| data.to_string()),
-                },
-                // The Codex app-server speaks JSON-RPC; the bridge forwards the
-                // whole message. A notification keeps its shape here because
-                // `turn_state` reads it, and text is only what actually carries
-                // text.
-                "muse" => BridgeEvent::Notification {
-                    seq,
-                    method: format!(
-                        "muse/{}",
-                        data.get("method")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                    ),
-                    params: data.get("params").cloned().unwrap_or(Value::Null),
-                },
-                "codex" => match data.get("method").and_then(Value::as_str) {
-                    Some(method) => BridgeEvent::Notification {
-                        seq,
-                        method: method.to_string(),
-                        params: data.get("params").cloned().unwrap_or(Value::Null),
-                    },
-                    None => BridgeEvent::Text {
-                        seq,
-                        text: data
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| data.to_string()),
-                    },
-                },
-                "approval_request" => {
-                    let request_id = data
-                        .get("request_id")
-                        .and_then(Value::as_u64)
-                        .ok_or_else(|| anyhow!("approval event without a request id"))?;
-                    BridgeEvent::Approval {
-                        seq,
-                        request: ApprovalRequest {
-                            request_id,
-                            method: data
-                                .get("method")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            params: data.get("params").cloned().unwrap_or(Value::Null),
-                        },
-                    }
-                }
-                "vendor_session" => BridgeEvent::VendorSession {
-                    seq,
-                    vendor_session_id: data
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                },
-                other => BridgeEvent::Other {
-                    seq,
-                    kind: other.to_string(),
-                },
-            });
+            events.push(decode_event(seq, kind, data)?);
         }
         if response.get("status").and_then(Value::as_str) == Some("closed")
             && !events.iter().any(|event| turn_state(event).is_some())
@@ -1632,6 +1714,74 @@ pub fn reap_orphaned_instances(pool: &DbPool) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// One decoder for four vendors: the chat path and a Code Studio
+    /// delegation read the same events, so neither can be blind to an engine
+    /// the other understands.
+    #[test]
+    fn every_engine_reports_its_text_and_the_end_of_its_turn() {
+        use super::*;
+        let decode = |kind: &str, data: Value| decode_event(7, kind, data).unwrap();
+
+        let grok = decode(
+            "grok",
+            serde_json::json!({"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}}}),
+        );
+        assert_eq!(event_text(&grok).as_deref(), Some("answer"));
+        assert_eq!(turn_state(&grok), None);
+        let thought = decode(
+            "grok",
+            serde_json::json!({"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"internal"}}}}),
+        );
+        assert_eq!(event_text(&thought), None);
+        let ended = decode(
+            "grok",
+            serde_json::json!({"method":"session/prompt_result","params":{"result":{"stopReason":"end_turn"}}}),
+        );
+        assert_eq!(turn_state(&ended), Some(TurnState::Completed));
+
+        let muse = decode(
+            "muse",
+            serde_json::json!({"method":"item/completed","params":{"item":{"kind":"agentMessage","text":"muse answer"}}}),
+        );
+        assert_eq!(event_text(&muse).as_deref(), Some("muse answer"));
+        assert_eq!(turn_state(&muse), None);
+        let muse_end = decode(
+            "muse",
+            serde_json::json!({"method":"turn/completed","params":{"terminal":"failed","reason":"quota"}}),
+        );
+        assert_eq!(
+            turn_state(&muse_end),
+            Some(TurnState::Failed("quota".into()))
+        );
+
+        let codex = decode(
+            "codex",
+            serde_json::json!({"method":"item/delta","params":{"delta":"partial"}}),
+        );
+        assert_eq!(event_text(&codex).as_deref(), Some("partial"));
+        let codex_end = decode(
+            "codex",
+            serde_json::json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}),
+        );
+        assert_eq!(turn_state(&codex_end), Some(TurnState::Completed));
+
+        let claude = decode(
+            "claude",
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"claude answer"}]}}),
+        );
+        assert_eq!(event_text(&claude).as_deref(), Some("claude answer"));
+        assert_eq!(turn_state(&claude), None);
+        let claude_end = decode(
+            "claude",
+            serde_json::json!({"type":"result","subtype":"success","is_error":false}),
+        );
+        assert_eq!(turn_state(&claude_end), Some(TurnState::Completed));
+
+        let terminal = decode("terminal", serde_json::json!({"text":"login code"}));
+        assert_eq!(event_text(&terminal).as_deref(), Some("login code"));
+        assert_eq!(turn_state(&terminal), None);
+    }
+
     #[test]
     fn grok_approvals_classify_tools_and_refuse_unknown_network_access() {
         use super::*;

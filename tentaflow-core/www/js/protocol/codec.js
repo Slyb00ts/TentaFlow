@@ -8384,6 +8384,156 @@ export const encode = {
   },
 
   // ===========================================================================
+  // Agent provider accounts — MessageBody::ProviderAccountBody. The fields are
+  // the wire's snake_case; an ABSENT filter is `null`, never an empty string —
+  // the core treats `Some("")` as a filter that matches nothing. The login
+  // exchange, session revoke and CLI install have no entry here: this node
+  // refuses them with NotAvailable, and a screen must not be able to send a
+  // request whose only outcome is a refusal.
+  // ===========================================================================
+
+  /** Konta agentów widoczne dla wołającego (A01; nie-admin dostaje własne + nadane). */
+  // wire: AccountListRequest
+  providerAccountListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountListRequest(JSON.stringify({
+      engine_id: csOptText(payload.engineId ?? payload.engine_id),
+      scope: csOptText(payload.scope),
+      query: csOptText(payload.query),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Jedno konto z grantami, sesjami, nodami i agentami (A03/A04). */
+  // wire: AccountGetRequest
+  providerAccountGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountGetRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Tworzy konto globalne (admin) albo własne konto użytkownika. */
+  // wire: AccountCreateRequest
+  providerAccountCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountCreateRequest(JSON.stringify({
+      engine_id: csText(payload.engineId ?? payload.engine_id),
+      display_name: csText(payload.displayName ?? payload.display_name),
+      scope: csText(payload.scope),
+      // Konto użytkownika należy do wołającego; serwer i tak odrzuca obcego
+      // właściciela, więc UI nie próbuje go wskazywać.
+      owner_user_id: csOptText(payload.ownerUserId ?? payload.owner_user_id),
+      credential_kind: csText(payload.credentialKind ?? payload.credential_kind),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Zmiana nazwy lub stanu konta; pominięte pole zostaje bez zmian. */
+  // wire: AccountUpdateRequest
+  providerAccountUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountUpdateRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+      display_name: csOptText(payload.displayName ?? payload.display_name),
+      status: csOptText(payload.status),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Usuwa konto wraz z jego grantami i poświadczeniem. */
+  // wire: AccountDeleteRequest
+  providerAccountDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountDeleteRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Zapisuje klucz API konta typu api_key. */
+  // wire: CredentialSetRequest
+  providerAccountCredentialSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountCredentialSetRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+      material: csText(payload.material),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Usuwa zapisane poświadczenie konta. */
+  // wire: CredentialClearRequest
+  providerAccountCredentialClearRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountCredentialClearRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * Pełna lista grantów konta — czego nie ma na liście, zostaje odebrane.
+   * `display_name` i `member_count` są polami odpowiedzi; w żądaniu liczy się
+   * para (subject_type, subject_id), a serwer rozwiązuje nazwy sam.
+   */
+  // wire: GrantsSetRequest
+  providerAccountGrantsSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const grants = (payload.grants ?? []).map((grant) => ({
+      subject_type: csText(grant.subjectType ?? grant.subject_type),
+      subject_id: csText(grant.subjectId ?? grant.subject_id),
+      display_name: csText(grant.displayName ?? grant.display_name),
+      member_count: csOptNumber(grant.memberCount ?? grant.member_count),
+    }));
+    const body = _wasm.encodeProviderAccountGrantsSetRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+      grants,
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Żywe sesje jednego konta (A03). */
+  // wire: SessionListRequest
+  providerAccountSessionListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountSessionListRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Własne konta wołającego plus konta globalne nadane mu grantem (U01). */
+  // wire: MyAccountListRequest
+  providerAccountMyListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountMyListRequest(JSON.stringify({
+      engine_id: csOptText(payload.engineId ?? payload.engine_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Macierz node × aplikacja CLI (N01). */
+  // wire: RuntimeListRequest
+  providerAccountRuntimeListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountRuntimeListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Przełącznik „Otrzymuje konta" jednego noda (N01). */
+  // wire: RuntimeSetReceivesAccountsRequest
+  providerAccountRuntimeSetReceivesAccountsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountRuntimeSetReceivesAccountsRequest(JSON.stringify({
+      node_id: csText(payload.nodeId ?? payload.node_id),
+      enabled: Boolean(payload.enabled),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // ===========================================================================
   // TentaNas — MessageBody::TentaNasBody. Every request except NodesList is
   // forwarded to the node picked in the header (`targetNodeId`), the fields
   // are the wire's snake_case; `sudoPassword` rides the encrypted mesh in the

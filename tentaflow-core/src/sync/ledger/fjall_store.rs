@@ -1096,6 +1096,15 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         }
 
         batch.commit()?;
+
+        // A removal only writes a tombstone; the operation bodies stay readable in
+        // the table files until those are rewritten. A reset is also how bodies
+        // that must not survive (a secret that once replicated through the ledger)
+        // are dropped, so the keyspaces that hold bodies are compacted right away.
+        // Resets are rare, which keeps the blocking compaction affordable.
+        for keyspace in [&self.operations, &self.inbox, &self.snapshots] {
+            keyspace.major_compact()?;
+        }
         Ok(())
     }
 }

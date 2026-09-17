@@ -281,10 +281,7 @@ pub fn decode_data_url(url: &str) -> Result<(Vec<u8>, String)> {
     }
     if !url.starts_with("data:") {
         return Err(crate::error::CoreError::InvalidRequest {
-            message: format!(
-                "image_url.url must be a data URL (data:<mime>;base64,...), got: {}",
-                if url.len() > 60 { &url[..60] } else { url }
-            ),
+            message: "image_url.url must be a data URL (data:<mime>;base64,...)".to_string(),
             details: None,
         }
         .into());
@@ -524,6 +521,15 @@ mod data_url_tests {
         let url = "file:///etc/passwd";
         let err = decode_data_url(url).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("data url"));
+    }
+
+    /// The process runs with `panic = "abort"`, so a byte-index slice of the
+    /// caller's URL in the error path would take the whole node down.
+    #[test]
+    fn decode_data_url_rejects_multibyte_input_without_panicking() {
+        let url = format!("{}é-suffix", "x".repeat(59));
+        let err = decode_data_url(&url).unwrap_err();
+        assert!(!err.to_string().contains('é'));
     }
 
     #[test]

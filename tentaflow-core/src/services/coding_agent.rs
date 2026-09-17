@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::code_studio::cli_bridge::{turn_state, BridgeEvent, TurnState};
+use crate::code_studio::cli_bridge::{
+    decode_event, event_text, turn_state, ApprovalRequest, BridgeEvent, TurnState,
+};
 use crate::services::transport::Transport;
 use crate::services_repo::services::ServiceRow;
 
@@ -709,15 +711,6 @@ pub async fn execute_chat(
     model_name: &str,
     prompt: &str,
 ) -> Result<String, String> {
-    let workspace = serde_json::from_str::<Value>(&service.config_json)
-        .ok()
-        .and_then(|config| {
-            config
-                .get("workspace_root")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| ".".to_string());
     let model = model_name
         .strip_prefix(&format!("{}/", service.engine_id))
         .unwrap_or(model_name);
@@ -726,7 +719,9 @@ pub async fn execute_chat(
         service,
         user_id,
         "session.create",
-        &serde_json::json!({"workspace": workspace, "model": model}).to_string(),
+        // No workspace: `execute_public` drops any the caller names and binds
+        // the session to the account's private one instead.
+        &serde_json::json!({"model": model}).to_string(),
     )
     .await?;
     let session_id = serde_json::from_str::<Value>(&created)
@@ -751,8 +746,6 @@ pub async fn execute_chat(
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
         let mut after_seq = 0_u64;
         let mut output = String::new();
-        let mut last_event = tokio::time::Instant::now();
-        let mut received_output = false;
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err("coding-agent turn timed out after 600 seconds".to_string());
@@ -773,60 +766,58 @@ pub async fn execute_chat(
                 .cloned()
                 .unwrap_or_default();
             let mut completed = false;
+            // Text and the end of the turn are both read by the functions that
+            // know every vendor's vocabulary, so a chat request and a Code
+            // Studio delegation cannot disagree about whether a turn finished —
+            // and a turn only ends when the CLI SAID it ended. A quiet stream is
+            // a thinking agent, not an answer.
             for event in events {
-                after_seq = after_seq.max(event.get("seq").and_then(Value::as_u64).unwrap_or(0));
-                last_event = tokio::time::Instant::now();
+                let seq = event.get("seq").and_then(Value::as_u64).unwrap_or(0);
+                after_seq = after_seq.max(seq);
                 let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
-                let data = event.get("data").cloned().unwrap_or(Value::Null);
-                if kind == "terminal" {
-                    if let Some(text) = data.get("text").and_then(Value::as_str) {
-                        output.push_str(text);
-                        received_output = true;
+                let decoded = match decode_event(
+                    seq,
+                    kind,
+                    event.get("data").cloned().unwrap_or(Value::Null),
+                ) {
+                    Ok(decoded) => decoded,
+                    // One event this build cannot read is not a failed turn: the
+                    // CLI will still say how the turn ended, and that is the only
+                    // thing allowed to end it.
+                    Err(error) => {
+                        tracing::debug!(
+                            seq,
+                            kind,
+                            "skipping an unreadable coding-agent event: {error}"
+                        );
+                        continue;
                     }
-                } else if kind == "codex" || kind == "claude" {
-                    collect_agent_text(&data, &mut output);
-                    received_output = !output.is_empty();
-                    // The end of the turn is read by the one function that knows
-                    // both vendors' vocabularies, so a chat request and a Code
-                    // Studio delegation cannot disagree about whether a turn
-                    // finished — and a failed turn is not answered with the text it
-                    // managed to produce before failing.
-                    let structured = match kind {
-                        "claude" => Some(BridgeEvent::StreamObject {
-                            seq: 0,
-                            object: data.clone(),
-                        }),
-                        _ => data.get("method").and_then(Value::as_str).map(|method| {
-                            BridgeEvent::Notification {
-                                seq: 0,
-                                method: method.to_string(),
-                                params: data.get("params").cloned().unwrap_or(Value::Null),
-                            }
-                        }),
-                    };
-                    match structured.as_ref().and_then(turn_state) {
-                        Some(TurnState::Completed) => completed = true,
-                        Some(TurnState::Failed(reason)) => {
-                            return Err(format!("coding-agent turn failed: {reason}"))
-                        }
-                        None => {}
+                };
+                if let Some(text) = event_text(&decoded) {
+                    output.push_str(&text);
+                }
+                if let BridgeEvent::Approval { request, .. } = &decoded {
+                    deny_approval(db, service, user_id, &session_id, request).await?;
+                    continue;
+                }
+                match turn_state(&decoded) {
+                    Some(TurnState::Completed) => completed = true,
+                    Some(TurnState::Failed(reason)) => {
+                        return Err(format!("coding-agent turn failed: {reason}"))
                     }
+                    None => {}
                 }
             }
-            if completed
-                || (received_output
-                    && last_event.elapsed()
-                        >= std::time::Duration::from_secs(if service.engine_id == "codex" {
-                            2
-                        } else {
-                            5
-                        }))
-            {
+            if completed {
                 let text = terminal_text(&output);
                 if text.is_empty() {
                     return Err("coding-agent turn completed without text output".to_string());
                 }
                 return Ok(text);
+            }
+            // A session the bridge has closed will never announce anything else.
+            if value.get("status").and_then(Value::as_str) == Some("closed") {
+                return Err("coding-agent session closed before the turn completed".to_string());
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -847,26 +838,59 @@ pub async fn execute_chat(
     }
 }
 
-fn collect_agent_text(value: &Value, output: &mut String) {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object {
-                if matches!(key.as_str(), "delta" | "text") {
-                    if let Some(text) = value.as_str() {
-                        output.push_str(text);
-                    }
-                } else {
-                    collect_agent_text(value, output);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_agent_text(value, output);
-            }
-        }
-        _ => {}
+/// Answers an approval the `/v1` chat path cannot ask anybody about.
+///
+/// Codex threads run with `approvalPolicy: "on-request"` and Claude Code with a
+/// permission-prompt tool, so a CLI that wants to run a command or write a file
+/// SUSPENDS until it is answered. Code Studio answers through the Permission
+/// Engine and, when that says ask, through the operator — a chat completion has
+/// neither a run to authorize against nor a person to ask, so the only honest
+/// answer is `denied`. The CLI then reports what it could not do and finishes
+/// the turn, which is what makes this different from the deadline: the turn
+/// ends because the agent ended it.
+///
+/// A denial that cannot be delivered IS fatal: nothing else will unblock the
+/// turn, so it must not be left to run out the clock. It is retried once first,
+/// because the alternative to a lost packet on loopback is failing a turn the
+/// agent could still have finished.
+async fn deny_approval(
+    db: &crate::db::DbPool,
+    service: &ServiceRow,
+    user_id: &str,
+    session_id: &str,
+    request: &ApprovalRequest,
+) -> Result<(), String> {
+    tracing::debug!(
+        engine = %service.engine_id,
+        method = %request.method,
+        request_id = request.request_id,
+        "denying a coding-agent approval: a chat completion has no approver"
+    );
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "request_id": request.request_id,
+        "decision": "denied",
+    })
+    .to_string();
+    let mut last =
+        match execute_authorized(db, service, user_id, "session.approval", &payload).await {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+    tracing::debug!(
+        request_id = request.request_id,
+        "retrying an undelivered approval denial: {last}"
+    );
+    if let Err(error) = execute_authorized(db, service, user_id, "session.approval", &payload).await
+    {
+        last = error;
+    } else {
+        return Ok(());
     }
+    Err(format!(
+        "coding-agent asked for approval of '{}' and the denial could not be delivered: {last}",
+        request.method
+    ))
 }
 
 fn terminal_text(raw: &str) -> String {
@@ -1276,5 +1300,160 @@ mod tests {
             Some("Claude Code — Haiku 4.5")
         );
         assert!(second[0].is_default);
+    }
+
+    /// A chat completion has no approver, so an approval request must be denied
+    /// and the turn must end because the AGENT ended it. Before this, the event
+    /// was ignored and the suspended CLI rode the 600 s deadline.
+    #[tokio::test]
+    async fn an_approval_nobody_can_answer_is_denied_so_the_turn_still_ends() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stub bridge");
+        let port = listener.local_addr().expect("addr").port();
+        let denied = std::sync::Arc::new(AtomicBool::new(false));
+        let decisions = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = denied.clone();
+        let recorded = decisions.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = seen.clone();
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    // Loops because the request line, the headers and the body
+                    // are not guaranteed to arrive in one read.
+                    loop {
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        let text = String::from_utf8_lossy(&request);
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                            continue;
+                        };
+                        let expected = head
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("Content-Length: ")
+                                    .or_else(|| line.strip_prefix("content-length: "))
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if body.len() >= expected {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    let reply = if line.starts_with("POST /sessions ") {
+                        // Core reserves the session id and refuses a bridge that
+                        // answers with a different one, so echo what it sent.
+                        let reserved = serde_json::from_str::<Value>(body)
+                            .ok()
+                            .and_then(|payload| {
+                                payload
+                                    .get("session_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .expect("create payload carries the reserved session id");
+                        serde_json::json!({"session": {"id": reserved}}).to_string()
+                    } else if line.contains("/turn") {
+                        "{}".to_string()
+                    } else if line.contains("/approval") {
+                        recorded.lock().unwrap().push(body.to_string());
+                        seen.store(true, Ordering::SeqCst);
+                        "{}".to_string()
+                    } else if line.contains("/events") {
+                        if seen.load(Ordering::SeqCst) {
+                            // Only after the denial: the CLI reports what it
+                            // could not do and completes the turn.
+                            r#"{"status":"running","events":[
+                                {"seq":2,"kind":"codex","data":{"text":"I was not allowed to run that."}},
+                                {"seq":3,"kind":"codex","data":{"method":"turn/completed",
+                                 "params":{"turn":{"status":"completed"}}}}]}"#
+                                .to_string()
+                        } else {
+                            r#"{"status":"running","events":[
+                                {"seq":1,"kind":"approval_request","data":{"request_id":7,
+                                 "method":"execCommandApproval","params":{"command":["rm","-rf","/"]}}}]}"#
+                                .to_string()
+                        }
+                    } else {
+                        "{}".to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::init(file.path()).unwrap();
+        let service_id = {
+            let conn = db.write().unwrap();
+            conn.execute(
+                "INSERT INTO user_accounts(id,username,password_hash,role) \
+                 VALUES('chat-admin','chat-admin','synthetic','admin')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO services (engine_id, category, display_name, deploy_method, \
+                    transport, status, endpoint_url) VALUES ('codex', 'agents', 'Codex', \
+                    'native_managed_cli', 'agent_rpc', 'running', ?1)",
+                rusqlite::params![format!("http://127.0.0.1:{port}")],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let mut config = serde_json::json!({});
+        ensure_account_config(&mut config).unwrap();
+        let profile = prepare_account_directory(&config).unwrap();
+        // Stored, not just held: `account_permission` re-reads the row to decide
+        // whether the account even has a directory yet.
+        let service = {
+            let conn = db.write().unwrap();
+            conn.execute(
+                "UPDATE services SET config_json = ?1 WHERE id = ?2",
+                rusqlite::params![config.to_string(), service_id],
+            )
+            .unwrap();
+            crate::services_repo::services::get(&conn, service_id)
+                .unwrap()
+                .unwrap()
+        };
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            execute_chat(&db, &service, "chat-admin", "codex/gpt-5", "run rm -rf /"),
+        )
+        .await
+        .expect("the turn must end on its own, not on the 600 s deadline")
+        .expect("chat");
+        assert_eq!(answer, "I was not allowed to run that.");
+
+        let decisions = decisions.lock().unwrap().clone();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "one approval, one answer: {decisions:?}"
+        );
+        let decision: Value = serde_json::from_str(&decisions[0]).expect("approval body");
+        assert_eq!(decision["decision"], "denied");
+        assert_eq!(decision["request_id"], 7);
+        std::fs::remove_dir_all(profile).unwrap();
     }
 }

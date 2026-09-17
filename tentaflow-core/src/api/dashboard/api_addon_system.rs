@@ -54,29 +54,59 @@ fn get_addon_config_map(
 // providerami (list/create/delete) odbywa sie przez binary protocol.
 // =============================================================================
 
+const SSO_STATE_TTL_SECONDS: i64 = 600;
+const MAX_OUTSTANDING_SSO_STATES: i64 = 1000;
+
+/// `/api/sso/login` is reachable before authentication and stores one state row
+/// per call. Expired rows are swept here, and the number of live ones is
+/// returned so the caller can refuse to add more once the cap is reached.
+fn sweep_sso_states(pool: &DbPool) -> Result<i64> {
+    let conn = pool
+        .write()
+        .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+    // Value format is "<provider_id>:<unix timestamp>".
+    conn.execute(
+        "DELETE FROM settings WHERE key LIKE 'sso_state:%' \
+         AND CAST(substr(value, instr(value, ':') + 1) AS INTEGER) < ?1",
+        rusqlite::params![chrono::Utc::now().timestamp() - SSO_STATE_TTL_SECONDS],
+    )?;
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM settings WHERE key LIKE 'sso_state:%'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Base URL the identity provider redirects back to. It must come from the
+/// administrator's setting: deriving it from the request's `Host` header would
+/// let whoever crafts the login link choose where the session is delivered.
+fn sso_redirect_base_url(pool: &DbPool) -> Result<String> {
+    db::repository::get_setting(pool, "oauth_redirect_base_url")?
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("oauth_redirect_base_url is not configured"))
+}
+
 /// GET /api/sso/login/:provider_id — generuje auth URL i zwraca redirect
 pub async fn handle_sso_login(
     pool: &DbPool,
     cipher: &crate::crypto::SecretsCipher,
     provider_id: i64,
-    redirect_base_url: &str,
 ) -> Result<(u16, String)> {
-    let provider = db::repository::get_sso_provider(pool, provider_id)?
-        .ok_or_else(|| anyhow::anyhow!("SSO provider nie znaleziony"))?;
-
-    if !provider.enabled {
-        return Ok((400, json_error("SSO provider jest wyłączony")));
-    }
+    let provider = match db::repository::get_sso_provider(pool, provider_id)? {
+        Some(p) if p.enabled => p,
+        _ => {
+            // Same answer for unknown and disabled, so ids cannot be probed.
+            return Ok((400, json_error("SSO provider jest niedostępny")));
+        }
+    };
 
     // Odszyfruj client_secret
     let client_secret = cipher
         .decrypt(&provider.client_secret_encrypted)
         .map_err(|e| anyhow::anyhow!("Blad odszyfrowywania client_secret: {}", e))?;
 
-    // Pobierz redirect base URL z ustawien DB (fallback na przekazany z Host header)
-    let base_url = db::repository::get_setting(pool, "oauth_redirect_base_url")?
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| redirect_base_url.to_string());
+    let base_url = sso_redirect_base_url(pool)?;
 
     let config = crate::auth::sso::provider_to_config(&provider, &client_secret, &base_url);
 
@@ -89,8 +119,11 @@ pub async fn handle_sso_login(
     let state = format!("{}:{}", provider_id, uuid::Uuid::new_v4());
 
     // Zapisz state z timestampem w ustawieniach (walidacja TTL przy callback)
+    if sweep_sso_states(pool)? >= MAX_OUTSTANDING_SSO_STATES {
+        return Ok((429, json_error("Zbyt wiele rozpoczetych logowan SSO")));
+    }
     let state_value = format!("{}:{}", provider_id, chrono::Utc::now().timestamp());
-    let _ = db::repository::set_setting(pool, &format!("sso_state:{}", state), &state_value);
+    db::repository::set_setting(pool, &format!("sso_state:{}", state), &state_value)?;
 
     let auth_url = crate::auth::sso::build_auth_url(&config, &discovery, &state);
 
@@ -104,14 +137,14 @@ pub async fn handle_sso_login(
     ))
 }
 
-/// GET /api/sso/callback?code=...&state=... — callback po zalogowaniu SSO
+/// GET /api/sso/callback?code=...&state=... — callback po zalogowaniu SSO.
+/// Returns the dashboard URL the browser is redirected to.
 pub async fn handle_sso_callback(
     pool: &DbPool,
     cipher: &crate::crypto::SecretsCipher,
     query: &str,
-    redirect_base_url: &str,
     settings_cipher: &crate::crypto::SettingsCipher,
-) -> Result<(u16, String)> {
+) -> Result<String> {
     let code = parse_query_opt_string(query, "code")
         .ok_or_else(|| anyhow::anyhow!("Brak parametru 'code' w callback"))?;
     let state = parse_query_opt_string(query, "state")
@@ -133,17 +166,12 @@ pub async fn handle_sso_callback(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow::anyhow!("Niepoprawny provider_id w state"))?;
 
-    // Sprawdz TTL state (max 10 minut)
-    if let Some(ts_str) = parts.get(1) {
-        if let Ok(ts) = ts_str.parse::<i64>() {
-            let now = chrono::Utc::now().timestamp();
-            let max_age_seconds = 600; // 10 minut
-            if now - ts > max_age_seconds {
-                return Err(anyhow::anyhow!(
-                    "State SSO wygasniety (starszy niz 10 minut)"
-                ));
-            }
-        }
+    let issued_at: i64 = parts
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("Niepoprawny timestamp w state"))?;
+    if chrono::Utc::now().timestamp() - issued_at > SSO_STATE_TTL_SECONDS {
+        return Err(anyhow::anyhow!("State SSO wygasniety"));
     }
 
     let provider = db::repository::get_sso_provider(pool, provider_id)?
@@ -154,10 +182,7 @@ pub async fn handle_sso_callback(
         .decrypt(&provider.client_secret_encrypted)
         .map_err(|e| anyhow::anyhow!("Blad odszyfrowywania client_secret: {}", e))?;
 
-    // Pobierz redirect base URL z ustawien DB (fallback na przekazany z Host header)
-    let base_url = db::repository::get_setting(pool, "oauth_redirect_base_url")?
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| redirect_base_url.to_string());
+    let base_url = sso_redirect_base_url(pool)?;
 
     let config = crate::auth::sso::provider_to_config(&provider, &client_secret, &base_url);
 
@@ -171,21 +196,13 @@ pub async fn handle_sso_callback(
         crate::auth::sso::handle_sso_callback(pool, &config, &discovery, &code, settings_cipher)
             .await?;
 
-    // Redirect do dashboardu z tokenem JWT w query param
-    let redirect_url = format!(
-        "{}/?token={}",
-        base_url.trim_end_matches('/'),
+    // The session travels in the fragment: unlike a query string it is never
+    // sent to a server, so it stays out of access logs and Referer headers.
+    // The dashboard reads it on load and clears it from the address bar.
+    Ok(format!(
+        "{}/#sso_token={}",
+        base_url,
         urlencoding::encode(&result.token)
-    );
-    Ok((
-        200,
-        serde_json::json!({
-            "redirect_url": redirect_url,
-            "token": result.token,
-            "username": result.username,
-            "is_new_user": result.is_new_user,
-        })
-        .to_string(),
     ))
 }
 
@@ -347,9 +364,11 @@ pub async fn handle_addon_oauth_callback(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Brak client_secret w konfiguracji addonu"))?;
 
+    // Fail closed: on a decrypt error the stored value is ciphertext, and
+    // sending it on would post our encrypted blob to the identity provider.
     let client_secret = cipher
         .decrypt(&client_secret_encrypted)
-        .unwrap_or_else(|_| client_secret_encrypted.clone());
+        .map_err(|e| anyhow::anyhow!("Nie mozna odszyfrowac client_secret addonu: {e}"))?;
 
     let tenant_id = config
         .get("tenant_id")
@@ -425,12 +444,13 @@ pub async fn handle_addon_oauth_callback(
     }
 
     // Zaszyfruj i zapisz tokeny do addon secrets per user
+    // Fail closed: a token that cannot be encrypted is not stored at all.
     let encrypted_access = cipher
         .encrypt(&access_token)
-        .unwrap_or_else(|_| access_token.clone());
+        .map_err(|e| anyhow::anyhow!("Nie mozna zaszyfrowac access_token: {e}"))?;
     let encrypted_refresh = cipher
         .encrypt(&refresh_token)
-        .unwrap_or_else(|_| refresh_token.clone());
+        .map_err(|e| anyhow::anyhow!("Nie mozna zaszyfrowac refresh_token: {e}"))?;
 
     // Zapisz tokeny do addon secrets per user
     db::repository::set_addon_secret(

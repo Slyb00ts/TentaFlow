@@ -272,6 +272,16 @@ pub fn xlsx_to_markdown(bytes: &[u8]) -> Result<String, String> {
 }
 
 /// Local-name tagu XML bez prefiksu namespace (`w:p` → `p`).
+/// Text of a character or predefined entity reference (`&#233;`, `&amp;`).
+/// The reader reports these as separate events instead of inside the text.
+fn reference_text(reference: &quick_xml::events::BytesRef) -> Option<String> {
+    if let Ok(Some(c)) = reference.resolve_char_ref() {
+        return Some(c.to_string());
+    }
+    let name = reference.decode().ok()?;
+    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_string)
+}
+
 fn local_name(name: &[u8]) -> &[u8] {
     match name.iter().rposition(|&b| b == b':') {
         Some(p) => &name[p + 1..],
@@ -402,13 +412,22 @@ pub fn docx_to_markdown(bytes: &[u8]) -> Result<String, String> {
             }
             Ok(Event::Text(t)) if in_text => {
                 let s = t
-                    .unescape()
+                    .decode()
                     .map(|c| c.into_owned())
                     .unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned());
                 if in_cell {
                     cur_cell.push_str(&s);
                 } else {
                     para_text.push_str(&s);
+                }
+            }
+            Ok(Event::GeneralRef(r)) if in_text => {
+                if let Some(s) = reference_text(&r) {
+                    if in_cell {
+                        cur_cell.push_str(&s);
+                    } else {
+                        para_text.push_str(&s);
+                    }
                 }
             }
             Ok(Event::End(e)) => {
@@ -507,10 +526,15 @@ pub fn pptx_to_markdown(bytes: &[u8]) -> Result<String, String> {
                 },
                 Ok(Event::Text(t)) if in_text => {
                     let s = t
-                        .unescape()
+                        .decode()
                         .map(|c| c.into_owned())
                         .unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned());
                     para.push_str(&s);
+                }
+                Ok(Event::GeneralRef(r)) if in_text => {
+                    if let Some(s) = reference_text(&r) {
+                        para.push_str(&s);
+                    }
                 }
                 Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
                     b"t" => in_text = false,
@@ -665,6 +689,26 @@ fn split_into_sentences(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docx_text_keeps_entity_and_character_references() {
+        use std::io::Write;
+
+        let document = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t>Smith &amp; Sons &lt;&#233;&gt;</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file("word/document.xml", zip::write::SimpleFileOptions::default())
+            .expect("start entry");
+        archive.write_all(document.as_bytes()).expect("write entry");
+        let bytes = archive.finish().expect("finish archive").into_inner();
+
+        let markdown = docx_to_markdown(&bytes).expect("docx parses");
+
+        assert!(markdown.contains("Smith & Sons <\u{e9}>"), "got: {markdown}");
+    }
 
     #[test]
     fn classify_by_mime_basic_paths() {

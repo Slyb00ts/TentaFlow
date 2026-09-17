@@ -94,7 +94,9 @@ fn html_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
 }
 
 /// Mapuje dowolny anyhow::Error (potencjalnie CoreError) na error response z odpowiednim HTTP status.
+/// The full error goes to the log here; the client receives `client_message`.
 fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
+    tracing::warn!(error = %format!("{e:#}"), "OpenAI API request failed");
     let core_error = e.downcast_ref::<CoreError>();
     if let Some(err) = core_error {
         let status = StatusCode::from_u16(err.status_code()).unwrap();
@@ -107,12 +109,13 @@ fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
             CoreError::Timeout { .. } => "timeout_error",
             _ => "internal_error",
         };
-        error_response(status, error_type, err.to_string())
+        let client_msg = err.client_message();
+        error_response(status, error_type, client_msg)
     } else {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
-            e.to_string(),
+            "Internal server error".to_string(),
         )
     }
 }
@@ -370,6 +373,10 @@ pub async fn handle_request(
     let path = req.uri().path();
 
     debug!("{} {}", method, path);
+
+    if let Some(rejection) = reject_oversized_body(method, path, req.headers()) {
+        return Ok(rejection);
+    }
 
     // Routing na podstawie path
     let response = match (method.as_str(), path) {
@@ -631,7 +638,10 @@ async fn handle_chat_completions(
                             }
                             Err(e) => {
                                 error!("Blad w streaming chunk: {}", e);
-                                let error_chunk = format!("data: {{\"error\": \"{}\"}}\n\n", e);
+                                let error_chunk = format!(
+                                    "data: {}\n\n",
+                                    serde_json::json!({ "error": e.to_string() })
+                                );
                                 Ok(Frame::data(Bytes::from(error_chunk)))
                             }
                         }
@@ -921,9 +931,57 @@ async fn handle_image_generation(
     Ok(json_response(StatusCode::OK, body))
 }
 
+/// Every handler buffers the whole request body in memory, so the size has to
+/// be decided before the first byte is read. JSON requests carry base64 images
+/// (vision), hence tens of megabytes; only speech-to-text takes a raw upload.
+const MAX_JSON_BODY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_AUDIO_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Refuses a body-carrying request unless it declares a `Content-Length` within
+/// the endpoint's limit. hyper then holds the body to the declared length, so
+/// this one check bounds what any handler can be made to buffer. A chunked
+/// body has no length to check and would stream without end, so it is refused
+/// (411) rather than measured after the fact.
+fn reject_oversized_body(
+    method: &hyper::Method,
+    path: &str,
+    headers: &hyper::header::HeaderMap,
+) -> Option<Response<OpenAIBody>> {
+    if !matches!(*method, hyper::Method::POST | hyper::Method::PUT | hyper::Method::PATCH) {
+        return None;
+    }
+    let limit = if path == "/v1/audio/transcriptions" {
+        MAX_AUDIO_UPLOAD_BYTES
+    } else {
+        MAX_JSON_BODY_BYTES
+    };
+    let declared = headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    match declared {
+        Some(len) if len <= limit => None,
+        Some(len) => Some(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            format!("request body is {len} bytes; the limit for this endpoint is {limit} bytes"),
+        )),
+        None => Some(error_response(
+            StatusCode::LENGTH_REQUIRED,
+            "length_required",
+            "request body must declare Content-Length".to_string(),
+        )),
+    }
+}
+
+/// Upper bound per side: latent memory grows with w*h, so an unclamped size
+/// lets one request exhaust VRAM or pin the backend until its timeout.
+const MAX_IMAGE_DIMENSION: u32 = 2048;
+
 /// Parsuje OpenAI pole `size` ("WxH") na (width, height). Akceptuje tylko
-/// dodatnie wymiary; przy braku/niepoprawnym formacie wraca natywne 512x512
-/// SD1.5. Wymiary zaokraglane w dol do wielokrotnosci 8 (wymog VAE SD).
+/// wymiary 8..=MAX_IMAGE_DIMENSION; przy braku/niepoprawnym formacie wraca
+/// natywne 512x512 SD1.5. Wymiary zaokraglane w dol do wielokrotnosci 8
+/// (wymog VAE SD).
 fn parse_image_size(size: Option<&str>) -> (u32, u32) {
     let default = (512u32, 512u32);
     let s = match size {
@@ -935,7 +993,11 @@ fn parse_image_size(size: Option<&str>) -> (u32, u32) {
         None => return default,
     };
     match (w, h) {
-        (Ok(w), Ok(h)) if w > 0 && h > 0 => ((w / 8) * 8, (h / 8) * 8),
+        (Ok(w), Ok(h)) if (8..=MAX_IMAGE_DIMENSION).contains(&w)
+            && (8..=MAX_IMAGE_DIMENSION).contains(&h) =>
+        {
+            ((w / 8) * 8, (h / 8) * 8)
+        }
         _ => default,
     }
 }
@@ -2884,8 +2946,19 @@ fn supports_structured_output(
     }
 }
 
+/// Route debugging reveals which node and backend served a request, how many
+/// fallbacks and mesh hops it took. API keys have no admin tier to restrict it
+/// to, so the operator turns it on for the whole node while diagnosing
+/// (`TENTAFLOW_DEBUG_ROUTE=1`) and it stays off otherwise.
+static DEBUG_ROUTE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("TENTAFLOW_DEBUG_ROUTE").is_ok_and(|v| v == "1")
+});
+
 /// Sprawdza czy request ma wlaczony debug routing (header lub query param)
 fn is_debug_route_openai(headers: &hyper::header::HeaderMap, uri: &hyper::Uri) -> bool {
+    if !*DEBUG_ROUTE_ENABLED {
+        return false;
+    }
     let has_header = headers
         .get("x-tentaflow-debug")
         .and_then(|v| v.to_str().ok())
@@ -2956,5 +3029,48 @@ mod error_mapping_tests {
         let core = crate::routing::dispatch_error_to_core(dispatch, "whisper-1");
         assert!(matches!(core, CoreError::SttServiceUnavailable));
         assert_eq!(core.status_code(), 503);
+    }
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::*;
+
+    fn headers(content_length: Option<&str>) -> hyper::header::HeaderMap {
+        let mut map = hyper::header::HeaderMap::new();
+        if let Some(len) = content_length {
+            map.insert(hyper::header::CONTENT_LENGTH, len.parse().unwrap());
+        }
+        map
+    }
+
+    fn status(method: hyper::Method, path: &str, content_length: Option<&str>) -> Option<StatusCode> {
+        reject_oversized_body(&method, path, &headers(content_length)).map(|r| r.status())
+    }
+
+    #[test]
+    fn a_declared_body_within_the_limit_passes() {
+        assert_eq!(status(hyper::Method::POST, "/v1/chat/completions", Some("1024")), None);
+        assert_eq!(status(hyper::Method::GET, "/v1/models", None), None);
+    }
+
+    #[test]
+    fn an_oversized_body_is_refused_before_it_is_read() {
+        let too_big = (MAX_JSON_BODY_BYTES + 1).to_string();
+        assert_eq!(
+            status(hyper::Method::POST, "/v1/chat/completions", Some(&too_big)),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        // Speech-to-text takes raw uploads and has its own, larger limit.
+        assert_eq!(status(hyper::Method::POST, "/v1/audio/transcriptions", Some(&too_big)), None);
+    }
+
+    /// A chunked body has no length to check and would be buffered without end.
+    #[test]
+    fn a_body_without_content_length_is_refused() {
+        assert_eq!(
+            status(hyper::Method::POST, "/v1/embeddings", None),
+            Some(StatusCode::LENGTH_REQUIRED)
+        );
     }
 }

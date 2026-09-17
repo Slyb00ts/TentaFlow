@@ -9,8 +9,8 @@ pub mod cbor;
 pub mod cluster_probe;
 pub mod cluster_rdma;
 pub mod command_executor;
+pub mod command_policy;
 pub mod frame_policy;
-pub mod gossip;
 #[cfg(all(feature = "rdma-probe", target_os = "linux"))]
 pub mod ibverbs_ffi;
 pub mod inference_proxy;
@@ -28,12 +28,14 @@ pub mod proto_conv;
 #[cfg(any(feature = "rdma-probe", target_os = "macos"))]
 pub mod rdma_probe;
 pub mod reconnect;
+pub mod replay;
 pub mod recordings_pull;
 pub mod relay_health;
 pub mod robot_control;
 pub mod robot_dispatch;
 pub mod roce_config;
 pub mod security;
+pub mod shared_secrets;
 pub mod token_coordinator;
 pub mod ufp2;
 pub mod vector_transport;

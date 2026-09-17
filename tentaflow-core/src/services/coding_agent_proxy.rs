@@ -6,6 +6,7 @@ use crate::code_studio::egress::{
     EgressEvent, EgressGateway, EgressGatewayConfig, EgressPolicy, HostPattern,
 };
 use crate::code_studio::models::EgressEnforcement;
+use crate::code_studio::process_sandbox::ProxyTransport;
 use anyhow::{bail, Result};
 use std::{
     collections::HashMap,
@@ -41,6 +42,10 @@ impl EgressEventSink for Audit {
 pub struct AgentProxy {
     account_id: String,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// The host end of the route the sandboxed CLI takes here. Kept for the
+    /// life of the bridge process, because closing it would leave the CLI with
+    /// a proxy URL that answers nowhere.
+    transport: Option<ProxyTransport>,
     port: u16,
     url: String,
 }
@@ -53,7 +58,17 @@ impl AgentProxy {
         &self.url
     }
 
+    /// The unix socket the sandbox reaches this proxy through, where the
+    /// sandbox has no route to the host's loopback. `None` on a platform whose
+    /// sandbox opens the endpoint directly.
+    pub fn socket_path(&self) -> Option<std::path::PathBuf> {
+        self.transport
+            .as_ref()
+            .and_then(|transport| transport.endpoint().socket_path())
+    }
+
     pub fn monitor(mut self, pid: u32) {
+        let transport = self.transport.take();
         if let Some(task) = self.task.take() {
             let account_id = self.account_id.clone();
             let generation = uuid::Uuid::new_v4();
@@ -66,6 +81,9 @@ impl AgentProxy {
                 },
             );
             tokio::spawn(async move {
+                // The transport outlives this loop's iterations and dies with
+                // the process it serves.
+                let _transport = transport;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let alive = crate::deploy::process_ctl::is_alive(pid);
@@ -109,10 +127,13 @@ pub async fn start(engine_id: &str, account_id: &str) -> Result<AgentProxy> {
         .ok_or_else(|| anyhow::anyhow!("agent egress cannot be enforced"))?
         .clone();
     let proxy = EgressProxy::bind(gateway, Arc::new(Audit), "127.0.0.1:0".parse()?).await?;
-    let port = proxy.local_addr()?.port();
+    let address = proxy.local_addr()?;
+    let port = address.port();
+    let transport = ProxyTransport::open(address)?;
     Ok(AgentProxy {
         account_id: account_id.into(),
         task: Some(tokio::spawn(proxy.run())),
+        transport: Some(transport),
         port,
         url: format!("http://tf:{token}@127.0.0.1:{port}"),
     })

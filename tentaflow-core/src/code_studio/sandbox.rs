@@ -477,6 +477,10 @@ impl super::egress::proxy::EgressEventSink for ProcessEgressAudit {
 
 pub struct ProcessProxy {
     task: tokio::task::JoinHandle<()>,
+    /// The host end of the sandbox's route here. It has to outlive the
+    /// listener, not the call that built it.
+    #[allow(dead_code)]
+    transport: super::process_sandbox::ProxyTransport,
     url: String,
 }
 
@@ -1238,11 +1242,6 @@ impl SandboxManager {
                 )
                 .map_err(SandboxError::Other)?;
                 let proxy = if profile.network == NetworkAccess::Gateway {
-                    if !cfg!(target_os = "macos") {
-                        return Err(SandboxError::RuntimeUnavailable(
-                            "process gateway requires macOS".into(),
-                        ));
-                    }
                     let (config, sink) = self.process_gateway.as_ref().ok_or_else(|| {
                         SandboxError::RuntimeUnavailable(
                             "process sandbox has no egress gateway policy".into(),
@@ -1280,7 +1279,11 @@ impl SandboxManager {
                     let address = listener
                         .local_addr()
                         .map_err(|error| SandboxError::Other(error.into()))?;
-                    policy = policy.with_proxy(address).map_err(SandboxError::Other)?;
+                    let transport = super::process_sandbox::ProxyTransport::open(address)
+                        .map_err(SandboxError::Other)?;
+                    policy = policy
+                        .with_proxy(transport.endpoint())
+                        .map_err(SandboxError::Other)?;
                     let listener = tokio::net::TcpListener::from_std(listener)
                         .map_err(|error| SandboxError::Other(error.into()))?;
                     let mut server = super::egress::proxy::EgressProxy::from_listener(
@@ -1293,6 +1296,7 @@ impl SandboxManager {
                     }
                     Some(Arc::new(ProcessProxy {
                         task: handle.spawn(server.run()),
+                        transport,
                         url: format!("http://tf:{token}@{address}"),
                     }))
                 } else {

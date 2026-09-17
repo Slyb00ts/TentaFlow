@@ -79,10 +79,9 @@ fn test_tls_config_builds_with_tls13_only() {
     // udaje i ze server config nie panikuje (panicowalby gdyby kombinacja
     // version/cipher byla pusta).
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certs_pem = include_bytes!("../../certs/cert.pem");
-    let key_pem = include_bytes!("../../certs/key.pem");
-    let certs = tentaflow_core::api::tls_pem::parse_certs_pem(certs_pem).expect("certy PEM");
-    let key = tentaflow_core::api::tls_pem::parse_key_pem(key_pem).expect("klucz PEM");
+    let identity = tentaflow_core::api::tls_identity::generate_ephemeral("localhost", &[])
+        .expect("ephemeral TLS identity");
+    let (certs, key) = (identity.certs, identity.key);
 
     let cfg = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_no_client_auth()

@@ -42,26 +42,6 @@ pub struct GrantRow {
     pub role: String,
 }
 
-/// Is `node_id` on the organization's operator list?
-///
-/// The same question `sync::tentavm_registry::authorize_organization` asks of
-/// an INCOMING operation, asked here of the outgoing one. Asking it in both
-/// directions is the point: a write this node would refuse from a peer is a
-/// write it must not mint either, and the answer comes from the same column.
-pub fn node_is_operator(main_db: &DbPool, node_id: &str) -> Result<bool> {
-    let conn = main_db
-        .read()
-        .map_err(|e| anyhow!("tentavm policy: main db lock: {e}"))?;
-    let flag: Option<i64> = conn
-        .query_row(
-            "SELECT operator FROM sync_nodes WHERE node_id = ?1",
-            rusqlite::params![node_id],
-            |row| row.get(0),
-        )
-        .ok();
-    Ok(flag.unwrap_or(0) != 0)
-}
-
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

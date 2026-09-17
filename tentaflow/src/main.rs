@@ -141,7 +141,8 @@ use tentaflow_core::mesh::pipeline::{start_mesh_pipeline, MeshPipelineConfig};
 // srodku tokio runtime). Dla normalnego startu serwera tworzymy tokio runtime
 // recznie pod `run_server`.
 fn main() -> Result<()> {
-    if let Some(code) = tentaflow_core::code_studio::process_sandbox::maybe_run_supervisor() {
+    if let Some(code) = tentaflow_core::code_studio::process_sandbox::maybe_run_sandbox_entrypoint()
+    {
         std::process::exit(code);
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -423,16 +424,6 @@ async fn run_server(args: Args) -> Result<()> {
     ) {
         Ok(_) => {
             info!("Sync Ledger runtime initialized");
-            match tentaflow_core::db::repository::enqueue_existing_shared_secret_settings(
-                &db,
-                &settings_cipher,
-            ) {
-                Ok(enqueued) if enqueued > 0 => {
-                    info!("Sync Ledger enqueued {} shared secret settings", enqueued)
-                }
-                Err(e) => error!("Sync Ledger shared secret enqueue failed: {}", e),
-                _ => {}
-            }
             match tentaflow_core::sync::runtime::run_pending_baseline_cutover() {
                 Ok(Some(reseeded)) => info!(
                     "Sync Ledger core baseline reset after v53 cutover: re-seeded {} core ops under new epoch",

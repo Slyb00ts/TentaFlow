@@ -275,8 +275,8 @@ pub fn start_unified_server_with_permissions(
     crate::api::mtls::set_pickup_mtls_config(pickup_mtls);
 
     // Per-installation certificate from <data>/tls (generated on first start,
-    // regenerated when local IPs change). The certificate embedded in the
-    // binary is only the emergency fallback when the data dir is unusable.
+    // regenerated when local IPs change). When the data dir is unusable the
+    // node serves a certificate generated for this process only.
     let tls_acceptor = {
         let extra_sans = config
             .server
@@ -285,26 +285,22 @@ pub fn start_unified_server_with_permissions(
             .map(|t| t.extra_sans.clone())
             .unwrap_or_default();
         let hostname = crate::mesh::node_info_collector::local_hostname();
-        let (certs, key) = match crate::api::tls_identity::load_or_generate(
+        let identity = match crate::api::tls_identity::load_or_generate(
             &crate::paths::tls_dir(),
             &hostname,
             &extra_sans,
         ) {
-            Ok(identity) => (identity.certs, identity.key),
+            Ok(identity) => identity,
             Err(e) => {
                 warn!(
                     error = %e,
-                    "TLS: per-installation certificate unavailable, using embedded fallback"
+                    "TLS: per-installation certificate unavailable, using an ephemeral one"
                 );
-                let cert_pem = include_bytes!("../../../certs/cert.pem");
-                let key_pem = include_bytes!("../../../certs/key.pem");
-                let certs = crate::api::tls_pem::parse_certs_pem(cert_pem)
-                    .expect("Nie udalo sie sparsowac wbudowanego certyfikatu");
-                let key = crate::api::tls_pem::parse_key_pem(key_pem)
-                    .expect("Nie udalo sie sparsowac wbudowanego klucza");
-                (certs, key)
+                crate::api::tls_identity::generate_ephemeral(&hostname, &extra_sans)
+                    .expect("Nie udalo sie wygenerowac tymczasowego certyfikatu TLS")
             }
         };
+        let (certs, key) = (identity.certs, identity.key);
 
         // TLS 1.3 only — F1b is HTTPS-native, no legacy clients to support.
         // Pinning the version here also pins AEAD-only cipher suites and

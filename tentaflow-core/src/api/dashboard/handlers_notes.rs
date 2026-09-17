@@ -13,6 +13,8 @@ use crate::db::repository;
 use crate::dispatch::HandlerContext;
 
 const PREVIEW_MAX_CHARS: usize = 200;
+const MAX_TITLE_BYTES: usize = 512;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 fn db_err(e: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::internal(format!("database error: {}", e))
@@ -64,6 +66,16 @@ fn require_user(ctx: &HandlerContext) -> Result<String, ProtocolError> {
             "missing user_id in session",
         )
     })
+}
+
+fn check_note_size(title: &str, body: &str) -> Result<(), ProtocolError> {
+    if title.len() > MAX_TITLE_BYTES {
+        return Err(ProtocolError::bad_request("note title too long"));
+    }
+    if body.len() > MAX_BODY_BYTES {
+        return Err(ProtocolError::bad_request("note body too long"));
+    }
+    Ok(())
 }
 
 fn body_preview(body: &str) -> String {
@@ -129,12 +141,14 @@ pub fn notes_dispatch(
             })
         }
         NotesRequest::Create(r) => {
+            check_note_size(&r.title, &r.body)?;
             let id =
                 repository::create_note(&ctx.state.db, &uid, &r.title, &r.body).map_err(db_err)?;
             audit(ctx, "note_create", Some(id));
             NotesResponse::Create(NoteCreateResponse { id })
         }
         NotesRequest::Update(r) => {
+            check_note_size(&r.title, &r.body)?;
             repository::update_note(&ctx.state.db, r.note_id, &uid, &r.title, &r.body)
                 .map_err(not_found_err)?;
             let updated = repository::get_note(&ctx.state.db, r.note_id, &uid)

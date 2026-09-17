@@ -180,7 +180,8 @@ const ENCRYPTED_SETTING_KEYS: &[&str] = &[
     "vision_bundle_api_key",
 ];
 
-/// Okresla sciezke do master key — priorytet: custom_dir, document_dir (iOS sandbox), home_dir, data_dir
+/// Okresla sciezke do master key — priorytet: custom_dir, TENTAFLOW_HOME,
+/// (iOS) document_dir, home_dir, data_dir.
 pub fn master_key_path(custom_dir: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
     if let Some(dir) = custom_dir {
         return Ok(dir.join("master.key"));
@@ -188,10 +189,13 @@ pub fn master_key_path(custom_dir: Option<&std::path::Path>) -> anyhow::Result<s
     if let Ok(home) = std::env::var("TENTAFLOW_HOME") {
         return Ok(std::path::PathBuf::from(home).join("master.key"));
     }
-    // Na iOS home_dir wskazuje na root sandboxa, ale zapis dozwolony jest tylko
-    // wewnatrz Documents/ — uzywamy document_dir zeby uniknac "Operation not permitted".
-    if let Some(docs) = dirs::document_dir() {
-        return Ok(docs.join("tentaflow-ai").join("master.key"));
+    // iOS only: home_dir is the sandbox root and the app may write solely inside
+    // Documents/. Everywhere else Documents is the folder cloud sync (iCloud
+    // Drive, OneDrive) uploads, which is no place for the key to every secret.
+    if cfg!(target_os = "ios") {
+        if let Some(path) = documents_master_key_path() {
+            return Ok(path);
+        }
     }
     if let Some(home) = dirs::home_dir() {
         return Ok(home.join(MASTER_KEY_PATH));
@@ -202,12 +206,93 @@ pub fn master_key_path(custom_dir: Option<&std::path::Path>) -> anyhow::Result<s
     anyhow::bail!("Nie mozna okreslic katalogu na master key (brak home_dir i data_dir)")
 }
 
+fn documents_master_key_path() -> Option<std::path::PathBuf> {
+    dirs::document_dir().map(|docs| docs.join("tentaflow-ai").join("master.key"))
+}
+
+/// One-time move of a master key out of the Documents folder, where every
+/// platform used to keep it before that location was narrowed to iOS.
+///
+/// The Documents key is the one the installation has been encrypting with, so
+/// it wins: a file already at `target` predates the Documents era and decrypts
+/// nothing current. It is set aside under a dated name rather than deleted,
+/// because a key is the one file nobody can regenerate.
+fn move_master_key_out_of_documents(
+    legacy: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<bool> {
+    if legacy == target || !legacy.exists() {
+        return Ok(false);
+    }
+    let key_hex = std::fs::read_to_string(legacy)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if target.exists() {
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let aside = target.with_file_name(format!("master.key.superseded-{stamp}"));
+        std::fs::rename(target, &aside)?;
+        tracing::warn!(
+            "Master key at {} was superseded by the one from {}; kept as {}",
+            target.display(),
+            legacy.display(),
+            aside.display()
+        );
+    }
+    write_new_key_file(target, key_hex.trim())?;
+    std::fs::remove_file(legacy)?;
+    if let Some(dir) = legacy.parent() {
+        // Only succeeds when the directory is empty — anything else the user
+        // keeps there stays.
+        let _ = std::fs::remove_dir(dir);
+    }
+    tracing::info!(
+        "Master key moved from {} to {}",
+        legacy.display(),
+        target.display()
+    );
+    Ok(true)
+}
+
+/// Creates the key file with owner-only access from the first byte: a plain
+/// write followed by chmod leaves it world-readable for an instant, and for
+/// good if the chmod fails.
+fn write_new_key_file(path: &std::path::Path, key_hex: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(key_hex.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    #[cfg(not(unix))]
+    std::fs::write(path, key_hex)?;
+
+    #[cfg(windows)]
+    restrict_file_acl_windows(path);
+
+    Ok(())
+}
+
 /// Laduje master key z pliku lub generuje nowy
 /// custom_dir: opcjonalny katalog (mobile/desktop podaja swoj data_dir)
 pub fn load_or_create_master_key_in(
     custom_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<[u8; 32]> {
     let key_path = master_key_path(custom_dir)?;
+
+    let uses_default_location = custom_dir.is_none() && std::env::var("TENTAFLOW_HOME").is_err();
+    if uses_default_location && !cfg!(target_os = "ios") {
+        if let Some(legacy) = documents_master_key_path() {
+            move_master_key_out_of_documents(&legacy, &key_path)?;
+        }
+    }
 
     if key_path.exists() {
         let key_hex = std::fs::read_to_string(&key_path)?;
@@ -233,18 +318,7 @@ pub fn load_or_create_master_key_in(
         }
 
         let hex_str = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-        std::fs::write(&key_path, &hex_str)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-
-        #[cfg(windows)]
-        {
-            restrict_file_acl_windows(&key_path);
-        }
+        write_new_key_file(&key_path, &hex_str)?;
 
         tracing::info!("Wygenerowano nowy master key: {}", key_path.display());
         Ok(key)
@@ -290,14 +364,23 @@ impl SettingsCipher {
         }
     }
 
-    /// Czy ten klucz settings powinien byc szyfrowany
+    /// Czy ten klucz settings powinien byc szyfrowany. The name match is
+    /// deliberately broad: encrypting a value that did not need it costs
+    /// nothing, while a missed secret sits in the database in plaintext.
     pub fn should_encrypt(key: &str) -> bool {
+        const SECRET_NAME_PARTS: &[&str] = &[
+            "_key",
+            "_secret",
+            "_token",
+            "_password",
+            "api_key",
+            "pepper",
+            "credential",
+            "passphrase",
+            "private",
+        ];
         ENCRYPTED_SETTING_KEYS.contains(&key)
-            || key.contains("_key")
-            || key.contains("_secret")
-            || key.contains("_token")
-            || key.contains("_password")
-            || key.contains("api_key")
+            || SECRET_NAME_PARTS.iter().any(|part| key.contains(part))
     }
 
     /// Szyfruj wartosc. Zwraca "enc:base64(nonce||ciphertext)"
@@ -482,6 +565,63 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LIVE_KEY: &str = "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11";
+    const STALE_KEY: &str = "bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22";
+
+    #[test]
+    fn a_documents_master_key_moves_to_the_private_location() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let legacy = root.path().join("Documents/tentaflow-ai/master.key");
+        let target = root.path().join(".tentaflow/master.key");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, LIVE_KEY).unwrap();
+
+        assert!(move_master_key_out_of_documents(&legacy, &target).unwrap());
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), LIVE_KEY);
+        assert!(!legacy.exists());
+        assert!(!legacy.parent().unwrap().exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Nothing left to move on the next start.
+        assert!(!move_master_key_out_of_documents(&legacy, &target).unwrap());
+    }
+
+    /// The Documents key is the one in use; a key already sitting at the target
+    /// is older and must be kept aside, never overwritten into oblivion.
+    #[test]
+    fn the_documents_key_wins_and_the_older_key_is_kept_aside() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let legacy = root.path().join("Documents/tentaflow-ai/master.key");
+        let target = root.path().join(".tentaflow/master.key");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, LIVE_KEY).unwrap();
+        std::fs::write(&target, STALE_KEY).unwrap();
+        std::fs::write(legacy.parent().unwrap().join("notes.txt"), "mine").unwrap();
+
+        assert!(move_master_key_out_of_documents(&legacy, &target).unwrap());
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), LIVE_KEY);
+        let kept: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("master.key.superseded-"))
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), STALE_KEY);
+        // The user's other files in that Documents folder are not ours to remove.
+        assert!(legacy.parent().unwrap().join("notes.txt").exists());
+    }
 
     #[test]
     fn settings_cipher_encrypt_decrypt_roundtrip() {

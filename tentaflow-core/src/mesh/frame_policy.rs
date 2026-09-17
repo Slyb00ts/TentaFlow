@@ -6,9 +6,10 @@
 // =============================================================================
 
 use tentaflow_protocol::mesh::{
-    MESH_MSG_HEARTBEAT, MESH_MSG_HELLO, MESH_MSG_KNOWN_PEERS, MESH_MSG_NODE_INFO,
-    MESH_MSG_PAIRING_CONFIRM, MESH_MSG_PAIRING_REJECT, MESH_MSG_PAIRING_REQUEST,
-    MESH_MSG_TOPOLOGY_ANNOUNCE,
+    MESH_MSG_COMMAND, MESH_MSG_HEARTBEAT, MESH_MSG_HELLO, MESH_MSG_HMAC_KEYS_SYNC,
+    MESH_MSG_KNOWN_PEERS, MESH_MSG_NODE_INFO, MESH_MSG_PAIRING_CONFIRM, MESH_MSG_PAIRING_REJECT,
+    MESH_MSG_PAIRING_REQUEST, MESH_MSG_SHARED_SECRETS_SYNC, MESH_MSG_TOPOLOGY_ANNOUNCE,
+    MESH_MSG_TRUSTED_KEYS_SYNC, MESH_MSG_TRUST_REVOKED,
 };
 
 /// Returns `true` for frames that may be accepted from peers that are NOT yet
@@ -43,10 +44,43 @@ pub fn is_discovery_noise_frame(frame_type: u8) -> bool {
     )
 }
 
+/// Frames that change security or execution state on the receiver and are
+/// therefore admitted at most once, inside the clock window. Telemetry,
+/// discovery and ledger sync stay outside: they are high-volume, idempotent,
+/// and must keep flowing from a node whose clock has drifted, so that the
+/// node stays visible while its commands are refused.
+#[inline]
+pub fn is_replay_guarded_frame(frame_type: u8) -> bool {
+    matches!(
+        frame_type,
+        MESH_MSG_COMMAND
+            | MESH_MSG_TRUSTED_KEYS_SYNC
+            | MESH_MSG_TRUST_REVOKED
+            | MESH_MSG_HMAC_KEYS_SYNC
+            | MESH_MSG_SHARED_SECRETS_SYNC
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tentaflow_protocol::mesh::*;
+
+    #[test]
+    fn state_changing_frames_are_replay_guarded_and_telemetry_is_not() {
+        for guarded in [
+            MESH_MSG_COMMAND,
+            MESH_MSG_TRUSTED_KEYS_SYNC,
+            MESH_MSG_TRUST_REVOKED,
+            MESH_MSG_HMAC_KEYS_SYNC,
+            MESH_MSG_SHARED_SECRETS_SYNC,
+        ] {
+            assert!(is_replay_guarded_frame(guarded));
+        }
+        for open in [MESH_MSG_HEARTBEAT, MESH_MSG_SYNC_PUSH, MESH_MSG_PAIRING_CONFIRM] {
+            assert!(!is_replay_guarded_frame(open));
+        }
+    }
 
     #[test]
     fn pairing_request_is_pre_trust() {

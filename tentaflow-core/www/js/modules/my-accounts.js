@@ -1,17 +1,34 @@
 // =============================================================================
 // Plik: modules/my-accounts.js
-// Opis: Ekran "Moje polaczone konta" (widok user-a). Grid kart per (addon,
-//       provider) w trybie individual. Karty maja trzy stany: active / expired
-//       / not_connected. Zrodlo danych: MyOAuthAccountsListRequest.
+// Opis: Ekran "Moje polaczone konta" (widok user-a). Dwie sekcje kart:
+//       dodatki per (addon, provider) w trybie individual
+//       (MyOAuthAccountsListRequest) oraz aplikacje agentowe per silnik CLI
+//       (U01, ProviderAccountBody: MyAccountList + AccountList po katalog
+//       silnikow). Karty dodatkow maja stany active / expired / not_connected,
+//       karty aplikacji — wlasne konto uzytkownika i konta firmowe mu nadane.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, toast } from '/js/utils.js';
+import { byId, escapeAttr, escapeHtml, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { runOAuthPopup } from '/js/modules/addons/oauth-popup.js';
+import {
+  AgentAccounts,
+  T,
+  accountSubtitle,
+  engineName,
+  engineTile,
+  statusChipHtml,
+  whenLabel,
+} from '/js/modules/agent-accounts.js';
+import { openCreateAccountWindow } from '/js/modules/agent-accounts-window.js';
 
 let entries = [];
+// U01 — the caller's agent applications: the engine catalog and the accounts
+// they may use, one card per engine.
+let agentEngines = [];
+let agentAccounts = [];
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
@@ -92,7 +109,11 @@ const MyAccountsScreen = {
           <div>${I18n.t('my_accounts.alert_explainer')}</div>
         </div>
 
+        <h4 class="aa-sub-h">${escapeHtml(I18n.t('my_accounts.section_addons'))}</h4>
         <div id="myacc-grid" class="myapps-grid"></div>
+
+        <h4 class="aa-sub-h">${escapeHtml(T('apps_section'))}</h4>
+        <div id="myacc-apps" class="myapps-grid"></div>
       </div>
     `;
   },
@@ -102,11 +123,13 @@ const MyAccountsScreen = {
       ?.closest('.myaccounts-page')
       ?.querySelector('[data-role="refresh-all"]')
       ?.addEventListener('click', () => onRefreshAll());
-    await loadAll();
+    await Promise.all([loadAll(), loadAgentApps()]);
   },
 
   unmount() {
     entries = [];
+    agentEngines = [];
+    agentAccounts = [];
   },
 };
 
@@ -368,6 +391,145 @@ async function onRefreshAll() {
   }
   await loadAll();
   toast(I18n.t('my_accounts.refresh_success', { n: done }), 'success');
+}
+
+// =============================================================================
+// U01 — Aplikacje agentowe
+// =============================================================================
+
+// The engine catalog comes from the admin list request, which answers any
+// caller (a non-administrator simply gets their own and granted accounts back);
+// the accounts themselves come from the caller's own list, which is the one
+// that says whether they may delete each of them.
+async function loadAgentApps() {
+  try {
+    const [catalog, mine] = await Promise.all([
+      AgentAccounts.list({}),
+      AgentAccounts.mine(),
+    ]);
+    agentEngines = catalog?.engines ?? [];
+    agentAccounts = mine?.accounts ?? [];
+  } catch (err) {
+    agentEngines = [];
+    agentAccounts = [];
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+  }
+  renderAgentApps();
+}
+
+function renderAgentApps() {
+  const grid = byId('myacc-apps');
+  if (!grid) return;
+  if (!agentEngines.length) {
+    grid.innerHTML = `<div class="aa-apps-empty">${escapeHtml(T('apps_empty'))}</div>`;
+    return;
+  }
+  grid.innerHTML = agentEngines
+    .map((engine) => renderAgentCard(engine.engine_id ?? engine.engineId))
+    .join('');
+  wireAgentCards(grid);
+}
+
+function renderAgentCard(engineId) {
+  const forEngine = agentAccounts.filter((a) => (a.engine_id ?? a.engineId) === engineId);
+  const own = forEngine.find((a) => a.scope === 'user') ?? null;
+  const shared = forEngine.filter((a) => a.scope !== 'user');
+  const head = own
+    ? statusChipHtml(own)
+    : `<tf-chip status="info" label="${escapeAttr(T('apps_not_connected'))}"></tf-chip>`;
+  return `
+    <div class="myapp-card aa-app-card" data-engine="${escapeHtml(engineId)}">
+      <div class="myapp-head">
+        ${engineTile(engineId)}
+        <div class="myapp-meta">
+          <div class="myapp-name">${escapeHtml(engineName(engineId, agentEngines))}</div>
+          <div class="myapp-desc">${escapeHtml(T('apps_card_sub'))}</div>
+        </div>
+        ${head}
+      </div>
+      ${own ? renderOwnAccount(own) : renderConnectPrompt()}
+      ${shared.map(renderSharedAccount).join('')}
+    </div>
+  `;
+}
+
+function renderOwnAccount(account) {
+  const title = accountSubtitle(account) || account.display_name || '';
+  const lastUsed = account.last_used_at ?? account.lastUsedAt;
+  const meta = lastUsed ? T('apps_last_used', { when: whenLabel(lastUsed) }) : T('apps_never_used');
+  const canDelete = (account.can_delete ?? account.canDelete) !== false;
+  return `
+    <div class="myapp-linked">
+      <div class="linked-avatar">${escapeHtml(initials(title))}</div>
+      <div class="linked-info">
+        <div class="linked-email">${escapeHtml(title)}</div>
+        <div class="linked-meta">${escapeHtml(meta)}</div>
+      </div>
+      <div class="linked-actions">
+        ${canDelete ? `<tf-button variant="ghost" size="sm" data-role="app-disconnect">${escapeHtml(T('apps_disconnect'))}</tf-button>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+// A shared account is somebody else's to manage: it is listed so the user knows
+// which company account their agents may use, with no action they could take.
+function renderSharedAccount(account) {
+  const subtitle = accountSubtitle(account);
+  return `
+    <div class="myapp-linked">
+      <div class="linked-avatar">${escapeHtml(initials(account.display_name ?? ''))}</div>
+      <div class="linked-info">
+        <div class="linked-email">${escapeHtml(account.display_name ?? '')}</div>
+        <div class="linked-meta">${escapeHtml([T('apps_shared'), subtitle].filter(Boolean).join(' · '))}</div>
+      </div>
+      <div class="linked-actions">${statusChipHtml(account)}</div>
+    </div>
+  `;
+}
+
+function renderConnectPrompt() {
+  return `
+    <div class="myapp-unlinked">
+      <div class="muted-text">${escapeHtml(T('apps_connect_hint'))}</div>
+      <tf-button variant="primary" size="sm" data-role="app-connect">${escapeHtml(T('apps_connect'))}</tf-button>
+    </div>
+  `;
+}
+
+function wireAgentCards(grid) {
+  grid.querySelectorAll('.myapp-card[data-engine]').forEach((card) => {
+    const engineId = card.dataset.engine;
+    card.querySelector('[data-role="app-connect"]')?.addEventListener('click', () => {
+      const engine = agentEngines.find((e) => (e.engine_id ?? e.engineId) === engineId);
+      openCreateAccountWindow({
+        engines: engine ? [engine] : agentEngines,
+        scope: 'user',
+        onCreated: () => loadAgentApps(),
+      });
+    });
+    card.querySelector('[data-role="app-disconnect"]')?.addEventListener('click', async () => {
+      const account = agentAccounts.find(
+        (a) => (a.engine_id ?? a.engineId) === engineId && a.scope === 'user',
+      );
+      if (!account) return;
+      const ok = await TfWindow.confirm({
+        title: T('apps_disconnect_confirm_title'),
+        message: T('apps_disconnect_confirm_body', { name: escapeHtml(account.display_name ?? '') }),
+        confirmLabel: T('apps_disconnect'),
+        cancelLabel: I18n.t('common.cancel'),
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        await AgentAccounts.remove(account.account_id ?? account.accountId);
+        toast(T('apps_disconnected'), 'success');
+        await loadAgentApps();
+      } catch (err) {
+        toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+      }
+    });
+  });
 }
 
 export default MyAccountsScreen;

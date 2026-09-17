@@ -2427,6 +2427,24 @@ fn validate_manifest(manifest: &AddonManifest) -> Result<()> {
     if manifest.version.is_empty() {
         bail!("addon.version is empty");
     }
+    if manifest.version.len() > 64 {
+        bail!("addon.version too long (max 64 chars)");
+    }
+    // Both values become path components of the package store
+    // (`packages/<addon_id>/<version>`), which install wipes with
+    // `remove_dir_all` — a separator or a dot-only segment would escape it.
+    if !manifest
+        .version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '+')
+    {
+        bail!("addon.version contains disallowed characters (allowed: a-z, 0-9, '.', '-', '_', '+')");
+    }
+    for (field, value) in [("addon.id", &manifest.addon_id), ("addon.version", &manifest.version)] {
+        if value.chars().all(|c| c == '.') {
+            bail!("{field} must not be a dot-only path segment");
+        }
+    }
     if manifest.display_name.is_empty() {
         bail!("addon.name is empty");
     }

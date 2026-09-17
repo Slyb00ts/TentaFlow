@@ -225,7 +225,6 @@ async fn run_pairing(
     joiner_node_id: String,
 ) -> BaselineImportReport {
     let (mut joiner_stream, mut donor_stream) = DuplexFrameStream::pair();
-    let cipher = test_cipher();
 
     let donor_task = {
         let donor_node_id = donor_node_id.clone();
@@ -246,7 +245,6 @@ async fn run_pairing(
             &joiner_pool,
             &joiner_node_id,
             &donor_node_id,
-            &cipher,
             0,
         )
         .await

@@ -10921,10 +10921,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "changed", changed.into());
         }
-        MessageBody::BusBody(envelope) => decode_bus_payload(&obj, envelope),
         MessageBody::TentaNasBody(payload) => decode_tentanas_payload(&obj, payload),
         MessageBody::TentaQuantBody(payload) => decode_tentaquant_payload(&obj, payload),
         MessageBody::TentaVmBody(payload) => decode_tentavm_payload(&obj, payload),
+        MessageBody::ProviderAccountBody(payload) => {
+            decode_provider_account_payload(&obj, payload)
+        }
     }
     Ok(obj.into())
 }
@@ -12326,6 +12328,46 @@ fn decode_code_studio_payload(
             }
         }
         _ => set(obj, "variant", "CodeStudioDecodeError".into()),
+    }
+}
+
+/// Decodes `ProviderAccountPayload` (agent provider accounts, grants, sessions,
+/// the node matrix) through the same generic path as
+/// `decode_code_studio_payload`: the tag becomes "ProviderAccount" + name and
+/// every field lands under both snake_case and camelCase. No variant carries
+/// raw bytes — a credential never travels to the browser in any form — so an
+/// appended variant decodes here without touching this crate.
+fn decode_provider_account_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::provider_account::ProviderAccountPayload,
+) {
+    let value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(_) => {
+            set(obj, "variant", "ProviderAccountDecodeError".into());
+            return;
+        }
+    };
+    match value {
+        serde_json::Value::String(name) => {
+            set(obj, "variant", format!("ProviderAccount{name}").into());
+        }
+        serde_json::Value::Object(map) => {
+            if let Some((name, fields)) = map.into_iter().next() {
+                set(obj, "variant", format!("ProviderAccount{name}").into());
+                if let serde_json::Value::Object(fields) = fields {
+                    for (key, val) in &fields {
+                        let js_val = json_value_to_js_dual(val);
+                        let camel = snake_key_to_camel(key);
+                        if &camel != key {
+                            set(obj, &camel, js_val.clone());
+                        }
+                        set(obj, key, js_val);
+                    }
+                }
+            }
+        }
+        _ => set(obj, "variant", "ProviderAccountDecodeError".into()),
     }
 }
 
@@ -22668,6 +22710,287 @@ pub fn encode_code_studio_project_link_set_request(
 #[wasm_bindgen(js_name = encodeCodeStudioRepoTreeRequest)]
 pub fn encode_code_studio_repo_tree_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_code_studio_json_request("RepoTreeRequest", &request_json)
+}
+
+// =============================================================================
+// Agent provider accounts — `MessageBody::ProviderAccountBody`. Built from a
+// JSON object of the variant's fields, exactly like Code Studio and TentaNas:
+// the dashboard hands over the payload it already holds and the enum is
+// deserialized from `{ variant: fields }`.
+//
+// The login exchange (`Login*`), `SessionRevokeRequest` and the runtime
+// install/uninstall pair have NO encoder here on purpose: this node answers
+// them with `NotAvailable`, and an encoder would invite a screen to send a
+// request whose only possible outcome is a refusal. They arrive with the
+// package that implements them.
+//
+// `CredentialSetRequest.material` is an API key. It rides the same encrypted
+// transport as every other field and the core stores it through the settings
+// cipher; nothing here logs or echoes it.
+// =============================================================================
+
+fn encode_provider_account_json_request(
+    variant: &str,
+    fields_json: &str,
+) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::provider_account::ProviderAccountPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::ProviderAccountBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// The administrator's account list (A01) and, for everybody else, the accounts
+/// they own or were granted.
+#[wasm_bindgen(js_name = encodeProviderAccountListRequest)]
+pub fn encode_provider_account_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("AccountListRequest", &request_json)
+}
+
+/// One account with its grants, sessions, nodes and agents (A03/A04).
+#[wasm_bindgen(js_name = encodeProviderAccountGetRequest)]
+pub fn encode_provider_account_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("AccountGetRequest", &request_json)
+}
+
+/// Creates a shared (`global`) or personal (`user`) account.
+#[wasm_bindgen(js_name = encodeProviderAccountCreateRequest)]
+pub fn encode_provider_account_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("AccountCreateRequest", &request_json)
+}
+
+/// Renames an account or changes its status.
+#[wasm_bindgen(js_name = encodeProviderAccountUpdateRequest)]
+pub fn encode_provider_account_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("AccountUpdateRequest", &request_json)
+}
+
+/// Deletes an account.
+#[wasm_bindgen(js_name = encodeProviderAccountDeleteRequest)]
+pub fn encode_provider_account_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("AccountDeleteRequest", &request_json)
+}
+
+/// Stores the API key of an `api_key` account.
+#[wasm_bindgen(js_name = encodeProviderAccountCredentialSetRequest)]
+pub fn encode_provider_account_credential_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("CredentialSetRequest", &request_json)
+}
+
+/// Removes the stored credential of an account.
+#[wasm_bindgen(js_name = encodeProviderAccountCredentialClearRequest)]
+pub fn encode_provider_account_credential_clear_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("CredentialClearRequest", &request_json)
+}
+
+/// Replaces the whole grant list of one account (A04 — one save).
+#[wasm_bindgen(js_name = encodeProviderAccountGrantsSetRequest)]
+pub fn encode_provider_account_grants_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("GrantsSetRequest", &request_json)
+}
+
+/// The live sessions of one account (A03).
+#[wasm_bindgen(js_name = encodeProviderAccountSessionListRequest)]
+pub fn encode_provider_account_session_list_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("SessionListRequest", &request_json)
+}
+
+/// The caller's own accounts plus the shared ones granted to them (U01).
+#[wasm_bindgen(js_name = encodeProviderAccountMyListRequest)]
+pub fn encode_provider_account_my_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("MyAccountListRequest", &request_json)
+}
+
+/// The node × engine matrix (N01).
+#[wasm_bindgen(js_name = encodeProviderAccountRuntimeListRequest)]
+pub fn encode_provider_account_runtime_list_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("RuntimeListRequest", &request_json)
+}
+
+/// Turns credential delivery to one node on or off (N01 toggle).
+#[wasm_bindgen(js_name = encodeProviderAccountRuntimeSetReceivesAccountsRequest)]
+pub fn encode_provider_account_runtime_set_receives_accounts_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("RuntimeSetReceivesAccountsRequest", &request_json)
+}
+
+#[cfg(test)]
+mod provider_account_codec_tests {
+    use super::*;
+
+    /// The variants this node answers with `NotAvailable`
+    /// (`dispatch/provider_account.rs`). They are on the wire because the family
+    /// is append-only, and they deliberately have NO encoder: a screen that
+    /// could send one would only ever get a refusal back.
+    ///
+    /// Adding an encoder for one of these means its package landed — drop the
+    /// name from here in the same commit.
+    const DEFERRED: &[&str] = &[
+        "LoginStartRequest",
+        "LoginInputRequest",
+        "LoginStatusRequest",
+        "LoginCancelRequest",
+        "SessionRevokeRequest",
+        "RuntimeInstallRequest",
+        "RuntimeUninstallRequest",
+    ];
+
+    #[test]
+    fn provider_account_encoders_roundtrip_the_actual_protocol_body() {
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 12] = [
+            (
+                "AccountListRequest",
+                encode_provider_account_list_request,
+                r#"{"engine_id":"claude-code","scope":"global","query":"firma"}"#,
+            ),
+            (
+                "AccountGetRequest",
+                encode_provider_account_get_request,
+                r#"{"account_id":"acc-1"}"#,
+            ),
+            (
+                "AccountCreateRequest",
+                encode_provider_account_create_request,
+                r#"{"engine_id":"codex","display_name":"Codex — firma","scope":"global","owner_user_id":null,"credential_kind":"api_key"}"#,
+            ),
+            (
+                "AccountUpdateRequest",
+                encode_provider_account_update_request,
+                r#"{"account_id":"acc-1","display_name":"Nowa nazwa","status":null}"#,
+            ),
+            (
+                "AccountDeleteRequest",
+                encode_provider_account_delete_request,
+                r#"{"account_id":"acc-1"}"#,
+            ),
+            (
+                "CredentialSetRequest",
+                encode_provider_account_credential_set_request,
+                r#"{"account_id":"acc-1","material":"test-key-not-real"}"#,
+            ),
+            (
+                "CredentialClearRequest",
+                encode_provider_account_credential_clear_request,
+                r#"{"account_id":"acc-1"}"#,
+            ),
+            (
+                "GrantsSetRequest",
+                encode_provider_account_grants_set_request,
+                r#"{"account_id":"acc-1","grants":[{"subject_type":"user","subject_id":"u-1","display_name":"","member_count":null},{"subject_type":"org","subject_id":"","display_name":"","member_count":null}]}"#,
+            ),
+            (
+                "SessionListRequest",
+                encode_provider_account_session_list_request,
+                r#"{"account_id":"acc-1"}"#,
+            ),
+            (
+                "MyAccountListRequest",
+                encode_provider_account_my_list_request,
+                r#"{"engine_id":null}"#,
+            ),
+            (
+                "RuntimeListRequest",
+                encode_provider_account_runtime_list_request,
+                "{}",
+            ),
+            (
+                "RuntimeSetReceivesAccountsRequest",
+                encode_provider_account_runtime_set_receives_accounts_request,
+                r#"{"node_id":"node-1","enabled":true}"#,
+            ),
+        ];
+        for (variant, encode, fields) in cases {
+            let bytes = encode(fields.to_owned()).unwrap();
+            let decoded: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+            let MessageBody::ProviderAccountBody(payload) = decoded else {
+                panic!("{variant} left the provider account family");
+            };
+            let expected_fields: serde_json::Value = serde_json::from_str(fields).unwrap();
+            let expected: tentaflow_protocol::provider_account::ProviderAccountPayload =
+                serde_json::from_value(serde_json::json!({ variant: expected_fields })).unwrap();
+            assert_eq!(payload, expected, "{variant} wire drift");
+        }
+    }
+
+    /// Every request variant of the family is either encodable from BOTH halves
+    /// (wasm + `codec.js`) or explicitly deferred. Mirrors the TentaNas test
+    /// below: the variant list is read from the protocol source, so appending a
+    /// variant there fails here until its encoder exists — a missing `codec.js`
+    /// entry is otherwise invisible until a real browser raises "unknown request
+    /// kind" at the click.
+    #[test]
+    fn every_request_variant_is_encodable_or_explicitly_deferred() {
+        const PROTOCOL_SRC: &str = include_str!("../../tentaflow-protocol/src/provider_account.rs");
+        const OWN_SRC: &str = include_str!("lib.rs");
+        const CODEC_JS: &str = include_str!("../../tentaflow-core/www/js/protocol/codec.js");
+
+        let body = PROTOCOL_SRC
+            .split_once("pub enum ProviderAccountPayload {")
+            .expect("ProviderAccountPayload enum")
+            .1;
+        let mut requests = Vec::new();
+        for line in body.lines() {
+            if line == "}" {
+                break;
+            }
+            let Some(rest) = line.strip_prefix("    ") else {
+                continue;
+            };
+            if rest.starts_with(' ') || !rest.starts_with(char::is_uppercase) {
+                continue;
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.ends_with("Request") {
+                requests.push(name);
+            }
+        }
+        assert_eq!(
+            requests.len(),
+            19,
+            "the parser found {} request variants, which cannot be right",
+            requests.len()
+        );
+
+        let mut problems = Vec::new();
+        for variant in &requests {
+            let has_encoder =
+                OWN_SRC.contains(&format!("encode_provider_account_json_request(\"{variant}\""));
+            // `codec.js` names the entry after the variant with the family
+            // prefix, minus the "Account"/"Request" noise the JS side drops.
+            let has_codec_entry = CODEC_JS.contains(&format!("// wire: {variant}\n"));
+            if DEFERRED.contains(&variant.as_str()) {
+                if has_encoder || has_codec_entry {
+                    problems.push(format!(
+                        "{variant} is listed as deferred but already has an encoder — its \
+                         package landed, so remove it from DEFERRED"
+                    ));
+                }
+                continue;
+            }
+            if !has_encoder {
+                problems.push(format!("{variant} has no wasm encoder"));
+            }
+            if !has_codec_entry {
+                problems.push(format!("{variant} has no codec.encode entry"));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
+    }
 }
 
 // =============================================================================

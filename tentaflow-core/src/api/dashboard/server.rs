@@ -230,6 +230,7 @@ impl DashboardServer {
         let port_allocator = self.port_allocator.clone();
         let mesh_services_registry = self.mesh_services_registry.clone();
 
+
         crate::scheduler::start(db.clone(), addon_manager.clone());
 
         // Wire up cross-node service action handlers (krok N3b). The mesh
@@ -316,7 +317,7 @@ impl DashboardServer {
                     db.clone(),
                     Some(service_manager.clone()),
                 ),
-                vnc_tunnels: Arc::new(dashmap::DashMap::new()),
+                vnc_tunnels: super::vnc_tunnel::shared_registry(),
                 mesh_relay_health: mesh_relay_health.clone(),
                 port_allocator: port_allocator.clone(),
                 mesh_services_registry: mesh_services_registry.clone(),
@@ -451,10 +452,18 @@ fn is_localhost_origin(origin: &str) -> bool {
     let host = origin
         .trim_start_matches("https://")
         .trim_start_matches("http://");
-    let host_without_port = host.split(':').next().unwrap_or("");
+
+    let host_without_port = if host.starts_with('[') {
+        // IPv6: extract from [addr]:port or [addr]
+        host.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        // IPv4 or hostname: split on first colon
+        host.split(':').next().unwrap_or("")
+    };
+
     matches!(
         host_without_port,
-        "localhost" | "127.0.0.1" | "[::1]" | "::1"
+        "localhost" | "127.0.0.1" | "::1"
     )
 }
 
@@ -544,6 +553,18 @@ fn make_static_response_with_origin(
         builder = builder
             .header("ETag", &quoted)
             .header("Cache-Control", "no-cache");
+    }
+
+    // Add security headers for HTML content to prevent framing and clickjacking.
+    // CSP with frame-ancestors 'none' + base-uri 'self' + object-src 'none' prevents
+    // embedding and restricts object/embed tags. X-Frame-Options is a legacy fallback.
+    if content_type.contains("text/html") {
+        builder = builder
+            .header("X-Frame-Options", "DENY")
+            .header(
+                "Content-Security-Policy",
+                "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+            );
     }
 
     if let Some(o) = origin {
@@ -1047,9 +1068,8 @@ pub async fn handle_request(
     }
 
     // VULN-038: CSRF — sprawdz Origin/Referer na requestach mutujacych
-    // Wyklucz endpointy publiczne (login, SSO callback) — nie maja Auth header
-    let csrf_exempt = path == "/api/auth/login"
-        || path.contains("/oauth/callback")
+    // Wyklucz endpointy publiczne (SSO callback, frame pickup) — nie maja Auth header
+    let csrf_exempt = path.contains("/oauth/callback")
         || path.contains("/sso/callback")
         || path == "/core/frame/pickup";
     if !csrf_exempt && (method == Method::POST || method == Method::PUT || method == Method::DELETE)
@@ -1068,7 +1088,12 @@ pub async fn handle_request(
             let origin_host = origin
                 .trim_start_matches("https://")
                 .trim_start_matches("http://");
-            if !origin_host.is_empty() && !host.is_empty() && !origin_host.starts_with(host) {
+            // Exact match: a prefix test accepts `<host>.attacker.example`.
+            // Browsers omit a default port in both headers, so they agree.
+            if !origin_host.is_empty()
+                && !host.is_empty()
+                && !origin_host.eq_ignore_ascii_case(host)
+            {
                 return Ok(json_error_cors(
                     403,
                     "Niedozwolone zrodlo zadania (CSRF)",
@@ -1194,7 +1219,7 @@ pub async fn handle_request(
             addon_manager: addon_manager.clone(),
             license: license.clone(),
             meeting_manager,
-            vnc_tunnels: std::sync::Arc::new(dashmap::DashMap::new()),
+            vnc_tunnels: super::vnc_tunnel::shared_registry(),
             mesh_relay_health: mesh_relay_health.clone(),
             port_allocator: port_allocator.clone(),
             mesh_services_registry: mesh_services_registry.clone(),
@@ -1206,6 +1231,7 @@ pub async fn handle_request(
 
         let upgrade = hyper::upgrade::on(&mut req);
 
+        let client_ip = client_ip.clone();
         tokio::spawn(async move {
             match upgrade.await {
                 Ok(upgraded) => {
@@ -1216,6 +1242,7 @@ pub async fn handle_request(
                         role,
                         resume_secret,
                         app_state,
+                        client_ip,
                     )
                     .await;
                 }
@@ -1252,21 +1279,9 @@ pub async fn handle_request(
                 ))
             }
         };
-        // Okresl base URL z naglowka Host
-        let host = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("localhost:8080");
-        let scheme = if host.contains("localhost") || host.contains("127.0.0.1") {
-            "http"
-        } else {
-            "https"
-        };
-        let redirect_base = format!("{scheme}://{host}");
         let _ = req.collect().await?;
         let (status, body) = handle_result(
-            api_addon_system::handle_sso_login(&db, &cipher, provider_id, &redirect_base).await,
+            api_addon_system::handle_sso_login(&db, &cipher, provider_id).await,
             500,
         );
         return Ok(json_response_cors(status, body, cors_origin.as_deref()));
@@ -1274,17 +1289,6 @@ pub async fn handle_request(
 
     // SSO callback (bez auth — redirect od providera OIDC)
     if method == Method::GET && path == "/api/sso/callback" {
-        let host = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("localhost:8080");
-        let scheme = if host.contains("localhost") || host.contains("127.0.0.1") {
-            "http"
-        } else {
-            "https"
-        };
-        let redirect_base = format!("{scheme}://{host}");
         let _ = req.collect().await?;
 
         // Obsluga bledow — jesli Microsoft zwrocil blad
@@ -1316,34 +1320,21 @@ pub async fn handle_request(
             ));
         }
 
-        match api_addon_system::handle_sso_callback(
-            &db,
-            &cipher,
-            &query_string,
-            &redirect_base,
-            &settings_cipher,
-        )
-        .await
+        match api_addon_system::handle_sso_callback(&db, &cipher, &query_string, &settings_cipher)
+            .await
         {
-            Ok((_, body)) => {
-                // Parsuj odpowiedz zeby wyciagnac redirect_url
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if let Some(redirect_url) = parsed.get("redirect_url").and_then(|v| v.as_str())
-                    {
-                        // HTTP 302 redirect do dashboardu z tokenem
-                        let response = Response::builder()
-                            .status(StatusCode::FOUND)
-                            .header("Location", redirect_url)
-                            .body(Either::Left(Full::new(Bytes::new())))
-                            .unwrap();
-                        return Ok(response);
-                    }
-                }
-                return Ok(json_response_cors(200, body, cors_origin.as_deref()));
+            Ok(redirect_url) => {
+                let response = Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header("Location", redirect_url)
+                    .header("Cache-Control", "no-store")
+                    .header("Referrer-Policy", "no-referrer")
+                    .body(Either::Left(Full::new(Bytes::new())))
+                    .unwrap();
+                return Ok(response);
             }
             Err(e) => {
                 warn!("Blad SSO callback: {}", e);
-                tracing::error!("Blad SSO callback: {}", e);
                 return Ok(json_error_cors(
                     500,
                     "Wewnetrzny blad serwera",
@@ -2892,34 +2883,13 @@ pub async fn handle_request(
         }
     }
 
-    let (status, response_body) = route_api(
-        &method,
-        &path,
-        &db,
-        &claims,
-        &body_bytes,
-        port_allocator.clone(),
-    )
-    .await;
-
-    Ok(json_response_cors(
-        status,
-        response_body,
+    Ok(json_error_cors(
+        404,
+        "Endpoint nie znaleziony",
         cors_origin.as_deref(),
     ))
 }
 
-/// Routuje endpointy /api/* do odpowiednich handlerow
-async fn route_api(
-    _method: &Method,
-    _path: &str,
-    _db: &DbPool,
-    _claims: &auth::Claims,
-    _body: &[u8],
-    _port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
-) -> (u16, String) {
-    (404, r#"{"error":"Endpoint nie znaleziony"}"#.to_string())
-}
 
 /// Oblicza Sec-WebSocket-Accept z Sec-WebSocket-Key (RFC 6455)
 fn compute_ws_accept(key: &str) -> String {
@@ -3761,5 +3731,26 @@ mod tests {
             Some("password_change_required"),
             "password rotation must not promote an already-issued bootstrap token"
         );
+    }
+
+    #[test]
+    fn is_localhost_origin_parses_ipv6_correctly() {
+        // IPv6 with brackets and port
+        assert!(is_localhost_origin("https://[::1]:3000"));
+        assert!(is_localhost_origin("http://[::1]:8080"));
+        assert!(is_localhost_origin("https://[::1]"));
+
+        // IPv4 localhost
+        assert!(is_localhost_origin("https://127.0.0.1:3000"));
+        assert!(is_localhost_origin("http://127.0.0.1"));
+
+        // Hostname localhost
+        assert!(is_localhost_origin("https://localhost:3000"));
+        assert!(is_localhost_origin("http://localhost"));
+
+        // Non-localhost origins should reject
+        assert!(!is_localhost_origin("https://example.com:3000"));
+        assert!(!is_localhost_origin("https://192.168.1.1"));
+        assert!(!is_localhost_origin("https://[2001:db8::1]:3000"));
     }
 }

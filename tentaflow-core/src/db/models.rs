@@ -538,6 +538,11 @@ pub struct DbAgent {
     /// Which agents this one may delegate to (§ delegation roster).
     /// `None` = unrestricted, `Some("[]")` = nobody, `Some(json array)` = only those.
     pub allowed_agents_json: Option<String>,
+    /// What the agent RUNS on (migration 156): `{"kind":"llm"}` for a model
+    /// prompt loop, or a `"cli"` runtime naming an engine and a provider
+    /// account. Parsed by `agents::AgentRuntime`, which is also what validates
+    /// it on save.
+    pub runtime_json: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -567,6 +572,11 @@ pub struct AgentParams<'a> {
     /// in `validate_agent_params`; the column CHECK is the fleet-wide backstop.
     pub on_child_complete: &'a str,
     pub allowed_agents_json: Option<&'a str>,
+    /// See `DbAgent::runtime_json`. `agents::LLM_RUNTIME_JSON` is what a caller
+    /// with no runtime of its own passes — the shape is required rather than
+    /// optional so a save path cannot forget it and silently reset an agent's
+    /// CLI binding to the default.
+    pub runtime_json: &'a str,
     pub actor_user_id: Option<&'a str>,
 }
 

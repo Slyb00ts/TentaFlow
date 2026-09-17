@@ -247,8 +247,13 @@ pub fn init(
     let ledger = Arc::new(FjallSyncLedgerStore::open(&ledger_path)?);
     let needs_baseline_reset = ledger.needs_baseline_reset();
     let local_node_id = signer.ed25519_public_key_hex();
-    repository::ensure_local_node_in_sync_identity(&db, &local_node_id, &local_node_id)
-        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    repository::ensure_local_node_in_sync_identity(
+        &db,
+        &local_node_id,
+        &local_node_id,
+        &crate::mesh::node_info_collector::detect_platform(),
+    )
+    .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
     // Resume the HLC from the persisted ledger state so monotonicity survives a
     // restart: the first post-restart `now()` is strictly later than the last
     // timestamp this node minted or observed before shutting down.
@@ -672,7 +677,7 @@ pub fn apply_core_operation_locally(
         return Ok(None);
     };
     let operation = runtime.ledger.get_operation(op_id)?;
-    crate::sync::core_materializer::apply_core_operation(pool, &runtime.settings_cipher, &operation)
+    crate::sync::core_materializer::apply_core_operation(pool, &operation)
         .map(Some)
 }
 
@@ -969,7 +974,7 @@ impl SyncRuntime {
         // outbox was wiped by `reset_core_partitions`, this is repeatable: a
         // crash-and-retry re-emits the same snapshot into an empty outbox.
         let emitted =
-            repository::reseed_core_state_from_current_rows(&self.db, &self.settings_cipher)
+            repository::reseed_core_state_from_current_rows(&self.db)
                 .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         crate::sync::core_capture::drain_pending_core_captures_with(
             &self.db,
@@ -991,7 +996,7 @@ impl SyncRuntime {
         self.ledger.reset_core_partitions()?;
         crate::sync::core_capture::clear_core_capture_journal(&self.db)
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
-        repository::reseed_core_state_from_current_rows(&self.db, &self.settings_cipher)
+        repository::reseed_core_state_from_current_rows(&self.db)
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         crate::sync::core_capture::drain_pending_core_captures_with(
             &self.db,
@@ -1478,7 +1483,9 @@ impl SyncRuntime {
                 }
                 Err(e) => return Err(e),
             };
-            if !self.outbox_target_still_allowed(target.as_str(), &operation)? {
+            if carries_shared_secret(&operation)
+                || !self.outbox_target_still_allowed(target.as_str(), &operation)?
+            {
                 self.ledger.mark_acknowledged(target.clone(), entry.op_id)?;
                 continue;
             }
@@ -2422,9 +2429,14 @@ impl SyncRuntime {
             // A FULL op the local node may not materialize is admitted as redacted:
             // we still advance the chain (so we don't loop on it) but never apply
             // its body. A node that hands us a full op we are not a target for is
-            // not punished — we simply do not retain the body.
+            // not punished — we simply do not retain the body. A secret-bearing
+            // op is treated the same way on every node, so a plaintext secret
+            // sent by a peer never reaches the store.
             let entry = match &entry {
-                NodeChainEntry::Full(operation) if !self.local_target_allowed(operation)? => {
+                NodeChainEntry::Full(operation)
+                    if carries_shared_secret(operation)
+                        || !self.local_target_allowed(operation)? =>
+                {
                     NodeChainEntry::Redacted(RedactedRecord {
                         op_id: operation.op_id,
                         operation_hash: operation.operation_hash,
@@ -2769,7 +2781,6 @@ impl SyncRuntime {
                 if entry.operation.body.addon_id == crate::sync::core_registry::CORE_SYNC_ADDON_ID {
                     match crate::sync::core_materializer::apply_core_operation(
                         &self.db,
-                        &self.settings_cipher,
                         &entry.operation,
                     ) {
                         Ok(_) => {
@@ -3107,7 +3118,9 @@ impl SyncRuntime {
     ) -> LedgerResult<MeshSyncOperationWire> {
         match entry {
             NodeChainEntry::Full(operation) => {
-                if self.peer_target_allowed(&operation, target_node_id)? {
+                if !carries_shared_secret(&operation)
+                    && self.peer_target_allowed(&operation, target_node_id)?
+                {
                     operation_to_wire(&operation)
                 } else {
                     Ok(operation_to_redacted_wire(&RedactedRecord {
@@ -3624,6 +3637,17 @@ fn chain_entry_prev_hash(entry: &NodeChainEntry) -> Option<[u8; 32]> {
         NodeChainEntry::Full(operation) => operation.body.prev_node_hash,
         NodeChainEntry::Redacted(record) => record.prev_node_hash,
     }
+}
+
+/// Shared secrets replicate sealed per recipient over `SharedSecretsSync`, never
+/// through the ledger: an operation body is stored and relayed in plaintext. An
+/// operation that names a secret setting therefore exists only as a redacted
+/// chain position — it keeps the author's chain contiguous, and its body is
+/// neither stored, served nor materialized.
+fn carries_shared_secret(operation: &SyncOperation) -> bool {
+    operation.body.resource_type
+        == crate::sync::core_registry::SHARED_SETTING_RESOURCE_TYPE
+        && crate::db::repository::is_shared_secret_setting_key(&operation.body.resource_id)
 }
 
 fn operation_to_wire(operation: &SyncOperation) -> LedgerResult<MeshSyncOperationWire> {
@@ -5121,7 +5145,6 @@ mod tests {
 
             crate::sync::core_materializer::apply_core_operation(
                 &receiver.runtime.db,
-                &receiver.runtime.settings_cipher,
                 &operation,
             )
             .expect("apply core operation");
@@ -5173,7 +5196,6 @@ mod tests {
 
             crate::sync::core_materializer::apply_core_operation(
                 &receiver.runtime.db,
-                &receiver.runtime.settings_cipher,
                 &operation,
             )
             .expect("merge core operation");
@@ -5265,7 +5287,6 @@ mod tests {
                 .expect("member op");
             let deferred = crate::sync::core_materializer::apply_core_operation(
                 &receiver.runtime.db,
-                &receiver.runtime.settings_cipher,
                 member_first,
             )
             .expect_err("member before workspace must not apply");
@@ -5281,7 +5302,6 @@ mod tests {
             for operation in ordered {
                 crate::sync::core_materializer::apply_core_operation(
                     &receiver.runtime.db,
-                    &receiver.runtime.settings_cipher,
                     operation,
                 )
                 .expect("apply code studio operation");
@@ -5359,11 +5379,7 @@ mod tests {
                 .expect("machine row");
             }
 
-            repository::reseed_core_state_from_current_rows(
-                &source.runtime.db,
-                &source.runtime.settings_cipher,
-            )
-            .expect("reseed");
+            repository::reseed_core_state_from_current_rows(&source.runtime.db).expect("reseed");
             let mut ops = Vec::new();
             crate::sync::core_capture::drain_pending_core_captures_with(
                 &source.runtime.db,
@@ -5396,7 +5412,6 @@ mod tests {
             // not become a terminal conflict — plan §6.1, "no parent".
             let deferred = crate::sync::core_materializer::apply_core_operation(
                 &receiver.runtime.db,
-                &receiver.runtime.settings_cipher,
                 guest_op,
             )
             .expect_err("a machine cannot land before its host");
@@ -5407,13 +5422,11 @@ mod tests {
 
             crate::sync::core_materializer::apply_core_operation(
                 &receiver.runtime.db,
-                &receiver.runtime.settings_cipher,
                 host_op,
             )
             .expect("the host lands");
             crate::sync::core_materializer::apply_core_operation(
                 &receiver.runtime.db,
-                &receiver.runtime.settings_cipher,
                 guest_op,
             )
             .expect("and then the machine does");
@@ -5473,7 +5486,6 @@ mod tests {
                 }
                 crate::sync::core_materializer::apply_core_operation(
                     &receiver.runtime.db,
-                    &receiver.runtime.settings_cipher,
                     operation,
                 )
                 .unwrap_or_else(|e| {
@@ -5536,7 +5548,6 @@ mod tests {
                     .expect("operation");
                 crate::sync::core_materializer::apply_core_operation(
                     &receiver.runtime.db,
-                    &receiver.runtime.settings_cipher,
                     &operation,
                 )
                 .expect("apply core operation")
@@ -5609,59 +5620,122 @@ mod tests {
     }
 
     #[test]
-    fn shared_setting_secret_capture_materializes_with_receiver_cipher() {
+    fn setting_a_shared_secret_writes_nothing_into_the_capture_journal() {
         with_tmp_home(|| {
             let source = make_runtime(31);
-            let receiver = make_runtime(32);
             repository::set_shared_secret_setting_secure(
                 &source.runtime.db,
                 "hf_token",
                 "hf_test_secret",
                 &source.runtime.settings_cipher,
-                None,
             )
             .expect("set shared secret");
-            let capture_id = {
+
+            let captures: i64 = {
                 let conn = source.runtime.db.read().expect("db lock");
                 conn.query_row(
-                    "SELECT capture_id FROM __tentaflow_core_sync_captures \
-                     WHERE resource_type = 'core.shared_setting_secret' AND resource_id = 'hf_token' \
-                     ORDER BY created_at_ms DESC LIMIT 1",
+                    "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                     WHERE resource_type = 'core.shared_setting_secret' AND resource_id = 'hf_token'",
                     [],
-                    |row| row.get::<_, String>(0),
+                    |row| row.get(0),
                 )
-                .expect("capture id")
+                .expect("count captures")
             };
-            let capture = {
-                let conn = source.runtime.db.read().expect("db lock");
-                crate::sync::core_capture::load_core_write_capture(&conn, &capture_id)
-                    .expect("load capture")
-                    .expect("capture")
-            };
-            let result = source
+            assert_eq!(captures, 0);
+            let versions = repository::list_shared_secret_versions(
+                &source.runtime.db,
+                &source.runtime.settings_cipher,
+            )
+            .expect("versions");
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[0].value, "hf_test_secret");
+            assert!(versions[0].hlc.wall_time_ms > 0, "the write must be versioned");
+        });
+    }
+
+    /// An operation naming a secret setting can still arrive from a node that
+    /// predates the rule. It must advance that node's chain without its body
+    /// being stored, materialized or served onward.
+    #[test]
+    fn a_secret_bearing_operation_from_a_peer_is_kept_only_as_a_redacted_position() {
+        with_tmp_home(|| {
+            let source = make_runtime(33);
+            let receiver = make_runtime(34);
+            seed_core_authority_target(
+                &source.runtime.db,
+                "core.shared_setting_secret",
+                &receiver.runtime.local_node_id,
+            );
+            seed_core_authority_target(
+                &receiver.runtime.db,
+                "core.shared_setting_secret",
+                &receiver.runtime.local_node_id,
+            );
+            let mut fields = BTreeMap::new();
+            fields.insert("key".to_string(), FieldValue::String("hf_token".to_string()));
+            fields.insert(
+                "value".to_string(),
+                FieldValue::String("hf_plaintext_from_old_peer".to_string()),
+            );
+            let capture = crate::sync::core_capture::CoreWriteCapture::new(
+                crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
+                crate::services::org::DEFAULT_ORG_ID,
+                "hf_token".to_string(),
+                SqlWriteAction::Update,
+                fields,
+                None,
+                source.runtime.hlc_now(),
+                core_epoch(),
+            );
+            let recorded = source
                 .runtime
                 .record_core_capture(capture)
                 .expect("record core capture");
             let operation = source
                 .runtime
                 .ledger
-                .get_operation(result.op_id)
+                .get_operation(recorded.op_id)
                 .expect("operation");
+            assert!(carries_shared_secret(&operation));
 
-            crate::sync::core_materializer::apply_core_operation(
-                &receiver.runtime.db,
-                &receiver.runtime.settings_cipher,
-                &operation,
-            )
-            .expect("apply shared secret");
-            let value = repository::get_setting_secure(
-                &receiver.runtime.db,
-                "hf_token",
-                &receiver.runtime.settings_cipher,
-            )
-            .expect("get secret");
+            assert!(
+                crate::sync::core_materializer::apply_core_operation(
+                    &receiver.runtime.db,
+                    &operation
+                )
+                .is_err(),
+                "the materializer must refuse a secret setting"
+            );
 
-            assert_eq!(value.as_deref(), Some("hf_test_secret"));
+            // The author's own push path now skips the operation, so the frame an
+            // older peer would send is built by hand.
+            assert!(source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("push")
+                .is_none());
+            receiver
+                .runtime
+                .handle_push_payload(
+                    &source.runtime.local_node_id,
+                    MeshSyncPushPayload {
+                        from_node_id: source.runtime.local_node_id.clone(),
+                        operations: vec![operation_to_wire(&operation).expect("wire")],
+                    },
+                )
+                .expect("handle push");
+            assert!(
+                receiver.runtime.ledger.get_operation(recorded.op_id).is_err(),
+                "the body must not be stored"
+            );
+            assert!(receiver
+                .runtime
+                .ledger
+                .get_redacted_record(recorded.op_id)
+                .expect("redacted lookup")
+                .is_some());
+            let stored = repository::get_setting(&receiver.runtime.db, "hf_token").expect("get");
+            assert!(stored.is_none_or(|value| value.is_empty()));
         });
     }
 
@@ -11376,13 +11450,11 @@ mod tests {
         });
     }
 
-    /// A baseline cutover must re-emit stored shared secrets. The pre-cutover
-    /// enqueue creates a `core.shared_setting_secret` capture, the cutover wipes
-    /// the whole journal, and the reseed is the only path that restores it — so
-    /// after cutover the outbox must hold a fresh secret op under the NEW epoch
-    /// with a real (non-zero) HLC, or the secret would silently vanish.
+    /// A baseline cutover re-seeds the ledger from current rows. Stored secrets
+    /// must stay out of that reseed, or the cutover would put their plaintext
+    /// back into the journal.
     #[test]
-    fn baseline_cutover_reseeds_stored_shared_secret() {
+    fn baseline_cutover_does_not_reseed_stored_shared_secrets() {
         with_tmp_home(|| {
             let node = make_runtime(170);
             seed_core_authority_target(
@@ -11390,16 +11462,15 @@ mod tests {
                 "core.shared_setting_secret",
                 "peer-authority",
             );
-
             repository::set_shared_secret_setting_secure(
                 &node.runtime.db,
                 "hf_token",
                 "hf_baseline_secret",
                 &node.runtime.settings_cipher,
-                None,
             )
             .expect("store shared secret");
-
+            repository::set_setting(&node.runtime.db, "jwt_expiry_hours", "12")
+                .expect("store shared setting");
             repository::set_setting(
                 &node.runtime.db,
                 crate::db::migrations::CORE_BASELINE_RESET_PENDING_KEY,
@@ -11412,36 +11483,34 @@ mod tests {
                 .expect("cutover runs")
                 .expect("cutover pending");
 
-            let new_epoch = node.runtime.ledger.current_epoch().expect("epoch");
             let push = node
                 .runtime
                 .build_push_payload_for_target("peer-authority", 256)
                 .expect("push")
                 .expect("payload");
-
-            let mut secret_hlcs: Vec<HybridLogicalTimestamp> = Vec::new();
+            let mut reseeded_settings = Vec::new();
             for wire in &push.operations {
                 let op = node
                     .runtime
                     .ledger
                     .get_operation(operation_id_from_wire(&wire.op_id).expect("op id"))
                     .expect("op");
-                if op.body.resource_type == "core.shared_setting_secret"
-                    && op.body.resource_id == "hf_token"
-                {
-                    assert_eq!(op.body.epoch, new_epoch, "secret reseed carries new epoch");
-                    secret_hlcs.push(op.body.hlc_timestamp.clone());
+                if op.body.resource_type == "core.shared_setting_secret" {
+                    reseeded_settings.push(op.body.resource_id.clone());
                 }
             }
+            assert!(reseeded_settings.contains(&"jwt_expiry_hours".to_string()));
+            assert!(!reseeded_settings.contains(&"hf_token".to_string()));
             assert_eq!(
-                secret_hlcs.len(),
-                1,
-                "exactly one fresh shared-secret op after cutover"
-            );
-            let hlc = &secret_hlcs[0];
-            assert!(
-                hlc.wall_time_ms > 0 || hlc.logical > 0,
-                "secret reseed must mint a real HLC, got {hlc:?}"
+                repository::get_setting_secure(
+                    &node.runtime.db,
+                    "hf_token",
+                    &node.runtime.settings_cipher
+                )
+                .expect("get secret")
+                .as_deref(),
+                Some("hf_baseline_secret"),
+                "the cutover must leave the stored secret in place"
             );
         });
     }
@@ -11597,19 +11666,18 @@ mod tests {
             // DB 1 applies older THEN newer; DB 2 applies newer THEN older.
             let db1 = make_db();
             let db2 = make_db();
-            let cipher = make_settings_cipher(91);
 
-            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_older)
+            crate::sync::core_materializer::apply_core_operation(&db1, &op_older)
                 .expect("db1 older");
-            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_newer)
+            crate::sync::core_materializer::apply_core_operation(&db1, &op_newer)
                 .expect("db1 newer");
 
-            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_newer)
+            crate::sync::core_materializer::apply_core_operation(&db2, &op_newer)
                 .expect("db2 newer");
             // The older op arriving last must be DROPPED by the LWW gate (applies
             // 0 rows), not clobber the newer value.
             let stale_rows =
-                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_older)
+                crate::sync::core_materializer::apply_core_operation(&db2, &op_older)
                     .expect("db2 older");
             assert_eq!(stale_rows, 0, "stale older op must be dropped by LWW");
 
@@ -11647,17 +11715,16 @@ mod tests {
 
             let db1 = make_db();
             let db2 = make_db();
-            let cipher = make_settings_cipher(93);
 
-            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_lower)
+            crate::sync::core_materializer::apply_core_operation(&db1, &op_lower)
                 .expect("db1 lower");
-            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &op_higher)
+            crate::sync::core_materializer::apply_core_operation(&db1, &op_higher)
                 .expect("db1 higher");
 
-            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_higher)
+            crate::sync::core_materializer::apply_core_operation(&db2, &op_higher)
                 .expect("db2 higher");
             let stale =
-                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &op_lower)
+                crate::sync::core_materializer::apply_core_operation(&db2, &op_lower)
                     .expect("db2 lower");
             assert_eq!(stale, 0, "lower node_id loses the tie-break and is dropped");
 
@@ -11796,7 +11863,7 @@ mod tests {
 
             let cap = api_key_capture("uid-1", &verifier, true, hlc_at(1_000, 0, "node-a"));
             let op = signed_flow_op(&node_a, cap);
-            let rows = crate::sync::core_materializer::apply_core_operation(&db_b, &cipher, &op)
+            let rows = crate::sync::core_materializer::apply_core_operation(&db_b, &op)
                 .expect("apply api key on B");
             assert_eq!(rows, 1);
 
@@ -11806,7 +11873,6 @@ mod tests {
                 "api_key_pepper",
                 &hex::encode(&pepper),
                 &cipher,
-                None,
             )
             .expect("seed pepper on B");
             let recovered = crate::db::repository::get_or_create_api_key_pepper(&db_b, &cipher)
@@ -11829,14 +11895,13 @@ mod tests {
     fn e2e_api_key_upsert_preserves_local_last_used_at() {
         with_tmp_home(|| {
             let node_a = make_runtime(82);
-            let cipher = make_settings_cipher(82);
             let db_b = make_db();
 
             let op1 = signed_flow_op(
                 &node_a,
                 api_key_capture("uid-2", "v1", true, hlc_at(1_000, 0, "node-a")),
             );
-            crate::sync::core_materializer::apply_core_operation(&db_b, &cipher, &op1)
+            crate::sync::core_materializer::apply_core_operation(&db_b, &op1)
                 .expect("first apply");
 
             // B stamps last_used_at locally (simulating a verify on B).
@@ -11853,7 +11918,7 @@ mod tests {
                 &node_a,
                 api_key_capture("uid-2", "v2", true, hlc_at(2_000, 0, "node-a")),
             );
-            crate::sync::core_materializer::apply_core_operation(&db_b, &cipher, &op2)
+            crate::sync::core_materializer::apply_core_operation(&db_b, &op2)
                 .expect("second apply");
 
             use rusqlite::OptionalExtension;
@@ -11881,7 +11946,6 @@ mod tests {
     fn e2e_resource_permission_clear_tombstone_beats_stale_allow() {
         with_tmp_home(|| {
             let node_a = make_runtime(83);
-            let cipher = make_settings_cipher(83);
 
             let allow_op = signed_flow_op(
                 &node_a,
@@ -11898,20 +11962,20 @@ mod tests {
 
             // Order 1: allow then clear → rule gone.
             let db1 = make_db();
-            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &allow_op)
+            crate::sync::core_materializer::apply_core_operation(&db1, &allow_op)
                 .expect("db1 allow");
             assert_eq!(perm_level(&db1).as_deref(), Some("allow"));
-            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &clear_op)
+            crate::sync::core_materializer::apply_core_operation(&db1, &clear_op)
                 .expect("db1 clear");
             assert_eq!(perm_level(&db1), None, "clear removes the rule");
 
             // Order 2: clear (newer) then stale allow (older) → allow is dropped by
             // LWW, the tombstone wins, rule stays absent.
             let db2 = make_db();
-            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &clear_op)
+            crate::sync::core_materializer::apply_core_operation(&db2, &clear_op)
                 .expect("db2 clear");
             let stale =
-                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &allow_op)
+                crate::sync::core_materializer::apply_core_operation(&db2, &allow_op)
                     .expect("db2 stale allow");
             assert_eq!(stale, 0, "older allow loses LWW against newer clear");
             assert_eq!(
@@ -11929,7 +11993,6 @@ mod tests {
         with_tmp_home(|| {
             let node_a = make_runtime(84);
             let node_b = make_runtime(85);
-            let cipher = make_settings_cipher(84);
 
             let older = signed_flow_op(
                 &node_a,
@@ -11941,12 +12004,12 @@ mod tests {
             );
 
             let db1 = make_db();
-            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &older).unwrap();
-            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &newer).unwrap();
+            crate::sync::core_materializer::apply_core_operation(&db1, &older).unwrap();
+            crate::sync::core_materializer::apply_core_operation(&db1, &newer).unwrap();
 
             let db2 = make_db();
-            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &newer).unwrap();
-            let stale = crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &older)
+            crate::sync::core_materializer::apply_core_operation(&db2, &newer).unwrap();
+            let stale = crate::sync::core_materializer::apply_core_operation(&db2, &older)
                 .unwrap();
             assert_eq!(stale, 0, "older active=true dropped by LWW");
 
@@ -12866,10 +12929,10 @@ mod tests {
     }
 
     #[test]
-    fn convergence_concurrent_external_credentials_no_equivocation() {
+    fn convergence_concurrent_shared_setting_writes_no_equivocation() {
         // Direct regression for the external-credentials seq-7 bug: two nodes each
-        // independently write `hf_token` (different values, different HLCs) into the
-        // shared-secret partition, then exchange. Because each write lives in its
+        // independently write `jwt_expiry_hours` (different values, different HLCs)
+        // into the shared-setting partition, then exchange. Because each write lives in its
         // OWN per-node chain, these are LEGAL concurrent writes — NOT a fork of one
         // node's chain — so admission must NOT raise HashChainMismatch/equivocation,
         // the repair queue must stay bounded, and both nodes must converge on the
@@ -12882,15 +12945,15 @@ mod tests {
             let a_id = node_a.node_id().to_string();
             let b_id = node_b.node_id().to_string();
 
-            // Node A writes hf_token first (lower HLC); node B writes a different
+            // Node A writes the setting first (lower HLC); node B writes a different
             // value with a strictly higher HLC — B must win the LWW everywhere.
             // Wall times are anchored to `now_ms()` so they exceed any baseline a
             // local write transaction would stamp, matching production scale.
             let base = now_ms();
             let op_a =
-                author_shared_secret(&node_a, "hf_token", "hf_from_a", hlc_at(base, 0, &a_id));
+                author_shared_setting(&node_a, "jwt_expiry_hours", "12", hlc_at(base, 0, &a_id));
             let op_b =
-                author_shared_secret(&node_b, "hf_token", "hf_from_b", hlc_at(base + 1, 0, &b_id));
+                author_shared_setting(&node_b, "jwt_expiry_hours", "48", hlc_at(base + 1, 0, &b_id));
 
             // Exchange both directions. Delivering a legal concurrent write must
             // succeed — these calls would Err with HashChainMismatch if the old
@@ -12902,27 +12965,19 @@ mod tests {
             deliver(&node_a, &b_id, std::slice::from_ref(&op_b)).expect("B->A redeliver");
             deliver(&node_b, &a_id, std::slice::from_ref(&op_a)).expect("A->B redeliver");
 
-            let value_a = repository::get_setting_secure(
-                &node_a.runtime.db,
-                "hf_token",
-                &node_a.runtime.settings_cipher,
-            )
-            .expect("read secret on A");
-            let value_b = repository::get_setting_secure(
-                &node_b.runtime.db,
-                "hf_token",
-                &node_b.runtime.settings_cipher,
-            )
-            .expect("read secret on B");
+            let value_a = repository::get_setting(&node_a.runtime.db, "jwt_expiry_hours")
+            .expect("read setting on A");
+            let value_b = repository::get_setting(&node_b.runtime.db, "jwt_expiry_hours")
+            .expect("read setting on B");
 
             assert_eq!(
                 value_a.as_deref(),
-                Some("hf_from_b"),
+                Some("48"),
                 "node A must converge on the higher-HLC value"
             );
             assert_eq!(
                 value_b.as_deref(),
-                Some("hf_from_b"),
+                Some("48"),
                 "node B must converge on the higher-HLC value"
             );
 
@@ -13155,7 +13210,7 @@ mod tests {
         });
     }
 
-    /// Authors a shared-secret (`external-credentials` partition) write on `node`:
+    /// Authors a shared-setting (`external-credentials` partition) write on `node`:
     /// builds the op on the node's own per-node chain with the supplied HLC and
     /// materializes it locally (recording the resource version), exactly as a real
     /// authoring node does. Returns the operation ready to ship to a peer.
@@ -13164,7 +13219,7 @@ mod tests {
     /// baseline version a real write transaction would stamp — concurrent writes
     /// in production differ by small deltas at that scale, which is what this
     /// mirrors.
-    fn author_shared_secret(
+    fn author_shared_setting(
         node: &ConvergenceNode,
         key: &str,
         value: &str,
@@ -13186,22 +13241,21 @@ mod tests {
         let result = node
             .runtime
             .record_core_capture(capture)
-            .expect("author shared secret op");
+            .expect("author shared setting op");
         let operation = node
             .runtime
             .ledger
             .get_operation(result.op_id)
-            .expect("authored shared secret op");
+            .expect("authored shared setting op");
         // A real authoring node also materializes its own write, which records the
         // resource's HLC in `core_resource_versions`. Without this, the local
         // write would carry no version and a stale concurrent op from a peer would
         // wrongly win the LWW gate (which compares against the version table).
         crate::sync::core_materializer::apply_core_operation(
             &node.runtime.db,
-            &node.runtime.settings_cipher,
             &operation,
         )
-        .expect("materialize own shared secret");
+        .expect("materialize own shared setting");
         operation
     }
 

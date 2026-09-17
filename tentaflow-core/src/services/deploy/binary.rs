@@ -115,6 +115,17 @@ impl BinaryDeploy {
         if native.runtime != NativeRuntime::ManagedCli {
             return Ok(());
         }
+        // Refused before a CLI is downloaded: without the OS mechanism there is
+        // no isolation to put a vendor binary in, and the account would exist
+        // only to fail.
+        crate::code_studio::process_sandbox::ProcessSandbox::check_available().map_err(
+            |error| {
+                DeployError::Manifest(format!(
+                    "engine '{}' cannot run on this node: {error:#}",
+                    self.manifest.engine.id
+                ))
+            },
+        )?;
         env.retain(|name, _| name == "PORT");
         env.insert("TENTAFLOW_ENGINE_ID".into(), self.manifest.engine.id.clone());
         let (install_root, bin_dir) = super::managed_cli::install(
@@ -140,6 +151,52 @@ impl BinaryDeploy {
             env.insert(name.into(), state_dir.join(directory).to_string_lossy().into_owned());
         }
         Ok(())
+    }
+
+    /// A listening bridge is not a usable account. `/health` says only that the
+    /// process is up; a node without a sandbox mechanism, without the
+    /// namespaces its kernel would have to allow, or without a working route to
+    /// the egress gateway would deploy "successfully" and then refuse every
+    /// turn. So readiness asks the bridge to launch a sandboxed process for
+    /// real and fails the deploy with what went wrong.
+    async fn verify_sandbox_ready(&self, port: u16) -> DeployResult<()> {
+        let directory = crate::services::coding_agent::account_directory(&self.user_config)
+            .map_err(DeployError::Manifest)?;
+        let token = std::fs::read_to_string(directory.join("bridge-token"))
+            .map_err(|e| DeployError::Spawn(format!("read the agent bridge token: {e}")))?;
+        let response = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/runtime/status"))
+            .header("Authorization", format!("Bearer {}", token.trim()))
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| {
+                DeployError::Spawn(format!("ask the bridge for its runtime status: {e}"))
+            })?;
+        if !response.status().is_success() {
+            return Err(DeployError::Spawn(format!(
+                "the agent bridge refused its runtime status with {}",
+                response.status()
+            )));
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| DeployError::Spawn(format!("read the bridge runtime status: {e}")))?;
+        if body
+            .pointer("/sandbox/ready")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Ok(());
+        }
+        Err(DeployError::Spawn(format!(
+            "this node cannot isolate a coding agent, so the account would refuse every turn: {}. \
+             A managed CLI needs macOS sandbox-exec or Linux /usr/bin/bwrap with unprivileged user namespaces.",
+            body.pointer("/sandbox/detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the bridge reported no sandbox capability")
+        )))
     }
 }
 
@@ -211,7 +268,8 @@ impl DeployStrategy for BinaryDeploy {
             });
         }
 
-        let managed_cli_executable = if native.runtime == NativeRuntime::ManagedCli {
+        let managed_cli = native.runtime == NativeRuntime::ManagedCli;
+        let managed_cli_executable = if managed_cli {
             let source_hash = self.manifest.native_source_hash.trim();
             if source_hash.is_empty() {
                 return Err(DeployError::Manifest(format!(
@@ -224,9 +282,8 @@ impl DeployStrategy for BinaryDeploy {
                 .join("bridge")
                 .join(&self.manifest.engine.id)
                 .join(source_hash);
-            #[cfg(windows)]
-            let immutable_server = immutable_root.join("server.exe");
-            #[cfg(not(windows))]
+            // No Windows variant: this runtime needs an OS sandbox mechanism,
+            // and the four manifests that use it declare Linux and macOS only.
             let immutable_server = immutable_root.join("server");
             if immutable_server.exists() {
                 Some(immutable_server)
@@ -234,22 +291,11 @@ impl DeployStrategy for BinaryDeploy {
                 if let Some(s) = &self.log_sink {
                     s.info("[managed-cli] building the local bridge");
                 }
-                #[cfg(windows)]
-                let output = Command::new("powershell.exe")
-                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-                    .arg(root.join("build.ps1"))
+                let output = Command::new("sh")
+                    .arg(root.join("build.sh"))
                     .output()
-                    .await;
-                #[cfg(not(windows))]
-                let output = Command::new("sh").arg(root.join("build.sh")).output().await;
-                let output = output
+                    .await
                     .map_err(|e| DeployError::Spawn(format!("build coding-agent bridge: {e}")))?;
-                #[cfg(windows)]
-                let built_server = root
-                    .join("target")
-                    .join("release")
-                    .join("tentaflow-coding-agent-bridge.exe");
-                #[cfg(not(windows))]
                 let built_server = root
                     .join("target")
                     .join("release")
@@ -353,13 +399,21 @@ impl DeployStrategy for BinaryDeploy {
         }
         super::apply_engine_env(&self.user_config, &mut env);
         super::apply_gpu_selection_env(&self.user_config, &mut env);
-        if native.runtime == NativeRuntime::ManagedCli { env.insert("PORT".into(),port.to_string()); }
+        if managed_cli { env.insert("PORT".into(),port.to_string()); }
         self.prepare_managed_cli_env(native, &mut env).await?;
 
-        let agent_proxy = if native.runtime == NativeRuntime::ManagedCli {
+        let agent_proxy = if managed_cli {
             let account_id = self.user_config.get("account_id").and_then(serde_json::Value::as_str).ok_or_else(|| DeployError::Manifest("missing agent account_id".into()))?;
             let proxy = crate::services::coding_agent_proxy::start(&self.manifest.engine.id, account_id).await.map_err(|e| DeployError::Spawn(e.to_string()))?;
             env.insert("TENTAFLOW_AGENT_PROXY_PORT".into(), proxy.port().to_string());
+            // Where a sandbox has no route to this loopback endpoint, the same
+            // endpoint is served inside it and reaches us through this socket.
+            if let Some(socket) = proxy.socket_path() {
+                env.insert(
+                    "TENTAFLOW_AGENT_PROXY_SOCKET".into(),
+                    socket.to_string_lossy().into_owned(),
+                );
+            }
             env.insert("HTTP_PROXY".into(), proxy.url().to_string());
             env.insert("HTTPS_PROXY".into(), proxy.url().to_string());
             Some(proxy)
@@ -367,9 +421,10 @@ impl DeployStrategy for BinaryDeploy {
 
         let mut cmd = Command::new(&exe);
         cmd.current_dir(&root);
-        if native.runtime == NativeRuntime::ManagedCli {
+        if managed_cli {
             cmd.env_clear();
-            for name in ["LANG", "LC_ALL", "TZ", "SystemRoot", "WINDIR"] {
+            // Linux and macOS only, per the four manifests this branch serves.
+            for name in ["LANG", "LC_ALL", "TZ"] {
                 if let Some(value) = std::env::var_os(name) { cmd.env(name, value); }
             }
         }
@@ -470,7 +525,15 @@ impl DeployStrategy for BinaryDeploy {
         .await;
 
         match outcome {
-            SmartProbeOutcome::Ready => {}
+            SmartProbeOutcome::Ready => {
+                if managed_cli {
+                    if let Err(error) = self.verify_sandbox_ready(port).await {
+                        self.kill_child().await;
+                        let _ = self.ports.release(port);
+                        return Err(error);
+                    }
+                }
+            }
             SmartProbeOutcome::ProcessExited(code) => {
                 self.kill_child().await;
                 let _ = self.ports.release(port);
@@ -505,7 +568,6 @@ impl DeployStrategy for BinaryDeploy {
         let config_json = super::merge_config_json(&self.user_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
-        let managed_cli = native.runtime == NativeRuntime::ManagedCli;
         Ok(PreparedDeploy {
             engine_id: self.manifest.engine.id.clone(),
             category: category_tag(&self.manifest).to_string(),

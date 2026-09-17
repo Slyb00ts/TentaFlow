@@ -38,12 +38,29 @@ pub struct VncTunnelEntry {
 /// holds one TCP fd and one tokio task, so we bound the fan-out explicitly.
 pub const MAX_TUNNELS_PER_USER: usize = 3;
 
+/// Maximum simultaneously active tunnels globally across all users.
+/// Prevents exhaustion of file descriptors and tokio tasks via resource abuse.
+pub const MAX_TUNNELS_GLOBAL: usize = 100;
+
+/// One registry for the whole process. A registry created per connection let a
+/// reconnect start counting from zero, which made both limits meaningless.
+pub fn shared_registry() -> std::sync::Arc<DashMap<String, VncTunnelEntry>> {
+    static REGISTRY: std::sync::LazyLock<std::sync::Arc<DashMap<String, VncTunnelEntry>>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(DashMap::new()));
+    REGISTRY.clone()
+}
+
 /// Counts how many tunnel entries already belong to `user_id`.
 pub fn count_for_user(registry: &DashMap<String, VncTunnelEntry>, user_id: &str) -> usize {
     registry
         .iter()
         .filter(|e| e.value().owner_user_id == user_id)
         .count()
+}
+
+/// Counts total active tunnels across all users.
+pub fn count_total(registry: &DashMap<String, VncTunnelEntry>) -> usize {
+    registry.len()
 }
 
 /// Opens the TCP bridge to `127.0.0.1:port` and, on success, registers an entry

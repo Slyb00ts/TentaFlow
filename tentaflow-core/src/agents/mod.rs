@@ -9,6 +9,7 @@ pub(crate) mod interaction;
 mod principal;
 mod retention_purge;
 pub(crate) mod run_manager;
+pub mod runtime;
 mod service;
 mod subagent_reactor;
 
@@ -25,6 +26,11 @@ pub use interaction::{
 };
 pub use principal::AgentPrincipal;
 pub use retention_purge::{purge_expired_agent_runtime, start_agent_runtime_purge_task};
+pub use runtime::{
+    validate_account_binding as validate_agent_account_binding, AccountBinding, AgentRuntime,
+    LLM_RUNTIME_JSON,
+};
+
 pub use run_manager::{
     global as agent_run_manager_global, init_global as agent_run_manager_init_global,
     AgentRunManager, BackgroundFlowRunner, CallerRun, ChildFinishedEvent, FlowDispatcherRunner,

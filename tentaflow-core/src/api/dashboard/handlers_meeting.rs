@@ -50,6 +50,41 @@ fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     }
 }
 
+/// The meeting bot opens this URL from inside its container, so a URL aimed at
+/// the node itself or at the local network would turn the bot into a probe of
+/// services no user can reach directly.
+fn validate_meeting_url(url_str: &str) -> Result<(), ProtocolError> {
+    let url =
+        url::Url::parse(url_str).map_err(|_| bad_request("meeting_url must be a valid URL"))?;
+    if url.scheme() != "https" {
+        return Err(bad_request("meeting_url must use https"));
+    }
+    let internal = match url.host() {
+        None => return Err(bad_request("meeting_url must have a host")),
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost") || !name.contains('.')
+        }
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            let segments = ip.segments();
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.to_ipv4_mapped().is_some()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+        }
+    };
+    if internal {
+        return Err(bad_request(
+            "meeting_url must point to a public meeting service",
+        ));
+    }
+    Ok(())
+}
+
 fn meeting_payload<'a>(req: &'a MessageBody) -> Result<&'a MeetingPayload, ProtocolError> {
     match req {
         MessageBody::MeetingBody(p) => Ok(p),
@@ -154,6 +189,7 @@ pub async fn meeting_session_start(
     if r.meeting_url.len() > 2048 {
         return Err(bad_request("meeting_url za dlugi"));
     }
+    validate_meeting_url(&r.meeting_url)?;
     let owner = current_user_id(ctx);
     // The per-user Meeting Bot setting `flow_id` picks the flow of every turn;
     // an unset or dangling id falls back to the factory Meeting Bot flow in
@@ -264,6 +300,7 @@ pub async fn meeting_session_leave(
     let MeetingPayload::ReqSessionLeave(r) = payload else {
         return Err(bad_request("expected ReqSessionLeave"));
     };
+    owned_session_detail(ctx, r.session_id)?;
     ctx.state
         .meeting_manager
         .leave_session(r.session_id)
@@ -334,23 +371,7 @@ pub fn meeting_session_detail(
     let MeetingPayload::ReqSessionDetail(r) = payload else {
         return Err(bad_request("expected ReqSessionDetail"));
     };
-    let desc = ctx
-        .state
-        .meeting_manager
-        .session_detail(r.session_id)
-        .map_err(internal)?
-        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "session not found"))?;
-    // BOLA: sesja widziana tylko przez ownera lub admina. Jesli owner_user_id
-    // nie ustawione (legacy lub zewnetrzny ingest) — admin only.
-    if !is_admin(ctx) {
-        let me = current_user_id(ctx);
-        if desc.owner_user_id.is_none() || me != desc.owner_user_id {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::PolicyDenied,
-                "nie masz dostepu do tej sesji",
-            ));
-        }
-    }
+    let desc = owned_session_detail(ctx, r.session_id)?;
     let transcripts = if r.include_transcripts {
         repository::transcripts::list_transcripts(&ctx.state.db, r.session_id)
             .map_err(internal)?
@@ -385,6 +406,7 @@ pub fn meeting_transcripts_list(
     let MeetingPayload::ReqTranscriptsList(r) = payload else {
         return Err(bad_request("expected ReqTranscriptsList"));
     };
+    owned_session_detail(ctx, r.session_id)?;
     let all =
         repository::transcripts::list_transcripts(&ctx.state.db, r.session_id).map_err(internal)?;
     let entries: Vec<MeetingTranscriptEntry> = all
@@ -495,6 +517,32 @@ pub fn meeting_settings_update(
 // =============================================================================
 // 10. Summaries list (po-sesyjne, historyczne)
 // =============================================================================
+
+/// Loads a session addressed by its numeric id and enforces ownership. Ids are
+/// sequential, so every handler taking a raw `session_id` must go through
+/// here: owner or admin only, and an ownerless (legacy / external ingest)
+/// session is admin-only.
+fn owned_session_detail(
+    ctx: &HandlerContext,
+    session_id: i64,
+) -> Result<crate::meeting::SessionDescriptor, ProtocolError> {
+    let desc = ctx
+        .state
+        .meeting_manager
+        .session_detail(session_id)
+        .map_err(internal)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "session not found"))?;
+    if !is_admin(ctx) {
+        let me = current_user_id(ctx);
+        if desc.owner_user_id.is_none() || me != desc.owner_user_id {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "nie masz dostepu do tej sesji",
+            ));
+        }
+    }
+    Ok(desc)
+}
 
 /// Weryfikuje ownership sesji i zwraca session_id. Admin widzi wszystko.
 /// Sesje bez ownera (legacy) — tylko admin.
@@ -626,7 +674,11 @@ pub fn meeting_action_item_status_update(
     // resolve_owned_session_id po meeting_key. Jesli item nie istnieje -> 404
     // (zgodne z update zwracajacym 0 rows).
     let session_id = {
-        let conn = ctx.state.db.read().unwrap();
+        let conn = ctx
+            .state
+            .db
+            .read()
+            .map_err(|e| internal(format!("database lock: {}", e)))?;
         conn.query_row::<i64, _, _>(
             "SELECT session_id FROM meeting_action_items WHERE id = ?1",
             rusqlite::params![r.item_id],
@@ -637,7 +689,11 @@ pub fn meeting_action_item_status_update(
     let session_id = session_id
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "action item not found"))?;
     let meeting_key: String = {
-        let conn = ctx.state.db.read().unwrap();
+        let conn = ctx
+            .state
+            .db
+            .read()
+            .map_err(|e| internal(format!("database lock: {}", e)))?;
         conn.query_row(
             "SELECT meeting_key FROM meeting_sessions WHERE id = ?1",
             rusqlite::params![session_id],
@@ -1088,5 +1144,37 @@ mod tests {
         ));
         let err = meeting_transcript_export(&req, &ctx).expect_err("forbidden");
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    #[test]
+    fn validate_meeting_url_accepts_valid_public_https_urls() {
+        assert!(validate_meeting_url("https://teams.microsoft.com/l/meetup-join/").is_ok());
+        assert!(validate_meeting_url("https://meet.google.com/abc-defg-hij").is_ok());
+        assert!(validate_meeting_url("https://zoom.us/j/123456789").is_ok());
+    }
+
+    #[test]
+    fn validate_meeting_url_rejects_http() {
+        let err = validate_meeting_url("http://teams.microsoft.com/l/meetup-join/")
+            .expect_err("http should be rejected");
+        assert!(err.message.to_lowercase().contains("https"));
+    }
+
+    #[test]
+    fn validate_meeting_url_rejects_localhost_and_private_hosts() {
+        assert!(validate_meeting_url("https://localhost:8443/meeting").is_err());
+        assert!(validate_meeting_url("https://127.0.0.1/meeting").is_err());
+        assert!(validate_meeting_url("https://[::1]/meeting").is_err());
+        assert!(validate_meeting_url("https://192.168.1.100/meeting").is_err());
+        assert!(validate_meeting_url("https://10.0.0.1/meeting").is_err());
+        assert!(validate_meeting_url("https://172.16.0.1/meeting").is_err());
+        assert!(validate_meeting_url("https://169.254.1.1/meeting").is_err());
+    }
+
+    #[test]
+    fn validate_meeting_url_rejects_missing_scheme_and_host() {
+        assert!(validate_meeting_url("not-a-url").is_err());
+        assert!(validate_meeting_url("https://").is_err());
+        assert!(validate_meeting_url("").is_err());
     }
 }

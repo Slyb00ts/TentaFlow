@@ -1220,7 +1220,7 @@ async fn summary(
     // the inbox can mark an item read-only instead of offering a button the
     // executor refuses (§7.1).
     let issuer_is_operator =
-        crate::tentavm::policy::node_is_operator(&ctx.state.db, issuer_node_id(ctx))
+        crate::db::repository::node_is_operator(&ctx.state.db, issuer_node_id(ctx))
             .unwrap_or(false);
 
     let mut unreachable_items: Vec<VmInboxItem> = Vec::new();
@@ -1630,7 +1630,7 @@ fn issuer_node_id(ctx: &HandlerContext) -> &str {
 /// revocation performed on the issuer between the request and its execution.
 fn require_operator_issuer(ctx: &HandlerContext, what: &str) -> Result<(), ProtocolError> {
     let issuer = issuer_node_id(ctx);
-    let operator = crate::tentavm::policy::node_is_operator(&ctx.state.db, issuer)
+    let operator = crate::db::repository::node_is_operator(&ctx.state.db, issuer)
         .map_err(|e| internal("operator list", e))?;
     if operator {
         return Ok(());

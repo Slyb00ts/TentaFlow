@@ -447,6 +447,34 @@ fn build_launch_command(spec: &DistributedDeploySpec) -> Result<String, String> 
     ))
 }
 
+/// Head specs received with `ServiceDeployDistributed`, by deployment id.
+///
+/// The serve command runs through `bash -c` inside the head container. The head
+/// builds it from the spec it was deployed with instead of accepting a command
+/// string from the coordinator, so no shell text ever arrives over the mesh. A
+/// head that restarted in between has lost the spec; `cluster_health` then
+/// rebuilds the command from the persisted deployment.
+static HEAD_SPECS: std::sync::LazyLock<dashmap::DashMap<String, DistributedDeploySpec>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+pub fn remember_head_spec(spec: &DistributedDeploySpec) {
+    if spec.role == "head" {
+        HEAD_SPECS.insert(spec.deployment_cluster_id.clone(), spec.clone());
+    }
+}
+
+pub fn forget_head_spec(deployment_cluster_id: &str) {
+    HEAD_SPECS.remove(deployment_cluster_id);
+}
+
+/// Serve command for a deployment whose head is this node.
+pub fn head_serve_command(deployment_cluster_id: &str) -> Result<String, String> {
+    let spec = HEAD_SPECS
+        .get(deployment_cluster_id)
+        .ok_or_else(|| format!("this node holds no head spec for '{deployment_cluster_id}'"))?;
+    build_serve_command(&spec)
+}
+
 /// Komenda `vllm serve` (TP=N, backend ray) odpalana NA HEADZIE przez
 /// `docker exec` DOPIERO gdy klaster Ray ma juz wszystkie GPU. Env (NCCL/RoCE,
 /// VLLM_HOST_IP, HF_HUB_CACHE/OFFLINE) dziedziczone z konfiguracji kontenera.
@@ -1841,6 +1869,26 @@ mod tests {
         assert!(cmd.contains("ray start --head --node-ip-address='10.10.10.24' --port=6379"));
         assert!(cmd.trim_end().ends_with("sleep infinity"));
         assert!(!cmd.contains("vllm serve"));
+    }
+
+    #[test]
+    fn the_head_builds_its_serve_command_from_the_spec_it_was_deployed_with() {
+        let mut head = spec("head");
+        head.deployment_cluster_id = "dep-head-spec".to_string();
+        let mut worker = spec("worker");
+        worker.deployment_cluster_id = "dep-worker-spec".to_string();
+
+        remember_head_spec(&head);
+        remember_head_spec(&worker);
+
+        assert_eq!(
+            head_serve_command("dep-head-spec").unwrap(),
+            build_serve_command(&head).unwrap()
+        );
+        assert!(head_serve_command("dep-worker-spec").is_err());
+
+        forget_head_spec("dep-head-spec");
+        assert!(head_serve_command("dep-head-spec").is_err());
     }
 
     #[test]

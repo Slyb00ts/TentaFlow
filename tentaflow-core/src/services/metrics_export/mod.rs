@@ -1361,7 +1361,7 @@ mod tests {
                 Ok(Event::Start(e)) if e.name().as_ref() == b"key" => in_key = true,
                 Ok(Event::End(e)) if e.name().as_ref() == b"key" => in_key = false,
                 Ok(Event::Text(t)) if in_key => {
-                    keys.insert(t.unescape().expect("valid text").into_owned());
+                    keys.insert(t.decode().expect("valid text").into_owned());
                 }
                 Err(e) => panic!("template xml parse error: {e}"),
                 _ => {}

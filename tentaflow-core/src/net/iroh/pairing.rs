@@ -75,7 +75,7 @@ impl PairingHandler {
         req: &PairingFirstContactRequest,
         transport_node_id: &str,
     ) -> (PairingFirstContactResponse, Option<PairingContactHints>) {
-        if !self.security.check_pin_rate_limit(&req.sender_node_id) {
+        if !self.security.check_pin_rate_limit(transport_node_id) {
             return (
                 PairingFirstContactResponse::Reject {
                     reason: "przekroczony limit prob PIN".into(),

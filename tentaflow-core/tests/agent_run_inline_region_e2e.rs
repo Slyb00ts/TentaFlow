@@ -248,6 +248,7 @@ fn seed_agent(pool: &DbPool, id: &str) {
     repository::upsert_agent(
         pool,
         &AgentParams {
+            runtime_json: tentaflow_core::agents::LLM_RUNTIME_JSON,
             id,
             name: "a",
             display_name: None,

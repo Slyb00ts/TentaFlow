@@ -8385,6 +8385,14 @@ pub enum MessageBody {
     // the lab a request means travels as `instance_id` INSIDE the payload,
     // because the package is multi-instance — the first one that is.
     TentaQuantBody(crate::tentaquant::TentaQuantPayload),
+    // ----- Agent provider accounts (docs/agent-accounts-technical-design.md) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the whole family (request+response) in
+    // `ProviderAccountPayload`: accounts, grants, credentials, login, sessions
+    // and the per-node agent runtime matrix. An account is org-scoped and
+    // replicated, so nothing here addresses a node except the requests whose
+    // SUBJECT is a node (login, runtime install, node state).
+    ProviderAccountBody(crate::provider_account::ProviderAccountPayload),
 }
 
 // =============================================================================

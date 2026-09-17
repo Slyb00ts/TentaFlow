@@ -403,7 +403,8 @@ pub fn stream_close(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let registry = super::subscription::global();
-    if registry.cancel(ctx.correlation_id) {
+    let key = super::subscription::SubscriptionKey::new(ctx.connection_id, ctx.correlation_id);
+    if registry.cancel(key) {
         // Returning a synthetic Closed echoes the contract: the caller
         // receives one terminal payload acknowledging the close. The streaming
         // task itself also emits a Closed via the cancel's Err event, but the
@@ -1013,7 +1014,10 @@ mod tests {
         let tx = register_stub_source(stream_id, Some(init.clone()));
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(101, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 101),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
@@ -1071,7 +1075,10 @@ mod tests {
         let tx = register_stub_source(stream_id, None);
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(606, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 606),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
@@ -1124,7 +1131,10 @@ mod tests {
     #[tokio::test]
     async fn subscribe_rejects_unregistered_stream() {
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(202, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 202),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "camera:does-not-exist-xyz".to_string(),
@@ -1145,7 +1155,10 @@ mod tests {
     #[tokio::test]
     async fn subscribe_rejects_unsupported_prefix() {
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(303, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 303),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "audio:doorbell".to_string(),
@@ -1169,7 +1182,10 @@ mod tests {
         let _tx = register_stub_source(stream_id, None);
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(404, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 404),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
@@ -1269,7 +1285,10 @@ mod tests {
         crate::services::lidar_hub::LidarStreamHub::global().publish(robot_id, 1, frame.clone());
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1101, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1101),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: format!("lidar:{}", robot_id),
@@ -1312,7 +1331,10 @@ mod tests {
         seed_robot(robot_id, "some-other-owner-node");
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1102, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1102),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: format!("lidar:{}", robot_id),
@@ -1341,7 +1363,10 @@ mod tests {
         seed_robot(robot_id, "perm-node");
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1103, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1103),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: format!("lidar:{}", robot_id),
@@ -1367,7 +1392,10 @@ mod tests {
     #[tokio::test]
     async fn lidar_unknown_robot_masked_not_found() {
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1104, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1104),
+            None,
+        );
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "lidar:go2-never-advertised-xyz".to_string(),
@@ -1398,7 +1426,10 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..MAX_STREAM_SUBS_PER_USER {
             let reg = SubscriptionRegistry::new();
-            let (sub, rx) = reg.create(900 + i as u64, None);
+            let (sub, rx) = reg.create(
+                crate::dispatch::subscription::SubscriptionKey::new(0, 900 + i as u64),
+                None,
+            );
             let mut ctx = ctx_with_camera_read(900 + i as u64);
             ctx.org_context = Some(test_org_context(user_key, PERM_CAMERA_READ));
             seed_local_camera(&ctx, "cap-test-cam");
@@ -1421,7 +1452,10 @@ mod tests {
 
         // (N+1)th subscribe must be denied with QuotaExceeded.
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx_over) = reg.create(999, None);
+        let (sub, mut rx_over) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 999),
+            None,
+        );
         let mut ctx = ctx_with_camera_read(999);
         ctx.org_context = Some(test_org_context(user_key, PERM_CAMERA_READ));
         seed_local_camera(&ctx, "cap-test-cam");

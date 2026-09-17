@@ -5121,7 +5121,11 @@ mod tests {
 
         let reg = SubscriptionRegistry::new();
         // Kanal plytszy niz burst — bez backpressure task zginalby na 5. linii.
-        let (sub, mut rx) = reg.create_with_capacity(1, None, 4);
+        let (sub, mut rx) = reg.create_with_capacity(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+            4,
+        );
         let h = find_stream_handler("DeploymentLogStreamRequest").unwrap();
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
@@ -5214,7 +5218,11 @@ mod tests {
         let tx = log_bus::sender_for(deploy_id);
 
         let reg = SubscriptionRegistry::new();
-        let (sub, rx) = reg.create_with_capacity(2, None, 4);
+        let (sub, rx) = reg.create_with_capacity(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 2),
+            None,
+            4,
+        );
         let h = find_stream_handler("DeploymentLogStreamRequest").unwrap();
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
@@ -5281,7 +5289,10 @@ mod tests {
         let alice_token = resume_token::issue(42, 5, alice, &secret);
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(99, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 99),
+            None,
+        );
         let h = find_stream_handler("SubscribeResumeRequest").unwrap();
 
         // Bob proboje uzyc tokenu Alice.
@@ -5325,7 +5336,10 @@ mod tests {
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+        );
         let h = find_stream_handler("SubscribeResumeRequest").unwrap();
         // 80-byte token (current TOKEN_LEN) of garbage — will fail signature verify.
         let req = MessageBody::SubscribeResumeRequest {
@@ -5373,7 +5387,10 @@ mod tests {
         let token = resume_token::issue(42, 5, user_id, &secret);
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(2, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 2),
+            None,
+        );
         let h = find_stream_handler("SubscribeResumeRequest").unwrap();
         let req = MessageBody::SubscribeResumeRequest {
             resume_token: token,
@@ -5420,7 +5437,10 @@ mod tests {
         use tentaflow_protocol::{ChatMessage, ChatStreamRequest, MessageBody, SessionAuth};
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+        );
 
         let h = find_stream_handler("ChatStreamRequest").unwrap();
         let req = MessageBody::ChatStreamRequestBody(ChatStreamRequest {
@@ -5506,7 +5526,10 @@ mod tests {
 
         let registry = SubscriptionRegistry::new();
 
-        let (sub, mut rx) = registry.create(1, None);
+        let (sub, mut rx) = registry.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+        );
         (find_stream_handler("CodeStudioSessionStreamRequest")
             .unwrap()
             .handler_fn)(
@@ -5525,7 +5548,10 @@ mod tests {
             other => panic!("expected a named session end, got {other:?}"),
         }
 
-        let (sub, mut rx) = registry.create(2, None);
+        let (sub, mut rx) = registry.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 2),
+            None,
+        );
         (find_stream_handler("CodeStudioTerminalStreamRequest")
             .unwrap()
             .handler_fn)(
@@ -5545,7 +5571,10 @@ mod tests {
             other => panic!("expected a named terminal end, got {other:?}"),
         }
 
-        let (sub, mut rx) = registry.create(3, None);
+        let (sub, mut rx) = registry.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 3),
+            None,
+        );
         (find_stream_handler("CodeStudioIndexStreamRequest")
             .unwrap()
             .handler_fn)(
@@ -5572,7 +5601,10 @@ mod tests {
         use tentaflow_protocol::MessageBody;
 
         let registry = SubscriptionRegistry::new();
-        let (sub, mut rx) = registry.create(1, None);
+        let (sub, mut rx) = registry.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+        );
         (find_stream_handler("CodeStudioSessionStreamRequest")
             .unwrap()
             .handler_fn)(MessageBody::ModelListRequest, code_studio_test_ctx(), sub);
@@ -5770,7 +5802,10 @@ mod tests {
 
         let registry = SubscriptionRegistry::new();
 
-        let (sub, mut rx) = registry.create(1, None);
+        let (sub, mut rx) = registry.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+        );
         (find_stream_handler("CodeStudioSessionStreamRequest")
             .unwrap()
             .handler_fn)(
@@ -5789,7 +5824,10 @@ mod tests {
             other => panic!("expected the timeline to take the pull path, got {other:?}"),
         }
 
-        let (sub, mut rx) = registry.create(2, None);
+        let (sub, mut rx) = registry.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 2),
+            None,
+        );
         (find_stream_handler("CodeStudioTerminalStreamRequest")
             .unwrap()
             .handler_fn)(
@@ -5820,7 +5858,10 @@ mod tests {
         use tentaflow_protocol::MessageBody;
 
         let registry = SubscriptionRegistry::new();
-        let (sub, mut rx) = registry.create(1, None);
+        let (sub, mut rx) = registry.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+        );
         (find_stream_handler("CodeStudioIndexStreamRequest")
             .unwrap()
             .handler_fn)(
@@ -5850,7 +5891,10 @@ mod tests {
         // The fixture seeds `index_enabled = 0`, and the local node owns it.
         let ctx = code_studio_seeded_ctx("test-node");
         let registry = SubscriptionRegistry::new();
-        let (sub, mut rx) = registry.create(1, None);
+        let (sub, mut rx) = registry.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+        );
         (find_stream_handler("CodeStudioIndexStreamRequest")
             .unwrap()
             .handler_fn)(
@@ -6482,7 +6526,10 @@ mod tests {
         );
 
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(11, None);
+        let (sub, mut rx) = reg.create(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 11),
+            None,
+        );
         let h = find_stream_handler("ProjectStudioChatStreamRequest").unwrap();
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {

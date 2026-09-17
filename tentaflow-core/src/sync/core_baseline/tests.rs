@@ -62,7 +62,7 @@ fn import(
     snap: &BaselineSnapshot,
     donor: &str,
 ) -> LedgerResult<BaselineImportReport> {
-    import_baseline(joiner, snap, donor, JOINER_LOCAL_NODE, &test_cipher())
+    import_baseline(joiner, snap, donor, JOINER_LOCAL_NODE)
 }
 
 fn epoch(counter: u64, origin: &str) -> BaselineEpoch {
@@ -556,7 +556,7 @@ fn snapshot_serialize_chunk_reassemble_roundtrip() {
     seed_membership(&pool, "org-donor", "u-donor-1", "role-user");
     seed_flow(&pool, "f-1", "donor-flow", Some("donor/model"));
 
-    let snap = capture_baseline_snapshot(&pool, epoch(3, "org-donor"), &test_cipher()).unwrap();
+    let snap = capture_baseline_snapshot(&pool, epoch(3, "org-donor")).unwrap();
     let bytes = serialize_snapshot(&snap).unwrap();
     let header = build_baseline_header(&snap, &bytes);
     let chunks = chunk_snapshot(&bytes);
@@ -573,7 +573,7 @@ fn snapshot_serialize_chunk_reassemble_roundtrip() {
 fn corrupted_chunk_is_detected() {
     let pool = new_pool();
     seed_org(&pool, "org-donor", "donor");
-    let snap = capture_baseline_snapshot(&pool, epoch(1, "org-donor"), &test_cipher()).unwrap();
+    let snap = capture_baseline_snapshot(&pool, epoch(1, "org-donor")).unwrap();
     let bytes = serialize_snapshot(&snap).unwrap();
     let header = build_baseline_header(&snap, &bytes);
     let mut chunks = chunk_snapshot(&bytes);
@@ -588,7 +588,7 @@ fn corrupted_chunk_is_detected() {
 fn sequence_gap_is_detected() {
     let bytes = vec![0u8; BASELINE_CHUNK_BYTES * 3];
     let header = BaselineHeader {
-        schema_version: 1,
+        schema_version: BASELINE_SCHEMA_VERSION,
         epoch: 1,
         tables: vec![],
         row_counts: vec![],
@@ -607,7 +607,7 @@ fn sequence_gap_is_detected() {
 fn oversize_snapshot_is_rejected() {
     let bytes = vec![0u8; BASELINE_CHUNK_BYTES];
     let header = BaselineHeader {
-        schema_version: 1,
+        schema_version: BASELINE_SCHEMA_VERSION,
         epoch: 1,
         tables: vec![],
         row_counts: vec![],
@@ -627,7 +627,7 @@ fn whole_snapshot_hash_mismatch_rejected() {
     // ale hash CALOSCI z naglowka juz nie pasuje -> odmowa.
     let bytes = vec![1u8; BASELINE_CHUNK_BYTES * 2 + 10];
     let header = BaselineHeader {
-        schema_version: 1,
+        schema_version: BASELINE_SCHEMA_VERSION,
         epoch: 1,
         tables: vec![],
         row_counts: vec![],
@@ -648,7 +648,7 @@ fn whole_snapshot_hash_mismatch_rejected() {
 
 /// Buduje snapshot dawcy z osobnej puli i importuje go do puli joinera.
 fn donor_snapshot(donor: &DbPool, epoch_counter: u64) -> BaselineSnapshot {
-    capture_baseline_snapshot(donor, epoch(epoch_counter, "donor-node"), &test_cipher()).unwrap()
+    capture_baseline_snapshot(donor, epoch(epoch_counter, "donor-node")).unwrap()
 }
 
 #[test]
@@ -914,7 +914,6 @@ fn run_baseline_adopt_drives_full_path_from_bytes() {
         "donor-node",
         JOINER_LOCAL_NODE,
         &rebuilt,
-        &test_cipher(),
     )
     .unwrap();
     assert!(user_exists(&joiner, "u-donor"));
@@ -1206,34 +1205,30 @@ fn import_brings_donor_explicit_shares_and_node_assignments() {
 }
 
 #[test]
-fn import_donor_secret_wins_and_is_reencrypted() {
+fn a_baseline_never_carries_fleet_secrets() {
     let donor = new_pool();
     let joiner = new_pool();
     seed_org(&donor, "org-donor", "donor");
     seed_org(&joiner, "org-joiner", "joiner");
 
-    // Dawca i joiner maja ROZNE ciphery i rozne wartosci tego samego sekretu.
     let donor_cipher = other_cipher();
     let joiner_cipher = test_cipher();
     set_secret(&donor, &donor_cipher, "hf_token", "DONOR-TOKEN");
     set_secret(&joiner, &joiner_cipher, "hf_token", "JOINER-TOKEN");
 
-    // Snapshot dawcy odszyfrowuje sekret dawcy do plaintextu (jego cipher).
-    let snap = capture_baseline_snapshot(&donor, epoch(1, "donor-node"), &donor_cipher).unwrap();
-    // Joiner importuje swoim cipherem (re-encrypt).
-    import_baseline(
-        &joiner,
-        &snap,
-        "donor-node",
-        JOINER_LOCAL_NODE,
-        &joiner_cipher,
-    )
-    .unwrap();
+    let snap = capture_baseline_snapshot(&donor, epoch(1, "donor-node")).unwrap();
+    let raw = serialize_snapshot(&snap).unwrap();
+    assert!(
+        !raw.windows(b"DONOR-TOKEN".len()).any(|w| w == b"DONOR-TOKEN"),
+        "the donor's secret must not appear in the snapshot bytes"
+    );
 
-    // Donor-wins: wartosc dawcy, odczytywalna joinerowym cipherem.
+    import_baseline(&joiner, &snap, "donor-node", JOINER_LOCAL_NODE).unwrap();
+
+    // Secrets arrive sealed over `SharedSecretsSync`; the import leaves them alone.
     assert_eq!(
         get_secret(&joiner, &joiner_cipher, "hf_token").as_deref(),
-        Some("DONOR-TOKEN")
+        Some("JOINER-TOKEN")
     );
 }
 

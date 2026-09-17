@@ -177,7 +177,13 @@ impl ProfileStorage {
         Ok(self.root.join(node_id))
     }
 
-    fn session_dir_path(&self, node_id: &str, session_id: &str) -> Result<PathBuf, StorageError> {
+    /// Validated session path without creating it — the only safe way to turn
+    /// a wire-supplied `session_id` into a filesystem path.
+    pub fn session_dir_path(
+        &self,
+        node_id: &str,
+        session_id: &str,
+    ) -> Result<PathBuf, StorageError> {
         check_session_id(session_id)?;
         Ok(self.node_dir(node_id)?.join(session_id))
     }

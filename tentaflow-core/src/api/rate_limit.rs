@@ -259,13 +259,20 @@ pub fn invalid_signed_token_limiter() -> &'static Arc<RateLimiter> {
 // IP. The /v1 surface is authenticated, so the meaningful budget is per API key:
 // each `api_keys.rate_limit_rps` is enforced as a token bucket keyed by the key
 // uid. The same key shares one budget across every IP it calls from; distinct
-// keys are isolated. `rate_limit_rps <= 0` disables the limit for that key.
+// keys are isolated. `rate_limit_rps <= 0` disables the per-key limit but a
+// global (process-wide) ceiling still applies to prevent an unlimited key from
+// exhausting the node.
 
 /// Hard ceiling on the per-key map. Unlike the per-IP surface (forged tokens) the
 /// keys here are valid uids, but a deployment with very high key cardinality (or a
 /// key-enumeration probe against `rate_limit_rps>0` keys) would otherwise grow the
 /// map without bound — idle eviction never fires for keys that keep firing.
 const MAX_PER_KEY_ENTRIES: usize = 10_000;
+
+/// Global rate limit for unlimited keys (rate_limit_rps <= 0): 10 000 req/s
+/// process-wide, burst of 10 000 requests. Prevents a single unlimited key from
+/// consuming all node resources.
+const UNLIMITED_KEY_GLOBAL_RPS: u32 = 10_000;
 
 struct KeyEntry {
     bucket: TokenBucket,
@@ -275,26 +282,40 @@ struct KeyEntry {
 
 pub struct PerKeyRateLimiter {
     keys: DashMap<String, KeyEntry>,
+    global_for_unlimited: Mutex<TokenBucket>,
 }
 
 impl PerKeyRateLimiter {
     fn new() -> Self {
         Self {
             keys: DashMap::new(),
+            global_for_unlimited: Mutex::new(TokenBucket::new(UNLIMITED_KEY_GLOBAL_RPS)),
         }
     }
 
     /// Charge one token against `key_uid`'s bucket sized for `rate_limit_rps`.
     /// Returns `None` when allowed, or `Some(retry_after_secs)` when throttled.
-    /// A non-positive `rate_limit_rps` means "no limit" and always allows.
+    /// A non-positive `rate_limit_rps` means "no per-key limit" but the global
+    /// ceiling for unlimited keys still applies.
     pub fn check(&self, key_uid: &str, rate_limit_rps: i64) -> Option<f64> {
-        if rate_limit_rps <= 0 {
-            return None;
-        }
-        let rps = rate_limit_rps as u32;
         let now = Instant::now();
         self.sweep_if_needed(now);
 
+        if rate_limit_rps <= 0 {
+            // No per-key limit, but check the global ceiling for unlimited keys.
+            let Ok(mut g) = self.global_for_unlimited.lock() else {
+                return Some(1.0);
+            };
+            return match g.refill_and_peek(UNLIMITED_KEY_GLOBAL_RPS, UNLIMITED_KEY_GLOBAL_RPS as f64, now) {
+                Ok(()) => {
+                    g.commit_one();
+                    None
+                }
+                Err(retry) => Some(retry),
+            };
+        }
+
+        let rps = rate_limit_rps as u32;
         let mut entry = self
             .keys
             .entry(key_uid.to_string())

@@ -9,7 +9,6 @@ use super::ledger::{
 };
 use crate::db::DbPool;
 use rusqlite::OptionalExtension;
-use std::sync::Arc;
 
 /// Resource kinds that multiple nodes may edit concurrently. Their writes go
 /// through HLC last-writer-wins: an incoming operation is applied only when its
@@ -123,12 +122,20 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             // add that arrived the long way round.
             | CoreSyncResourceKind::Cluster
             | CoreSyncResourceKind::ClusterMember
+            // Agent provider accounts: every one of these is revocable or
+            // editable from any node, and a revocation must not be resurrected
+            // by a stale grant that took the long way round. LWW makes the
+            // Delete tombstone win over the older Insert, the same reason
+            // `CodeWorkspaceMember` is tracked.
+            | CoreSyncResourceKind::ProviderAccount
+            | CoreSyncResourceKind::ProviderAccountGrant
+            | CoreSyncResourceKind::AgentRuntimeNode
+            | CoreSyncResourceKind::AgentRuntimeEngine
     )
 }
 
 pub fn apply_core_operation(
     pool: &DbPool,
-    settings_cipher: &Arc<crate::crypto::SettingsCipher>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
     if operation.body.addon_id != CORE_SYNC_ADDON_ID {
@@ -200,7 +207,7 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::SyncResourceAcl => apply_sync_resource_acl(&tx, operation)?,
         CoreSyncResourceKind::SyncExplicitShare => apply_sync_explicit_share(&tx, operation)?,
         CoreSyncResourceKind::SharedSettingSecret => {
-            apply_shared_setting_secret(&tx, settings_cipher, operation)?
+            apply_shared_setting_secret(&tx, operation)?
         }
         CoreSyncResourceKind::AddonInstance => apply_addon_instance(&tx, operation)?,
         CoreSyncResourceKind::AddonConfig => apply_addon_config(&tx, operation)?,
@@ -281,6 +288,12 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::BusSchemaVersion => apply_bus_schema_version(&tx, operation)?,
         CoreSyncResourceKind::Cluster => apply_cluster(&tx, operation)?,
         CoreSyncResourceKind::ClusterMember => apply_cluster_member(&tx, operation)?,
+        CoreSyncResourceKind::ProviderAccount => apply_provider_account(&tx, operation)?,
+        CoreSyncResourceKind::ProviderAccountGrant => {
+            apply_provider_account_grant(&tx, operation)?
+        }
+        CoreSyncResourceKind::AgentRuntimeNode => apply_agent_runtime_node(&tx, operation)?,
+        CoreSyncResourceKind::AgentRuntimeEngine => apply_agent_runtime_engine(&tx, operation)?,
     };
 
     if lww_tracked && authorized {
@@ -406,35 +419,24 @@ pub(crate) fn upsert_resource_version(
 
 fn apply_shared_setting_secret(
     tx: &rusqlite::Transaction<'_>,
-    settings_cipher: &crate::crypto::SettingsCipher,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
     let key = field_string(operation, "key")?;
-    // Same resource kind carries both allowlisted secrets (re-encrypted per node)
-    // and allowlisted non-secret fleet config (plaintext). Anything else is
-    // refused — a node never materializes a setting it has not opted into.
-    let is_secret = crate::db::repository::is_shared_secret_setting_key(&key);
-    let is_shared = crate::db::repository::is_shared_setting_key(&key);
-    if !is_secret && !is_shared {
+    // Deny by default: only allowlisted non-secret fleet config materializes.
+    // Secrets are refused here as well as at admission, so that no ledger path
+    // can write one into `settings`.
+    if !crate::db::repository::is_shared_setting_key(&key) {
         return Err(SyncLedgerError::Runtime(format!(
-            "setting is not syncable: {key}"
+            "setting is not syncable through the ledger: {key}"
         )));
     }
     match operation.body.action {
         ActionType::Insert | ActionType::Update => {
             let value = field_string(operation, "value")?;
-            // Secrets re-encrypt with THIS node's cipher; non-secrets stay plain.
-            let stored = if is_secret {
-                settings_cipher
-                    .encrypt(&value)
-                    .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
-            } else {
-                value
-            };
             tx.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
-                rusqlite::params![key, stored],
+                rusqlite::params![key, value],
             )
             .map_err(sql_error)
         }
@@ -2052,8 +2054,9 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                 "INSERT INTO agents \
                  (id, name, display_name, description, system_prompt, model, tools_json, \
                   skills_json, params_json, max_iterations, timeout_secs, max_subagents, \
-                  max_spawn_depth, flow_id, routable, is_enabled, on_child_complete) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+                  max_spawn_depth, flow_id, routable, is_enabled, on_child_complete, runtime_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                  ?17, ?18) \
                  ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, display_name = excluded.display_name, \
                  description = excluded.description, system_prompt = excluded.system_prompt, \
@@ -2063,6 +2066,7 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                  max_subagents = excluded.max_subagents, max_spawn_depth = excluded.max_spawn_depth, \
                  flow_id = excluded.flow_id, routable = excluded.routable, \
                  is_enabled = excluded.is_enabled, on_child_complete = excluded.on_child_complete, \
+                 runtime_json = excluded.runtime_json, \
                  updated_at = datetime('now')",
                 rusqlite::params![
                     id,
@@ -2082,6 +2086,14 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                     field_bool_or(operation, "routable", true)?,
                     field_bool_or(operation, "is_enabled", true)?,
                     field_string_or(operation, "on_child_complete", "notify")?,
+                    // A peer built before migration 156 sends no runtime at
+                    // all; its agents are the plain LLM kind, which is exactly
+                    // what the column default says.
+                    field_string_or(
+                        operation,
+                        "runtime_json",
+                        crate::agents::LLM_RUNTIME_JSON,
+                    )?,
                 ],
             )
             .map_err(sql_error),
@@ -2108,6 +2120,7 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                  routable = COALESCE(?19, routable), \
                  is_enabled = COALESCE(?20, is_enabled), \
                  on_child_complete = COALESCE(?21, on_child_complete), \
+                 runtime_json = COALESCE(?22, runtime_json), \
                  updated_at = datetime('now') \
                  WHERE id = ?1",
                 rusqlite::params![
@@ -2132,6 +2145,7 @@ fn apply_agent(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> Led
                     optional_present_bool(operation, "routable")?,
                     optional_present_bool(operation, "is_enabled")?,
                     optional_present_string(operation, "on_child_complete")?,
+                    optional_present_string(operation, "runtime_json")?,
                 ],
             )
             .map_err(sql_error)
@@ -4084,6 +4098,238 @@ fn apply_cluster_member(
     }
 }
 
+/// Apply a replicated provider account. Every local write is captured as a
+/// full-row Insert, so the Insert arm is the whole path.
+///
+/// `provider_subject` is IMMUTABLE once non-NULL: an operation carrying a
+/// different one is refused and logged, because a different provider identity
+/// under the same account id is a mistake and never a rename — taking the newer
+/// one would leave every grant, session and agent pointing at somebody else's
+/// subscription. A NULL in the operation does not erase a stored one either:
+/// the account learned it at a login this node may not have seen.
+fn apply_provider_account(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let account_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let incoming_subject = field_optional_string(operation, "provider_subject")?;
+            let stored_subject: Option<String> = tx
+                .query_row(
+                    "SELECT provider_subject FROM provider_accounts WHERE account_id = ?1",
+                    rusqlite::params![account_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .flatten();
+            if let (Some(stored), Some(incoming)) = (&stored_subject, &incoming_subject) {
+                if stored != incoming {
+                    tracing::warn!(
+                        account_id = %account_id,
+                        "refused a replicated provider account whose provider identity differs \
+                         from the stored one"
+                    );
+                    return Ok(0);
+                }
+            }
+            let subject = incoming_subject.or(stored_subject);
+            tx.execute(
+                "INSERT INTO provider_accounts \
+                   (account_id, org_id, engine_id, display_name, scope, owner_user_id, \
+                    credential_kind, provider_subject, plan_label, home_node_id, status, \
+                    created_by, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                    strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
+                 ON CONFLICT(account_id) DO UPDATE SET \
+                    org_id = excluded.org_id, engine_id = excluded.engine_id, \
+                    display_name = excluded.display_name, scope = excluded.scope, \
+                    owner_user_id = excluded.owner_user_id, \
+                    credential_kind = excluded.credential_kind, \
+                    provider_subject = excluded.provider_subject, \
+                    plan_label = excluded.plan_label, home_node_id = excluded.home_node_id, \
+                    status = excluded.status, \
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+                rusqlite::params![
+                    account_id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "engine_id")?,
+                    field_string(operation, "display_name")?,
+                    field_string(operation, "scope")?,
+                    field_optional_string(operation, "owner_user_id")?,
+                    field_string(operation, "credential_kind")?,
+                    subject,
+                    field_optional_string(operation, "plan_label")?,
+                    field_optional_string(operation, "home_node_id")?,
+                    field_string(operation, "status")?,
+                    field_string(operation, "created_by")?,
+                    field_string(operation, "created_at")?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM provider_accounts WHERE account_id = ?1",
+                rusqlite::params![account_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated grant. Identity is (account_id, subject_type,
+/// subject_id); `granted_by` travels so the Dostęp tab can say who gave access
+/// on whichever node it is read from.
+fn apply_provider_account_grant(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let account_id = field_string(operation, "account_id")?;
+    let subject_type = field_string(operation, "subject_type")?;
+    let subject_id = field_string(operation, "subject_id")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            require_provider_account(tx, &account_id)?;
+            tx.execute(
+                "INSERT INTO provider_account_grants \
+                   (account_id, subject_type, subject_id, granted_by, granted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(account_id, subject_type, subject_id) DO UPDATE SET \
+                    granted_by = excluded.granted_by, granted_at = excluded.granted_at",
+                rusqlite::params![
+                    account_id,
+                    subject_type,
+                    subject_id,
+                    field_string(operation, "granted_by")?,
+                    field_string(operation, "granted_at")?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM provider_account_grants \
+                 WHERE account_id = ?1 AND subject_type = ?2 AND subject_id = ?3",
+                rusqlite::params![account_id, subject_type, subject_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn require_provider_account(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+) -> LedgerResult<()> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM provider_accounts WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or(false);
+    if exists {
+        Ok(())
+    } else {
+        Err(SyncLedgerError::DeferredOrdering(format!(
+            "provider account not found: {account_id}"
+        )))
+    }
+}
+
+/// Apply the "this node receives account credentials" flag. The row is created
+/// on arrival: a node is in this table because an administrator decided
+/// something about it, and that decision must reach every node that renders the
+/// N01 matrix.
+fn apply_agent_runtime_node(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let node_id = field_string(operation, "node_id")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO agent_runtime_nodes (node_id, receives_accounts, updated_by, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(node_id) DO UPDATE SET \
+                    receives_accounts = excluded.receives_accounts, \
+                    updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+                rusqlite::params![
+                    node_id,
+                    i64::from(field_bool_or(operation, "receives_accounts", false)?),
+                    field_optional_string(operation, "updated_by")?,
+                    field_string(operation, "updated_at")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM agent_runtime_nodes WHERE node_id = ?1",
+                rusqlite::params![node_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply one cell of the node matrix. The runtime-node row is created if it is
+/// missing rather than deferred: the engine row's FK needs it, and a node that
+/// reports an installed CLI IS an agent-runtime node — with the flag at its
+/// default 0, so arriving here never grants anybody a credential.
+fn apply_agent_runtime_engine(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let node_id = field_string(operation, "node_id")?;
+    let engine_id = field_string(operation, "engine_id")?;
+    // An engine row is a MEASUREMENT of one node's own filesystem, so only that
+    // node may assert it. Without this, any trusted peer could tell us that our
+    // own `claude-code` is installed, and the matrix would show an install this
+    // machine never made — the operator would then route work to a node with no
+    // binary. Terminal, not deferred: no later state makes this operation legal.
+    if local_node_id(tx)?.as_deref() == Some(node_id.as_str())
+        && operation.body.actor_node_id.as_deref() != Some(node_id.as_str())
+    {
+        return Err(SyncLedgerError::Runtime(format!(
+            "node {} may not assert the agent runtime of this node",
+            operation.body.actor_node_id.as_deref().unwrap_or("unknown")
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            tx.execute(
+                "INSERT OR IGNORE INTO agent_runtime_nodes (node_id) VALUES (?1)",
+                rusqlite::params![node_id],
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO agent_runtime_engines \
+                   (node_id, engine_id, install_state, version, installed_at, last_error) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(node_id, engine_id) DO UPDATE SET \
+                    install_state = excluded.install_state, version = excluded.version, \
+                    installed_at = excluded.installed_at, last_error = excluded.last_error",
+                rusqlite::params![
+                    node_id,
+                    engine_id,
+                    field_string(operation, "install_state")?,
+                    field_optional_string(operation, "version")?,
+                    field_optional_string(operation, "installed_at")?,
+                    field_optional_string(operation, "last_error")?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM agent_runtime_engines WHERE node_id = ?1 AND engine_id = ?2",
+                rusqlite::params![node_id, engine_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
 pub(crate) fn field_string(operation: &SyncOperation, key: &str) -> LedgerResult<String> {
     match operation.body.changed_fields.get(key) {
         Some(FieldValue::String(value)) => Ok(value.clone()),
@@ -6001,11 +6247,10 @@ mod tests {
     #[test]
     fn bus_topic_insert_then_update_then_delete_round_trips() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
 
         let row = bus_topic_row("org-1", "orders.created");
         let insert_op = bus_topic_op(&row, ActionType::Insert);
-        assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &insert_op).unwrap(), 1);
         let fetched =
             repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.created")
                 .unwrap()
@@ -6035,7 +6280,7 @@ mod tests {
         // A strictly-later HLC is needed for the outer LWW gate to accept a
         // second op for the same resource_id.
         update_op.body.hlc_timestamp.wall_time_ms = 2;
-        assert_eq!(apply_core_operation(&db, &cipher, &update_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &update_op).unwrap(), 1);
         let fetched =
             repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.created")
                 .unwrap()
@@ -6045,7 +6290,7 @@ mod tests {
 
         let mut delete_op = bus_topic_op(&updated_row, ActionType::Delete);
         delete_op.body.hlc_timestamp.wall_time_ms = 3;
-        assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &delete_op).unwrap(), 1);
         assert!(
             repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.created")
                 .unwrap()
@@ -6102,12 +6347,11 @@ mod tests {
     #[test]
     fn bus_topic_fire_and_forget_is_coerced_to_at_least_once() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
 
         let mut row = bus_topic_row("org-1", "orders.legacy");
         row.delivery = "fire_and_forget".to_string();
         let op = bus_topic_op(&row, ActionType::Insert);
-        assert_eq!(apply_core_operation(&db, &cipher, &op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &op).unwrap(), 1);
 
         let fetched = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.legacy")
             .unwrap()
@@ -6121,16 +6365,15 @@ mod tests {
     #[test]
     fn bus_partition_assignment_applies_when_no_stored_row_and_topic_exists() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
         let topic_op = bus_topic_op(
             &bus_topic_row("org-1", "orders.created"),
             ActionType::Insert,
         );
-        apply_core_operation(&db, &cipher, &topic_op).unwrap();
+        apply_core_operation(&db, &topic_op).unwrap();
 
         let assignment = test_assignment("org-1", "orders.created", 0, "node-a", 1);
         let op = bus_assignment_op(&assignment, ActionType::Insert);
-        assert_eq!(apply_core_operation(&db, &cipher, &op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &op).unwrap(), 1);
 
         let stored =
             repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
@@ -6186,17 +6429,16 @@ mod tests {
     #[test]
     fn bus_partition_assignment_stale_epoch_is_rejected_as_noop() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
         let topic_op = bus_topic_op(
             &bus_topic_row("org-1", "orders.created"),
             ActionType::Insert,
         );
-        apply_core_operation(&db, &cipher, &topic_op).unwrap();
+        apply_core_operation(&db, &topic_op).unwrap();
 
         let fresh = test_assignment("org-1", "orders.created", 0, "node-a", 5);
         let mut fresh_op = bus_assignment_op(&fresh, ActionType::Insert);
         fresh_op.body.hlc_timestamp.wall_time_ms = 10;
-        assert_eq!(apply_core_operation(&db, &cipher, &fresh_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &fresh_op).unwrap(), 1);
 
         // Same resource, LOWER leader_epoch, but a strictly NEWER HLC so the
         // OUTER LWW gate would admit it — only the epoch gate inside
@@ -6205,7 +6447,7 @@ mod tests {
         let mut stale_op = bus_assignment_op(&stale, ActionType::Insert);
         stale_op.body.hlc_timestamp.wall_time_ms = 20;
         assert_eq!(
-            apply_core_operation(&db, &cipher, &stale_op).unwrap(),
+            apply_core_operation(&db, &stale_op).unwrap(),
             0,
             "a lower leader_epoch must be rejected as a no-op even with a newer HLC"
         );
@@ -6221,17 +6463,16 @@ mod tests {
     #[test]
     fn bus_partition_assignment_equal_epoch_tiebreaks_by_lowest_node_id() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
         let topic_op = bus_topic_op(
             &bus_topic_row("org-1", "orders.created"),
             ActionType::Insert,
         );
-        apply_core_operation(&db, &cipher, &topic_op).unwrap();
+        apply_core_operation(&db, &topic_op).unwrap();
 
         let first = test_assignment("org-1", "orders.created", 0, "node-m", 7);
         let mut first_op = bus_assignment_op(&first, ActionType::Insert);
         first_op.body.hlc_timestamp.wall_time_ms = 10;
-        assert_eq!(apply_core_operation(&db, &cipher, &first_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &first_op).unwrap(), 1);
 
         // Same epoch, HIGHER node id: must lose the tie-break even though its
         // HLC is newer.
@@ -6239,7 +6480,7 @@ mod tests {
         let mut higher_op = bus_assignment_op(&higher_node, ActionType::Insert);
         higher_op.body.hlc_timestamp.wall_time_ms = 20;
         assert_eq!(
-            apply_core_operation(&db, &cipher, &higher_op).unwrap(),
+            apply_core_operation(&db, &higher_op).unwrap(),
             0,
             "a higher node_id at the same epoch must lose the tie-break"
         );
@@ -6256,7 +6497,7 @@ mod tests {
         let mut lower_op = bus_assignment_op(&lower_node, ActionType::Insert);
         lower_op.body.hlc_timestamp.wall_time_ms = 30;
         assert_eq!(
-            apply_core_operation(&db, &cipher, &lower_op).unwrap(),
+            apply_core_operation(&db, &lower_op).unwrap(),
             1,
             "a lower node_id at the same epoch must win the tie-break"
         );
@@ -6272,21 +6513,20 @@ mod tests {
     #[test]
     fn bus_partition_assignment_delete_removes_row() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
         let topic_op = bus_topic_op(
             &bus_topic_row("org-1", "orders.created"),
             ActionType::Insert,
         );
-        apply_core_operation(&db, &cipher, &topic_op).unwrap();
+        apply_core_operation(&db, &topic_op).unwrap();
 
         let assignment = test_assignment("org-1", "orders.created", 0, "node-a", 1);
         let mut insert_op = bus_assignment_op(&assignment, ActionType::Insert);
         insert_op.body.hlc_timestamp.wall_time_ms = 10;
-        assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &insert_op).unwrap(), 1);
 
         let mut delete_op = bus_assignment_op(&assignment, ActionType::Delete);
         delete_op.body.hlc_timestamp.wall_time_ms = 20;
-        assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &delete_op).unwrap(), 1);
         assert!(repository::bus_assignment_get(
             &db,
             "tentabus-00000001",
@@ -6391,11 +6631,10 @@ mod tests {
     #[test]
     fn bus_schema_subject_insert_then_update_then_delete_cascades_versions() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
 
         let row = schema_subject_row_for_test("org-1", "orders.v1");
         let insert_op = bus_schema_subject_op(&row, ActionType::Insert);
-        assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &insert_op).unwrap(), 1);
         let fetched =
             repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders.v1")
                 .unwrap()
@@ -6409,7 +6648,7 @@ mod tests {
         updated_row.updated_at_ms = 2;
         let mut update_op = bus_schema_subject_op(&updated_row, ActionType::Update);
         update_op.body.hlc_timestamp.wall_time_ms = 2;
-        assert_eq!(apply_core_operation(&db, &cipher, &update_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &update_op).unwrap(), 1);
         let fetched =
             repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders.v1")
                 .unwrap()
@@ -6422,7 +6661,7 @@ mod tests {
             ActionType::Insert,
         );
         version_op.body.hlc_timestamp.wall_time_ms = 3;
-        assert_eq!(apply_core_operation(&db, &cipher, &version_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &version_op).unwrap(), 1);
         assert!(repository::bus_schema_version_get(
             &db,
             "tentabus-00000001",
@@ -6435,7 +6674,7 @@ mod tests {
 
         let mut delete_op = bus_schema_subject_op(&updated_row, ActionType::Delete);
         delete_op.body.hlc_timestamp.wall_time_ms = 4;
-        assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &delete_op).unwrap(), 1);
         assert!(
             repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders.v1")
                 .unwrap()
@@ -6480,23 +6719,22 @@ mod tests {
     #[test]
     fn bus_schema_version_replay_with_the_same_content_hash_is_a_noop() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
         let subject_op = bus_schema_subject_op(
             &schema_subject_row_for_test("org-1", "orders.v1"),
             ActionType::Insert,
         );
-        apply_core_operation(&db, &cipher, &subject_op).unwrap();
+        apply_core_operation(&db, &subject_op).unwrap();
 
         let version_row = schema_version_row_for_test("org-1", "orders.v1", 1, "hash-a", 801);
         let mut first_op = bus_schema_version_op(&version_row, ActionType::Insert);
         first_op.body.hlc_timestamp.wall_time_ms = 2;
-        assert_eq!(apply_core_operation(&db, &cipher, &first_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &first_op).unwrap(), 1);
 
         // Redelivery of the exact same op (or an independent op for the same
         // content from another node) must not error and must not double-insert.
         let mut replay_op = bus_schema_version_op(&version_row, ActionType::Insert);
         replay_op.body.hlc_timestamp.wall_time_ms = 3;
-        assert_eq!(apply_core_operation(&db, &cipher, &replay_op).unwrap(), 0);
+        assert_eq!(apply_core_operation(&db, &replay_op).unwrap(), 0);
         assert_eq!(
             repository::bus_schema_version_list(&db, "tentabus-00000001", "org-1", "orders.v1")
                 .unwrap()
@@ -6508,17 +6746,16 @@ mod tests {
     #[test]
     fn bus_schema_version_divergent_content_hash_keeps_the_local_row() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
         let subject_op = bus_schema_subject_op(
             &schema_subject_row_for_test("org-1", "orders.v1"),
             ActionType::Insert,
         );
-        apply_core_operation(&db, &cipher, &subject_op).unwrap();
+        apply_core_operation(&db, &subject_op).unwrap();
 
         let local_row = schema_version_row_for_test("org-1", "orders.v1", 1, "hash-local", 901);
         let mut local_op = bus_schema_version_op(&local_row, ActionType::Insert);
         local_op.body.hlc_timestamp.wall_time_ms = 2;
-        assert_eq!(apply_core_operation(&db, &cipher, &local_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &local_op).unwrap(), 1);
 
         // Same (org, subject, version) but a DIFFERENT content_hash/schema_ref_id
         // — a documented mesh divergence: must be skipped, never overwritten.
@@ -6527,7 +6764,7 @@ mod tests {
         let mut divergent_op = bus_schema_version_op(&divergent_row, ActionType::Insert);
         divergent_op.body.hlc_timestamp.wall_time_ms = 3;
         assert_eq!(
-            apply_core_operation(&db, &cipher, &divergent_op).unwrap(),
+            apply_core_operation(&db, &divergent_op).unwrap(),
             0
         );
 
@@ -6545,14 +6782,13 @@ mod tests {
     #[test]
     fn bus_schema_generation_bumps_on_subject_and_version_apply() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
 
         let before = crate::bus::schema_registry::generation();
         let subject_op = bus_schema_subject_op(
             &schema_subject_row_for_test("org-1", "orders.v1"),
             ActionType::Insert,
         );
-        apply_core_operation(&db, &cipher, &subject_op).unwrap();
+        apply_core_operation(&db, &subject_op).unwrap();
         let after_subject = crate::bus::schema_registry::generation();
         assert!(
             after_subject > before,
@@ -6564,7 +6800,7 @@ mod tests {
             ActionType::Insert,
         );
         version_op.body.hlc_timestamp.wall_time_ms = 2;
-        apply_core_operation(&db, &cipher, &version_op).unwrap();
+        apply_core_operation(&db, &version_op).unwrap();
         let after_version = crate::bus::schema_registry::generation();
         assert!(
             after_version > after_subject,
@@ -6580,28 +6816,27 @@ mod tests {
     #[test]
     fn bus_schema_version_standalone_delete_removes_only_that_version() {
         let db = bus_db();
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
 
         let subject_op = bus_schema_subject_op(
             &schema_subject_row_for_test("org-1", "orders.v1"),
             ActionType::Insert,
         );
-        apply_core_operation(&db, &cipher, &subject_op).unwrap();
+        apply_core_operation(&db, &subject_op).unwrap();
 
         let v1 = schema_version_row_for_test("org-1", "orders.v1", 1, "hash-a", 1101);
         let mut v1_op = bus_schema_version_op(&v1, ActionType::Insert);
         v1_op.body.hlc_timestamp.wall_time_ms = 2;
-        assert_eq!(apply_core_operation(&db, &cipher, &v1_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &v1_op).unwrap(), 1);
 
         let v2 = schema_version_row_for_test("org-1", "orders.v1", 2, "hash-b", 1102);
         let mut v2_op = bus_schema_version_op(&v2, ActionType::Insert);
         v2_op.body.hlc_timestamp.wall_time_ms = 3;
-        assert_eq!(apply_core_operation(&db, &cipher, &v2_op).unwrap(), 1);
+        assert_eq!(apply_core_operation(&db, &v2_op).unwrap(), 1);
 
         let mut delete_v1_op = bus_schema_version_op(&v1, ActionType::Delete);
         delete_v1_op.body.hlc_timestamp.wall_time_ms = 4;
         assert_eq!(
-            apply_core_operation(&db, &cipher, &delete_v1_op).unwrap(),
+            apply_core_operation(&db, &delete_v1_op).unwrap(),
             1
         );
 
@@ -6624,7 +6859,7 @@ mod tests {
         let mut redelivered_delete_op = bus_schema_version_op(&v1, ActionType::Delete);
         redelivered_delete_op.body.hlc_timestamp.wall_time_ms = 5;
         assert_eq!(
-            apply_core_operation(&db, &cipher, &redelivered_delete_op).unwrap(),
+            apply_core_operation(&db, &redelivered_delete_op).unwrap(),
             0
         );
     }

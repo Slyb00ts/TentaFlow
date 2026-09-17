@@ -15,14 +15,13 @@ use futures::Stream;
 use iroh::{
     address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher},
     endpoint::{presets, PortmapperConfig, QuicTransportConfig},
-    protocol::Router,
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use std::time::Duration;
 
-use super::{ALPN_API, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_BUS, ALPN_MESH, ALPN_PAIRING};
+use super::{ALPN_ARTIFACT, ALPN_BASELINE, ALPN_BUS, ALPN_MESH, ALPN_PAIRING};
 
 /// Konfiguracja uruchomienia iroh endpointa dla daemona.
 #[derive(Clone)]
@@ -65,13 +64,12 @@ impl IrohConfig {
     }
 }
 
-/// Opakowanie na `iroh::Endpoint` + ewentualny `Router` obslugujacy ALPN-y.
+/// Opakowanie na `iroh::Endpoint`.
 /// Trzyma tez uchwyt na `MdnsAddressLookup` zeby udostepnic strumien
 /// `DiscoveryEvent` warstwie mesh — bez tego autodiscovery po LAN nie
 /// propaguje sie do gossip/peer_manager.
 pub struct IrohEndpoint {
     endpoint: Endpoint,
-    router: Option<Router>,
     mdns: Option<MdnsAddressLookup>,
 }
 
@@ -116,7 +114,6 @@ impl IrohEndpoint {
                 ALPN_MESH.to_vec(),
                 ALPN_PAIRING.to_vec(),
                 ALPN_BASELINE.to_vec(),
-                ALPN_API.to_vec(),
                 ALPN_ARTIFACT.to_vec(),
                 ALPN_BUS.to_vec(),
             ])
@@ -191,7 +188,6 @@ impl IrohEndpoint {
 
         Ok(Self {
             endpoint,
-            router: None,
             mdns,
         })
     }
@@ -209,22 +205,6 @@ impl IrohEndpoint {
     /// Zwraca `EndpointId` (Ed25519 public key) tego endpointa.
     pub fn id(&self) -> EndpointId {
         self.endpoint.id()
-    }
-
-    /// Podpina router z handlerami dla wszystkich trzech ALPN-ow.
-    pub fn with_handlers<M, P, A>(mut self, mesh: M, pairing: P, api: A) -> Self
-    where
-        M: iroh::protocol::ProtocolHandler,
-        P: iroh::protocol::ProtocolHandler,
-        A: iroh::protocol::ProtocolHandler,
-    {
-        let router = Router::builder(self.endpoint.clone())
-            .accept(ALPN_MESH, mesh)
-            .accept(ALPN_PAIRING, pairing)
-            .accept(ALPN_API, api)
-            .spawn();
-        self.router = Some(router);
-        self
     }
 
     /// Zwraca `true` jesli endpoint ma aktywny mDNS lookup.
@@ -247,11 +227,8 @@ impl IrohEndpoint {
         &self.endpoint
     }
 
-    /// Szybkie zamkniecie endpointa + routera (jeśli pod pięty).
+    /// Szybkie zamkniecie endpointa.
     pub async fn shutdown(self) {
-        if let Some(router) = self.router {
-            let _ = router.shutdown().await;
-        }
         self.endpoint.close().await;
     }
 }

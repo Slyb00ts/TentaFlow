@@ -156,6 +156,24 @@ impl CoreError {
         }
     }
 
+    /// Message safe to return to an API client. The `Display` form names
+    /// backend addresses and model paths on disk; that detail belongs in the
+    /// server log, not in a response body.
+    pub fn client_message(&self) -> String {
+        match self {
+            CoreError::BackendError { .. } | CoreError::AllBackendsUnavailable { .. } => {
+                "Backend unavailable. Please try again later.".to_string()
+            }
+            CoreError::Timeout { .. } => "Request timed out. Please try again later.".to_string(),
+            CoreError::InferenceError { .. } => {
+                "Model processing failed. Please try again later.".to_string()
+            }
+            CoreError::ModelNotFound { model_name } => format!("Model not found: {model_name}"),
+            CoreError::QueueFull { .. } => "Service is busy. Please try again later.".to_string(),
+            _ => self.to_string(),
+        }
+    }
+
     /// Sprawdza czy blad jest mozliwy do retry (transient error).
     ///
     /// Uzywane przez retry logic w load balancerze — jesli blad jest transient,

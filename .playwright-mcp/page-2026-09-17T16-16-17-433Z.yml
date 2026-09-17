@@ -1,0 +1,260 @@
+- generic [ref=f5e2]:
+  - generic [ref=f5e3]:
+    - generic [ref=f5e4]: A03
+    - heading "Okno „Konto agenta” — zakładka Przegląd" [level=2] [ref=f5e5]
+    - generic [ref=f5e6]: "ISTNIEJĄCE okno „Konto agenta” (dziś zakładki: Dostęp, Przenieś). Dochodzi „Przegląd”; „Przenieś” znika, bo konto samo trafia na nody."
+  - generic [ref=f5e7]:
+    - generic [ref=f5e8]: "Gdzie w aplikacji:"
+    - generic [ref=f5e9]: "A01: kliknięcie wiersza konta globalnego"
+    - generic [ref=f5e10]: "→ okno: Konto agenta"
+    - generic [ref=f5e11]: "→ zakładka: Przegląd"
+  - generic [ref=f5e12]:
+    - generic [ref=f5e13]:
+      - complementary [ref=f5e14]:
+        - generic [ref=f5e15]: TentaFlow
+        - generic [ref=f5e17]:
+          - generic [ref=f5e18]: Ogólne
+          - generic [ref=f5e21] [cursor=pointer]: Pulpit
+          - generic [ref=f5e24] [cursor=pointer]: Serwisy
+          - generic [ref=f5e27] [cursor=pointer]: Nody mesh
+        - generic [ref=f5e30]:
+          - generic [ref=f5e31]: Aplikacje
+          - generic [ref=f5e34] [cursor=pointer]: Projekty
+          - generic [ref=f5e37] [cursor=pointer]: ML Studio
+          - generic [ref=f5e40] [cursor=pointer]: Benchmark Studio
+          - generic [ref=f5e43] [cursor=pointer]: Agenci
+        - generic [ref=f5e46]:
+          - generic [ref=f5e47]: Zarządzanie
+          - generic [ref=f5e50] [cursor=pointer]: Użytkownicy
+          - generic [ref=f5e53] [cursor=pointer]: Dziennik audytu
+        - generic [ref=f5e57]:
+          - generic [ref=f5e58]: AK
+          - generic [ref=f5e59]:
+            - generic [ref=f5e60]: Anna · Menedżer
+            - generic [ref=f5e61]: Euvic · QA
+      - main [ref=f5e62]:
+        - generic [ref=f5e63]:
+          - heading "Serwisy" [level=1] [ref=f5e64]
+          - generic [ref=f5e65]: 12 serwisów · 4 nody
+          - button "+ Dodaj serwis" [ref=f5e66] [cursor=pointer]
+        - generic [ref=f5e67]:
+          - button "Lista 12" [ref=f5e68] [cursor=pointer]:
+            - text: Lista
+            - generic [ref=f5e69]: "12"
+          - button "Konta agentów 6" [ref=f5e70] [cursor=pointer]:
+            - text: Konta agentów
+            - generic [ref=f5e71]: "6"
+          - button "Aliasy 5" [ref=f5e72] [cursor=pointer]:
+            - text: Aliasy
+            - generic [ref=f5e73]: "5"
+          - button "Modele 31" [ref=f5e74] [cursor=pointer]:
+            - text: Modele
+            - generic [ref=f5e75]: "31"
+        - generic [ref=f5e76]:
+          - generic [ref=f5e77]:
+            - button "Konta" [ref=f5e78] [cursor=pointer]
+            - button "Aplikacje na nodach" [ref=f5e79] [cursor=pointer]
+          - button "1 + Dodaj konto globalne" [ref=f5e80] [cursor=pointer]:
+            - generic [ref=f5e81]: "1"
+            - text: + Dodaj konto globalne
+        - table [ref=f5e82]:
+          - rowgroup [ref=f5e83]:
+            - row [ref=f5e84]:
+              - columnheader "Konto" [ref=f5e85]
+              - columnheader "Zakres" [ref=f5e86]
+              - columnheader "Logowanie" [ref=f5e87]
+              - columnheader "Stan" [ref=f5e88]
+              - columnheader "Aktywne sesje" [ref=f5e89]
+              - columnheader "Używane na" [ref=f5e90]
+              - columnheader "Akcje" [ref=f5e91]
+          - rowgroup [ref=f5e92]:
+            - row [ref=f5e93]:
+              - cell "CC Claude Code — firma 2 zespol@euvic.pl · Max 20x" [ref=f5e94]:
+                - generic [ref=f5e95]:
+                  - generic [ref=f5e96]: CC
+                  - generic [ref=f5e97]:
+                    - generic [ref=f5e98]:
+                      - text: Claude Code — firma
+                      - generic [ref=f5e99]: "2"
+                    - generic [ref=f5e100]: zespol@euvic.pl · Max 20x
+              - cell "Globalne" [ref=f5e101]
+              - cell "Subskrypcja" [ref=f5e103]
+              - cell "Zalogowane" [ref=f5e104]
+              - cell "5 · 3 osoby" [ref=f5e106]
+              - cell "helios, rig26" [ref=f5e107]
+              - cell [ref=f5e108]:
+                - button "Otwórz" [ref=f5e109] [cursor=pointer]
+            - row [ref=f5e110]:
+              - cell "CX Codex — firma dev@euvic.pl · ChatGPT Business" [ref=f5e111]:
+                - generic [ref=f5e112]:
+                  - generic [ref=f5e113]: CX
+                  - generic [ref=f5e114]:
+                    - generic [ref=f5e115]: Codex — firma
+                    - generic [ref=f5e116]: dev@euvic.pl · ChatGPT Business
+              - cell "Globalne" [ref=f5e117]
+              - cell "Subskrypcja" [ref=f5e119]
+              - cell "Zalogowane" [ref=f5e120]
+              - cell "2" [ref=f5e122]
+              - cell "helios, rig26" [ref=f5e123]
+              - cell [ref=f5e124]:
+                - button "Otwórz" [ref=f5e125] [cursor=pointer]
+            - row [ref=f5e126]:
+              - cell "CC Claude Code — klucz API (CI) sk-ant-…4f2a · rozliczenie za tokeny" [ref=f5e127]:
+                - generic [ref=f5e128]:
+                  - generic [ref=f5e129]: CC
+                  - generic [ref=f5e130]:
+                    - generic [ref=f5e131]: Claude Code — klucz API (CI)
+                    - generic [ref=f5e132]: sk-ant-…4f2a · rozliczenie za tokeny
+              - cell "Globalne" [ref=f5e133]
+              - cell "Klucz API" [ref=f5e135]
+              - cell "Zweryfikowany" [ref=f5e136]
+              - cell "0" [ref=f5e138]
+              - cell "—" [ref=f5e139]
+              - cell [ref=f5e140]:
+                - button "Otwórz" [ref=f5e141] [cursor=pointer]
+            - row [ref=f5e142]:
+              - cell "GK Grok Build — firma ai@euvic.pl" [ref=f5e143]:
+                - generic [ref=f5e144]:
+                  - generic [ref=f5e145]: GK
+                  - generic [ref=f5e146]:
+                    - generic [ref=f5e147]: Grok Build — firma
+                    - generic [ref=f5e148]: ai@euvic.pl
+              - cell "Globalne" [ref=f5e149]
+              - cell "Subskrypcja" [ref=f5e151]
+              - cell "Wymaga logowania" [ref=f5e152]
+              - cell "0" [ref=f5e154]
+              - cell "—" [ref=f5e155]
+              - cell [ref=f5e156]:
+                - button "3 Zaloguj" [ref=f5e157] [cursor=pointer]:
+                  - generic [ref=f5e158]: "3"
+                  - text: Zaloguj
+            - row [ref=f5e159]:
+              - cell "CC Claude Code — Piotr Jarocki konto użytkownika" [ref=f5e160]:
+                - generic [ref=f5e161]:
+                  - generic [ref=f5e162]: CC
+                  - generic [ref=f5e163]:
+                    - generic [ref=f5e164]: Claude Code — Piotr Jarocki
+                    - generic [ref=f5e165]: konto użytkownika
+              - cell "Użytkownika" [ref=f5e166]
+              - cell "Subskrypcja" [ref=f5e168]
+              - cell "Zalogowane" [ref=f5e169]
+              - cell "2" [ref=f5e171]
+              - cell "mac-critix, rig26" [ref=f5e172]
+              - cell "tylko właściciel" [ref=f5e173]
+            - row [ref=f5e174]:
+              - cell "CX Codex — Anna Kowalska konto użytkownika" [ref=f5e175]:
+                - generic [ref=f5e176]:
+                  - generic [ref=f5e177]: CX
+                  - generic [ref=f5e178]:
+                    - generic [ref=f5e179]: Codex — Anna Kowalska
+                    - generic [ref=f5e180]: konto użytkownika
+              - cell "Użytkownika" [ref=f5e181]
+              - cell "Subskrypcja" [ref=f5e183]
+              - cell "Zalogowane" [ref=f5e184]
+              - cell "1" [ref=f5e186]
+              - cell "helios" [ref=f5e187]
+              - cell "tylko właściciel" [ref=f5e188]
+        - generic [ref=f5e189]: 6 kont · 4 globalne · 2 użytkowników.
+        - generic [ref=f5e190]:
+          - generic [ref=f5e191]:
+            - generic [ref=f5e192]: "1"
+            - text: otwiera okno logowania — ekran A02
+          - generic [ref=f5e193]:
+            - generic [ref=f5e194]: "2"
+            - text: kliknięcie wiersza konta globalnego otwiera okno „Konto agenta” — ekrany A03 (Przegląd) i A04 (Dostęp)
+          - generic [ref=f5e195]:
+            - generic [ref=f5e196]: "3"
+            - text: ponowne logowanie — to samo okno A02
+    - generic [ref=f5e198]:
+      - generic [ref=f5e199]:
+        - generic [ref=f5e200]:
+          - generic [ref=f5e201]: CC
+          - text: Konto agenta — Claude Code — firma
+        - button "✕" [ref=f5e202] [cursor=pointer]
+      - generic [ref=f5e203]:
+        - button "Przegląd" [ref=f5e204] [cursor=pointer]
+        - button "Dostęp (3)" [ref=f5e205] [cursor=pointer]
+        - button "Agenci (4)" [ref=f5e206] [cursor=pointer]
+      - generic [ref=f5e207]:
+        - generic [ref=f5e208]:
+          - generic [ref=f5e209]: Konto dostawcy
+          - generic [ref=f5e210]: zespol@euvic.pl · Claude Max 20x
+          - generic [ref=f5e211]: Logowanie
+          - generic [ref=f5e212]: Subskrypcja · zalogował Piotr Jarocki, 2026-09-17 10:12
+          - generic [ref=f5e213]: Stan
+          - generic [ref=f5e214]: Zalogowane
+        - heading "Aktywne sesje (5) — bez limitu równoległych" [level=4] [ref=f5e216]
+        - table [ref=f5e217]:
+          - rowgroup [ref=f5e218]:
+            - row [ref=f5e219]:
+              - columnheader "Użytkownik" [ref=f5e220]
+              - columnheader "Agent" [ref=f5e221]
+              - columnheader "Workspace" [ref=f5e222]
+              - columnheader "Node" [ref=f5e223]
+              - columnheader "Od" [ref=f5e224]
+              - columnheader [ref=f5e225]
+          - rowgroup [ref=f5e226]:
+            - row [ref=f5e227]:
+              - cell "Piotr Jarocki" [ref=f5e228]
+              - cell "code-implementer" [ref=f5e229]
+              - cell "TentaFlow" [ref=f5e230]
+              - cell "helios" [ref=f5e231]
+              - cell "14 min" [ref=f5e232]
+              - cell [ref=f5e233]:
+                - button "Zakończ" [ref=f5e234] [cursor=pointer]
+            - row [ref=f5e235]:
+              - cell "Piotr Jarocki" [ref=f5e236]
+              - cell "code-reviewer" [ref=f5e237]
+              - cell "TentaFlow" [ref=f5e238]
+              - cell "helios" [ref=f5e239]
+              - cell "3 min" [ref=f5e240]
+              - cell [ref=f5e241]:
+                - button "Zakończ" [ref=f5e242] [cursor=pointer]
+            - row [ref=f5e243]:
+              - cell "Anna Kowalska" [ref=f5e244]
+              - cell "code-implementer" [ref=f5e245]
+              - cell "CRM addon" [ref=f5e246]
+              - cell "helios" [ref=f5e247]
+              - cell "41 min" [ref=f5e248]
+              - cell [ref=f5e249]:
+                - button "Zakończ" [ref=f5e250] [cursor=pointer]
+            - row [ref=f5e251]:
+              - cell "Marek Nowak" [ref=f5e252]
+              - cell "code-implementer" [ref=f5e253]
+              - cell "TentaNas" [ref=f5e254]
+              - cell "rig26" [ref=f5e255]
+              - cell "1 h 02 min" [ref=f5e256]
+              - cell [ref=f5e257]:
+                - button "Zakończ" [ref=f5e258] [cursor=pointer]
+            - row [ref=f5e259]:
+              - cell "Marek Nowak" [ref=f5e260]
+              - cell "code-tester" [ref=f5e261]
+              - cell "TentaNas" [ref=f5e262]
+              - cell "rig26" [ref=f5e263]
+              - cell "8 min" [ref=f5e264]
+              - cell [ref=f5e265]:
+                - button "Zakończ" [ref=f5e266] [cursor=pointer]
+        - heading "Na nodach" [level=4] [ref=f5e267]
+        - table [ref=f5e268]:
+          - rowgroup [ref=f5e269]:
+            - row [ref=f5e270]:
+              - columnheader "Node" [ref=f5e271]
+              - columnheader "Logowanie konta" [ref=f5e272]
+              - columnheader "Sesje" [ref=f5e273]
+          - rowgroup [ref=f5e274]:
+            - row [ref=f5e275]:
+              - cell "helios" [ref=f5e276]
+              - cell "aktualne" [ref=f5e277]
+              - cell "3" [ref=f5e278]
+            - row [ref=f5e279]:
+              - cell "rig26" [ref=f5e280]
+              - cell "aktualne" [ref=f5e281]
+              - cell "2" [ref=f5e282]
+            - row [ref=f5e283]:
+              - cell "mac-critix" [ref=f5e284]
+              - cell "trafi przy pierwszym użyciu" [ref=f5e285]
+              - cell "0" [ref=f5e286]
+      - generic [ref=f5e287]:
+        - button "Usuń konto" [ref=f5e288] [cursor=pointer]
+        - button "Zaloguj ponownie" [ref=f5e289] [cursor=pointer]
+        - button "Zamknij" [ref=f5e290] [cursor=pointer]

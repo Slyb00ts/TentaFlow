@@ -450,11 +450,6 @@ pub struct BaselineSnapshot {
     pub user_identity_keys: Vec<UserIdentityKeyRow>,
     pub node_user_assignments: Vec<NodeUserAssignmentRow>,
     pub sync_explicit_shares: Vec<SyncExplicitShareRow>,
-    /// Allowlistowane sekrety zewnetrzne (`settings` is_secret) wyslane jako
-    /// ODSZYFROWANY plaintext po juz-zaufanym kanale pairingu (donor wysyla po
-    /// uzgodnieniu rol); joiner re-encryptuje wlasnym `SettingsCipher` przy
-    /// imporcie. Donor-wins: wartosc dawcy nadpisuje lokalna.
-    pub shared_secrets: Vec<SharedSecretRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,21 +604,12 @@ pub struct SyncExplicitShareRow {
     pub granted_by: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SharedSecretRow {
-    pub key: String,
-    /// Plaintext sekretu (donor odszyfrowal swoim cipher przed wyslaniem;
-    /// joiner re-encryptuje przy imporcie). Nigdy nie persystowany w tej formie.
-    pub value: String,
-}
-
 /// Buduje snapshot baseline'u z bazy dawcy w JEDNEJ transakcji read, dzieki
 /// czemu wszystkie tabele widza spojny migawkowy stan (deferred-read snapshot
 /// izolacji SQLite).
 pub fn capture_baseline_snapshot(
     db: &DbPool,
     epoch: BaselineEpoch,
-    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineSnapshot> {
     let mut conn = db::repository::acquire_for_baseline(db)
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -631,7 +617,7 @@ pub fn capture_baseline_snapshot(
         .transaction()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
 
-    let snapshot = capture_baseline_snapshot_tx(&tx, epoch, cipher)?;
+    let snapshot = capture_baseline_snapshot_tx(&tx, epoch)?;
     // Read-only transakcja — commit zwalnia migawke bez zmian.
     tx.commit()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -641,7 +627,6 @@ pub fn capture_baseline_snapshot(
 fn capture_baseline_snapshot_tx(
     tx: &Transaction<'_>,
     epoch: BaselineEpoch,
-    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineSnapshot> {
     let map_err = |e: rusqlite::Error| SyncLedgerError::Runtime(e.to_string());
 
@@ -938,30 +923,6 @@ fn capture_baseline_snapshot_tx(
         .map_err(map_err)?;
     drop(stmt);
 
-    // Sekrety: odszyfrowane plaintext do wyslania po juz-zaufanym kanale.
-    let mut shared_secrets = Vec::new();
-    for &key in db::repository::SHARED_SECRET_SETTING_KEYS {
-        let raw: Option<String> = tx
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![key],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(map_err)?;
-        let Some(raw_value) = raw else { continue };
-        if raw_value.is_empty() {
-            continue;
-        }
-        let value = cipher
-            .decrypt(&raw_value)
-            .map_err(|e| SyncLedgerError::Runtime(format!("decrypt shared secret {key}: {e}")))?;
-        shared_secrets.push(SharedSecretRow {
-            key: key.to_string(),
-            value,
-        });
-    }
-
     Ok(BaselineSnapshot {
         epoch,
         organizations,
@@ -978,9 +939,13 @@ fn capture_baseline_snapshot_tx(
         user_identity_keys,
         node_user_assignments,
         sync_explicit_shares,
-        shared_secrets,
     })
 }
+
+/// Version 1 carried the fleet secrets in plaintext. A joiner refuses any other
+/// version than its own, so it never accepts a snapshot from a donor that still
+/// sends them: upgrade the fleet first, then add nodes.
+pub const BASELINE_SCHEMA_VERSION: u32 = 2;
 
 /// Liczba importowanych tabel — uzywane przez naglowek transferu (`tables`).
 pub const BASELINE_TABLE_NAMES: &[&str] = &[
@@ -998,7 +963,6 @@ pub const BASELINE_TABLE_NAMES: &[&str] = &[
     "user_identity_keys",
     "node_user_assignments",
     "sync_explicit_shares",
-    "settings",
 ];
 
 // =============================================================================
@@ -1056,10 +1020,9 @@ pub fn build_baseline_header(snapshot: &BaselineSnapshot, raw: &[u8]) -> Baselin
         snapshot.user_identity_keys.len() as u64,
         snapshot.node_user_assignments.len() as u64,
         snapshot.sync_explicit_shares.len() as u64,
-        snapshot.shared_secrets.len() as u64,
     ];
     BaselineHeader {
-        schema_version: 1,
+        schema_version: BASELINE_SCHEMA_VERSION,
         epoch: snapshot.epoch.counter,
         tables: BASELINE_TABLE_NAMES.iter().map(|s| s.to_string()).collect(),
         row_counts,
@@ -1081,6 +1044,12 @@ pub fn reassemble_chunks(
     chunks: &[BaselineChunk],
     header: &BaselineHeader,
 ) -> LedgerResult<Vec<u8>> {
+    if header.schema_version != BASELINE_SCHEMA_VERSION {
+        return Err(SyncLedgerError::Runtime(format!(
+            "baseline schema version {} from the donor does not match local version {}; upgrade the donor node",
+            header.schema_version, BASELINE_SCHEMA_VERSION
+        )));
+    }
     if header.total_bytes > header.max_bytes || header.total_bytes > BASELINE_MAX_TOTAL_BYTES {
         return Err(SyncLedgerError::Runtime(format!(
             "baseline snapshot too large: declared {} bytes exceeds limit {} (hard cap {})",
@@ -1171,7 +1140,6 @@ pub fn import_baseline(
     snapshot: &BaselineSnapshot,
     donor_node_id: &str,
     local_node_id: &str,
-    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineImportReport> {
     let donor_org_id = primary_donor_org(snapshot)?;
 
@@ -1207,7 +1175,7 @@ pub fn import_baseline(
             .transaction()
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
 
-        let report = match import_baseline_tx(&tx, snapshot, &donor_org_id, local_node_id, cipher) {
+        let report = match import_baseline_tx(&tx, snapshot, &donor_org_id, local_node_id) {
             Ok(report) => report,
             Err(e) => {
                 // Rollback automatyczny przy drop(tx). Stan zostaje `Importing`
@@ -1350,7 +1318,6 @@ fn import_baseline_tx(
     snapshot: &BaselineSnapshot,
     donor_org_id: &str,
     local_node_id: &str,
-    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineImportReport> {
     let map_err = |e: rusqlite::Error| SyncLedgerError::Runtime(e.to_string());
     let mut report = BaselineImportReport {
@@ -1395,7 +1362,7 @@ fn import_baseline_tx(
     // (a) Upsert wierszy dawcy po UUID PK. Deterministyczne seedy (np.
     // role-org-admin, org-default) zlewaja sie po tym samym id; user-created
     // dawcy sa wstawiane jako nowe.
-    upsert_donor_rows(tx, snapshot, donor_org_id, local_node_id, cipher, &map_err)?;
+    upsert_donor_rows(tx, snapshot, donor_org_id, local_node_id, &map_err)?;
 
     // (c) Remap lokalnych danych joinera do org dawcy. Email-match mapuje na
     // usera dawcy; inaczej user joinera dolacza jako nowy czlonek org dawcy.
@@ -1775,7 +1742,6 @@ fn upsert_donor_rows(
     snapshot: &BaselineSnapshot,
     donor_org_id: &str,
     local_node_id: &str,
-    cipher: &crate::crypto::SettingsCipher,
     map_err: &impl Fn(rusqlite::Error) -> SyncLedgerError,
 ) -> LedgerResult<()> {
     for o in &snapshot.organizations {
@@ -2113,25 +2079,6 @@ fn upsert_donor_rows(
         .map_err(map_err)?;
     }
 
-    // shared secrets: donor-wins. Donor przyslal ODSZYFROWANY plaintext po
-    // zaufanym kanale; re-encryptujemy lokalnym cipherem i nadpisujemy wartosc.
-    // Reseed czyta z `settings`, wiec po tym imporcie emituje sekret DAWCY, nie
-    // lokalny — kluczowe, by reseed nie cofnal donor-wins.
-    for secret in &snapshot.shared_secrets {
-        if !db::repository::is_shared_secret_setting_key(&secret.key) {
-            continue;
-        }
-        let encrypted = cipher
-            .encrypt(&secret.value)
-            .map_err(|e| SyncLedgerError::Runtime(format!("encrypt shared secret: {e}")))?;
-        tx.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
-            params![secret.key, encrypted],
-        )
-        .map_err(map_err)?;
-    }
-
     Ok(())
 }
 
@@ -2368,10 +2315,9 @@ pub fn run_baseline_adopt(
     donor_node_id: &str,
     local_node_id: &str,
     donor_snapshot_bytes: &[u8],
-    cipher: &crate::crypto::SettingsCipher,
 ) -> LedgerResult<BaselineImportReport> {
     let snapshot = deserialize_snapshot(donor_snapshot_bytes)?;
-    import_baseline(db, &snapshot, donor_node_id, local_node_id, cipher)
+    import_baseline(db, &snapshot, donor_node_id, local_node_id)
 }
 
 #[cfg(test)]

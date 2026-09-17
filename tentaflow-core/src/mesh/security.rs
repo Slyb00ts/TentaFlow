@@ -11,6 +11,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -29,6 +31,19 @@ use crate::db::{self, DbPool};
 /// layer (w przyszlosci = iroh NodeId). X25519 uzywany do derywacji pairing
 /// proof (HKDF(ECDH(our_x25519, remote_x25519))).
 pub const PUBLIC_KEY_HEX_LEN: usize = 128;
+/// Format of `trusted_nodes.approved_at` and `revoked_nodes.revoked_at` (UTC).
+/// Fixed-width, so plain string comparison orders the two.
+const TRUST_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+const SEAL_NONCE_LEN: usize = 12;
+const SEAL_HKDF_LABEL: &[u8] = b"tentaflow-peer-seal";
+
+/// A six-digit PIN has 10^6 values; these limits keep an online guess far below
+/// any useful success rate while leaving room for an operator's typos.
+const PIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(600);
+const PIN_ATTEMPTS_PER_KEY: u32 = 3;
+const PIN_ATTEMPTS_ALL_KEYS: u32 = 30;
+const PIN_TRACKED_KEYS: usize = 1024;
 
 /// Zarzadca tozsamosci i zaufania mesh.
 pub struct MeshSecurity {
@@ -47,13 +62,16 @@ pub struct MeshSecurity {
     /// Snapshot zaufanych `node_id` jako `Arc<HashSet>` — odbudowywany przy
     /// kazdej zmianie trusted_keys. ArcSwap = zero-lock reads.
     trusted_node_ids: ArcSwap<HashSet<String>>,
-    /// Aktywnie cofniete zaufanie — wypelniane przez `revoke_trust`.
-    revoked_nodes: DashMap<String, ()>,
+    /// Aktywnie cofniete zaufanie: `node_id` -> `revoked_at` (UTC
+    /// `%Y-%m-%d %H:%M:%S`) — wypelniane przez `revoke_trust`.
+    revoked_nodes: DashMap<String, String>,
     /// Nody w trakcie revoke/unpair — synchronicznie ustawiane przed async
     /// broadcastem TrustRevoked.
     revoking_nodes: DashMap<String, ()>,
-    /// Rate limit prob PIN per node_id: (count, last_attempt).
+    /// PIN attempts per transport identity: (count, window start).
     pin_attempts: DashMap<String, (u32, Instant)>,
+    /// PIN attempts across all identities: (count, window start).
+    pin_global_budget: Mutex<(u32, Instant)>,
     /// Aktywne zaproszenie QR — (pin, expiry). Jeden naraz, rotowany co 60s.
     /// Mutex bo to jeden globalny slot; contention znikoma (co 50s refresh).
     invite: Mutex<Option<(String, Instant)>>,
@@ -82,6 +100,7 @@ impl MeshSecurity {
             revoked_nodes: DashMap::with_capacity(64),
             revoking_nodes: DashMap::with_capacity(16),
             pin_attempts: DashMap::with_capacity(64),
+            pin_global_budget: Mutex::new((0, Instant::now())),
             invite: Mutex::new(None),
             db,
             settings_cipher,
@@ -90,8 +109,8 @@ impl MeshSecurity {
         security.load_trusted_from_db()?;
 
         if let Ok(revoked) = db::repository::list_revoked_nodes(&security.db) {
-            for node_id in revoked {
-                security.revoked_nodes.insert(node_id, ());
+            for (node_id, revoked_at) in revoked {
+                security.revoked_nodes.insert(node_id, revoked_at);
             }
         }
 
@@ -185,6 +204,33 @@ impl MeshSecurity {
 
         self.rebuild_trusted_snapshot();
         Ok(())
+    }
+
+    /// VULN-M5: node_id jest pierwszymi 64 znakami hex 128-znakowego
+    /// combined key (Ed25519 verifying key). Konwencja jak w
+    /// `net::iroh::pairing::validate_public_key_shape`.
+    fn validate_identity_binding(node_id: &str, public_key_hex: &str) -> Result<()> {
+        if node_id.len() != 64 || !node_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("node_id musi miec 64 znaki hex");
+        }
+        if !public_key_hex.starts_with(node_id) {
+            bail!("Ed25519 czesc klucza publicznego nie zgadza sie z node_id");
+        }
+        Ok(())
+    }
+
+    fn now_timestamp() -> String {
+        chrono::Utc::now().format(TRUST_TIMESTAMP_FORMAT).to_string()
+    }
+
+    /// Wire timestamps are clamped to "now": a future `approved_at` would make
+    /// trust expiry never fire, and a future `revoked_at` would block every
+    /// later re-pairing. An unparsable value also lands on "now".
+    fn clamp_wire_timestamp(ts: &str) -> String {
+        match chrono::NaiveDateTime::parse_from_str(ts, TRUST_TIMESTAMP_FORMAT) {
+            Ok(parsed) if parsed <= chrono::Utc::now().naive_utc() => ts.to_string(),
+            _ => Self::now_timestamp(),
+        }
     }
 
     /// Parsuje Ed25519 public key z hex stringa (pierwsze 64 znaki hex).
@@ -355,11 +401,11 @@ impl MeshSecurity {
         let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
         let expires_str = expires.format("%Y-%m-%d %H:%M:%S").to_string();
 
-        if self.is_revoked(remote_node_id) {
-            let _ = self.admin_retrust(remote_node_id);
-        }
-
-        self.pin_attempts.remove(remote_node_id);
+        // A revocation is NOT lifted here: this runs on a frame from the
+        // revoked node itself. `confirm_pairing` lifts it once a local
+        // operator has approved the pairing.
+        // The attempt counter is not cleared here either: a new request must
+        // not buy the sender a fresh set of guesses.
 
         db::repository::create_pending_pairing(
             &self.db,
@@ -428,6 +474,9 @@ impl MeshSecurity {
             );
         }
 
+        // VULN-M5: tozsamosc sparowanego noda musi byc powiazana z kluczem.
+        Self::validate_identity_binding(remote_node_id, remote_public_key_hex)?;
+
         let vk = Self::parse_verifying_key(remote_public_key_hex)?;
 
         db::repository::add_trusted_node(
@@ -440,6 +489,13 @@ impl MeshSecurity {
         )?;
 
         self.trusted_keys.insert(remote_node_id.to_string(), vk);
+
+        // Confirmation is an operator decision (manual approval or a locally
+        // issued invite PIN), so it overrides an earlier revocation. The fresh
+        // `approved_at` then outranks that revocation on every other node.
+        if self.is_revoked(remote_node_id) {
+            self.admin_retrust(remote_node_id)?;
+        }
 
         db::repository::delete_pending_pairing(&self.db, remote_node_id)?;
         let _ = db::repository::delete_setting(
@@ -456,6 +512,24 @@ impl MeshSecurity {
             );
         }
         self.rebuild_trusted_snapshot();
+
+        // Confirming a pairing is the one moment a person on this node vouches
+        // for the peer, so it is also what makes the peer an operator here.
+        // Nodes that become trusted through `TrustedKeysSync` never pass this
+        // point and may not send node-changing commands until promoted.
+        let promotion = db::repository::SyncNodeProfileUpdate {
+            node_kind: None,
+            operator: Some(true),
+        };
+        if let Err(e) =
+            db::repository::update_sync_node_profile(&self.db, remote_node_id, &promotion, None)
+        {
+            warn!(
+                remote_node_id = %remote_node_id,
+                "Nadanie roli operatora po parowaniu nieudane: {}",
+                e
+            );
+        }
 
         info!(
             remote_node_id = %remote_node_id,
@@ -529,18 +603,144 @@ impl MeshSecurity {
     }
 
     // =========================================================================
+    // Sealing for one trusted peer
+    // =========================================================================
+
+    /// Encrypts `plaintext` so that only `recipient_node_id` can open it.
+    ///
+    /// The key is `HKDF-SHA256(ECDH(our_x25519, recipient_x25519))` with both
+    /// node ids in the HKDF info, sender first: a blob sealed for one peer does
+    /// not open for another, and one sealed by A for B does not pass as one
+    /// sealed by B for A. `context` is authenticated but not encrypted; callers
+    /// bind the blob to what it describes (setting key and version) so it cannot
+    /// be replanted under a different key.
+    pub fn seal_for_peer(
+        &self,
+        recipient_node_id: &str,
+        context: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let local_node_id = self.ed25519_public_key_hex();
+        let cipher = self.peer_seal_cipher(recipient_node_id, &local_node_id, recipient_node_id)?;
+        let mut nonce = [0u8; SEAL_NONCE_LEN];
+        getrandom::fill(&mut nonce)
+            .map_err(|e| anyhow::anyhow!("OS RNG unavailable while sealing: {e}"))?;
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: context })
+            .map_err(|_| anyhow::anyhow!("sealing for peer {recipient_node_id} failed"))?;
+        let mut sealed = Vec::with_capacity(SEAL_NONCE_LEN + ciphertext.len());
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&ciphertext);
+        Ok(sealed)
+    }
+
+    /// Opens a blob produced by `seal_for_peer` on `sender_node_id` for this
+    /// node. Fails when the sender is not trusted, the blob was sealed for a
+    /// different recipient, or `context` differs from the one used for sealing.
+    pub fn open_from_peer(
+        &self,
+        sender_node_id: &str,
+        context: &[u8],
+        sealed: &[u8],
+    ) -> Result<Vec<u8>> {
+        if sealed.len() < SEAL_NONCE_LEN {
+            bail!("sealed blob from {sender_node_id} is shorter than its nonce");
+        }
+        let local_node_id = self.ed25519_public_key_hex();
+        let cipher = self.peer_seal_cipher(sender_node_id, sender_node_id, &local_node_id)?;
+        let (nonce, ciphertext) = sealed.split_at(SEAL_NONCE_LEN);
+        cipher
+            .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: context })
+            .map_err(|_| anyhow::anyhow!("sealed blob from {sender_node_id} did not authenticate"))
+    }
+
+    fn peer_seal_cipher(
+        &self,
+        peer_node_id: &str,
+        sender_node_id: &str,
+        recipient_node_id: &str,
+    ) -> Result<Aes256Gcm> {
+        let public_key_hex = db::repository::get_trusted_node_public_key(&self.db, peer_node_id)?
+            .ok_or_else(|| anyhow::anyhow!("node {peer_node_id} is not trusted"))?;
+        let x25519_hex = public_key_hex
+            .get(PUBLIC_KEY_HEX_LEN / 2..PUBLIC_KEY_HEX_LEN)
+            .ok_or_else(|| anyhow::anyhow!("node {peer_node_id} has no X25519 key on record"))?;
+        let key_bytes: [u8; 32] = hex::decode(x25519_hex)
+            .context("X25519 key of the peer is not hex")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("X25519 key of the peer must be 32 bytes"))?;
+        let shared = self
+            .x25519_secret
+            .diffie_hellman(&X25519PublicKey::from(key_bytes));
+        // A low-order peer key yields an all-zero shared secret that anyone can compute.
+        if !shared.was_contributory() {
+            bail!("node {peer_node_id} has a degenerate X25519 key");
+        }
+
+        let mut info = Vec::with_capacity(SEAL_HKDF_LABEL.len() + 2 * PUBLIC_KEY_HEX_LEN);
+        info.extend_from_slice(SEAL_HKDF_LABEL);
+        info.extend_from_slice(sender_node_id.as_bytes());
+        info.extend_from_slice(recipient_node_id.as_bytes());
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        Hkdf::<Sha256>::new(None, shared.as_bytes())
+            .expand(&info, key.as_mut())
+            .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+        Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| anyhow::anyhow!("AES key rejected"))
+    }
+
+    // =========================================================================
     // Trust management
     // =========================================================================
 
     /// Cofniecie zaufania — usuniecie z `trusted_nodes` i zapis do `revoked_nodes`.
-    pub fn revoke_trust(&self, node_id: &str) -> Result<()> {
+    /// `revoked_at` is the fleet-wide revocation time when the revocation was
+    /// propagated by a peer; `None` for a revocation that originates here.
+    /// Returns the stored timestamp so the caller can propagate it unchanged.
+    pub fn revoke_trust(&self, node_id: &str, revoked_at: Option<&str>) -> Result<String> {
+        let stored = self.record_revocation_at(node_id, revoked_at)?;
         db::repository::remove_trusted_node(&self.db, node_id)?;
         self.trusted_keys.remove(node_id);
-        self.revoked_nodes.insert(node_id.to_string(), ());
-        let _ = db::repository::add_revoked_node(&self.db, node_id, None);
         self.rebuild_trusted_snapshot();
-        info!(node_id = %node_id, "Cofnieto zaufanie dla noda");
-        Ok(())
+        info!(node_id = %node_id, revoked_at = %stored, "Cofnieto zaufanie dla noda");
+        Ok(stored)
+    }
+
+    /// Persists a locally originated revocation WITHOUT dropping the trusted
+    /// key yet — the admin flow still needs the key to deliver the signed
+    /// TrustRevoked notification, and removes it with `unpair` afterwards.
+    pub fn record_revocation(&self, node_id: &str) -> Result<String> {
+        self.record_revocation_at(node_id, None)
+    }
+
+    fn record_revocation_at(&self, node_id: &str, revoked_at: Option<&str>) -> Result<String> {
+        let revoked_at = revoked_at.map_or_else(Self::now_timestamp, Self::clamp_wire_timestamp);
+        db::repository::add_revoked_node(&self.db, node_id, None, &revoked_at)?;
+        let stored = self
+            .revoked_nodes
+            .entry(node_id.to_string())
+            .and_modify(|current| {
+                if *current < revoked_at {
+                    *current = revoked_at.clone();
+                }
+            })
+            .or_insert_with(|| revoked_at.clone())
+            .clone();
+        Ok(stored)
+    }
+
+    /// A propagated revocation is stale when the node was (re-)approved after
+    /// it: the sender missed the re-pairing, and honouring the frame would
+    /// knock a legitimately re-paired node out of the fleet again. A frame
+    /// without a timestamp cannot be ordered and is never treated as stale.
+    pub fn is_stale_revocation(&self, node_id: &str, revoked_at: Option<&str>) -> bool {
+        let Some(revoked_at) = revoked_at else {
+            return false;
+        };
+        let revoked_at = Self::clamp_wire_timestamp(revoked_at);
+        matches!(
+            db::repository::get_trusted_node_approved_at(&self.db, node_id),
+            Ok(Some(approved_at)) if approved_at > revoked_at
+        )
     }
 
     /// Unpair bez revoke — usun z trusted_nodes, nie dodawaj do revoked.
@@ -567,9 +767,12 @@ impl MeshSecurity {
         self.revoking_nodes.remove(node_id);
     }
 
-    /// Lista revokowanych node IDs — do synchronizacji przy reconnect.
-    pub fn get_revoked_node_ids(&self) -> Vec<String> {
-        self.revoked_nodes.iter().map(|e| e.key().clone()).collect()
+    /// Revokowane nody jako `(node_id, revoked_at)` — do synchronizacji przy reconnect.
+    pub fn get_revoked_nodes(&self) -> Vec<(String, String)> {
+        self.revoked_nodes
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
     }
 
     /// Usuwa node z listy revoked (admin re-trust).
@@ -661,6 +864,21 @@ impl MeshSecurity {
             return Ok(());
         }
 
+        // Transitive trust must not resurrect a revoked node: a peer that has
+        // not seen the revocation yet would otherwise re-add it with its next
+        // sync. The one legitimate case is a re-pairing approved elsewhere in
+        // the fleet AFTER the revocation — its `approved_at` outranks it, and
+        // the revocation is lifted so the node propagates normally again.
+        if let Some(revoked_at) = self.revoked_nodes.get(node_id).map(|e| e.value().clone()) {
+            let approved_after_revocation = origin_approved_at
+                .map(Self::clamp_wire_timestamp)
+                .is_some_and(|approved_at| approved_at > revoked_at);
+            if !approved_after_revocation {
+                bail!("node {} is revoked — mesh sync cannot re-trust it", node_id);
+            }
+            self.admin_retrust(node_id)?;
+        }
+
         if public_key_hex.len() != PUBLIC_KEY_HEX_LEN {
             bail!(
                 "Nieprawidlowa dlugosc klucza publicznego: {} (oczekiwano {})",
@@ -668,6 +886,15 @@ impl MeshSecurity {
                 PUBLIC_KEY_HEX_LEN
             );
         }
+
+        // VULN-M5: node_id musi odpowiadac czesci Ed25519 klucza. Bez tego
+        // TrustedKeysSync od zlosliwego peera moze wstawic dowolny klucz pod
+        // cudzym node_id i podpic tozsamosc obcego noda.
+        Self::validate_identity_binding(node_id, public_key_hex)?;
+
+        // VULN-M16: przyszly origin_approved_at sprawialby, ze trust expiry
+        // (max(last_seen, approved_at)) nigdy nie wygasa — clamp do "teraz".
+        let approved_at_safe = origin_approved_at.map(Self::clamp_wire_timestamp);
 
         let vk = Self::parse_verifying_key(public_key_hex)?;
 
@@ -677,7 +904,7 @@ impl MeshSecurity {
             public_key_hex,
             hostname,
             "mesh-sync",
-            origin_approved_at,
+            approved_at_safe.as_deref(),
         )?;
 
         self.trusted_keys.insert(node_id.to_string(), vk);
@@ -697,22 +924,57 @@ impl MeshSecurity {
         Ok(pairing.map(|p| p.pin_code).filter(|pin| !pin.is_empty()))
     }
 
-    /// Sprawdza limit prob PIN (3 proby w oknie 60 s).
-    pub fn check_pin_rate_limit(&self, node_id: &str) -> bool {
-        let mut entry = self
-            .pin_attempts
-            .entry(node_id.to_string())
-            .or_insert((0, Instant::now()));
+    /// VULN-M1: Zwraca PIN oczekujacego parowania TYLKO gdy to MY je
+    /// zainicjowalismy (`direction = "outgoing"` — PIN wygenerowany lokalnie
+    /// i wyswietlony naszemu uzytkownikowi). Pending "incoming" tworzy sama
+    /// ramka PairingRequest od obcego noda, wiec jego PIN nie moze
+    /// autoryzowac PairingConfirm (samoparowanie z PIN-em atakujacego).
+    /// Pusty PIN jest odrzucany — nigdy nie pomija weryfikacji.
+    pub fn get_pending_outgoing_pin(&self, remote_node_id: &str) -> Result<Option<String>> {
+        let pairing = db::repository::get_pending_pairing(&self.db, remote_node_id)?;
+        Ok(pairing
+            .filter(|p| p.direction == "outgoing")
+            .map(|p| p.pin_code)
+            .filter(|pin| !pin.is_empty()))
+    }
 
-        if Instant::now().duration_since(entry.1) > Duration::from_secs(60) {
-            *entry = (0, Instant::now());
+    /// Records one PIN attempt and says whether it may proceed.
+    ///
+    /// `key` must be something the remote side cannot choose freely (its
+    /// transport identity). A fresh identity is still cheap to mint, so every
+    /// attempt also draws from one budget shared by all keys: rotating
+    /// identities runs into that budget instead of getting three new guesses
+    /// each time.
+    pub fn check_pin_rate_limit(&self, key: &str) -> bool {
+        let now = Instant::now();
+
+        {
+            let mut budget = self.pin_global_budget.lock();
+            if now.duration_since(budget.1) >= PIN_ATTEMPT_WINDOW {
+                *budget = (0, now);
+            }
+            if budget.0 >= PIN_ATTEMPTS_ALL_KEYS {
+                return false;
+            }
+            budget.0 += 1;
         }
 
-        if entry.0 >= 3 {
+        if self.pin_attempts.len() >= PIN_TRACKED_KEYS {
+            self.pin_attempts
+                .retain(|_, (_, started)| now.duration_since(*started) < PIN_ATTEMPT_WINDOW);
+            if self.pin_attempts.len() >= PIN_TRACKED_KEYS {
+                return false;
+            }
+        }
+
+        let mut entry = self.pin_attempts.entry(key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) >= PIN_ATTEMPT_WINDOW {
+            *entry = (0, now);
+        }
+        if entry.0 >= PIN_ATTEMPTS_PER_KEY {
             return false;
         }
         entry.0 += 1;
-        entry.1 = Instant::now();
         true
     }
 
@@ -753,6 +1015,23 @@ mod tests {
         Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]))
     }
 
+    /// Losowy klucz node'a w formacie wire: Ed25519 (64 hex) + X25519 (64 hex).
+    /// Ed25519 czesc musi byc poprawnym punktem krzywej — losowy hex,
+    /// np. "ab".repeat(64), dekoduje sie tylko w ~polowie przypadkow.
+    fn random_node_key_hex() -> String {
+        let mut seed = [0u8; 32];
+        loop {
+            getrandom::fill(&mut seed).unwrap();
+            let ed: String = seed.iter().map(|b| format!("{:02x}", b)).collect();
+            if MeshSecurity::parse_verifying_key(&ed).is_ok() {
+                let mut x = [0u8; 32];
+                getrandom::fill(&mut x).unwrap();
+                let x_hex: String = x.iter().map(|b| format!("{:02x}", b)).collect();
+                return format!("{ed}{x_hex}");
+            }
+        }
+    }
+
     #[test]
     fn generowanie_klucza_i_zapis_do_db() {
         let db = setup_test_db();
@@ -778,18 +1057,20 @@ mod tests {
         let sec_a = MeshSecurity::new(db_a, test_settings_cipher()).unwrap();
         let sec_b = MeshSecurity::new(db_b, test_settings_cipher()).unwrap();
 
+        // VULN-M5: node_id = pierwsze 64 hex znakow klucza (binding).
+        let sec_a_node_id = &sec_a.public_key_hex()[..64];
         sec_b
-            .add_trusted_key("node-a", &sec_a.public_key_hex(), "host-a", None)
+            .add_trusted_key(sec_a_node_id, &sec_a.public_key_hex(), "host-a", None)
             .unwrap();
 
         let data = b"Wiadomosc do podpisania";
         let sig = sec_a.sign(data);
 
-        assert!(sec_b.verify("node-a", data, &sig).unwrap());
+        assert!(sec_b.verify(sec_a_node_id, data, &sig).unwrap());
 
         let mut bad_sig = sig.clone();
         bad_sig[0] ^= 0xFF;
-        assert!(!sec_b.verify("node-a", data, &bad_sig).unwrap());
+        assert!(!sec_b.verify(sec_a_node_id, data, &bad_sig).unwrap());
     }
 
     #[test]
@@ -836,10 +1117,264 @@ mod tests {
         let sec = MeshSecurity::new(db, test_settings_cipher()).unwrap();
 
         assert!(!sec.is_revoked("node-x"));
-        sec.revoke_trust("node-x").unwrap();
+        sec.revoke_trust("node-x", None).unwrap();
         assert!(sec.is_revoked("node-x"));
 
         sec.admin_retrust("node-x").unwrap();
         assert!(!sec.is_revoked("node-x"));
+    }
+
+    /// VULN-M1: PIN z pending "incoming" (tworzonego sama ramka PairingRequest
+    /// od obcego noda) NIE moze autoryzowac PairingConfirm, a pusty PIN nigdy
+    /// nie pomija weryfikacji. Auto-confirm dotyczy wylacznie pending
+    /// "outgoing" z PIN-em wygenerowanym lokalnie.
+    #[test]
+    fn pending_outgoing_pin_ignoruje_incoming_i_puste_pin() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool.clone(), test_settings_cipher()).unwrap();
+
+        // Outgoing: PIN wygenerowany lokalnie — autoryzuje Confirm.
+        sec.initiate_pairing_with_pin("node-a", "123456").unwrap();
+        assert_eq!(
+            sec.get_pending_outgoing_pin("node-a").unwrap().as_deref(),
+            Some("123456")
+        );
+
+        // Incoming: PIN wybrany przez nadawce requestu.
+        sec.receive_pairing_request(
+            "node-b",
+            "654321",
+            "",
+            tentaflow_protocol::environment::NodeEnvironment::Dev,
+        )
+        .unwrap();
+        assert_eq!(sec.get_pending_outgoing_pin("node-b").unwrap(), None);
+
+        // Pusty PIN — nigdy nie pomija weryfikacji.
+        db::repository::create_pending_pairing(
+            &pool,
+            "node-d",
+            "",
+            "outgoing",
+            "2099-01-01 00:00:00",
+        )
+        .unwrap();
+        assert_eq!(sec.get_pending_outgoing_pin("node-d").unwrap(), None);
+    }
+
+    /// VULN-M5: add_trusted_key wymaga wiazania node_id <-> klucz publiczny.
+    /// Bez tego TrustedKeysSync od zlosliwego peera wstawia klucz pod cudzym
+    /// node_id i podpina tozsamosc obcego noda.
+    #[test]
+    fn add_trusted_key_wymaga_wiazania_node_id_z_kluczem() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool.clone(), test_settings_cipher()).unwrap();
+
+        // Poprawne wiazanie: node_id = pierwsze 64 znakow hex klucza.
+        let pubkey = random_node_key_hex();
+        let node_id = pubkey[..64].to_string();
+        sec.add_trusted_key(&node_id, &pubkey, "host", None).unwrap();
+        assert!(sec.is_trusted(&node_id));
+
+        // Mismatch: klucz nie zaczyna sie od node_id — reject, brak zaufania.
+        let other_pubkey = random_node_key_hex();
+        let wrong_node_id = "ef".repeat(32);
+        assert!(sec
+            .add_trusted_key(&wrong_node_id, &other_pubkey, "host", None)
+            .is_err());
+        assert!(!sec.is_trusted(&wrong_node_id));
+
+        // node_id niehex / zla dlugosc — reject.
+        assert!(sec.add_trusted_key("zz", &pubkey, "host", None).is_err());
+        assert!(sec.add_trusted_key("gg".repeat(32).as_str(), &pubkey, "host", None).is_err());
+    }
+
+    /// VULN-M16: przyszly origin_approved_at (z wire) jest clampowany do
+    /// "teraz" — inaczej trust expiry (max(last_seen, approved_at)) nigdy
+    /// nie wygasa.
+    #[test]
+    fn add_trusted_key_clampuje_przyszly_approved_at() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool.clone(), test_settings_cipher()).unwrap();
+        let pubkey = random_node_key_hex();
+        let node_id = pubkey[..64].to_string();
+        sec.add_trusted_key(&node_id, &pubkey, "host", Some("2099-01-01 00:00:00"))
+            .unwrap();
+
+        let conn = pool.read().unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT approved_at FROM trusted_nodes WHERE node_id = ?1",
+                rusqlite::params![node_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_ne!(stored, "2099-01-01 00:00:00");
+        // Format datetime('now') — sparsowalny i <= teraz.
+        let parsed = chrono::NaiveDateTime::parse_from_str(&stored, "%Y-%m-%d %H:%M:%S")
+            .expect("approved_at po clampie w formacie DB");
+        assert!(parsed <= chrono::Utc::now().naive_utc());
+    }
+
+    #[test]
+    fn add_trusted_key_rejects_revoked_node_until_admin_retrust() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool.clone(), test_settings_cipher()).unwrap();
+        let pubkey = random_node_key_hex();
+        let node_id = pubkey[..64].to_string();
+
+        sec.add_trusted_key(&node_id, &pubkey, "host", None).unwrap();
+        sec.revoke_trust(&node_id, Some("2026-01-10 12:00:00")).unwrap();
+
+        // A peer that missed the revocation still carries the old approval.
+        assert!(sec.add_trusted_key(&node_id, &pubkey, "host", None).is_err());
+        assert!(sec
+            .add_trusted_key(&node_id, &pubkey, "host", Some("2026-01-01 00:00:00"))
+            .is_err());
+        assert!(!sec.is_trusted(&node_id));
+
+        sec.admin_retrust(&node_id).unwrap();
+        sec.add_trusted_key(&node_id, &pubkey, "host", None).unwrap();
+        assert!(sec.is_trusted(&node_id));
+    }
+
+    #[test]
+    fn repairing_after_revocation_propagates_through_sync() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool.clone(), test_settings_cipher()).unwrap();
+        let pubkey = random_node_key_hex();
+        let node_id = pubkey[..64].to_string();
+        sec.revoke_trust(&node_id, Some("2026-01-10 12:00:00")).unwrap();
+
+        sec.add_trusted_key(&node_id, &pubkey, "host", Some("2026-01-10 12:05:00"))
+            .unwrap();
+        assert!(sec.is_trusted(&node_id));
+        assert!(!sec.is_revoked(&node_id));
+
+        // A node that missed the re-pairing replays the old revocation.
+        assert!(sec.is_stale_revocation(&node_id, Some("2026-01-10 12:00:00")));
+        // A genuinely newer revocation, or one without a timestamp, still applies.
+        assert!(!sec.is_stale_revocation(&node_id, Some("2026-01-10 12:30:00")));
+        assert!(!sec.is_stale_revocation(&node_id, None));
+    }
+
+    #[test]
+    fn revoke_trust_clamps_future_timestamp_and_survives_restart() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool.clone(), test_settings_cipher()).unwrap();
+        let stored = sec.revoke_trust("node-future", Some("2099-01-01 00:00:00")).unwrap();
+        assert_ne!(stored, "2099-01-01 00:00:00");
+
+        let reloaded = MeshSecurity::new(pool, test_settings_cipher()).unwrap();
+        assert_eq!(
+            reloaded.get_revoked_nodes(),
+            vec![("node-future".to_string(), stored)]
+        );
+    }
+
+    #[test]
+    fn pairing_request_from_revoked_node_does_not_lift_revocation() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool.clone(), test_settings_cipher()).unwrap();
+        let pubkey = random_node_key_hex();
+        let node_id = pubkey[..64].to_string();
+        sec.revoke_trust(&node_id, None).unwrap();
+
+        sec.receive_pairing_request(
+            &node_id,
+            "123456",
+            &pubkey,
+            tentaflow_protocol::environment::NodeEnvironment::default(),
+        )
+        .unwrap();
+
+        assert!(sec.is_revoked(&node_id));
+    }
+
+    #[test]
+    fn a_new_pairing_request_does_not_restore_pin_attempts() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool, test_settings_cipher()).unwrap();
+        let public_key = random_node_key_hex();
+        let node_id = public_key[..64].to_string();
+
+        for _ in 0..PIN_ATTEMPTS_PER_KEY {
+            assert!(sec.check_pin_rate_limit(&node_id));
+        }
+        assert!(!sec.check_pin_rate_limit(&node_id));
+
+        sec.receive_pairing_request(
+            &node_id,
+            "123456",
+            &public_key,
+            tentaflow_protocol::environment::NodeEnvironment::default(),
+        )
+        .unwrap();
+
+        assert!(!sec.check_pin_rate_limit(&node_id));
+    }
+
+    #[test]
+    fn rotating_identities_runs_into_the_shared_pin_budget() {
+        let pool = setup_test_db();
+        let sec = MeshSecurity::new(pool, test_settings_cipher()).unwrap();
+
+        let allowed = (0..PIN_ATTEMPTS_ALL_KEYS * 2)
+            .filter(|i| sec.check_pin_rate_limit(&format!("identity-{i}")))
+            .count();
+
+        assert_eq!(allowed as u32, PIN_ATTEMPTS_ALL_KEYS);
+        assert!(!sec.check_pin_rate_limit("never-seen-before"));
+    }
+
+    /// Three nodes on separate databases that all trust each other, the way a
+    /// paired fleet does.
+    fn mutually_trusting_nodes() -> [MeshSecurity; 3] {
+        let nodes = [(); 3].map(|_| MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap());
+        for a in &nodes {
+            for b in &nodes {
+                a.add_trusted_key(&b.ed25519_public_key_hex(), &b.public_key_hex(), "peer", None)
+                    .unwrap();
+            }
+        }
+        nodes
+    }
+
+    #[test]
+    fn a_sealed_blob_opens_only_for_its_recipient_and_context() {
+        let [alice, bob, carol] = mutually_trusting_nodes();
+        let alice_id = alice.ed25519_public_key_hex();
+        let bob_id = bob.ed25519_public_key_hex();
+
+        let sealed = alice.seal_for_peer(&bob_id, b"hf_token|7", b"secret-value").unwrap();
+
+        assert_eq!(bob.open_from_peer(&alice_id, b"hf_token|7", &sealed).unwrap(), b"secret-value");
+        assert!(carol.open_from_peer(&alice_id, b"hf_token|7", &sealed).is_err());
+        assert!(bob.open_from_peer(&alice_id, b"ngc_api_key|7", &sealed).is_err());
+    }
+
+    #[test]
+    fn a_sealed_blob_cannot_be_reflected_back_to_its_sender() {
+        let [alice, bob, _] = mutually_trusting_nodes();
+        let sealed = alice
+            .seal_for_peer(&bob.ed25519_public_key_hex(), b"ctx", b"secret-value")
+            .unwrap();
+        assert!(alice
+            .open_from_peer(&bob.ed25519_public_key_hex(), b"ctx", &sealed)
+            .is_err());
+    }
+
+    #[test]
+    fn sealing_for_an_untrusted_or_keyless_node_fails() {
+        let db = setup_test_db();
+        let sec = MeshSecurity::new(db, test_settings_cipher()).unwrap();
+        assert!(sec.seal_for_peer(&"ab".repeat(32), b"ctx", b"v").is_err());
+
+        let keyless = random_node_key_hex();
+        let keyless_id = keyless[..64].to_string();
+        let without_x25519 = format!("{keyless_id}{}", "00".repeat(32));
+        sec.add_trusted_key(&keyless_id, &without_x25519, "peer", None).unwrap();
+        assert!(sec.seal_for_peer(&keyless_id, b"ctx", b"v").is_err());
     }
 }

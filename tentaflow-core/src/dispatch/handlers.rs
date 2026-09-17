@@ -192,7 +192,8 @@ pub fn meta_cancel_stream(
     // Anuluj subskrypcje matching ctx.correlation_id (klient prosi o anulowanie
     // streama z ktorym dzieli correlation_id).
     let registry = super::subscription::global();
-    if registry.cancel(ctx.correlation_id) {
+    let key = super::subscription::SubscriptionKey::new(ctx.connection_id, ctx.correlation_id);
+    if registry.cancel(key) {
         Ok(MessageBody::MetaCancelStream)
     } else {
         Err(ProtocolError::not_found(
@@ -235,23 +236,31 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
         ));
     }
 
+    // Unknown, disabled and wrong-password logins must be indistinguishable:
+    // same message, and the same Argon2 cost even when no account exists —
+    // otherwise both the wording and the response time enumerate usernames.
+    // "disabled" is only revealed to a caller who proved the password.
+    static UNKNOWN_USER_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        crate::crypto::hash_password("unknown-user-timing-equalizer").unwrap_or_default()
+    });
+    let invalid_credentials =
+        || ProtocolError::new(ProtocolErrorCode::AuthRequired, "invalid credentials");
+
     let user = repository::get_user_account_by_username(&ctx.state.db, &payload.username)
-        .map_err(db_err)?
-        .ok_or_else(|| {
-            ProtocolError::new(ProtocolErrorCode::AuthRequired, "invalid credentials")
-        })?;
+        .map_err(db_err)?;
+    let stored_hash = user
+        .as_ref()
+        .map_or(UNKNOWN_USER_HASH.as_str(), |u| u.password_hash.as_str());
+    let password_ok = auth::verify_password(&payload.password, stored_hash);
+    let user = match user {
+        Some(user) if password_ok => user,
+        _ => return Err(invalid_credentials()),
+    };
 
     if !user.is_active {
         return Err(ProtocolError::new(
             ProtocolErrorCode::AuthRequired,
             "account is disabled",
-        ));
-    }
-
-    if !auth::verify_password(&payload.password, &user.password_hash) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::AuthRequired,
-            "invalid credentials",
         ));
     }
 
@@ -904,6 +913,9 @@ pub fn model_list_request(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    // `None` = unfiltered catalog, reserved for admins and trusted mesh peers.
+    // A session without a user identity has no ACL to evaluate, so it gets an
+    // empty list rather than the node/endpoint topology of every model.
     let user_acl = match &ctx.session {
         crate::dispatch::SessionAuth::UserSession { user_id, role, .. } => {
             let role_str = role.clone().unwrap_or_else(|| "user".to_string());
@@ -913,7 +925,11 @@ pub fn model_list_request(
                 Some((user_id_to_uuid(user_id), role_str))
             }
         }
-        _ => None,
+        crate::dispatch::SessionAuth::MeshTrust { .. } => None,
+        crate::dispatch::SessionAuth::Anonymous
+        | crate::dispatch::SessionAuth::ApiKey { .. } => {
+            return Ok(MessageBody::ModelListResponse { models: Vec::new() });
+        }
     };
 
     let models: Vec<ModelSummary> = ctx
@@ -2569,14 +2585,15 @@ pub fn settings_update(
 
     let mut applied = 0u32;
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    let mut shared_secret_changed = false;
     for entry in &payload.entries {
         let result = if entry.is_secret && repository::is_shared_secret_setting_key(&entry.key) {
+            shared_secret_changed = true;
             repository::set_shared_secret_setting_secure(
                 &ctx.state.db,
                 &entry.key,
                 &entry.value,
                 &ctx.state.settings_cipher,
-                user_id.as_deref(),
             )
         } else if entry.is_secret {
             repository::set_setting_secure(
@@ -2591,6 +2608,12 @@ pub fn settings_update(
         match result {
             Ok(_) => applied += 1,
             Err(e) => tracing::warn!("settings_update '{}' failed: {}", entry.key, e),
+        }
+    }
+
+    if shared_secret_changed {
+        if let Some(mesh) = ctx.state.quic_mesh.clone() {
+            tokio::spawn(async move { mesh.push_shared_secrets_to_trusted(None).await });
         }
     }
 
@@ -7842,6 +7865,12 @@ struct AgentUpsertInput {
     /// already #[policy(Admin)]); validated against the allowed set on upsert.
     #[serde(default = "default_on_child_complete")]
     on_child_complete: String,
+    /// What the agent RUNS on (`agents.runtime_json`, see `agents::runtime`).
+    /// An editor that knows nothing about CLI runtimes omits the key and keeps
+    /// saving plain LLM agents; a CLI agent that round-trips through
+    /// `AgentDetail` carries its engine and account back unchanged.
+    #[serde(default = "default_runtime")]
+    runtime: serde_json::Value,
 }
 
 fn default_skills_selection() -> serde_json::Value {
@@ -7864,6 +7893,9 @@ fn default_true() -> bool {
 }
 fn default_on_child_complete() -> String {
     "notify".to_string()
+}
+fn default_runtime() -> serde_json::Value {
+    serde_json::json!({ "kind": "llm" })
 }
 
 /// List projection of `DbAgent` — the columns the card grid renders, including
@@ -7913,6 +7945,9 @@ struct AgentDetail<'a> {
     on_child_complete: &'a str,
     /// `None` = unrestricted delegation; a list = only those agents.
     allowed_agents: Option<Vec<String>>,
+    /// Decoded `agents.runtime_json` — `{"kind":"llm"}` or a CLI runtime with
+    /// its engine and account binding.
+    runtime: serde_json::Value,
     created_at: &'a str,
     updated_at: &'a str,
 }
@@ -7932,6 +7967,13 @@ impl<'a> AgentDetail<'a> {
         let params: serde_json::Value = serde_json::from_str(&agent.params_json).map_err(|e| {
             ProtocolError::internal(format!("agent {} has invalid params_json: {e}", agent.id))
         })?;
+        let runtime: serde_json::Value =
+            serde_json::from_str(&agent.runtime_json).map_err(|e| {
+                ProtocolError::internal(format!(
+                    "agent {} has invalid runtime_json: {e}",
+                    agent.id
+                ))
+            })?;
         Ok(Self {
             id: &agent.id,
             name: &agent.name,
@@ -7961,6 +8003,7 @@ impl<'a> AgentDetail<'a> {
                         agent.id
                     ))
                 })?,
+            runtime,
             created_at: &agent.created_at,
             updated_at: &agent.updated_at,
         })
@@ -8203,7 +8246,7 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
 
 /// True when the acting session is an admin. Non-admins only ever see their own
 /// runs (Harness §3.3 ACL) — enforced here, never in the UI.
-fn session_is_admin(ctx: &HandlerContext) -> bool {
+pub(crate) fn session_is_admin(ctx: &HandlerContext) -> bool {
     matches!(
         &ctx.session,
         SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
@@ -8347,6 +8390,31 @@ pub fn agents_upsert(
         .map_err(|e| ProtocolError::internal(format!("agent skills encode failed: {}", e)))?;
     let params_json = serde_json::to_string(&input.params)
         .map_err(|e| ProtocolError::internal(format!("agent params encode failed: {}", e)))?;
+    let runtime_json = serde_json::to_string(&input.runtime)
+        .map_err(|e| ProtocolError::internal(format!("agent runtime encode failed: {}", e)))?;
+    // The structural half is `validate_agent_params` below; the account a global
+    // binding names has to exist HERE, where the session says which org asked.
+    let runtime = crate::agents::AgentRuntime::parse(&runtime_json)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    match ctx.org_context.as_ref() {
+        Some(org) => {
+            crate::agents::validate_agent_account_binding(&ctx.state.db, &org.org_id, &runtime)
+                .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+        }
+        // A session with no org cannot be told which accounts it may point at,
+        // so it may not point at one at all. Every other runtime is org-free.
+        None if matches!(
+            &runtime,
+            crate::agents::AgentRuntime::Cli(cli)
+                if matches!(cli.account, crate::agents::AccountBinding::Global { .. })
+        ) =>
+        {
+            return Err(ProtocolError::bad_request(
+                "a global agent account needs an organisation context",
+            ));
+        }
+        None => {}
+    }
 
     let params = db::models::AgentParams {
         id: &agent_id,
@@ -8368,6 +8436,7 @@ pub fn agents_upsert(
         on_child_complete: &input.on_child_complete,
         actor_user_id: Some(&user_id),
         allowed_agents_json: allowed_agents_json.as_deref(),
+        runtime_json: &runtime_json,
     };
     repository::validate_agent_params(&params)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
@@ -11610,28 +11679,14 @@ pub async fn service_agent(
             Some("administrator_required_for_login".to_string()),
         );
     }
+    // The owner node runs this same handler for the forwarded request. It
+    // verifies a signed assertion of who is acting and takes that person's role
+    // from its own database, so the checks above hold there too and a peer
+    // cannot simply name the user it wants to act as.
     if let Some(target) = forward_target_node(ctx, &payload.node_id) {
-        let command = tentaflow_protocol::mesh::MeshCommandType::AgentRpc {
-            service_id: payload.service_id,
-            operation: payload.operation,
-            payload_json: payload.payload_json,
-            user_id: uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),
-        };
-        return match forward_command(ctx, target, command).await {
-            Ok(result) if result.ok => match result.payload {
-                tentaflow_protocol::mesh::MeshCommandResponsePayload::AgentRpcResult {
-                    result_json,
-                } => response(result_json, None),
-                _ => response(String::new(), Some("unexpected mesh response".to_string())),
-            },
-            Ok(result) => response(
-                String::new(),
-                result
-                    .error
-                    .or(Some("remote coding-agent request failed".to_string())),
-            ),
-            Err(error) => response(String::new(), Some(error)),
-        };
+        let body_cbor = tentaflow_protocol::cbor::encode(req)
+            .map_err(|e| ProtocolError::internal(format!("request encode failed: {e}")))?;
+        return super::app_route::forward_to_node(ctx, target, body_cbor).await;
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
     let service = fetch_service_row(ctx, payload.service_id)?;

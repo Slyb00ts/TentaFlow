@@ -268,7 +268,6 @@ async fn happy_path_joiner_and_donor_reach_completed() {
     assert_eq!(joiner, joiner_node_id);
 
     let (mut joiner_stream, mut donor_stream) = DuplexFrameStream::pair();
-    let cipher = test_cipher();
 
     let donor_task = {
         let security = Arc::clone(&security);
@@ -293,7 +292,6 @@ async fn happy_path_joiner_and_donor_reach_completed() {
             &joiner_pool_for_task,
             &joiner_node_id,
             &donor_node_id_for_joiner,
-            &cipher,
             0,
         )
         .await
@@ -366,7 +364,6 @@ async fn reroll_happy_path() {
         seed_joiner_org(&joiner_pool);
 
         let (mut joiner_stream, mut donor_stream) = DuplexFrameStream::pair();
-        let cipher = test_cipher();
 
         let donor_task = {
             let security = Arc::clone(&security);
@@ -391,7 +388,6 @@ async fn reroll_happy_path() {
                 &joiner_pool_for_task,
                 &jni,
                 &donor_node_id_for_joiner,
-                &cipher,
                 0,
             )
             .await
@@ -438,7 +434,6 @@ async fn joiner_with_lower_node_id_completes_full_session() {
     seed_joiner_org(&joiner_pool);
 
     let (mut joiner_stream, mut donor_stream) = DuplexFrameStream::pair();
-    let cipher = test_cipher();
 
     let donor_task = {
         let security = Arc::clone(&security);
@@ -463,7 +458,6 @@ async fn joiner_with_lower_node_id_completes_full_session() {
             &joiner_pool_for_task,
             &joiner_node_id,
             &donor_node_id_for_joiner,
-            &cipher,
             0,
         )
         .await
@@ -494,7 +488,6 @@ async fn joiner_aborts_on_ack_role_mismatch() {
     let (joiner_node_id, _) = gen_identity();
     let joiner_pool = new_pool();
     seed_joiner_org(&joiner_pool);
-    let cipher = test_cipher();
 
     // Fake donor pisze BaselineAck o NIEZGODNYM donorze. Joiner musi przerwac.
     let donor_node_id = {
@@ -532,7 +525,6 @@ async fn joiner_aborts_on_ack_role_mismatch() {
         &joiner_pool,
         &joiner_node_id,
         &donor_node_id,
-        &cipher,
         0,
     )
     .await;
@@ -584,7 +576,6 @@ async fn joiner_detects_corrupted_chunk() {
     let (joiner_node_id, _) = gen_identity();
     let joiner_pool = new_pool();
     seed_joiner_org(&joiner_pool);
-    let cipher = test_cipher();
 
     let donor_node_id = loop {
         let (cand, _) = gen_identity();
@@ -602,7 +593,6 @@ async fn joiner_detects_corrupted_chunk() {
             counter: 0,
             origin_node: donor_node_id.clone(),
         },
-        &test_cipher(),
     )
     .unwrap();
     let raw = serialize_snapshot(&snapshot).unwrap();
@@ -645,7 +635,6 @@ async fn joiner_detects_corrupted_chunk() {
         &joiner_pool,
         &joiner_node_id,
         &donor_node_id,
-        &cipher,
         0,
     )
     .await;
@@ -663,7 +652,6 @@ async fn joiner_rejects_header_over_hard_cap_without_buffering() {
     let (joiner_node_id, _) = gen_identity();
     let joiner_pool = new_pool();
     seed_joiner_org(&joiner_pool);
-    let cipher = test_cipher();
 
     let donor_node_id = loop {
         let (cand, _) = gen_identity();
@@ -692,7 +680,7 @@ async fn joiner_rejects_header_over_hard_cap_without_buffering() {
             };
             write_frame(&mut fake_donor, &ack, "ack").await.unwrap();
             let header = BaselineHeader {
-                schema_version: 1,
+                schema_version: crate::sync::core_baseline::BASELINE_SCHEMA_VERSION,
                 epoch: 0,
                 tables: Vec::new(),
                 row_counts: Vec::new(),
@@ -712,7 +700,6 @@ async fn joiner_rejects_header_over_hard_cap_without_buffering() {
         &joiner_pool,
         &joiner_node_id,
         &donor_node_id,
-        &cipher,
         0,
     )
     .await;
@@ -741,7 +728,6 @@ async fn joiner_aborts_when_stream_overshoots_declared_total() {
     let (joiner_node_id, _) = gen_identity();
     let joiner_pool = new_pool();
     seed_joiner_org(&joiner_pool);
-    let cipher = test_cipher();
 
     let donor_node_id = loop {
         let (cand, _) = gen_identity();
@@ -771,7 +757,7 @@ async fn joiner_aborts_when_stream_overshoots_declared_total() {
         bytes: chunk_bytes,
     };
     let header = BaselineHeader {
-        schema_version: 1,
+        schema_version: crate::sync::core_baseline::BASELINE_SCHEMA_VERSION,
         epoch: 0,
         tables: Vec::new(),
         row_counts: Vec::new(),
@@ -816,7 +802,6 @@ async fn joiner_aborts_when_stream_overshoots_declared_total() {
         &joiner_pool,
         &joiner_node_id,
         &donor_node_id,
-        &cipher,
         0,
     )
     .await;

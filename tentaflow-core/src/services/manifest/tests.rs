@@ -934,6 +934,35 @@ fn loaded_manifest_engine_ids_unique() {
     assert_eq!(sorted.len(), ids.len(), "Duplikaty engine.id wsrod {ids:?}");
 }
 
+/// A managed CLI runs a vendor binary inside a process sandbox, and only macOS
+/// and Linux have a backend for one. Declaring any other platform offers the
+/// engine in the catalog of a node that can only refuse it.
+#[test]
+fn managed_cli_engines_declare_only_platforms_with_a_sandbox() {
+    let reg = super::registry::registry();
+    let mut checked = 0;
+    for manifest in reg.engines() {
+        let Some(native) = manifest.deploy.native.as_ref() else {
+            continue;
+        };
+        if native.runtime != NativeRuntime::ManagedCli {
+            continue;
+        }
+        checked += 1;
+        for platform in &native.platforms {
+            assert!(
+                matches!(platform, TargetOs::Linux | TargetOs::Macos),
+                "{} declares {platform:?}, which has no process sandbox",
+                manifest.engine.id
+            );
+        }
+    }
+    assert_eq!(
+        checked, 4,
+        "the managed CLI engines are not in the registry"
+    );
+}
+
 /// E4: REGISTRY zawiera kluczowe silniki LLM. `tensorrt-llm` swiadomie nie ma na
 /// tej liscie — jego manifest zostal usuniety przy reorganizacji bundle'i
 /// kontenerow, a asercja przetrwala i failowala od tamtej pory.

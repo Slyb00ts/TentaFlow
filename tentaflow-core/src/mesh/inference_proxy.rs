@@ -37,7 +37,7 @@ pub fn invalidate_meeting_session(meeting_key: &str) {
 
 /// Sidecar payload policy for the unary reverse path.
 ///
-/// A mesh peer (`caller = None`) is a trust-paired node and keeps full access.
+/// A mesh peer (`caller = None`) goes through `authorize_mesh_peer_request`.
 /// A sidecar (`caller = Some`) is a container Core spawned: it may only drive
 /// the meeting it was spawned for, so every payload that names a meeting goes
 /// through `lookup_owned_session`, and every payload that would turn Core into
@@ -84,10 +84,30 @@ fn authorize_sidecar_request(
     }
 }
 
+/// Mesh peer payload policy for the unary forward path.
+///
+/// A trust-paired node forwards inference its own router could not serve, so
+/// inference payloads pass. Meeting payloads are different: only the sidecar
+/// Core spawned for a meeting produces them, and it is bound to that meeting by
+/// `authorize_sidecar_request`. A peer has no such binding, so accepting them
+/// here would let any node in the fleet write into, or read prompts on behalf
+/// of, a meeting it has nothing to do with.
+fn authorize_mesh_peer_request(request: &tentaflow_protocol::ModelRequest) -> Result<(), String> {
+    use tentaflow_protocol::ModelPayload;
+
+    match &request.payload {
+        ModelPayload::MeetingEvent(_) | ModelPayload::PromptFetch(_) => Err(
+            "meeting payloads are accepted only from the sidecar that owns the meeting"
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Dispatchuje odwrotny request przez odpowiednia metode Routera. Dostepne
 /// publicznie zeby forward handler mesh mogl uzyc tej samej sciezki.
 /// `caller` identifies a sidecar that opened the stream back to Core; mesh
-/// forwarding passes `None` (trust-paired peer, no sidecar policy).
+/// forwarding passes `None` (trust-paired peer, mesh peer policy).
 pub async fn dispatch_reverse_request(
     router: &Router,
     request: tentaflow_protocol::ModelRequest,
@@ -97,23 +117,25 @@ pub async fn dispatch_reverse_request(
 
     let request_id = request.request_id.clone();
 
-    if let Some(caller) = caller {
-        if let Err(message) = authorize_sidecar_request(router, &request, caller) {
-            warn!(
-                request_id = %request_id,
-                service = %caller.service_name,
-                "reverse request refused: {message}"
-            );
-            return ModelResponse {
-                request_id,
-                result: ModelResult::Error(ErrorInfo {
-                    error_type: ErrorType::Unauthorized,
-                    message,
-                    details: None,
-                }),
-                metrics: None,
-            };
-        }
+    let authorized = match caller {
+        Some(caller) => authorize_sidecar_request(router, &request, caller),
+        None => authorize_mesh_peer_request(&request),
+    };
+    if let Err(message) = authorized {
+        warn!(
+            request_id = %request_id,
+            service = caller.map(|c| c.service_name.as_str()).unwrap_or("mesh peer"),
+            "reverse request refused: {message}"
+        );
+        return ModelResponse {
+            request_id,
+            result: ModelResult::Error(ErrorInfo {
+                error_type: ErrorType::Unauthorized,
+                message,
+                details: None,
+            }),
+            metrics: None,
+        };
     }
 
     // Codex R3b.7 H2: anti-loop. Forwarding peer carries hop count in
@@ -1655,7 +1677,8 @@ mod tests {
     // =========================================================================
     // Sidecar policy (CR-002): a service that opened a reverse stream may only
     // drive the meeting it was spawned for, and may not use Core as an
-    // anonymous inference proxy. Mesh peers (`caller = None`) are unaffected.
+    // anonymous inference proxy. Mesh peers (`caller = None`) keep inference but
+    // lose the meeting payloads.
     // =========================================================================
 
     /// Router with a database and a session owned by `meeting-bot-1`.
@@ -1829,22 +1852,36 @@ mod tests {
         );
     }
 
-    // Mesh forwarding keeps the pre-policy behaviour: no caller, no gate.
     #[tokio::test]
-    async fn mesh_caller_none_keeps_meeting_event_behaviour() {
+    async fn a_mesh_peer_cannot_write_into_a_meeting() {
         let (router, db) = policy_router();
         let response =
             dispatch_reverse_request(&router, meeting_event_request("mtg-from-peer"), None).await;
-        assert!(
-            matches!(response.result, ModelResult::Completion(_)),
-            "mesh peer must not be gated: {:?}",
-            response.result
-        );
-        assert_eq!(
-            summary_count(&db, "mtg-from-peer"),
-            1,
-            "mesh path still persists the event"
-        );
+        assert!(matches!(
+            error_of(&response).error_type,
+            ErrorType::Unauthorized
+        ));
+        assert_eq!(summary_count(&db, "mtg-from-peer"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_mesh_peer_cannot_fetch_prompts() {
+        let (router, _db) = policy_router();
+        let request = ModelRequest {
+            request_id: "pf-peer".to_string(),
+            payload: ModelPayload::PromptFetch(PromptFetchRequest {
+                prompt_id: "meeting_summary".to_string(),
+                language: "en".to_string(),
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+        let response = dispatch_reverse_request(&router, request, None).await;
+        assert!(matches!(
+            error_of(&response).error_type,
+            ErrorType::Unauthorized
+        ));
     }
 
     // =========================================================================

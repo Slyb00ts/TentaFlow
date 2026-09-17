@@ -198,9 +198,18 @@ fn parse_identity(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<TlsIdentity
     Ok(TlsIdentity { certs, key })
 }
 
+/// Generates a certificate that lives only in this process. Used when the TLS
+/// directory is unusable: a key shared between installations would let anyone
+/// holding the binary impersonate the node, so the fallback is never persisted
+/// or embedded.
+pub fn generate_ephemeral(hostname: &str, extra_sans: &[String]) -> anyhow::Result<TlsIdentity> {
+    let (cert_pem, key_pem) = generate(hostname, &desired_sans(hostname, extra_sans))?;
+    parse_identity(cert_pem.as_bytes(), key_pem.as_bytes())
+}
+
 /// Loads `<tls_dir>/cert.pem` + `key.pem` when present and still covering the
 /// desired SAN set, otherwise generates and stores a new pair. Any failure is
-/// returned so the caller can fall back to the embedded certificate.
+/// returned so the caller can fall back to an ephemeral certificate.
 pub fn load_or_generate(
     tls_dir: &Path,
     hostname: &str,

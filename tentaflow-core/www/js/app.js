@@ -200,7 +200,12 @@ async function bootstrap() {
 
   // Otworz WS natychmiast (anonymous jesli brak JWT). Serwer akceptuje i
   // pozwala tylko na authLogin + schema + heartbeat przed zalogowaniem.
-  initTransport().catch((e) => console.warn('[app] initTransport:', e?.message));
+  const ssoToken = takeSsoTokenFromFragment();
+  if (ssoToken) {
+    await ApiBinary.setJwt(ssoToken).catch((e) => console.warn('[app] SSO session:', e?.message));
+  } else {
+    initTransport().catch((e) => console.warn('[app] initTransport:', e?.message));
+  }
   SystemEvents.init();
 
   if (!ApiBinary.hasJwt()) {
@@ -236,6 +241,17 @@ async function bootstrap() {
       console.debug('[app] SW register failed:', e?.message);
     });
   }
+}
+
+// The SSO callback hands the session over in the URL fragment, which never
+// reaches a server, proxy log or Referer header. It is removed from the address
+// bar before anything else runs so it does not linger in history either.
+function takeSsoTokenFromFragment() {
+  const prefix = '#sso_token=';
+  if (!window.location.hash.startsWith(prefix)) return null;
+  const token = decodeURIComponent(window.location.hash.slice(prefix.length));
+  window.history.replaceState({}, '', window.location.pathname + window.location.search);
+  return token || null;
 }
 
 async function handlePairDeepLink() {

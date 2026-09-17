@@ -1,0 +1,166 @@
+- generic [ref=f4e2]:
+  - generic [ref=f4e3]:
+    - generic [ref=f4e4]: A01
+    - heading "Serwisy → zakładka „Konta agentów”" [level=2] [ref=f4e5]
+    - generic [ref=f4e6]: "ISTNIEJĄCY ekran Serwisy i ISTNIEJĄCA zakładka „Konta agentów”. Zmienia się zawartość zakładki: zamiast listy serwisów-mostów — lista kont (globalne + użytkowników)."
+  - generic [ref=f4e7]:
+    - generic [ref=f4e8]: "Gdzie w aplikacji:"
+    - generic [ref=f4e9]: "menu boczne: Serwisy"
+    - generic [ref=f4e10]: "→ zakładka: Konta agentów"
+    - generic [ref=f4e11]: "→ segment: Konta"
+  - generic [ref=f4e13]:
+    - complementary [ref=f4e14]:
+      - generic [ref=f4e15]: TentaFlow
+      - generic [ref=f4e17]:
+        - generic [ref=f4e18]: Ogólne
+        - generic [ref=f4e21] [cursor=pointer]: Pulpit
+        - generic [ref=f4e24] [cursor=pointer]: Serwisy
+        - generic [ref=f4e27] [cursor=pointer]: Nody mesh
+      - generic [ref=f4e30]:
+        - generic [ref=f4e31]: Aplikacje
+        - generic [ref=f4e34] [cursor=pointer]: Projekty
+        - generic [ref=f4e37] [cursor=pointer]: ML Studio
+        - generic [ref=f4e40] [cursor=pointer]: Benchmark Studio
+        - generic [ref=f4e43] [cursor=pointer]: Agenci
+      - generic [ref=f4e46]:
+        - generic [ref=f4e47]: Zarządzanie
+        - generic [ref=f4e50] [cursor=pointer]: Użytkownicy
+        - generic [ref=f4e53] [cursor=pointer]: Dziennik audytu
+      - generic [ref=f4e57]:
+        - generic [ref=f4e58]: AK
+        - generic [ref=f4e59]:
+          - generic [ref=f4e60]: Anna · Menedżer
+          - generic [ref=f4e61]: Euvic · QA
+    - main [ref=f4e62]:
+      - generic [ref=f4e63]:
+        - heading "Serwisy" [level=1] [ref=f4e64]
+        - generic [ref=f4e65]: 12 serwisów · 4 nody
+        - button "+ Dodaj serwis" [ref=f4e66] [cursor=pointer]
+      - generic [ref=f4e67]:
+        - button "Lista 12" [ref=f4e68] [cursor=pointer]:
+          - text: Lista
+          - generic [ref=f4e69]: "12"
+        - button "Konta agentów 7" [ref=f4e70] [cursor=pointer]:
+          - text: Konta agentów
+          - generic [ref=f4e71]: "7"
+        - button "Aliasy 5" [ref=f4e72] [cursor=pointer]:
+          - text: Aliasy
+          - generic [ref=f4e73]: "5"
+        - button "Modele 31" [ref=f4e74] [cursor=pointer]:
+          - text: Modele
+          - generic [ref=f4e75]: "31"
+      - generic [ref=f4e76]:
+        - generic [ref=f4e77]:
+          - button "Konta" [ref=f4e78] [cursor=pointer]
+          - button "Aplikacje na nodach" [ref=f4e79] [cursor=pointer]
+        - button "1 + Dodaj konto globalne" [ref=f4e80] [cursor=pointer]:
+          - generic [ref=f4e81]: "1"
+          - text: + Dodaj konto globalne
+      - table [ref=f4e82]:
+        - rowgroup [ref=f4e83]:
+          - row [ref=f4e84]:
+            - columnheader "Konto" [ref=f4e85]
+            - columnheader "Zakres" [ref=f4e86]
+            - columnheader "Logowanie" [ref=f4e87]
+            - columnheader "Stan" [ref=f4e88]
+            - columnheader "Aktywne sesje" [ref=f4e89]
+            - columnheader "Używane na" [ref=f4e90]
+            - columnheader "Akcje" [ref=f4e91]
+        - rowgroup [ref=f4e92]:
+          - row [ref=f4e93]:
+            - cell "CC Claude Code — firma 2 zespol@euvic.pl · Max 20x" [ref=f4e94]:
+              - generic [ref=f4e95]:
+                - generic [ref=f4e96]: CC
+                - generic [ref=f4e97]:
+                  - generic [ref=f4e98]:
+                    - text: Claude Code — firma
+                    - generic [ref=f4e99]: "2"
+                  - generic [ref=f4e100]: zespol@euvic.pl · Max 20x
+            - cell "Globalne" [ref=f4e101]
+            - cell "Subskrypcja" [ref=f4e103]
+            - cell "Zalogowane" [ref=f4e104]
+            - cell "5 · 3 osoby" [ref=f4e106]
+            - cell "helios, rig26" [ref=f4e107]
+            - cell [ref=f4e108]:
+              - button "Otwórz" [ref=f4e109] [cursor=pointer]
+          - row [ref=f4e110]:
+            - cell "CX Codex — firma dev@euvic.pl · ChatGPT Business" [ref=f4e111]:
+              - generic [ref=f4e112]:
+                - generic [ref=f4e113]: CX
+                - generic [ref=f4e114]:
+                  - generic [ref=f4e115]: Codex — firma
+                  - generic [ref=f4e116]: dev@euvic.pl · ChatGPT Business
+            - cell "Globalne" [ref=f4e117]
+            - cell "Subskrypcja" [ref=f4e119]
+            - cell "Zalogowane" [ref=f4e120]
+            - cell "2" [ref=f4e122]
+            - cell "helios, rig26" [ref=f4e123]
+            - cell [ref=f4e124]:
+              - button "Otwórz" [ref=f4e125] [cursor=pointer]
+          - row [ref=f4e126]:
+            - cell "CC Claude Code — klucz API (CI) sk-ant-…4f2a · rozliczenie za tokeny" [ref=f4e127]:
+              - generic [ref=f4e128]:
+                - generic [ref=f4e129]: CC
+                - generic [ref=f4e130]:
+                  - generic [ref=f4e131]: Claude Code — klucz API (CI)
+                  - generic [ref=f4e132]: sk-ant-…4f2a · rozliczenie za tokeny
+            - cell "Globalne" [ref=f4e133]
+            - cell "Klucz API" [ref=f4e135]
+            - cell "Zweryfikowany" [ref=f4e136]
+            - cell "0" [ref=f4e138]
+            - cell "—" [ref=f4e139]
+            - cell [ref=f4e140]:
+              - button "Otwórz" [ref=f4e141] [cursor=pointer]
+          - row [ref=f4e142]:
+            - cell "GK Grok Build — firma ai@euvic.pl" [ref=f4e143]:
+              - generic [ref=f4e144]:
+                - generic [ref=f4e145]: GK
+                - generic [ref=f4e146]:
+                  - generic [ref=f4e147]: Grok Build — firma
+                  - generic [ref=f4e148]: ai@euvic.pl
+            - cell "Globalne" [ref=f4e149]
+            - cell "Subskrypcja" [ref=f4e151]
+            - cell "Wymaga logowania" [ref=f4e152]
+            - cell "0" [ref=f4e154]
+            - cell "—" [ref=f4e155]
+            - cell [ref=f4e156]:
+              - button "3 Zaloguj" [ref=f4e157] [cursor=pointer]:
+                - generic [ref=f4e158]: "3"
+                - text: Zaloguj
+          - row [ref=f4e159]:
+            - cell "CC Claude Code — Piotr Jarocki konto użytkownika" [ref=f4e160]:
+              - generic [ref=f4e161]:
+                - generic [ref=f4e162]: CC
+                - generic [ref=f4e163]:
+                  - generic [ref=f4e164]: Claude Code — Piotr Jarocki
+                  - generic [ref=f4e165]: konto użytkownika
+            - cell "Użytkownika" [ref=f4e166]
+            - cell "Subskrypcja" [ref=f4e168]
+            - cell "Zalogowane" [ref=f4e169]
+            - cell "2" [ref=f4e171]
+            - cell "mac-critix, rig26" [ref=f4e172]
+            - cell "tylko właściciel" [ref=f4e173]
+          - row [ref=f4e174]:
+            - cell "CX Codex — Anna Kowalska konto użytkownika" [ref=f4e175]:
+              - generic [ref=f4e176]:
+                - generic [ref=f4e177]: CX
+                - generic [ref=f4e178]:
+                  - generic [ref=f4e179]: Codex — Anna Kowalska
+                  - generic [ref=f4e180]: konto użytkownika
+            - cell "Użytkownika" [ref=f4e181]
+            - cell "Subskrypcja" [ref=f4e183]
+            - cell "Zalogowane" [ref=f4e184]
+            - cell "1" [ref=f4e186]
+            - cell "helios" [ref=f4e187]
+            - cell "tylko właściciel" [ref=f4e188]
+      - generic [ref=f4e189]: 6 kont · 4 globalne · 2 użytkowników.
+      - generic [ref=f4e190]:
+        - generic [ref=f4e191]:
+          - generic [ref=f4e192]: "1"
+          - text: otwiera okno logowania — ekran A02
+        - generic [ref=f4e193]:
+          - generic [ref=f4e194]: "2"
+          - text: kliknięcie wiersza konta globalnego otwiera okno „Konto agenta” — ekrany A03 (Przegląd) i A04 (Dostęp)
+        - generic [ref=f4e195]:
+          - generic [ref=f4e196]: "3"
+          - text: ponowne logowanie — to samo okno A02

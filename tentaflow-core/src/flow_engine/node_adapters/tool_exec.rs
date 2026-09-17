@@ -1321,6 +1321,7 @@ mod tests {
         repository::upsert_agent(
             pool,
             &AgentParams {
+                runtime_json: crate::agents::LLM_RUNTIME_JSON,
                 id,
                 name: "a",
                 display_name: None,
@@ -1457,6 +1458,7 @@ mod tests {
         crate::db::repository::upsert_agent(
             &pool,
             &crate::db::models::AgentParams {
+                runtime_json: crate::agents::LLM_RUNTIME_JSON,
                 id: "agent-count",
                 name: "counter",
                 display_name: None,

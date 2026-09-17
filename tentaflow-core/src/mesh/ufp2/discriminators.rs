@@ -121,6 +121,7 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_SERVICES_ANNOUNCE
             | legacy::MESH_MSG_SERVICES_UPDATE
             | legacy::MESH_MSG_HMAC_KEYS_SYNC
+            | legacy::MESH_MSG_SHARED_SECRETS_SYNC
             | legacy::MESH_MSG_FRAME_PROXY_REQUEST
             | legacy::MESH_MSG_FRAME_PROXY_RESPONSE
             | legacy::MESH_MSG_STORAGE_PROXY_REQUEST
@@ -178,6 +179,7 @@ pub mod kinds {
     pub const DEPLOY_PROGRESS: Kind = Kind(legacy::MESH_MSG_DEPLOY_PROGRESS as u16);
     pub const LOG_CHUNK: Kind = Kind(legacy::MESH_MSG_LOG_CHUNK as u16);
     pub const HMAC_KEYS_SYNC: Kind = Kind(legacy::MESH_MSG_HMAC_KEYS_SYNC as u16);
+    pub const SHARED_SECRETS_SYNC: Kind = Kind(legacy::MESH_MSG_SHARED_SECRETS_SYNC as u16);
     pub const FRAME_PROXY_REQUEST: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_REQUEST as u16);
     pub const FRAME_PROXY_RESPONSE: Kind = Kind(legacy::MESH_MSG_FRAME_PROXY_RESPONSE as u16);
     pub const STORAGE_PROXY_REQUEST: Kind = Kind(legacy::MESH_MSG_STORAGE_PROXY_REQUEST as u16);
@@ -252,6 +254,7 @@ mod tests {
             legacy::MESH_MSG_SERVICES_ANNOUNCE,
             legacy::MESH_MSG_SERVICES_UPDATE,
             legacy::MESH_MSG_HMAC_KEYS_SYNC,
+            legacy::MESH_MSG_SHARED_SECRETS_SYNC,
             legacy::MESH_MSG_FRAME_PROXY_REQUEST,
             legacy::MESH_MSG_FRAME_PROXY_RESPONSE,
             legacy::MESH_MSG_STORAGE_PROXY_REQUEST,

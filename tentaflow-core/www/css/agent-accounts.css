@@ -1,0 +1,156 @@
+/* ============================================================================
+ * agent-accounts.css — agent provider accounts: the "Konta agentów" tab of the
+ * Services screen (A01 + N01), the account window (A03/A04) and the "Aplikacje
+ * agentowe" section of "Moje konta" (U01).
+ *
+ * Every control on those screens is a tf-* component; this sheet only lays the
+ * components out. Anything rendered INSIDE a tf-table cell must use the shared
+ * `tf-table__*` classes from controls.css instead — that is the only sheet
+ * adopted into a shadow root, so none of the rules below reach a cell.
+ * ============================================================================ */
+
+.aa-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ---- Shared text blocks --------------------------------------------------- */
+
+.aa-sub-h {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-3);
+}
+
+.aa-foot {
+  font-size: 11.5px;
+  color: var(--text-3);
+  padding: 2px 2px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.aa-hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+.aa-note {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+}
+
+.aa-error {
+  font-size: 12px;
+  color: var(--danger);
+  line-height: 1.5;
+}
+.aa-error[hidden] { display: none; }
+
+/* ---- Forms (create window, settings block) -------------------------------- */
+
+.aa-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* An input plus the buttons that act on it: the buttons sit on the input's
+   baseline, which is below the label tf-input renders above the field. */
+.aa-form-row {
+  flex-direction: row;
+  align-items: flex-end;
+  gap: 8px;
+}
+.aa-form-row tf-input { flex: 1; min-width: 0; }
+
+.aa-toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+}
+.aa-toggle-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+/* ---- Account window (A03/A04) --------------------------------------------- */
+
+.aa-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.aa-detail [data-pane] {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.aa-kv {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 8px 14px;
+  font-size: 12.5px;
+  align-items: center;
+}
+.aa-kv dt { color: var(--text-3); }
+.aa-kv dd { color: var(--text); display: flex; align-items: center; gap: 8px; }
+
+.aa-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* tf-window footers are right-aligned; a destructive action belongs on the
+   opposite edge so it is never the button next to "Zamknij". */
+.aa-footer-left { margin-right: auto; }
+
+/* ---- U01 — "Aplikacje agentowe" ------------------------------------------- */
+
+/* "Moje konta" is a plain block page, so its two section headings carry their
+   own spacing instead of relying on a flex gap. */
+.myaccounts-page .aa-sub-h { margin: 18px 0 10px; }
+.myaccounts-page .aa-sub-h:first-of-type { margin-top: 4px; }
+
+.aa-apps-empty {
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.6;
+  padding: 14px 16px;
+  border: 1px dashed var(--border-hover);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+}
+
+/* The engine tile is the same element the tables use, so one map of engine
+   colours serves both; here it is scaled to the icon size of an addon card. */
+.aa-app-card .myapp-head > .tf-table__tile {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+}
+.aa-app-card .myapp-linked + .myapp-linked { margin-top: 8px; }
+
+@media (max-width: 900px) {
+  .aa-kv { grid-template-columns: 1fr; gap: 2px; }
+  .aa-kv dd { margin-bottom: 8px; }
+  .aa-form-row { flex-direction: column; align-items: stretch; }
+}

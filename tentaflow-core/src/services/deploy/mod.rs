@@ -3030,6 +3030,11 @@ pub(crate) fn transport_hint(user_config: &serde_json::Value) -> Option<String> 
 }
 
 /// Detects whether the host's OS matches the manifest's declared platforms.
+///
+/// Every OS the catalog can name is named here. A mobile host used to match any
+/// manifest, which let an engine that cannot run there — a managed CLI needs a
+/// sandbox mechanism iOS and Android do not offer — report a successful deploy;
+/// engines that do run on a phone declare `ios`/`android` themselves.
 pub(crate) fn host_os_supported(platforms: &[crate::services::manifest::TargetOs]) -> bool {
     use crate::services::manifest::TargetOs;
     let host = if cfg!(target_os = "linux") {
@@ -3038,8 +3043,12 @@ pub(crate) fn host_os_supported(platforms: &[crate::services::manifest::TargetOs
         TargetOs::Macos
     } else if cfg!(target_os = "windows") {
         TargetOs::Windows
+    } else if cfg!(target_os = "ios") {
+        TargetOs::Ios
+    } else if cfg!(target_os = "android") {
+        TargetOs::Android
     } else {
-        return true;
+        return false;
     };
     platforms.iter().any(|p| *p == host)
 }

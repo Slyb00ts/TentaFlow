@@ -33,6 +33,7 @@ pub mod model_metrics;
 pub mod pii;
 pub mod profiling;
 pub mod project_studio;
+pub mod provider_account;
 pub mod storage;
 pub mod stream;
 pub mod tentanas;

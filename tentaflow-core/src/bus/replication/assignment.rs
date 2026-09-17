@@ -559,8 +559,7 @@ mod tests {
         // 3. A replica that never saw the topic materializes it from that op —
         //    with the policy columns intact, which is the point: the
         //    replication layer must not have to invent any of them.
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[11u8; 32]));
-        let rows = crate::sync::core_materializer::apply_core_operation(&receiver, &cipher, &op)
+        let rows = crate::sync::core_materializer::apply_core_operation(&receiver, &op)
             .expect("materialize");
         assert_eq!(rows, 1);
         let fetched =
@@ -590,7 +589,7 @@ mod tests {
             delete_op.body.action,
             crate::sync::ledger::ActionType::Delete
         );
-        crate::sync::core_materializer::apply_core_operation(&receiver, &cipher, &delete_op)
+        crate::sync::core_materializer::apply_core_operation(&receiver, &delete_op)
             .expect("materialize delete");
         assert!(
             crate::db::repository::bus_topic_get(&receiver, "tentabus-00000001", org, name)
@@ -655,8 +654,7 @@ mod tests {
         // Re-applying the SAME op (the shape of a peer relaying the
         // author's op back) is an idempotent no-op: the outer HLC-LWW gate
         // sees an HLC it already stamped and rejects before the row gate.
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[11u8; 32]));
-        let rows = crate::sync::core_materializer::apply_core_operation(&pool, &cipher, &op)
+        let rows = crate::sync::core_materializer::apply_core_operation(&pool, &op)
             .expect("materialize (idempotent re-apply)");
         assert_eq!(
             rows, 0,

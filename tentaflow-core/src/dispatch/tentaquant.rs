@@ -4216,7 +4216,11 @@ mod tests {
         let handler = find_stream_handler("TentaQuantRunSubscribeRequest")
             .expect("the subscribe handler is registered");
         let registry = SubscriptionRegistry::new();
-        let (sub, mut rx) = registry.create_with_capacity(1, None, 8);
+        let (sub, mut rx) = registry.create_with_capacity(
+            crate::dispatch::subscription::SubscriptionKey::new(0, 1),
+            None,
+            8,
+        );
         (handler.handler_fn)(
             tq(P::RunSubscribeRequest {
                 instance_id: lab_id.to_string(),

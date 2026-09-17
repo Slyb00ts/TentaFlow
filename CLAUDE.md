@@ -188,8 +188,8 @@ Production: `pickup_required = true` + at least one `client_cert_fingerprints` (
 `[server.tls]` (optional) — `extra_sans = [...]` added to the per-installation HTTPS
 certificate (`api/tls_identity.rs`): generated with rcgen into `<data>/tls/{cert,key}.pem`
 (EC P-256, CN = hostname, SANs = localhost + hostname + every local IP + extras), regenerated
-when a desired SAN is missing from the stored cert, `certs/cert.pem` embedded only as the
-fallback when `<data>/tls` is unusable. `/v1/models` reports `supports_embeddings` and
+when a desired SAN is missing from the stored cert; when `<data>/tls` is unusable the node
+serves an in-memory certificate generated for that process only. `/v1/models` reports `supports_embeddings` and
 `supports_structured_output` per entry (the latter is true only for a LOCAL HTTP-transport
 chat service — embedded, QUIC, mesh-forwarded and flow paths drop `response_format`).
 `ChatCompletionRequest.extra` / `ResponseFormat.{json_schema,extra}` pass unknown vendor

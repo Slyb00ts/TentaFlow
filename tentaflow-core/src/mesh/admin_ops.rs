@@ -734,10 +734,14 @@ pub async fn confirm_pairing(
         ));
     }
 
+    // Rate limit check for manual admin confirmation. Pipeline also checks at
+    // the transport level (by peer_id) for incoming requests; this adds a second
+    // line of defense for the admin UI and is keyed on the local node_id (not
+    // rotatable at this interface).
     if !security.check_pin_rate_limit(remote_node_id) {
         return Err(AdminError::new(
             AdminErrorKind::RateLimited,
-            "too many attempts — wait 60 seconds",
+            "too many attempts — wait before retrying",
         ));
     }
 
@@ -751,8 +755,7 @@ pub async fn confirm_pairing(
         .ok_or_else(|| AdminError::new(AdminErrorKind::BadPin, "no pending pairing"))?;
 
     let provided = pin.unwrap_or("");
-    // CR-006: constant-time compare — counter for the rate limiter is bumped
-    // by check_pin_rate_limit above (single source of truth in security.rs).
+    // CR-006: constant-time compare — counter is managed by check_pin_rate_limit.
     if !pin_eq(provided, &expected) {
         return Err(AdminError::new(AdminErrorKind::BadPin, "invalid PIN"));
     }
@@ -951,9 +954,17 @@ pub fn revoke_trust(
 
     if let Some(ref qm) = quic_mesh {
         let _ = local_node_id;
+        // Recorded before the broadcast so the revocation holds even when the
+        // async delivery below never completes; the key stays in memory until
+        // the task drops it, so the notification can still be signed and sent.
+        let revoked_at = security.record_revocation(node_id).map_err(|e| {
+            error!(target_node = %node_id, "security.record_revocation failed: {}", e);
+            AdminError::new(AdminErrorKind::Internal, "internal mesh error")
+        })?;
         let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
             revoked_node_id: node_id.to_string(),
             from_node_id: security.ed25519_public_key_hex(),
+            revoked_at: Some(revoked_at),
         };
         let qm = qm.clone();
         let sec = security.clone();
@@ -1002,8 +1013,8 @@ pub fn revoke_trust(
         });
     } else {
         security.mark_revoking(node_id);
-        security.unpair(node_id).map_err(|e| {
-            error!(target_node = %node_id, "security.unpair failed: {}", e);
+        security.revoke_trust(node_id, None).map_err(|e| {
+            error!(target_node = %node_id, "security.revoke_trust failed: {}", e);
             AdminError::new(AdminErrorKind::Internal, "internal mesh error")
         })?;
         crate::mesh::robot_dispatch::global().remove_node(node_id);
@@ -1046,15 +1057,17 @@ mod baseline_adopt_admin_tests {
     }
 
     /// Buduje MeshSecurity z jednym zaufanym peerem `donor` (valid Ed25519 key
-    /// pozyczony z drugiej, niezależnej tożsamości).
-    fn security_with_trusted_donor(db: &DbPool, donor: &str) -> Arc<MeshSecurity> {
+    /// pozyczony z drugiej, niezależnej tożsamości). Zwraca takze node_id
+    /// donora — node_id to pierwsze 64 znaki hex klucza (VULN-M5).
+    fn security_with_trusted_donor(db: &DbPool) -> (Arc<MeshSecurity>, String) {
         let security = Arc::new(MeshSecurity::new(db.clone(), test_cipher()).unwrap());
         let other_db = setup_test_db();
         let other = MeshSecurity::new(other_db, test_cipher()).unwrap();
+        let donor = other.public_key_hex()[..64].to_string();
         security
-            .add_trusted_key(donor, &other.public_key_hex(), "donor-host", None)
+            .add_trusted_key(&donor, &other.public_key_hex(), "donor-host", None)
             .unwrap();
-        security
+        (security, donor)
     }
 
     #[test]
@@ -1071,8 +1084,8 @@ mod baseline_adopt_admin_tests {
     #[test]
     fn rejects_self_as_donor() {
         let db = setup_test_db();
-        let security = security_with_trusted_donor(&db, "local-node");
-        let err = admin_start_baseline_adopt(&db, &security, "local-node", "local-node", &None)
+        let (security, donor) = security_with_trusted_donor(&db);
+        let err = admin_start_baseline_adopt(&db, &security, &donor, &donor, &None)
             .expect_err("self donor must be rejected");
         assert!(matches!(err.kind, AdminErrorKind::BadRequest));
     }
@@ -1080,14 +1093,14 @@ mod baseline_adopt_admin_tests {
     #[test]
     fn starts_adopt_as_joiner_for_trusted_donor() {
         let db = setup_test_db();
-        let security = security_with_trusted_donor(&db, "donor-node");
-        let outcome = admin_start_baseline_adopt(&db, &security, "local-node", "donor-node", &None)
+        let (security, donor) = security_with_trusted_donor(&db);
+        let outcome = admin_start_baseline_adopt(&db, &security, "local-node", &donor, &None)
             .expect("trusted donor must start adopt");
         assert!(outcome.started);
 
         let state = load_adopt_state(&db).unwrap().expect("state persisted");
         assert_eq!(state.role, BaselineRole::Joiner);
-        assert_eq!(state.peer, "donor-node");
+        assert_eq!(state.peer, donor);
         assert_eq!(state.phase, BaselinePhase::Elected);
     }
 
@@ -1095,20 +1108,20 @@ mod baseline_adopt_admin_tests {
     fn second_start_with_different_donor_conflicts_single_flight() {
         let db = setup_test_db();
         let security = Arc::new(MeshSecurity::new(db.clone(), test_cipher()).unwrap());
-        let other_db = setup_test_db();
-        let other = MeshSecurity::new(other_db, test_cipher()).unwrap();
+        let other = MeshSecurity::new(setup_test_db(), test_cipher()).unwrap();
+        let donor_a = other.public_key_hex()[..64].to_string();
         security
-            .add_trusted_key("donor-a", &other.public_key_hex(), "a", None)
+            .add_trusted_key(&donor_a, &other.public_key_hex(), "a", None)
             .unwrap();
-        let other_db2 = setup_test_db();
-        let other2 = MeshSecurity::new(other_db2, test_cipher()).unwrap();
+        let other2 = MeshSecurity::new(setup_test_db(), test_cipher()).unwrap();
+        let donor_b = other2.public_key_hex()[..64].to_string();
         security
-            .add_trusted_key("donor-b", &other2.public_key_hex(), "b", None)
+            .add_trusted_key(&donor_b, &other2.public_key_hex(), "b", None)
             .unwrap();
 
-        admin_start_baseline_adopt(&db, &security, "local-node", "donor-a", &None)
+        admin_start_baseline_adopt(&db, &security, "local-node", &donor_a, &None)
             .expect("first start ok");
-        let err = admin_start_baseline_adopt(&db, &security, "local-node", "donor-b", &None)
+        let err = admin_start_baseline_adopt(&db, &security, "local-node", &donor_b, &None)
             .expect_err("second start with different donor must conflict");
         assert!(matches!(err.kind, AdminErrorKind::AlreadyPending));
     }

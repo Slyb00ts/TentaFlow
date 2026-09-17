@@ -481,10 +481,16 @@ pub fn get_or_create_api_key_pepper(
         use std::fmt::Write as _;
         let _ = write!(hex, "{:02x}", b);
     }
-    // Persist through the shared-secret path: encrypts with the local cipher AND
-    // emits a `core.shared_setting_secret` capture, so a genesis-node pepper also
-    // replicates to already-joined peers (joiners get it from the baseline).
-    set_shared_secret_setting_secure(pool, API_KEY_PEPPER_KEY, &hex, cipher, None)?;
+    // A pepper minted because none was found must lose to the pepper the fleet
+    // already uses, or a node that joins late would invalidate every issued API
+    // key. It is therefore versioned at the floor of the clock; the node id keeps
+    // the order total, so nodes that minted at the same time still converge.
+    let floor = crate::sync::ledger::HybridLogicalTimestamp {
+        wall_time_ms: 0,
+        logical: 0,
+        node_id: crate::sync::runtime::core_hlc_now().node_id,
+    };
+    store_shared_secret(pool, API_KEY_PEPPER_KEY, &hex, cipher, &floor)?;
     Ok(pepper.to_vec())
 }
 
@@ -775,7 +781,8 @@ fn record_api_key_full_row_capture_tx(tx: &rusqlite::Transaction<'_>, uid: &str)
 }
 
 /// Verifies an API key by its precomputed verifier and stamps `last_used_at` on
-/// a hit. Inactive keys are never returned.
+/// a hit. Inactive keys are never returned. Hash comparison is constant-time to
+/// prevent timing attacks.
 pub fn verify_api_key(pool: &DbPool, key_verifier: &str) -> Result<Option<DbApiKey>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
@@ -976,12 +983,75 @@ fn shared_secret_setting_fields(
     fields
 }
 
+/// A shared secret as it replicates between nodes: the decrypted value and the
+/// HLC of the write that produced it.
+pub struct SharedSecretVersion {
+    pub key: String,
+    pub value: String,
+    pub hlc: crate::sync::ledger::HybridLogicalTimestamp,
+}
+
+fn stamp_shared_secret_version_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    hlc: &crate::sync::ledger::HybridLogicalTimestamp,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO core_resource_versions (resource_type, resource_id, hlc_wall, hlc_logical, hlc_node) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+         hlc_wall = excluded.hlc_wall, hlc_logical = excluded.hlc_logical, hlc_node = excluded.hlc_node",
+        rusqlite::params![
+            crate::sync::core_registry::SHARED_SETTING_RESOURCE_TYPE,
+            key,
+            hlc.wall_time_ms,
+            hlc.logical as i64,
+            hlc.node_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn shared_secret_version_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> Result<Option<crate::sync::ledger::HybridLogicalTimestamp>> {
+    let version = tx
+        .query_row(
+            "SELECT hlc_wall, hlc_logical, hlc_node FROM core_resource_versions \
+             WHERE resource_type = ?1 AND resource_id = ?2",
+            rusqlite::params![crate::sync::core_registry::SHARED_SETTING_RESOURCE_TYPE, key],
+            |row| {
+                Ok(crate::sync::ledger::HybridLogicalTimestamp {
+                    wall_time_ms: row.get(0)?,
+                    logical: row.get::<_, i64>(1)? as u32,
+                    node_id: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(version)
+}
+
+/// Stores a fleet-wide secret locally and versions the write. The secret is NOT
+/// captured into the sync ledger: operation bodies are stored and relayed in
+/// plaintext. It reaches other nodes sealed per recipient over
+/// `SharedSecretsSync`, and the HLC stamped here decides which write wins there.
 pub fn set_shared_secret_setting_secure(
     pool: &DbPool,
     key: &str,
     value: &str,
     cipher: &crate::crypto::SettingsCipher,
-    actor_user_id: Option<&str>,
+) -> Result<()> {
+    store_shared_secret(pool, key, value, cipher, &crate::sync::runtime::core_hlc_now())
+}
+
+fn store_shared_secret(
+    pool: &DbPool,
+    key: &str,
+    value: &str,
+    cipher: &crate::crypto::SettingsCipher,
+    hlc: &crate::sync::ledger::HybridLogicalTimestamp,
 ) -> Result<()> {
     if !is_shared_secret_setting_key(key) {
         anyhow::bail!("setting nie jest syncowalnym sekretem: {}", key);
@@ -996,25 +1066,21 @@ pub fn set_shared_secret_setting_secure(
          ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
         rusqlite::params![key, encrypted],
     )?;
-    record_core_capture_tx(
-        &tx,
-        crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
-        key,
-        crate::sync::runtime::SqlWriteAction::Update,
-        shared_secret_setting_fields(key, value),
-        actor_user_id.map(|id| id.to_string()),
-    )?;
+    stamp_shared_secret_version_tx(&tx, key, hlc)?;
     tx.commit()?;
     Ok(())
 }
 
-pub fn enqueue_existing_shared_secret_settings(
+/// Every shared secret this node holds, decrypted, with its version. A secret
+/// stored before versions existed reports the zero HLC, so any versioned write
+/// elsewhere in the fleet wins over it.
+pub fn list_shared_secret_versions(
     pool: &DbPool,
     cipher: &crate::crypto::SettingsCipher,
-) -> Result<usize> {
+) -> Result<Vec<SharedSecretVersion>> {
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
-    let mut count = 0usize;
+    let mut secrets = Vec::new();
     for &key in SHARED_SECRET_SETTING_KEYS {
         let raw: Option<String> = tx
             .query_row(
@@ -1023,36 +1089,63 @@ pub fn enqueue_existing_shared_secret_settings(
                 |row| row.get(0),
             )
             .optional()?;
-        let Some(raw_value) = raw else {
+        let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
             continue;
         };
-        if raw_value.is_empty() {
-            continue;
-        }
-        let existing: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
-             WHERE resource_type = 'core.shared_setting_secret' AND resource_id = ?1",
-            rusqlite::params![key],
-            |row| row.get(0),
-        )?;
-        if existing > 0 {
-            continue;
-        }
-        let value = cipher
-            .decrypt(&raw_value)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        record_core_capture_tx(
-            &tx,
-            crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
-            key,
-            crate::sync::runtime::SqlWriteAction::Update,
-            shared_secret_setting_fields(key, &value),
-            None,
-        )?;
-        count += 1;
+        let value = cipher.decrypt(&raw).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let hlc = shared_secret_version_tx(&tx, key)?.unwrap_or_else(|| {
+            crate::sync::ledger::HybridLogicalTimestamp {
+                wall_time_ms: 0,
+                logical: 0,
+                node_id: String::new(),
+            }
+        });
+        secrets.push(SharedSecretVersion {
+            key: key.to_string(),
+            value,
+            hlc,
+        });
     }
+    Ok(secrets)
+}
+
+/// Adopts a secret received from a peer when it is strictly newer than the local
+/// one, re-encrypting it with this node's cipher. Returns whether it was adopted.
+pub fn adopt_shared_secret_version(
+    pool: &DbPool,
+    cipher: &crate::crypto::SettingsCipher,
+    secret: &SharedSecretVersion,
+) -> Result<bool> {
+    if !is_shared_secret_setting_key(&secret.key) {
+        anyhow::bail!("setting is not a shared secret: {}", secret.key);
+    }
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let held: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![secret.key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let holds_value = held.is_some_and(|raw| !raw.is_empty());
+    let local_version = shared_secret_version_tx(&tx, &secret.key)?;
+    // A version row without a value is left over from a ledger-era write that was
+    // since purged; it must not shadow the value a peer still holds.
+    if holds_value && local_version.is_some_and(|local| secret.hlc <= local) {
+        return Ok(false);
+    }
+    let encrypted = cipher
+        .encrypt(&secret.value)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+        rusqlite::params![secret.key, encrypted],
+    )?;
+    stamp_shared_secret_version_tx(&tx, &secret.key, &secret.hlc)?;
     tx.commit()?;
-    Ok(count)
+    Ok(true)
 }
 
 /// Usuwa ustawienie po kluczu (CR-016: jednorazowe tokeny SSO state)
@@ -4813,15 +4906,10 @@ fn compliance_processor_fields(
 /// repository writes, because peers materialize these operations through the same
 /// `apply_*` paths; the per-kind blocks below mirror those Insert field sets.
 ///
-/// Allowlisted shared-secret settings are included: the baseline reset clears the
-/// whole capture journal, so this reseed is the only path that re-emits them. The
-/// `cipher` decrypts each stored secret into the canonical shared-secret capture
-/// (the receiver re-encrypts per node). Each descriptor is reseeded exactly once,
-/// so no resource is duplicated.
-pub fn reseed_core_state_from_current_rows(
-    pool: &DbPool,
-    cipher: &crate::crypto::SettingsCipher,
-) -> Result<usize> {
+/// Shared-secret settings are never re-seeded: they stay out of the ledger and
+/// replicate sealed over `SharedSecretsSync`. Each descriptor is reseeded exactly
+/// once, so no resource is duplicated.
+pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
     use crate::sync::core_registry::{CoreSyncResourceKind as K, CORE_SYNC_DESCRIPTORS};
     use crate::sync::runtime::SqlWriteAction::{Insert, Update};
 
@@ -5318,6 +5406,7 @@ pub fn reseed_core_state_from_current_rows(
                         is_enabled: agent.is_enabled,
                         on_child_complete: &agent.on_child_complete,
                         allowed_agents_json: agent.allowed_agents_json.as_deref(),
+                        runtime_json: &agent.runtime_json,
                         actor_user_id: None,
                     };
                     record_core_capture_tx(
@@ -5508,44 +5597,8 @@ pub fn reseed_core_state_from_current_rows(
                 }
             }
             K::SharedSettingSecret => {
-                // Allowlisted external-credential secrets are stored encrypted in
-                // `settings`. The baseline reset wipes the whole capture journal,
-                // so this snapshot is the ONLY source that re-emits them — re-seed
-                // them here through the canonical shared-secret capture path
-                // (decrypted plaintext in the capture; the receiver re-encrypts
-                // per node). Matches the field shape of
-                // `set_shared_secret_setting_secure` / set/enqueue: Update action,
-                // `shared_secret_setting_fields`. Without this, a cutover would
-                // drop every stored secret from the outbox.
-                for &key in SHARED_SECRET_SETTING_KEYS {
-                    let raw: Option<String> = tx
-                        .query_row(
-                            "SELECT value FROM settings WHERE key = ?1",
-                            rusqlite::params![key],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    let Some(raw_value) = raw else {
-                        continue;
-                    };
-                    if raw_value.is_empty() {
-                        continue;
-                    }
-                    let value = cipher
-                        .decrypt(&raw_value)
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    record_core_capture_tx(
-                        &tx,
-                        descriptor.kind,
-                        key,
-                        Update,
-                        shared_secret_setting_fields(key, &value),
-                        None,
-                    )?;
-                    emitted += 1;
-                }
-                // Non-secret fleet config (plaintext, no decrypt) under the same
-                // resource kind. Disjoint keyspace from the secret allowlist.
+                // Only the non-secret fleet config is re-seeded. Secrets stay out of
+                // the capture journal: they replicate sealed over `SharedSecretsSync`.
                 for &key in SHARED_SETTING_KEYS {
                     let value: Option<String> = tx
                         .query_row(
@@ -6594,6 +6647,62 @@ pub fn reseed_core_state_from_current_rows(
                 drop(stmt);
                 for (cluster_id, node_id) in rows {
                     capture_cluster_member_tx(&tx, &cluster_id, &node_id)?;
+                    emitted += 1;
+                }
+            }
+            // Provider accounts delegate to `provider_accounts::sync_capture`,
+            // the same module the live writes use. A reseed must reproduce the
+            // exact capture shape peers materialize, and one implementation is
+            // the only way to keep that true as the registry grows.
+            K::ProviderAccount => {
+                let ids = collect_text_column(&tx, "SELECT account_id FROM provider_accounts")?;
+                for account_id in ids {
+                    crate::provider_accounts::sync_capture::capture_account(&tx, &account_id)?;
+                    emitted += 1;
+                }
+            }
+            K::ProviderAccountGrant => {
+                let mut stmt = tx.prepare(
+                    "SELECT account_id, subject_type, subject_id FROM provider_account_grants",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (account_id, subject_type, subject_id) in rows {
+                    crate::provider_accounts::sync_capture::capture_grant(
+                        &tx,
+                        &account_id,
+                        &subject_type,
+                        &subject_id,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::AgentRuntimeNode => {
+                let ids = collect_text_column(&tx, "SELECT node_id FROM agent_runtime_nodes")?;
+                for node_id in ids {
+                    crate::provider_accounts::sync_capture::capture_runtime_node(&tx, &node_id)?;
+                    emitted += 1;
+                }
+            }
+            K::AgentRuntimeEngine => {
+                let mut stmt =
+                    tx.prepare("SELECT node_id, engine_id FROM agent_runtime_engines")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (node_id, engine_id) in rows {
+                    crate::provider_accounts::sync_capture::capture_runtime_engine(
+                        &tx, &node_id, &engine_id,
+                    )?;
                     emitted += 1;
                 }
             }
@@ -8656,8 +8765,8 @@ pub const AGENT_RUN_STATES: &[&str] = &[
 
 const AGENT_COLS: &str = "id, name, display_name, description, system_prompt, model, tools_json, \
      skills_json, params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, \
-     flow_id, routable, is_enabled, on_child_complete, allowed_agents_json, created_at, \
-     updated_at";
+     flow_id, routable, is_enabled, on_child_complete, allowed_agents_json, runtime_json, \
+     created_at, updated_at";
 
 /// Admissible `agents.on_child_complete` values (mirrors the column CHECK).
 pub const AGENT_ON_CHILD_COMPLETE_VALUES: &[&str] = &["notify", "continue"];
@@ -8687,8 +8796,9 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgent> {
         is_enabled: row.get::<_, i64>(15)? != 0,
         on_child_complete: row.get(16)?,
         allowed_agents_json: row.get(17)?,
-        created_at: row.get(18)?,
-        updated_at: row.get(19)?,
+        runtime_json: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
 }
 
@@ -8767,6 +8877,11 @@ pub fn validate_agent_params(params: &AgentParams<'_>) -> Result<()> {
     if !prms.is_object() {
         return Err(anyhow::anyhow!("agent params_json must be a JSON object"));
     }
+    // Structural only: the enum values, the engine catalog and the rule that a
+    // binding names an account exactly when it can have one. Whether the named
+    // account exists needs the registry and belongs to the save handler
+    // (`agents::validate_agent_account_binding`), which has the org in hand.
+    crate::agents::AgentRuntime::parse(params.runtime_json)?;
     Ok(())
 }
 
@@ -8820,6 +8935,10 @@ fn agent_changed_fields(
         "on_child_complete".to_string(),
         field_string(params.on_child_complete),
     );
+    fields.insert(
+        "runtime_json".to_string(),
+        field_string(params.runtime_json),
+    );
     fields
 }
 
@@ -8841,6 +8960,41 @@ pub fn list_agents(pool: &DbPool, filter: &AgentListFilter) -> Result<Vec<DbAgen
         binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
     let rows = stmt
         .query_map(&bind_refs[..], row_to_agent)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The name and runtime of an agent, without the prompt, tool lists and model
+/// configuration a full row carries.
+#[derive(Debug, Clone)]
+pub struct CliAgentRow {
+    pub id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub runtime_json: String,
+}
+
+/// Every agent that runs a CLI engine rather than a model prompt loop.
+///
+/// The filter is on the column, not in Rust: the account screens ask this to
+/// answer "which agents break if I delete this account", and on an installation
+/// where every agent is an LLM agent that question must not read (and parse)
+/// the whole agents table.
+pub fn list_cli_agents(pool: &DbPool) -> Result<Vec<CliAgentRow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, display_name, runtime_json FROM agents \
+         WHERE runtime_json <> ?1 ORDER BY name, id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![crate::agents::LLM_RUNTIME_JSON], |row| {
+            Ok(CliAgentRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                display_name: row.get(2)?,
+                runtime_json: row.get(3)?,
+            })
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -8879,8 +9033,9 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
         "INSERT INTO agents \
          (id, name, display_name, description, system_prompt, model, tools_json, skills_json, \
           params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, flow_id, \
-          routable, is_enabled, on_child_complete, allowed_agents_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
+          routable, is_enabled, on_child_complete, allowed_agents_json, runtime_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
+          ?19) \
          ON CONFLICT(id) DO UPDATE SET \
          name = excluded.name, display_name = excluded.display_name, \
          description = excluded.description, system_prompt = excluded.system_prompt, \
@@ -8891,6 +9046,7 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
          flow_id = excluded.flow_id, routable = excluded.routable, \
          is_enabled = excluded.is_enabled, on_child_complete = excluded.on_child_complete, \
          allowed_agents_json = excluded.allowed_agents_json, \
+         runtime_json = excluded.runtime_json, \
          updated_at = datetime('now')",
         rusqlite::params![
             params.id,
@@ -8911,6 +9067,7 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
             params.is_enabled as i64,
             params.on_child_complete,
             params.allowed_agents_json,
+            params.runtime_json,
         ],
     )?;
     record_core_capture_tx(
@@ -9277,6 +9434,7 @@ mod agents_repository_tests {
 
     fn agent_params<'a>(id: &'a str, name: &'a str) -> AgentParams<'a> {
         AgentParams {
+            runtime_json: crate::agents::LLM_RUNTIME_JSON,
             id,
             name,
             display_name: Some("Research Agent"),
@@ -9454,6 +9612,18 @@ mod agents_repository_tests {
         bad = agent_params(&id, "ok-name");
         bad.max_spawn_depth = 0;
         assert!(upsert_agent(&db, &bad).is_err(), "spawn depth below 1");
+
+        // The runtime is validated on the WRITE path, not only where the wire
+        // is parsed: a row with an unreadable runtime would break every later
+        // read of that agent.
+        bad = agent_params(&id, "ok-name");
+        bad.runtime_json = r#"{"kind":"cli","engine":"nano-bot","account":{"mode":"user"}}"#;
+        assert!(upsert_agent(&db, &bad).is_err(), "unknown engine");
+        bad.runtime_json = r#"{"kind":"cli","engine":"codex","account":{"mode":"global"}}"#;
+        assert!(
+            upsert_agent(&db, &bad).is_err(),
+            "a global binding must name its account"
+        );
 
         assert!(
             get_agent(&db, &id).expect("get").is_none(),
@@ -12171,6 +12341,12 @@ pub fn delete_user_account(pool: &DbPool, id: &str) -> Result<()> {
         rusqlite::params![id],
     )?;
     if rows_affected > 0 {
+        // Provider accounts carry no FK to this table (migration 156 keeps
+        // own-feature FKs only, so a replicated row may name a user this node
+        // has not materialized), so the cascade a FK would have performed is
+        // run explicitly — inside THIS transaction, or an interrupted commit
+        // would leave a personal account, and its credential, owned by nobody.
+        crate::provider_accounts::repository::forget_user_tx(&tx, id, None)?;
         let mut fields = BTreeMap::new();
         fields.insert("id".to_string(), field_string(id));
         record_core_capture_tx(
@@ -12345,7 +12521,7 @@ const NAME_LOOKUP_CHUNK: usize = 500;
 
 /// Runs `sql_for(placeholders)` once per chunk of `ids` and feeds each row to
 /// `visit`. `sql_for` receives a ready `?1, ?2, …` list for the chunk.
-fn lookup_in_chunks<F, V>(
+pub(crate) fn lookup_in_chunks<F, V>(
     conn: &rusqlite::Connection,
     ids: &[String],
     sql_for: F,
@@ -12369,6 +12545,32 @@ where
         }
     }
     Ok(())
+}
+
+/// Batched `agent_id -> the name to show`, preferring `display_name`; unknown
+/// ids are absent. For lists that label rows by agent instead of reading a full
+/// agent record per row.
+pub fn lookup_agent_names(pool: &DbPool, ids: &[String]) -> Result<HashMap<String, String>> {
+    let conn = acquire(pool)?;
+    let mut out = HashMap::with_capacity(ids.len());
+    lookup_in_chunks(
+        &conn,
+        ids,
+        |placeholders| {
+            format!("SELECT id, name, display_name FROM agents WHERE id IN ({placeholders})")
+        },
+        |row| {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let display_name: Option<String> = row.get(2)?;
+            out.insert(
+                id,
+                display_name.filter(|name| !name.is_empty()).unwrap_or(name),
+            );
+            Ok(())
+        },
+    )?;
+    Ok(out)
 }
 
 /// Display data of a user for analytics rows (names resolved Core-side).
@@ -12645,6 +12847,10 @@ pub fn delete_group(pool: &DbPool, id: &str) -> Result<()> {
         rusqlite::params![id],
     )?;
     if rows_affected > 0 {
+        // Same reason as `delete_user_account`: an account grant naming a group
+        // that no longer exists would stay in the table as an access rule
+        // pointing at nothing.
+        crate::provider_accounts::repository::forget_grant_subject_tx(&tx, "group", id)?;
         let mut fields = BTreeMap::new();
         fields.insert("id".to_string(), field_string(id));
         record_core_capture_tx(
@@ -13955,10 +14161,17 @@ pub fn delete_sync_node(pool: &DbPool, node_id: &str) -> Result<()> {
              so its registry row cannot be deleted"
         );
     }
-    tx.execute(
+    let removed = tx.execute(
         "DELETE FROM sync_nodes WHERE node_id = ?1",
         rusqlite::params![node_id],
     )?;
+    if removed > 0 {
+        // The agent-runtime matrix and the accounts homed on this node have no
+        // FK to `sync_nodes` (migration 156), so a removed node would otherwise
+        // keep a row in the fleet view and stay the home node of accounts it can
+        // no longer refresh.
+        crate::provider_accounts::repository::forget_node_tx(&tx, node_id)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -14061,6 +14274,23 @@ pub fn ensure_trusted_nodes_in_sync_identity(pool: &DbPool) -> Result<usize> {
     Ok(changed)
 }
 
+/// Is `node_id` on this node's operator list?
+///
+/// The sync materializer asks the same question of an incoming registry
+/// operation; mesh commands and TentaVM writes ask it here. One column answers
+/// all of them, so a node cannot be an operator for one path and not another.
+pub fn node_is_operator(pool: &DbPool, node_id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let flag: Option<bool> = conn
+        .query_row(
+            "SELECT operator FROM sync_nodes WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(flag.unwrap_or(false))
+}
+
 /// Rejestruje lokalny node we własnym rejestrze tożsamości sync. Bez tego wpisu
 /// `ensure_local_target_allowed` odrzuca każdy przychodzący push (lokalny node nie
 /// jest widziany jako dozwolony target własnych zasobów). Wpis jest czysto lokalny
@@ -14096,6 +14326,7 @@ pub fn ensure_local_node_in_sync_identity(
     pool: &DbPool,
     node_id: &str,
     public_key: &str,
+    platform: &str,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     // Guarded so a boot that changes nothing writes nothing.
@@ -14113,10 +14344,44 @@ pub fn ensure_local_node_in_sync_identity(
     conn.execute(
         "INSERT OR IGNORE INTO sync_nodes \
          (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile, operator) \
-         VALUES (?1, ?2, 'ed25519', '', 'server', 'trusted', NULL, 'authority', 1)",
-        rusqlite::params![node_id, public_key],
+         VALUES (?1, ?2, 'ed25519', '', ?3, 'trusted', NULL, 'authority', 1)",
+        rusqlite::params![node_id, public_key, default_node_kind_for_platform(platform)],
     )?;
+    drop(conn);
+    fill_default_node_kind(pool, node_id, platform)?;
     Ok(())
+}
+
+/// The device kind a node gets when nobody has chosen one: a mobile OS is a
+/// phone, everything else is a server. An administrator's choice on the Mesh
+/// screen always wins — see `fill_default_node_kind`.
+pub fn default_node_kind_for_platform(platform: &str) -> &'static str {
+    match platform {
+        "ios" | "android" => "phone",
+        _ => "server",
+    }
+}
+
+/// Replaces a node kind nobody chose with the one its platform implies. The
+/// platform is what the node itself reports (`MeshHelloPayload.platform`, or
+/// `detect_platform()` for the local row), so every node derives the same
+/// answer without an operation crossing the mesh.
+///
+/// Only `unknown` counts as "nobody chose" — plus `server` on a mobile
+/// platform, because every local row used to be created as `server` and no
+/// administrator files a phone under that kind on purpose.
+pub fn fill_default_node_kind(pool: &DbPool, node_id: &str, platform: &str) -> Result<bool> {
+    if platform.is_empty() {
+        return Ok(false);
+    }
+    let kind = default_node_kind_for_platform(platform);
+    let conn = acquire(pool)?;
+    let updated = conn.execute(
+        "UPDATE sync_nodes SET node_kind = ?2 \
+         WHERE node_id = ?1 AND (node_kind = 'unknown' OR (?2 = 'phone' AND node_kind = 'server'))",
+        rusqlite::params![node_id, kind],
+    )?;
+    Ok(updated > 0)
 }
 
 // =============================================================================
@@ -15716,12 +15981,21 @@ pub fn create_default_addon_resource_limits(pool: &DbPool, addon_id: &str) -> Re
 // Revoked nodes — cofniete zaufanie z persistencja
 // =============================================================================
 
-/// Dodaje node do listy revoked
-pub fn add_revoked_node(pool: &DbPool, node_id: &str, revoked_by: Option<&str>) -> Result<()> {
+/// Dodaje node do listy revoked. `revoked_at` is the fleet-wide revocation
+/// time (UTC `%Y-%m-%d %H:%M:%S`); a repeated revocation moves it forward.
+pub fn add_revoked_node(
+    pool: &DbPool,
+    node_id: &str,
+    revoked_by: Option<&str>,
+    revoked_at: &str,
+) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
-        "INSERT OR IGNORE INTO revoked_nodes (node_id, revoked_by) VALUES (?1, ?2)",
-        rusqlite::params![node_id, revoked_by],
+        "INSERT INTO revoked_nodes (node_id, revoked_by, revoked_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(node_id) DO UPDATE SET \
+             revoked_by = excluded.revoked_by, \
+             revoked_at = MAX(revoked_at, excluded.revoked_at)",
+        rusqlite::params![node_id, revoked_by, revoked_at],
     )?;
     Ok(())
 }
@@ -15747,15 +16021,29 @@ pub fn remove_revoked_node(pool: &DbPool, node_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Lista wszystkich revoked nodow
-pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<String>> {
+/// Lista wszystkich revoked nodow jako `(node_id, revoked_at)`.
+pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<(String, String)>> {
     let conn = acquire(pool)?;
-    let mut stmt =
-        conn.prepare_cached("SELECT node_id FROM revoked_nodes ORDER BY revoked_at DESC")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, revoked_at FROM revoked_nodes ORDER BY revoked_at DESC",
+    )?;
     let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// `approved_at` of an active trusted node — the timestamp a revocation is
+/// ordered against.
+pub fn get_trusted_node_approved_at(pool: &DbPool, node_id: &str) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    conn.query_row(
+        "SELECT approved_at FROM trusted_nodes WHERE node_id = ?1 AND is_active = 1",
+        rusqlite::params![node_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 // =============================================================================
@@ -26158,8 +26446,7 @@ mod chunk_c_visibility_consumer_tests {
             .expect("plain row");
         }
 
-        let cipher = crate::crypto::SettingsCipher::new(&[0u8; 32]);
-        reseed_core_state_from_current_rows(&db, &cipher).expect("reseed");
+        reseed_core_state_from_current_rows(&db).expect("reseed");
 
         let conn = db.read().expect("lock");
         for (node_id, expected) in [("node-op", true), ("node-plain", false)] {
@@ -26193,7 +26480,7 @@ mod chunk_c_visibility_consumer_tests {
     #[test]
     fn the_local_node_bootstraps_the_operator_list_once() {
         let db = make_db();
-        ensure_local_node_in_sync_identity(&db, "node-local", "pk").expect("first boot");
+        ensure_local_node_in_sync_identity(&db, "node-local", "pk", "linux").expect("first boot");
         assert_eq!(operator_node_ids(&db), vec!["node-local".to_string()]);
         assert_eq!(
             get_setting(&db, LOCAL_NODE_ID_SETTING).expect("setting"),
@@ -26236,12 +26523,69 @@ mod chunk_c_visibility_consumer_tests {
             None,
         )
         .expect("demote");
-        ensure_local_node_in_sync_identity(&db, "node-local", "pk").expect("second boot");
+        ensure_local_node_in_sync_identity(&db, "node-local", "pk", "linux").expect("second boot");
         assert_eq!(
             operator_node_ids(&db),
             vec!["node-peer".to_string()],
             "boot must not undo the administrator's decision"
         );
+    }
+
+    fn node_kind_of(db: &DbPool, node_id: &str) -> String {
+        let conn = db.read().expect("lock");
+        conn.query_row(
+            "SELECT node_kind FROM sync_nodes WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |row| row.get(0),
+        )
+        .expect("node row")
+    }
+
+    /// Nobody should have to tell the mesh that a phone is a phone: the kind
+    /// follows the platform a node reports, and everything else is a server.
+    #[test]
+    fn an_unchosen_node_kind_follows_the_reported_platform() {
+        let db = make_db();
+        ensure_local_node_in_sync_identity(&db, "node-phone", "pk", "ios").expect("boot");
+        assert_eq!(node_kind_of(&db, "node-phone"), "phone");
+
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, node_kind) VALUES \
+                 ('peer-android', 'pk', 'unknown'), ('peer-linux', 'pk', 'unknown'), \
+                 ('peer-legacy-phone', 'pk', 'server'), ('peer-silent', 'pk', 'unknown')",
+                [],
+            )
+            .expect("seed peers");
+        }
+        assert!(fill_default_node_kind(&db, "peer-android", "android").expect("fill"));
+        assert!(fill_default_node_kind(&db, "peer-linux", "linux").expect("fill"));
+        assert!(fill_default_node_kind(&db, "peer-legacy-phone", "ios").expect("fill"));
+        assert!(!fill_default_node_kind(&db, "peer-silent", "").expect("fill"));
+        assert_eq!(node_kind_of(&db, "peer-android"), "phone");
+        assert_eq!(node_kind_of(&db, "peer-linux"), "server");
+        assert_eq!(node_kind_of(&db, "peer-legacy-phone"), "phone");
+        assert_eq!(node_kind_of(&db, "peer-silent"), "unknown");
+    }
+
+    /// The default only fills a kind nobody chose; the Mesh screen's choice stays.
+    #[test]
+    fn a_chosen_node_kind_is_not_replaced_by_the_platform_default() {
+        let db = make_db();
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, node_kind) VALUES \
+                 ('peer-tablet', 'pk', 'tablet'), ('peer-laptop', 'pk', 'laptop')",
+                [],
+            )
+            .expect("seed peers");
+        }
+        assert!(!fill_default_node_kind(&db, "peer-tablet", "ios").expect("fill"));
+        assert!(!fill_default_node_kind(&db, "peer-laptop", "macos").expect("fill"));
+        assert_eq!(node_kind_of(&db, "peer-tablet"), "tablet");
+        assert_eq!(node_kind_of(&db, "peer-laptop"), "laptop");
     }
 
     #[test]
@@ -26769,8 +27113,7 @@ mod chunk_c_visibility_consumer_tests {
             )
             .unwrap();
         }
-        let cipher = crate::crypto::SettingsCipher::new(&[0u8; 32]);
-        reseed_core_state_from_current_rows(&db, &cipher).expect("reseed");
+        reseed_core_state_from_current_rows(&db).expect("reseed");
 
         let conn = db.read().unwrap();
         let resource_id = |resource_type: &str| -> String {
@@ -31753,9 +32096,8 @@ mod bus_repository_tests {
             "bus_assignment_upsert must not itself mint a capture"
         );
 
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[11u8; 32]));
         let emitted =
-            reseed_core_state_from_current_rows(&author, &cipher).expect("reseed must not hang");
+            reseed_core_state_from_current_rows(&author).expect("reseed must not hang");
         assert!(
             emitted >= 2,
             "reseed must publish both the topic and the assignment"

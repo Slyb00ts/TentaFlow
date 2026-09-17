@@ -1,0 +1,66 @@
+- generic [ref=f1e2]:
+  - generic [ref=f1e3]:
+    - generic [ref=f1e4]: G01
+    - 'heading "Agents → edycja agenta: silnik i konto" [level=2] [ref=f1e5]'
+    - generic [ref=f1e6]: "Agent działa na modelu LLM albo przez aplikację CLI. Dla CLI admin wybiera: konkretne konto globalne albo konto użytkownika prowadzącego sesję."
+  - generic [ref=f1e8]:
+    - generic [ref=f1e9]:
+      - heading "code-implementer" [level=1] [ref=f1e10]
+      - generic [ref=f1e11]: agent
+      - button "Anuluj" [ref=f1e12] [cursor=pointer]
+      - button "Zapisz" [ref=f1e13] [cursor=pointer]
+    - generic [ref=f1e14]:
+      - generic [ref=f1e15] [cursor=pointer]: Podstawowe
+      - generic [ref=f1e16] [cursor=pointer]: Narzędzia
+      - generic [ref=f1e17] [cursor=pointer]: Skille
+      - generic [ref=f1e18] [cursor=pointer]: Podagenci
+      - generic [ref=f1e19] [cursor=pointer]: Przebiegi
+    - generic [ref=f1e20]:
+      - heading "Silnik agenta" [level=3] [ref=f1e21]
+      - generic [ref=f1e22]:
+        - generic [ref=f1e23]: Sposób działania
+        - generic [ref=f1e24]:
+          - button "Model LLM" [ref=f1e25] [cursor=pointer]
+          - button "Aplikacja CLI" [ref=f1e26] [cursor=pointer]
+      - generic [ref=f1e27]:
+        - generic [ref=f1e28]: Aplikacja
+        - combobox [ref=f1e29]:
+          - option "Claude Code" [selected]
+          - option "Codex"
+          - option "Grok Build"
+          - option "Muse Code"
+      - generic [ref=f1e30]:
+        - generic [ref=f1e31]:
+          - text: Model
+          - generic [ref=f1e32]: lista z wybranej aplikacji
+        - combobox [ref=f1e33]:
+          - option "claude-opus-5" [selected]
+          - option "claude-sonnet-5"
+      - generic [ref=f1e34]:
+        - generic [ref=f1e35]: Konto
+        - generic [ref=f1e36]:
+          - generic [ref=f1e37]:
+            - generic [ref=f1e38]:
+              - heading "Konto globalne" [level=4] [ref=f1e39]:
+                - generic [ref=f1e40] [cursor=pointer]
+                - text: Konto globalne
+              - paragraph [ref=f1e41]: Zawsze to samo, wskazane konto organizacji — niezależnie od tego, kto prowadzi sesję.
+              - combobox [disabled] [ref=f1e42]:
+                - option "Claude Code — firma (zespol@euvic.pl)" [selected]
+                - option "Claude Code — klucz API (CI)"
+            - generic [ref=f1e43]:
+              - heading "Konto użytkownika" [level=4] [ref=f1e44]:
+                - generic [ref=f1e45] [cursor=pointer]
+                - text: Konto użytkownika
+              - paragraph [ref=f1e46]: Zawsze konto Claude Code tej osoby, która prowadzi sesję Code Studio. Podagenci dziedziczą tę osobę. Brak konta = prośba o połączenie (C01), nigdy konto globalne.
+          - generic [ref=f1e47]: Przy „Konto globalne” lista pokazuje tylko konta globalne wybranej aplikacji. Użytkownik uruchamiający agenta musi mieć do tego konta dostęp (A04).
+    - generic [ref=f1e48]:
+      - heading "Pozostałe" [level=3] [ref=f1e49]
+      - generic [ref=f1e50]:
+        - generic [ref=f1e51]: Prompt systemowy
+        - textbox [ref=f1e52]: Implementujesz jedno zadanie w worktree sesji…
+      - generic [ref=f1e53]:
+        - generic [ref=f1e54]: Budżet tokenów / timeout
+        - generic [ref=f1e55]:
+          - textbox [ref=f1e56]: 1 000 000
+          - textbox [ref=f1e57]: 1800 s

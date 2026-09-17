@@ -1832,6 +1832,7 @@ mod tests {
         repository::upsert_agent(
             pool,
             &AgentParams {
+                runtime_json: crate::agents::LLM_RUNTIME_JSON,
                 id,
                 name,
                 display_name: None,
@@ -1869,6 +1870,7 @@ mod tests {
         repository::upsert_agent(
             pool,
             &AgentParams {
+                runtime_json: crate::agents::LLM_RUNTIME_JSON,
                 id,
                 name,
                 display_name: None,

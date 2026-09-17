@@ -598,41 +598,22 @@ async fn pump(
         for event in bridge.poll(pool, instance).await? {
             ordinal += 1;
             pumped.reported.observe(&event);
+            if let Some(text) = cli_bridge::event_text(&event) {
+                let text = redact::redact_text(&text);
+                push_bounded(&mut pumped.transcript, &text);
+                append_message(pool, instance, &text, ordinal);
+            }
+            if let Some(state) = cli_bridge::turn_state(&event) {
+                tracing::debug!(
+                    instance = %instance.id,
+                    "delegate_cli: the vendor announced the end of the turn"
+                );
+                pumped.state = Some(state);
+            }
             match &event {
-                BridgeEvent::Text { text, .. } => {
-                    let text = redact::redact_text(text);
-                    push_bounded(&mut pumped.transcript, &text);
-                    append_message(pool, instance, &text, ordinal);
-                }
-                BridgeEvent::Notification { method, params, .. } => {
-                    if let Some(text) = notification_text(method, params) {
-                        let text = redact::redact_text(&text);
-                        push_bounded(&mut pumped.transcript, &text);
-                        append_message(pool, instance, &text, ordinal);
-                    }
-                    if let Some(state) = cli_bridge::turn_state(&event) {
-                        tracing::debug!(
-                            instance = %instance.id,
-                            method = %method,
-                            "delegate_cli: the vendor announced the end of the turn"
-                        );
-                        pumped.state = Some(state);
-                    }
-                }
-                BridgeEvent::StreamObject { object, .. } => {
-                    if let Some(text) = stream_object_text(object) {
-                        let text = redact::redact_text(&text);
-                        push_bounded(&mut pumped.transcript, &text);
-                        append_message(pool, instance, &text, ordinal);
-                    }
-                    if let Some(state) = cli_bridge::turn_state(&event) {
-                        tracing::debug!(
-                            instance = %instance.id,
-                            "delegate_cli: the vendor announced the end of the turn"
-                        );
-                        pumped.state = Some(state);
-                    }
-                }
+                BridgeEvent::Text { .. }
+                | BridgeEvent::Notification { .. }
+                | BridgeEvent::StreamObject { .. } => {}
                 BridgeEvent::Approval { request, .. } => {
                     pumped.approvals += 1;
                     let outcome = cli_bridge::resolve_approval(approvals, request).await;
@@ -702,70 +683,6 @@ fn push_bounded(transcript: &mut String, text: &str) {
         return;
     }
     transcript.extend(text.chars().take(MAX_TRANSCRIPT_CHARS - used));
-}
-
-/// The human-readable half of a vendor notification, when it has one. A frame
-/// that carries no text is a control frame; putting its JSON on the timeline
-/// would be noise nobody reads.
-/// What one object of Claude Code's `stream-json` output contributes to the
-/// transcript: the text blocks of an assistant message, and nothing else. The
-/// closing `result` object repeats the last assistant text, so taking it too
-/// would put every answer in the transcript twice; its outcome is read by
-/// `cli_bridge::turn_state` and lands in the run's status instead.
-fn stream_object_text(object: &Value) -> Option<String> {
-    if object.get("type").and_then(Value::as_str) != Some("assistant") {
-        return None;
-    }
-    let blocks = object.pointer("/message/content")?.as_array()?;
-    let text = blocks
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!text.is_empty()).then_some(text)
-}
-
-fn notification_text(method: &str, params: &Value) -> Option<String> {
-    if method.starts_with("muse/") {
-        return (method == "muse/item/completed"
-            && params.pointer("/item/kind").and_then(Value::as_str) == Some("agentMessage"))
-        .then(|| {
-            params
-                .pointer("/item/text")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-        })
-        .flatten();
-    }
-    if method.starts_with("grok/") {
-        if method != "grok/session/update"
-            || params
-                .pointer("/update/sessionUpdate")
-                .and_then(Value::as_str)
-                != Some("agent_message_chunk")
-            || params
-                .pointer("/update/content/type")
-                .and_then(Value::as_str)
-                != Some("text")
-        {
-            return None;
-        }
-        return params
-            .pointer("/update/content/text")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-    }
-    for field in ["text", "message", "delta", "content"] {
-        if let Some(text) = params.get(field).and_then(Value::as_str) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        }
-    }
-    None
 }
 
 fn append_message(pool: &DbPool, instance: &CliInstance, text: &str, ordinal: u64) {
@@ -1670,24 +1587,6 @@ pub fn known_engines() -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn grok_text_only_contains_assistant_message_chunks() {
-        let text = serde_json::json!({"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}});
-        assert_eq!(
-            super::notification_text("grok/session/update", &text),
-            Some("answer".into())
-        );
-        let thought = serde_json::json!({"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"internal"}}});
-        assert_eq!(
-            super::notification_text("grok/session/update", &thought),
-            None
-        );
-        assert_eq!(
-            super::notification_text("grok/session/prompt_result", &text),
-            None
-        );
-    }
-
     use super::*;
     use crate::code_studio::models::{AutonomyMode, WorkspaceRole};
     use crate::code_studio::{paths as cs_paths, workspace_db};

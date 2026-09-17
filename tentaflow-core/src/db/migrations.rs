@@ -174,6 +174,14 @@ pub fn run(conn: &Connection) -> Result<()> {
     let crossing_env_partition_format =
         current_version > 0 && current_version < ENV_PARTITION_FORMAT_VERSION;
 
+    // The baseline reset rebuilds the ledger from current rows, which drops the
+    // operation bodies that carried fleet secrets in plaintext. It costs a new
+    // epoch and a fleet-wide reconcile, so only nodes whose ledger can hold such
+    // a body pay for it.
+    let crossing_ledger_secret_purge = current_version > 0
+        && current_version < LEDGER_SECRET_PURGE_VERSION
+        && ledger_may_hold_shared_secrets(conn)?;
+
     for (version, name, step) in get_migrations() {
         if version > current_version {
             info!("Migracja {}: {}", version, name);
@@ -206,7 +214,7 @@ pub fn run(conn: &Connection) -> Result<()> {
         }
     }
 
-    if crossing_identity_flip {
+    if crossing_identity_flip || crossing_ledger_secret_purge {
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
             rusqlite::params![CORE_BASELINE_RESET_PENDING_KEY],
@@ -226,6 +234,10 @@ pub fn run(conn: &Connection) -> Result<()> {
 /// Migration version of the INTEGER→UUID core identity flip. Crossing it arms
 /// the one-shot Sync Ledger baseline reset.
 pub const CORE_IDENTITY_FLIP_VERSION: i64 = 56;
+
+/// Migration version from which fleet secrets no longer live in the sync ledger.
+/// Crossing it on a node whose ledger may hold one arms the baseline reset.
+pub const LEDGER_SECRET_PURGE_VERSION: i64 = 158;
 
 /// `settings` key holding the one-shot "baseline reset pending after cutover"
 /// flag. Written by `run` when v56 is crossed, consumed (and cleared) by the
@@ -966,8 +978,211 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "single_code_harness_flow",
             MigrationStep::Rust(keep_only_the_pinned_code_harness),
         ),
+        (
+            156,
+            "provider_accounts",
+            MigrationStep::Sql(PROVIDER_ACCOUNTS),
+        ),
+        (
+            157,
+            "operators_from_direct_pairing",
+            MigrationStep::Sql(OPERATORS_FROM_DIRECT_PAIRING),
+        ),
+        (
+            LEDGER_SECRET_PURGE_VERSION,
+            "purge_shared_secrets_from_sync_journal",
+            MigrationStep::Rust(purge_shared_secrets_from_sync_journal),
+        ),
     ]
 }
+
+/// Fleet secrets (`hf_token`, `ngc_api_key`, `api_key_pepper`) used to replicate
+/// through the sync ledger, which kept their plaintext in the capture journal and
+/// in ledger operation bodies. This removes the journal rows while SQLite zeroes
+/// the freed pages. The ledger half is not reachable from a migration — it lives
+/// in Fjall — so `run` arms the baseline reset for it.
+///
+/// Pages freed by earlier deletes, database backups and support bundles taken
+/// before the upgrade still hold the values; only rotating the secrets fixes that.
+fn purge_shared_secrets_from_sync_journal(conn: &Connection) -> Result<()> {
+    let journal_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = '__tentaflow_core_sync_captures')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !journal_exists {
+        return Ok(());
+    }
+    let secure_delete: i64 = conn.query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
+    conn.query_row("PRAGMA secure_delete = ON", [], |_| Ok(()))?;
+    let deleted = conn.execute(
+        "DELETE FROM __tentaflow_core_sync_captures \
+         WHERE resource_type = 'core.shared_setting_secret' \
+           AND resource_id IN ('hf_token', 'ngc_api_key', 'api_key_pepper')",
+        [],
+    );
+    conn.query_row(&format!("PRAGMA secure_delete = {secure_delete}"), [], |_| Ok(()))?;
+    deleted?;
+    Ok(())
+}
+
+/// Whether a fleet secret ever went through the ledger on this node. Both minting
+/// and materializing a secret operation stamped `core_resource_versions`, so a
+/// row there means the local ledger may hold the plaintext body.
+fn ledger_may_hold_shared_secrets(conn: &Connection) -> Result<bool> {
+    let versions_exist: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'core_resource_versions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !versions_exist {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM core_resource_versions \
+         WHERE resource_type = 'core.shared_setting_secret' \
+           AND resource_id IN ('hf_token', 'ngc_api_key', 'api_key_pepper'))",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+// Mesh commands that change a node (deploys, containers, certificates) are
+// accepted only from operator nodes. A pairing an administrator confirmed makes
+// the peer an operator from now on; this gives fleets paired before that rule
+// the same result, so they keep managing each other after the upgrade. Trust
+// that arrived through `TrustedKeysSync` ('mesh-sync') was never confirmed by
+// anyone on this node and stays a plain peer until an administrator promotes it.
+const OPERATORS_FROM_DIRECT_PAIRING: &str = r#"
+UPDATE sync_nodes SET operator = 1
+WHERE operator = 0
+  AND node_id IN (
+      SELECT node_id FROM trusted_nodes
+      WHERE is_active = 1 AND approved_by <> 'mesh-sync'
+  );
+"#;
+
+// v156 — agent provider accounts (docs/agent-accounts-technical-design.md §A.1).
+//
+// An account stops being a `services` row. A `services` row is node-local and
+// never replicates, so an account written into one could only ever exist on one
+// node; these tables are org-scoped sync resources
+// (`sync/core_registry.rs`), which is what lets the same account run on every
+// node of the mesh.
+//
+// NO foreign key points at `user_accounts`, `organizations` or `sync_nodes`,
+// and the omission is deliberate — the same decision migration 125 took for
+// `code_workspaces`. A replicated row may name a user, an org or a node the
+// receiving node has not materialized yet, and an enforced FK would turn that
+// ordinary ordering into a refused write. The FKs that remain are the ones
+// INSIDE this feature, where both rows travel in one partition and the
+// materializer already orders a satellite after its account.
+//
+// `provider_account_node_state` is the one table here that must never be added
+// to the registry: `applied_revision` and `runtime_state` are what THIS node
+// measured about its own copy of a credential, so a replicated value would
+// claim a materialization that never happened locally.
+//
+// `agents.runtime_json` rides along because an agent is what NAMES an account:
+// `{"kind":"llm"}` (the historical agent, and the default every existing row
+// gets) or `{"kind":"cli","engine":…,"account":{"mode":"global"|"user",…}}`.
+// Precedent for the shape of the step: `agents_add_delegation_roster` (v132).
+const PROVIDER_ACCOUNTS: &str = r#"
+CREATE TABLE provider_accounts (
+    account_id      TEXT PRIMARY KEY,
+    org_id          TEXT NOT NULL,
+    engine_id       TEXT NOT NULL,
+    display_name    TEXT NOT NULL,
+    scope           TEXT NOT NULL CHECK(scope IN ('global','user')),
+    owner_user_id   TEXT NULL,
+    credential_kind TEXT NOT NULL CHECK(credential_kind IN ('api_key','provider_login')),
+    provider_subject TEXT NULL,
+    plan_label      TEXT NULL,
+    home_node_id    TEXT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                      CHECK(status IN ('pending','active','needs_login','disabled')),
+    created_by      TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    CHECK ((scope = 'user') = (owner_user_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX idx_provider_accounts_subject
+    ON provider_accounts(org_id, engine_id, provider_subject)
+    WHERE provider_subject IS NOT NULL;
+CREATE INDEX idx_provider_accounts_owner ON provider_accounts(owner_user_id, engine_id);
+
+CREATE TABLE provider_account_grants (
+    account_id   TEXT NOT NULL REFERENCES provider_accounts(account_id) ON DELETE CASCADE,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('user','group','org')),
+    subject_id   TEXT NOT NULL,
+    granted_by   TEXT NOT NULL,
+    granted_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (account_id, subject_type, subject_id)
+);
+CREATE INDEX idx_provider_account_grants_subject
+    ON provider_account_grants(subject_type, subject_id);
+
+CREATE TABLE provider_account_credentials (
+    account_id        TEXT PRIMARY KEY REFERENCES provider_accounts(account_id) ON DELETE CASCADE,
+    revision          INTEGER NOT NULL DEFAULT 1,
+    material_enc      TEXT NOT NULL,
+    material_sha256   TEXT NOT NULL,
+    provider_subject  TEXT NULL,
+    expires_at        TEXT NULL,
+    refreshed_at      TEXT NOT NULL,
+    refreshed_by_node TEXT NULL
+);
+
+CREATE TABLE provider_account_sessions (
+    account_id        TEXT NOT NULL REFERENCES provider_accounts(account_id) ON DELETE CASCADE,
+    session_id        TEXT NOT NULL,
+    user_id           TEXT NOT NULL,
+    agent_id          TEXT NULL,
+    workspace_id      TEXT NULL,
+    node_id           TEXT NOT NULL,
+    vendor_session_id TEXT NULL,
+    started_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    last_used_at      TEXT NULL,
+    PRIMARY KEY (account_id, session_id)
+);
+CREATE UNIQUE INDEX idx_provider_account_sessions_vendor
+    ON provider_account_sessions(account_id, user_id, agent_id, workspace_id)
+    WHERE vendor_session_id IS NOT NULL;
+CREATE INDEX idx_provider_account_sessions_user
+    ON provider_account_sessions(account_id, user_id);
+
+CREATE TABLE provider_account_node_state (
+    account_id       TEXT NOT NULL REFERENCES provider_accounts(account_id) ON DELETE CASCADE,
+    node_id          TEXT NOT NULL,
+    applied_revision INTEGER NOT NULL DEFAULT 0,
+    runtime_state    TEXT NOT NULL DEFAULT 'absent'
+                       CHECK(runtime_state IN ('absent','materializing','ready','error')),
+    last_error       TEXT NULL,
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (account_id, node_id)
+);
+
+CREATE TABLE agent_runtime_nodes (
+    node_id           TEXT PRIMARY KEY,
+    receives_accounts INTEGER NOT NULL DEFAULT 0 CHECK(receives_accounts IN (0,1)),
+    updated_by        TEXT NULL,
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE TABLE agent_runtime_engines (
+    node_id       TEXT NOT NULL REFERENCES agent_runtime_nodes(node_id) ON DELETE CASCADE,
+    engine_id     TEXT NOT NULL,
+    install_state TEXT NOT NULL CHECK(install_state IN ('absent','installing','installed','error')),
+    version       TEXT NULL,
+    installed_at  TEXT NULL,
+    last_error    TEXT NULL,
+    PRIMARY KEY (node_id, engine_id)
+);
+
+ALTER TABLE agents ADD COLUMN runtime_json TEXT NOT NULL DEFAULT '{"kind":"llm"}';
+"#;
 
 const CODING_AGENT_ACCOUNT_MOVES: &str = r#"
 CREATE TABLE coding_agent_account_moves (
@@ -4254,6 +4469,49 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "registration attribution, born TEXT in v144 (post-flip, never held an \
              INTEGER id); no declared user_accounts FK, same rationale as \
              bus_schema_subjects.created_by",
+        ),
+        // Agent provider accounts (v156). All five born TEXT, post-flip, and
+        // none carries a declared FK for the reason spelled out above
+        // `PROVIDER_ACCOUNTS`: these tables replicate, and a row may name a
+        // user or a node the receiving node has not materialized yet.
+        t(
+            "provider_accounts",
+            "owner_user_id",
+            "owner of a scope='user' account, NULL for a global one; born TEXT in \
+             v156, no declared user_accounts FK because the account replicates ahead \
+             of the account bookkeeping on a receiving node",
+        ),
+        t(
+            "provider_accounts",
+            "created_by",
+            "attribution of who added the account; an account must outlive the \
+             administrator who created it",
+        ),
+        t(
+            "provider_account_grants",
+            "subject_id",
+            "polymorphic user id | group id | '' for the whole organisation, \
+             discriminated by subject_type; born TEXT in v156, so it could never be a \
+             single-table FK",
+        ),
+        t(
+            "provider_account_grants",
+            "granted_by",
+            "attribution of who granted the access; the grant outlives the grantor's \
+             account, same rationale as vm_host_grants.granted_by",
+        ),
+        t(
+            "provider_account_sessions",
+            "user_id",
+            "whose session this is; born TEXT in v156, no user_accounts FK — the row \
+             is written on the node running the session, which may not hold the \
+             account row yet",
+        ),
+        t(
+            "agent_runtime_nodes",
+            "updated_by",
+            "attribution of the administrator who flipped 'receives accounts'; free \
+             text, born TEXT in v156, no user_accounts FK",
         ),
     ]
 }
@@ -11368,21 +11626,21 @@ mod tests {
                 name TEXT NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            INSERT INTO _migrations (version, name) VALUES (155, 'from_a_newer_build');",
+            INSERT INTO _migrations (version, name) VALUES (159, 'from_a_newer_build');",
         )
         .unwrap();
 
         let err =
             run(&conn).expect_err("a database ahead of this build's ladder head must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("155"), "{msg}");
-        assert!(msg.contains("head 154"), "{msg}");
+        assert!(msg.contains("159"), "{msg}");
+        assert!(msg.contains("head 158"), "{msg}");
     }
 
     /// The counterpart of the guard test above, and the reason 145/146 are
     /// `retired_migration` rather than renumbered-away: a database left at 146
     /// by a build that still carried the ORIGINAL 145/146 is NOT ahead of this
-    /// ladder (head 154), so the guard must let it through to be upgraded the
+    /// ladder (head 158), so the guard must let it through to be upgraded the
     /// rest of the way. Before the rungs were retired the head was 144 and the
     /// very same database was refused.
     #[test]
@@ -11411,12 +11669,12 @@ mod tests {
     #[test]
     fn a_database_exactly_at_this_builds_ladder_head_still_passes() {
         let conn = Connection::open_in_memory().unwrap();
-        run(&conn).expect("fresh install migrates cleanly to head 154");
-        run(&conn).expect("a database already at head 154 must still pass the guard");
+        run(&conn).expect("fresh install migrates cleanly to head 158");
+        run(&conn).expect("a database already at head 158 must still pass the guard");
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 155);
+        assert_eq!(head, 158);
     }
 
     #[test]
@@ -11448,7 +11706,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 155, "155 must be the highest applied migration");
+        assert_eq!(head, 158, "158 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -11456,7 +11714,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 155);
+        assert_eq!(head_again, 158);
     }
 
     /// v155 leaves the Flow Builder with the one harness Code Studio pins: the
@@ -11564,6 +11822,108 @@ mod tests {
         }
     }
 
+    /// v156 is additive: it creates the account registry and gives every agent
+    /// that already exists a runtime. The DEFAULT is what fills the rows an
+    /// upgraded install already has — an agent with an empty `runtime_json`
+    /// would fail to parse on the first read, so "no runtime" must be spelled
+    /// out as the LLM one at the column level and not by a later repair.
+    #[test]
+    fn migration_v156_registers_provider_accounts_and_gives_every_agent_a_runtime() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        for table in [
+            "provider_accounts",
+            "provider_account_grants",
+            "provider_account_credentials",
+            "provider_account_sessions",
+            "provider_account_node_state",
+            "agent_runtime_nodes",
+            "agent_runtime_engines",
+        ] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table} is missing after the ladder");
+        }
+
+        // An agent written by code that predates the column reads as an LLM
+        // agent, which is what every existing agent is.
+        conn.execute(
+            "INSERT INTO agents (id, name, description, tools_json, skills_json, params_json) \
+             VALUES ('a1', 'old', 'd', '[]', '{}', '{}')",
+            [],
+        )
+        .unwrap();
+        let runtime: String = conn
+            .query_row("SELECT runtime_json FROM agents WHERE id = 'a1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(runtime, r#"{"kind":"llm"}"#);
+
+        // Two accounts of one org may not claim the same provider identity for
+        // the same engine — that is one subscription, not two.
+        conn.execute(
+            "INSERT INTO provider_accounts \
+               (account_id, org_id, engine_id, display_name, scope, credential_kind, \
+                provider_subject, created_by) \
+             VALUES ('acc1', 'org-default', 'codex', 'A', 'global', 'api_key', 'a@b.c', 'admin')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO provider_accounts \
+                   (account_id, org_id, engine_id, display_name, scope, credential_kind, \
+                    provider_subject, created_by) \
+                 VALUES ('acc2', 'org-default', 'codex', 'B', 'global', 'api_key', 'a@b.c', 'admin')",
+                [],
+            )
+            .is_err(),
+            "the provider identity is unique per org and engine"
+        );
+        // A personal account without an owner, and a shared one with one, are
+        // both nonsense the column CHECK refuses.
+        for (scope, owner) in [("user", None), ("global", Some("u1"))] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO provider_accounts \
+                       (account_id, org_id, engine_id, display_name, scope, credential_kind, \
+                        owner_user_id, created_by) \
+                     VALUES ('acc3', 'org-default', 'codex', 'C', ?1, 'api_key', ?2, 'admin')",
+                    rusqlite::params![scope, owner],
+                )
+                .is_err(),
+                "scope '{scope}' with owner {owner:?} must be refused"
+            );
+        }
+
+        // Everything hanging off an account goes with it.
+        conn.execute(
+            "INSERT INTO provider_account_grants (account_id, subject_type, subject_id, granted_by) \
+             VALUES ('acc1', 'org', '', 'admin')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM provider_accounts WHERE account_id = 'acc1'",
+            [],
+        )
+        .unwrap();
+        let orphans: i64 = conn
+            .query_row("SELECT COUNT(*) FROM provider_account_grants", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
     /// `sync_nodes.operator` is the organization's authority list, so it is a
     /// two-valued column with a safe default: a row that arrives from an older
     /// peer, or a migration of an existing install, must read as "not an
@@ -11627,7 +11987,7 @@ mod tests {
         // authorizer rewrite and the instance-db handle that made them dead.
         // Their NUMBERS stay occupied by `retired_migration` so the rungs
         // above them keep the versions databases already recorded.
-        assert_eq!(*sorted.last().unwrap(), 155);
+        assert_eq!(*sorted.last().unwrap(), 158);
 
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();

@@ -88,15 +88,24 @@ struct Session {
     events: Arc<SyncMutex<Vec<Event>>>,
 }
 
+/// When the last sandbox probe ran and what it found: `None` for a working
+/// sandbox, `Some(reason)` for the message a deploy has to show.
+type SandboxProbeCache = Arc<SyncMutex<Option<(std::time::Instant, Option<String>)>>>;
+
 #[derive(Clone)]
 struct AppState {
     bridge_token: Arc<String>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     lease: Arc<Mutex<Option<String>>>,
     provider: Provider,
+    data_dir: PathBuf,
     state_file: PathBuf,
     probe_file: PathBuf,
     models_file: PathBuf,
+    /// The last real sandbox launch and when it ran. A deploy asks once, but the
+    /// dashboard and `account_move` ask repeatedly, and a spawn per poll is a
+    /// cost nobody asked for.
+    sandbox: SandboxProbeCache,
     probe: Arc<Mutex<ProbeCache>>,
     /// Serializes every probe. Held across the whole CLI interaction, so
     /// concurrent callers queue up and the second one finds the cache filled
@@ -345,7 +354,7 @@ struct ApprovalRequest {
 }
 
 fn main() -> Result<()> {
-    if let Some(code) = process_sandbox::maybe_run_supervisor() {
+    if let Some(code) = process_sandbox::maybe_run_sandbox_entrypoint() {
         std::process::exit(code);
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -411,9 +420,11 @@ async fn run() -> Result<()> {
                 .to_string(),
         ),
         provider,
+        data_dir: data_dir.clone(),
         state_file,
         probe_file,
         models_file,
+        sandbox: Arc::new(SyncMutex::new(None)),
         probe: Arc::new(Mutex::new(probe)),
         probe_lock: Arc::new(Mutex::new(())),
         sessions: Arc::new(Mutex::new(sessions)),
@@ -439,7 +450,7 @@ async fn run() -> Result<()> {
     }
     persist(&state).await?;
     let app = Router::new()
-        .route("/runtime/status", get(health))
+        .route("/runtime/status", get(runtime_status))
         .route("/runtime/shutdown", post(shutdown_runtime))
         .route("/auth/status", get(auth_status))
         .route("/auth/start", post(auth_start))
@@ -543,27 +554,54 @@ fn cli_environment(overrides: &[(String, String)]) -> Vec<(String, String)> {
     values.into_iter().collect()
 }
 
+/// A value the session was started with, otherwise the one this bridge runs on.
+fn configured(overrides: &[(String, String)], name: &str) -> Option<String> {
+    overrides
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.clone())
+        .or_else(|| env::var(name).ok())
+}
+
+/// Two possible egresses, one contract: the provider adapter of a ticketed run,
+/// otherwise the account's own proxy. Each is opened by Core, which also owns
+/// the transport carrying it into a sandbox without a route to the host, and
+/// names both to us here.
+fn sandbox_endpoint(overrides: &[(String, String)]) -> Result<process_sandbox::ProxyEndpoint> {
+    let (address, socket) = match configured(overrides, "TENTAFLOW_AGENT_ADAPTER_ADDR") {
+        Some(value) => (
+            value.parse().context("invalid agent adapter endpoint")?,
+            configured(overrides, "TENTAFLOW_AGENT_ADAPTER_SOCKET"),
+        ),
+        None => (
+            format!(
+                "127.0.0.1:{}",
+                env::var("TENTAFLOW_AGENT_PROXY_PORT").context("agent proxy port missing")?
+            )
+            .parse()?,
+            configured(overrides, "TENTAFLOW_AGENT_PROXY_SOCKET"),
+        ),
+    };
+    process_sandbox::ProxyEndpoint::from_parts(address, socket.map(PathBuf::from))
+}
+
+fn require_process_execution() -> Result<()> {
+    match env::var("TENTAFLOW_AGENT_EXECUTION").as_deref() {
+        Ok("container") => Err(anyhow!(
+            "per-session container account isolation is unavailable"
+        )),
+        Ok("process") => Ok(()),
+        _ => Err(anyhow!("managed agent execution policy is required")),
+    }
+}
+
 fn sandbox_argv(
     argv: Vec<String>,
     workspace: &Path,
     overrides: &[(String, String)],
 ) -> Result<Vec<String>> {
-    match env::var("TENTAFLOW_AGENT_EXECUTION").as_deref() {
-        Ok("container") => {
-            return Err(anyhow!(
-                "per-session container account isolation is unavailable"
-            ))
-        }
-        Ok("process") => {}
-        _ => return Err(anyhow!("managed agent execution policy is required")),
-    }
-    let find = |name: &str| {
-        overrides
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.clone())
-            .or_else(|| env::var(name).ok())
-    };
+    require_process_execution()?;
+    let find = |name: &str| configured(overrides, name);
     let private = find("TENTAFLOW_AGENT_PRIVATE_ROOT")
         .or_else(|| find("TMPDIR"))
         .context("agent private directory missing")?;
@@ -646,17 +684,8 @@ fn sandbox_argv(
             }
         }
     }
-    let endpoint: std::net::SocketAddr = if let Some(value) = find("TENTAFLOW_AGENT_ADAPTER_ADDR") {
-        value.parse().context("invalid agent adapter endpoint")?
-    } else {
-        format!(
-            "127.0.0.1:{}",
-            env::var("TENTAFLOW_AGENT_PROXY_PORT").context("agent proxy port missing")?
-        )
-        .parse()?
-    };
     process_sandbox::ProcessSandbox::new(workspace, Path::new(&private), false, &reads, &writes)?
-        .with_proxy(endpoint)?
+        .with_proxy(sandbox_endpoint(overrides)?)?
         .wrap(&argv, workspace)
 }
 
@@ -748,6 +777,94 @@ async fn shutdown_runtime(State(state): State<AppState>) -> Result<Json<Value>, 
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"ok": true, "provider": state.provider}))
+}
+
+/// How long a sandbox launch answers for. Long enough that polling costs
+/// nothing, short enough that a host repaired (or broken) while the bridge runs
+/// is noticed without a restart.
+const SANDBOX_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Unlike `/health`, this answers whether this node can RUN a CLI at all.
+///
+/// The deploy readiness probe reads it: a node whose sandbox mechanism is
+/// missing, whose kernel refuses the namespaces, or whose egress transport does
+/// not reach the gateway must FAIL its deploy instead of registering an account
+/// that every later turn would refuse.
+async fn runtime_status(State(state): State<AppState>) -> Json<Value> {
+    let failure = sandbox_readiness(&state).await;
+    Json(json!({
+        "ok": true,
+        "provider": state.provider,
+        "sandbox": {"ready": failure.is_none(), "detail": failure},
+    }))
+}
+
+async fn sandbox_readiness(state: &AppState) -> Option<String> {
+    let measured = state.sandbox.lock().clone();
+    if let Some((when, failure)) = measured {
+        if when.elapsed() < SANDBOX_PROBE_TTL {
+            return failure;
+        }
+    }
+    let data_dir = state.data_dir.clone();
+    let failure = tokio::task::spawn_blocking(move || probe_sandbox(&data_dir))
+        .await
+        .unwrap_or_else(|error| Err(anyhow!("sandbox probe did not finish: {error}")))
+        .err()
+        .map(|error| format!("{error:#}"));
+    *state.sandbox.lock() = Some((std::time::Instant::now(), failure.clone()));
+    failure
+}
+
+/// Launches a trivial command through the real policy, with the real egress
+/// endpoint attached. That exercises everything a turn depends on before a
+/// vendor CLI is ever installed: the OS mechanism, the private directories, the
+/// bind mounts, the transport that carries the proxy into the sandbox and — on
+/// a platform with a supervisor — the cleanup that has to follow the process.
+fn probe_sandbox(data_dir: &Path) -> Result<()> {
+    require_process_execution()?;
+    process_sandbox::ProcessSandbox::check_available()?;
+    let endpoint = sandbox_endpoint(&[])?;
+    let root = data_dir.join("sandbox-probe");
+    // A previous probe's leftovers are not what this measures.
+    match std::fs::remove_dir_all(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("clear the sandbox probe directory"),
+    }
+    let workspace = root.join("workspace");
+    let private = root.join("private");
+    for path in [&workspace, &private] {
+        std::fs::create_dir_all(path).context("create the sandbox probe directory")?;
+    }
+    let policy = process_sandbox::ProcessSandbox::new(&workspace, &private, false, &[], &[])?
+        .with_proxy(endpoint)?;
+    let argv = policy.wrap(
+        &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+        &workspace,
+    )?;
+    let outcome = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &private)
+        .current_dir(&workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("start a sandboxed process")?;
+    if !outcome.status.success() {
+        return Err(anyhow!(
+            "a sandboxed process could not start: {}",
+            String::from_utf8_lossy(&outcome.stderr).trim()
+        ));
+    }
+    if let Some(supervisor) = process_sandbox::supervisor_root(&argv)? {
+        process_sandbox::wait_for_supervisor(&supervisor, std::time::Duration::from_secs(5))
+            .context("sandbox cleanup was not confirmed")?;
+        let _ = std::fs::remove_dir_all(&supervisor);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 async fn auth_status(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
@@ -2797,13 +2914,69 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lease: Arc::new(Mutex::new(None)),
             provider: Provider::Codex,
+            data_dir: root.to_path_buf(),
             state_file: root.join("sessions.json"),
             probe_file: root.join("probe.json"),
             models_file: root.join("models.json"),
+            sandbox: Arc::new(SyncMutex::new(None)),
             probe: Arc::new(Mutex::new(ProbeCache::default())),
             probe_lock: Arc::new(Mutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             processes: Arc::new(process::Registry::new(root).unwrap()),
+        }
+    }
+
+    /// Liveness and readiness are different questions. This process has no
+    /// managed execution policy and no proxy, which is exactly the state of a
+    /// node that cannot run a CLI — `/health` still answers, `runtime.status`
+    /// must not claim a sandbox.
+    #[tokio::test]
+    async fn runtime_status_refuses_to_report_a_sandbox_it_could_not_launch() {
+        assert!(
+            require_process_execution().is_err(),
+            "the test process must not carry a managed execution policy"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let state = account_fixture(directory.path());
+        let Json(alive) = health(State(state.clone())).await;
+        assert_eq!(alive["ok"], json!(true));
+
+        let Json(status) = runtime_status(State(state.clone())).await;
+        assert_eq!(status["sandbox"]["ready"], json!(false));
+        let detail = status["sandbox"]["detail"].as_str().unwrap().to_string();
+        assert!(!detail.is_empty(), "a refusal has to say what is missing");
+        // Answered from the measurement, not measured again per poll.
+        let (_, cached) = state.sandbox.lock().clone().unwrap();
+        assert_eq!(cached.as_deref(), Some(detail.as_str()));
+    }
+
+    /// The endpoint the sandbox is given is Core's, including the transport it
+    /// opened: on a platform whose sandbox has no route to the host, an
+    /// endpoint without that socket is not usable and must not be accepted.
+    #[test]
+    fn the_sandbox_endpoint_names_the_transport_its_platform_needs() {
+        let overrides = vec![(
+            "TENTAFLOW_AGENT_ADAPTER_ADDR".to_string(),
+            "127.0.0.1:41999".to_string(),
+        )];
+        #[cfg(target_os = "linux")]
+        {
+            assert!(sandbox_endpoint(&overrides).is_err());
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("adapter.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let mut overrides = overrides;
+            overrides.push((
+                "TENTAFLOW_AGENT_ADAPTER_SOCKET".to_string(),
+                socket.display().to_string(),
+            ));
+            let endpoint = sandbox_endpoint(&overrides).unwrap();
+            assert_eq!(endpoint.socket_path(), Some(socket));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let endpoint = sandbox_endpoint(&overrides).unwrap();
+            assert_eq!(endpoint.socket_path(), None);
         }
     }
 

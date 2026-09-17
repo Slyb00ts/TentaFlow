@@ -7,6 +7,9 @@
 use super::ledger::{LedgerResult, NodeEnvironment, PartitionId};
 
 pub const CORE_SYNC_ADDON_ID: &str = "core";
+/// Resource type of replicated `settings` rows. The name predates the rule that
+/// secrets stay out of the ledger; it is a persisted format and cannot change.
+pub const SHARED_SETTING_RESOURCE_TYPE: &str = "core.shared_setting_secret";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreSyncResourceKind {
@@ -109,6 +112,25 @@ pub enum CoreSyncResourceKind {
     /// wiring the deploy path needs. Removing a member is a revocation, so it
     /// is LWW-tracked: a stale add must never resurrect it.
     ClusterMember,
+    /// An agent provider account (migration 156). The metadata only — WHICH
+    /// accounts exist, whose they are and who may use them. The credential is
+    /// a separate resource that does not exist yet: it needs per-node
+    /// re-encryption and an ACL that keeps it off nodes without an agent
+    /// runtime, and a half-registered secret would replicate to every trusted
+    /// node in the mesh.
+    ProviderAccount,
+    /// Who may use a global account. Revocation-bearing, composite PK —
+    /// the same shape as `CodeWorkspaceMember`.
+    ProviderAccountGrant,
+    /// Whether a node may hold account credentials. An administrator's
+    /// fleet-wide decision taken from any node, which is why it travels; what
+    /// a node MEASURED about its own copy (`provider_account_node_state`) does
+    /// not, and neither do the sessions running on it.
+    AgentRuntimeNode,
+    /// One cell of the N01 matrix. `install_state` is per-node truth written
+    /// only by the node it describes (enforced in the handler, where the
+    /// node's identity is known); it replicates so N01 is a fleet view.
+    AgentRuntimeEngine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,7 +364,7 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
     CoreSyncDescriptor {
         kind: CoreSyncResourceKind::SharedSettingSecret,
         table_name: "settings",
-        resource_type: "core.shared_setting_secret",
+        resource_type: SHARED_SETTING_RESOURCE_TYPE,
         primary_key_column: "key",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
@@ -965,6 +987,60 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "clusters",
     },
+    // ---------------------------------------------------------------------
+    // Agent provider accounts (docs/agent-accounts-technical-design.md §C.1).
+    // One partition for the whole set, for the same reason `code-studio` keeps
+    // one: a grant cannot be ordered before the account it names, and
+    // `DeferredOrdering` is only a useful retry hint while the prerequisite
+    // travels on the same ordered stream.
+    //
+    // NEVER add here, and each omission is a decision:
+    //   * `provider_account_credentials` — the material is sealed with the
+    //     PER-NODE SettingsCipher key, so it can only travel decrypted with
+    //     the receiver re-encrypting (the `SharedSettingSecret` model), and it
+    //     must reach ONLY the nodes flagged `receives_accounts`. Both halves
+    //     land together or not at all;
+    //   * `provider_account_sessions` — runtime state, like `flow_executions`;
+    //     a remote account's sessions are read from the node running them;
+    //   * `provider_account_node_state` — what THIS node measured about its own
+    //     copy of a credential. A replicated `applied_revision` would claim a
+    //     materialization that never happened locally.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ProviderAccount,
+        table_name: "provider_accounts",
+        resource_type: "core.provider_account",
+        primary_key_column: "account_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "agent-accounts",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ProviderAccountGrant,
+        table_name: "provider_account_grants",
+        resource_type: "core.provider_account_grant",
+        primary_key_column: "account_id,subject_type,subject_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "agent-accounts",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AgentRuntimeNode,
+        table_name: "agent_runtime_nodes",
+        resource_type: "core.agent_runtime_node",
+        primary_key_column: "node_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "agent-accounts",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AgentRuntimeEngine,
+        table_name: "agent_runtime_engines",
+        resource_type: "core.agent_runtime_engine",
+        primary_key_column: "node_id,engine_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "agent-accounts",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -1283,6 +1359,57 @@ mod tests {
             assert!(
                 !table.starts_with("vm_"),
                 "{table} is an application table and must not travel in the baseline"
+            );
+        }
+    }
+
+    /// The provider-account registry: four metadata tables, one partition,
+    /// org scope. The three tables that are NOT here are the point of the
+    /// test — the secret, the sessions and the per-node state.
+    #[test]
+    fn registry_contains_the_provider_account_tables() {
+        for (table, resource_type, primary_key) in [
+            ("provider_accounts", "core.provider_account", "account_id"),
+            (
+                "provider_account_grants",
+                "core.provider_account_grant",
+                "account_id,subject_type,subject_id",
+            ),
+            ("agent_runtime_nodes", "core.agent_runtime_node", "node_id"),
+            (
+                "agent_runtime_engines",
+                "core.agent_runtime_engine",
+                "node_id,engine_id",
+            ),
+        ] {
+            let descriptor =
+                descriptor_for_table(table).unwrap_or_else(|| panic!("missing descriptor {table}"));
+            assert_eq!(descriptor.resource_type, resource_type);
+            assert_eq!(descriptor.primary_key_column, primary_key);
+            assert_eq!(descriptor.scope, CoreSyncScope::Organization);
+            assert_eq!(descriptor.retention, CoreSyncRetention::Durable);
+            // One partition for the set: a grant must be ordered after the
+            // account it names.
+            assert_eq!(
+                descriptor
+                    .partition_id("org-default", None, NodeEnvironment::Prod)
+                    .unwrap()
+                    .as_str(),
+                "core/env/prod/org/org-default/agent-accounts"
+            );
+        }
+        for table in [
+            // Sealed with the per-node key; it travels only once the
+            // re-encrypting materializer and the runtime-node ACL land together.
+            "provider_account_credentials",
+            // Runtime state, read from the node that runs it.
+            "provider_account_sessions",
+            // What one node measured about its own copy.
+            "provider_account_node_state",
+        ] {
+            assert!(
+                !is_core_sync_table(table),
+                "{table} must stay out of core sync"
             );
         }
     }

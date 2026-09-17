@@ -31,7 +31,7 @@ fn element_name(e: &BytesStart) -> String {
     String::from_utf8_lossy(e.name().as_ref()).into_owned()
 }
 
-fn xml_err(e: quick_xml::Error) -> FormatError {
+fn xml_err(e: impl std::fmt::Display) -> FormatError {
     FormatError(format!("xml: {e}"))
 }
 

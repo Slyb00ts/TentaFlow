@@ -1,0 +1,181 @@
+- generic [ref=f2e2]:
+  - generic [ref=f2e3]:
+    - generic [ref=f2e4]: G01
+    - heading "Szczegóły agenta · Konfiguracja" [level=2] [ref=f2e5]
+    - generic [ref=f2e6]: "Kopia ekranu agenci-20260822/A02 — zmienia się WYŁĄCZNIE sekcja „Model i generowanie”: wybór Model LLM / Aplikacja CLI oraz konto globalne albo konto użytkownika. Reszta konfiguracji agenta bez zmian."
+  - generic [ref=f2e8]:
+    - complementary [ref=f2e9]:
+      - generic [ref=f2e10]: TentaFlow
+      - generic [ref=f2e12]:
+        - generic [ref=f2e13]: Ogólne
+        - generic [ref=f2e16] [cursor=pointer]: Pulpit
+        - generic [ref=f2e19] [cursor=pointer]: Serwisy
+        - generic [ref=f2e22] [cursor=pointer]: Nody mesh
+      - generic [ref=f2e25]:
+        - generic [ref=f2e26]: Aplikacje
+        - generic [ref=f2e29] [cursor=pointer]: Projekty
+        - generic [ref=f2e32] [cursor=pointer]: ML Studio
+        - generic [ref=f2e35] [cursor=pointer]: Benchmark Studio
+        - generic [ref=f2e38] [cursor=pointer]: Agenci
+      - generic [ref=f2e41]:
+        - generic [ref=f2e42]: Zarządzanie
+        - generic [ref=f2e45] [cursor=pointer]: Użytkownicy
+        - generic [ref=f2e48] [cursor=pointer]: Dziennik audytu
+      - generic [ref=f2e52]:
+        - generic [ref=f2e53]: AK
+        - generic [ref=f2e54]:
+          - generic [ref=f2e55]: Anna · Menedżer
+          - generic [ref=f2e56]: Euvic · QA
+    - main [ref=f2e57]:
+      - generic [ref=f2e58]:
+        - generic [ref=f2e59] [cursor=pointer]: Agenci
+        - generic [ref=f2e63]: Generator scenariuszy
+      - generic [ref=f2e64]:
+        - generic [ref=f2e71]:
+          - generic [ref=f2e72]:
+            - text: Generator scenariuszy
+            - generic [ref=f2e73]: Włączony
+            - generic [ref=f2e75]: Kierowalny do czatu
+          - generic [ref=f2e76]: generator-scenariuszy · utworzono 2026-07-02 · zmieniono dzisiaj 09:14
+          - generic [ref=f2e77]:
+            - generic [ref=f2e78]: Claude Code · claude-opus-5
+            - generic [ref=f2e79]: Konto użytkownika
+            - generic [ref=f2e80]: 7 narzędzi
+            - generic [ref=f2e81]: 3 umiejętności
+            - generic [ref=f2e82]: "Sub-agenci: max 4, głębokość 2"
+            - generic [ref=f2e83]: "Pętla: 12 iteracji / timeout 600 s"
+        - generic [ref=f2e84]:
+          - button "Uruchom test" [ref=f2e85] [cursor=pointer]
+          - button "Duplikuj" [ref=f2e88] [cursor=pointer]
+          - button "Wyłącz" [ref=f2e91] [cursor=pointer]
+          - button "Usuń" [ref=f2e94] [cursor=pointer]
+      - generic [ref=f2e97]:
+        - button "Konfiguracja" [ref=f2e98] [cursor=pointer]
+        - button "Narzędzia i umiejętności 7+3" [ref=f2e101] [cursor=pointer]:
+          - text: Narzędzia i umiejętności
+          - generic [ref=f2e104]: 7+3
+        - button "Testowanie" [ref=f2e105] [cursor=pointer]
+        - button "Przebiegi 23" [ref=f2e108] [cursor=pointer]:
+          - text: Przebiegi
+          - generic [ref=f2e111]: "23"
+      - generic [ref=f2e112]:
+        - heading "Tożsamość" [level=3] [ref=f2e113]
+        - generic [ref=f2e116]:
+          - generic [ref=f2e117]:
+            - generic [ref=f2e118]: Nazwa techniczna
+            - textbox [ref=f2e119]: generator-scenariuszy
+            - generic [ref=f2e120]: małe litery i myślniki; identyfikuje agenta w flow i API.
+          - generic [ref=f2e121]:
+            - generic [ref=f2e122]: Nazwa wyświetlana
+            - textbox [ref=f2e123]: Generator scenariuszy
+        - generic [ref=f2e124]:
+          - generic [ref=f2e125]: Opis
+          - textbox [ref=f2e126]: Tworzy przypadki testowe z wymagań i wiedzy projektu. Samodzielnie wyszukuje brakujące informacje w źródłach i internecie, a gotowe przypadki zapisuje do generacji w projekcie.
+          - generic [ref=f2e127]: Widoczna na karcie agenta i w wyborze agenta w czacie.
+      - generic [ref=f2e128]:
+        - heading "Prompt systemowy" [level=3] [ref=f2e129]
+        - generic [ref=f2e131]:
+          - textbox [ref=f2e132]: "Jesteś generatorem przypadków testowych dla zespołu QA. Zasady: 1. Analizuj przekazane wymagania sekcja po sekcji; dla każdej ścieżki biznesowej zaproponuj przypadki pozytywne, negatywne i brzegowe. 2. Zanim napiszesz scenariusze, sprawdź wiedzę projektu (project_search) — istniejące przypadki pomijaj, duplikaty oznaczaj. 3. Gdy wymaganie jest niejednoznaczne, zadaj pytanie użytkownikowi (ask_user) zamiast zgadywać. 4. Każdy przypadek zapisuj przez project_case_save — jeden przypadek = jedno wywołanie. 5. Język przypadków: {{jezyk}}. Format: kroki akcja/oczekiwany rezultat."
+          - generic [ref=f2e133]:
+            - generic [ref=f2e134]: 682 znaki · ok. 170 tokenów
+            - generic [ref=f2e135]: "{{jezyk}}"
+            - generic [ref=f2e136]:
+              - button "Popraw z AI" [ref=f2e137] [cursor=pointer]
+              - button "Przywróć poprzedni" [ref=f2e140] [cursor=pointer]
+      - generic [ref=f2e141]:
+        - heading "Model i generowanie" [level=3] [ref=f2e142]
+        - generic [ref=f2e145]:
+          - generic [ref=f2e146]: Silnik agenta
+          - generic [ref=f2e147]:
+            - button "Model LLM" [ref=f2e148] [cursor=pointer]
+            - button "Aplikacja CLI" [ref=f2e149] [cursor=pointer]
+          - generic [ref=f2e150]: „Model LLM" = dotychczasowe zachowanie, pola poniżej bez zmian (Model, Temperatura, Poziom rozumowania).
+        - generic [ref=f2e151]:
+          - generic [ref=f2e152]:
+            - generic [ref=f2e153]: Aplikacja
+            - combobox [ref=f2e154]:
+              - option "Claude Code" [selected]
+              - option "Codex"
+              - option "Grok Build"
+              - option "Muse Code"
+          - generic [ref=f2e155]:
+            - generic [ref=f2e156]: Model
+            - combobox [ref=f2e157]:
+              - option "claude-opus-5" [selected]
+              - option "claude-sonnet-5"
+            - generic [ref=f2e158]: Lista pochodzi z wybranej aplikacji.
+          - generic [ref=f2e159]:
+            - generic [ref=f2e160]: Poziom rozumowania
+            - combobox [ref=f2e161]:
+              - option "standard" [selected]
+              - option "minimal"
+              - option "maximal"
+            - generic [ref=f2e162]: Temperatura nie dotyczy aplikacji CLI — pole ukryte.
+        - generic [ref=f2e163]:
+          - generic [ref=f2e164]: Konto
+          - generic [ref=f2e165]:
+            - generic [ref=f2e166]:
+              - heading "Konto globalne" [level=4] [ref=f2e167]:
+                - generic [ref=f2e168] [cursor=pointer]
+                - text: Konto globalne
+              - paragraph [ref=f2e169]: Zawsze to samo, wskazane konto organizacji — niezależnie od tego, kto prowadzi sesję.
+              - combobox [disabled] [ref=f2e170]:
+                - option "Claude Code — firma (zespol@euvic.pl)" [selected]
+                - option "Claude Code — klucz API (CI)"
+            - generic [ref=f2e171]:
+              - heading "Konto użytkownika" [level=4] [ref=f2e172]:
+                - generic [ref=f2e173] [cursor=pointer]
+                - text: Konto użytkownika
+              - paragraph [ref=f2e174]: Zawsze konto Claude Code osoby, która prowadzi sesję. Sub-agenci dziedziczą tę osobę. Brak konta = prośba o połączenie w czacie (C01), nigdy konto globalne.
+          - generic [ref=f2e175]: Lista kont globalnych pokazuje tylko konta wybranej aplikacji (Services → Konta agentów).
+      - generic [ref=f2e176]:
+        - heading "Pętla pracy i limity" [level=3] [ref=f2e177]
+        - generic [ref=f2e180]:
+          - generic [ref=f2e181]:
+            - generic [ref=f2e182]: Maksymalna liczba iteracji
+            - generic [ref=f2e183]: Ile razy agent może wywoływać narzędzia w jednym przebiegu.
+          - slider [ref=f2e184]: "12"
+          - generic [ref=f2e185]: "12"
+        - generic [ref=f2e186]:
+          - generic [ref=f2e187]:
+            - generic [ref=f2e188]: Limit sub-agentów
+            - generic [ref=f2e189]: Ile zadań agent może jednocześnie delegować (agent_spawn). 0 = delegacja zablokowana.
+          - slider [ref=f2e190]: "4"
+          - generic [ref=f2e191]: "4"
+        - generic [ref=f2e192]:
+          - generic [ref=f2e193]:
+            - generic [ref=f2e194]: Głębokość zagnieżdżania
+            - generic [ref=f2e195]: Na ile poziomów sub-agent może delegować dalej.
+          - slider [ref=f2e196]: "2"
+          - generic [ref=f2e197]: "2"
+        - generic [ref=f2e198]:
+          - generic [ref=f2e199]:
+            - generic [ref=f2e200]: Timeout przebiegu (s)
+            - spinbutton [ref=f2e201]: "600"
+          - generic [ref=f2e202]:
+            - generic [ref=f2e203]: Po zakończeniu sub-agenta
+            - combobox [ref=f2e204]:
+              - option "Powiadom (wynik trafia do kontekstu)" [selected]
+              - option "Kontynuuj (uruchom nowy przebieg rodzica)"
+            - generic [ref=f2e205]: „Kontynuuj" = autonomiczna praca w tle.
+      - generic [ref=f2e206]:
+        - heading "Zachowanie i dostęp" [level=3] [ref=f2e207]
+        - generic [ref=f2e210]:
+          - generic [ref=f2e211] [cursor=pointer]
+          - generic [ref=f2e212]:
+            - generic [ref=f2e213]: Kierowalny do czatu
+            - generic [ref=f2e214]: Agent pojawia się w selektorze agentów w czacie i może obsługiwać rozmowy.
+        - generic [ref=f2e215]:
+          - generic [ref=f2e216] [cursor=pointer]
+          - generic [ref=f2e217]:
+            - generic [ref=f2e218]: Włączony
+            - generic [ref=f2e219]: Wyłączony agent nie przyjmuje nowych przebiegów; historia pozostaje dostępna.
+        - generic [ref=f2e220]:
+          - generic [ref=f2e221]: Flow (opcjonalnie)
+          - textbox "puste = wbudowana pętla agenta" [ref=f2e222]
+          - generic [ref=f2e223]: ID flow z Flow Buildera, który przejmuje logikę agenta (zaawansowane).
+      - generic [ref=f2e224]:
+        - generic [ref=f2e225]: Masz niezapisane zmiany konfiguracji
+        - generic [ref=f2e228]:
+          - button "Odrzuć" [ref=f2e229] [cursor=pointer]
+          - button "Zapisz zmiany" [ref=f2e230] [cursor=pointer]

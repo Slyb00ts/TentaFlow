@@ -29,7 +29,7 @@ use crate::net::iroh::{
         endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
         merge_contact_hints, PairingContactHints, PairingHandler,
     },
-    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_BUS,
+    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_BUS,
     ALPN_MESH, ALPN_PAIRING,
 };
 
@@ -133,6 +133,9 @@ pub struct CommandWaitResponse {
 }
 
 const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
+/// Pairing handshakes carry keys, contact hints and a trusted-key list —
+/// kilobytes even for a large fleet.
+const PRE_TRUST_MAX_MSG_BYTES: usize = 256 * 1024;
 
 /// Konfiguracja startowa mesh menedzera iroh.
 pub struct IrohMeshConfig {
@@ -231,6 +234,8 @@ pub enum IrohMeshEvent {
     TrustRevokedReceived {
         node_id: String,
         revoked_node_id: String,
+        /// Original revocation time from the wire; `None` from older nodes.
+        revoked_at: Option<String>,
     },
     TrustedKeysSyncReceived {
         node_id: String,
@@ -245,6 +250,12 @@ pub enum IrohMeshEvent {
     HmacKeysSyncReceived {
         node_id: String,
         payload: tentaflow_protocol::mesh::HmacKeysSyncPayload,
+    },
+    /// A peer pushed the fleet secrets it holds, sealed for this node. The
+    /// pipeline checks that the sender may change them before adopting any.
+    SharedSecretsSyncReceived {
+        node_id: String,
+        payload: tentaflow_protocol::mesh::SharedSecretsSyncPayload,
     },
     /// F1b P3.C-1 — trust-paired peer asked us for a frame whose `frame_url`
     /// they hold. Server-side handling (lookup in local frame store, build
@@ -424,6 +435,7 @@ pub struct ConnectionSnapshot {
 pub struct IrohMeshManager {
     endpoint: Arc<IrohEndpoint>,
     security: Arc<MeshSecurity>,
+    replay_guard: Arc<crate::mesh::replay::MeshReplayGuard>,
     config: IrohMeshConfig,
     connections: Arc<DashMap<String, ActiveConnection>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
@@ -552,6 +564,9 @@ impl IrohMeshManager {
         Ok(Arc::new(Self {
             endpoint: Arc::new(endpoint),
             security,
+            replay_guard: Arc::new(crate::mesh::replay::MeshReplayGuard::new(
+                crate::mesh::proto_conv::now_unix_ms(),
+            )),
             config,
             connections: Arc::new(DashMap::with_capacity(256)),
             event_tx,
@@ -841,6 +856,7 @@ impl IrohMeshManager {
             connections: Arc::clone(&self.connections),
             event_tx: self.event_tx.clone(),
             security: Arc::clone(&self.security),
+            replay_guard: Arc::clone(&self.replay_guard),
             forward_handler: Arc::clone(&self.forward_handler),
             forward_stream_handler: Arc::clone(&self.forward_stream_handler),
             camera_stream_handler: Arc::clone(&self.camera_stream_handler),
@@ -1041,11 +1057,6 @@ impl IrohMeshManager {
                         connection.close(0u32.into(), b"bus-disabled");
                     }
                 }
-            }
-            a if a == ALPN_API => {
-                debug!(
-                    "iroh_mesh: ALPN_API otrzymane — delegacja do dashboard layer (zadanie #56)"
-                );
             }
             other => {
                 warn!(
@@ -1604,13 +1615,11 @@ impl IrohMeshManager {
             .await
             .map_err(|e| anyhow::anyhow!("baseline pull: open_bi: {e}"))?;
         let mut stream = crate::sync::baseline_transport::IrohFrameStream::new(send, recv);
-        let cipher = Arc::clone(self.security.settings_cipher_ref());
         crate::sync::baseline_transport::run_joiner_session(
             &mut stream,
             &self.security.db,
             &local_node_id,
             donor_node_id,
-            &cipher,
             epoch_seen,
         )
         .await
@@ -2144,6 +2153,44 @@ impl IrohMeshManager {
             data,
         )
         .await
+    }
+
+    /// Sends every fleet secret this node holds to one trusted peer, sealed for
+    /// that peer. Does nothing for an untrusted peer or when there is no secret.
+    pub async fn send_shared_secrets_sync(&self, node_id: &str) -> Result<()> {
+        if !self.security.is_trusted(node_id) {
+            return Ok(());
+        }
+        let Some(payload) = crate::mesh::shared_secrets::build_for_peer(&self.security, node_id)?
+        else {
+            return Ok(());
+        };
+        let data = crate::mesh::cbor::encode(&payload)
+            .map_err(|e| anyhow::anyhow!("SharedSecretsSync encode failed: {e}"))?;
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_SHARED_SECRETS_SYNC,
+            &data,
+        )
+        .await
+    }
+
+    /// Pushes the fleet secrets to every connected trusted peer except `exclude`.
+    /// Each peer gets its own frame because the values are sealed per recipient.
+    pub async fn push_shared_secrets_to_trusted(&self, exclude: Option<&str>) {
+        let trusted = self.security.trusted_node_ids_snapshot();
+        let peers: Vec<String> = self
+            .connections
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|id| trusted.contains(id) && Some(id.as_str()) != exclude)
+            .collect();
+        futures::future::join_all(peers.iter().map(|node_id| async move {
+            if let Err(e) = self.send_shared_secrets_sync(node_id).await {
+                warn!(peer = %node_id, "iroh_mesh: SharedSecretsSync send failed: {e}");
+            }
+        }))
+        .await;
     }
 
     pub async fn send_sync_push(&self, node_id: &str, data: &[u8]) -> Result<()> {
@@ -2818,6 +2865,7 @@ struct IrohMeshManagerRef {
     connections: Arc<DashMap<String, ActiveConnection>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
     security: Arc<MeshSecurity>,
+    replay_guard: Arc<crate::mesh::replay::MeshReplayGuard>,
     forward_handler: Arc<AsyncRwLock<Option<ForwardHandler>>>,
     forward_stream_handler: Arc<AsyncRwLock<Option<ForwardStreamHandler>>>,
     camera_stream_handler: Arc<AsyncRwLock<Option<CameraStreamHandler>>>,
@@ -3061,6 +3109,50 @@ impl IrohMeshManagerRef {
         }
     }
 
+    /// A peer whose clock drifts past the window has every guarded frame
+    /// refused, which from the dashboard looks like a node ignoring commands.
+    /// The audit row and the warning name the real cause; both are debounced
+    /// per peer because the peer keeps sending.
+    fn report_replay_rejection(
+        &self,
+        remote_hex: &str,
+        frame_type: u8,
+        envelope: &tentaflow_sdk_spec::protocol::frame::envelope::Envelope,
+        rejection: crate::mesh::replay::ReplayRejection,
+    ) {
+        if !self.replay_guard.should_report(&envelope.source.id) {
+            return;
+        }
+        let now_ms = crate::mesh::proto_conv::now_unix_ms();
+        tracing::warn!(
+            target: "mesh::replay",
+            peer = %remote_hex,
+            frame_type = format!("0x{:02X}", frame_type),
+            reason = rejection.as_str(),
+            frame_created_at_ms = envelope.created_at_ms,
+            local_now_ms = now_ms,
+            "iroh_mesh: refused a state-changing frame; if the reason is clock_skew, the clocks of the two nodes differ by more than 120 s"
+        );
+        let details = serde_json::json!({
+            "peer": remote_hex,
+            "frame_type": format!("0x{:02X}", frame_type),
+            "reason": rejection.as_str(),
+            "frame_created_at_ms": envelope.created_at_ms,
+            "local_now_ms": now_ms,
+        })
+        .to_string();
+        let _ = crate::db::repository::log_audit(
+            &self.security.db,
+            None,
+            None,
+            "mesh.frame_replay_rejected",
+            None,
+            Some(&details),
+            None,
+            Some(remote_hex),
+        );
+    }
+
     async fn handle_mesh_uni(
         &self,
         remote_hex: String,
@@ -3070,9 +3162,17 @@ impl IrohMeshManagerRef {
         recv.read_exact(&mut first)
             .await
             .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
-        // iroh RecvStream.read_to_end bierze limit bajtow, zwraca Vec<u8>.
+        // The frame kind lives inside the signed envelope, so the read budget
+        // is the only lever available before decoding: an untrusted peer may
+        // only send pairing handshakes, which are tiny, and must not be able to
+        // make us buffer and CBOR-decode a full-size message per stream.
+        let read_limit = if self.security.is_trusted(&remote_hex) {
+            MAX_MSG_BYTES
+        } else {
+            PRE_TRUST_MAX_MSG_BYTES
+        };
         let tail = recv
-            .read_to_end(MAX_MSG_BYTES)
+            .read_to_end(read_limit)
             .await
             .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
         if tail.len() > MAX_MSG_BYTES {
@@ -3089,10 +3189,10 @@ impl IrohMeshManagerRef {
         // below routes by `frame_type` unchanged.
         let local_pubkey = self.security.verifying_key_bytes();
         let peer_pubkey_opt = parse_iroh_node_id_to_pubkey(&remote_hex);
-        let (frame_type, payload) = if let Some(peer_pubkey) = peer_pubkey_opt {
+        let (frame_type, payload, envelope) = if let Some(peer_pubkey) = peer_pubkey_opt {
             match crate::mesh::ufp2::classify_inbound(first[0], tail, peer_pubkey, local_pubkey) {
                 Ok(crate::mesh::ufp2::InboundMeshFrame::Ufp2(decoded)) => {
-                    (decoded.legacy_discriminator, decoded.body)
+                    (decoded.legacy_discriminator, decoded.body, decoded.envelope)
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -3154,6 +3254,17 @@ impl IrohMeshManagerRef {
                 );
             }
             return Ok(());
+        }
+
+        // Runs after the trust gate so that only trusted peers can allocate a
+        // per-source cache. Pairing frames are exempt: they arrive before
+        // trust and are bound to a one-time PIN instead.
+        if trusted_now && crate::mesh::frame_policy::is_replay_guarded_frame(frame_type) {
+            let now_ms = crate::mesh::proto_conv::now_unix_ms();
+            if let Err(rejection) = self.replay_guard.admit(&envelope, now_ms) {
+                self.report_replay_rejection(&remote_hex, frame_type, &envelope, rejection);
+                return Ok(());
+            }
         }
 
         use tentaflow_protocol::mesh::*;
@@ -3240,6 +3351,21 @@ impl IrohMeshManagerRef {
                     }
                 }
             }
+            x if x == MESH_MSG_SHARED_SECRETS_SYNC => {
+                match crate::mesh::cbor::decode::<
+                    tentaflow_protocol::mesh::SharedSecretsSyncPayload,
+                >(&payload)
+                {
+                    Ok(p) => IrohMeshEvent::SharedSecretsSyncReceived {
+                        node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(peer = %remote_hex, "iroh_mesh: failed to decode SharedSecretsSync: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
             x if x == MESH_MSG_FRAME_PROXY_REQUEST => {
                 let parsed = crate::mesh::cbor::decode::<
                     tentaflow_protocol::mesh::FrameProxyRequestPayload,
@@ -3321,7 +3447,7 @@ impl IrohMeshManagerRef {
                     tentaflow_protocol::mesh::TrustRevokedPayload,
                 >(&payload)
                 {
-                    Ok(p) => p.revoked_node_id,
+                    Ok(p) => p,
                     Err(e) => {
                         warn!(peer = %remote_hex, "iroh_mesh: failed to decode TrustRevoked CBOR: {}", e);
                         return Ok(());
@@ -3329,7 +3455,8 @@ impl IrohMeshManagerRef {
                 };
                 IrohMeshEvent::TrustRevokedReceived {
                     node_id: remote_hex,
-                    revoked_node_id: revoked,
+                    revoked_node_id: revoked.revoked_node_id,
+                    revoked_at: revoked.revoked_at,
                 }
             }
             x if x == MESH_MSG_NODE_LEAVING => IrohMeshEvent::NodeLeavingReceived {

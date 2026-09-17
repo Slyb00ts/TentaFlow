@@ -129,12 +129,20 @@ fn vnc_tunnel_open_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subsc
             return;
         };
 
-        // 5. Per-user tunnel budget.
+        // 5. Per-user and global tunnel budgets.
         if vnc_tunnel::count_for_user(&ctx.state.vnc_tunnels, &me) >= MAX_TUNNELS_PER_USER {
             emit_open_status(
                 &sub,
                 VNC_TUNNEL_OPEN_FAILED,
                 "tunnel limit reached (3 concurrent per user)",
+            );
+            return;
+        }
+        if vnc_tunnel::count_total(&ctx.state.vnc_tunnels) >= vnc_tunnel::MAX_TUNNELS_GLOBAL {
+            emit_open_status(
+                &sub,
+                VNC_TUNNEL_OPEN_FAILED,
+                "tunnel limit reached (global capacity exceeded)",
             );
             return;
         }

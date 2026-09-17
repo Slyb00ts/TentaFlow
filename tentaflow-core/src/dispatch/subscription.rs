@@ -120,9 +120,26 @@ pub enum SubscriptionEvent {
 // SubscriptionRegistry
 // =============================================================================
 
+/// Identifies a stream by the connection that opened it. Correlation ids are
+/// chosen by the client, so on their own they collide across connections and
+/// would let one session cancel or overwrite another session's stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriptionKey {
+    pub connection_id: u64,
+    pub correlation_id: u64,
+}
+
+impl SubscriptionKey {
+    pub fn new(connection_id: u64, correlation_id: u64) -> Self {
+        Self {
+            connection_id,
+            correlation_id,
+        }
+    }
+}
+
 pub struct SubscriptionRegistry {
-    /// correlation_id → Subscription handle.
-    subs: RwLock<HashMap<u64, Arc<Subscription>>>,
+    subs: RwLock<HashMap<SubscriptionKey, Arc<Subscription>>>,
 }
 
 impl SubscriptionRegistry {
@@ -135,19 +152,20 @@ impl SubscriptionRegistry {
     /// Tworzy nowa subscription. Zwraca (handle dla handlera, receiver dla writer task'a).
     pub fn create(
         &self,
-        correlation_id: u64,
+        key: SubscriptionKey,
         bucket: Option<BucketTier>,
     ) -> (Arc<Subscription>, mpsc::Receiver<SubscriptionEvent>) {
-        self.create_with_capacity(correlation_id, bucket, DEFAULT_CHANNEL_CAPACITY)
+        self.create_with_capacity(key, bucket, DEFAULT_CHANNEL_CAPACITY)
     }
 
     /// Jak `create`, ale z jawna pojemnoscia kanalu (patrz `channel_capacity_for`).
     pub fn create_with_capacity(
         &self,
-        correlation_id: u64,
+        key: SubscriptionKey,
         bucket: Option<BucketTier>,
         capacity: usize,
     ) -> (Arc<Subscription>, mpsc::Receiver<SubscriptionEvent>) {
+        let correlation_id = key.correlation_id;
         let (tx, rx) = mpsc::channel(capacity);
         let sub = Arc::new(Subscription {
             correlation_id,
@@ -156,7 +174,7 @@ impl SubscriptionRegistry {
             chunks_sent: 0,
         });
         let mut guard = self.subs.write().unwrap();
-        if let Some(_old) = guard.insert(correlation_id, Arc::clone(&sub)) {
+        if let Some(_old) = guard.insert(key, Arc::clone(&sub)) {
             warn!(
                 correlation_id,
                 "subscription_registry: nadpisano istniejaca subscription"
@@ -167,14 +185,15 @@ impl SubscriptionRegistry {
     }
 
     /// Pobiera subscription handle (dla MetaCancelStream / status query).
-    pub fn get(&self, correlation_id: u64) -> Option<Arc<Subscription>> {
-        self.subs.read().unwrap().get(&correlation_id).cloned()
+    pub fn get(&self, key: SubscriptionKey) -> Option<Arc<Subscription>> {
+        self.subs.read().unwrap().get(&key).cloned()
     }
 
     /// Anuluje subscription (MetaCancelStream lub disconnect).
     /// Zwraca true jesli usunieto, false jesli nie istnialo.
-    pub fn cancel(&self, correlation_id: u64) -> bool {
-        let removed = self.subs.write().unwrap().remove(&correlation_id);
+    pub fn cancel(&self, key: SubscriptionKey) -> bool {
+        let correlation_id = key.correlation_id;
+        let removed = self.subs.write().unwrap().remove(&key);
         if let Some(sub) = removed {
             // Try-send error — jesli kanal zapelniony to writer juz odpina sie.
             let _ = sub.tx.try_send(SubscriptionEvent::Error(
@@ -198,7 +217,12 @@ impl SubscriptionRegistry {
 
     /// Wszystkie aktywne correlation_ids (dla admin UI).
     pub fn active_correlation_ids(&self) -> Vec<u64> {
-        self.subs.read().unwrap().keys().copied().collect()
+        self.subs
+            .read()
+            .unwrap()
+            .keys()
+            .map(|key| key.correlation_id)
+            .collect()
     }
 }
 
@@ -370,18 +394,18 @@ mod tests {
     #[tokio::test]
     async fn create_and_cancel_subscription() {
         let reg = SubscriptionRegistry::new();
-        let (sub, _rx) = reg.create(42, None);
+        let (sub, _rx) = reg.create(SubscriptionKey::new(0, 42), None);
         assert_eq!(sub.correlation_id, 42);
         assert_eq!(reg.count(), 1);
-        assert!(reg.cancel(42));
+        assert!(reg.cancel(SubscriptionKey::new(0, 42)));
         assert_eq!(reg.count(), 0);
-        assert!(!reg.cancel(42)); // juz nie istnieje
+        assert!(!reg.cancel(SubscriptionKey::new(0, 42))); // juz nie istnieje
     }
 
     #[tokio::test]
     async fn push_chunk_and_end_flow() {
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1, None);
+        let (sub, mut rx) = reg.create(SubscriptionKey::new(0, 1), None);
 
         push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: 1 }).unwrap();
         push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: 2 }).unwrap();
@@ -403,8 +427,9 @@ mod tests {
     #[tokio::test]
     async fn multiple_subscriptions_independent() {
         let reg = SubscriptionRegistry::new();
-        let (sub1, mut rx1) = reg.create(100, Some(BucketTier::OneSecond));
-        let (sub2, mut rx2) = reg.create(200, Some(BucketTier::TenSeconds));
+        let (sub1, mut rx1) = reg.create(SubscriptionKey::new(0, 100), Some(BucketTier::OneSecond));
+        let (sub2, mut rx2) =
+            reg.create(SubscriptionKey::new(0, 200), Some(BucketTier::TenSeconds));
         assert_eq!(reg.count(), 2);
 
         push_chunk(&sub1, MessageBody::ModelListRequest).unwrap();
@@ -423,10 +448,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_connection_cannot_cancel_another_connections_stream() {
+        let reg = SubscriptionRegistry::new();
+        let (_victim, _victim_rx) = reg.create(SubscriptionKey::new(1, 7), None);
+        let (_other, _other_rx) = reg.create(SubscriptionKey::new(2, 7), None);
+        assert_eq!(reg.count(), 2, "same correlation id must not overwrite");
+
+        assert!(!reg.cancel(SubscriptionKey::new(3, 7)));
+        assert!(reg.cancel(SubscriptionKey::new(2, 7)));
+        assert!(reg.get(SubscriptionKey::new(1, 7)).is_some());
+    }
+
+    #[tokio::test]
     async fn cancel_emits_error_event() {
         let reg = SubscriptionRegistry::new();
-        let (_sub, mut rx) = reg.create(7, None);
-        assert!(reg.cancel(7));
+        let (_sub, mut rx) = reg.create(SubscriptionKey::new(0, 7), None);
+        assert!(reg.cancel(SubscriptionKey::new(0, 7)));
 
         let event = rx.recv().await.unwrap();
         match event {
@@ -448,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn backpressure_full_channel_returns_err() {
         let reg = SubscriptionRegistry::new();
-        let (sub, _rx) = reg.create(1, None);
+        let (sub, _rx) = reg.create(SubscriptionKey::new(0, 1), None);
         // Wypelnij kanal (capacity = 64) — _rx nie czyta wiec try_send blokuje.
         let mut accepted = 0;
         for i in 0..(DEFAULT_CHANNEL_CAPACITY + 5) {
@@ -471,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn end_guard_emits_terminal_frame_on_drop() {
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1, None);
+        let (sub, mut rx) = reg.create(SubscriptionKey::new(0, 1), None);
         {
             let _guard = StreamEndGuard::new(Arc::clone(&sub));
         }
@@ -484,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn end_guard_finish_sends_body_and_disarms() {
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create(1, None);
+        let (sub, mut rx) = reg.create(SubscriptionKey::new(0, 1), None);
         let guard = StreamEndGuard::new(Arc::clone(&sub));
         guard
             .finish(Some(MessageBody::MetaHeartbeat { sent_at_epoch: 9 }))
@@ -506,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn end_guard_on_closed_receiver_does_not_panic() {
         let reg = SubscriptionRegistry::new();
-        let (sub, rx) = reg.create(1, None);
+        let (sub, rx) = reg.create(SubscriptionKey::new(0, 1), None);
         drop(rx);
         let guard = StreamEndGuard::new(Arc::clone(&sub));
         drop(guard);
@@ -517,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn end_guard_delivers_terminal_frame_despite_full_channel() {
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create_with_capacity(1, None, 2);
+        let (sub, mut rx) = reg.create_with_capacity(SubscriptionKey::new(0, 1), None, 2);
         push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: 1 }).unwrap();
         push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: 2 }).unwrap();
         drop(StreamEndGuard::new(Arc::clone(&sub)));
@@ -540,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn push_chunk_async_waits_instead_of_failing() {
         let reg = SubscriptionRegistry::new();
-        let (sub, mut rx) = reg.create_with_capacity(1, None, 1);
+        let (sub, mut rx) = reg.create_with_capacity(SubscriptionKey::new(0, 1), None, 1);
         push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: 1 }).unwrap();
 
         let sender = Arc::clone(&sub);
@@ -580,9 +617,9 @@ mod tests {
     #[tokio::test]
     async fn active_correlation_ids_returns_all() {
         let reg = SubscriptionRegistry::new();
-        let (_s1, _r1) = reg.create(11, None);
-        let (_s2, _r2) = reg.create(22, None);
-        let (_s3, _r3) = reg.create(33, None);
+        let (_s1, _r1) = reg.create(SubscriptionKey::new(0, 11), None);
+        let (_s2, _r2) = reg.create(SubscriptionKey::new(0, 22), None);
+        let (_s3, _r3) = reg.create(SubscriptionKey::new(0, 33), None);
         let mut ids = reg.active_correlation_ids();
         ids.sort();
         assert_eq!(ids, vec![11, 22, 33]);

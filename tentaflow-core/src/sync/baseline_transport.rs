@@ -37,7 +37,6 @@ use tentaflow_protocol::mesh::{
 };
 use tracing::{info, warn};
 
-use crate::crypto::SettingsCipher;
 use crate::db::DbPool;
 use crate::mesh::security::MeshSecurity;
 use crate::sync::core_baseline::{
@@ -123,7 +122,6 @@ pub async fn run_joiner_session<S: FrameStream>(
     db: &DbPool,
     local_node_id: &str,
     donor_node_id: &str,
-    cipher: &SettingsCipher,
     epoch_seen: u64,
 ) -> LedgerResult<BaselineImportReport> {
     // The caller mandates the donor (pairing confirm already elected it;
@@ -250,7 +248,7 @@ pub async fn run_joiner_session<S: FrameStream>(
             phase: BaselinePhase::Receiving,
         },
     )?;
-    let report = import_baseline(db, &snapshot, donor_node_id, local_node_id, cipher)?;
+    let report = import_baseline(db, &snapshot, donor_node_id, local_node_id)?;
 
     let _ = stream.finish().await;
     info!(
@@ -425,8 +423,7 @@ pub async fn run_donor_session<S: FrameStream>(
         }
     }
 
-    let cipher = security.settings_cipher_ref();
-    let snapshot = capture_baseline_snapshot(&security.db, epoch.clone(), cipher)?;
+    let snapshot = capture_baseline_snapshot(&security.db, epoch.clone())?;
     let raw = serialize_snapshot(&snapshot)?;
     let header = build_baseline_header(&snapshot, &raw);
 

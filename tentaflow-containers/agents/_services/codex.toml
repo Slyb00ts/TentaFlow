@@ -19,6 +19,6 @@ input_modalities = ["text"]
 output_modalities = ["text"]
 
 [deploy.native]
-platforms = ["linux", "macos", "windows"]
+platforms = ["linux", "macos"]
 runtime = "managed-cli"
 binary_path = "agents/native/coding-agent-bridge"

@@ -498,8 +498,8 @@ Pacman requires confirmation of the upgrade and user decisions on package confli
 > On macOS 26+ (Xcode 26) the Metal compiler is a separate component. Without it, MLX models return
 > gibberish with no build error — `setup.sh` installs it and `build.rs` fails loudly if it's missing.
 
-TLS certs are generated automatically on first build (self-signed EC P-256, pure Rust via `rcgen`);
-drop your own into `certs/cert.pem` + `certs/key.pem` to override.
+TLS certs are generated automatically on first start (self-signed EC P-256, pure Rust via `rcgen`)
+into `<data>/tls/`; drop your own `cert.pem` + `key.pem` there to override.
 
 ### Build from source
 

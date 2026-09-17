@@ -148,7 +148,6 @@ lz4_flex = { workspace = true, features = ["safe-encode", "safe-decode"] }
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez
 # tentaflow-client/native i tentaflow-containers/sidecar.
 iroh = { workspace = true, features = ["portmapper", "tls-ring"] }
-iroh-relay = { workspace = true, features = ["server"] }
 iroh-mdns-address-lookup = { workspace = true }
 iroh-mainline-address-lookup = { workspace = true }
 tentaflow-transport = { workspace = true }
@@ -452,7 +451,6 @@ cozo = { workspace = true, features = ["storage-sled", "rayon"], optional = true
 cozo = { workspace = true, features = ["rayon"], optional = true }
 
 [build-dependencies]
-rcgen = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = true }
 toml = { workspace = true }

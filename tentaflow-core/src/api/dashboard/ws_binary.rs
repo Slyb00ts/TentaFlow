@@ -220,12 +220,17 @@ fn media_class(body: &MessageBody) -> Option<bool> {
 /// na to pozwala.
 /// `resume_secret` = HMAC key dla SubscribeResumeOffer tokens emitowanych przy
 /// IS_STREAM_END (zwykle reuse jwt_secret).
+/// Login attempts one client address may make per rate-limit window. Several
+/// people can share an address, so this sits above the per-username limit.
+const MAX_LOGINS_PER_CLIENT: usize = 30;
+
 pub async fn handle_ws_connection<S>(
     stream: S,
     user_id: Option<String>,
     role: Option<String>,
     resume_secret: std::sync::Arc<Vec<u8>>,
     app_state: std::sync::Arc<AppState>,
+    client_ip: String,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -278,8 +283,15 @@ pub async fn handle_ws_connection<S>(
 
     debug!("binary-WS: nowe polaczenie");
 
-    // Spawnuj task ktory pushuje audit eventy jako unsolicited frames.
-    {
+    // Unsolicited pumps are scoped to the connection's identity: the session
+    // is fixed at upgrade time, so an anonymous (pre-login) socket never
+    // receives any of them and the audit stream reaches admins only. A session
+    // still locked behind the forced password rotation counts as pre-login.
+    let is_authenticated = matches!(session, SessionAuth::UserSession { .. })
+        && role.as_deref() != Some("password_change_required");
+    let is_admin = is_authenticated && role.as_deref() == Some("admin");
+
+    if is_admin {
         let tx_audit = control_tx.clone();
         let mut audit_rx = audit_broadcast::subscribe();
         tokio::spawn(async move {
@@ -303,7 +315,7 @@ pub async fn handle_ws_connection<S>(
     // Spawnuj task pushujacy SystemEvent jako unsolicited frames — service status
     // + mesh peer status. GUI nasluchuje przez ApiBinary.onUnsolicited i pokazuje
     // toasty/odswieza karty bez pollowania.
-    {
+    if is_authenticated {
         let tx_sys = control_tx.clone();
         let mut sys_rx = crate::dispatch::system_event_broadcast::subscribe();
         let sys_user_id = user_id.clone();
@@ -339,7 +351,7 @@ pub async fn handle_ws_connection<S>(
     }
 
     // Spawnuj task pushujacy AddonPermissionChangedEvent jako unsolicited frames.
-    {
+    if is_authenticated {
         let tx_perm = control_tx.clone();
         let mut perm_rx = addon_perm_broadcast::subscribe();
         tokio::spawn(async move {
@@ -673,11 +685,34 @@ pub async fn handle_ws_connection<S>(
                 };
 
                 if let Err(error) = dispatch::check_password_rotation(&body, &ctx) {
-                    let _ = send_protocol_error(&control_tx, envelope.correlation_id, error.code, &error.message).await;
+                    let _ = send_protocol_error(
+                        &control_tx,
+                        envelope.correlation_id,
+                        error.code,
+                        &error.message,
+                    )
+                    .await;
                     continue;
                 }
 
                 let variant_name = dispatch::variant_name_of(&body);
+
+                // The handler limits attempts per username; that alone lets one
+                // client walk through many usernames. The address is known only
+                // at this layer, so the per-client limit lives here.
+                if variant_name == "AuthLoginRequest"
+                    && !crate::auth::rate_limit::LOGIN_RATE_LIMITER
+                        .check_and_record(&format!("ip:{client_ip}"), MAX_LOGINS_PER_CLIENT)
+                {
+                    let _ = send_protocol_error(
+                        &control_tx,
+                        envelope.correlation_id,
+                        ProtocolErrorCode::RateLimited,
+                        "too many login attempts",
+                    )
+                    .await;
+                    continue;
+                }
 
                 // Forward do innego wezla: osobny task (czeka do 45 s na wezel
                 // wykonawczy — petla odczytu nie moze na tym stac). Body
@@ -735,7 +770,7 @@ pub async fn handle_ws_connection<S>(
                     }
                     let registry = subscription::global();
                     let (sub, rx) = registry.create_with_capacity(
-                        envelope.correlation_id,
+                        subscription::SubscriptionKey::new(connection_id, envelope.correlation_id),
                         None,
                         subscription::channel_capacity_for(variant_name),
                     );
@@ -794,7 +829,12 @@ pub async fn handle_ws_connection<S>(
                                             // (galaz nizej) albo skonsumuje event Error z cancel.
                                             for cid in cancels {
                                                 if cid != correlation_id {
-                                                    subscription::global().cancel(cid);
+                                                    subscription::global().cancel(
+                                                        subscription::SubscriptionKey::new(
+                                                            connection_id,
+                                                            cid,
+                                                        ),
+                                                    );
                                                 }
                                             }
                                             if own_poisoned {
@@ -883,7 +923,10 @@ pub async fn handle_ws_connection<S>(
                             }
                         }
                         // Cleanup po naturalnym koncu (task wie kiedy stream sie konczy).
-                        subscription::global().cancel(correlation_id);
+                        subscription::global().cancel(subscription::SubscriptionKey::new(
+                            connection_id,
+                            correlation_id,
+                        ));
                     });
                     continue;
                 }
@@ -934,7 +977,7 @@ pub async fn handle_ws_connection<S>(
         let registry = subscription::global();
         let cleanup_count = owned_subscription_ids
             .iter()
-            .filter(|&&id| registry.cancel(id))
+            .filter(|&&id| registry.cancel(subscription::SubscriptionKey::new(connection_id, id)))
             .count();
         debug!(
             cleanup_count,

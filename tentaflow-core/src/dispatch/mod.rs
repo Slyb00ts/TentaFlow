@@ -50,6 +50,7 @@ pub mod ml_studio_remote_import;
 pub mod model_conversion;
 pub mod model_metrics;
 pub mod project_studio;
+pub mod provider_account;
 pub mod recorder;
 pub mod resume_token;
 pub mod robots;
@@ -2653,6 +2654,47 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tq::RunStateQueryResponse { .. } => "TentaQuantRunStateQueryResponse",
             }
         }
+        // Family prefix + the variant's own name, verbatim — the browser
+        // decoder builds the same string by concatenation
+        // (`decode_provider_account_payload`), so a variant has ONE name on
+        // both sides even where that repeats the word "Account".
+        MessageBody::ProviderAccountBody(p) => {
+            use tentaflow_protocol::provider_account::ProviderAccountPayload as Pa;
+            match p {
+                Pa::AccountListRequest { .. } => "ProviderAccountAccountListRequest",
+                Pa::AccountListResponse { .. } => "ProviderAccountAccountListResponse",
+                Pa::AccountGetRequest { .. } => "ProviderAccountAccountGetRequest",
+                Pa::AccountGetResponse { .. } => "ProviderAccountAccountGetResponse",
+                Pa::AccountCreateRequest { .. } => "ProviderAccountAccountCreateRequest",
+                Pa::AccountCreateResponse { .. } => "ProviderAccountAccountCreateResponse",
+                Pa::AccountUpdateRequest { .. } => "ProviderAccountAccountUpdateRequest",
+                Pa::AccountDeleteRequest { .. } => "ProviderAccountAccountDeleteRequest",
+                Pa::CredentialSetRequest { .. } => "ProviderAccountCredentialSetRequest",
+                Pa::CredentialClearRequest { .. } => "ProviderAccountCredentialClearRequest",
+                Pa::LoginStartRequest { .. } => "ProviderAccountLoginStartRequest",
+                Pa::LoginStartResponse { .. } => "ProviderAccountLoginStartResponse",
+                Pa::LoginInputRequest { .. } => "ProviderAccountLoginInputRequest",
+                Pa::LoginStatusRequest { .. } => "ProviderAccountLoginStatusRequest",
+                Pa::LoginStatusResponse { .. } => "ProviderAccountLoginStatusResponse",
+                Pa::LoginCancelRequest { .. } => "ProviderAccountLoginCancelRequest",
+                Pa::GrantsSetRequest { .. } => "ProviderAccountGrantsSetRequest",
+                Pa::GrantsSetResponse { .. } => "ProviderAccountGrantsSetResponse",
+                Pa::SessionListRequest { .. } => "ProviderAccountSessionListRequest",
+                Pa::SessionListResponse { .. } => "ProviderAccountSessionListResponse",
+                Pa::SessionRevokeRequest { .. } => "ProviderAccountSessionRevokeRequest",
+                Pa::MyAccountListRequest { .. } => "ProviderAccountMyAccountListRequest",
+                Pa::MyAccountListResponse { .. } => "ProviderAccountMyAccountListResponse",
+                Pa::RuntimeListRequest {} => "ProviderAccountRuntimeListRequest",
+                Pa::RuntimeListResponse { .. } => "ProviderAccountRuntimeListResponse",
+                Pa::RuntimeSetReceivesAccountsRequest { .. } => {
+                    "ProviderAccountRuntimeSetReceivesAccountsRequest"
+                }
+                Pa::RuntimeInstallRequest { .. } => "ProviderAccountRuntimeInstallRequest",
+                Pa::RuntimeUninstallRequest { .. } => "ProviderAccountRuntimeUninstallRequest",
+                Pa::RuntimeStatusResponse { .. } => "ProviderAccountRuntimeStatusResponse",
+                Pa::AccountOpAck { .. } => "ProviderAccountAccountOpAck",
+            }
+        }
     }
 }
 
@@ -4060,6 +4102,7 @@ mod tests {
         let owner = uuid::Uuid::from_bytes([7u8; 16]).to_string();
         let other = uuid::Uuid::from_bytes([8u8; 16]).to_string();
         let params = crate::db::models::AgentParams {
+            runtime_json: crate::agents::LLM_RUNTIME_JSON,
             id: "agent-1",
             name: "runner",
             display_name: None,
@@ -4141,6 +4184,7 @@ mod tests {
         let state = state::AppState::for_test();
         let owner = uuid::Uuid::from_bytes([7u8; 16]).to_string();
         let params = crate::db::models::AgentParams {
+            runtime_json: crate::agents::LLM_RUNTIME_JSON,
             id: "agent-2",
             name: "runner-two",
             display_name: None,
@@ -4203,6 +4247,7 @@ mod tests {
         let owner_bytes = [42u8; 16];
         let owner = uuid::Uuid::from_bytes(owner_bytes).to_string();
         let params = crate::db::models::AgentParams {
+            runtime_json: crate::agents::LLM_RUNTIME_JSON,
             id: "agent-r",
             name: "asker",
             display_name: None,

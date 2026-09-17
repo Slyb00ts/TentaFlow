@@ -14,7 +14,9 @@
 use std::sync::Arc;
 use tentaflow_core::dispatch::{
     self, recorder, resume_token,
-    subscription::{find_stream_handler, SubscriptionEvent, SubscriptionRegistry},
+    subscription::{
+        find_stream_handler, SubscriptionEvent, SubscriptionKey, SubscriptionRegistry,
+    },
     HandlerContext,
 };
 use tentaflow_protocol::{ChatMessage, ChatStreamRequest, MessageBody, SessionAuth};
@@ -24,7 +26,7 @@ async fn streaming_handler_emits_chunks_and_end() {
     // Pomijamy global recorder init (tests share global state — to OK dla
     // smoke; dla real CI uzywamy osobnego --test-threads=1).
     let reg = SubscriptionRegistry::new();
-    let (sub, mut rx) = reg.create(100, None);
+    let (sub, mut rx) = reg.create(SubscriptionKey::new(0, 100), None);
 
     let h = find_stream_handler("ChatStreamRequest").expect("handler registered");
     let req = MessageBody::ChatStreamRequestBody(ChatStreamRequest {
@@ -81,7 +83,7 @@ async fn resume_token_round_trip_through_subscribe_resume_handler() {
 
     // Krok 2: klient ze swojej strony wysyla SubscribeResumeRequest z tokenem.
     let reg = SubscriptionRegistry::new();
-    let (sub, mut rx) = reg.create(200, None);
+    let (sub, mut rx) = reg.create(SubscriptionKey::new(0, 200), None);
     let h = find_stream_handler("SubscribeResumeRequest").expect("registered");
     let req = MessageBody::SubscribeResumeRequest {
         resume_token: token_bytes,
@@ -121,7 +123,7 @@ async fn invalid_resume_token_results_in_negative_ack() {
     let _wrong_secret = b"wrong-secret".to_vec();
 
     let reg = SubscriptionRegistry::new();
-    let (sub, mut rx) = reg.create(300, None);
+    let (sub, mut rx) = reg.create(SubscriptionKey::new(0, 300), None);
     let h = find_stream_handler("SubscribeResumeRequest").expect("registered");
 
     // Wystawiamy token z innym sekretem — verify powinno failowac.

@@ -318,6 +318,7 @@ fn seed_agent(pool: &DbPool, id: &str, name: &str, tools_json: &str, max_subagen
     repository::upsert_agent(
         pool,
         &tentaflow_core::db::models::AgentParams {
+            runtime_json: tentaflow_core::agents::LLM_RUNTIME_JSON,
             id,
             name,
             display_name: None,

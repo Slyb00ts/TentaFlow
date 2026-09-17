@@ -11,6 +11,11 @@ struct Artifact {
     size: u64,
 }
 
+/// Every entry was downloaded over HTTPS and hashed; the Muse ones also match
+/// the vendor's own release manifest
+/// (`.../muse/download/?channel=muse&version=<version>&file=manifest.json`).
+/// A platform with no verified artifact is refused rather than guessed, which
+/// is why the table is keyed by the exact pinned version.
 fn artifact(engine: &str, version: &str, os: &str, arch: &str) -> DeployResult<Artifact> {
     let (url, sha256, size) = match (engine, version, os, arch) {
         ("muse-code", "1.0.3-R2198.1", "macos", "aarch64") => (
@@ -19,12 +24,24 @@ fn artifact(engine: &str, version: &str, os: &str, arch: &str) -> DeployResult<A
         ("muse-code", "1.0.3-R2198.1", "macos", "x86_64") => (
             "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=1.0.3-R2198.1&file=muse-x86-macos",
             "dbcee07bd234fc19805d5d6a358c591b79cc7d781311d10219f856d934843ac2", 263883536),
+        ("muse-code", "1.0.3-R2198.1", "linux", "x86_64") => (
+            "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=1.0.3-R2198.1&file=muse-x86-linux",
+            "75a68f98c437dfd17d264730c5bc72d57e5f1e18d10472a9f53261ffcc091352", 263960760),
+        ("muse-code", "1.0.3-R2198.1", "linux", "aarch64") => (
+            "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=1.0.3-R2198.1&file=muse-aarch64-linux",
+            "4ffcf55f5eb0668643f30c5febd90d188b9a2da65858918444d31f6046940120", 235063400),
         ("grok-build", "1.0.13", "macos", "aarch64") => (
             "https://x.ai/cli/grok-1.0.13-macos-aarch64",
             "8669e0fdadceec25b8c159c355f427ffbd82583525d774b6ab1522197ea83b80", 133486016),
         ("grok-build", "1.0.13", "macos", "x86_64") => (
             "https://x.ai/cli/grok-1.0.13-macos-x86_64",
             "8eacec87f5ecdb9259c6d812d12ce9e2d405b1526e36ae9d7fc81ec31dbd74d6", 149694528),
+        ("grok-build", "1.0.13", "linux", "x86_64") => (
+            "https://x.ai/cli/grok-1.0.13-linux-x86_64",
+            "edf79521581bb5e6b95abef848491a6a742e860da3e237ebe86a280d30dce4c1", 166079904),
+        ("grok-build", "1.0.13", "linux", "aarch64") => (
+            "https://x.ai/cli/grok-1.0.13-linux-aarch64",
+            "b926fc5308374396e260e7efbd6107231a8dae13c084ddaf0fe89b7ebb3edd25", 135641288),
         _ => return Err(DeployError::Manifest(format!("no verified {engine} {version} artifact for {os}/{arch}"))),
     };
     Ok(Artifact { url, sha256, size })
@@ -111,11 +128,7 @@ pub(super) async fn install(
     acquire_install_lock(&lock, std::time::Duration::from_secs(300)).await?;
     let bin = if let Some(package) = package {
         let bin = root.join("node_modules/.bin");
-        let name = if cfg!(windows) {
-            format!("{executable}.cmd")
-        } else {
-            executable.into()
-        };
+        let name = executable.to_string();
         let completion = root.join("installation-complete");
         let identity = format!("{package}@{version}");
         if !bin.join(&name).is_file()
@@ -137,7 +150,7 @@ pub(super) async fn install(
             for config in [&user_config, &global_config] {
                 std::fs::write(config, b"").map_err(|e| DeployError::Other(e.to_string()))?;
             }
-            let output = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+            let output = Command::new("npm")
                 .env_clear()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("HOME", &home)
@@ -325,5 +338,16 @@ mod tests {
         }
         assert!(artifact("grok-build", "latest", "macos", "aarch64").is_err());
         assert!(artifact("muse-code", "1.0.3-R2198.1", "windows", "x86_64").is_err());
+        // Every platform the two manifests now declare has a pinned artifact
+        // for both architectures a node can run on.
+        for (engine, version) in [("grok-build", "1.0.13"), ("muse-code", "1.0.3-R2198.1")] {
+            for os in ["linux", "macos"] {
+                for arch in ["x86_64", "aarch64"] {
+                    let pinned = artifact(engine, version, os, arch).unwrap();
+                    assert_eq!(pinned.sha256.len(), 64, "{engine} {os}/{arch}");
+                    assert!(pinned.size > 0 && pinned.url.starts_with("https://"));
+                }
+            }
+        }
     }
 }
