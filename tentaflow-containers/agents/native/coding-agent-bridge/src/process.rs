@@ -360,9 +360,58 @@ fn process_identity(pid: u32) -> Result<(u64, u64)> {
             .parse::<u64>()?;
         return Ok((ticks, 0));
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        return windows_birth_identity(pid);
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    )))]
     {
         anyhow::bail!("managed process identity is unavailable on this platform")
+    }
+}
+
+/// The pid alone is unsafe on Windows (pids are reused aggressively), so the
+/// recorded identity is the process creation time; a reused pid never matches.
+#[cfg(target_os = "windows")]
+fn windows_birth_identity(pid: u32) -> Result<(u64, u64)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            anyhow::bail!("OpenProcess pid={pid} returned null");
+        }
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if ok == 0 {
+            anyhow::bail!("GetProcessTimes pid={pid} failed");
+        }
+        Ok((
+            ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64,
+            0,
+        ))
     }
 }
 fn kill_identified(pid: u32, expected: (u64, u64), has_supervisor: bool) -> bool {

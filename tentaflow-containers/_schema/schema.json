@@ -129,7 +129,7 @@
         "platforms": { "$ref": "#/$defs/platforms" },
         "runtime": {
           "type": "string",
-          "enum": ["embedded", "binary", "python-bundle"]
+          "enum": ["embedded", "binary", "python-bundle", "managed-cli"]
         },
         "feature_flag": { "type": "string", "minLength": 1 },
         "binary_path": { "type": "string", "minLength": 1 },
@@ -162,6 +162,16 @@
             "not": { "anyOf": [
               { "required": ["feature_flag"] },
               { "required": ["binary_path"] }
+            ]}
+          }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "managed-cli" } } },
+          "then": {
+            "required": ["binary_path"],
+            "not": { "anyOf": [
+              { "required": ["feature_flag"] },
+              { "required": ["bundle_path"] }
             ]}
           }
         }

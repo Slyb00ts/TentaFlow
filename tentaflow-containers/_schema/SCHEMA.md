@@ -75,9 +75,9 @@ download_size_mb = 8500                    # OPTIONAL
 # `runtime` decyduje o sposobie uruchomienia natywnego silnika.
 [deploy.native]
 platforms = ["linux", "macos", "windows"]  # REQUIRED
-runtime = "embedded"                       # REQUIRED: embedded | binary | python-bundle
+runtime = "embedded"                       # REQUIRED: embedded | binary | python-bundle | managed-cli
 feature_flag = "inference-llamacpp"        # opcjonalne gdy runtime = embedded (gating przez Cargo feature)
-# binary_path = "tts/native/sherpa-onnx"   # gdy runtime = binary
+# binary_path = "tts/native/sherpa-onnx"   # gdy runtime = binary | managed-cli
 # bundle_path = "llm/python/vllm"          # gdy runtime = python-bundle
 
 # Sekcja [deploy.external] — opcjonalna; w wizardzie przycisk "External".

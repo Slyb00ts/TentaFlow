@@ -562,10 +562,11 @@ fn preflight(ctx: &MoveContext, requester: &str, manifest: &Manifest) -> Result<
         bail!("account transfer node binding mismatch");
     }
     admin(&ctx.db, &manifest.actor_user_id)?;
-    if !cfg!(target_os = "macos") {
-        bail!("target does not support managed provider process networking");
-    }
-    crate::code_studio::process_sandbox::ProcessSandbox::check_available()?;
+    // Capability-gated, not OS-gated: macOS runs the sandbox-exec + launchd
+    // supervisor pair, Linux runs bwrap. A node with neither refuses the
+    // transfer honestly instead of accepting unsandboxed credential storage.
+    crate::code_studio::process_sandbox::ProcessSandbox::check_available()
+        .map_err(|error| anyhow!("target does not support managed provider process networking: {error}"))?;
     let conn = ctx.db.read().map_err(|error| anyhow!(error.to_string()))?;
     for user in &manifest.grants {
         if !conn.query_row(

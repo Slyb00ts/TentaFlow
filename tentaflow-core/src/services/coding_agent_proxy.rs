@@ -68,13 +68,7 @@ impl AgentProxy {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    #[cfg(unix)]
-                    let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-                    #[cfg(not(unix))]
-                    let alive = {
-                        let _ = pid;
-                        false
-                    };
+                    let alive = crate::deploy::process_ctl::is_alive(pid);
                     if !alive || task.is_finished() {
                         task.abort();
                         let mut owners = runtime_owners().lock();
@@ -101,9 +95,6 @@ impl Drop for AgentProxy {
 }
 
 pub async fn start(engine_id: &str, account_id: &str) -> Result<AgentProxy> {
-    if !cfg!(target_os = "macos") {
-        bail!("native agent proxy isolation is currently supported only on macOS");
-    }
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
