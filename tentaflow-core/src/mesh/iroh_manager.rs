@@ -934,14 +934,19 @@ impl IrohMeshManager {
                     };
                     let mut stream =
                         crate::sync::baseline_transport::IrohFrameStream::new(send, recv);
-                    match crate::sync::baseline_transport::run_donor_session(
+                    let outcome = crate::sync::baseline_transport::run_donor_session(
                         &mut stream,
                         &security,
                         &local_node_id,
                         &remote_hex,
                     )
-                    .await
-                    {
+                    .await;
+                    // A refusal writes its nack and returns at once; dropping the
+                    // connection here would discard that frame, and the joiner would
+                    // only ever see "connection lost" instead of why it was refused.
+                    // A session that already finished its stream makes this a no-op.
+                    let _ = crate::sync::baseline_transport::FrameStream::finish(&mut stream).await;
+                    match outcome {
                         Ok(()) => info!(peer = %remote_hex, "baseline: donor session OK"),
                         Err(e) => warn!(peer = %remote_hex, "baseline: donor session blad: {}", e),
                     }

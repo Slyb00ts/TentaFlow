@@ -1870,6 +1870,52 @@ impl SyncRuntime {
             limit: Some(payload.limit as usize),
         })?;
         entries.sort_by_key(|entry| entry.node_seq());
+        // The floor only knows where live content STARTS, not that the chain is
+        // whole above it: a position whose row is gone (a baseline reset keeps the
+        // node_log index of the core ops it deletes) leaves a hole the scan skips.
+        // Served as-is, the slice claimed to start at `from_node_seq` while its
+        // first op sat past the hole, so the requester rejected every response as a
+        // gap and re-pulled the same range forever. A hole at the start is the same
+        // situation as a request below the floor; a hole further in ends the slice,
+        // and the next pull starts at it.
+        if let Some(first_seq) = entries.first().map(NodeChainEntry::node_seq) {
+            if first_seq > from_node_seq {
+                match self.escalate_pull_to_snapshot(source_node_id, &payload, first_seq)? {
+                    Some(result) => return Ok(result),
+                    None => {
+                        if self
+                            .floor_anchor_warned
+                            .lock()
+                            .insert(payload.target_node_id.clone())
+                        {
+                            warn!(
+                                "sync pull for node {} from {from_node_seq} hits a hole in the \
+                                 chain up to {first_seq} with no covering snapshot (requested \
+                                 by {source_node_id}); serving from {first_seq} so the requester \
+                                 can anchor there",
+                                payload.target_node_id
+                            );
+                        }
+                        from_node_seq = first_seq;
+                    }
+                }
+            }
+        }
+        let dense = entries
+            .iter()
+            .zip(from_node_seq..)
+            .take_while(|(entry, seq)| entry.node_seq() == *seq)
+            .count();
+        entries.truncate(dense);
+        // Nothing servable from `from_node_seq` on: every remaining position is an
+        // index entry whose content is gone. Advertising the frontier as the tip
+        // told the requester there was more to fetch, so it re-queued the same
+        // repair on every tick without ever receiving an op.
+        let serving_tip_node_seq = if entries.is_empty() {
+            serving_tip_node_seq.min(from_node_seq.saturating_sub(1))
+        } else {
+            serving_tip_node_seq
+        };
         // Per-op permission gating: an op the requester is a sync target for is
         // served in full; one it is NOT is served as a signed redacted placeholder
         // (chain proof only, no body). This keeps the per-node chain DENSE for the
@@ -1889,7 +1935,9 @@ impl SyncRuntime {
                 // this value, and a floor-anchored slice starts at the floor.
                 from_node_seq,
                 operations: wire,
-                serving_floor_node_seq,
+                // Raised to the slice start when a hole moved it: the requester
+                // anchors only on a floor above the seq it still expects.
+                serving_floor_node_seq: serving_floor_node_seq.max(from_node_seq),
                 serving_tip_node_seq,
             },
         ))
@@ -1917,7 +1965,13 @@ impl SyncRuntime {
             Some(op_id) => op_id,
             None => return Ok(None),
         };
-        let partition_id = self.ledger.get_operation(floor_op_id)?.body.partition_id;
+        // A position held only redacted carries no partition, so no snapshot can
+        // be located for it; the caller then anchors the requester there instead.
+        let partition_id = match self.ledger.get_operation(floor_op_id) {
+            Ok(operation) => operation.body.partition_id,
+            Err(SyncLedgerError::OperationNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let Some(snapshot) = self.ledger.latest_snapshot(partition_id.clone(), None)? else {
             return Ok(None);
         };
@@ -5768,6 +5822,170 @@ mod tests {
                     .is_none(),
                 "redacted op must never materialize"
             );
+        });
+    }
+
+    /// A relay that held an author's chain as redacted and full positions, then
+    /// reset its core partitions, keeps the redacted records and loses the full
+    /// rows: the chain reads redacted, hole, redacted. The serving floor counts
+    /// only full current-epoch ops, so it sits at 0 and a pull INTO the hole used
+    /// to answer with a slice that claimed to start at the requested seq but
+    /// began past the hole — the requester rejected it as a gap on every retry.
+    #[test]
+    fn pull_into_a_hole_after_a_reset_anchors_the_requester_past_it() {
+        with_tmp_home(|| {
+            let author = make_runtime(150);
+            let relay = make_runtime(151);
+            let joiner = make_runtime(152);
+            let relay_id = relay.runtime.local_node_id.clone();
+            let author_id = author.runtime.local_node_id.clone();
+            for id in ["flow-kept-1", "flow-kept-2"] {
+                for db in [&author.runtime.db, &relay.runtime.db] {
+                    seed_core_authority_target_for_resource(db, "core.flow", id, &relay_id);
+                }
+            }
+            // seq 1 and 4 reach the relay redacted, seq 2 and 3 in full.
+            for (id, name) in [
+                ("flow-hidden-1", "Hidden 1"),
+                ("flow-kept-1", "Kept 1"),
+                ("flow-kept-2", "Kept 2"),
+                ("flow-hidden-2", "Hidden 2"),
+            ] {
+                author
+                    .runtime
+                    .record_core_capture(complete_core_flow_capture(id, name))
+                    .expect("record");
+            }
+            let pull = |from_node_seq| MeshSyncPullPayload {
+                from_node_id: relay_id.clone(),
+                target_node_id: author_id.clone(),
+                from_node_seq,
+                limit: 64,
+            };
+            let MeshSyncPullResult::Operations(chain) = author
+                .runtime
+                .handle_pull_payload(&relay_id, pull(1))
+                .expect("author serves its chain")
+            else {
+                panic!("expected operations");
+            };
+            relay
+                .runtime
+                .handle_pull_response_payload(&author_id, chain)
+                .expect("relay admits the chain");
+            relay
+                .runtime
+                .ledger
+                .reset_core_partitions()
+                .expect("core reset");
+
+            let joiner_id = joiner.runtime.local_node_id.clone();
+            let MeshSyncPullResult::Operations(response) = relay
+                .runtime
+                .handle_pull_payload(
+                    &joiner_id,
+                    MeshSyncPullPayload {
+                        from_node_id: joiner_id.clone(),
+                        target_node_id: author_id.clone(),
+                        from_node_seq: 2,
+                        limit: 64,
+                    },
+                )
+                .expect("a pull into the hole is served")
+            else {
+                panic!("no snapshot covers the hole, so a log slice is served");
+            };
+            assert_eq!(response.from_node_seq, 4, "the slice starts past the hole");
+            assert_eq!(response.serving_floor_node_seq, 4);
+            assert_eq!(response.operations.len(), 1);
+
+            joiner
+                .runtime
+                .handle_pull_response_payload(&relay_id, response)
+                .expect("the requester accepts the slice instead of reporting a gap");
+            let frontier = joiner
+                .runtime
+                .ledger
+                .get_node_frontier(&author_id)
+                .expect("frontier")
+                .expect("frontier present");
+            assert_eq!(frontier.last_seq, 4, "the requester anchors past the hole");
+        });
+    }
+
+    /// A relay whose copy of a chain is only index entries without content has
+    /// nothing to serve, yet it used to advertise its frontier as the tip, so the
+    /// requester kept its repair open and pulled the same empty range forever.
+    #[test]
+    fn a_pull_with_nothing_servable_closes_the_requesters_repair() {
+        with_tmp_home(|| {
+            let author = make_runtime(153);
+            let relay = make_runtime(154);
+            let joiner = make_runtime(155);
+            let relay_id = relay.runtime.local_node_id.clone();
+            let author_id = author.runtime.local_node_id.clone();
+            for db in [&author.runtime.db, &relay.runtime.db] {
+                seed_core_authority_target_for_resource(db, "core.flow", "flow-gone", &relay_id);
+            }
+            author
+                .runtime
+                .record_core_capture(complete_core_flow_capture("flow-gone", "Gone"))
+                .expect("record");
+            let MeshSyncPullResult::Operations(chain) = author
+                .runtime
+                .handle_pull_payload(
+                    &relay_id,
+                    MeshSyncPullPayload {
+                        from_node_id: relay_id.clone(),
+                        target_node_id: author_id.clone(),
+                        from_node_seq: 1,
+                        limit: 64,
+                    },
+                )
+                .expect("author serves its chain")
+            else {
+                panic!("expected operations");
+            };
+            relay
+                .runtime
+                .handle_pull_response_payload(&author_id, chain)
+                .expect("relay admits the chain");
+            relay
+                .runtime
+                .ledger
+                .reset_core_partitions()
+                .expect("core reset");
+
+            let joiner_id = joiner.runtime.local_node_id.clone();
+            joiner.runtime.queue_repair_request(&relay_id, &author_id, 1);
+            let MeshSyncPullResult::Operations(response) = relay
+                .runtime
+                .handle_pull_payload(
+                    &joiner_id,
+                    MeshSyncPullPayload {
+                        from_node_id: joiner_id.clone(),
+                        target_node_id: author_id.clone(),
+                        from_node_seq: 1,
+                        limit: 64,
+                    },
+                )
+                .expect("an empty pull is served")
+            else {
+                panic!("expected operations");
+            };
+            assert!(response.operations.is_empty());
+            assert_eq!(response.serving_tip_node_seq, 0);
+
+            joiner
+                .runtime
+                .handle_pull_response_payload(&relay_id, response)
+                .expect("empty response applies");
+            let open = joiner
+                .runtime
+                .ledger
+                .list_due_repair_requests(PeerId::new(relay_id).expect("peer"), i64::MAX, 16)
+                .expect("repairs");
+            assert!(open.is_empty(), "nothing left to pull: {open:?}");
         });
     }
 

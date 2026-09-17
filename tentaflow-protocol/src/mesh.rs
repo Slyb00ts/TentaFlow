@@ -2261,6 +2261,10 @@ pub struct BaselineHeader {
 pub struct BaselineChunk {
     pub seq: u64,
     pub content_hash: [u8; 32],
+    /// A CBOR byte string, not an array of integers: as an array every byte from
+    /// 24 up costs two bytes on the wire, so a full chunk of real snapshot data
+    /// outgrew the frame limit and no baseline larger than one chunk could move.
+    #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
 

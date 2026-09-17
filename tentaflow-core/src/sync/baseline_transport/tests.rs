@@ -11,7 +11,7 @@ use super::*;
 use crate::crypto::SettingsCipher;
 use crate::db::{self, DbPool};
 use crate::mesh::security::MeshSecurity;
-use crate::sync::core_baseline::{load_adopt_state, BaselinePhase, BaselineRole};
+use crate::sync::core_baseline::{load_adopt_state, BaselinePhase, BaselineRole, BASELINE_CHUNK_BYTES};
 use std::sync::Arc;
 use tentaflow_protocol::mesh::BaselineEpoch;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -554,6 +554,29 @@ async fn joiner_aborts_on_ack_role_mismatch() {
         )
         .unwrap();
     assert!(has_joiner_org, "joiner org must be untouched on abort");
+}
+
+/// A full chunk of incompressible bytes must fit one frame. The fixtures above
+/// produce snapshots smaller than a chunk, and all-zero payloads encode one byte
+/// per byte either way, so neither could notice a chunk encoding that doubles
+/// real data past `MAX_BASELINE_FRAME_BYTES`.
+#[tokio::test]
+async fn a_full_chunk_of_high_entropy_bytes_fits_one_frame() {
+    let raw: Vec<u8> = (0..BASELINE_CHUNK_BYTES * 2)
+        .map(|i| blake3::hash(&(i as u64).to_le_bytes()).as_bytes()[0])
+        .collect();
+    let chunks = chunk_snapshot(&raw);
+    assert_eq!(chunks.len(), 2);
+
+    let (mut sender, mut receiver) = DuplexFrameStream::pair();
+    for chunk in &chunks {
+        write_frame(&mut sender, chunk, "chunk")
+            .await
+            .expect("a full chunk must fit the frame limit");
+        let received: BaselineChunk = read_frame(&mut receiver, "chunk").await.unwrap();
+        assert_eq!(received.seq, chunk.seq);
+        assert_eq!(received.bytes, chunk.bytes);
+    }
 }
 
 #[tokio::test]
