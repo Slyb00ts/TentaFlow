@@ -101,7 +101,11 @@ impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
         meta.user_id = principal.user_id.clone();
         meta.org_id = principal.org_id.clone();
         let outcome = dispatcher
-            .dispatch_by_flow_id_background(flow_id, initial, meta)
+            .dispatch_by_flow_id_background(
+                crate::flow_engine::dispatcher::FlowRef::live(flow_id),
+                initial,
+                meta,
+            )
             .await
             .map_err(|e| anyhow::anyhow!("reactive flow dispatch failed: {e}"))?;
         if let Some(err) = outcome.error {

@@ -6834,7 +6834,10 @@ async fn start_session_run(
             &[],
             &[(tools::SESSION_META_KEY, binding)],
             None,
-            Some(&scope.session.flow_id),
+            Some(crate::flow_engine::dispatcher::FlowRef {
+                flow_id: scope.session.flow_id.clone(),
+                version_id: resolved.version_id.clone(),
+            }),
         )
         .await
         .map_err(|e| ProtocolError::internal(format!("cannot start an agent run: {e:#}")))?;

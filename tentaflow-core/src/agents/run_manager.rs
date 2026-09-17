@@ -18,6 +18,7 @@
 // marked `interrupted` (honest v1; resume is out of scope). Mailbox and
 // auto-continuation are phase 7 and deliberately absent. =====
 
+use crate::flow_engine::dispatcher::FlowRef;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -159,7 +160,7 @@ pub struct AgentFlowOutcome {
 /// manager's orchestration (semaphore, watch, cancel, heartbeat) is unit-testable
 #[async_trait]
 pub trait BackgroundFlowRunner: Send + Sync {
-    /// Runs `flow_id` with `initial` as the trigger input under `principal`,
+    /// Runs `flow` with `initial` as the trigger input under `principal`,
     /// governed by `deadline` and `cancel`. Returns the final answer and what it
     /// cost. The `agent_run_id` already lives in `initial.meta`, so the harness flow's
     /// `agent_context` reuses the manager-created row instead of opening a new
@@ -167,7 +168,7 @@ pub trait BackgroundFlowRunner: Send + Sync {
     /// to; `scope` is the run id broadcast key.
     async fn run_agent_flow(
         &self,
-        flow_id: String,
+        flow: FlowRef,
         initial: FlowEnvelope,
         principal: AgentPrincipal,
         deadline: Option<Instant>,
@@ -395,9 +396,9 @@ impl AgentRunManager {
     /// Project Studio `ps_generation`): no post-spawn write, no race with the
     /// first tool call.
     ///
-    /// `flow_override` replaces the harness graph this run executes. It exists
-    /// for Code Studio, where the graph is a property of the SESSION (§16) and
-    /// not of the agent definition.
+    /// `flow_override` replaces the harness graph this run executes, at the
+    /// version it names. It exists for Code Studio, where the graph is a property
+    /// of the SESSION (§16) and not of the agent definition.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         &self,
@@ -408,7 +409,7 @@ impl AgentRunManager {
         inherited_tools: &[String],
         extra_meta: &[(&str, Value)],
         target_session_id: Option<&str>,
-        flow_override: Option<&str>,
+        flow_override: Option<FlowRef>,
     ) -> Result<String> {
         self.spawn_with_run_id(
             &uuid::Uuid::new_v4().to_string(),
@@ -441,7 +442,7 @@ impl AgentRunManager {
         inherited_tools: &[String],
         extra_meta: &[(&str, Value)],
         target_session_id: Option<&str>,
-        flow_override: Option<&str>,
+        flow_override: Option<FlowRef>,
     ) -> Result<String> {
         let agent = repository::get_agent(&self.db, agent_id)?
             .ok_or_else(|| anyhow!("agent '{agent_id}' not found"))?;
@@ -480,11 +481,17 @@ impl AgentRunManager {
         // and that pin belongs to the SESSION, not to the agent definition — the
         // same agent serves every workspace. The caller therefore names the flow
         // when it has one; everyone else keeps the agent's own harness.
-        let flow_id = flow_override
-            .filter(|s| !s.is_empty())
-            .or(agent.flow_id.as_deref().filter(|s| !s.is_empty()))
-            .unwrap_or(crate::flow_engine::node_adapters::AGENT_RUN_FLOW_ID)
-            .to_string();
+        let flow = flow_override
+            .filter(|flow| !flow.flow_id.is_empty())
+            .unwrap_or_else(|| {
+                FlowRef::live(
+                    agent
+                        .flow_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(crate::flow_engine::node_adapters::AGENT_RUN_FLOW_ID),
+                )
+            });
 
         // The permit is acquired INSIDE the task, not here: a saturated pool must
         // not block `spawn` (a parent dispatching a batch returns immediately, the
@@ -525,7 +532,7 @@ impl AgentRunManager {
             agent_id: agent.id.clone(),
             parent_run_id: parent_run_id.map(|s| s.to_string()),
             target_session_id: target_session_id.map(|s| s.to_string()),
-            flow_id,
+            flow,
             initial,
             principal: principal.clone(),
             deadline,
@@ -1273,7 +1280,7 @@ struct TaskContext {
     /// Chat session the spawning context belonged to — the mailbox
     /// `target_session_id` for this child's result.
     target_session_id: Option<String>,
-    flow_id: String,
+    flow: FlowRef,
     initial: FlowEnvelope,
     principal: AgentPrincipal,
     deadline: Option<Instant>,
@@ -1301,7 +1308,7 @@ async fn run_task(ctx: TaskContext) {
         agent_id,
         parent_run_id,
         target_session_id,
-        flow_id,
+        flow,
         initial,
         principal,
         deadline,
@@ -1394,7 +1401,7 @@ async fn run_task(ctx: TaskContext) {
 
     let outcome = runner
         .run_agent_flow(
-            flow_id,
+            flow,
             initial,
             principal,
             deadline,
@@ -1736,7 +1743,7 @@ impl FlowDispatcherRunner {
 impl BackgroundFlowRunner for FlowDispatcherRunner {
     async fn run_agent_flow(
         &self,
-        flow_id: String,
+        flow: FlowRef,
         initial: FlowEnvelope,
         principal: AgentPrincipal,
         deadline: Option<Instant>,
@@ -1775,7 +1782,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
         };
 
         let outcome = dispatcher
-            .dispatch_by_flow_id_background(flow_id, initial, meta)
+            .dispatch_by_flow_id_background(flow, initial, meta)
             .await
             .map_err(|e| anyhow!("agent flow dispatch failed: {e}"))?;
         if let Some(err) = outcome.error {
@@ -1931,7 +1938,7 @@ mod tests {
     impl BackgroundFlowRunner for GatedRunner {
         async fn run_agent_flow(
             &self,
-            _flow_id: String,
+            _flow: FlowRef,
             _initial: FlowEnvelope,
             _principal: AgentPrincipal,
             _deadline: Option<Instant>,
@@ -1962,7 +1969,7 @@ mod tests {
     impl BackgroundFlowRunner for InstantRunner {
         async fn run_agent_flow(
             &self,
-            _flow_id: String,
+            _flow: FlowRef,
             _initial: FlowEnvelope,
             _principal: AgentPrincipal,
             _deadline: Option<Instant>,

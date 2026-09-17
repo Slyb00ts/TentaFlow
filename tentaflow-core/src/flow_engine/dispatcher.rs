@@ -421,6 +421,28 @@ impl CallProvenance {
     }
 }
 
+/// A flow named outright by the caller, optionally at one stored version.
+///
+/// `version_id` runs that version's graph instead of the flow's current one: a
+/// Code Studio session is pinned to the harness version it opened with, and
+/// resolving the flow by id alone would silently run whatever the graph was
+/// edited into since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowRef {
+    pub flow_id: String,
+    pub version_id: Option<String>,
+}
+
+impl FlowRef {
+    /// The flow's current graph.
+    pub fn live(flow_id: impl Into<String>) -> Self {
+        Self {
+            flow_id: flow_id.into(),
+            version_id: None,
+        }
+    }
+}
+
 /// Per-request metadata przekazywane przez callera. FlowDispatcher buduje z
 /// tego `ExecutionContext` (klonując Arc'i dispatcherów + clock + blobs).
 #[derive(Clone)]
@@ -1056,16 +1078,27 @@ impl FlowDispatcher {
     /// resolver-unreachable system flows (no per-user ACL rows).
     pub async fn dispatch_by_flow_id_background(
         &self,
-        flow_id: String,
+        target: FlowRef,
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let pool = self.db.clone();
-        let lookup_id = flow_id.clone();
-        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, &lookup_id))
-            .await
-            .map_err(|e| DispatchError::Internal(e.to_string()))?
-            .map_err(|e| DispatchError::Internal(e.to_string()))?;
+        let lookup = target.clone();
+        let (flow_opt, version_json) = tokio::task::spawn_blocking(move || {
+            let flow = repository::get_flow(&pool, &lookup.flow_id)?;
+            let version_json = match &lookup.version_id {
+                Some(version_id) => Some(
+                    repository::get_flow_version(&pool, &lookup.flow_id, version_id)?
+                        .and_then(|version| version.flow_json),
+                ),
+                None => None,
+            };
+            anyhow::Ok((flow, version_json))
+        })
+        .await
+        .map_err(|e| DispatchError::Internal(e.to_string()))?
+        .map_err(|e| DispatchError::Internal(e.to_string()))?;
+        let flow_id = target.flow_id;
         let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
             flow_id: flow_id.clone(),
             msg: "flow id does not exist in DB".to_string(),
@@ -1076,7 +1109,20 @@ impl FlowDispatcher {
                 msg: format!("flow status='{}' (not active)", flow.status),
             });
         }
-        let compiled = match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
+        let flow_json = match version_json {
+            None => flow.flow_json,
+            Some(Some(json)) => json,
+            Some(None) => {
+                return Err(DispatchError::CompileFailed {
+                    flow_id,
+                    msg: format!(
+                        "pinned version '{}' does not exist",
+                        target.version_id.unwrap_or_default()
+                    ),
+                });
+            }
+        };
+        let compiled = match CompiledFlow::from_json(&flow.id, &flow_json, &self.registry) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 return Err(DispatchError::CompileFailed {

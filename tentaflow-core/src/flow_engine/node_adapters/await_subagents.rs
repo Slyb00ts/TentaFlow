@@ -227,7 +227,7 @@ mod tests {
     impl BackgroundFlowRunner for InstantRunner {
         async fn run_agent_flow(
             &self,
-            _flow_id: String,
+            _flow: crate::flow_engine::dispatcher::FlowRef,
             _initial: FlowEnvelope,
             _principal: AgentPrincipal,
             _deadline: Option<Instant>,

@@ -3305,9 +3305,9 @@ pub fn restore_factory_version(
 /// rules under a conversation that is already in flight, and the timeline would
 /// no longer explain itself. The live flow is used only when the pinned version
 /// is gone (pruned by the 5-version window), and that fallback is reported so
-/// the caller can say which graph it ran.
+/// the caller can say which graph it ran. The run itself loads the graph from
+/// the version named here, so what is checked is what executes.
 pub struct ResolvedFlow {
-    pub flow_json: String,
     pub version_id: Option<String>,
     /// True when the pinned version no longer exists and the live graph was
     /// used instead.
@@ -3319,19 +3319,17 @@ pub fn resolve_session_flow(db: &DbPool, session: &SessionRecord) -> Result<Reso
         if let Some(version) =
             crate::db::repository::get_flow_version(db, &session.flow_id, &session.flow_version_id)?
         {
-            if let Some(flow_json) = version.flow_json {
+            if version.flow_json.is_some() {
                 return Ok(ResolvedFlow {
-                    flow_json,
                     version_id: Some(version.id),
                     fell_back_to_live: false,
                 });
             }
         }
     }
-    let flow = crate::db::repository::get_flow(db, &session.flow_id)?
+    crate::db::repository::get_flow(db, &session.flow_id)?
         .ok_or_else(|| anyhow!("session flow '{}' no longer exists", session.flow_id))?;
     Ok(ResolvedFlow {
-        flow_json: flow.flow_json,
         version_id: None,
         fell_back_to_live: true,
     })

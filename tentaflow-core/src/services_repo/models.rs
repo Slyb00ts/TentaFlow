@@ -316,10 +316,14 @@ pub fn list_alive(conn: &Connection) -> Result<Vec<ModelWithService>> {
 
 /// The model an agent falls back to when its definition names none.
 ///
-/// „Default" means, in order: a model a service explicitly marked default, then
-/// the oldest model of any service that can actually serve. A model whose
-/// service is down would only move the failure one step later, so the join is
-/// part of the answer rather than a filter applied by the caller.
+/// „Default" means, in order: a chat model a service explicitly marked default,
+/// then the oldest chat model of any service that can actually serve. A model
+/// whose service is down would only move the failure one step later, so the
+/// join is part of the answer rather than a filter applied by the caller.
+///
+/// Only models tagged `chat` qualify. Every service marks its first model
+/// default, so without the tag an embeddings or speech service registered
+/// before any LLM handed an agent a model that cannot answer a conversation.
 ///
 /// Returns `None` on a node with no usable model at all — the caller turns that
 /// into an actionable message instead of a bare "no model".
@@ -328,9 +332,59 @@ pub fn default_llm_model(conn: &Connection) -> rusqlite::Result<Option<String>> 
         "SELECT m.model_name FROM model_registry m \
          JOIN services s ON s.id = m.service_id \
          WHERE s.status IN ('running', 'degraded') \
+           AND json_valid(m.capabilities) \
+           AND EXISTS (SELECT 1 FROM json_each(m.capabilities) WHERE value = 'chat') \
          ORDER BY m.is_default DESC, m.id ASC LIMIT 1",
         [],
         |row| row.get::<_, String>(0),
     )
     .optional()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::transport::Transport;
+    use crate::services_repo::services::{self, DeployMethod, NewService, ServiceStatus};
+
+    fn running_service(conn: &Connection, engine: &str) -> i64 {
+        let id = services::insert(
+            conn,
+            &NewService::minimal(engine, DeployMethod::Docker, Transport::HttpDirect),
+        )
+        .unwrap();
+        services::update_status(conn, id, ServiceStatus::Running).unwrap();
+        id
+    }
+
+    fn model(conn: &Connection, service_id: i64, name: &str, capabilities: &str) {
+        insert(
+            conn,
+            &NewModel {
+                service_id,
+                model_name: name.to_string(),
+                display_name: None,
+                capabilities: capabilities.to_string(),
+                context_length: None,
+                quantization: None,
+                is_default: true,
+            },
+        )
+        .unwrap();
+    }
+
+    /// An embeddings service deployed before any LLM holds the oldest default
+    /// row; an agent without a model must still get the chat model.
+    #[test]
+    fn the_default_agent_model_is_a_chat_model() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        let embeddings = running_service(&conn, "tei");
+        model(&conn, embeddings, "bge-m3", r#"["embeddings"]"#);
+        assert_eq!(default_llm_model(&conn).unwrap(), None);
+
+        let llm = running_service(&conn, "vllm");
+        model(&conn, llm, "qwen", r#"["chat"]"#);
+        assert_eq!(default_llm_model(&conn).unwrap().as_deref(), Some("qwen"));
+    }
 }
