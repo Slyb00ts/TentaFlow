@@ -7116,6 +7116,7 @@
     "credential_unchanged": "La misma clave ya estaba guardada: no ha cambiado nada.",
     "credential_absent": "Esta cuenta no tenía credenciales guardadas.",
     "error_unknown": "Error desconocido.",
+    "error_timeout": "El nodo no respondió a tiempo. Inténtalo de nuevo.",
     "login": {
       "title": "Inicio de sesión del proveedor",
       "step_start": "Iniciar el acceso",
@@ -7139,6 +7140,17 @@
       "copied": "Dirección copiada.",
       "copy_failed": "No se pudo copiar la dirección: selecciónala y cópiala a mano.",
       "lost": "Este inicio de sesión ya no existe en el nodo. Vuelve a empezarlo.",
+      "engine_missing": "Esta aplicación de agente no está instalada en ese nodo. Instálala en la pestaña «Aplicaciones en nodos».",
+      "no_terminal": "El nodo no inició ninguna terminal de acceso. Revisa cómo está instalada la aplicación allí.",
+      "no_address_failed": "El acceso falló antes de que la aplicación mostrara una dirección. Revisa los registros del nodo e inténtalo de nuevo.",
+      "no_address_closed": "La terminal de acceso se cerró antes de mostrar una dirección. Vuelve a empezar el acceso.",
+      "no_address_timeout": "La aplicación no mostró una dirección de acceso a tiempo. Vuelve a empezar el acceso.",
+      "not_a_login_account": "Esta cuenta se autentica con una clave API: no hay nada a lo que acceder.",
+      "account_disabled": "La cuenta está desactivada. Actívala antes de iniciar sesión.",
+      "already_running": "Ya hay un acceso en curso para esta cuenta en ese nodo. Termínalo o cancélalo.",
+      "owner_only": "Solo su propietario inicia sesión en una cuenta personal. Un administrador puede desactivarla o eliminarla.",
+      "result_starting": "El nodo está iniciando la terminal de la aplicación y espera su dirección. Puede tardar hasta un minuto.",
+      "result_cancelled": "El acceso se canceló. El nodo está cerrando la terminal de la aplicación.",
       "instruction": {
         "code": "Abre la dirección indicada e introduce allí el código."
       },
@@ -7235,6 +7247,7 @@
     "key_clear_confirm_title": "¿Quitar la clave API?",
     "key_clear_confirm_body": "La cuenta dejará de funcionar hasta que guardes una clave nueva.",
     "sessions_title": "Sesiones activas ({count})",
+    "sessions_hint": "Las sesiones se ejecutan en paralelo sin límite; finalizar una no afecta a las demás.",
     "sessions_empty": "No hay sesiones activas.",
     "session_end_confirm_title": "¿Finalizar la sesión?",
     "session_end_confirm_body": "La sesión se cerrará en el nodo. El agente puede abrir otra.",

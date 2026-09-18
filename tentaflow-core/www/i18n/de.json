@@ -7116,6 +7116,7 @@
     "credential_unchanged": "Derselbe Schlüssel war bereits gespeichert – es hat sich nichts geändert.",
     "credential_absent": "Für dieses Konto waren keine Anmeldedaten gespeichert.",
     "error_unknown": "Unbekannter Fehler.",
+    "error_timeout": "Der Node hat nicht rechtzeitig geantwortet. Versuche es erneut.",
     "login": {
       "title": "Anmeldung beim Anbieter",
       "step_start": "Anmeldung starten",
@@ -7139,6 +7140,17 @@
       "copied": "Adresse kopiert.",
       "copy_failed": "Die Adresse konnte nicht kopiert werden — markiere sie und kopiere sie von Hand.",
       "lost": "Diese Anmeldung existiert auf dem Node nicht mehr. Starte sie erneut.",
+      "engine_missing": "Diese Agent-Anwendung ist auf diesem Node nicht installiert. Installiere sie im Reiter „Anwendungen auf Nodes“.",
+      "no_terminal": "Der Node hat kein Anmelde-Terminal gestartet. Prüfe die Installation der Anwendung auf diesem Node.",
+      "no_address_failed": "Die Anmeldung schlug fehl, bevor die Anwendung eine Adresse zeigte. Prüfe die Node-Logs und versuche es erneut.",
+      "no_address_closed": "Das Anmelde-Terminal wurde geschlossen, bevor es eine Adresse zeigte. Starte die Anmeldung erneut.",
+      "no_address_timeout": "Die Anwendung zeigte nicht rechtzeitig eine Anmeldeadresse. Starte die Anmeldung erneut.",
+      "not_a_login_account": "Dieses Konto authentifiziert sich mit einem API-Schlüssel — es gibt nichts anzumelden.",
+      "account_disabled": "Das Konto ist deaktiviert. Aktiviere es vor der Anmeldung.",
+      "already_running": "Für dieses Konto läuft auf diesem Node bereits eine Anmeldung. Schließe sie ab oder brich sie ab.",
+      "owner_only": "Ein persönliches Konto meldet nur sein Eigentümer an. Ein Administrator kann es deaktivieren oder löschen.",
+      "result_starting": "Der Node startet das Anwendungs-Terminal und wartet auf dessen Adresse. Das kann bis zu einer Minute dauern.",
+      "result_cancelled": "Die Anmeldung wurde abgebrochen. Der Node schließt das Anwendungs-Terminal.",
       "instruction": {
         "code": "Öffnen Sie die angezeigte Adresse und geben Sie dort den Code ein."
       },
@@ -7235,6 +7247,7 @@
     "key_clear_confirm_title": "API-Schlüssel entfernen?",
     "key_clear_confirm_body": "Das Konto funktioniert erst wieder, wenn Sie einen neuen Schlüssel speichern.",
     "sessions_title": "Aktive Sitzungen ({count})",
+    "sessions_hint": "Sitzungen laufen unbegrenzt parallel; das Beenden einer Sitzung lässt die anderen unberührt.",
     "sessions_empty": "Keine aktiven Sitzungen.",
     "session_end_confirm_title": "Sitzung beenden?",
     "session_end_confirm_body": "Die Sitzung wird auf dem Node geschlossen. Der Agent kann eine neue öffnen.",

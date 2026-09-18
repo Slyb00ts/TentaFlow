@@ -8332,6 +8332,7 @@
     "credential_unchanged": "The same key was already stored — nothing changed.",
     "credential_absent": "This account had no credentials stored.",
     "error_unknown": "Unknown error.",
+    "error_timeout": "The node did not answer in time. Try again.",
     "login": {
       "title": "Provider sign-in",
       "step_start": "Start the sign-in",
@@ -8355,6 +8356,17 @@
       "copied": "Address copied.",
       "copy_failed": "The address could not be copied — select it and copy it by hand.",
       "lost": "This sign-in no longer exists on the node. Start it again.",
+      "engine_missing": "This agent application is not installed on that node. Install it in the “Applications on nodes” tab.",
+      "no_terminal": "The node started no sign-in terminal. Check how the application is installed there.",
+      "no_address_failed": "The sign-in failed before the application showed an address. Check the node logs and try again.",
+      "no_address_closed": "The sign-in terminal closed before it showed an address. Start the sign-in again.",
+      "no_address_timeout": "The application did not show a sign-in address in time. Start the sign-in again.",
+      "not_a_login_account": "This account authenticates with an API key — there is nothing to sign in to.",
+      "account_disabled": "The account is disabled. Enable it before signing in.",
+      "already_running": "A sign-in for this account is already running on that node. Finish it or cancel it.",
+      "owner_only": "Only its owner signs a personal account in. An administrator may disable or delete it.",
+      "result_starting": "The node is starting the application terminal and waiting for its address. This can take up to a minute.",
+      "result_cancelled": "The sign-in was cancelled. The node is closing the application terminal.",
       "instruction": {
         "code": "Open the address shown and enter the code there."
       },
@@ -8451,6 +8463,7 @@
     "key_clear_confirm_title": "Remove the API key?",
     "key_clear_confirm_body": "The account stops working until you store a new key.",
     "sessions_title": "Active sessions ({count})",
+    "sessions_hint": "Sessions run in parallel with no limit; ending one leaves the others untouched.",
     "sessions_empty": "No active sessions.",
     "session_end_confirm_title": "End the session?",
     "session_end_confirm_body": "The session will be closed on the node. The agent can open a new one.",

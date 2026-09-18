@@ -50,11 +50,20 @@ export class LoginFlow {
     this.providerSubject = null;
     this.planLabel = null;
     this.message = '';
+    // The node's own English sentence when `message` is its translation, so the
+    // window can show both — a mapped message must not be all that is left of
+    // what the node said.
+    this.detail = '';
     this.busy = false;
     this.listener = null;
     this.timer = null;
     this.pollFailures = 0;
     this.disposed = false;
+    // Set by `cancel()` before there is a flow to cancel. `LoginStartRequest`
+    // answers with the login id only once the CLI has printed its address (up
+    // to 45 s on the node), so a person who gives up in between is remembered
+    // here and the cancel is sent the moment the id exists.
+    this.cancelRequested = false;
   }
 
   onChange(listener) {
@@ -75,21 +84,34 @@ export class LoginFlow {
     this.busy = true;
     this.state = 'starting';
     this.message = '';
+    this.detail = '';
     this.notify();
     try {
       const started = await this.api.loginStart({ accountId, nodeId });
-      if (this.disposed) return;
       this.loginId = started.login_id ?? started.loginId ?? '';
       this.nodeId = started.node_id ?? started.nodeId ?? nodeId;
+      // A sign-in cancelled while it was starting: this is the first moment the
+      // node can be told, because the id it answers by did not exist before.
+      // Checked BEFORE `disposed`, so closing the window cancels the terminal
+      // instead of leaving the CLI to run out its own ten-minute deadline.
+      if (this.cancelRequested) {
+        await this.sendCancel();
+        return;
+      }
+      if (this.disposed) return;
       this.verificationUrl = started.verification_url ?? started.verificationUrl ?? '';
       this.instructionKey = started.instruction_key ?? started.instructionKey ?? '';
       this.expiresAt = started.expires_at ?? started.expiresAt ?? '';
       this.state = 'awaiting_input';
       this.schedulePoll();
     } catch (error) {
-      if (this.disposed) return;
+      // A start that was cancelled keeps the cancellation as its outcome; the
+      // node answering afterwards changes nothing the person can act on.
+      if (this.disposed || this.cancelRequested) return;
+      const refusal = describeError(error);
       this.state = 'failed';
-      this.message = describeError(error).message;
+      this.message = refusal.message;
+      this.detail = refusal.detail;
     } finally {
       this.busy = false;
       this.notify();
@@ -102,6 +124,7 @@ export class LoginFlow {
     if (!this.loginId || this.busy || this.finished || !code) return;
     this.busy = true;
     this.message = '';
+    this.detail = '';
     this.notify();
     try {
       await this.api.loginInput(this.loginId, code);
@@ -112,7 +135,9 @@ export class LoginFlow {
       this.state = 'verifying';
     } catch (error) {
       if (this.disposed) return;
-      this.message = describeError(error).message;
+      const refusal = describeError(error);
+      this.message = refusal.message;
+      this.detail = refusal.detail;
     } finally {
       this.busy = false;
       this.notify();
@@ -123,16 +148,24 @@ export class LoginFlow {
    * Abandons the sign-in. The account keeps whatever credential it had, and the
    * node closes the terminal — a cancel that never reached it would leave a CLI
    * running for the flow's whole ten-minute deadline.
+   *
+   * Works while a start is still in flight: the flow is marked cancelled at
+   * once (so the answer is discarded) and `start()` sends the cancel as soon as
+   * the node hands back the id.
    */
   async cancel() {
     this.stopPolling();
-    const loginId = this.loginId;
-    const wasRunning = !this.finished && Boolean(loginId);
+    if (this.finished) return;
+    this.cancelRequested = true;
+    const started = Boolean(this.loginId);
     this.state = 'cancelled';
     this.notify();
-    if (!wasRunning) return;
+    if (started) await this.sendCancel();
+  }
+
+  async sendCancel() {
     try {
-      await this.api.loginCancel(loginId);
+      await this.api.loginCancel(this.loginId);
     } catch (error) {
       // The flow may already be gone (it expired, or the node swept it); the
       // sign-in is over either way, so this is reported and not retried.
@@ -169,12 +202,13 @@ export class LoginFlow {
       this.pollFailures = 0;
     } catch (error) {
       if (this.disposed || this.finished) return;
-      const { code, message } = describeError(error);
+      const { code, message, detail } = describeError(error);
       // The node knows of no such flow: it expired, it was cancelled elsewhere,
       // or Core restarted under it. There is nothing left to poll.
       if (code === 'NotFound') {
         this.state = 'failed';
         this.message = T('login.lost');
+        this.detail = '';
         this.notify();
         return;
       }
@@ -182,6 +216,7 @@ export class LoginFlow {
       if (this.pollFailures >= 5) {
         this.state = 'failed';
         this.message = message;
+        this.detail = detail;
         this.notify();
         return;
       }
@@ -194,6 +229,7 @@ export class LoginFlow {
     this.providerSubject = snapshot.provider_subject ?? snapshot.providerSubject ?? this.providerSubject;
     this.planLabel = snapshot.plan_label ?? snapshot.planLabel ?? this.planLabel;
     this.message = messageKey ? I18n.t(messageKey) : '';
+    this.detail = '';
     if (state === 'succeeded' || state === 'failed') {
       this.state = state;
       this.notify();
@@ -289,7 +325,10 @@ export function openLoginWizard({
         </div>
       </li>
     </ol>
-    <p class="aa-error" role="alert" data-error hidden></p>`;
+    <div class="aa-error" role="alert" data-error hidden>
+      <p data-error-text></p>
+      <p class="aa-error-detail" data-error-detail hidden></p>
+    </div>`;
 
   const footer = document.createElement('div');
   footer.innerHTML = `
@@ -361,8 +400,10 @@ export function openLoginWizard({
     const canType = flow.state === 'awaiting_input' || flow.state === 'awaiting_open';
     field('code').toggleAttribute('disabled', !canType || flow.busy);
     act('submit').toggleAttribute('disabled', !canType || flow.busy);
+    // Never disabled while a start is in flight: the CLI is already running on
+    // the node by then, and the node waits up to 45 s for its address, so this
+    // is exactly the window in which a person changes their mind.
     act('cancel').hidden = flow.finished;
-    act('cancel').toggleAttribute('disabled', flow.busy);
 
     const result = body.querySelector('[data-result]');
     if (flow.state === 'succeeded') {
@@ -370,16 +411,26 @@ export function openLoginWizard({
       result.textContent = identity ? T('login.result_ok_as', { who: identity }) : T('login.result_ok');
     } else if (flow.state === 'failed') {
       result.textContent = flow.message || T('login.result_failed');
+    } else if (flow.state === 'cancelled') {
+      result.textContent = T('login.result_cancelled');
     } else if (flow.state === 'verifying') {
       result.textContent = T('login.result_verifying');
+    } else if (flow.state === 'starting') {
+      // The node is opening a terminal and reading it; saying "waiting for the
+      // provider" here would name a step that has not happened yet.
+      result.textContent = T('login.result_starting');
     } else {
       result.textContent = T('login.step_result_hint');
     }
 
     // One line for everything that went wrong: a refused start, a code the
-    // terminal would not take, and the outcome of a sign-in that failed.
+    // terminal would not take, and the outcome of a sign-in that failed — with
+    // the node's own sentence under it whenever the line above is a translation.
     const problem = flow.state === 'failed' ? (flow.message || T('login.result_failed')) : flow.message;
-    error.textContent = problem;
+    body.querySelector('[data-error-text]').textContent = problem;
+    const detail = body.querySelector('[data-error-detail]');
+    detail.textContent = problem ? flow.detail : '';
+    detail.hidden = !problem || !flow.detail;
     error.hidden = !problem;
   };
 

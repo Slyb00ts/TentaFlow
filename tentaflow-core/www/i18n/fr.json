@@ -7116,6 +7116,7 @@
     "credential_unchanged": "La même clé était déjà enregistrée — rien n'a changé.",
     "credential_absent": "Aucun identifiant n'était enregistré pour ce compte.",
     "error_unknown": "Erreur inconnue.",
+    "error_timeout": "Le nœud n’a pas répondu à temps. Réessaie.",
     "login": {
       "title": "Connexion au fournisseur",
       "step_start": "Démarrer la connexion",
@@ -7139,6 +7140,17 @@
       "copied": "Adresse copiée.",
       "copy_failed": "L’adresse n’a pas pu être copiée — sélectionne-la et copie-la à la main.",
       "lost": "Cette connexion n’existe plus sur le nœud. Recommence-la.",
+      "engine_missing": "Cette application d’agent n’est pas installée sur ce nœud. Installe-la dans l’onglet « Applications sur les nœuds ».",
+      "no_terminal": "Le nœud n’a lancé aucun terminal de connexion. Vérifie l’installation de l’application sur ce nœud.",
+      "no_address_failed": "La connexion a échoué avant que l’application n’affiche une adresse. Consulte les journaux du nœud et réessaie.",
+      "no_address_closed": "Le terminal de connexion s’est fermé avant d’afficher une adresse. Recommence la connexion.",
+      "no_address_timeout": "L’application n’a pas affiché d’adresse de connexion à temps. Recommence la connexion.",
+      "not_a_login_account": "Ce compte s’authentifie avec une clé API — il n’y a rien à connecter.",
+      "account_disabled": "Le compte est désactivé. Active-le avant de te connecter.",
+      "already_running": "Une connexion pour ce compte est déjà en cours sur ce nœud. Termine-la ou annule-la.",
+      "owner_only": "Seul son propriétaire connecte un compte personnel. Un administrateur peut le désactiver ou le supprimer.",
+      "result_starting": "Le nœud lance le terminal de l’application et attend son adresse. Cela peut prendre jusqu’à une minute.",
+      "result_cancelled": "La connexion a été annulée. Le nœud ferme le terminal de l’application.",
       "instruction": {
         "code": "Ouvrez l'adresse indiquée et saisissez-y le code."
       },
@@ -7235,6 +7247,7 @@
     "key_clear_confirm_title": "Retirer la clé API ?",
     "key_clear_confirm_body": "Le compte cessera de fonctionner tant que vous n’aurez pas enregistré une nouvelle clé.",
     "sessions_title": "Sessions actives ({count})",
+    "sessions_hint": "Les sessions s’exécutent en parallèle sans limite ; en terminer une ne touche pas les autres.",
     "sessions_empty": "Aucune session active.",
     "session_end_confirm_title": "Terminer la session ?",
     "session_end_confirm_body": "La session sera fermée sur le nœud. L’agent peut en ouvrir une nouvelle.",

@@ -646,7 +646,10 @@ test.describe('Logowanie u dostawcy (A02)', () => {
     await win.locator('tf-button[data-act="start"]').click();
 
     await expect(win.locator('[data-error]')).toBeVisible();
-    await expect(win.locator('[data-error]')).toContainText('Ten węzeł nie przyjmuje kont agentowych');
+    await expect(win.locator('[data-error-text]')).toContainText('Ten węzeł nie przyjmuje kont agentowych');
+    // The node's own English sentence stays under the translation.
+    await expect(win.locator('[data-error-detail]'))
+      .toHaveText('this node is not configured to receive agent accounts');
     // A refusal is not an address: nothing linkable was shown.
     expect(await win.locator('[data-link]').evaluate((el) => el.hidden)).toBe(true);
     expect(dbCredential(account.account_id), 'a refused sign-in stores nothing').toBeNull();
@@ -671,11 +674,17 @@ test.describe('Logowanie u dostawcy (A02)', () => {
 
     // Whatever this machine lacks (a runtime that was never installed, a CLI
     // that cannot reach the provider), the reason travels to the operator —
-    // and never as the transport's own `protocol error <Code>:` prefix.
-    await expect(win.locator('[data-error]')).toBeVisible({ timeout: 60000 });
-    const message = (await win.locator('[data-error]').textContent()).trim();
+    // and never as the transport's own `protocol error <Code>:` prefix, nor as
+    // the browser's own deadline for a node that was still working.
+    await expect(win.locator('[data-error]')).toBeVisible({ timeout: 120000 });
+    const message = (await win.locator('[data-error-text]').textContent()).trim();
     expect(message.length).toBeGreaterThan(0);
     expect(message).not.toContain('protocol error');
+    expect(message).not.toContain('timed out after 30000ms');
+    // The engine is not installed here, so this is the mapped Polish refusal
+    // with the node's own sentence kept under it.
+    expect(message).toContain('Ta aplikacja agentowa nie jest zainstalowana');
+    await expect(win.locator('[data-error-detail]')).toContainText('is not installed on this node');
     expect(await win.locator('[data-link]').evaluate((el) => el.hidden)).toBe(true);
     // The step 4 line repeats the outcome instead of leaving "waiting" behind.
     await expect(win.locator('[data-result]')).toHaveText(message);
@@ -816,6 +825,114 @@ test.describe('Aplikacje na nodach (N01)', () => {
     // Removing it again leaves the matrix as this suite found it.
     await runtimeMenuAction(page, 'claude-code', 'uninstall');
     await expect.poll(() => dbRuntimeEngines().filter((e) => e.engine_id === 'claude-code').length).toBe(0);
+  });
+});
+
+// =============================================================================
+// A02 on a node that can actually run the CLI
+//
+// Two things only a real terminal proves, and both were defects: the browser
+// used to abandon a start after the shim's 30 s while the node was still
+// inside its own 45 s wait for the address, and "Anuluj" was disabled for
+// exactly that window, so a person who gave up left `claude setup-token`
+// holding a PTY. This needs the vendor CLI installed on the node; where it
+// cannot be installed (no egress), the test says so instead of pretending.
+// =============================================================================
+
+/** Sign-in processes this run started, ignoring anything that was already there. */
+function newSignIns(baseline) {
+  return signInProcesses().filter((pid) => !baseline.includes(pid));
+}
+
+/** Vendor sign-in processes the bridge may have left running on this machine. */
+function signInProcesses() {
+  try {
+    return execFileSync('/usr/bin/pgrep', ['-f', 'setup-token'], { encoding: 'utf8' })
+      .split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch {
+    // pgrep exits 1 when nothing matches.
+    return [];
+  }
+}
+
+test.describe('Logowanie u dostawcy na żywo (A02)', () => {
+  test('a start outlives the old 30 s deadline, and cancelling one closes the terminal', async ({ page }) => {
+    test.setTimeout(600_000);
+    await loginAsAdmin(page);
+    const node = await localRuntimeNode(page);
+    await setReceivesAccounts(page, node.node_id, true);
+    const installed = await api(page, 'providerAccountRuntimeInstallRequest', {
+      nodeId: node.node_id, engineId: 'claude-code',
+    }).catch((error) => ({ error: String(error?.message ?? error) }));
+    const engineRow = dbRuntimeEngines().find((e) => e.engine_id === 'claude-code');
+    test.skip(
+      engineRow?.install_state !== 'installed',
+      `claude-code could not be installed on this machine: ${engineRow?.install_state ?? installed.error}`,
+    );
+
+    // This machine may run the operator's own vendor CLIs; only the processes
+    // this test causes are its business.
+    const baseline = signInProcesses();
+
+    await openAccountsTab(page);
+    await clickRowAction(page, LOGIN_NAME, 'Zaloguj');
+    const win = page.locator('tf-window').filter({ has: page.locator('.aa-login') }).last();
+    await win.locator('.aa-login').waitFor({ state: 'visible', timeout: 10000 });
+    const startedAt = Date.now();
+    await win.locator('tf-button[data-act="start"]').click();
+
+    // While the node opens the terminal the wizard says so, and "Anuluj" is
+    // live — that window is precisely when a person changes their mind.
+    await expect(win.locator('[data-result]')).toContainText('Węzeł uruchamia terminal', { timeout: 10000 });
+    expect(await win.locator('tf-button[data-act="cancel"]').getAttribute('disabled')).toBeNull();
+
+    // Past the shim's old 30 s: the browser must still be waiting on the node.
+    await page.waitForTimeout(Math.max(0, 35_000 - (Date.now() - startedAt)));
+    const errorAt35s = await win.locator('[data-error]').evaluate((el) => (el.hidden ? '' : el.textContent.trim()));
+    expect(errorAt35s, 'the browser gave up before the node did').not.toContain('timed out after 30000ms');
+
+    // The node's own outcome: either the CLI printed an address, or it reported
+    // why it could not — never the transport giving up under it.
+    const read = () => win.evaluate((w) => ({
+      link: !w.querySelector('[data-link]').hidden,
+      error: w.querySelector('[data-error]').hidden ? '' : w.querySelector('[data-error-text]').textContent.trim(),
+    }));
+    let outcome = await read();
+    const deadline = Date.now() + 150_000;
+    while (!outcome.link && !outcome.error && Date.now() < deadline) {
+      await page.waitForTimeout(1000);
+      outcome = await read();
+    }
+    expect(outcome.link || outcome.error, 'the node answered the start one way or the other').toBeTruthy();
+    if (outcome.error) {
+      expect(outcome.error).not.toContain('timed out');
+      expect(outcome.error).not.toContain('protocol error');
+    }
+    console.log(`[live A02] start answered after ${Math.round((Date.now() - startedAt) / 1000)} s: `
+      + (outcome.link ? 'address shown' : outcome.error));
+    // Whatever it was, closing the wizard ends the sign-in on the node.
+    await page.keyboard.press('Escape');
+    await expect.poll(() => newSignIns(baseline), { timeout: 120_000, intervals: [2000] }).toEqual([]);
+
+    // Cancel WHILE the node is starting: the id does not exist yet, so this is
+    // the path that used to send nothing at all.
+    await openAccountsTab(page);
+    await clickRowAction(page, LOGIN_NAME, 'Zaloguj');
+    const second = page.locator('tf-window').filter({ has: page.locator('.aa-login') }).last();
+    await second.locator('.aa-login').waitFor({ state: 'visible', timeout: 10000 });
+    await second.locator('tf-button[data-act="start"]').click();
+    await expect(second.locator('[data-result]')).toContainText('Węzeł uruchamia terminal', { timeout: 10000 });
+    await second.locator('tf-button[data-act="cancel"]').click();
+    await expect(second.locator('.aa-login')).toHaveCount(0, { timeout: 15000 });
+
+    // The CLI the node started for it must not outlive the cancellation: the
+    // cancel is sent the moment the node answers with the flow's id.
+    await expect.poll(() => newSignIns(baseline), { timeout: 180_000, intervals: [2000] }).toEqual([]);
+    expect(dbCredential(dbAccountByName(LOGIN_NAME).account_id), 'a cancelled sign-in stores nothing').toBeNull();
+
+    // Leave the engine as the rest of the suite expects it. The node row stays
+    // (it receives accounts), which is what the later U01 test reads its id from.
+    await api(page, 'providerAccountRuntimeUninstallRequest', { nodeId: node.node_id, engineId: 'claude-code' });
   });
 });
 

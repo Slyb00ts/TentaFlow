@@ -47,7 +47,9 @@ ApiBinary.action = () => Promise.resolve({});
 const { I18n } = await import('/js/i18n.js');
 await I18n.setLanguage('pl');
 const { LoginFlow, safeHttpUrl } = await import('/js/modules/agent-accounts-login.js');
-const { describeError } = await import('/js/modules/agent-accounts.js');
+const {
+  AgentAccounts, LOGIN_START_TIMEOUT_MS, LOGIN_STEP_TIMEOUT_MS, describeError,
+} = await import('/js/modules/agent-accounts.js');
 
 const pl = JSON.parse(readFileSync(join(WWW_ROOT, 'i18n', 'pl.json'), 'utf8')).agent_accounts;
 
@@ -64,7 +66,9 @@ function fakeApi({ start = {}, statuses = [], input = null, cancel = null } = {}
     calls,
     loginStart(payload) {
       calls.push({ kind: 'start', payload });
-      return answer(start);
+      // A function is a start the TEST resolves, which is how a node that takes
+      // most of a minute to print an address is reproduced without waiting.
+      return typeof start === 'function' ? start() : answer(start);
     },
     loginInput(loginId, value) {
       calls.push({ kind: 'input', loginId, value });
@@ -265,6 +269,7 @@ test('a transport rejection without a message key falls back to the generic erro
   assert.deepEqual(describeError(new Error('protocol error PolicyDenied: not your account')), {
     code: 'PolicyDenied',
     message: 'not your account',
+    detail: '',
   });
   assert.equal(describeError(new Error('the socket is gone')).code, '');
   assert.equal(describeError(new Error('the socket is gone')).message, 'the socket is gone');
@@ -279,4 +284,172 @@ test('only an http(s) address from the terminal becomes a link', () => {
   assert.equal(safeHttpUrl('Open https://provider.example/device in a browser'), '');
   assert.equal(safeHttpUrl(''), '');
   assert.equal(safeHttpUrl(null), '');
+});
+
+// =============================================================================
+// Deadlines
+//
+// The browser used to give up on a start after the shim's ordinary 30 s while
+// the node was still inside its own 45 s wait for the CLI's address, and the
+// person read "timed out after 30000ms" for a terminal that was working. Both
+// halves of that contract are pinned here: the option the request carries, and
+// the flow's own patience while the node has not answered.
+// =============================================================================
+
+test('the sign-in requests carry the node\'s deadline, not the shim\'s default', async () => {
+  const sent = [];
+  const realOne = ApiBinary.one;
+  const realAction = ApiBinary.action;
+  ApiBinary.one = (kind, payload, options) => { sent.push({ kind, payload, options }); return Promise.resolve({}); };
+  ApiBinary.action = (kind, payload, options) => { sent.push({ kind, payload, options }); return Promise.resolve({}); };
+  try {
+    await AgentAccounts.loginStart({ accountId: 'acc-1', nodeId: null });
+    await AgentAccounts.loginInput('node-a:1', '1234');
+    await AgentAccounts.loginCancel('node-a:1');
+    await AgentAccounts.loginStatus('node-a:1');
+  } finally {
+    ApiBinary.one = realOne;
+    ApiBinary.action = realAction;
+  }
+  const byKind = Object.fromEntries(sent.map((call) => [call.kind, call]));
+  assert.equal(byKind.providerAccountLoginStartRequest.options.timeoutMs, LOGIN_START_TIMEOUT_MS);
+  assert.equal(byKind.providerAccountLoginInputRequest.options.timeoutMs, LOGIN_STEP_TIMEOUT_MS);
+  assert.equal(byKind.providerAccountLoginCancelRequest.options.timeoutMs, LOGIN_STEP_TIMEOUT_MS);
+  // A poll is retried by the caller, so it deliberately keeps the default.
+  assert.equal(byKind.providerAccountLoginStatusRequest.options, undefined);
+});
+
+test('the start deadline outlasts the shim default and the node\'s own address timeout', () => {
+  const shim = readFileSync(join(WWW_ROOT, 'js', 'protocol', 'api-binary-shim.js'), 'utf8');
+  const callDeadline = Number(/const CALL_DEADLINE_MS = ([\d_]+);/.exec(shim)[1].replace(/_/g, ''));
+  const login = readFileSync(resolve(WWW_ROOT, '..', 'src', 'provider_accounts', 'login.rs'), 'utf8');
+  const urlTimeout = Number(/URL_TIMEOUT: Duration = Duration::from_secs\((\d+)\)/.exec(login)[1]) * 1000;
+
+  assert.ok(callDeadline < urlTimeout, 'the shim default is shorter than the node wait this exists for');
+  assert.ok(
+    LOGIN_START_TIMEOUT_MS >= urlTimeout + 30_000,
+    `a start must outlast the node's ${urlTimeout} ms address wait plus starting the bridge`,
+  );
+});
+
+test('a start the node is slow to answer keeps waiting instead of failing', async () => {
+  let release;
+  const api = fakeApi({ start: () => new Promise((resolve_) => { release = () => resolve_(STARTED); }) });
+  const flow = new LoginFlow(api, { pollMs: 60_000 });
+  const started = flow.start({ accountId: 'acc-1' });
+
+  // Whatever the node takes, nothing here abandons the flow: the only deadline
+  // is the one the request carries into the transport.
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(flow.state, 'starting');
+  assert.equal(flow.busy, true);
+  assert.equal(flow.finished, false);
+
+  release();
+  await started;
+  assert.equal(flow.state, 'awaiting_input');
+  flow.dispose();
+});
+
+// =============================================================================
+// Cancelling while the node is still starting the terminal
+//
+// `LoginStartRequest` answers with the id only once the CLI printed its
+// address, so for up to 45 s there is a terminal running on the node that the
+// browser cannot yet name. Giving up in that window has to reach the node
+// anyway — otherwise the CLI holds a PTY until the flow's own ten-minute
+// deadline, which is exactly the failure this wizard replaced.
+// =============================================================================
+
+test('cancelling during a start sends the cancel as soon as the node names the flow', async () => {
+  let release;
+  const api = fakeApi({ start: () => new Promise((resolve_) => { release = () => resolve_(STARTED); }) });
+  const flow = new LoginFlow(api, { pollMs: 60_000 });
+  const started = flow.start({ accountId: 'acc-1' });
+  await new Promise((r) => setTimeout(r, 5));
+
+  await flow.cancel();
+  assert.equal(flow.state, 'cancelled');
+  assert.equal(flow.finished, true);
+  assert.equal(api.calls.filter((c) => c.kind === 'cancel').length, 0, 'there is no id to cancel by yet');
+
+  release();
+  await started;
+  assert.deepEqual(api.calls.at(-1), { kind: 'cancel', loginId: STARTED.login_id });
+  assert.equal(flow.state, 'cancelled', 'the answer does not resurrect a cancelled sign-in');
+  assert.equal(flow.verificationUrl, '', 'no address is shown for a sign-in nobody is finishing');
+  assert.equal(api.calls.filter((c) => c.kind === 'status').length, 0, 'and it is not polled');
+  flow.dispose();
+});
+
+test('closing the window during a start cancels it too, disposed or not', async () => {
+  let release;
+  const api = fakeApi({ start: () => new Promise((resolve_) => { release = () => resolve_(STARTED); }) });
+  const flow = new LoginFlow(api, { pollMs: 60_000 });
+  const started = flow.start({ accountId: 'acc-1' });
+  await new Promise((r) => setTimeout(r, 5));
+
+  // What `openLoginWizard` does when its window closes: cancel, then dispose.
+  flow.cancel();
+  flow.dispose();
+
+  release();
+  await started;
+  assert.deepEqual(api.calls.at(-1), { kind: 'cancel', loginId: STARTED.login_id });
+});
+
+test('cancelling a start that then fails cancels nothing and keeps the cancellation', async () => {
+  let reject;
+  const api = fakeApi({
+    start: () => new Promise((_, reject_) => { reject = () => reject_(new Error('protocol error NotAvailable: engine \'claude-code\' is not installed on this node')); }),
+  });
+  const flow = new LoginFlow(api, { pollMs: 60_000 });
+  const started = flow.start({ accountId: 'acc-1' });
+  await new Promise((r) => setTimeout(r, 5));
+  await flow.cancel();
+
+  reject();
+  await started;
+  assert.equal(flow.state, 'cancelled');
+  assert.equal(api.calls.filter((c) => c.kind === 'cancel').length, 0, 'a terminal that never started needs no cancel');
+  flow.dispose();
+});
+
+// =============================================================================
+// Refusals an operator actually hits
+// =============================================================================
+
+test('every refusal the node can answer a sign-in with is translated, with its own sentence kept', () => {
+  const cases = [
+    ['protocol error PolicyDenied: this node is not configured to receive agent accounts', pl.login.node_not_receiving],
+    ["protocol error NotAvailable: engine 'claude-code' is not installed on this node", pl.login.engine_missing],
+    ['protocol error NotAvailable: the sign-in failed before it showed an address', pl.login.no_address_failed],
+    ['protocol error NotAvailable: the sign-in ended before it showed an address', pl.login.no_address_closed],
+    ['protocol error NotAvailable: the CLI did not show a sign-in address in time', pl.login.no_address_timeout],
+    ['protocol error NotAvailable: the bridge started no sign-in', pl.login.no_terminal],
+    ['protocol error BadRequest: this account authenticates with a key, so there is nothing to sign in to', pl.login.not_a_login_account],
+    ['protocol error PolicyDenied: this account is disabled', pl.login.account_disabled],
+    ['protocol error Conflict: a claude-code sign-in for this account is already running on this node', pl.login.already_running],
+    ["protocol error PolicyDenied: signing in on a personal account is the owner's alone; an administrator may disable or delete it", pl.login.owner_only],
+    ['request providerAccountLoginStartRequest timed out after 90000ms', pl.error_timeout],
+  ];
+  for (const [wire, expected] of cases) {
+    const described = describeError(new Error(wire));
+    assert.equal(described.message, expected, wire);
+    assert.ok(described.detail.length > 0, `${wire} keeps the node's own sentence`);
+    assert.ok(!described.detail.startsWith('protocol error'), 'the transport prefix is not part of the detail');
+  }
+});
+
+test('a refusal the map does not know keeps the server sentence and no detail', () => {
+  const described = describeError(new Error('protocol error PolicyDenied: some refusal nobody mapped'));
+  assert.equal(described.message, 'some refusal nobody mapped');
+  assert.equal(described.detail, '');
+});
+
+test('a refusal is only translated for the code that can raise it', () => {
+  // The same sentence under a different code is not the refusal this key names.
+  const described = describeError(new Error('protocol error Internal: this account is disabled'));
+  assert.equal(described.message, 'this account is disabled');
+  assert.equal(described.detail, '');
 });

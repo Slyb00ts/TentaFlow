@@ -56,6 +56,16 @@
   line-height: 1.5;
 }
 .aa-error[hidden] { display: none; }
+.aa-error p { margin: 0; }
+
+/* The node's own English sentence under its translation: present for anyone
+   diagnosing the node, quiet enough not to compete with the line above. */
+.aa-error-detail {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.aa-error-detail[hidden] { display: none; }
 
 /* ---- Forms (create window, settings block) -------------------------------- */
 

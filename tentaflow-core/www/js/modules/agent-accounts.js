@@ -22,6 +22,19 @@ export function T(key, vars) {
 // Requests
 // =============================================================================
 
+/**
+ * Deadlines for the sign-in, in milliseconds.
+ *
+ * `provider_accounts/login.rs` gives the CLI 45 s to print its verification
+ * address (`URL_TIMEOUT`) and spends more before that materializing the
+ * credential and starting the bridge; the shim's default call deadline is 30 s
+ * (`protocol/api-binary-shim.js`), which is why a start on a healthy node used
+ * to end in "timed out after 30000ms" while the terminal was still opening.
+ */
+export const LOGIN_START_TIMEOUT_MS = 90_000;
+/** Typing a code and closing a terminal both go through the bridge on the node. */
+export const LOGIN_STEP_TIMEOUT_MS = 60_000;
+
 export const AgentAccounts = {
   /** A01 — every account for an administrator, own + granted for anybody else. */
   list({ engineId = null, scope = null, query = null } = {}) {
@@ -64,18 +77,39 @@ export const AgentAccounts = {
    * A02 — the provider sign-in. Core runs the vendor CLI on `nodeId` (its home
    * node, or this one, when the caller names none) and answers with the address
    * the person has to open; every later step addresses the flow by its id.
+   *
+   * The deadline is the caller's, not the shim's default: `login.rs` waits
+   * `URL_TIMEOUT` = 45 s for the CLI to print an address, on top of
+   * materializing the credential and starting the bridge. With the shim's 30 s
+   * the browser gave up first and reported a timeout for a terminal the node
+   * was still opening.
    */
   loginStart({ accountId, nodeId = null }) {
-    return ApiBinary.one('providerAccountLoginStartRequest', { accountId, nodeId });
+    return ApiBinary.action(
+      'providerAccountLoginStartRequest',
+      { accountId, nodeId },
+      { timeoutMs: LOGIN_START_TIMEOUT_MS },
+    );
   },
+  /** Typing into the terminal goes through the bridge, so it gets the long deadline too. */
   loginInput(loginId, value) {
-    return ApiBinary.action('providerAccountLoginInputRequest', { loginId, value });
+    return ApiBinary.action(
+      'providerAccountLoginInputRequest',
+      { loginId, value },
+      { timeoutMs: LOGIN_STEP_TIMEOUT_MS },
+    );
   },
+  /** A poll is retried by the caller, so it keeps the shim's ordinary deadline. */
   loginStatus(loginId) {
     return ApiBinary.one('providerAccountLoginStatusRequest', { loginId });
   },
+  /** Cancelling closes a PTY on the node; it must not give up before the node does. */
   loginCancel(loginId) {
-    return ApiBinary.action('providerAccountLoginCancelRequest', { loginId });
+    return ApiBinary.action(
+      'providerAccountLoginCancelRequest',
+      { loginId },
+      { timeoutMs: LOGIN_STEP_TIMEOUT_MS },
+    );
   },
   /** U01 — the caller's own accounts plus the shared ones granted to them. */
   mine({ engineId = null } = {}) {
@@ -101,33 +135,58 @@ export const AgentAccounts = {
 // =============================================================================
 
 // A refusal Core spells out in English, and the key that says the same thing in
-// the operator's language. `ProtocolError` has no key field, so the sentence IS
-// the contract: these are the constants the node sends
-// (`services/agent_runtime.rs::NOT_RECEIVING_ACCOUNTS`, whose
-// `NOT_RECEIVING_ACCOUNTS_KEY` names the key below). Matched by substring,
-// because an anyhow chain prefixes it with the operation that hit it.
-const REFUSAL_KEYS = [
-  ['this node is not configured to receive agent accounts', 'login.node_not_receiving'],
+// the operator's language.
+//
+// `ProtocolError` carries `code` + `message` + `trace_id` and NO key field
+// (`tentaflow-protocol/src/message_body.rs`), so for these handlers the English
+// sentence IS the contract. Every marker below is a literal from the node:
+// `services/agent_runtime.rs` (NOT_RECEIVING_ACCOUNTS, "is not installed on
+// this node"), `provider_accounts/login.rs` (the three ways a start can end
+// without an address) and `dispatch/provider_account.rs` (the two refusals
+// `require_login_authority` raises). Matched by substring, because an anyhow
+// chain prefixes each with the operation that hit it, and the `code` narrows
+// the match so an unrelated sentence cannot borrow a translation.
+//
+// The last entry is the BROWSER's own deadline (`api-binary-shim.js`), which
+// arrives with no protocol prefix at all.
+const REFUSALS = [
+  { code: 'PolicyDenied', marker: 'is not configured to receive agent accounts', key: 'login.node_not_receiving' },
+  { code: 'NotAvailable', marker: 'is not installed on this node', key: 'login.engine_missing' },
+  { code: 'NotAvailable', marker: 'failed before it showed an address', key: 'login.no_address_failed' },
+  { code: 'NotAvailable', marker: 'ended before it showed an address', key: 'login.no_address_closed' },
+  { code: 'NotAvailable', marker: 'did not show a sign-in address in time', key: 'login.no_address_timeout' },
+  { code: 'NotAvailable', marker: 'the bridge started no sign-in', key: 'login.no_terminal' },
+  { code: 'BadRequest', marker: 'nothing to sign in to', key: 'login.not_a_login_account' },
+  { code: 'PolicyDenied', marker: 'this account is disabled', key: 'login.account_disabled' },
+  { code: 'Conflict', marker: 'sign-in for this account is already running', key: 'login.already_running' },
+  { code: 'PolicyDenied', marker: "personal account is the owner's alone", key: 'login.owner_only' },
+  { code: '', marker: 'timed out after', key: 'error_timeout' },
 ];
 
 /**
- * A server refusal as a screen may render it: the transport's
- * `protocol error <Code>: ` prefix removed, the code kept for the caller that
- * reacts to it, and a known refusal replaced by its translation.
+ * A server refusal as a screen may render it.
  *
- * The prefix is added by `binary-ws-client.js` when it rejects a call; it names
- * a wire enum variant and belongs in a log, not in a sentence an operator
- * reads. A message that carries no prefix (a transport timeout, say) passes
- * through unchanged — it is already the whole story.
+ * `message` is what the operator reads: the translation when the node sent one
+ * of the refusals above, the server's own sentence otherwise. `detail` is that
+ * sentence whenever it was replaced, so a screen can keep it next to the
+ * translation — a mapped message must not be the only thing left of what the
+ * node said. `code` is the wire enum the caller reacts to (`NotFound` while
+ * polling).
+ *
+ * The `protocol error <Code>: ` prefix is added by `binary-ws-client.js` when
+ * it rejects a call; it names a wire enum variant and belongs in a log, not in
+ * a sentence an operator reads.
  */
 export function describeError(error) {
   const raw = String(error?.message ?? error ?? '').trim();
   const parsed = /^protocol error ([A-Za-z]+):\s*([\s\S]*)$/.exec(raw);
   const code = parsed ? parsed[1] : '';
   const message = (parsed ? parsed[2] : raw).trim();
-  const known = REFUSAL_KEYS.find(([needle]) => message.includes(needle));
-  if (known) return { code, message: T(known[1]) };
-  return { code, message: message || T('error_unknown') };
+  const known = REFUSALS.find(
+    (entry) => (entry.code === '' || entry.code === code) && message.includes(entry.marker),
+  );
+  if (known) return { code, message: T(known.key), detail: message };
+  return { code, message: message || T('error_unknown'), detail: '' };
 }
 
 /** The same refusal as one string, for a toast or an error line. */

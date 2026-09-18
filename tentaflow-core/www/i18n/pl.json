@@ -8383,6 +8383,7 @@
     "credential_unchanged": "Ten sam klucz był już zapisany — nic się nie zmieniło.",
     "credential_absent": "To konto nie miało zapisanych danych logowania.",
     "error_unknown": "Nieznany błąd.",
+    "error_timeout": "Węzeł nie odpowiedział na czas. Spróbuj ponownie.",
     "login": {
       "title": "Logowanie u dostawcy",
       "step_start": "Rozpocznij logowanie",
@@ -8406,6 +8407,17 @@
       "copied": "Adres skopiowany.",
       "copy_failed": "Nie udało się skopiować adresu — zaznacz go i skopiuj ręcznie.",
       "lost": "To logowanie już nie istnieje na węźle. Zacznij je od nowa.",
+      "engine_missing": "Ta aplikacja agentowa nie jest zainstalowana na tym węźle. Zainstaluj ją w zakładce „Aplikacje na nodach”.",
+      "no_terminal": "Węzeł nie uruchomił terminala logowania. Sprawdź instalację aplikacji na tym węźle.",
+      "no_address_failed": "Logowanie nie powiodło się, zanim aplikacja pokazała adres. Sprawdź logi węzła i spróbuj ponownie.",
+      "no_address_closed": "Terminal logowania zamknął się, zanim pokazał adres. Zacznij logowanie od nowa.",
+      "no_address_timeout": "Aplikacja nie pokazała adresu logowania w wyznaczonym czasie. Zacznij logowanie od nowa.",
+      "not_a_login_account": "To konto korzysta z klucza API — nie ma tu czego logować.",
+      "account_disabled": "Konto jest wyłączone. Włącz je, zanim zaczniesz logowanie.",
+      "already_running": "Logowanie tego konta już trwa na tym węźle. Dokończ je albo anuluj.",
+      "owner_only": "Konto osobiste loguje wyłącznie jego właściciel. Administrator może je wyłączyć albo usunąć.",
+      "result_starting": "Węzeł uruchamia terminal aplikacji i czeka, aż pokaże adres. To może potrwać do minuty.",
+      "result_cancelled": "Logowanie anulowane. Węzeł zamyka terminal aplikacji.",
       "instruction": {
         "code": "Otwórz podany adres i wpisz tam kod."
       },
@@ -8502,6 +8514,7 @@
     "key_clear_confirm_title": "Usunąć klucz API?",
     "key_clear_confirm_body": "Konto przestanie działać, dopóki nie zapiszesz nowego klucza.",
     "sessions_title": "Aktywne sesje ({count})",
+    "sessions_hint": "Sesje działają równolegle bez limitu; zakończenie jednej nie dotyka pozostałych.",
     "sessions_empty": "Brak aktywnych sesji.",
     "session_end_confirm_title": "Zakończyć sesję?",
     "session_end_confirm_body": "Sesja zostanie zamknięta na nodzie. Agent może otworzyć nową.",

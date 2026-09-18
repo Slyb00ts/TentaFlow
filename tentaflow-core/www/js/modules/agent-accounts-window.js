@@ -25,6 +25,7 @@ import {
   engineEntry,
   engineName,
   engineTile,
+  describeError,
   errorText,
   grantedByLabel,
   nodeCredentialLabel,
@@ -154,7 +155,9 @@ export function openCreateAccountWindow({ engines = [], scope = 'global', onCrea
       host.close();
       onCreated?.(accountId ?? null);
     } catch (err) {
-      error.textContent = errorText(err);
+      const refusal = describeError(err);
+      error.textContent = refusal.message;
+      error.title = refusal.detail;
       error.hidden = false;
     } finally {
       button.removeAttribute('disabled');
@@ -331,6 +334,7 @@ export async function openAccountWindow(accountId, {
 
       <section class="aa-section">
         <h4 class="aa-sub-h">${escapeHtml(T('sessions_title', { count: state.sessions.length }))}</h4>
+        <p class="aa-hint">${escapeHtml(T('sessions_hint'))}</p>
         <tf-table variant="flush" data-table="sessions" actions-label="${escapeAttr(I18n.t('common.actions'))}"
                   empty-message="${escapeAttr(T('sessions_empty'))}">
           <tf-column key="user" label="${escapeAttr(T('col_user'))}" renderer="html" fill></tf-column>
@@ -413,8 +417,11 @@ export async function openAccountWindow(accountId, {
     // impossible to miss after the pane scrolled — the server's own message,
     // never a generic one, because it is what says WHY the write was refused.
     const fail = (err) => {
-      const message = errorText(err);
+      const { message, detail } = describeError(err);
       error.textContent = message;
+      // The node's own sentence stays reachable next to its translation; the
+      // toast can only carry one line, the error line can carry both.
+      error.title = detail;
       error.hidden = false;
       toast(message, 'error');
     };
@@ -686,8 +693,9 @@ export async function openAccountWindow(accountId, {
         notifyChanged();
         await reload();
       } catch (err) {
-        const message = errorText(err);
+        const { message, detail } = describeError(err);
         error.textContent = message;
+        error.title = detail;
         error.hidden = false;
         toast(message, 'error');
       } finally {
