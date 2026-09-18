@@ -1259,6 +1259,15 @@ async fn run_server(args: Args) -> Result<()> {
             }
         }
     }
+    // Agent bridges are not `services` rows, so the sweep above does not see
+    // them. One left running holds the account's `account.lock` and its
+    // canonical credential directory, and the next Core could then never start
+    // that account — each stop is bounded, and a bridge whose parent pipe
+    // closes exits on its own even when this never runs.
+    let stopped = tentaflow_core::services::agent_runtime::stop_all().await;
+    if stopped > 0 {
+        info!("stopped {} agent account bridge(s) on shutdown", stopped);
+    }
     router.shutdown();
 
     // Stop every running TentaBus instance's background retention-sweep

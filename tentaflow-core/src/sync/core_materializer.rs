@@ -6867,4 +6867,71 @@ mod tests {
             0
         );
     }
+
+    /// An engine row is what ONE node measured on its own filesystem. A peer
+    /// asserting the local node's runtime would put an install this machine
+    /// never made into the matrix, and the operator would route work to a node
+    /// with no binary. Terminal, because no later state makes it legal.
+    #[test]
+    fn a_peer_may_not_assert_the_agent_runtime_of_the_local_node() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_local_node_id(&tx, "node-me");
+
+        let fields = field_map(&[
+            ("node_id", FieldValue::String("node-me".into())),
+            ("engine_id", FieldValue::String("claude-code".into())),
+            ("install_state", FieldValue::String("installed".into())),
+        ]);
+        let mut forged = matrix_operation(
+            "core.agent_runtime_engine",
+            "agent_runtime_engines",
+            "node_id",
+            &["node-me", "claude-code"],
+            ActionType::Insert,
+            fields.clone(),
+        );
+        forged.body.actor_node_id = "node-peer".to_string();
+        let refused = apply_agent_runtime_engine(&tx, &forged)
+            .expect_err("a peer cannot measure this node's filesystem");
+        assert!(
+            matches!(refused, SyncLedgerError::Runtime(_)),
+            "an illegal assertion is terminal, not deferred: {refused:?}"
+        );
+        let rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM agent_runtime_engines", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        // The node's own report lands, and so does a peer's report about ITSELF.
+        let mut own = matrix_operation(
+            "core.agent_runtime_engine",
+            "agent_runtime_engines",
+            "node_id",
+            &["node-me", "claude-code"],
+            ActionType::Insert,
+            fields,
+        );
+        own.body.actor_node_id = "node-me".to_string();
+        assert_eq!(apply_agent_runtime_engine(&tx, &own).unwrap(), 1);
+
+        let peer_fields = field_map(&[
+            ("node_id", FieldValue::String("node-peer".into())),
+            ("engine_id", FieldValue::String("codex".into())),
+            ("install_state", FieldValue::String("installed".into())),
+        ]);
+        let mut peer = matrix_operation(
+            "core.agent_runtime_engine",
+            "agent_runtime_engines",
+            "node_id",
+            &["node-peer", "codex"],
+            ActionType::Insert,
+            peer_fields,
+        );
+        peer.body.actor_node_id = "node-peer".to_string();
+        assert_eq!(apply_agent_runtime_engine(&tx, &peer).unwrap(), 1);
+    }
 }

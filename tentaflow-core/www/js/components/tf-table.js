@@ -7,6 +7,8 @@
 //       (dozwolone: 480 640 720 900 1024 1180 1280 — regula zyje w controls.css,
 //       a media query nie czyta zmiennej CSS). Komorki zostaja w DOM, wiec stan
 //       tabeli (zaznaczenie, ekspansja, sort) przezywa zmiane szerokosci.
+//       `hint="…"` puts one explanatory sentence on the column HEADER (title),
+//       for a caveat that belongs to the column and not to each of its cells.
 //       `fill` marks the one column that absorbs free width
 //       and ellipsises (flush variant), `width` pins a column width (any CSS
 //       length) so stacked tables share one template, `priority="low"` hides
@@ -200,6 +202,10 @@ class TfTable extends HTMLElement {
     return Array.from(this.querySelectorAll('tf-column')).map((c) => ({
       key: c.getAttribute('key') || '',
       label: c.getAttribute('label') || '',
+      // One sentence that explains what the column MEANS, on the header only.
+      // A caveat a screen has to state ("as measured by this node") belongs
+      // next to the heading, not repeated in every cell under it.
+      hint: c.getAttribute('hint') || '',
       sortable: c.hasAttribute('sortable'),
       renderer: (c.getAttribute('renderer') || 'text').toLowerCase(),
       align: (c.getAttribute('align') || '').toLowerCase(),
@@ -437,6 +443,7 @@ class TfTable extends HTMLElement {
       } else {
         th.textContent = col.label;
       }
+      if (col.hint) th.title = col.hint;
       if (col.align === 'num' || col.renderer === 'num') th.classList.add('num');
       if (col.nowrap) th.classList.add('nowrap');
       if (col.fill) th.classList.add('fill');

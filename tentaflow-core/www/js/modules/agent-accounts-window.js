@@ -4,10 +4,9 @@
 //       detail with its Przegląd / Dostęp / Agenci tabs (A03/A04).
 //
 //       Both read and write ONLY through the `ProviderAccountBody` family
-//       (modules/agent-accounts.js). The provider login wizard (A02), ending a
-//       session and installing a CLI are refused by this node, so this file
-//       renders no affordance for them — an explanatory line takes the place of
-//       a button that could not work.
+//       (modules/agent-accounts.js). Signing the account in opens the A02
+//       wizard (modules/agent-accounts-login.js), which runs the vendor CLI on
+//       a node — this window never touches credential material itself.
 // =============================================================================
 
 import '/js/components/tf-tabs.js';
@@ -26,12 +25,16 @@ import {
   engineEntry,
   engineName,
   engineTile,
+  errorText,
+  grantedByLabel,
   nodeCredentialLabel,
   shortId,
   sinceLabel,
   statusChipHtml,
+  usedOnLabel,
   whenLabel,
 } from '/js/modules/agent-accounts.js';
+import { openLoginWizard } from '/js/modules/agent-accounts-login.js';
 
 // =============================================================================
 // New account
@@ -96,14 +99,16 @@ export function openCreateAccountWindow({ engines = [], scope = 'global', onCrea
   const error = body.querySelector('[data-error]');
   const kindSegment = field('kind');
 
+  // Which methods exist depends on the engine, so the segmented control is
+  // filled through `setOptions`: its light-DOM options are consumed when it
+  // builds and re-setting innerHTML would not reach the rendered buttons.
   const paintKinds = () => {
     const engine = engineEntry(engines, field('engine').value);
     const kinds = credentialKindsFor(engine);
-    kindSegment.innerHTML = kinds
-      .map((kind) => `<option value="${escapeAttr(kind)}">${escapeHtml(credentialKindLabel(kind))}</option>`)
-      .join('');
-    const current = kinds.includes(kindSegment.value) ? kindSegment.value : kinds[0];
-    kindSegment.setAttribute('value', current);
+    kindSegment.setOptions(
+      kinds.map((kind) => ({ value: kind, label: credentialKindLabel(kind) })),
+      kindSegment.value,
+    );
     paintKindDetails();
   };
   const paintKindDetails = () => {
@@ -149,7 +154,7 @@ export function openCreateAccountWindow({ engines = [], scope = 'global', onCrea
       host.close();
       onCreated?.(accountId ?? null);
     } catch (err) {
-      error.textContent = err.message || String(err);
+      error.textContent = errorText(err);
       error.hidden = false;
     } finally {
       button.removeAttribute('disabled');
@@ -167,7 +172,9 @@ export function openCreateAccountWindow({ engines = [], scope = 'global', onCrea
  * administrator decisions, and the server refuses them anyway — hiding them is
  * what keeps the window honest rather than optimistic.
  */
-export async function openAccountWindow(accountId, { engines = [], isAdmin = false, onChanged = null } = {}) {
+export async function openAccountWindow(accountId, {
+  engines = [], runtimeNodes = [], isAdmin = false, onChanged = null,
+} = {}) {
   const loaded = await AgentAccounts.get(accountId);
   const state = {
     account: loaded.account ?? {},
@@ -187,6 +194,11 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
   };
   const scopeUser = state.account.scope === 'user';
   const canAccess = isAdmin && !scopeUser;
+  // Signing in decides which provider identity the account's runs are
+  // attributed to, and the node refuses that on a PERSONAL account from anyone
+  // but its owner — who has their own button in "Moje konta". A window an
+  // administrator opened therefore offers the sign-in on shared accounts only.
+  const canLogin = isAdmin && !scopeUser && state.account.credential_kind === 'provider_login';
 
   const body = document.createElement('div');
   body.className = 'aa-detail';
@@ -200,6 +212,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
   const footer = document.createElement('div');
   footer.innerHTML = `
     <tf-button variant="danger" data-act="delete" class="aa-footer-left">${escapeHtml(T('action_delete'))}</tf-button>
+    ${canLogin ? `<tf-button variant="secondary" data-act="login"></tf-button>` : ''}
     <tf-button variant="primary" data-action="close">${escapeHtml(I18n.t('common.close'))}</tf-button>`;
 
   TfWindow.open({
@@ -238,7 +251,30 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
     paint();
   };
 
+  // A02 — the footer's sign-in, whose wording is the whole difference between a
+  // first login and a repeat: an account that already holds a credential keeps
+  // working until the new one lands.
+  const loginButton = footer.querySelector('[data-act="login"]');
+  loginButton?.addEventListener('click', () => {
+    openLoginWizard({
+      accountId,
+      accountName: state.account.display_name ?? '',
+      engineId: state.account.engine_id,
+      engines,
+      nodes: runtimeNodes,
+      homeNodeId: state.account.home_node_id ?? null,
+      onFinished: (outcome) => {
+        if (outcome === 'succeeded') notifyChanged();
+        reload();
+      },
+    });
+  });
+
   const paint = () => {
+    if (loginButton) {
+      const revision = Number(state.account.credential_revision ?? 0);
+      loginButton.setAttribute('label', T(revision > 0 ? 'action_relogin' : 'action_login'));
+    }
     if (state.tab === 'access') paintAccess();
     else if (state.tab === 'agents') paintAgents();
     else paintOverview();
@@ -259,9 +295,13 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
           ? T('kv_revision', { n: revision, when: whenLabel(account.updated_at) })
           : T('kv_no_credential'))}</dd>
         <dt>${escapeHtml(T('kv_status'))}</dt>
-        <dd>${statusChipHtml(account)}</dd>
+        <dd>${statusChipHtml(account)}${account.status === 'needs_login'
+          ? `<span class="aa-hint">${escapeHtml(T(apiKey ? 'kv_needs_key_hint' : 'kv_needs_login_hint'))}</span>`
+          : ''}</dd>
         <dt>${escapeHtml(T('kv_engine'))}</dt>
         <dd>${engineTile(account.engine_id)} ${escapeHtml(engineName(account.engine_id, engines))}</dd>
+        <dt>${escapeHtml(T('col_used_on'))}</dt>
+        <dd title="${escapeAttr(T('used_on_tooltip'))}">${escapeHtml(usedOnLabel(account))}</dd>
       </dl>
 
       <section class="aa-section">
@@ -291,21 +331,21 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
 
       <section class="aa-section">
         <h4 class="aa-sub-h">${escapeHtml(T('sessions_title', { count: state.sessions.length }))}</h4>
-        <tf-table variant="flush" data-table="sessions" empty-message="${escapeAttr(T('sessions_empty'))}">
-          <tf-column key="user" label="${escapeAttr(T('col_user'))}" fill></tf-column>
+        <tf-table variant="flush" data-table="sessions" actions-label="${escapeAttr(I18n.t('common.actions'))}"
+                  empty-message="${escapeAttr(T('sessions_empty'))}">
+          <tf-column key="user" label="${escapeAttr(T('col_user'))}" renderer="html" fill></tf-column>
           <tf-column key="agent" label="${escapeAttr(T('col_agent'))}"></tf-column>
           <tf-column key="workspace" label="${escapeAttr(T('col_workspace'))}"></tf-column>
           <tf-column key="node" label="${escapeAttr(T('col_node'))}"></tf-column>
           <tf-column key="since" label="${escapeAttr(T('col_since'))}"></tf-column>
         </tf-table>
-        <p class="aa-hint">${escapeHtml(T('sessions_end_unavailable'))}</p>
       </section>
 
       <section class="aa-section">
         <h4 class="aa-sub-h">${escapeHtml(T('nodes_title'))}</h4>
         <tf-table variant="flush" data-table="nodes" empty-message="${escapeAttr(T('nodes_empty'))}">
-          <tf-column key="node" label="${escapeAttr(T('col_node'))}" fill></tf-column>
-          <tf-column key="credential" label="${escapeAttr(T('col_node_credential'))}"></tf-column>
+          <tf-column key="node" label="${escapeAttr(T('col_node'))}" renderer="html" fill></tf-column>
+          <tf-column key="credential" label="${escapeAttr(T('col_node_credential'))}" renderer="html"></tf-column>
           <tf-column key="sessions" label="${escapeAttr(T('col_node_sessions'))}"></tf-column>
         </tf-table>
       </section>`;
@@ -315,14 +355,48 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
       const id = session.node_id ?? session.nodeId ?? '';
       sessionsByNode.set(id, (sessionsByNode.get(id) ?? 0) + 1);
     }
-    pane.querySelector('[data-table="sessions"]').rows = state.sessions.map((session) => ({
+    const sessionsTable = pane.querySelector('[data-table="sessions"]');
+    sessionsTable.rows = state.sessions.map((session) => ({
       user: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(session.user_display_name ?? '')}</div>`
         + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(session.session_id))}</div>`,
-      agent: escapeHtml(session.agent_name ?? T('value_none')),
-      workspace: escapeHtml(session.workspace_name ?? T('value_none')),
-      node: escapeHtml(session.node_name ?? ''),
-      since: escapeHtml(sinceLabel(session.started_at)),
+      agent: session.agent_name ?? T('value_none'),
+      workspace: session.workspace_name ?? T('value_none'),
+      node: session.node_name ?? '',
+      since: sinceLabel(session.started_at),
+      _sessionId: session.session_id,
     }));
+    // "Zakończ": the node closes the CLI first and only then forgets the row,
+    // so a bridge that refuses leaves the session visible and closable instead
+    // of disappearing from a list while its process keeps running.
+    sessionsTable.rowActions = (row, _idx, currentRow) => {
+      const button = document.createElement('tf-button');
+      button.setAttribute('variant', 'danger');
+      button.setAttribute('size', 'sm');
+      button.textContent = T('action_end_session');
+      button.addEventListener('click', async () => {
+        const live = currentRow?.() ?? row;
+        const confirmed = await TfWindow.confirm({
+          title: T('session_end_confirm_title'),
+          message: T('session_end_confirm_body'),
+          confirmLabel: T('action_end_session'),
+          cancelLabel: I18n.t('common.cancel'),
+          danger: true,
+        });
+        if (!confirmed || !host.isConnected) return;
+        button.setAttribute('disabled', '');
+        try {
+          await AgentAccounts.revokeSession(accountId, live._sessionId);
+          toast(T('session_ended'), 'success');
+          notifyChanged();
+          await reload();
+        } catch (err) {
+          fail(err);
+        } finally {
+          reenable(button);
+        }
+      });
+      return button;
+    };
     pane.querySelector('[data-table="nodes"]').rows = state.nodes.map((node) => {
       const credential = nodeCredentialLabel(node, state.account.credential_revision);
       return {
@@ -335,18 +409,30 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
     });
 
     const error = pane.querySelector('[data-error]');
+    // A refusal has to be both readable where the operator is looking and
+    // impossible to miss after the pane scrolled — the server's own message,
+    // never a generic one, because it is what says WHY the write was refused.
     const fail = (err) => {
-      error.textContent = err.message || String(err);
+      const message = errorText(err);
+      error.textContent = message;
       error.hidden = false;
+      toast(message, 'error');
+    };
+    // `event.currentTarget` is null as soon as the handler yields, so every
+    // button is captured BEFORE the first await; re-enabling is skipped for a
+    // button a repaint already replaced.
+    const reenable = (button) => {
+      if (button.isConnected) button.removeAttribute('disabled');
     };
     pane.querySelector('[data-act="rename"]').addEventListener('click', async (event) => {
+      const button = event.currentTarget;
       const name = String(pane.querySelector('[data-field="name"]').value || '').trim();
       error.hidden = true;
       if (!name) {
         fail(new Error(T('err_name_required')));
         return;
       }
-      event.currentTarget.setAttribute('disabled', '');
+      button.setAttribute('disabled', '');
       try {
         await AgentAccounts.update({ accountId, displayName: name });
         toast(T('renamed'), 'success');
@@ -355,7 +441,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
       } catch (err) {
         fail(err);
       } finally {
-        event.currentTarget.removeAttribute('disabled');
+        reenable(button);
       }
     });
     pane.querySelector('[data-field="enabled"]')?.addEventListener('change', async (event) => {
@@ -379,6 +465,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
       }
     });
     pane.querySelector('[data-act="key-save"]')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
       const input = pane.querySelector('[data-field="key"]');
       const material = String(input.value || '').trim();
       error.hidden = true;
@@ -386,7 +473,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
         fail(new Error(T('err_key_required')));
         return;
       }
-      event.currentTarget.setAttribute('disabled', '');
+      button.setAttribute('disabled', '');
       try {
         await AgentAccounts.setCredential(accountId, material);
         input.value = '';
@@ -396,10 +483,12 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
       } catch (err) {
         fail(err);
       } finally {
-        event.currentTarget.removeAttribute('disabled');
+        reenable(button);
       }
     });
     pane.querySelector('[data-act="key-clear"]')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      error.hidden = true;
       const ok = await TfWindow.confirm({
         title: T('key_clear_confirm_title'),
         message: T('key_clear_confirm_body'),
@@ -408,7 +497,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
         danger: true,
       });
       if (!ok) return;
-      event.currentTarget.setAttribute('disabled', '');
+      button.setAttribute('disabled', '');
       try {
         await AgentAccounts.clearCredential(accountId);
         toast(T('key_cleared'), 'success');
@@ -417,7 +506,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
       } catch (err) {
         fail(err);
       } finally {
-        event.currentTarget.removeAttribute('disabled');
+        reenable(button);
       }
     });
   }
@@ -456,8 +545,9 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
         <tf-button variant="primary" data-act="save-access" disabled>${escapeHtml(T('access_save'))}</tf-button>
       </div>
       <tf-table variant="flush" data-table="grants" empty-message="${escapeAttr(T('access_empty'))}">
-        <tf-column key="who" label="${escapeAttr(T('col_who'))}" fill></tf-column>
+        <tf-column key="who" label="${escapeAttr(T('col_who'))}" renderer="html" fill></tf-column>
         <tf-column key="kind" label="${escapeAttr(T('col_kind'))}"></tf-column>
+        <tf-column key="granted" label="${escapeAttr(T('col_granted_by'))}"></tf-column>
         <tf-column key="sessions" label="${escapeAttr(T('col_active_sessions'))}"></tf-column>
       </tf-table>
       <div class="aa-foot" data-access-foot></div>
@@ -505,7 +595,8 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
         ? [{
             who: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(T('access_whole_org'))}</div>`
               + `<div class="tf-table__cell-sub">${escapeHtml(T('access_whole_org_sub'))}</div>`,
-            kind: escapeHtml(T('subject_org')),
+            kind: T('subject_org'),
+            granted: grantedByLabel(state.grants.find((g) => (g.subject_type ?? g.subjectType) === 'org') ?? {}),
             sessions: '—',
             _subject: null,
           }]
@@ -524,7 +615,11 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
           return {
             who: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(title)}</div>`
               + (sub ? `<div class="tf-table__cell-sub">${escapeHtml(sub)}</div>` : ''),
-            kind: escapeHtml(T(type === 'group' ? 'subject_group' : 'subject_user')),
+            kind: T(type === 'group' ? 'subject_group' : 'subject_user'),
+            // Who granted it, from the STORED grant: a subject the operator has
+            // just added is not granted by anybody yet, and printing their own
+            // name next to it would claim a write that has not happened.
+            granted: grantedByLabel(state.grants.find((g) => subjectKey(g) === `${type}:${id}`) ?? {}),
             // A group's people are not enumerated here, so its session count is
             // not known from this response — an em dash, never a zero.
             sessions: type === 'user' ? String(sessionsByUser.get(id) ?? 0) : '—',
@@ -574,9 +669,9 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
       paintRows();
       paintSave();
     });
-    save.addEventListener('click', async (event) => {
+    save.addEventListener('click', async () => {
       error.hidden = true;
-      event.currentTarget.setAttribute('disabled', '');
+      save.setAttribute('disabled', '');
       const grants = state.orgWide
         ? [{ subject_type: 'org', subject_id: '' }]
         : state.subjects.map((grant) => ({
@@ -591,8 +686,10 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
         notifyChanged();
         await reload();
       } catch (err) {
-        error.textContent = err.message || String(err);
+        const message = errorText(err);
+        error.textContent = message;
         error.hidden = false;
+        toast(message, 'error');
       } finally {
         paintSave();
       }
@@ -612,7 +709,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
   function paintAgents() {
     pane.innerHTML = `
       <tf-table variant="flush" data-table="agents" empty-message="${escapeAttr(T('agents_empty'))}">
-        <tf-column key="agent" label="${escapeAttr(T('col_agent'))}" fill></tf-column>
+        <tf-column key="agent" label="${escapeAttr(T('col_agent'))}" renderer="html" fill></tf-column>
         <tf-column key="mode" label="${escapeAttr(T('col_bind_mode'))}"></tf-column>
       </tf-table>
       <div class="aa-foot">${escapeHtml(T('agents_foot', { count: state.agents.length }))}</div>
@@ -620,7 +717,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
     pane.querySelector('[data-table="agents"]').rows = state.agents.map((agent) => ({
       agent: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(agent.agent_name ?? '')}</div>`
         + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(agent.agent_id))}</div>`,
-      mode: escapeHtml(T(agent.bind_mode === 'user' ? 'bind_mode_user' : 'bind_mode_global')),
+      mode: T(agent.bind_mode === 'user' ? 'bind_mode_user' : 'bind_mode_global'),
     }));
   }
 
@@ -645,7 +742,7 @@ export async function openAccountWindow(accountId, { engines = [], isAdmin = fal
       host.close();
       onChanged?.();
     } catch (err) {
-      toast(err.message || String(err), 'error');
+      toast(errorText(err), 'error');
     }
   });
 

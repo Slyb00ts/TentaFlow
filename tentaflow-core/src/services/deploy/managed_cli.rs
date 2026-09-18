@@ -89,7 +89,76 @@ async fn acquire_install_lock(lock: &std::fs::File, wait: std::time::Duration) -
     })?
 }
 
-pub(super) async fn install(
+/// The bridge executable for one engine, built once per source hash and shared
+/// by every account that runs on it.
+///
+/// It lives here rather than in the deploy strategy because a bridge is a
+/// property of the ENGINE on a node, not of a deployed service: the node matrix
+/// installs it without an account existing, and the on-demand runtime starts it
+/// per account afterwards. `source_hash` keys the cache, so a rebuilt tree
+/// produces a new executable instead of a silently stale one.
+pub(crate) async fn ensure_bridge(
+    engine: &str,
+    source_hash: &str,
+    source_root: &Path,
+    log: Option<&LogSink>,
+) -> DeployResult<PathBuf> {
+    let source_hash = source_hash.trim();
+    if source_hash.is_empty() {
+        return Err(DeployError::Manifest(format!(
+            "engine '{engine}': managed-cli runtime has no native source hash"
+        )));
+    }
+    let immutable_root = crate::paths::cache_dir()
+        .join("coding-agents")
+        .join("bridge")
+        .join(engine)
+        .join(source_hash);
+    // No Windows variant: this runtime needs an OS sandbox mechanism, and the
+    // four manifests that use it declare Linux and macOS only.
+    let immutable_server = immutable_root.join("server");
+    if immutable_server.exists() {
+        return Ok(immutable_server);
+    }
+    if let Some(log) = log {
+        log.info("[managed-cli] building the local bridge");
+    }
+    let output = Command::new("sh")
+        .arg(source_root.join("build.sh"))
+        .output()
+        .await
+        .map_err(|e| DeployError::Spawn(format!("build coding-agent bridge: {e}")))?;
+    let built_server = source_root
+        .join("target")
+        .join("release")
+        .join("tentaflow-coding-agent-bridge");
+    if !output.status.success() || !built_server.exists() {
+        return Err(DeployError::Spawn(format!(
+            "coding-agent bridge build failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    std::fs::create_dir_all(&immutable_root)
+        .map_err(|e| DeployError::Spawn(format!("create coding-agent bridge cache: {e}")))?;
+    let temporary = immutable_root.join(format!(".server-{}", uuid::Uuid::new_v4()));
+    std::fs::copy(&built_server, &temporary)
+        .map_err(|e| DeployError::Spawn(format!("cache coding-agent bridge executable: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o555)).map_err(
+            |error| DeployError::Spawn(format!("protect cached coding-agent bridge: {error}")),
+        )?;
+    }
+    std::fs::rename(&temporary, &immutable_server).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        DeployError::Spawn(format!("publish coding-agent bridge executable: {e}"))
+    })?;
+    Ok(immutable_server)
+}
+
+pub(crate) async fn install(
     engine: &str,
     version: &str,
     log: Option<&LogSink>,

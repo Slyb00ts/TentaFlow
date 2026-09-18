@@ -147,7 +147,12 @@ impl BinaryDeploy {
             "TENTAFLOW_CODING_AGENT_DATA_DIR".to_string(),
             state_dir.to_string_lossy().into_owned(),
         );
-        for (name, directory) in [("HOME", "home"), ("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude"), ("GROK_HOME", "grok"), ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("TMPDIR", "tmp")] {
+        // The bridge process's OWN private directories. The engine credential
+        // homes are NOT among them: the bridge points every invocation at
+        // `credentials/` (an account-wide sign-in) or at an instance profile (a
+        // session), so a second, inherited credential location would only be a
+        // place for a login to get lost in.
+        for (name, directory) in [("HOME", "home"), ("XDG_DATA_HOME", "data"), ("TMPDIR", "tmp")] {
             env.insert(name.into(), state_dir.join(directory).to_string_lossy().into_owned());
         }
         Ok(())
@@ -270,62 +275,15 @@ impl DeployStrategy for BinaryDeploy {
 
         let managed_cli = native.runtime == NativeRuntime::ManagedCli;
         let managed_cli_executable = if managed_cli {
-            let source_hash = self.manifest.native_source_hash.trim();
-            if source_hash.is_empty() {
-                return Err(DeployError::Manifest(format!(
-                    "engine '{}': managed-cli runtime has no native source hash",
-                    self.manifest.engine.id
-                )));
-            }
-            let immutable_root = crate::paths::cache_dir()
-                .join("coding-agents")
-                .join("bridge")
-                .join(&self.manifest.engine.id)
-                .join(source_hash);
-            // No Windows variant: this runtime needs an OS sandbox mechanism,
-            // and the four manifests that use it declare Linux and macOS only.
-            let immutable_server = immutable_root.join("server");
-            if immutable_server.exists() {
-                Some(immutable_server)
-            } else {
-                if let Some(s) = &self.log_sink {
-                    s.info("[managed-cli] building the local bridge");
-                }
-                let output = Command::new("sh")
-                    .arg(root.join("build.sh"))
-                    .output()
-                    .await
-                    .map_err(|e| DeployError::Spawn(format!("build coding-agent bridge: {e}")))?;
-                let built_server = root
-                    .join("target")
-                    .join("release")
-                    .join("tentaflow-coding-agent-bridge");
-                if !output.status.success() || !built_server.exists() {
-                    return Err(DeployError::Spawn(format!(
-                        "coding-agent bridge build failed with status {}: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    )));
-                }
-                std::fs::create_dir_all(&immutable_root).map_err(|e| {
-                    DeployError::Spawn(format!("create coding-agent bridge cache: {e}"))
-                })?;
-                let temporary = immutable_root.join(format!(".server-{}", uuid::Uuid::new_v4()));
-                std::fs::copy(&built_server, &temporary).map_err(|e| {
-                    DeployError::Spawn(format!("cache coding-agent bridge executable: {e}"))
-                })?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o555))
-                        .map_err(|error| DeployError::Spawn(format!("protect cached coding-agent bridge: {error}")))?;
-                }
-                std::fs::rename(&temporary, &immutable_server).map_err(|e| {
-                    let _ = std::fs::remove_file(&temporary);
-                    DeployError::Spawn(format!("publish coding-agent bridge executable: {e}"))
-                })?;
-                Some(immutable_server)
-            }
+            Some(
+                super::managed_cli::ensure_bridge(
+                    &self.manifest.engine.id,
+                    &self.manifest.native_source_hash,
+                    &root,
+                    self.log_sink.as_ref(),
+                )
+                .await?,
+            )
         } else {
             None
         };

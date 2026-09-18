@@ -8,16 +8,18 @@
 //       toolbar the operator is typing in.
 //
 //       Both halves are administration, and both read the binary
-//       `ProviderAccountBody` family. Signing an account in (A02) and
-//       installing a CLI on a node are refused by this node today, so the
-//       affordances for them are absent rather than dead.
+//       `ProviderAccountBody` family. Signing an account in opens the A02
+//       wizard; installing a CLI runs on the node the row names, so the matrix
+//       polls itself until that node's own report settles.
 // =============================================================================
 
 import '/js/components/tf-table.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-toggle.js';
+import '/js/components/tf-menu.js';
 import { escapeAttr, escapeHtml, toast } from '/js/utils.js';
+import { I18n } from '/js/i18n.js';
 import {
   AgentAccounts,
   T,
@@ -25,11 +27,15 @@ import {
   credentialKindLabel,
   engineName,
   engineTile,
+  errorText,
+  osLabel,
   scopeChipHtml,
   shortId,
   statusChipHtml,
+  usedOnLabel,
 } from '/js/modules/agent-accounts.js';
 import { openAccountWindow, openCreateAccountWindow } from '/js/modules/agent-accounts-window.js';
+import { openLoginWizard } from '/js/modules/agent-accounts-login.js';
 
 const state = {
   host: null,
@@ -127,7 +133,7 @@ async function load() {
     state.error = '';
   } catch (err) {
     state.accounts = [];
-    state.error = err.message || String(err);
+    state.error = errorText(err);
   }
   if (state.segment === 'runtime' || state.isAdmin) {
     try {
@@ -155,16 +161,19 @@ function paintToolbar() {
   host.querySelector('[data-act="create"]').hidden = !accounts || !state.isAdmin;
 }
 
+// The catalog arrives with the first response, so the filter is filled through
+// `setOptions` — a tf-select consumes its light-DOM options when it builds, and
+// re-setting innerHTML afterwards would leave the built list untouched.
 function paintEngineFilter() {
   const select = state.host?.querySelector('[data-field="engine"]');
   if (!select) return;
-  const options = [`<option value="">${escapeHtml(T('filter_engine_all'))}</option>`]
-    .concat(state.engines.map((engine) => {
+  const options = [{ value: '', label: T('filter_engine_all') }].concat(
+    state.engines.map((engine) => {
       const id = engine.engine_id ?? engine.engineId;
-      return `<option value="${escapeAttr(id)}">${escapeHtml(engineName(id, state.engines))}</option>`;
-    }));
-  select.innerHTML = options.join('');
-  select.value = state.engineFilter;
+      return { value: id, label: engineName(id, state.engines) };
+    }),
+  );
+  select.setOptions(options, state.engineFilter);
 }
 
 function paint() {
@@ -181,13 +190,15 @@ function paint() {
 function paintAccounts(body) {
   body.innerHTML = `
     ${state.error ? `<p class="aa-error" role="alert">${escapeHtml(state.error)}</p>` : ''}
-    <tf-table variant="flush" id="aa-accounts-table" empty-message="${escapeAttr(T('list_empty'))}">
-      <tf-column key="account" label="${escapeAttr(T('col_account'))}" fill></tf-column>
-      <tf-column key="scope" label="${escapeAttr(T('col_scope'))}"></tf-column>
+    <tf-table variant="flush" id="aa-accounts-table" actions-label="${escapeAttr(I18n.t('common.actions'))}"
+              empty-message="${escapeAttr(T('list_empty'))}">
+      <tf-column key="account" label="${escapeAttr(T('col_account'))}" renderer="html" fill></tf-column>
+      <tf-column key="scope" label="${escapeAttr(T('col_scope'))}" renderer="html"></tf-column>
       <tf-column key="credential" label="${escapeAttr(T('col_credential'))}"></tf-column>
-      <tf-column key="status" label="${escapeAttr(T('col_status'))}"></tf-column>
-      <tf-column key="sessions" label="${escapeAttr(T('col_sessions'))}"></tf-column>
-      <tf-column key="nodes" label="${escapeAttr(T('col_used_on'))}"></tf-column>
+      <tf-column key="status" label="${escapeAttr(T('col_status'))}" renderer="html"></tf-column>
+      <tf-column key="sessions" label="${escapeAttr(T('col_sessions'))}" renderer="html"></tf-column>
+      <tf-column key="nodes" label="${escapeAttr(T('col_used_on'))}"
+                 hint="${escapeAttr(T('used_on_tooltip'))}"></tf-column>
     </tf-table>
     <div class="aa-foot" id="aa-accounts-foot"></div>`;
 
@@ -198,15 +209,24 @@ function paintAccounts(body) {
       + `<div class="tf-table__cell-sub">${escapeHtml(accountSubtitle(account) || shortId(account.account_id))}</div>`
       + '</div></div>',
     scope: scopeChipHtml(account.scope),
-    credential: escapeHtml(credentialKindLabel(account.credential_kind)),
+    credential: credentialKindLabel(account.credential_kind),
     status: statusChipHtml(account),
     sessions: `<b>${Number(account.session_count ?? 0)}</b>`,
-    // The wire knows which node HOLDS the login; which nodes have materialized
-    // it is per-account state and lives in the account window, not in a list
-    // that would need one request per row to fill this cell.
-    nodes: escapeHtml(account.home_node_name ?? T('value_none')),
+    // The nodes that hold this account's credential, as this node measured
+    // them — the column header carries the same caveat as its tooltip.
+    nodes: usedOnLabel(account),
     _accountId: account.account_id,
     _manageable: account.scope === 'global',
+    // "Zaloguj" belongs where the account is waiting for one: a shared account
+    // with no stored credential, or one the node put back into `needs_login`
+    // after the bridge rejected what a session produced.
+    _needsLogin: account.scope === 'global'
+      && account.credential_kind === 'provider_login'
+      && account.status !== 'disabled'
+      && (Number(account.credential_revision ?? 0) === 0 || account.status === 'needs_login'),
+    _engineId: account.engine_id,
+    _name: account.display_name ?? '',
+    _homeNodeId: account.home_node_id ?? null,
   }));
   table.rowActions = (row, _idx, currentRow) => {
     const live = () => currentRow?.() ?? row;
@@ -216,6 +236,28 @@ function paintAccounts(body) {
       note.textContent = T('owner_only');
       return note;
     }
+    const actions = document.createElement('div');
+    actions.className = 'tf-table__row-actions';
+    if (row._needsLogin && state.isAdmin) {
+      const login = document.createElement('tf-button');
+      login.setAttribute('variant', 'primary');
+      login.setAttribute('size', 'sm');
+      login.textContent = T('action_login');
+      login.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const current = live();
+        openLoginWizard({
+          accountId: current._accountId,
+          accountName: current._name,
+          engineId: current._engineId,
+          engines: state.engines,
+          nodes: state.nodes,
+          homeNodeId: current._homeNodeId,
+          onFinished: () => load(),
+        });
+      });
+      actions.appendChild(login);
+    }
     const button = document.createElement('tf-button');
     button.setAttribute('variant', 'ghost');
     button.setAttribute('size', 'sm');
@@ -224,7 +266,8 @@ function paintAccounts(body) {
       event.stopPropagation();
       openAccount(live()._accountId);
     });
-    return button;
+    actions.appendChild(button);
+    return actions;
   };
   table.addEventListener('row-click', (event) => {
     const row = event.detail?.row;
@@ -241,9 +284,10 @@ function paintAccounts(body) {
 function openAccount(accountId) {
   openAccountWindow(accountId, {
     engines: state.engines,
+    runtimeNodes: state.nodes,
     isAdmin: state.isAdmin,
     onChanged: () => load(),
-  }).catch((err) => toast(err.message || String(err), 'error'));
+  }).catch((err) => toast(errorText(err), 'error'));
 }
 
 // =============================================================================
@@ -253,36 +297,44 @@ function openAccount(accountId) {
 function paintRuntime(body) {
   const engines = state.engines;
   body.innerHTML = `
-    <tf-table variant="flush" id="aa-runtime-table" empty-message="${escapeAttr(T('runtime_empty'))}">
-      <tf-column key="node" label="${escapeAttr(T('col_node'))}" fill></tf-column>
-      <tf-column key="sandbox" label="${escapeAttr(T('col_sandbox'))}"></tf-column>
+    <tf-table variant="flush" id="aa-runtime-table" actions-label="${escapeAttr(T('col_receives'))}"
+              empty-message="${escapeAttr(T('runtime_empty'))}">
+      <tf-column key="node" label="${escapeAttr(T('col_node'))}" renderer="html" fill></tf-column>
+      <tf-column key="sandbox" label="${escapeAttr(T('col_sandbox'))}" renderer="html"></tf-column>
       ${engines.map((engine) => {
         const id = engine.engine_id ?? engine.engineId;
-        return `<tf-column key="engine_${escapeAttr(id)}" label="${escapeAttr(engineName(id, engines))}"></tf-column>`;
+        return `<tf-column key="engine_${escapeAttr(id)}" label="${escapeAttr(engineName(id, engines))}" renderer="html"></tf-column>`;
       }).join('')}
-      <tf-column key="receives" label="${escapeAttr(T('col_receives'))}"></tf-column>
     </tf-table>
+    <tf-menu placement="bottom-end" compact id="aa-runtime-menu">
+      <tf-menu-item action="install" icon="download"></tf-menu-item>
+      <tf-menu-item action="uninstall" icon="trash" danger></tf-menu-item>
+    </tf-menu>
     <div class="aa-foot">
       <p>${escapeHtml(T('runtime_foot_install'))}</p>
       <p>${escapeHtml(T('runtime_foot_receives'))}</p>
     </div>`;
 
   const table = body.querySelector('#aa-runtime-table');
+  wireRuntimeMenu(body);
   table.rows = state.nodes.map((node) => {
     const capable = node.sandbox_capable;
     const byEngine = new Map((node.engines ?? []).map((entry) => [entry.engine_id ?? entry.engineId, entry]));
+    const gate = runtimeGate(node);
     const row = {
+      // The sub-line says what the operator can act on: the operating system
+      // this node reported (only a node knows its own), whether it is reachable
+      // and how many accounts already have a credential on it.
       node: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(node.node_name ?? '')}</div>`
-        + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(node.node_id))}</div>`
-        + (capable === false ? `<div class="tf-table__cell-sub">${escapeHtml(T('runtime_not_possible'))}</div>` : ''),
+        + `<div class="tf-table__cell-sub">${escapeHtml(nodeSubLine(node))}</div>`
+        + (gate.ok ? '' : `<div class="tf-table__cell-sub">${escapeHtml(T(gate.reason))}</div>`),
       sandbox: sandboxChip(capable),
-      receives: '',
       _nodeId: node.node_id,
       _receives: node.receives_accounts === true,
     };
     for (const engine of engines) {
       const id = engine.engine_id ?? engine.engineId;
-      row[`engine_${id}`] = installCell(byEngine.get(id));
+      row[`engine_${id}`] = installCell(node, id, byEngine.get(id), gate);
     }
     return row;
   });
@@ -300,11 +352,31 @@ function paintRuntime(body) {
         await load();
       } catch (err) {
         toggle.toggleAttribute('checked', !enabled);
-        toast(err.message || String(err), 'error');
+        toast(errorText(err), 'error');
       }
     });
     return toggle;
   };
+}
+
+function nodeSubLine(node) {
+  const count = Number(node.account_count ?? 0);
+  const accounts = count > 0 ? T('node_accounts', { n: count }) : T('node_accounts_none');
+  return `${osLabel(node.os)} · ${T(node.online ? 'node_online' : 'node_offline')} · ${accounts}`;
+}
+
+/**
+ * Whether this node can be told to install or remove a CLI, and why not.
+ *
+ * Two answers only a node can give about itself: whether it can isolate a
+ * process at all, and what it runs on. A peer reports neither until the matrix
+ * is read ON it, so an unreachable node is refused here rather than through a
+ * forwarded request that would time out with nothing to show for it.
+ */
+function runtimeGate(node) {
+  if (node.sandbox_capable === false) return { ok: false, reason: 'runtime_not_possible' };
+  if (!node.online) return { ok: false, reason: 'runtime_node_unreachable' };
+  return { ok: true, reason: '' };
 }
 
 function sandboxChip(capable) {
@@ -314,25 +386,105 @@ function sandboxChip(capable) {
 }
 
 /**
- * One engine cell of the matrix. Read-only on purpose: installing a CLI is a
- * node-side operation this build refuses, and a dead "Zainstaluj" button would
- * be a promise the node cannot keep.
+ * One engine cell of the matrix: the state the owning node reports, plus the
+ * menu that installs or removes it there.
+ *
+ * The button is markup rather than an element, because a cell is written as
+ * HTML into the table's shadow root; the menu it opens lives OUTSIDE that root
+ * (one per matrix), so its panel is not clipped by the table and the click that
+ * opened it is what tells the menu which node and engine it is acting on.
  */
-function installCell(entry) {
+function installCell(node, engineId, entry, gate) {
   const stateName = entry?.install_state ?? entry?.installState ?? 'absent';
+  const trigger = `<tf-button variant="ghost" size="sm" icon="more"
+      data-runtime-menu data-node="${escapeAttr(node.node_id ?? '')}" data-engine="${escapeAttr(engineId)}"
+      data-state="${escapeAttr(stateName)}"
+      aria-label="${escapeAttr(T('runtime_actions'))}"
+      ${gate.ok ? '' : `disabled title="${escapeAttr(T(gate.reason))}"`}></tf-button>`;
+  let label;
   if (stateName === 'installed') {
     const version = entry.version;
-    return version
+    label = version
       ? `<span class="tf-table__cell-title">${escapeHtml(version)}</span>`
       : `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('install_installed'))}"></tf-chip>`;
-  }
-  if (stateName === 'installing') {
-    return `<tf-chip size="sm" status="info" dot label="${escapeAttr(T('install_installing'))}"></tf-chip>`;
-  }
-  if (stateName === 'error') {
+  } else if (stateName === 'installing') {
+    label = `<tf-chip size="sm" status="info" dot label="${escapeAttr(T('install_installing'))}"></tf-chip>`;
+  } else if (stateName === 'error') {
     const reason = entry.last_error ?? entry.lastError ?? '';
-    return `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('install_error'))}"></tf-chip>`
+    label = `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('install_error'))}"></tf-chip>`
       + (reason ? `<div class="tf-table__cell-sub">${escapeHtml(reason)}</div>` : '');
+  } else {
+    label = `<span class="tf-table__cell-sub">${escapeHtml(T('install_absent'))}</span>`;
   }
-  return `<span class="tf-table__cell-sub">${escapeHtml(T('install_absent'))}</span>`;
+  // `tf-table__ent` is the shared "icon plus text on one line" cell layout from
+  // controls.css — the only sheet a shadow root adopts, so this is what a cell
+  // may use; a class from agent-accounts.css would never reach it.
+  return `<div class="tf-table__ent">${label}${trigger}</div>`;
+}
+
+/**
+ * One menu for the whole matrix, opened from the cell that was clicked.
+ *
+ * A click inside a shadow root is `composed`, so it reaches this listener with
+ * `composedPath()` naming the button it started on — which is how a cell
+ * written as HTML gets a real, anchored `tf-menu` without every cell building
+ * one of its own.
+ */
+function wireRuntimeMenu(body) {
+  const menu = body.querySelector('#aa-runtime-menu');
+  const install = menu.querySelector('[action="install"]');
+  const uninstall = menu.querySelector('[action="uninstall"]');
+  let target = null;
+
+  body.querySelector('#aa-runtime-table').addEventListener('click', (event) => {
+    const trigger = event.composedPath().find((el) => el?.dataset?.runtimeMenu !== undefined);
+    if (!trigger || trigger.hasAttribute('disabled')) return;
+    event.stopPropagation();
+    target = { nodeId: trigger.dataset.node, engineId: trigger.dataset.engine, state: trigger.dataset.state };
+    const installed = target.state === 'installed';
+    install.setAttribute('label', T(installed ? 'runtime_reinstall' : 'runtime_install'));
+    uninstall.setAttribute('label', T('runtime_uninstall'));
+    uninstall.toggleAttribute('disabled', target.state === 'absent');
+    menu.anchor = trigger;
+    menu.open();
+  });
+
+  menu.addEventListener('action', (event) => {
+    const action = event.detail?.action;
+    if (!target || (action !== 'install' && action !== 'uninstall')) return;
+    runInstall(target.nodeId, target.engineId, action === 'install');
+  });
+}
+
+/**
+ * Installs or removes one engine and then follows the node's own report.
+ *
+ * The request answers with the matrix row the NODE now holds, not with what was
+ * asked for; a state that is still `installing` when it lands means the node is
+ * still working, so the matrix keeps reading until it settles instead of
+ * leaving a chip that never changes.
+ */
+async function runInstall(nodeId, engineId, install) {
+  const label = engineName(engineId, state.engines);
+  toast(T(install ? 'runtime_install_started' : 'runtime_uninstall_started', { engine: label }), 'info');
+  try {
+    await AgentAccounts[install ? 'installRuntime' : 'uninstallRuntime'](nodeId, engineId);
+    toast(T(install ? 'runtime_installed' : 'runtime_uninstalled', { engine: label }), 'success');
+  } catch (err) {
+    toast(errorText(err), 'error');
+  }
+  await load();
+  await watchInstall(nodeId, engineId);
+}
+
+/** Re-reads the matrix while one cell is still `installing`, and then stops. */
+async function watchInstall(nodeId, engineId) {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const node = state.nodes.find((row) => row.node_id === nodeId);
+    const entry = (node?.engines ?? []).find((e) => (e.engine_id ?? e.engineId) === engineId);
+    if ((entry?.install_state ?? entry?.installState ?? 'absent') !== 'installing') return;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    if (!state.host || state.segment !== 'runtime') return;
+    await load();
+  }
 }

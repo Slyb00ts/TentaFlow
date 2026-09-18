@@ -492,3 +492,112 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
    WP1 is additive (migration 156 + repository + wire + admin dispatch).
 4. H-1 accepted: adopted accounts start `needs_login`; H-2: `api_key` stays as the second method of the
    same A02 wizard; H-3 accepted (same trust model as shared secrets, restricted to agent-runtime nodes).
+5. **"Administrator" is `handlers::session_is_admin`**, not the `org_admin` / PowerUser wording of §B.
+   One definition of administrator for the whole dashboard; a second one in this family could drift from
+   the Services and Nodes screens, and an ACL that disagrees with the screen next to it is an ACL nobody
+   can reason about. Every account handler stays `#[policy(UserSession)]` and carries its own check, in
+   the Project Studio pattern.
+   Within that: a **personal** account's credential and display name answer to its OWNER alone
+   (`CredentialSet`, `CredentialClear`, rename). An administrator keeps `status` (disable) and delete —
+   taking a personal account out of service is a different power from putting a credential of one's
+   choosing behind somebody else's name and having runs attributed to it (plan §2.2).
+6. **`SCHEMA_VERSION` stays 29 in this additive package.** Nothing on the wire is removed here, and a
+   bump would refuse the handshake of every node still on the old binary — including the ones this
+   package is supposed to leave working. The consequence is stated rather than hidden: a node that has
+   not been upgraded dead-letters the `core.provider_account*` operations it cannot materialize, and
+   after its upgrade the state reaches it through `reseed_core_state_from_current_rows`, not through a
+   replay of the dead-lettered ones. The bump lands with the package that REMOVES the `AgentCredential*`
+   variants, where old and new binaries genuinely cannot talk.
+7. **§C.5 and §D.4 credential sharing is replaced: a session never reaches the canonical credential.**
+   The shared-writable credential directory those sections describe was measured on a real `bwrap`
+   sandbox and failed: a session could overwrite, unlink or symlink-swap the account's canonical
+   credential (planting a foreign provider identity for every other user of the account, or denying
+   it to all of them), and by replacing `credentials/<engine>` with a directory symlink it could make
+   the UNSANDBOXED bridge read, hash, publish and write arbitrary host paths — including the Claude
+   sign-in writing a fresh token into a directory of the session's choosing. What replaces it:
+   - `accounts/<id>/credentials/` is in NO session's sandbox policy — not writable, not read-only, not
+     as a directory and not as a file. A session gets a private COPY in its own profile at start
+     (claude: the token in the process environment and no file at all; grok keeps its own mechanism
+     with no canonical path exposed).
+   - Sign-in, `login status` and discovery run in a separate bridge-private home
+     `accounts/<id>/login/`, which no session can write either. A working copy of the canonical
+     credential is placed there before the CLI runs and whatever the CLI leaves is extracted back.
+   - A session's changed copy is a REQUEST, published only if: the file is a bounded regular
+     non-symlink opened `O_NOFOLLOW` and stat'ed through the descriptor it is read from; the provider
+     identity in the new material equals the identity of the canonical credential (codex:
+     `tokens.account_id`, else the `sub` claim of `tokens.id_token`; an engine whose format carries no
+     stable subject — muse, grok — is never published); and the canonical credential still holds the
+     hash the session started from (CAS), so a session closing late cannot resurrect an older token.
+   - A refusal is reported as `credential_rejected {engine, reason, sha256}` (`identity_mismatch`,
+     `identity_unverifiable`, `stale_baseline`, `unsafe_credential_file`), a publication as
+     `credential_changed {engine, sha256}`; material never travels on either.
+   - After a publication the bridge fans the new material out to every live session whose copy is
+     still the old one, so a rotation reaches the sessions running beside it; a session that changed
+     its own copy is left alone.
+   - Two live sessions may share an account but never one vendor profile (`profile_in_use`).
+   The identity comparison refuses a credential that NAMES a different account. It is not
+   authentication: the material is not authenticated at all, the `id_token` signature is not verified,
+   and a session that forges the name defeats the check. It therefore stops a careless or
+   differently-signed-in session from replacing the account's credential, and does not stop a hostile
+   one. Open item: verify the `id_token` signature against the provider's published JWKS, which would
+   turn the name into a claim the provider stands behind. A grant remains a delegation of the
+   credential.
+8. **§B.2's `MeshCommandType::ProviderAccountOp` / `ProviderCredentialSubmit` were not added; the
+   family travels on the existing `AppRouteOp`.** Both designed variants are "a signed assertion plus
+   a CBOR payload routed to one node and dispatched there", which is exactly what `AppRouteOp` already
+   is, and a second variant of it would have to be kept in step with the first for the rest of its
+   life — including `SCHEMA_VERSION`, which correction 6 keeps at 29 precisely to avoid a handshake
+   break in this package. The guarantees §B.2 asked for are the ones `AppRouteOp` gives: the assertion
+   is verified on the far node, the actor is RE-DERIVED there rather than taken from the message, the
+   payload is bound by `args_digest`, `jti` is burned against replay and `exp`/`nbf` are enforced, and
+   the far node re-runs the same dispatch — so every ACL in `dispatch/provider_account.rs` applies
+   again on arrival. `ProviderCredentialSubmit` has no substitute because nothing needs it: a login
+   stores the credential on the node that ran it, and the other nodes receive it through the ledger
+   (§C.2), not through a mesh message carrying plaintext material.
+   The caveat is inherited and stated rather than hidden: `mesh/command_policy.rs:66` classifies
+   `AppRouteOp` as `ActorAsserted`, so a COMPROMISED trusted peer can name any subject in an assertion
+   it mints. Credential minting (`login.*`) and runtime install now sit behind that classification.
+   It is the same trust model the ledger already gives a trusted peer for this data (correction 4,
+   H-3) — a peer that can mint assertions can also write the synced rows — but the blast radius grew
+   from "reads what it is allowed to read" to "starts a sign-in as somebody else". Tightening it means
+   a stricter class for this op (and a reason for every other `AppRouteOp` user to follow), which is
+   a mesh-policy change, not an account change, and is therefore open rather than done.
+9. **The fleet-wide-looking counts are node-local and the wire says so.** `used_on`,
+   `MyAccountInfo.session_count`, `RuntimeNodeInfo.account_count` and `RuntimeNodeInfo.os` are derived
+   from `provider_account_sessions` and `provider_account_node_state`, which §C.1 deliberately keeps
+   OUT of the ledger. They are therefore a subset — what the answering node itself measured — and the
+   doc comments in `tentaflow-protocol/src/provider_account.rs` say that instead of promising a fleet
+   view. Making them fleet-wide is a forwarded read per node (§H.4), not a field rename, and is not
+   part of this package; a screen must not print them as if they covered the mesh.
+10. **`agent_runtime_nodes.receives_accounts` is a GATE, not a label.** A node with the flag off
+    starts no bridge and materializes no credential: `services::agent_runtime::ensure_runtime` and
+    `ensure_account_materialized` refuse with `NOT_RECEIVING_ACCOUNTS`, and `LoginStartRequest`
+    refuses earlier, at the dispatch boundary, with `PolicyDenied`. Without the gate the flag was
+    advisory: the target node of a sign-in is named by the caller (including a non-admin owner of a
+    personal account), so a node an administrator had explicitly taken out of the account fleet still
+    installed a CLI and wrote a credential onto its disk. The refusal carries the message key
+    `agent_accounts.login.node_not_receiving` (`NOT_RECEIVING_ACCOUNTS_KEY`) in all five locales;
+    `ProtocolError` has no key field, so the text on the wire is English and the key is what the
+    dashboard will render once the A02 wizard shows this refusal.
+11. **The two directions of `/account/credential` answer differently while a sign-in runs.**
+    The PUT (Core installing what the ledger delivered) is REFUSED with `login_in_progress`, and
+    the `login_flow` guard is held across the write rather than only read: releasing it after the
+    test leaves a window in which `auth_start` takes it and this handler then overwrites the file
+    the sign-in is about to be settled onto. The GET (Core collecting what a sign-in or a rotation
+    produced) deliberately does NOT refuse: it is how a rotation is picked up at all, the canonical
+    file is replaced by rename so the answer is whole whichever side of a settle it lands on, and
+    refusing would leave a rotation unread for as long as somebody is at the provider's device
+    page — minutes, during which every node in the fleet keeps the retired token. The same
+    ordering rule binds the end of a sign-in: `close_session` takes the login-home lease BEFORE it
+    clears `login_flow` and holds both across the publication, in the one order every other holder
+    uses (flag, then home). Clearing first left a window in which a probe saw "no sign-in running",
+    leased the home, materialized the OLD canonical credential over what the CLI had just written,
+    and the sign-in then published nothing.
+12. **One `identity_mismatch` from a VERIFIED identity puts the account in `needs_login`.** The
+    two-in-24-hours rule that guards the other rejection reasons exists because a single refusal can
+    be noise — a session closing late, a copy that never matched. `identity_mismatch` is not noise:
+    the bridge compared two identities it could both read and they named different provider accounts,
+    which means the credential in front of the sessions is not the one the account is supposed to
+    hold. Leaving it `active` would keep every session on a token whose owner has already changed.
+    `identity_unverifiable` keeps the two-in-24-hours rule: it is the answer for an engine whose
+    format carries no stable subject (muse, grok), so it says nothing about the credential at all.

@@ -84,14 +84,31 @@ async function prepare(page) {
   });
 }
 
+// A fresh node refuses to let the seeded admin in until the initial password is
+// replaced, so the first login of a run walks that screen and the rest of the
+// run keeps using the password it set.
+const ROTATED_PASSWORD = 'admin-e2e-2026';
+let adminPassword = 'admin';
+
 async function openAgentsScreen(page) {
   await prepare(page);
   await page.goto(`https://127.0.0.1:${PORT}/`);
   await page.locator('#login-username input').first().waitFor({ state: 'visible', timeout: 20000 });
   await page.locator('#login-username input').first().fill('admin');
-  await page.locator('#login-password input').first().fill('admin');
+  await page.locator('#login-password input').first().fill(adminPassword);
   await page.locator('#login-submit').click();
-  await page.waitForSelector('aside', { timeout: 30000 });
+  await Promise.race([
+    page.waitForSelector('aside', { timeout: 30000 }),
+    page.waitForSelector('#login-new-password input', { timeout: 30000 }),
+  ]);
+  if (await page.locator('#login-new-password input').count()) {
+    await page.locator('#login-password input').first().fill(adminPassword);
+    await page.locator('#login-new-password input').first().fill(ROTATED_PASSWORD);
+    await page.locator('#login-confirm-password input').first().fill(ROTATED_PASSWORD);
+    await page.locator('#login-submit').click();
+    adminPassword = ROTATED_PASSWORD;
+    await page.waitForSelector('aside', { timeout: 30000 });
+  }
   // `data-view` is the stable handle; the nav label is translated.
   await page.locator('.sidebar .nav-item[data-view="agents"]').first().click();
   await page.waitForSelector('#agents-grid-host .agent-card', { timeout: 20000 });

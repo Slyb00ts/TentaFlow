@@ -11924,6 +11924,87 @@ mod tests {
         assert_eq!(orphans, 0);
     }
 
+    /// Strips what v156 adds, so the migration can be exercised on a database
+    /// that really is at v155.
+    fn rewind_to_v155(conn: &Connection) {
+        conn.execute_batch(
+            "DROP TABLE agent_runtime_engines; \
+             DROP TABLE agent_runtime_nodes; \
+             DROP TABLE provider_account_node_state; \
+             DROP TABLE provider_account_sessions; \
+             DROP TABLE provider_account_credentials; \
+             DROP TABLE provider_account_grants; \
+             DROP TABLE provider_accounts; \
+             ALTER TABLE agents DROP COLUMN runtime_json;",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM _migrations WHERE version = 156", [])
+            .unwrap();
+    }
+
+    /// The agents an installation already has must come out of the upgrade
+    /// runnable. `runtime_json` is NOT NULL, so the only thing standing between
+    /// an existing row and a failed `ALTER TABLE` is the column default — and
+    /// the value it backfills has to be the runtime those agents actually have.
+    #[test]
+    fn migration_v156_upgrades_v155_database_without_data_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        rewind_to_v155(&conn);
+        assert!(
+            !column_exists(&conn, "agents", "runtime_json").unwrap(),
+            "the rewind must really land on v155"
+        );
+
+        for (id, name) in [("a1", "support"), ("a2", "researcher")] {
+            conn.execute(
+                "INSERT INTO agents (id, name, description, tools_json, skills_json, params_json) \
+                 VALUES (?1, ?2, 'd', '[]', '{}', '{}')",
+                rusqlite::params![id, name],
+            )
+            .unwrap();
+        }
+        let agents_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
+            .unwrap();
+
+        conn.execute_batch(PROVIDER_ACCOUNTS).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            agents_before,
+            "no agent may be lost by the upgrade"
+        );
+        let runtimes: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, runtime_json FROM agents ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(
+            runtimes,
+            vec![
+                ("a1".to_string(), r#"{"kind":"llm"}"#.to_string()),
+                ("a2".to_string(), r#"{"kind":"llm"}"#.to_string()),
+            ],
+            "an agent that predates the column is an LLM agent, spelled out"
+        );
+        assert_eq!(
+            conn.query_row("SELECT name FROM agents WHERE id = 'a1'", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "support",
+            "the upgrade rewrites no other column"
+        );
+        assert!(table_exists(&conn, "provider_accounts").unwrap());
+    }
+
     /// `sync_nodes.operator` is the organization's authority list, so it is a
     /// two-valued column with a safe default: a row that arrives from an older
     /// peer, or a migration of an existing install, must read as "not an

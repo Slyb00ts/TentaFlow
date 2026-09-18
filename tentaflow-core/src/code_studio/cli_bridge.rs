@@ -134,6 +134,27 @@ pub enum BridgeEvent {
         seq: u64,
         vendor_session_id: String,
     },
+    /// The account's shared provider credential changed while this session ran —
+    /// a refresh token the vendor rotated on use, or a new sign-in. The bridge
+    /// reports the HASH of the new credential and never its material, which is
+    /// what lets Core record the rotation without ever holding the token on this
+    /// path.
+    CredentialChanged {
+        seq: u64,
+        engine_id: String,
+        sha256: String,
+    },
+    /// The bridge REFUSED a credential the session's own copy now holds: a
+    /// foreign provider identity, a format that names no account, a file shape
+    /// no credential has, or material older than what the account already
+    /// carries. The account's credential did not move; the reason is what an
+    /// operator needs, and the material is never part of it.
+    CredentialRejected {
+        seq: u64,
+        engine_id: String,
+        reason: String,
+        sha256: String,
+    },
     Other {
         seq: u64,
         kind: String,
@@ -148,6 +169,8 @@ impl BridgeEvent {
             | BridgeEvent::StreamObject { seq, .. }
             | BridgeEvent::Approval { seq, .. }
             | BridgeEvent::VendorSession { seq, .. }
+            | BridgeEvent::CredentialChanged { seq, .. }
+            | BridgeEvent::CredentialRejected { seq, .. }
             | BridgeEvent::Other { seq, .. } => *seq,
         }
     }
@@ -158,6 +181,27 @@ impl BridgeEvent {
 pub enum TurnState {
     Completed,
     Failed(String),
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The engine a bridge event names, filtered the same way its reason and its
+/// digest are: this value reaches logs and audit details, so it is a bounded
+/// identifier or nothing at all. An unfiltered one is whatever the process on
+/// the other end of the channel chose to write.
+fn bridge_engine_id(data: &Value) -> String {
+    data.get("engine")
+        .and_then(Value::as_str)
+        .filter(|engine| {
+            (1..=32).contains(&engine.len())
+                && engine
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        })
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Reads one raw bridge event into the shape the rest of the system knows.
@@ -244,6 +288,38 @@ pub fn decode_event(seq: u64, kind: &str, data: Value) -> Result<BridgeEvent> {
             vendor_session_id: data
                 .get("id")
                 .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "credential_changed" => BridgeEvent::CredentialChanged {
+            seq,
+            engine_id: bridge_engine_id(&data),
+            sha256: data
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|value| is_sha256_hex(value))
+                .ok_or_else(|| anyhow!("credential change event without a usable hash"))?
+                .to_string(),
+        },
+        "credential_rejected" => BridgeEvent::CredentialRejected {
+            seq,
+            engine_id: bridge_engine_id(&data),
+            reason: data
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|reason| {
+                    (1..=64).contains(&reason.len())
+                        && reason
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                })
+                .ok_or_else(|| anyhow!("credential refusal without a usable reason"))?
+                .to_string(),
+            // A refusal that could not even read the file has no hash to carry.
+            sha256: data
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|value| is_sha256_hex(value))
                 .unwrap_or_default()
                 .to_string(),
         },
@@ -755,6 +831,16 @@ impl CliBridge {
         &self.service.engine_id
     }
 
+    /// The provider account this bridge runs as, as the service row records it.
+    ///
+    /// `None` is a bridge whose configuration carries no account id — which a
+    /// row written before the managed-CLI deploy path existed can still be; the
+    /// callers treat it as "nothing to attribute this to" rather than as an
+    /// error, because the session itself is working.
+    pub fn account_id(&self) -> Option<String> {
+        crate::services::coding_agent::account_id_of(&self.service)
+    }
+
     async fn call(&self, operation: &str, payload: Value) -> Result<Value> {
         let response = crate::services::coding_agent::execute_authorized(
             &self.db,
@@ -849,6 +935,7 @@ impl CliBridge {
                 ));
             }
         }
+        self.record_account_session(&instance, request.session_id);
         let bridge = self.clone();
         let pool = pool.clone();
         let watched = instance.clone();
@@ -1021,7 +1108,64 @@ impl CliBridge {
         let state = confirmed_process_state(&response)?;
         let status = if state == "reaped" { "reaped" } else { "ended" };
         set_instance_status(pool, instance_id, status)?;
+        if let Some(account_id) = self.account_id() {
+            let _ = crate::provider_accounts::repository::delete_session(
+                &self.db,
+                &account_id,
+                bridge_session_id,
+            );
+        }
         Ok(state.to_owned())
+    }
+
+    /// Records the open session against the provider account it runs on, so
+    /// A03 can list — and end — what is using a shared subscription right now.
+    ///
+    /// An account the registry does not know about is skipped rather than
+    /// created: the only writer of `provider_accounts` is the account screen,
+    /// and a session must not be able to mint the account it claims to be
+    /// using. The recording is best effort for the same reason the `services`
+    /// row is: a failure here must not take down a session that is otherwise
+    /// running.
+    fn record_account_session(&self, instance: &CliInstance, workspace_session_id: &str) {
+        let Some(account_id) = self.account_id() else {
+            return;
+        };
+        use crate::provider_accounts::repository as store;
+        match store::get_account(&self.db, &account_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(%account_id, %error, "provider account lookup for a session failed");
+                return;
+            }
+        }
+        let workspace_id = super::session::get_session(&self.db, workspace_session_id)
+            .ok()
+            .flatten()
+            .map(|session| session.workspace_id);
+        let node_id = crate::code_studio::remote_proxy::node_state()
+            .map(|state| state.local_node_id.to_string())
+            .unwrap_or_default();
+        if let Err(error) = store::upsert_session(
+            &self.db,
+            &crate::provider_accounts::SessionRecord {
+                account_id: account_id.clone(),
+                session_id: instance.bridge_session_id.clone(),
+                user_id: self.user_id.clone(),
+                // The agent is a property of the RUN, which this layer is not
+                // given; the workspace is what the session screen shows and
+                // what the account detail needs to name the work.
+                agent_id: None,
+                workspace_id,
+                node_id,
+                vendor_session_id: Some(instance.vendor_session_id.clone()),
+                started_at: String::new(),
+                last_used_at: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            },
+        ) {
+            tracing::warn!(%account_id, %error, "an open agent session was not recorded on its account");
+        }
     }
 }
 
@@ -2571,6 +2715,117 @@ mod tests {
                 turn_state(&event),
                 None,
                 "no end-of-turn signal must stay no end of turn: {event:?}"
+            );
+        }
+    }
+
+    /// The bridge's report that the account's credential rotated. It carries a
+    /// hash and an engine and nothing else — a decoder that accepted anything
+    /// resembling material here would put a provider token on the timeline.
+    #[test]
+    fn a_credential_change_decodes_to_a_hash_and_carries_no_material() {
+        let sha = "b".repeat(64);
+        let decoded = decode_event(
+            7,
+            "credential_changed",
+            serde_json::json!({"engine": "codex", "sha256": sha}),
+        )
+        .expect("a credential change is readable");
+        assert_eq!(
+            decoded,
+            BridgeEvent::CredentialChanged {
+                seq: 7,
+                engine_id: "codex".into(),
+                sha256: sha,
+            }
+        );
+        // It is a control frame: nothing about it belongs in a transcript, and
+        // it must never be read as the end of a turn.
+        assert_eq!(event_text(&decoded), None);
+        assert_eq!(turn_state(&decoded), None);
+
+        // The engine name reaches a log line, so it is an identifier or it is
+        // dropped — free text from the other end of the channel is neither.
+        let sha = "b".repeat(64);
+        for named in [
+            serde_json::json!({"engine": "sk-ant-oat01-secret\nWARN forged", "sha256": sha}),
+            serde_json::json!({"engine": "x".repeat(200), "sha256": sha}),
+            serde_json::json!({"engine": {"nested": "value"}, "sha256": sha}),
+            serde_json::json!({"sha256": sha}),
+        ] {
+            let BridgeEvent::CredentialChanged { engine_id, .. } =
+                decode_event(9, "credential_changed", named.clone()).expect("still readable")
+            else {
+                panic!("wrong variant for {named}");
+            };
+            assert_eq!(engine_id, "", "accepted {named}");
+        }
+
+        // Anything that is not a hash is refused rather than stored.
+        for broken in [
+            serde_json::json!({"engine": "codex"}),
+            serde_json::json!({"engine": "codex", "sha256": "short"}),
+            serde_json::json!({"engine": "codex", "sha256": "z".repeat(64)}),
+            serde_json::json!({"engine": "codex", "sha256": {"token": "sk-live"}}),
+        ] {
+            assert!(
+                decode_event(8, "credential_changed", broken.clone()).is_err(),
+                "accepted {broken}"
+            );
+        }
+    }
+
+    /// The other half of the contract: the bridge REFUSED a credential a session
+    /// tried to hand back. The reason is what reaches Core, the hash identifies
+    /// which material was refused, and nothing else travels.
+    #[test]
+    fn a_refused_credential_decodes_to_a_reason_and_carries_no_material() {
+        let sha = "c".repeat(64);
+        let decoded = decode_event(
+            11,
+            "credential_rejected",
+            serde_json::json!({"engine": "codex", "reason": "identity_mismatch", "sha256": sha}),
+        )
+        .expect("a refusal is readable");
+        assert_eq!(
+            decoded,
+            BridgeEvent::CredentialRejected {
+                seq: 11,
+                engine_id: "codex".into(),
+                reason: "identity_mismatch".into(),
+                sha256: sha,
+            }
+        );
+        assert_eq!(event_text(&decoded), None);
+        assert_eq!(turn_state(&decoded), None);
+
+        // A refusal that could not read the file at all carries no hash.
+        assert_eq!(
+            decode_event(
+                12,
+                "credential_rejected",
+                serde_json::json!({"engine": "codex", "reason": "unsafe_credential_file"}),
+            )
+            .unwrap(),
+            BridgeEvent::CredentialRejected {
+                seq: 12,
+                engine_id: "codex".into(),
+                reason: "unsafe_credential_file".into(),
+                sha256: String::new(),
+            }
+        );
+
+        // A reason is a machine token, never free text a vendor error or a token
+        // could be smuggled through.
+        for broken in [
+            serde_json::json!({"engine": "codex"}),
+            serde_json::json!({"engine": "codex", "reason": ""}),
+            serde_json::json!({"engine": "codex", "reason": "sk-ant-oat01-secret"}),
+            serde_json::json!({"engine": "codex", "reason": {"nested": "value"}}),
+        ] {
+            assert!(
+                decode_event(13, "credential_rejected", broken.clone()).is_err(),
+                "accepted {broken}"
             );
         }
     }

@@ -176,7 +176,7 @@ function mount({ deployId = 'dep-1', summaries = [], engineId = 'teams-bot', esc
     (fn) => fn(),
   );
 
-  mod.openDeployProgressModal({ deployId, engineId, deployMethod: 'docker', nodeId: 'n1' });
+  mod.openDeployProgressModal({ deployId, engineId, deployMethod: 'docker' });
 
   const win = document.body.children[0];
   const bodyEl = win.children[0];

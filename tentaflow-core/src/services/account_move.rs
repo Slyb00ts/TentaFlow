@@ -186,10 +186,24 @@ fn private_write(path: &Path, value: &Value) -> Result<()> {
     std::fs::File::open(path.parent().context("account state directory missing")?)?.sync_all()?;
     Ok(())
 }
+/// The canonical credential file of one account, as a path.
+///
+/// HARDENING: this module writes and deletes that file directly, while the
+/// bridge treats itself as its only writer and replaces it atomically. The two
+/// do not collide today only because a relocation requires an IDLE account and
+/// refuses while any session is open, so no bridge is serving the file at the
+/// moment this touches it. That is an invariant of the relocation protocol, not
+/// of the filesystem: anything that relaxes the idle requirement — or that
+/// starts a bridge on demand during a transfer — has to move these two calls
+/// onto the bridge's own `/account/credential` route instead, which is the
+/// route `services::agent_runtime` materialization already uses for exactly
+/// this reason. The path spelling below is duplicated from the bridge's
+/// `credentials::relative`, and only codex and claude are portable at all.
 fn credential_path(root: &Path, engine: &str) -> Result<std::path::PathBuf> {
+    let credentials = coding_agent::account_credential_directory(root);
     match engine {
-        "codex" => Ok(root.join("codex/auth.json")),
-        "claude-code" => Ok(root.join("claude/setup-token.json")),
+        "codex" => Ok(credentials.join("codex/auth.json")),
+        "claude-code" => Ok(credentials.join("claude/setup-token.json")),
         _ => bail!("provider portability is unavailable"),
     }
 }

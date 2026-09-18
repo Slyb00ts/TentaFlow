@@ -62,6 +62,16 @@ pub struct ProviderAccountInfo {
     pub session_count: u32,
     pub agent_count: u32,
     pub updated_at: String,
+    /// Nodes that have materialized this account's credential AS MEASURED BY
+    /// THE ANSWERING NODE — A01's "Używane na".
+    ///
+    /// `provider_account_node_state` is node-local and stays out of the ledger
+    /// (it is a measurement, not a decision), so this is what the answering node
+    /// knows and never the whole fleet: a peer that materialized the account and
+    /// never told anybody is absent from it. Empty therefore means "not here and
+    /// nothing reported", not "nowhere".
+    #[serde(default)]
+    pub used_on: Vec<AccountUsageNode>,
 }
 
 /// One row of the Dostęp tab (A04). `subject_type` is 'user' | 'group' | 'org';
@@ -73,6 +83,16 @@ pub struct GrantEntry {
     pub display_name: String,
     /// How many people a group grant covers; `None` for a user or org subject.
     pub member_count: Option<u32>,
+    /// Who granted it, resolved to a name — A04's "Nadał". `None` when the
+    /// grant names an actor this node cannot resolve (a peer's administrator
+    /// who never replicated here); the raw id is deliberately not sent in its
+    /// place, because the column would then read as a person.
+    #[serde(default)]
+    pub granted_by_name: Option<String>,
+    /// When the grant was made. Empty on a request, which is a full replace and
+    /// carries no history — the server stamps it.
+    #[serde(default)]
+    pub granted_at: String,
 }
 
 /// One live session on an account (A03). Runtime state, never replicated — a
@@ -130,6 +150,19 @@ pub struct MyAccountInfo {
     pub can_login: bool,
     pub can_delete: bool,
     pub last_used_at: Option<String>,
+    /// 'api_key' | 'provider_login' — U01 offers "Zaloguj" for one and "Wklej
+    /// klucz" for the other, and `can_login` alone cannot tell them apart.
+    #[serde(default)]
+    pub credential_kind: String,
+    /// Nodes this account is materialized on, same meaning and the same limit
+    /// as `ProviderAccountInfo::used_on`: what the answering node measured.
+    #[serde(default)]
+    pub used_on: Vec<AccountUsageNode>,
+    /// How many sessions the ANSWERING NODE has open on the account.
+    /// `provider_account_sessions` is runtime state and is not replicated, so a
+    /// session running on a peer is not in this number.
+    #[serde(default)]
+    pub session_count: u32,
 }
 
 /// One row of the node matrix (N01): what the node is, whether it may hold
@@ -148,7 +181,18 @@ pub struct RuntimeNodeInfo {
     pub sandbox_capable: Option<bool>,
     pub receives_accounts: bool,
     pub engines: Vec<RuntimeEngineInfo>,
+    /// How many accounts this node holds a credential for, as counted by the
+    /// ANSWERING node from its own `provider_account_node_state` — which is
+    /// node-local and not replicated, so a remote row reads 0 until that node
+    /// answers for itself.
     pub account_count: u32,
+    /// Operating system of the node ('linux' / 'macos' / …), N01's sub-line.
+    /// `None` for a node that has not reported one, for the same reason
+    /// `sandbox_capable` stays unknown: only a node knows what it runs, and
+    /// nothing replicates it — a peer stays unknown until the matrix is read on
+    /// that peer.
+    #[serde(default)]
+    pub os: Option<String>,
 }
 
 /// One cell of the node matrix: the state of one engine on one node.
@@ -169,6 +213,14 @@ pub struct EngineSummary {
     pub display_name: String,
     pub supports_login: bool,
     pub supports_api_key: bool,
+}
+
+/// One node an account is present on, named rather than identified: the list is
+/// rendered inline in a table cell, where a UUID is noise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AccountUsageNode {
+    pub node_id: String,
+    pub node_name: String,
 }
 
 // =============================================================================
@@ -397,28 +449,29 @@ mod tests {
         let names: Vec<String> = structs.iter().map(|item| item.name.clone()).collect();
         assert_eq!(
             names.len(),
-            9,
+            10,
             "wire struct COUNT changed. Live structs:\n{}",
             names.join("\n")
         );
         assert_eq!(
             name_digest(&names),
-            0xcbe1_305b_593b_4b80,
+            0x06df_ec4c_dbdc_c900,
             "wire struct NAMES or their DECLARATION ORDER changed. Live structs:\n{}",
             names.join("\n")
         );
 
         // (struct, field count, digest of its attributes + "name: Type" fields)
         let pinned: &[(&str, usize, u64)] = &[
-            ("ProviderAccountInfo", 18, 0x8c94_a37f_486f_db04),
-            ("GrantEntry", 4, 0xaa05_3ffe_8d57_11e2),
+            ("ProviderAccountInfo", 19, 0x6197_9160_94a4_6043),
+            ("GrantEntry", 6, 0x6c64_44d1_5f29_be89),
             ("AccountSessionInfo", 11, 0x3227_205e_b73c_ec8d),
             ("AccountNodeInfo", 6, 0x2d0a_7b9e_3aa3_acb6),
             ("AccountAgentInfo", 3, 0xf485_7274_2ec5_4bef),
-            ("MyAccountInfo", 10, 0xda85_8c4c_7c84_3b7d),
-            ("RuntimeNodeInfo", 7, 0x5e15_bccf_1721_b03c),
+            ("MyAccountInfo", 13, 0x8f3a_1ca1_fb6b_a66b),
+            ("RuntimeNodeInfo", 8, 0xda92_e650_eba7_469e),
             ("RuntimeEngineInfo", 4, 0x3b72_3d70_7ebd_2541),
             ("EngineSummary", 4, 0x9d7c_c109_f7dd_c510),
+            ("AccountUsageNode", 2, 0xa9b4_a56e_70f7_26dd),
         ];
         assert_eq!(pinned.len(), structs.len());
         for (name, count, digest) in pinned {

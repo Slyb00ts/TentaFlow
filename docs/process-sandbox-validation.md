@@ -64,6 +64,20 @@ Granica zaufania nadal wyklucza wrogie procesy działające poza sandboxem na ty
 
 ## Konta agentów i prywatne profile
 
+> **Sprostowanie z 2026-09-17 (nie zmienia pomiarów z 2026-09-06).** Cztery akapity tej sekcji
+> opisują stan sprzed wielosesyjności konta: „jedna aktywna sesja” na konto, kopiowanie poświadczenia
+> przy starcie sesji oraz kwarantannę `pending-credential.json` z wymuszonym ponownym logowaniem.
+> Zdania te pozostają tu jako zapis tego, co wtedy zmierzono. Obowiązujące zachowanie jest inne:
+> konto obsługuje wiele równoczesnych sesji bez blokady; każda sesja dostaje prywatną KOPIĘ
+> poświadczenia, a kanoniczne poświadczenie konta nie występuje w polityce sandboxa żadnej sesji;
+> logowanie i odczyty dla konta wykonują się w osobnym, prywatnym katalogu bridge'a; zmieniona kopia
+> sesji wraca do konta tylko po kontroli kształtu pliku (bez podążania za dowiązaniami), zgodności
+> tożsamości konta dostawcy i niezmienionego skrótu kanonicznego (CAS), a odmowa jest raportowana
+> jako `credential_rejected` z powodem. Uwaga o braku kryptograficznego dowodu tożsamości
+> pozostaje aktualna: porównanie `account_id`/`sub` jest kontrolą zamknięcia, nie uwierzytelnieniem.
+> Opis obowiązującego modelu: [instrukcja obsługi](agent-accounts-operations.md), kontrakt:
+> `docs/agent-accounts-technical-design.md`, „Binding corrections” punkt 7.
+
 Rekord serwisu wskazuje osobny UUID konta. Core przechowuje lokalny token IPC w prywatnym katalogu konta, a nie w publicznym `config_json`. Zwykłe operacje sesji sprawdzają aktywność użytkownika, grant do konta i właściciela konkretnej sesji. Odebranie grantu zamyka sesje tego użytkownika. Dodatkowy monitor sprawdza aktywność i uprawnienie co 500 ms; Code Studio oddzielnie sprawdza członkostwo projektu i stan sesji. To maksymalny typowy interwał wykrycia, nie synchroniczne zatrzymanie w chwili zapisu zmiany w bazie. Potwierdzenie zamknięcia wymaga zakończonego cleanupu procesów.
 
 Jedno konto ma wyłączną blokadę OS na proces bridge oraz jedną aktywną sesję. Każda sesja otrzymuje osobny HOME, cache i historię. Kopiowane jest wyłącznie wybrane poświadczenie, bez profilu CLI, historii, hooks ani konfiguracji poprzedniego użytkownika. Konsola w Services ma prywatny katalog roboczy; istniejący projekt uruchamia się przez autoryzowany katalog Code Studio. Zamkniętej sesji nie można uruchomić ponownie przez `session.turn`; wznowienie przechodzi przez pełne `session.create`, kontrolę właściciela i blokadę konta.

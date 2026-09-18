@@ -9296,7 +9296,22 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             P::ResOk
         }
         P::ReqDeleteUser { user_id } => {
-            repository::delete_user_account(db, user_id).map_err(db_err)?;
+            // Deleting a user cascades into their provider accounts and the
+            // credentials those hold, so the audit trail has to name who ordered
+            // it — the deleted row itself can no longer answer that.
+            let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+            repository::delete_user_account(db, user_id, actor.as_deref()).map_err(db_err)?;
+            repository::log_audit(
+                db,
+                actor.as_deref(),
+                None,
+                "iam.user.delete",
+                Some(&format!("user:{}", user_id)),
+                None,
+                None,
+                Some(&ctx.state.local_node_id),
+            )
+            .map_err(db_err)?;
             P::ResOk
         }
         P::ReqSetUserGroups { user_id, group_ids } => {

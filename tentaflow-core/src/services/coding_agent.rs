@@ -41,34 +41,66 @@ pub fn ensure_account_config(config: &mut Value) -> Result<String, String> {
 }
 
 pub fn account_directory(config: &Value) -> Result<std::path::PathBuf, String> {
-    let id = config
-        .get("account_id")
-        .and_then(Value::as_str)
-        .ok_or("agent account requires redeployment before use")?;
-    let parsed = uuid::Uuid::parse_str(id).map_err(|_| "invalid account_id")?;
-    if parsed.to_string() != id {
+    account_root(
+        config
+            .get("account_id")
+            .and_then(Value::as_str)
+            .ok_or("agent account requires redeployment before use")?,
+    )
+}
+
+/// The on-disk home of one account, addressed by its id alone.
+///
+/// The id is the last path component, so it is validated as a canonical UUID
+/// before it is joined: anything else would be a caller-chosen directory name
+/// under the key store.
+pub fn account_root(account_id: &str) -> Result<std::path::PathBuf, String> {
+    let parsed = uuid::Uuid::parse_str(account_id).map_err(|_| "invalid account_id")?;
+    if parsed.to_string() != account_id {
         return Err("account_id must be a canonical UUID".into());
     }
     Ok(crate::paths::keys_dir()
         .join("coding-agents")
         .join("accounts")
-        .join(id))
+        .join(account_id))
+}
+
+/// The account's ONE canonical provider credential, written by the bridge and
+/// by nothing else.
+///
+/// It is named in NO session's sandbox policy — not writable, not read-only,
+/// not as a directory and not as a file (binding correction 7). A session gets a
+/// private COPY in its own profile, and the only way back is the bridge's
+/// publication gate. Core creates the directory here because it prepares the
+/// account root before the bridge starts; it never writes the credential.
+pub fn account_credential_directory(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("credentials")
 }
 
 pub fn prepare_account_directory(config: &Value) -> Result<std::path::PathBuf, String> {
+    prepare_account_root(
+        config
+            .get("account_id")
+            .and_then(Value::as_str)
+            .ok_or("agent account requires redeployment before use")?,
+    )
+}
+
+pub fn prepare_account_root(account_id: &str) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
-    let root = account_directory(config)?;
+    let root = account_root(account_id)?;
+    let credentials = account_credential_directory(&root);
     for path in [
         root.clone(),
         root.join("home"),
-        root.join("codex"),
-        root.join("claude"),
-        root.join("grok"),
-        root.join("config"),
-        root.join("config/muse"),
         root.join("data"),
-        root.join("data/muse"),
         root.join("tmp"),
+        credentials.clone(),
+        credentials.join("codex"),
+        credentials.join("claude"),
+        credentials.join("grok"),
+        credentials.join("config"),
+        credentials.join("config/muse"),
     ] {
         std::fs::create_dir_all(&path).map_err(|e| format!("create account profile: {e}"))?;
         let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
@@ -102,7 +134,7 @@ pub fn prepare_account_directory(config: &Value) -> Result<std::path::PathBuf, S
             )
             .map_err(|e| e.to_string())?,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            read_bridge_token(config)?;
+            read_account_bridge_token(account_id)?;
         }
         Err(e) => return Err(format!("create bridge credential: {e}")),
     }
@@ -110,7 +142,18 @@ pub fn prepare_account_directory(config: &Value) -> Result<std::path::PathBuf, S
 }
 
 fn read_bridge_token(config: &Value) -> Result<String, String> {
-    let path = account_directory(config)?.join("bridge-token");
+    read_account_bridge_token(
+        config
+            .get("account_id")
+            .and_then(Value::as_str)
+            .ok_or("agent account requires redeployment before use")?,
+    )
+}
+
+/// The account's bridge bearer token, which is what makes the loopback HTTP
+/// surface private to this process.
+pub(crate) fn read_account_bridge_token(account_id: &str) -> Result<String, String> {
+    let path = account_root(account_id)?.join("bridge-token");
     let metadata = std::fs::symlink_metadata(&path)
         .map_err(|e| format!("read bridge credential metadata: {e}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 64 {
@@ -122,6 +165,16 @@ fn read_bridge_token(config: &Value) -> Result<String, String> {
         return Err("invalid bridge credential".into());
     }
     Ok(token)
+}
+
+/// The provider account a service row runs as, or `None` when its
+/// configuration names none.
+pub fn account_id_of(service: &ServiceRow) -> Option<String> {
+    serde_json::from_str::<Value>(&service.config_json)
+        .ok()?
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 pub fn account_permission(
@@ -175,6 +228,14 @@ fn owned_sessions(
         .map_err(|e| e.to_string())
 }
 
+/// Serializes operations that change the ACCOUNT: its name, its grants, its
+/// credential, its deployment and its relocation.
+///
+/// It is deliberately not taken for session traffic. An account serves as many
+/// sessions as it is asked to — several agents, several users with a grant,
+/// several Code Studio workspaces — exactly like several vendor CLIs running on
+/// one login, so holding an account-wide lock across a turn or a poll would
+/// reintroduce single-session behaviour by the back door.
 pub(crate) async fn lock_account(service_id:i64)->Result<tokio::sync::OwnedMutexGuard<()>,String> {
     static LOCKS: OnceLock<Mutex<HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
@@ -188,6 +249,14 @@ pub(crate) async fn lock_account(service_id:i64)->Result<tokio::sync::OwnedMutex
     Ok(lock.lock_owned().await)
 }
 
+/// Whether an operation changes the account rather than using it. The account
+/// lock follows this answer, and nothing else does.
+fn mutates_account(operation: &str) -> bool {
+    operation.starts_with("account.")
+        || operation.starts_with("auth.")
+        || operation.starts_with("runtime.")
+}
+
 pub async fn execute_authorized(
     db: &crate::db::DbPool,
     service: &ServiceRow,
@@ -195,7 +264,11 @@ pub async fn execute_authorized(
     operation: &str,
     payload_json: &str,
 ) -> Result<String, String> {
-    let _guard = lock_account(service.id).await?;
+    let _guard = if mutates_account(operation) {
+        Some(lock_account(service.id).await?)
+    } else {
+        None
+    };
     let (can_use, can_manage) = account_permission(db, service.id, user_id)?;
     let config: Value = serde_json::from_str(&service.config_json).map_err(|e| e.to_string())?;
     let account_id = config.get("account_id").and_then(Value::as_str);
@@ -579,13 +652,34 @@ pub async fn execute(
             return Ok(cached);
         }
     }
+    let config: Value = serde_json::from_str(&service.config_json)
+        .map_err(|e| format!("invalid agent configuration: {e}"))?;
+    let token = read_bridge_token(&config)?;
+    let text = call_bridge(base, &token, method, &path, body).await?;
+    if operation == "models.list" {
+        store_models(service.id, &text);
+    }
+    Ok(text)
+}
+
+/// One HTTP call to a coding-agent bridge, and the only place this process
+/// talks to one.
+///
+/// It is shared with `services::agent_runtime`, which addresses a bridge by the
+/// account it was started for rather than by a `services` row: a second client
+/// would be a second set of rules about the endpoint, the bearer token and what
+/// a 401 means, and the two would drift.
+pub(crate) async fn call_bridge(
+    base: &str,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(65))
         .build()
         .map_err(|e| e.to_string())?;
-    let config: Value = serde_json::from_str(&service.config_json)
-        .map_err(|e| format!("invalid agent configuration: {e}"))?;
-    let token = read_bridge_token(&config)?;
     let mut request = client
         .request(method, format!("{base}{path}"))
         .bearer_auth(token);
@@ -606,9 +700,6 @@ pub async fn execute(
     }
     serde_json::from_str::<Value>(&text)
         .map_err(|e| format!("bridge returned invalid JSON: {e}"))?;
-    if operation == "models.list" {
-        store_models(service.id, &text);
-    }
     Ok(text)
 }
 
@@ -798,6 +889,36 @@ pub async fn execute_chat(
                 }
                 if let BridgeEvent::Approval { request, .. } = &decoded {
                     deny_approval(db, service, user_id, &session_id, request).await?;
+                    continue;
+                }
+                // A rotation observed on the chat path is the same fact as one
+                // observed on the delegation path, and it reaches the same
+                // consumer: a token the provider retired must stop being the
+                // one every other node materializes.
+                if let BridgeEvent::CredentialChanged {
+                    engine_id, sha256, ..
+                } = &decoded
+                {
+                    if let Some(id) = account_id_of(service) {
+                        crate::provider_accounts::credential_events::observed_change(
+                            &id, engine_id, sha256,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                if let BridgeEvent::CredentialRejected {
+                    engine_id,
+                    reason,
+                    sha256,
+                    ..
+                } = &decoded
+                {
+                    if let Some(id) = account_id_of(service) {
+                        crate::provider_accounts::credential_events::observed_rejection(
+                            &id, engine_id, reason, sha256,
+                        );
+                    }
                     continue;
                 }
                 match turn_state(&decoded) {
@@ -1007,6 +1128,70 @@ mod tests {
                 .unwrap()
                 .0
         );
+    }
+
+    /// The account lock is for CHANGING an account, never for using one.
+    ///
+    /// An account serves several sessions at once — several agents, several
+    /// users with a grant, several workspaces — so a session operation must run
+    /// while the account is locked; only another account mutation waits.
+    #[tokio::test]
+    async fn the_account_lock_holds_up_a_rename_and_never_a_session() {
+        // A service id nobody else in this process uses: the lock is a global
+        // keyed by that id, and `:memory:` hands out low rowids to everyone.
+        const SERVICE_ID: i64 = 970_431;
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut config = serde_json::json!({});
+        ensure_account_config(&mut config).unwrap();
+        let service = {
+            let conn = db.write().unwrap();
+            conn.execute("INSERT INTO user_accounts(id,username,password_hash,role,is_admin) VALUES('lock-admin','lock-admin','synthetic','admin',1)",[]).unwrap();
+            conn.execute(
+                "INSERT INTO services (id, engine_id, category, display_name, deploy_method, \
+                    transport, status, config_json) VALUES (?1, 'codex', 'agents', 'Codex', \
+                    'native_managed_cli', 'agent_rpc', 'running', ?2)",
+                rusqlite::params![SERVICE_ID, config.to_string()],
+            )
+            .unwrap();
+            crate::services_repo::services::get(&conn, SERVICE_ID)
+                .unwrap()
+                .unwrap()
+        };
+        let held = lock_account(SERVICE_ID).await.unwrap();
+
+        // Refused on ownership, which it can only reach without the lock.
+        let session = tokio::time::timeout(
+            Duration::from_secs(5),
+            execute_authorized(
+                &db,
+                &service,
+                "lock-admin",
+                "session.events",
+                r#"{"session_id":"someone-elses"}"#,
+            ),
+        )
+        .await
+        .expect("session traffic waited for the account lock");
+        assert!(session.unwrap_err().contains("session_access_denied"));
+
+        let rename = r#"{"display_name":"Renamed"}"#;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                execute_authorized(&db, &service, "lock-admin", "account.rename", rename),
+            )
+            .await
+            .is_err(),
+            "an account mutation must still wait for the account lock"
+        );
+        drop(held);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            execute_authorized(&db, &service, "lock-admin", "account.rename", rename),
+        )
+        .await
+        .expect("the rename proceeds once the lock is free")
+        .unwrap();
     }
 
     fn path_of(operation: &str, payload: &str) -> String {

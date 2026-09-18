@@ -7,10 +7,6 @@
 //       `ProviderAccountBody`. Nothing here ever handles credential material
 //       except the one field of `providerAccountCredentialSetRequest`, which is
 //       write-only: no response carries a key back, so no screen can show one.
-//
-//       Login, session revoke and CLI installation are NOT here, because this
-//       node refuses them with NotAvailable — the screens leave the affordance
-//       out instead of rendering a button that cannot work.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -60,6 +56,27 @@ export const AgentAccounts = {
   sessions(accountId) {
     return ApiBinary.one('providerAccountSessionListRequest', { accountId });
   },
+  /** Ends ONE live session of an account; the credential is untouched. */
+  revokeSession(accountId, sessionId) {
+    return ApiBinary.action('providerAccountSessionRevokeRequest', { accountId, sessionId });
+  },
+  /**
+   * A02 — the provider sign-in. Core runs the vendor CLI on `nodeId` (its home
+   * node, or this one, when the caller names none) and answers with the address
+   * the person has to open; every later step addresses the flow by its id.
+   */
+  loginStart({ accountId, nodeId = null }) {
+    return ApiBinary.one('providerAccountLoginStartRequest', { accountId, nodeId });
+  },
+  loginInput(loginId, value) {
+    return ApiBinary.action('providerAccountLoginInputRequest', { loginId, value });
+  },
+  loginStatus(loginId) {
+    return ApiBinary.one('providerAccountLoginStatusRequest', { loginId });
+  },
+  loginCancel(loginId) {
+    return ApiBinary.action('providerAccountLoginCancelRequest', { loginId });
+  },
   /** U01 — the caller's own accounts plus the shared ones granted to them. */
   mine({ engineId = null } = {}) {
     return ApiBinary.one('providerAccountMyListRequest', { engineId });
@@ -70,7 +87,53 @@ export const AgentAccounts = {
   setReceivesAccounts(nodeId, enabled) {
     return ApiBinary.action('providerAccountRuntimeSetReceivesAccountsRequest', { nodeId, enabled });
   },
+  /** N01 — installs the vendor CLI and its bridge for one engine on one node. */
+  installRuntime(nodeId, engineId) {
+    return ApiBinary.action('providerAccountRuntimeInstallRequest', { nodeId, engineId });
+  },
+  uninstallRuntime(nodeId, engineId) {
+    return ApiBinary.action('providerAccountRuntimeUninstallRequest', { nodeId, engineId });
+  },
 };
+
+// =============================================================================
+// Refusals
+// =============================================================================
+
+// A refusal Core spells out in English, and the key that says the same thing in
+// the operator's language. `ProtocolError` has no key field, so the sentence IS
+// the contract: these are the constants the node sends
+// (`services/agent_runtime.rs::NOT_RECEIVING_ACCOUNTS`, whose
+// `NOT_RECEIVING_ACCOUNTS_KEY` names the key below). Matched by substring,
+// because an anyhow chain prefixes it with the operation that hit it.
+const REFUSAL_KEYS = [
+  ['this node is not configured to receive agent accounts', 'login.node_not_receiving'],
+];
+
+/**
+ * A server refusal as a screen may render it: the transport's
+ * `protocol error <Code>: ` prefix removed, the code kept for the caller that
+ * reacts to it, and a known refusal replaced by its translation.
+ *
+ * The prefix is added by `binary-ws-client.js` when it rejects a call; it names
+ * a wire enum variant and belongs in a log, not in a sentence an operator
+ * reads. A message that carries no prefix (a transport timeout, say) passes
+ * through unchanged — it is already the whole story.
+ */
+export function describeError(error) {
+  const raw = String(error?.message ?? error ?? '').trim();
+  const parsed = /^protocol error ([A-Za-z]+):\s*([\s\S]*)$/.exec(raw);
+  const code = parsed ? parsed[1] : '';
+  const message = (parsed ? parsed[2] : raw).trim();
+  const known = REFUSAL_KEYS.find(([needle]) => message.includes(needle));
+  if (known) return { code, message: T(known[1]) };
+  return { code, message: message || T('error_unknown') };
+}
+
+/** The same refusal as one string, for a toast or an error line. */
+export function errorText(error) {
+  return describeError(error).message;
+}
 
 // =============================================================================
 // Labels and chips
@@ -114,14 +177,20 @@ export function engineName(engineId, engines = []) {
  * one question — an active subscription is "signed in", an active API-key
  * account is "verified" — and a pending one says which of the two it is still
  * waiting for, so the operator knows what to do next.
+ *
+ * A row that carries no `credential_kind` (the caller's own accounts, which the
+ * wire returns without it) falls back to wording that holds for both kinds: a
+ * key account must never be labelled "signed in".
  */
 export function statusChipHtml(account) {
   const status = String(account.status || '');
-  const apiKey = (account.credential_kind ?? account.credentialKind) === 'api_key';
+  const kind = account.credential_kind ?? account.credentialKind ?? null;
+  const apiKey = kind === 'api_key';
+  const forKind = (keyApiKey, keyLogin, keyAny) => (kind === null ? keyAny : (apiKey ? keyApiKey : keyLogin));
   const map = {
-    active: { tone: 'ok', key: apiKey ? 'status_active_api_key' : 'status_active_login' },
-    needs_login: { tone: 'warn', key: apiKey ? 'status_needs_key' : 'status_needs_login' },
-    pending: { tone: 'info', key: apiKey ? 'status_pending_api_key' : 'status_pending_login' },
+    active: { tone: 'ok', key: forKind('status_active_api_key', 'status_active_login', 'status_active_any') },
+    needs_login: { tone: 'warn', key: forKind('status_needs_key', 'status_needs_login', 'status_needs_any') },
+    pending: { tone: 'info', key: forKind('status_pending_api_key', 'status_pending_login', 'status_pending_any') },
     disabled: { tone: 'neutral', key: 'status_disabled' },
   };
   const entry = map[status] ?? { tone: 'neutral', key: 'status_unknown' };
@@ -191,13 +260,47 @@ export function sinceLabel(isoTimestamp) {
   return T('since_hours', { h: hours, m: String(minutes % 60).padStart(2, '0') });
 }
 
-/** Local date+time of an ISO timestamp, or an em dash when there is none. */
+/**
+ * Date+time of an ISO timestamp in the APP's language (the one the operator
+ * picked), not the browser's — the rest of the dashboard formats the same way.
+ * An em dash when there is no usable timestamp.
+ */
 export function whenLabel(isoTimestamp) {
   const at = Date.parse(String(isoTimestamp || ''));
   if (!Number.isFinite(at)) return '—';
-  return new Date(at).toLocaleString(undefined, {
+  return new Date(at).toLocaleString(I18n.getLanguage() || undefined, {
     year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
   });
+}
+
+/**
+ * A01/U01 "Używane na": the nodes that hold this account's credential, named.
+ *
+ * The wire says this is what the ANSWERING node measured, never a fleet view
+ * (`provider_account_node_state` stays out of the ledger), so an empty list is
+ * "nothing reported here" — an em dash, and the tooltip next to the column says
+ * the rest.
+ */
+export function usedOnLabel(account) {
+  const nodes = account.used_on ?? account.usedOn ?? [];
+  const names = nodes.map((node) => node.node_name ?? node.nodeName ?? '').filter(Boolean);
+  return names.length ? names.join(', ') : T('value_none');
+}
+
+/** `linux` / `macos` / `windows` as the operator's language spells it. */
+export function osLabel(os) {
+  const id = String(os || '');
+  if (!id) return T('runtime_os_unknown');
+  const known = { linux: 'runtime_os_linux', macos: 'runtime_os_macos', windows: 'runtime_os_windows' };
+  return known[id] ? T(known[id]) : id;
+}
+
+/** A04 "Nadał": who granted access and when, or nothing when neither is known. */
+export function grantedByLabel(grant) {
+  const who = grant.granted_by_name ?? grant.grantedByName ?? '';
+  const when = grant.granted_at ?? grant.grantedAt ?? '';
+  const parts = [who, when ? whenLabel(when) : ''].filter(Boolean);
+  return parts.length ? parts.join(' · ') : T('value_none');
 }
 
 /** The engine ids an account may be created for, given what the engine supports. */

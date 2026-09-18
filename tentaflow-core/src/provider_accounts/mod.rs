@@ -11,6 +11,8 @@
 // only writer, and `sync_capture.rs` the only place a write becomes a ledger
 // operation.
 
+pub mod credential_events;
+pub mod login;
 pub mod repository;
 pub mod sync_capture;
 

@@ -122,6 +122,96 @@
    opposite edge so it is never the button next to "Zamknij". */
 .aa-footer-left { margin-right: auto; }
 
+/* ---- Login wizard (A02) ---------------------------------------------------- */
+
+.aa-login {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.aa-login-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.aa-login-step {
+  display: grid;
+  grid-template-columns: 26px 1fr;
+  gap: 12px;
+  align-items: start;
+  opacity: 0.55;
+}
+.aa-login-step.is-now,
+.aa-login-step.is-done { opacity: 1; }
+
+.aa-login-num {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  font-size: 11.5px;
+  font-weight: 800;
+  color: var(--text-3);
+}
+.aa-login-step.is-now .aa-login-num {
+  border-color: var(--accent-1);
+  color: var(--accent-1);
+}
+.aa-login-step.is-done .aa-login-num {
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.aa-login-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.aa-login-body h5 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.aa-login-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.aa-login-actions tf-input { flex: 1; min-width: 0; }
+
+/* The verification address: a real link, so it can be opened, copied and
+   focused by keyboard without the buttons next to it. */
+.aa-login-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+}
+.aa-login-link[hidden] { display: none; }
+.aa-login-link a {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11.5px;
+  color: var(--accent-1);
+  overflow-wrap: anywhere;
+}
+
 /* ---- U01 — "Aplikacje agentowe" ------------------------------------------- */
 
 /* "Moje konta" is a plain block page, so its two section headings carry their

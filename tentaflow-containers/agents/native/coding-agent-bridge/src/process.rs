@@ -26,10 +26,13 @@
 // is the cost of that boundary, and the record format is deliberately the same
 // idea so both are debugged the same way.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// How long a terminated process is given to exit before SIGKILL.
@@ -81,6 +84,11 @@ pub struct Reaped {
 #[derive(Clone, Debug)]
 pub struct Registry {
     dir: PathBuf,
+    /// Record ids this process currently owns. An account runs several sessions
+    /// at once, so "there is a record on disk" no longer means "a previous life
+    /// left it": without this set the second session's orphan sweep would kill
+    /// the first session's CLI.
+    live: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Registry {
@@ -93,7 +101,10 @@ impl Registry {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            live: Arc::new(Mutex::new(HashSet::new())),
+        })
     }
 
     /// Records a running child. The handle removes the record when the child is
@@ -104,26 +115,30 @@ impl Registry {
         let path = self.dir.join(format!("{id}.json"));
         let birth_identity = process_identity(pid)?;
         let record = Record {
-            id,
+            id: id.clone(),
             kind: kind.to_string(),
             pid,
             birth_identity,
             supervisor_root: supervisor_root.clone(),
         };
+        self.live.lock().insert(id.clone());
         if let Err(error) = serde_json::to_vec(&record)
             .map_err(anyhow::Error::from)
             .and_then(|bytes| std::fs::write(&path, bytes).map_err(anyhow::Error::from))
         {
+            self.live.lock().remove(&id);
             kill_and_reap(pid);
             wait_for_supervisor(&supervisor_root)?;
-            return Err(error.context("persist account process lease"));
+            return Err(error.context("persist account process record"));
         }
         Ok(Handle {
+            id,
             path,
             pid,
             state: ProcessState::Running,
             birth_identity,
             supervisor_root,
+            live: self.live.clone(),
         })
     }
 
@@ -134,6 +149,10 @@ impl Registry {
     ///
     /// An inherited process is not our child, so it cannot be waited for; what
     /// is verified instead is that its pid is gone.
+    ///
+    /// Records this process owns are skipped: the sweep answers "did a previous
+    /// life leave something behind", and a session running right now is not an
+    /// orphan of anything.
     pub fn reap_orphans(&self) -> Result<Vec<Reaped>> {
         let mut reaped = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -142,6 +161,13 @@ impl Registry {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| self.live.lock().contains(name))
+            {
                 continue;
             }
             match std::fs::read(&path)
@@ -166,7 +192,7 @@ impl Registry {
                         },
                     });
                 }
-                Err(error) => return Err(error.context("unreadable account process lease")),
+                Err(error) => return Err(error.context("unreadable account process record")),
             }
             if reaped
                 .last()
@@ -184,11 +210,13 @@ impl Registry {
 /// kills, which is exactly the defect being fixed, so `Drop` terminates too.
 #[derive(Debug)]
 pub struct Handle {
+    id: String,
     path: PathBuf,
     pid: u32,
     state: ProcessState,
     birth_identity: (u64, u64),
     supervisor_root: Option<PathBuf>,
+    live: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Handle {
@@ -209,6 +237,7 @@ impl Handle {
             ProcessState::Running
         };
         if self.state != ProcessState::Running {
+            self.live.lock().remove(&self.id);
             let _ = std::fs::remove_file(&self.path);
         }
         self.state
@@ -220,6 +249,7 @@ impl Handle {
         if self.state == ProcessState::Running && wait_for_supervisor(&self.supervisor_root).is_ok()
         {
             self.state = ProcessState::Exited;
+            self.live.lock().remove(&self.id);
             let _ = std::fs::remove_file(&self.path);
         }
         self.state
@@ -364,11 +394,7 @@ fn process_identity(pid: u32) -> Result<(u64, u64)> {
     {
         return windows_birth_identity(pid);
     }
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "windows"
-    )))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         anyhow::bail!("managed process identity is unavailable on this platform")
     }
@@ -499,12 +525,50 @@ mod tests {
         let mut record: Record = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         record.birth_identity.0 = record.birth_identity.0.wrapping_add(1);
         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-        let reaped = registry.reap_orphans().unwrap();
+        // A fresh registry is what a restarted bridge has: the record belongs to
+        // nobody it knows, so it is a candidate — and is still spared, because
+        // the recorded identity no longer matches the live pid.
+        let reaped = Registry::new(dir.path()).unwrap().reap_orphans().unwrap();
         assert_eq!(reaped[0].state, ProcessState::Running);
         assert!(path.exists());
         assert!(process_alive(pid));
         child.kill().unwrap();
         let _ = child.wait();
+    }
+
+    /// Several sessions share one account, so one session's start must not sweep
+    /// another session's CLI. The record of a child THIS process owns is not an
+    /// orphan, however many times the sweep runs.
+    #[test]
+    fn a_sweep_never_kills_a_process_this_bridge_still_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::new(dir.path()).unwrap();
+        let mut first = std::process::Command::new(sleep_program())
+            .args(sleep_args())
+            .spawn()
+            .unwrap();
+        let mut second = std::process::Command::new(sleep_program())
+            .args(sleep_args())
+            .spawn()
+            .unwrap();
+        let mut running = registry.track("session-one", first.id(), None).unwrap();
+        let mut other = registry.track("session-two", second.id(), None).unwrap();
+
+        assert!(
+            registry.reap_orphans().unwrap().is_empty(),
+            "a live session was reported as an orphan"
+        );
+        assert!(process_alive(first.id()));
+        assert!(process_alive(second.id()));
+
+        // Closing one leaves the other alone, and its own record is gone.
+        assert_eq!(running.terminate(), ProcessState::Reaped);
+        assert!(process_alive(second.id()), "closing one killed the other");
+        assert!(registry.reap_orphans().unwrap().is_empty());
+
+        assert_eq!(other.terminate(), ProcessState::Reaped);
+        let _ = first.wait();
+        let _ = second.wait();
     }
 
     fn sleep_program() -> &'static str {

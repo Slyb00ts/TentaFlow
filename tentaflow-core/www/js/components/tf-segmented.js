@@ -43,6 +43,29 @@ class TfSegmented extends HTMLElement {
     }
   }
 
+  // Replaces the options at runtime. The light-DOM <option> children are
+  // consumed at build time, so a caller whose option list depends on another
+  // control (engine → credential kinds) must use this instead of re-setting
+  // innerHTML, which would leave the built buttons in place and the new
+  // options unread. `list` is [{value,label,variant,icon}]; `selected` keeps
+  // the pick when it is still in the new list, otherwise the first option
+  // wins — a segmented control always has a value.
+  setOptions(list, selected) {
+    this._options = (list || []).map((o) => ({
+      value: o.value ?? '',
+      variant: (o.variant || 'neutral').toLowerCase(),
+      icon: (o.icon || '').trim(),
+      label: o.label ?? String(o.value ?? ''),
+    }));
+    this._buildFromOptions();
+    const values = this._options.map((o) => o.value);
+    const want = selected != null && values.includes(String(selected))
+      ? String(selected)
+      : (values.includes(this.value) ? this.value : values[0] ?? '');
+    this.setAttribute('value', want);
+    this._update();
+  }
+
   _collectOptions() {
     // Zbierz z <option value="x" variant="y">label</option> przed build().
     const optEls = Array.from(this.querySelectorAll(':scope > option'));
@@ -57,6 +80,14 @@ class TfSegmented extends HTMLElement {
 
   _build() {
     this._collectOptions();
+    this._buildFromOptions();
+  }
+
+  _buildFromOptions() {
+    if (this._container) {
+      this._container.removeEventListener('click', this._onClick);
+      this._container.removeEventListener('keydown', this._onKey);
+    }
     this.innerHTML = '';
     const wrap = document.createElement('div');
     wrap.className = 'tf-segmented';

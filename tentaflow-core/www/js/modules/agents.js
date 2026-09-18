@@ -34,7 +34,10 @@ import '/js/components/tf-chat-bubble.js';
 import '/js/components/tf-chat-composer.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-stat-card.js';
+import '/js/components/tf-segmented.js';
+import '/js/components/tf-radio.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
+import { AgentAccounts, engineName } from '/js/modules/agent-accounts.js';
 import { activityLabels, activityStatusText } from '/js/lib/agent-activity-bridge.js';
 import { renderMarkdown } from '/js/lib/md-lite.js';
 
@@ -54,6 +57,16 @@ const RUN_PERIODS = [
   { days: 0, key: 'runs_period_all' },
 ];
 const KEBAB_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+// The effort levels a CLI application takes (G01). They are NOT the per-model
+// levels of the LLM catalog: a CLI has one switch of its own, so the list is
+// fixed here rather than read from `ModelModalities`.
+const CLI_REASONING_LEVELS = ['minimal', 'standard', 'maximal'];
+
+/** The operator-facing name of a CLI effort level; the value stays the wire id. */
+function cliReasoningLabel(level) {
+  return t(`cli_reasoning.${level}`);
+}
 
 // Run status → tf-chip status colour. Mirrors the agent_runs CHECK set.
 const RUN_STATUS_CHIP = {
@@ -653,6 +666,10 @@ function payloadFromDetail(agent, overrides = {}) {
     flow_id: agent.flow_id || null,
     routable: !!agent.routable,
     is_enabled: !!agent.is_enabled,
+    // Upsert defaults an absent runtime to `{"kind":"llm"}`, so enabling or
+    // duplicating a CLI agent without carrying this key would quietly turn it
+    // back into a model prompt loop.
+    runtime: agent.runtime ?? { kind: 'llm' },
     ...overrides,
   };
 }
@@ -746,6 +763,13 @@ async function openDetail(agentId, tab = 'config') {
 
   const skills = normalizeSkillsSelection(agent.skills);
   const params = agent.params && typeof agent.params === 'object' ? agent.params : {};
+  // `runtime` is what the agent RUNS on: a model prompt loop or a CLI
+  // application bound to a provider account. A row that predates the CLI
+  // runtime carries `{"kind":"llm"}`, so the absent key and the explicit one
+  // mean the same thing.
+  const runtime = agent.runtime && typeof agent.runtime === 'object' ? agent.runtime : {};
+  const cli = runtime.kind === 'cli' ? runtime : null;
+  const cliAccount = cli?.account && typeof cli.account === 'object' ? cli.account : {};
   // Editable draft: every field the config tab renders. `sourceParams` carries
   // params_json keys this UI does not manage so a save never drops them.
   const cfg = {
@@ -764,6 +788,15 @@ async function openDetail(agentId, tab = 'config') {
     flow_id: agent.flow_id || '',
     routable: !!agent.routable,
     is_enabled: !!agent.is_enabled,
+    runtime_kind: cli ? 'cli' : 'llm',
+    cli_engine: cli?.engine || '',
+    cli_model: cli?.model || '',
+    cli_reasoning: cli?.reasoning || '',
+    // "User" is the default for a runtime that has none yet: it is valid
+    // without picking anything, while "global" without an account is a save
+    // the backend refuses.
+    account_mode: cliAccount.mode === 'global' ? 'global' : 'user',
+    account_id: cliAccount.account_id || '',
   };
 
   state.detail = {
@@ -776,6 +809,9 @@ async function openDetail(agentId, tab = 'config') {
     catalog: { addons: [], core: [] },
     skills: [],
     models: [],
+    cliModels: new Map(),
+    accountEngines: [],
+    globalAccounts: [],
     selectedTools: new Set(Array.isArray(agent.tools) ? agent.tools : []),
     skillNames: new Set(skills.names),
     skillTags: new Set(skills.tags),
@@ -815,19 +851,25 @@ async function openDetail(agentId, tab = 'config') {
   renderDetailTabs();
   // Picker/model data feeds every tab; loading it up front keeps the first
   // paint of each tab complete instead of popping options in afterwards.
-  const [catalogRows, skillRows, modelRows, runRows] = await Promise.all([
+  const [catalogRows, skillRows, modelRows, runRows, accountOptions] = await Promise.all([
     loadToolsCatalog(),
     loadSkillList(),
     loadModelOptions(),
     fetchAgentRuns(agentId).catch(() => []),
+    loadAgentAccountOptions(),
   ]);
   const dd = state.detail;
   if (!dd || dd.agentId !== agentId) return;
   dd.catalog = catalogRows;
   dd.skills = skillRows;
-  dd.models = modelRows;
+  dd.models = modelRows.llm;
+  dd.cliModels = modelRows.cli;
+  dd.accountEngines = accountOptions.engines;
+  dd.globalAccounts = accountOptions.accounts;
   dd.agentRuns = runRows;
   dd.runsLoaded = true;
+  // The header names the application and the account, which are known only now.
+  renderDetailHeader();
   renderDetailTabs();
   await switchDetailTab(tab);
   updateSubLine();
@@ -891,6 +933,28 @@ async function refreshDetailAgent() {
   renderDetailTabs();
 }
 
+// What the agent runs on, as the header states it (G01): a CLI agent shows its
+// application and model plus which account it uses, an LLM agent its model. The
+// chips read the SAVED row, not the draft, so they never announce a binding the
+// operator has not saved yet.
+function runtimeBadges(d) {
+  const runtime = d.agent.runtime && typeof d.agent.runtime === 'object' ? d.agent.runtime : {};
+  if (runtime.kind !== 'cli') {
+    return [`<tf-chip variant="outline" status="accent">${escapeHtml(t('label_model'))}: ${escapeHtml(d.agent.model || t('model_inherited'))}</tf-chip>`];
+  }
+  const application = engineName(runtime.engine, d.accountEngines);
+  const title = runtime.model ? `${application} · ${runtime.model}` : application;
+  const global = runtime.account?.mode === 'global';
+  const account = global
+    ? (d.globalAccounts.find((a) => (a.account_id ?? a.accountId) === runtime.account.account_id)?.display_name
+      || t('cli_account_global'))
+    : t('cli_account_user');
+  return [
+    `<tf-chip variant="outline" status="accent">${escapeHtml(title)}</tf-chip>`,
+    `<tf-chip variant="outline" status="${global ? 'info' : 'ok'}">${escapeHtml(account)}</tf-chip>`,
+  ];
+}
+
 function renderDetailHeader() {
   const d = state.detail;
   const host = byId('ag-detail-header-host');
@@ -899,7 +963,7 @@ function renderDetailHeader() {
   const toolsCount = d.selectedTools.size;
   const skillsCount = d.skillNames.size + d.skillTags.size;
   const badges = [
-    `<tf-chip variant="outline" status="accent">${escapeHtml(t('label_model'))}: ${escapeHtml(agent.model || t('model_inherited'))}</tf-chip>`,
+    ...runtimeBadges(d),
     `<tf-chip variant="outline" status="neutral">${escapeHtml(t('card_tools_count', { count: toolsCount }))}</tf-chip>`,
     `<tf-chip variant="outline" status="neutral">${escapeHtml(t('card_skills_count', { count: skillsCount }))}</tf-chip>`,
   ];
@@ -1067,6 +1131,7 @@ async function saveDetailDraft() {
     flow_id: c.flow_id.trim() || null,
     routable: !!c.routable,
     is_enabled: !!c.is_enabled,
+    runtime: draftRuntime(c),
   };
   try {
     await ApiBinary.one('agentsUpsertRequest', { agentJson: JSON.stringify(payload) });
@@ -1080,9 +1145,27 @@ async function saveDetailDraft() {
   }
 }
 
+// `agents.runtime_json` as the backend parses it: an empty model or reasoning
+// level is left OUT rather than sent as "", and a user binding carries no
+// account id at all — it is resolved per run from whoever runs the agent.
+function draftRuntime(c) {
+  if (c.runtime_kind !== 'cli') return { kind: 'llm' };
+  const runtime = { kind: 'cli', engine: c.cli_engine };
+  if (c.cli_model) runtime.model = c.cli_model;
+  if (c.cli_reasoning) runtime.reasoning = c.cli_reasoning;
+  runtime.account = c.account_mode === 'global'
+    ? { mode: 'global', account_id: c.account_id }
+    : { mode: 'user' };
+  return runtime;
+}
+
 function validateDraft() {
   const c = state.detail?.cfg;
   if (!c) return null;
+  if (c.runtime_kind === 'cli') {
+    if (!c.cli_engine) return t('err_cli_engine_required');
+    if (c.account_mode === 'global' && !c.account_id) return t('err_cli_account_required');
+  }
   const name = c.name.trim();
   if (!name) return t('err_name_required');
   if (name.length > NAME_MAX_CHARS) return t('err_name_length');
@@ -1140,6 +1223,21 @@ async function loadModelOptions() {
     const name = m.model_name || m.modelName;
     if (name) modelByName.set(name, m);
   }
+  // A CLI application publishes its models as `<engine_id>/<model>` rows of the
+  // same catalog (services/coding_agent.rs). The runtime stores the bare model
+  // id — the name the application itself understands — so the prefix is
+  // stripped here rather than saved and stripped at every consumer.
+  const cli = new Map();
+  for (const m of models) {
+    const engine = m.engine_id || m.engineId;
+    const name = m.model_name || m.modelName || '';
+    const prefix = `${engine}/`;
+    if (!engine || !name.startsWith(prefix)) continue;
+    const value = name.slice(prefix.length);
+    const label = m.display_name || m.displayName || value;
+    if (!cli.has(engine)) cli.set(engine, []);
+    cli.get(engine).push({ value, label });
+  }
   const opts = models
     .filter((m) => (m.category || '').toLowerCase() === 'llm')
     .map((m) => {
@@ -1157,7 +1255,19 @@ async function loadModelOptions() {
     if ((targetModel.category || '').toLowerCase() !== 'llm') continue;
     opts.push({ value: a.alias, label: `↪ ${a.alias} → ${target}` });
   }
-  return opts;
+  return { llm: opts, cli };
+}
+
+// The engine catalog and the SHARED accounts a CLI agent may be bound to. A
+// personal account is never offered here: `mode = "user"` resolves whoever runs
+// the agent, so naming one would be a different binding altogether.
+async function loadAgentAccountOptions() {
+  try {
+    const list = await AgentAccounts.list({ scope: 'global' });
+    return { engines: list?.engines ?? [], accounts: list?.accounts ?? [] };
+  } catch {
+    return { engines: [], accounts: [] };
+  }
 }
 
 // Fills the reasoning-effort list from the catalog for the CURRENTLY selected
@@ -1219,6 +1329,88 @@ function sliderRow(field, labelKey, descKey, min, max, value) {
   `;
 }
 
+// ---- G01: the CLI half of "Model i generowanie" ----------------------------
+
+// The models the selected application published. An application that has never
+// been synchronised has none, and the stored model is kept as an option so
+// opening the agent cannot silently erase what it runs on.
+function cliModelOptions(d) {
+  const c = d.cfg;
+  const known = d.cliModels.get(c.cli_engine) ?? [];
+  const stored = c.cli_model && !known.some((m) => m.value === c.cli_model)
+    ? [{ value: c.cli_model, label: c.cli_model }]
+    : [];
+  return [{ value: '', label: t('cli_model_default') }, ...stored, ...known];
+}
+
+function cliAccountOptions(d) {
+  const c = d.cfg;
+  const forEngine = d.globalAccounts.filter((a) => (a.engine_id ?? a.engineId) === c.cli_engine);
+  if (!forEngine.length) return [{ value: '', label: t('cli_account_none') }];
+  return [{ value: '', label: t('cli_account_pick') }, ...forEngine.map((a) => {
+    const id = a.account_id ?? a.accountId;
+    const subject = a.provider_subject ?? a.providerSubject;
+    return { value: id, label: subject ? `${a.display_name} (${subject})` : String(a.display_name ?? id) };
+  })];
+}
+
+// A tf-select consumes its light-DOM options when it builds, so the initial
+// markup carries them and every later change goes through `setOptions`.
+function optionsHtml(options, selected) {
+  return options
+    .map((o) => `<option value="${escapeAttr(o.value)}"${o.value === selected ? ' selected' : ''}>${escapeHtml(o.label)}</option>`)
+    .join('');
+}
+
+function renderCliRuntimeFields(d) {
+  const c = d.cfg;
+  const engines = d.accountEngines;
+  const globalMode = c.account_mode === 'global';
+  return `
+    <div class="agents-editor-grid agents-model-grid">
+      <div>
+        <tf-select data-cfg="cli_engine" label="${escapeAttr(t('label_cli_engine'))}">
+          <option value="">${escapeHtml(t('cli_engine_pick'))}</option>
+          ${engines.map((engine) => {
+            const id = engine.engine_id ?? engine.engineId;
+            return `<option value="${escapeAttr(id)}"${id === c.cli_engine ? ' selected' : ''}>${escapeHtml(engineName(id, engines))}</option>`;
+          }).join('')}
+        </tf-select>
+      </div>
+      <div>
+        <tf-select data-cfg="cli_model" label="${escapeAttr(t('label_model'))}">${optionsHtml(cliModelOptions(d), c.cli_model)}</tf-select>
+        <div class="agents-field-hint">${escapeHtml(t('cli_model_hint'))}</div>
+      </div>
+      <div>
+        <tf-select data-cfg="cli_reasoning" label="${escapeAttr(t('label_reasoning_effort'))}">
+          <option value="">${escapeHtml(t('reasoning_effort_default'))}</option>
+          ${CLI_REASONING_LEVELS.map((level) => `<option value="${escapeAttr(level)}"${level === c.cli_reasoning ? ' selected' : ''}>${escapeHtml(cliReasoningLabel(level))}</option>`).join('')}
+        </tf-select>
+        <div class="agents-field-hint">${escapeHtml(t('cli_temperature_hint'))}</div>
+      </div>
+    </div>
+    <div class="agents-field">
+      <div class="agents-field-label">${escapeHtml(t('label_cli_account'))}</div>
+      <tf-radio-group cards name="agent-account-mode" data-account-mode value="${escapeAttr(c.account_mode)}">
+        <tf-radio card value="global">
+          <div>
+            <div class="agents-pick-title">${escapeHtml(t('cli_account_global'))}</div>
+            <p class="agents-pick-desc">${escapeHtml(t('cli_account_global_desc'))}</p>
+            <tf-select data-cfg="account_id" ${globalMode ? '' : 'disabled'}>${optionsHtml(cliAccountOptions(d), c.account_id)}</tf-select>
+          </div>
+        </tf-radio>
+        <tf-radio card value="user">
+          <div>
+            <div class="agents-pick-title">${escapeHtml(t('cli_account_user'))}</div>
+            <p class="agents-pick-desc">${escapeHtml(t('cli_account_user_desc'))}</p>
+          </div>
+        </tf-radio>
+      </tf-radio-group>
+      <div class="agents-field-hint">${escapeHtml(t('cli_account_hint'))}</div>
+    </div>
+  `;
+}
+
 function renderConfigTab(body) {
   const d = state.detail;
   if (!d || !body) return;
@@ -1257,24 +1449,38 @@ function renderConfigTab(body) {
     `)}
 
     ${sectionCard('brain', 'section_model', `
-      <div class="agents-editor-grid agents-model-grid">
-        <div>
-          <tf-select data-cfg="model" label="${escapeAttr(t('label_model'))}">
-            <option value="">${escapeHtml(t('model_inherited'))}</option>
-            ${d.models.map((m) => `<option value="${escapeAttr(m.value)}" ${m.value === c.model ? 'selected' : ''}>${escapeHtml(m.label)}</option>`).join('')}
-          </tf-select>
-          <div class="agents-field-hint">${escapeHtml(t('model_hint'))}</div>
+      <div class="agents-runtime-switch">
+        <tf-segmented data-runtime-kind size="md" value="${escapeAttr(c.runtime_kind)}">
+          <option value="llm">${escapeHtml(t('runtime_kind_llm'))}</option>
+          <option value="cli">${escapeHtml(t('runtime_kind_cli'))}</option>
+        </tf-segmented>
+        <div class="agents-field-hint">${escapeHtml(t('runtime_kind_hint'))}</div>
+      </div>
+
+      <div data-runtime-pane="llm" ${c.runtime_kind === 'cli' ? 'hidden' : ''}>
+        <div class="agents-editor-grid agents-model-grid">
+          <div>
+            <tf-select data-cfg="model" label="${escapeAttr(t('label_model'))}">
+              <option value="">${escapeHtml(t('model_inherited'))}</option>
+              ${d.models.map((m) => `<option value="${escapeAttr(m.value)}" ${m.value === c.model ? 'selected' : ''}>${escapeHtml(m.label)}</option>`).join('')}
+            </tf-select>
+            <div class="agents-field-hint">${escapeHtml(t('model_hint'))}</div>
+          </div>
+          <div>
+            <tf-input data-cfg="temperature" type="number" min="0" max="2" step="0.1"
+              label="${escapeAttr(t('label_temperature'))}"
+              value="${escapeAttr(c.temperature ?? '')}"></tf-input>
+            <div class="agents-field-hint">${escapeHtml(t('hint_temperature'))}</div>
+          </div>
+          <div data-reasoning-field hidden>
+            <tf-select data-cfg="reasoning_effort" label="${escapeAttr(t('label_reasoning_effort'))}"></tf-select>
+            <div class="agents-field-hint">${escapeHtml(t('hint_reasoning_effort'))}</div>
+          </div>
         </div>
-        <div>
-          <tf-input data-cfg="temperature" type="number" min="0" max="2" step="0.1"
-            label="${escapeAttr(t('label_temperature'))}"
-            value="${escapeAttr(c.temperature ?? '')}"></tf-input>
-          <div class="agents-field-hint">${escapeHtml(t('hint_temperature'))}</div>
-        </div>
-        <div data-reasoning-field hidden>
-          <tf-select data-cfg="reasoning_effort" label="${escapeAttr(t('label_reasoning_effort'))}"></tf-select>
-          <div class="agents-field-hint">${escapeHtml(t('hint_reasoning_effort'))}</div>
-        </div>
+      </div>
+
+      <div data-runtime-pane="cli" ${c.runtime_kind === 'cli' ? '' : 'hidden'}>
+        ${renderCliRuntimeFields(d)}
       </div>
     `)}
 
@@ -1327,6 +1533,49 @@ function renderConfigTab(body) {
   );
 }
 
+// The runtime switch, the application picker and the account cards. Every
+// control here writes into the same draft as the rest of the tab, so one save
+// bar covers the whole section.
+function wireRuntimeInputs(body) {
+  const d = state.detail;
+  if (!d) return;
+  const c = d.cfg;
+  const accountSelect = () => body.querySelector('[data-cfg="account_id"]');
+
+  body.querySelector('[data-runtime-kind]')?.addEventListener('change', (event) => {
+    c.runtime_kind = event.detail?.value === 'cli' ? 'cli' : 'llm';
+    body.querySelector('[data-runtime-pane="llm"]').hidden = c.runtime_kind === 'cli';
+    body.querySelector('[data-runtime-pane="cli"]').hidden = c.runtime_kind !== 'cli';
+    markDirty();
+  });
+
+  // Switching the application changes BOTH lists below it: the models it
+  // published and the accounts that belong to it. A model or account of the
+  // previous application is dropped rather than carried over into a binding
+  // that could not run.
+  body.querySelector('[data-cfg="cli_engine"]')?.addEventListener('change', (event) => {
+    c.cli_engine = event.currentTarget.value || '';
+    c.cli_model = '';
+    c.account_id = '';
+    body.querySelector('[data-cfg="cli_model"]')?.setOptions(cliModelOptions(d), '');
+    accountSelect()?.setOptions(cliAccountOptions(d), '');
+    markDirty();
+  });
+
+  // The account select lives INSIDE the "global" card, and its own change
+  // event bubbles through the radio group — so the group's handler has to
+  // answer only for the group itself, or picking an account would read as
+  // picking a mode.
+  const modeGroup = body.querySelector('[data-account-mode]');
+  modeGroup?.addEventListener('change', (event) => {
+    if (event.target !== modeGroup) return;
+    c.account_mode = event.detail?.value === 'global' ? 'global' : 'user';
+    const accounts = accountSelect();
+    if (accounts) accounts.toggleAttribute('disabled', c.account_mode !== 'global');
+    markDirty();
+  });
+}
+
 function wireConfigInputs(body) {
   const d = state.detail;
   if (!d) return;
@@ -1367,6 +1616,8 @@ function wireConfigInputs(body) {
     const reasoning = body.querySelector('[data-cfg="reasoning_effort"]');
     if (reasoning) reasoning.dataset.cfgModelValue = modelSelect.value || '';
   }
+
+  wireRuntimeInputs(body);
 
   body.querySelector('[data-prompt-assist]')?.addEventListener('click', () => openAssist('detail'));
   body.querySelector('[data-prompt-restore]')?.addEventListener('click', () => {
@@ -2916,8 +3167,11 @@ async function openWizard(agent, { forceCreate = false } = {}) {
   };
   state.wizard = wzPending;
 
-  const [models, catalog, skills] = await Promise.all([loadModelOptions(), loadToolsCatalog(), loadSkillList()]);
+  const [modelRows, catalog, skills] = await Promise.all([loadModelOptions(), loadToolsCatalog(), loadSkillList()]);
   if (!win.isConnected || state.wizard !== wzPending) return;
+  // The wizard creates plain LLM agents; a CLI runtime is chosen in the detail
+  // editor, where the account it needs is editable too.
+  const models = modelRows.llm;
   wzPending.models = models;
   wzPending.catalog = catalog;
   wzPending.skills = skills;

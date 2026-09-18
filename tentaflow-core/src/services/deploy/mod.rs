@@ -402,6 +402,29 @@ pub(crate) fn resolve_vision_bundle_api_key(
     })
 }
 
+/// Installs the vendor CLI of one managed-CLI engine and answers with its
+/// shared installation root and the directory holding the executable.
+///
+/// Public so the node matrix can install a runtime WITHOUT deploying a service:
+/// an engine on a node is not an account, and `services::agent_runtime` is what
+/// owns that distinction. The installation itself is content-addressed by
+/// version and shared by every account on this node.
+pub async fn managed_cli_install(
+    engine_id: &str,
+    version: &str,
+) -> DeployResult<(std::path::PathBuf, std::path::PathBuf)> {
+    managed_cli::install(engine_id, version, None).await
+}
+
+/// Builds, or reuses, the bridge executable of one managed-CLI engine.
+pub async fn managed_cli_bridge(
+    engine_id: &str,
+    source_hash: &str,
+    source_root: &std::path::Path,
+) -> DeployResult<std::path::PathBuf> {
+    managed_cli::ensure_bridge(engine_id, source_hash, source_root, None).await
+}
+
 pub fn create_deploy_job(
     method: DeployMethod,
     manifest: &ServiceManifest,

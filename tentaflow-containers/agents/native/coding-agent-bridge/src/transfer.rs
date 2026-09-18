@@ -1,12 +1,38 @@
 // ============ File: transfer.rs — idle-account transfer barriers behind authenticated IPC ============
-use crate::{credential_name, ensure_idle_runtime, ApiError, AppState, Provider};
+use crate::{credentials, ensure_idle_runtime, ApiError, AppState, Provider};
 use anyhow::{anyhow, Context, Result};
 use axum::{extract::State, Json};
 use serde_json::{json, Value};
 use std::{io::Write, path::Path};
 
+/// Refuses while the account is running anything.
+///
+/// A move is the one operation that still needs the account to be idle — it
+/// retires the credential on this node — so it asks the sessions directly. The
+/// account itself is not leased: that is what lets several sessions share it.
+async fn require_no_sessions(state: &AppState, refusal: &str) -> Result<(), ApiError> {
+    let running = state
+        .sessions
+        .lock()
+        .await
+        .values()
+        .filter(|session| session.runtime.is_some() || session.meta.status != "closed")
+        .count();
+    if running > 0 {
+        return Err(ApiError::bad_request(&format!(
+            "account_busy: {running} session(s) are open; {refusal}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn available(state: &AppState) -> Result<()> {
-    if state.shutting_down.load(std::sync::atomic::Ordering::SeqCst) { return Err(anyhow!("account runtime is stopping")); }
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(anyhow!("account runtime is stopping"));
+    }
     if state
         .state_file
         .parent()
@@ -53,12 +79,7 @@ pub async fn freeze(
     State(state): State<AppState>,
     Json(request): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let _lease = state.lease.lock().await;
-    if _lease.is_some() {
-        return Err(ApiError::bad_request(
-            "account_busy: finish the active session before moving this account",
-        ));
-    }
+    require_no_sessions(&state, "close them before moving this account").await?;
     ensure_idle_runtime(&state)?;
     if !matches!(state.provider, Provider::Codex | Provider::ClaudeCode) {
         return Err(ApiError::bad_request(
@@ -70,11 +91,6 @@ pub async fn freeze(
         .get("manifest")
         .context("transfer manifest missing")?;
     let root = state.state_file.parent().context("account root missing")?;
-    if root.join("credential-review-required").exists() {
-        return Err(ApiError::bad_request(
-            "sign in again before moving credentials awaiting verification",
-        ));
-    }
     let marker = root.join("transfer.json");
     let expected = json!({"transfer_id":id,"phase":"source_frozen","manifest":manifest});
     if marker.exists() {
@@ -86,31 +102,14 @@ pub async fn freeze(
             ));
         }
     }
-    let (directory, file) = credential_name(state.provider);
-    let path = root.join(directory).join(file);
-    if path
-        .parent()
-        .context("credential directory missing")?
-        .canonicalize()?
-        != root.canonicalize()?.join(directory)
-    {
-        return Err(ApiError::bad_request(
-            "portable credential directory is redirected",
-        ));
-    }
-    let metadata = std::fs::symlink_metadata(&path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
-        return Err(ApiError::bad_request("invalid portable credential file"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(ApiError::bad_request("portable credential has hardlinks"));
-        }
-    }
+    // The canonical credential, read the one way the bridge ever reads it: no
+    // symlink followed in any component, stat taken from the descriptor the
+    // bytes come out of.
+    let material = credentials::read(&credentials::root(&state.data_dir), state.provider)
+        .map_err(|error| ApiError::bad_request(&error.to_string()))?
+        .context("this account has no provider credential on this node")?;
     let credential: Value =
-        serde_json::from_slice(&std::fs::read(path)?).context("invalid portable credential")?;
+        serde_json::from_slice(&material).context("invalid portable credential")?;
     if !credential
         .as_object()
         .is_some_and(|object| !object.is_empty())
@@ -125,10 +124,7 @@ pub async fn retire(
     State(state): State<AppState>,
     Json(request): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let _lease = state.lease.lock().await;
-    if _lease.is_some() {
-        return Err(ApiError::bad_request("account is busy"));
-    }
+    require_no_sessions(&state, "close them before retiring this account").await?;
     let id = identifier(&request)?;
     let path = state
         .state_file
@@ -154,10 +150,7 @@ pub async fn activate(
     State(state): State<AppState>,
     Json(request): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let _lease = state.lease.lock().await;
-    if _lease.is_some() {
-        return Err(ApiError::bad_request("account is busy"));
-    }
+    require_no_sessions(&state, "close them before activating this account").await?;
     let id = identifier(&request)?;
     let path = state
         .state_file

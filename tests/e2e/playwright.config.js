@@ -60,6 +60,7 @@ module.exports = defineConfig({
     { name: 'tentavision-evidence', testMatch: 'tentavision-evidence.spec.js' },
     { name: 'analytics', testMatch: 'analytics.spec.js' },
     { name: 'agents-ui', testMatch: 'agents-ui.spec.js' },
+    { name: 'agent-accounts', testMatch: 'agent-accounts.spec.js' },
     { name: 'tentaquant', testMatch: 'tentaquant.spec.js' },
   ],
 });

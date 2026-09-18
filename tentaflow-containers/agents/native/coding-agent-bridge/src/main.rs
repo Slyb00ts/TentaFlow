@@ -1,3 +1,4 @@
+mod credentials;
 mod grok;
 mod muse;
 mod process;
@@ -32,7 +33,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     sync::Mutex,
 };
@@ -60,6 +61,17 @@ struct SessionMeta {
     login_completed: Option<bool>,
     #[serde(default)]
     request_hash: Option<String>,
+    /// The account credential this session's private copy was made from. It is
+    /// the baseline a rotation is measured against and the value the bridge
+    /// requires the canonical credential to still hold before it accepts one, so
+    /// a session that closes late cannot put its older token back.
+    #[serde(default)]
+    credential_sha256: Option<String>,
+    /// The last hash of this session's private copy the bridge already acted on.
+    /// Without it a copy that was refused once would be re-examined, and
+    /// re-reported, on every single poll.
+    #[serde(default)]
+    credential_reported: Option<String>,
     created_at_ms: u128,
 }
 
@@ -96,7 +108,14 @@ type SandboxProbeCache = Arc<SyncMutex<Option<(std::time::Instant, Option<String
 struct AppState {
     bridge_token: Arc<String>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
-    lease: Arc<Mutex<Option<String>>>,
+    /// The sign-in flow currently driving a terminal, if any.
+    ///
+    /// An account does NOT lease: several agents, users and workspaces run their
+    /// own sessions on it at the same time, exactly as several `codex` terminals
+    /// share one login. Only the sign-in is exclusive, because two device-code
+    /// flows would write the same credential file, and only against another
+    /// sign-in — never against a session.
+    login_flow: Arc<Mutex<Option<String>>>,
     provider: Provider,
     data_dir: PathBuf,
     state_file: PathBuf,
@@ -111,6 +130,15 @@ struct AppState {
     /// concurrent callers queue up and the second one finds the cache filled
     /// instead of starting a second session.
     probe_lock: Arc<Mutex<()>>,
+    /// Exclusive use of the bridge's private login home (`login/`).
+    ///
+    /// Every invocation that acts for the ACCOUNT rather than for a session —
+    /// the sign-in terminal, the authentication probe, discovery — runs there
+    /// with a working copy of the canonical credential. Two of them at once
+    /// would overwrite each other's copy and then publish whichever finished
+    /// last, so the directory is leased: `login_home` hands out the lease and
+    /// the environment that names it together.
+    login_home: Arc<Mutex<()>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     processes: Arc<process::Registry>,
 }
@@ -335,6 +363,14 @@ struct InputRequest {
     text: String,
 }
 
+/// The credential Core installs as this account's canonical one. It carries the
+/// material and nothing else: the bridge computes the digest itself, so a
+/// caller cannot label bytes with somebody else's hash.
+#[derive(Deserialize)]
+struct CredentialRequest {
+    material: String,
+}
+
 #[derive(Deserialize)]
 struct EventQuery {
     #[serde(default)]
@@ -377,6 +413,9 @@ async fn run() -> Result<()> {
             .unwrap_or_else(|_| ".tentaflow-coding-agent".into()),
     );
     std::fs::create_dir_all(&data_dir)?;
+    // The one lock that survives: it guards the account's credential FILES
+    // against a second bridge process, which is the only writer that could tear
+    // them. Sessions inside this process never take it.
     let account_lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -390,6 +429,7 @@ async fn run() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
     }
+    credentials::prepare(&data_dir)?;
     require_binary(provider)?;
     let state_file = data_dir.join("sessions.json");
     let probe_file = data_dir.join("probe-cache.json");
@@ -413,7 +453,7 @@ async fn run() -> Result<()> {
     }
     let state = AppState {
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        lease: Arc::new(Mutex::new(None)),
+        login_flow: Arc::new(Mutex::new(None)),
         bridge_token: Arc::new(
             std::fs::read_to_string(data_dir.join("bridge-token"))?
                 .trim()
@@ -427,18 +467,10 @@ async fn run() -> Result<()> {
         sandbox: Arc::new(SyncMutex::new(None)),
         probe: Arc::new(Mutex::new(probe)),
         probe_lock: Arc::new(Mutex::new(())),
+        login_home: Arc::new(Mutex::new(())),
         sessions: Arc::new(Mutex::new(sessions)),
         processes: Arc::new(processes),
     };
-    let active_profile = data_dir.join("active-profile");
-    match std::fs::read_to_string(&active_profile) {
-        Ok(profile_id) => {
-            reconcile_session_credential(&state, profile_id.trim())?;
-            std::fs::remove_file(&active_profile)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
     {
         let mut sessions = state.sessions.lock().await;
         for session in sessions
@@ -449,6 +481,7 @@ async fn run() -> Result<()> {
         }
     }
     persist(&state).await?;
+    watch_parent(&state);
     let app = Router::new()
         .route("/runtime/status", get(runtime_status))
         .route("/runtime/shutdown", post(shutdown_runtime))
@@ -456,6 +489,10 @@ async fn run() -> Result<()> {
         .route("/auth/start", post(auth_start))
         .route("/models", get(list_models))
         .route("/usage", get(usage))
+        .route(
+            "/account/credential",
+            get(read_account_credential).put(write_account_credential),
+        )
         .route("/account/transfer/freeze", post(transfer::freeze))
         .route("/account/transfer/retire", post(transfer::retire))
         .route("/account/transfer/activate", post(transfer::activate))
@@ -479,6 +516,48 @@ async fn run() -> Result<()> {
     let listener = tokio::net::TcpListener::bind((bind_host.as_str(), port)).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Core sets this when it keeps the write end of the bridge's stdin.
+const PARENT_PIPE_ENV: &str = "TENTAFLOW_BRIDGE_PARENT_PIPE";
+
+/// Ends the bridge once the parent that started it is gone.
+///
+/// Core stops its bridges on the way out, but a SIGKILLed Core runs no shutdown
+/// path at all, and an orphan here is not merely a stray process: it keeps
+/// `account.lock`, so the account cannot be started again on this node until
+/// somebody finds the pid. The pipe costs nothing and closes in every case a
+/// signal handler would miss.
+///
+/// Opt-in, because a bridge started by hand has a terminal (or nothing) on
+/// stdin, and neither is a parent whose death means anything.
+fn watch_parent(state: &AppState) {
+    if env::var(PARENT_PIPE_ENV).ok().as_deref() != Some("1") {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        wait_for_parent_pipe_eof(tokio::io::stdin()).await;
+        eprintln!("coding-agent-bridge: the parent that started this account is gone; stopping");
+        if let Err(error) = shutdown_runtime(State(state)).await {
+            eprintln!("coding-agent-bridge: shutdown after parent death: {error:?}");
+        }
+        std::process::exit(0);
+    });
+}
+
+/// Returns when the parent closes its end of the pipe, and not before. Core
+/// never writes on it, so anything read is noise from a wrapper and is discarded
+/// rather than treated as a message; an error is the same answer as EOF, because
+/// a pipe that cannot be read is not a parent that is still there.
+async fn wait_for_parent_pipe_eof<R: AsyncRead + Unpin>(mut pipe: R) {
+    let mut discard = [0u8; 64];
+    loop {
+        match pipe.read(&mut discard).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 async fn authenticate_bridge(
@@ -595,6 +674,30 @@ fn require_process_execution() -> Result<()> {
     }
 }
 
+/// Everything one invocation may write to, named by the directories it was
+/// given. It is a function of the invocation's OWN environment, which is what
+/// keeps one account out of another's policy: the paths come from the profile
+/// this session was prepared with.
+///
+/// The account's canonical credential directory is deliberately absent and must
+/// stay absent. A session gets a COPY of the credential inside the profile roots
+/// below; granting it the canonical directory instead would let the code it runs
+/// replace the account's identity for every other user, and let it redirect this
+/// bridge — which is not sandboxed — by swapping a directory for a link.
+fn profile_write_roots(overrides: &[(String, String)]) -> Vec<PathBuf> {
+    [
+        "HOME",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "GROK_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    ]
+    .into_iter()
+    .filter_map(|name| configured(overrides, name).map(PathBuf::from))
+    .collect()
+}
+
 fn sandbox_argv(
     argv: Vec<String>,
     workspace: &Path,
@@ -664,19 +767,7 @@ fn sandbox_argv(
             reads.push(PathBuf::from(path));
         }
     }
-    let mut writes = Vec::new();
-    for name in [
-        "HOME",
-        "CODEX_HOME",
-        "CLAUDE_CONFIG_DIR",
-        "GROK_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-    ] {
-        if let Some(path) = find(name) {
-            writes.push(PathBuf::from(path));
-        }
-    }
+    let writes = profile_write_roots(overrides);
     for name in ["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"] {
         if let Some(path) = find(name) {
             if let Some(parent) = Path::new(&path).parent() {
@@ -761,18 +852,34 @@ async fn persist(state: &AppState) -> Result<()> {
 }
 
 async fn shutdown_runtime(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    state.shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
-    let ids = {
-        let _lease=state.lease.lock().await;
-        state.sessions.lock().await.iter().filter(|(_,session)|session.runtime.is_some() || session.meta.status!="closed").map(|(id,_)|id.clone()).collect::<Vec<_>>()
-    };
-    for id in ids { let _=close_session(State(state.clone()), AxumPath(id)).await?; }
-    let _lease=state.lease.lock().await;
-    let _probe=state.probe_lock.lock().await;
-    if state.processes.reap_orphans()?.iter().any(|record|record.state!=process::ProcessState::Reaped) {
-        return Err(ApiError::internal("account process cleanup remains unconfirmed"));
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let ids = state
+        .sessions
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, session)| session.runtime.is_some() || session.meta.status != "closed")
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        let _ = close_session(State(state.clone()), AxumPath(id)).await?;
     }
-    Ok(Json(json!({"process_state":"reaped","bridge_pid":std::process::id()})))
+    let _probe = state.probe_lock.lock().await;
+    if state
+        .processes
+        .reap_orphans()?
+        .iter()
+        .any(|record| record.state != process::ProcessState::Reaped)
+    {
+        return Err(ApiError::internal(
+            "account process cleanup remains unconfirmed",
+        ));
+    }
+    Ok(Json(
+        json!({"process_state":"reaped","bridge_pid":std::process::id()}),
+    ))
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -888,8 +995,10 @@ async fn auth_status(State(state): State<AppState>) -> (StatusCode, Json<Value>)
 }
 
 async fn auth_status_snapshot(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let lease = state.lease.lock().await;
-    if let Some(id) = lease.as_deref() {
+    // A running session says nothing about authentication any more: the account
+    // serves as many of them as it is asked to. Only a sign-in in flight does.
+    let login = state.login_flow.lock().await;
+    if let Some(id) = login.as_deref() {
         let finished = {
             let mut sessions = state.sessions.lock().await;
             sessions
@@ -907,7 +1016,7 @@ async fn auth_status_snapshot(State(state): State<AppState>) -> (StatusCode, Jso
         };
         if let Some(success) = finished {
             let id = id.to_owned();
-            drop(lease);
+            drop(login);
             if let Err(error) = close_session(State(state.clone()), AxumPath(id)).await {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -924,12 +1033,18 @@ async fn auth_status_snapshot(State(state): State<AppState>) -> (StatusCode, Jso
         }
         return (
             StatusCode::OK,
+            Json(json!({"authenticated":false,"status":"authenticating"})),
+        );
+    }
+    drop(login);
+    if let Err(error) = transfer::available(&state) {
+        return (
+            StatusCode::OK,
             Json(
-                json!({"authenticated":false,"status":if id.starts_with("auth-") {"authenticating"} else {"account_busy"}}),
+                json!({"authenticated":false,"status":"account_moving","output":error.to_string()}),
             ),
         );
     }
-    if let Err(error) = transfer::available(&state) { return (StatusCode::OK,Json(json!({"authenticated":false,"status":"account_moving","output":error.to_string()}))); }
     if let Err(error) = ensure_idle_runtime(&state) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -939,7 +1054,7 @@ async fn auth_status_snapshot(State(state): State<AppState>) -> (StatusCode, Jso
         );
     }
     if matches!(state.provider, Provider::MuseCode | Provider::GrokBuild) {
-        return match stored_credential_available(state.provider) {
+        return match stored_credential_available(&state) {
             Ok(present) => (
                 StatusCode::OK,
                 Json(
@@ -949,17 +1064,17 @@ async fn auth_status_snapshot(State(state): State<AppState>) -> (StatusCode, Jso
             Err(error) => (
                 StatusCode::OK,
                 Json(
-                    json!({"authenticated":false,"credential_present":false,"status":"credential_verification_required","output":error.to_string()}),
+                    json!({"authenticated":false,"credential_present":false,"status":"credential_unreadable","output":error.to_string()}),
                 ),
             ),
         };
     }
-    match authentication_status(state.provider).await {
+    match authentication_status(&state).await {
         Ok((authenticated, output)) => (
             StatusCode::OK,
             Json(json!({
                 "authenticated": authenticated,
-                "status": if authenticated { "authenticated" } else if output.starts_with("credential_verification_required") { "credential_verification_required" } else { "session_expired" },
+                "status": if authenticated { "authenticated" } else { "session_expired" },
                 "output": output,
             })),
         ),
@@ -970,58 +1085,39 @@ async fn auth_status_snapshot(State(state): State<AppState>) -> (StatusCode, Jso
     }
 }
 
-fn stored_credential_available(provider: Provider) -> Result<bool> {
-    let account = PathBuf::from(env::var("TENTAFLOW_CODING_AGENT_DATA_DIR")?);
-    if account.join("credential-review-required").exists() {
-        return Err(anyhow!("Sign in again to verify changed credentials"));
-    }
-    let (directory, file) = credential_name(provider);
-    let path = account.join(directory).join(file);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
+fn stored_credential_available(state: &AppState) -> Result<bool> {
+    let Some(material) = credentials::read(&credentials::root(&state.data_dir), state.provider)?
+    else {
+        return Ok(false);
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
-        return Err(anyhow!("invalid provider credential file"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(anyhow!("provider credential must not have hardlinks"));
-        }
-    }
-    let value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let value: Value = serde_json::from_slice(&material)?;
     Ok(value.as_object().is_some_and(|value| !value.is_empty()))
 }
 
-async fn authentication_status(provider: Provider) -> Result<(bool, String)> {
-    let account = PathBuf::from(env::var("TENTAFLOW_CODING_AGENT_DATA_DIR")?);
-    if account.join("credential-review-required").exists() {
-        return Ok((
-            false,
-            "credential_verification_required: sign in again to verify refreshed credentials"
-                .into(),
-        ));
-    }
-    let argv = if provider == Provider::Codex {
+/// Asks the vendor CLI whether the account's credential authenticates.
+///
+/// It runs in the bridge's own login home with a working copy of the canonical
+/// credential — never in a session profile and never on the canonical file
+/// itself: the answer is about the account, a session must not have to exist for
+/// it, and a probe that refreshed the token must not be able to write anywhere
+/// but the bridge's own directory.
+async fn authentication_status(state: &AppState) -> Result<(bool, String)> {
+    let argv = if state.provider == Provider::Codex {
         vec!["codex".into(), "login".into(), "status".into()]
     } else {
         vec!["claude".into(), "auth".into(), "status".into()]
     };
-    let overrides = if provider == Provider::ClaudeCode {
-        let path = PathBuf::from(env::var("CLAUDE_CONFIG_DIR")?).join("setup-token.json");
-        if !path.exists() {
+    let home = login_home(state).await?;
+    let mut overrides = home.env().to_vec();
+    if state.provider == Provider::ClaudeCode {
+        if !stored_credential_available(state).unwrap_or(false) {
             return Ok((
                 false,
                 "Claude subscription token is not configured; use account sign-in".into(),
             ));
         }
-        vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), read_claude_token(&path)?)]
-    } else {
-        Vec::new()
-    };
+        overrides.push(("CLAUDE_CODE_OAUTH_TOKEN".into(), read_claude_token(state)?));
+    }
     let (mut command, supervisor_root) =
         cli_command(argv, Path::new(&env::var("HOME")?), &overrides)?;
     command
@@ -1037,6 +1133,7 @@ async fn authentication_status(provider: Provider) -> Result<(bool, String)> {
         process_sandbox::wait_for_supervisor(&root, std::time::Duration::from_secs(10))?;
     }
     let output = output.context("authentication status timed out")??;
+    settle_login_credential(state, &home).await?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1044,7 +1141,7 @@ async fn authentication_status(provider: Provider) -> Result<(bool, String)> {
     );
     Ok((
         output.status.success(),
-        if provider == Provider::ClaudeCode {
+        if state.provider == Provider::ClaudeCode {
             "Claude subscription automation token".into()
         } else {
             text
@@ -1052,15 +1149,15 @@ async fn authentication_status(provider: Provider) -> Result<(bool, String)> {
     ))
 }
 
-async fn require_authenticated(provider: Provider) -> Result<(), ApiError> {
-    if matches!(provider, Provider::MuseCode | Provider::GrokBuild) {
-        return if stored_credential_available(provider)? {
+async fn require_authenticated(state: &AppState) -> Result<(), ApiError> {
+    if matches!(state.provider, Provider::MuseCode | Provider::GrokBuild) {
+        return if stored_credential_available(state)? {
             Ok(())
         } else {
             Err(ApiError::unauthorized("authentication_required"))
         };
     }
-    match authentication_status(provider).await {
+    match authentication_status(state).await {
         Ok((true, _)) => Ok(()),
         Ok((false, _)) => Err(ApiError::unauthorized("session_expired")),
         Err(error) => Err(ApiError::internal(&format!(
@@ -1070,7 +1167,12 @@ async fn require_authenticated(provider: Provider) -> Result<(), ApiError> {
 }
 
 fn ensure_idle_runtime(state: &AppState) -> Result<()> {
-    if state.shutting_down.load(std::sync::atomic::Ordering::SeqCst) { return Err(anyhow!("account runtime is stopping")); }
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(anyhow!("account runtime is stopping"));
+    }
     if state
         .processes
         .reap_orphans()?
@@ -1084,11 +1186,16 @@ fn ensure_idle_runtime(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+/// Starts a sign-in. Sessions are irrelevant to it: they read the credential
+/// file, and a running turn keeps the credential it started with, so a login
+/// next to them is safe — the sessions opened afterwards pick up the new one.
+/// What IS refused is a second sign-in, because two device-code flows would both
+/// write this account's credential.
 async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let mut lease = state.lease.lock().await;
-    if lease.is_some() {
+    let mut login = state.login_flow.lock().await;
+    if login.is_some() {
         return Err(ApiError::bad_request(
-            "account_busy: close the active session before signing in",
+            "login_in_progress: this account is already signing in",
         ));
     }
     ensure_idle_runtime(&state)?;
@@ -1096,10 +1203,15 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
     let workspace = env::var("HOME").context("account HOME missing")?;
     let id = format!("auth-{}", uuid::Uuid::new_v4());
     let events = Arc::new(SyncMutex::new(Vec::new()));
+    // The lease is taken while the `login_flow` guard is still held, so a probe
+    // can neither slip its own materialization between these two lines nor be
+    // half-way through one: it would have to own this mutex.
+    let home = lease_login_home(&state, credentials::LoginOrigin::SignIn).await?;
     let runtime = spawn_terminal(
         TerminalSpawn {
-            provider: state.provider,
+            state: &state,
             workspace: &workspace,
+            overrides: home.env(),
         },
         events.clone(),
         &state.processes,
@@ -1113,6 +1225,8 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
         profile_id: None,
         login_completed: None,
         request_hash: None,
+        credential_sha256: None,
+        credential_reported: None,
         created_at_ms: now_ms(),
     };
     state.sessions.lock().await.insert(
@@ -1123,7 +1237,7 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
             events,
         },
     );
-    *lease = Some(id.clone());
+    *login = Some(id.clone());
     Ok(Json(json!({"flow_id": id})))
 }
 
@@ -1164,14 +1278,13 @@ async fn list_models(
             json!({"models": cache.models, "cached": true, "source": "cli"}),
         ));
     }
-    let lease = state.lease.lock().await;
-    if lease.is_some() {
+    if state.login_flow.lock().await.is_some() {
         return Err(ApiError::bad_request(
-            "account_busy: discovery cannot refresh credentials while a session is active",
+            "login_in_progress: discovery cannot run while the account is signing in",
         ));
     }
     ensure_idle_runtime(&state)?;
-    require_authenticated(state.provider).await?;
+    require_authenticated(&state).await?;
     let _probe = state.probe_lock.lock().await;
     // Whoever waited on the lock may have been waiting for the probe that just
     // filled the cache; asking the CLI again would only spend another process.
@@ -1181,13 +1294,18 @@ async fn list_models(
             json!({"models": cache.models, "cached": true, "source": "cli"}),
         ));
     }
+    // One lease for the whole probe: the login home is materialized once and
+    // stays leased until the answer is settled, so a concurrent sign-in cannot
+    // rewrite the directory the CLI is reading from under it.
+    let home = login_home(&state).await?;
     if state.provider == Provider::GrokBuild {
         let response = grok::GrokRuntime::discover(
             &env::var("HOME").context("account HOME missing")?,
-            &[],
+            home.env(),
             &state.processes,
         )
         .await?;
+        settle_login_credential(&state, &home).await?;
         let models = response.pointer("/result/_meta/modelState/availableModels").and_then(Value::as_array).context("Grok initialize omitted models")?.iter().map(|model| json!({"id":model["modelId"],"name":model["name"],"isDefault":model["modelId"]==response["result"]["_meta"]["modelState"]["currentModelId"]})).collect::<Vec<_>>();
         let mut cache = state.probe.lock().await;
         cache.models = models.clone();
@@ -1199,10 +1317,11 @@ async fn list_models(
     if state.provider == Provider::MuseCode {
         let models = muse::MuseRuntime::discover(
             &env::var("HOME").context("account HOME missing")?,
-            &[],
+            home.env(),
             &state.processes,
         )
         .await?;
+        settle_login_credential(&state, &home).await?;
         let models = models.as_array().context("Muse model/list omitted model array")?.iter().map(|model| json!({"id":model["modelId"],"name":model["displayLabel"],"isDefault":model["isDefault"]})).collect::<Vec<_>>();
         let mut cache = state.probe.lock().await;
         cache.models = models.clone();
@@ -1214,7 +1333,7 @@ async fn list_models(
     let events = Arc::new(SyncMutex::new(Vec::new()));
     let runtime = CodexRuntime::connect(
         &env::var("HOME").context("account HOME missing")?,
-        &[],
+        home.env(),
         &[],
         events,
         &state.processes,
@@ -1223,6 +1342,7 @@ async fn list_models(
     let response = runtime
         .request("model/list", json!({"includeHidden": false}))
         .await?;
+    settle_login_credential(&state, &home).await?;
     let result = response.get("result").unwrap_or(&response);
     let models = result
         .get("models")
@@ -1319,14 +1439,13 @@ async fn usage(
             ));
         }
     }
-    let lease = state.lease.lock().await;
-    if lease.is_some() {
+    if state.login_flow.lock().await.is_some() {
         return Err(ApiError::bad_request(
-            "account_busy: discovery cannot refresh credentials while a session is active",
+            "login_in_progress: usage cannot be read while the account is signing in",
         ));
     }
     ensure_idle_runtime(&state)?;
-    require_authenticated(state.provider).await?;
+    require_authenticated(&state).await?;
     let _probe = state.probe_lock.lock().await;
     if !query.refresh {
         let cache = state.probe.lock().await;
@@ -1339,9 +1458,10 @@ async fn usage(
     let usage = match state.provider {
         Provider::Codex => {
             let events = Arc::new(SyncMutex::new(Vec::new()));
+            let home = login_home(&state).await?;
             let runtime = CodexRuntime::connect(
                 &env::var("HOME").context("account HOME missing")?,
-                &[],
+                home.env(),
                 &[],
                 events,
                 &state.processes,
@@ -1350,6 +1470,7 @@ async fn usage(
             let response = runtime
                 .request("account/rateLimits/read", Value::Null)
                 .await?;
+            settle_login_credential(&state, &home).await?;
             let result = response
                 .get("result")
                 .ok_or_else(|| ApiError::internal("Codex usage response has no result"))?;
@@ -1440,23 +1561,147 @@ async fn create_session(
             "per-session account isolation requires a native process sandbox",
         ));
     }
-    if !uuid::Uuid::parse_str(&req.session_id).is_ok_and(|value|value.to_string()==req.session_id) {return Err(ApiError::bad_request("invalid session identifier"));}
-    let id=req.session_id.clone();
+    if !uuid::Uuid::parse_str(&req.session_id)
+        .is_ok_and(|value| value.to_string() == req.session_id)
+    {
+        return Err(ApiError::bad_request("invalid session identifier"));
+    }
+    let id = req.session_id.clone();
     use sha2::Digest;
-    let request_hash = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&req).context("serialize session request")?));
-    let mut lease = state.lease.lock().await;
-    if let Some(existing) = state.sessions.lock().await.get(&id) {
-        if existing.meta.status == "closed" { return Err(ApiError::bad_request("session_closed: canceled session cannot be started")); }
-        if existing.meta.request_hash.as_deref()!=Some(&request_hash) { return Err(ApiError::bad_request("session identifier belongs to a different request")); }
-        return Ok(Json(json!({"session":existing.meta})));
+    let request_hash = hex::encode(sha2::Sha256::digest(
+        serde_json::to_vec(&req).context("serialize session request")?,
+    ));
+    // The account is NOT leased: agents, users and workspaces run their own
+    // sessions on it side by side. What is still exclusive is this identifier —
+    // reserved here, under the map's lock, so two concurrent starts of the same
+    // session cannot both spawn a CLI.
+    let events = Arc::new(SyncMutex::new(Vec::new()));
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(existing) = sessions.get(&id) {
+            if existing.meta.status == "closed" {
+                return Err(ApiError::bad_request(
+                    "session_closed: canceled session cannot be started",
+                ));
+            }
+            if existing.meta.request_hash.as_deref() != Some(&request_hash) {
+                return Err(ApiError::bad_request(
+                    "session identifier belongs to a different request",
+                ));
+            }
+            return Ok(Json(json!({"session":existing.meta})));
+        }
+        sessions.insert(
+            id.clone(),
+            Session {
+                meta: SessionMeta {
+                    id: id.clone(),
+                    vendor_session_id: String::new(),
+                    workspace: req.workspace.clone(),
+                    status: "starting".into(),
+                    model: None,
+                    profile_id: None,
+                    login_completed: None,
+                    request_hash: Some(request_hash.clone()),
+                    credential_sha256: None,
+                    credential_reported: None,
+                    created_at_ms: now_ms(),
+                },
+                runtime: None,
+                events: events.clone(),
+            },
+        );
     }
-    if lease.is_some() {
-        return Err(ApiError::bad_request("account_busy: this account already has an active session"));
+    let (meta, mut runtime) = match start_session(&state, &req, &id, &request_hash, events).await {
+        Ok(started) => started,
+        Err(error) => {
+            state.sessions.lock().await.remove(&id);
+            return Err(error);
+        }
+    };
+    {
+        let mut sessions = state.sessions.lock().await;
+        // Closed while it was starting: the caller cancelled, and its decision
+        // outranks a CLI that has only just come up.
+        let live = sessions
+            .get(&id)
+            .is_some_and(|existing| existing.meta.status == "starting");
+        if !live {
+            drop(sessions);
+            terminate_runtime(&mut runtime).await;
+            return Err(ApiError::bad_request(
+                "session_closed: canceled session cannot be started",
+            ));
+        }
+        let session = sessions.get_mut(&id).expect("the reservation is live");
+        session.meta = meta.clone();
+        session.runtime = Some(runtime);
     }
-    transfer::available(&state)?;
-    ensure_idle_runtime(&state)?;
+    if let Err(error) = persist(&state).await {
+        let _ = close_session(State(state), AxumPath(id)).await?;
+        return Err(error.into());
+    }
+    Ok(Json(json!({"session": meta})))
+}
+
+/// Stops one runtime and reports the settled process state. Every path that
+/// gives up on a CLI goes through here, so "closed" means the same thing to a
+/// cancelled start and to an explicit close.
+async fn terminate_runtime(runtime: &mut Runtime) -> process::ProcessState {
+    match runtime {
+        Runtime::Terminal(runtime) => runtime.shutdown().await,
+        Runtime::Codex(runtime) => runtime.shutdown().await,
+        Runtime::Claude(runtime) => runtime.shutdown().await,
+        Runtime::Muse(runtime) => runtime.shutdown().await,
+        Runtime::Grok(runtime) => runtime.shutdown().await,
+    }
+}
+
+/// Starts the CLI of one reserved session. Split out of `create_session` so the
+/// reservation has exactly one place that removes it again.
+async fn start_session(
+    state: &AppState,
+    req: &CreateSession,
+    id: &str,
+    request_hash: &str,
+    events: Arc<SyncMutex<Vec<Event>>>,
+) -> Result<(SessionMeta, Runtime), ApiError> {
+    let id = id.to_string();
+    transfer::available(state)?;
+    ensure_idle_runtime(state)?;
+    // Which private profile this session runs in, resolved before anything is
+    // spent on it: a resume names an existing profile, a fresh session gets its
+    // own. `None` is a caller-supplied environment, which brings its own.
+    let profile_id = if req.env.is_empty() {
+        let sessions = state.sessions.lock().await;
+        let profile_id = match &req.resume_vendor_session_id {
+            Some(resume) => sessions
+                .values()
+                .find(|session| &session.meta.vendor_session_id == resume)
+                .and_then(|session| session.meta.profile_id.clone())
+                .ok_or_else(|| {
+                    ApiError::bad_request("resume profile is unavailable; start a new session")
+                })?,
+            None => id.clone(),
+        };
+        // One profile, one CLI. Two vendor processes on one private profile
+        // would write the same session files, history and lock files and corrupt
+        // each other's state, so resuming a session that is still open is a
+        // different request from opening a second one.
+        if sessions.values().any(|session| {
+            session.meta.status != "closed"
+                && session.meta.profile_id.as_deref() == Some(&profile_id)
+        }) {
+            return Err(ApiError::bad_request(
+                "profile_in_use: this vendor session is already open",
+            ));
+        }
+        Some(profile_id)
+    } else {
+        None
+    };
     if req.env.is_empty() {
-        require_authenticated(state.provider).await?;
+        require_authenticated(state).await?;
     }
     let workspace = if let Some(actor) = &req.private_workspace {
         let actor = uuid::Uuid::parse_str(actor).context("invalid workspace actor")?;
@@ -1484,26 +1729,13 @@ async fn create_session(
         .transpose()?;
     let mut env = validated_env(&req.env)?;
     let args = validated_args(&req.args)?;
-    let profile_id = if env.is_empty() {
-        let previous = if let Some(resume) = &req.resume_vendor_session_id {
-            let sessions = state.sessions.lock().await;
-            Some(
-                sessions
-                    .values()
-                    .find(|session| &session.meta.vendor_session_id == resume)
-                    .and_then(|session| session.meta.profile_id.clone())
-                    .ok_or_else(|| {
-                        ApiError::bad_request("resume profile is unavailable; start a new session")
-                    })?,
-            )
-        } else {
-            None
-        };
-        let profile_id = previous.unwrap_or_else(|| id.clone());
-        env = prepare_session_profile(&state, &profile_id)?;
-        Some(profile_id)
-    } else {
-        None
+    let credential_sha256 = match &profile_id {
+        Some(profile_id) => {
+            let profile = prepare_session_profile(state, profile_id)?;
+            env = profile.env;
+            profile.credential_sha256
+        }
+        None => None,
     };
     let requested_vendor_id = if req.fork || req.resume_vendor_session_id.is_none() {
         uuid::Uuid::new_v4().to_string()
@@ -1512,21 +1744,6 @@ async fn create_session(
             .clone()
             .expect("resume id checked")
     };
-    if let Some(profile_id) = &profile_id {
-        let marker = state
-            .state_file
-            .parent()
-            .context("account root missing")?
-            .join("active-profile");
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(marker)?;
-        file.write_all(profile_id.as_bytes())?;
-        file.sync_all()?;
-    }
-    *lease = Some(id.clone());
-    let events = Arc::new(SyncMutex::new(Vec::new()));
     let started: Result<Runtime> = async {
         Ok(match state.provider {
             Provider::Codex => Runtime::Codex(
@@ -1595,11 +1812,10 @@ async fn create_session(
         Ok(runtime) => runtime,
         Err(error) => {
             rollback_session_start(
-                &state,
+                state,
                 profile_id.as_deref(),
                 req.resume_vendor_session_id.is_none(),
             )?;
-            *lease = None;
             return Err(error.into());
         }
     };
@@ -1621,32 +1837,92 @@ async fn create_session(
         model,
         profile_id,
         login_completed: None,
-        request_hash: Some(request_hash),
+        request_hash: Some(request_hash.to_string()),
+        // The credential this session's private copy was made from. Anything the
+        // provider writes into that copy after this point is a rotation, and is
+        // offered to the account as one.
+        credential_sha256: credential_sha256.clone(),
+        credential_reported: credential_sha256,
         created_at_ms: now_ms(),
     };
-    state.sessions.lock().await.insert(
-        id.clone(),
-        Session {
-            meta: meta.clone(),
-            runtime: Some(runtime),
-            events,
-        },
-    );
-    *lease = Some(id.clone());
-    if let Err(error) = persist(&state).await {
-        drop(lease);
-        let _ = close_session(State(state), AxumPath(id)).await?;
-        return Err(error.into());
-    }
-    Ok(Json(json!({"session": meta})))
+    Ok((meta, runtime))
 }
 
-fn credential_name(provider: Provider) -> (&'static str, &'static str) {
-    match provider {
-        Provider::Codex => ("codex", "auth.json"),
-        Provider::ClaudeCode => ("claude", "setup-token.json"),
-        Provider::MuseCode => ("config/muse", "auth.json"),
-        Provider::GrokBuild => ("grok", "auth.json"),
+/// Exclusive use of the bridge's private login home, plus the environment that
+/// points a CLI at it.
+///
+/// Holding one of these is what makes an account-level invocation safe: the
+/// canonical credential was copied in while the lease was held, the digest it
+/// was copied FROM is remembered, and nothing else may materialize into the
+/// same directory until the lease is dropped. `settle_login_credential` takes a
+/// reference to it rather than re-locking, which is also how the type system
+/// says "only the holder publishes what the CLI left".
+struct LoginHome {
+    env: Vec<(String, String)>,
+    /// The canonical credential the login home was made from, `None` when the
+    /// account had none. The CAS a probe's publication is checked against.
+    baseline: Option<String>,
+    origin: credentials::LoginOrigin,
+    _lease: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl LoginHome {
+    fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+}
+
+/// Leases the login home for an operation that is NOT a sign-in, refusing while
+/// one is running.
+///
+/// A sign-in owns the login home for its whole terminal — minutes, while the
+/// person is at the provider — and it is the CLI writing the credential file
+/// there. A probe that re-materialized the canonical credential underneath it
+/// would overwrite exactly that file.
+async fn login_home(state: &AppState) -> Result<LoginHome> {
+    if state.login_flow.lock().await.is_some() {
+        return Err(anyhow!(
+            "login_in_progress: the account's sign-in owns its login home"
+        ));
+    }
+    lease_login_home(state, credentials::LoginOrigin::Probe).await
+}
+
+/// The same lease without the sign-in check, for `auth_start` — which holds the
+/// `login_flow` guard while it starts the terminal, so checking it here would
+/// deadlock, and which IS the sign-in the check exists to protect.
+async fn lease_login_home(state: &AppState, origin: credentials::LoginOrigin) -> Result<LoginHome> {
+    let lease = state.login_home.clone().lock_owned().await;
+    let login = credentials::login_root(&state.data_dir);
+    let baseline =
+        credentials::materialize(state.provider, &credentials::root(&state.data_dir), &login)?;
+    Ok(login_home_lease(state, baseline, origin, lease))
+}
+
+/// Leases the login home WITHOUT copying the canonical credential in, for the
+/// end of a sign-in: the CLI just wrote this account's new credential there, and
+/// materializing over it would publish back the very login it replaced.
+async fn finished_login_home(state: &AppState) -> LoginHome {
+    let lease = state.login_home.clone().lock_owned().await;
+    login_home_lease(state, None, credentials::LoginOrigin::SignIn, lease)
+}
+
+fn login_home_lease(
+    state: &AppState,
+    baseline: Option<String>,
+    origin: credentials::LoginOrigin,
+    lease: tokio::sync::OwnedMutexGuard<()>,
+) -> LoginHome {
+    let login = credentials::login_root(&state.data_dir);
+    let (home, directory) = credentials::engine_home(state.provider);
+    LoginHome {
+        env: vec![(
+            home.to_string(),
+            login.join(directory).to_string_lossy().into_owned(),
+        )],
+        baseline,
+        origin,
+        _lease: lease,
     }
 }
 
@@ -1658,12 +1934,13 @@ fn valid_claude_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn read_claude_token(path: &Path) -> Result<String> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 8192 {
-        return Err(anyhow!("invalid Claude subscription token file"));
-    }
-    let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+/// Reads the account's Claude subscription token. Claude Code takes its token
+/// from the environment, so this is the ONE place the material is read and the
+/// session never holds a file at all.
+fn read_claude_token(state: &AppState) -> Result<String> {
+    let material = credentials::read(&credentials::root(&state.data_dir), state.provider)?
+        .context("this account has no Claude subscription token on this node")?;
+    let value: Value = serde_json::from_slice(&material)?;
     let token = value
         .get("oauth_token")
         .and_then(Value::as_str)
@@ -1689,54 +1966,18 @@ fn extract_claude_token(plain: &str) -> Option<String> {
     valid_claude_token(&token).then_some(token)
 }
 
-fn store_claude_token(path: &Path, token: &str) -> Result<()> {
+/// Stores a freshly minted Claude subscription token as the account's
+/// credential. The bridge captures it from the sign-in terminal's own output, so
+/// the canonical path is written by this process and never named to the CLI.
+fn store_claude_token(state: &AppState, token: &str) -> Result<()> {
     if !valid_claude_token(token) {
         return Err(anyhow!("invalid Claude subscription token"));
     }
-    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    file.write_all(&serde_json::to_vec(&json!({"oauth_token":token}))?)?;
-    file.sync_all()?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
-}
-
-fn copy_credential(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(source).context("exportable provider credential is unavailable; sign in using a file-backed provider profile")?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
-        return Err(anyhow!(
-            "provider credential must be a bounded regular file"
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(anyhow!("provider credential must not have hardlinks"));
-        }
-    }
-    let bytes = std::fs::read(source)?;
-    serde_json::from_slice::<Value>(&bytes).context("invalid provider credential JSON")?;
-    let temporary = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, destination)?;
-    Ok(())
+    credentials::write(
+        &credentials::root(&state.data_dir),
+        state.provider,
+        &serde_json::to_vec(&json!({"oauth_token": token}))?,
+    )
 }
 
 fn session_profile_root(state: &AppState, id: &str) -> Result<PathBuf> {
@@ -1763,18 +2004,15 @@ fn session_profile_root(state: &AppState, id: &str) -> Result<PathBuf> {
     Ok(profile)
 }
 
-fn prepare_session_profile(state: &AppState, id: &str) -> Result<Vec<(String, String)>> {
-    if state
-        .state_file
-        .parent()
-        .context("account root missing")?
-        .join("credential-review-required")
-        .exists()
-    {
-        return Err(anyhow!(
-            "credential_verification_required: sign in again before opening another session"
-        ));
-    }
+/// What preparing a session's private profile produced: the environment its CLI
+/// runs with, and the account credential the private copy inside it was made
+/// from — the baseline every later change of that copy is judged against.
+struct SessionProfile {
+    env: Vec<(String, String)>,
+    credential_sha256: Option<String>,
+}
+
+fn prepare_session_profile(state: &AppState, id: &str) -> Result<SessionProfile> {
     let root = session_profile_root(state, id)?;
     for name in [
         "home",
@@ -1800,14 +2038,6 @@ fn prepare_session_profile(state: &AppState, id: &str) -> Result<Vec<(String, St
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    let (directory, file) = credential_name(state.provider);
-    let source = state
-        .state_file
-        .parent()
-        .context("account root missing")?
-        .join(directory)
-        .join(file);
-    copy_credential(&source, &root.join(directory).join(file))?;
     let mut values: Vec<(String, String)> = [
         ("HOME", root.join("home")),
         ("TMPDIR", root.join("tmp")),
@@ -1816,76 +2046,315 @@ fn prepare_session_profile(state: &AppState, id: &str) -> Result<Vec<(String, St
         ("GROK_HOME", root.join("grok")),
         ("XDG_CONFIG_HOME", root.join("config")),
         ("XDG_DATA_HOME", root.join("data")),
-        ("TENTAFLOW_AGENT_PRIVATE_ROOT", root),
+        ("TENTAFLOW_AGENT_PRIVATE_ROOT", root.clone()),
     ]
     .into_iter()
     .map(|(name, path)| (name.to_string(), path.to_string_lossy().into_owned()))
     .collect();
-    if state.provider == Provider::ClaudeCode {
-        values.push((
-            "CLAUDE_CODE_OAUTH_TOKEN".into(),
-            read_claude_token(&session_profile_root(state, id)?.join(directory).join(file))?,
-        ));
+    // Claude Code reads its token from the environment, so its profile holds no
+    // credential file at all. Every other engine gets a private COPY of the
+    // account's credential: the canonical one stays outside this profile and
+    // outside the sandbox policy built from it.
+    let credential_sha256 = if state.provider == Provider::ClaudeCode {
+        values.push(("CLAUDE_CODE_OAUTH_TOKEN".into(), read_claude_token(state)?));
         values.push((
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
             "1".into(),
         ));
-    }
-    Ok(values)
+        None
+    } else {
+        Some(
+            credentials::materialize(
+                state.provider,
+                &credentials::root(&state.data_dir),
+                &root,
+            )?
+            .context(
+                "this account has no provider credential on this node; sign in before opening a session",
+            )?,
+        )
+    };
+    Ok(SessionProfile {
+        env: values,
+        credential_sha256,
+    })
 }
 
-fn reconcile_session_credential(state: &AppState, id: &str) -> Result<()> {
+/// What the bridge does after looking at a session's private credential: the
+/// hash it published or refused, and the baseline the session carries from now
+/// on.
+struct CredentialUpdate {
+    baseline: Option<String>,
+    reported: Option<String>,
+}
+
+/// Hands a session's private credential back to the account when it moved, and
+/// tells Core what happened.
+///
+/// A session is untrusted, so a change of its copy is a REQUEST: the material
+/// must still name the same provider account and the canonical credential must
+/// still be the one this session started from. A refusal is reported with its
+/// reason and nothing else changes — in particular a session that ran through a
+/// rotation it never saw cannot put its older token back.
+async fn settle_session_credential(
+    state: &AppState,
+    profile_id: &str,
+    meta: (Option<String>, Option<String>),
+    events: &Arc<SyncMutex<Vec<Event>>>,
+) -> Result<Option<CredentialUpdate>> {
     if state.provider == Provider::ClaudeCode {
-        return Ok(());
+        return Ok(None);
     }
-    let (directory, file) = credential_name(state.provider);
-    let source = session_profile_root(state, id)?.join(directory).join(file);
-    let account = state.state_file.parent().context("account root missing")?;
-    let destination = account.join(directory).join(file);
-    let profile = session_profile_root(state, id)?;
-    let safe_parent =
-        std::fs::canonicalize(source.parent().context("credential directory missing")?)
-            .map(|path| path == profile.join(directory))
-            .unwrap_or(false);
-    if !safe_parent {
-        std::fs::write(
-            account.join("credential-review-required"),
-            b"Private credential directory changed; sign in again",
-        )?;
-        return Ok(());
+    // A sign-in is the account's own authority over its credential; a session's
+    // request has nothing to add while one is running.
+    if state.login_flow.lock().await.is_some() {
+        return Ok(None);
     }
-    let previous = std::fs::read(&destination)?;
-    let metadata = std::fs::symlink_metadata(&source)?;
-    #[cfg(unix)]
-    let has_hardlinks = {
-        use std::os::unix::fs::MetadataExt;
-        metadata.nlink() != 1
+    let (baseline, reported) = meta;
+    let profile = session_profile_root(state, profile_id)?;
+    let publication = credentials::publish_from_profile(
+        state.provider,
+        &credentials::root(&state.data_dir),
+        &profile,
+        baseline.as_deref(),
+        reported.as_deref(),
+    )?;
+    match publication {
+        credentials::Publication::Unchanged => Ok(None),
+        credentials::Publication::Refused { reason, sha256 } => {
+            push_event(
+                events,
+                "credential_rejected",
+                json!({"engine": state.provider, "reason": reason, "sha256": sha256}),
+            );
+            Ok(Some(CredentialUpdate {
+                baseline,
+                // What the session has to remember so this refusal is reported
+                // once. A refusal that could not read the file has no digest to
+                // remember it by, so the reason is what gets stored.
+                reported: Some(credentials::refusal_marker(reason, &sha256)),
+            }))
+        }
+        credentials::Publication::Published {
+            sha256,
+            previous,
+            material,
+        } => {
+            push_event(
+                events,
+                "credential_changed",
+                json!({"engine": state.provider, "sha256": sha256}),
+            );
+            fan_out_credential(
+                state,
+                &sha256,
+                previous.as_deref(),
+                Some(profile_id),
+                &material,
+            )
+            .await;
+            Ok(Some(CredentialUpdate {
+                baseline: Some(sha256.clone()),
+                reported: Some(sha256),
+            }))
+        }
+    }
+}
+
+/// Hands the account's canonical credential to Core.
+///
+/// Core is the trust root of this pair: it authenticated the person who signed
+/// in, it owns the encrypted store every other node is served from, and there
+/// is no other way for what a sign-in produced inside this process to get
+/// there. The channel is the same authenticated loopback surface every other
+/// route uses — a session reaches none of it, which is the property the whole
+/// credential design rests on.
+///
+/// The material is returned verbatim and never written to a log here or by the
+/// caller; `identity` is the same containment value `publish_from_profile`
+/// compares, so Core stores the account's provider subject without parsing a
+/// vendor format of its own.
+///
+/// Unlike the write, this read deliberately does NOT refuse while a sign-in is
+/// running: reading is what Core does to pick a rotation up, the canonical file
+/// is replaced by rename, and the answer is therefore whole whichever side of a
+/// settle it lands on. Refusing here would leave a rotation unread for as long
+/// as somebody is at the provider's device page.
+async fn read_account_credential(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let Some(material) = credentials::read(&credentials::root(&state.data_dir), state.provider)?
+    else {
+        return Ok(Json(json!({"present": false, "engine": state.provider})));
     };
-    #[cfg(not(unix))]
-    let has_hardlinks = false;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > 1024 * 1024
-        || has_hardlinks
+    let text = String::from_utf8(material.clone())
+        .map_err(|_| ApiError::internal("the stored credential is not text"))?;
+    Ok(Json(json!({
+        "present": true,
+        "engine": state.provider,
+        "sha256": credentials::digest(&material),
+        "identity": credentials::identity(state.provider, &material),
+        "material": text,
+    })))
+}
+
+/// Installs the credential Core holds as this account's canonical one.
+///
+/// This is materialization: the node received the account through the ledger,
+/// or re-read it after a rotation elsewhere, and the bridge is the ONLY writer
+/// of the canonical file — Core hands the bytes over instead of writing them,
+/// because a second writer would race this process's atomic replacement.
+///
+/// A sign-in in flight wins: it is the account's own authority over its
+/// credential, and overwriting the file underneath it would make the sign-in
+/// finish onto a credential nobody asked for. The `login_flow` guard is held
+/// across the write rather than only read: releasing it after the test would
+/// leave the window in which `auth_start` takes it and this handler then writes
+/// the file the sign-in is about to be settled onto.
+async fn write_account_credential(
+    State(state): State<AppState>,
+    Json(request): Json<CredentialRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let login = state.login_flow.lock().await;
+    if login.is_some() {
+        return Err(ApiError::bad_request(
+            "login_in_progress: this account is signing in",
+        ));
+    }
+    let material = request.material.into_bytes();
+    // The same shape test `publish_from_login` applies: an empty object is what
+    // a CLI leaves behind when it wrote a file and nothing else, and storing it
+    // would replace a working credential with one that authenticates nobody.
+    if serde_json::from_slice::<Value>(&material)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| object.is_empty()))
+        .unwrap_or(true)
     {
-        std::fs::write(
-            account.join("credential-review-required"),
-            b"Private credential path changed; sign in again",
-        )?;
-        return Ok(());
+        return Err(ApiError::bad_request(
+            "a provider credential is a non-empty JSON document",
+        ));
     }
-    let refreshed = std::fs::read(&source)?;
-    if previous == refreshed {
-        return Ok(());
+    let canonical = credentials::root(&state.data_dir);
+    let sha256 = credentials::digest(&material);
+    let previous =
+        credentials::read(&canonical, state.provider)?.map(|held| credentials::digest(&held));
+    if previous.as_deref() == Some(sha256.as_str()) {
+        return Ok(Json(json!({"applied": false, "sha256": sha256})));
     }
-    // Project processes can edit their private profile. Only a provider-verified
-    // identity may authorize replacing the canonical credential after refresh.
-    let pending = account.join("pending-credential.json");
-    copy_credential(&source, &pending)?;
-    std::fs::write(account.join("credential-review-required"), b"Provider identity verification is required after credential changes. Sign in again to confirm this account.")?;
+    credentials::write(&canonical, state.provider, &material)?;
+    fan_out_credential(&state, &sha256, previous.as_deref(), None, &material).await;
+    drop(login);
+    Ok(Json(json!({"applied": true, "sha256": sha256})))
+}
+
+/// Extracts whatever a sign-in, an authentication probe or a discovery run left
+/// in the bridge's private login home, and puts it in front of the sessions.
+///
+/// The `home` reference is the proof that the caller holds the login-home lease:
+/// the material being published is whatever the CLI left in a directory that was
+/// exclusively the caller's for the whole run, and `home.baseline` is the
+/// canonical credential it started from.
+async fn settle_login_credential(state: &AppState, home: &LoginHome) -> Result<()> {
+    let publication = credentials::publish_from_login(
+        state.provider,
+        &credentials::root(&state.data_dir),
+        &credentials::login_root(&state.data_dir),
+        home.baseline.as_deref(),
+        home.origin,
+    )?;
+    match publication {
+        credentials::Publication::Published {
+            sha256,
+            previous,
+            material,
+        } => fan_out_credential(state, &sha256, previous.as_deref(), None, &material).await,
+        // The CLI left something in the login home that is not a credential. The
+        // account keeps the one it had, and the operator sees a failed sign-in
+        // rather than a silently unchanged account.
+        credentials::Publication::Refused { reason, .. } => {
+            eprintln!("coding-agent-bridge: the sign-in produced no usable credential ({reason})");
+        }
+        credentials::Publication::Unchanged => {}
+    }
     Ok(())
 }
 
+/// Gives the account's new credential to every live session still holding the
+/// old one.
+///
+/// Without it a rotation would reach exactly one session and every other would
+/// keep presenting a token the provider has already retired — and would then be
+/// refused publication for the rest of its life, because its baseline no longer
+/// matches. A session that changed its own copy is left alone: its divergence is
+/// its own, and overwriting it would destroy whatever it is holding.
+/// The session lock is taken TWICE and never held across the file work in
+/// between: writing a profile copy is a synchronous `openat`/`write`/`rename`
+/// per session, and holding the lock over all of them would stall every other
+/// request the bridge is serving — including the turns of the sessions being
+/// fanned out to. A session that closed meanwhile is simply not found on the
+/// second pass, and one whose copy changed meanwhile fails the `adopt`
+/// baseline, so the split cannot overwrite a divergence it did not see.
+async fn fan_out_credential(
+    state: &AppState,
+    published: &str,
+    previous: Option<&str>,
+    except: Option<&str>,
+    material: &[u8],
+) {
+    let candidates: Vec<String> = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .values()
+            .filter_map(|session| {
+                let profile_id = session.meta.profile_id.clone()?;
+                (Some(profile_id.as_str()) != except
+                    && session.meta.status != "closed"
+                    && session.meta.credential_sha256.as_deref() == previous)
+                    .then_some(profile_id)
+            })
+            .collect()
+    };
+    let mut adopted = Vec::with_capacity(candidates.len());
+    for profile_id in candidates {
+        match session_profile_root(state, &profile_id)
+            .and_then(|profile| credentials::adopt(state.provider, &profile, previous, material))
+        {
+            Ok(true) => adopted.push(profile_id),
+            // A profile that cannot be written safely keeps what it has; it is
+            // the session's own copy, and it stops nobody else from working.
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "coding-agent-bridge: session {profile_id} kept its own credential copy: {error}"
+            ),
+        }
+    }
+    if adopted.is_empty() {
+        return;
+    }
+    let mut sessions = state.sessions.lock().await;
+    for session in sessions.values_mut() {
+        let Some(profile_id) = session.meta.profile_id.as_deref() else {
+            continue;
+        };
+        // Only a session still holding the copy that was replaced: one that
+        // rotated its own between the two passes owns what it has.
+        if adopted.iter().any(|id| id == profile_id)
+            && session.meta.credential_sha256.as_deref() == previous
+        {
+            session.meta.credential_sha256 = Some(published.to_string());
+            session.meta.credential_reported = Some(published.to_string());
+        }
+    }
+}
+
+/// Undoes a start that never produced a running CLI.
+///
+/// The ACCOUNT's credential needs no undoing: a start only ever copied it INTO
+/// the new profile, and a profile that is discarded takes its copy with it.
+/// What is left is profile teardown plus the proof that nothing survived the
+/// failed start.
+///
+/// A profile reused by a resume is kept: it carries the history the resumed
+/// session is made of, and its credential copy is the one that session is still
+/// entitled to.
 fn rollback_session_start(
     state: &AppState,
     profile_id: Option<&str>,
@@ -1897,21 +2366,10 @@ fn rollback_session_start(
         .iter()
         .any(|entry| entry.state != process::ProcessState::Reaped)
     {
-        return Err(anyhow!(
-            "failed session process termination is unconfirmed; account remains leased"
-        ));
+        return Err(anyhow!("failed session process termination is unconfirmed"));
     }
-    if let Some(profile_id) = profile_id {
-        reconcile_session_credential(state, profile_id)?;
-        let marker = state
-            .state_file
-            .parent()
-            .context("account root missing")?
-            .join("active-profile");
-        std::fs::remove_file(marker)?;
-        if discard_profile {
-            std::fs::remove_dir_all(session_profile_root(state, profile_id)?)?;
-        }
+    if let Some(profile_id) = profile_id.filter(|_| discard_profile) {
+        std::fs::remove_dir_all(session_profile_root(state, profile_id)?)?;
     }
     Ok(())
 }
@@ -2031,26 +2489,40 @@ async fn close_session(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut lease = state.lease.lock().await;
     let session = {
         let mut sessions = state.sessions.lock().await;
         sessions.remove(&id)
     };
     let Some(mut session) = session else {
-        if !uuid::Uuid::parse_str(&id).is_ok_and(|value| value.to_string()==id) {
+        if !uuid::Uuid::parse_str(&id).is_ok_and(|value| value.to_string() == id) {
             return Err(ApiError::bad_request("invalid session identifier"));
         }
-        let meta=SessionMeta{id:id.clone(),vendor_session_id:String::new(),workspace:String::new(),status:"closed".into(),model:None,profile_id:None,login_completed:None,request_hash:None,created_at_ms:now_ms()};
-        state.sessions.lock().await.insert(id,Session{meta,runtime:None,events:Arc::new(SyncMutex::new(Vec::new()))});
+        let meta = SessionMeta {
+            id: id.clone(),
+            vendor_session_id: String::new(),
+            workspace: String::new(),
+            status: "closed".into(),
+            model: None,
+            profile_id: None,
+            login_completed: None,
+            request_hash: None,
+            credential_sha256: None,
+            credential_reported: None,
+            created_at_ms: now_ms(),
+        };
+        state.sessions.lock().await.insert(
+            id,
+            Session {
+                meta,
+                runtime: None,
+                events: Arc::new(SyncMutex::new(Vec::new())),
+            },
+        );
         persist(&state).await?;
         return Ok(Json(json!({"closed":true,"process_state":"reaped"})));
     };
     let state_after = match session.runtime.as_mut() {
-        Some(Runtime::Terminal(runtime)) => runtime.shutdown().await,
-        Some(Runtime::Codex(runtime)) => runtime.shutdown().await,
-        Some(Runtime::Claude(runtime)) => runtime.shutdown().await,
-        Some(Runtime::Muse(runtime)) => runtime.shutdown().await,
-        Some(Runtime::Grok(runtime)) => runtime.shutdown().await,
+        Some(runtime) => terminate_runtime(runtime).await,
         // A session whose runtime was never restarted after a bridge restart
         // has nothing running; the process it once had was reaped at startup.
         None => process::ProcessState::Reaped,
@@ -2058,82 +2530,139 @@ async fn close_session(
     if state_after == process::ProcessState::Running {
         state.sessions.lock().await.insert(id, session);
         return Err(ApiError::internal(
-            "account process termination is unconfirmed; lease retained",
+            "account process termination is unconfirmed; the session stays open",
         ));
     }
-    let settlement = (|| -> Result<()> {
-        if let Some(Runtime::Terminal(runtime)) = session.runtime.as_mut() {
-            if let Some(reader) = runtime.reader_thread.take() {
-                reader
-                    .join()
-                    .map_err(|_| anyhow!("login output capture failed"))?;
-            }
-        }
-        if let Some(profile_id) = session
-            .meta
-            .profile_id
-            .as_ref()
-            .filter(|_| session.meta.status != "closed")
+    if let Some(Runtime::Terminal(runtime)) = session.runtime.as_mut() {
+        if let Err(error) = runtime
+            .reader_thread
+            .take()
+            .map(|reader| reader.join())
+            .transpose()
+            .map_err(|_| anyhow!("login output capture failed"))
         {
-            reconcile_session_credential(&state, profile_id)?;
-            let marker = state
-                .state_file
-                .parent()
-                .context("account root missing")?
-                .join("active-profile");
-            match std::fs::remove_file(marker) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+            state.sessions.lock().await.insert(id, session);
+            return Err(error.into());
+        }
+    }
+    // The last look at the credential this session ran on: a rotation the
+    // provider wrote into the private copy after the final poll is offered to
+    // the account here.
+    if let Some(profile_id) = session
+        .meta
+        .profile_id
+        .clone()
+        .filter(|_| session.meta.status != "closed")
+    {
+        match settle_session_credential(
+            &state,
+            &profile_id,
+            (
+                session.meta.credential_sha256.clone(),
+                session.meta.credential_reported.clone(),
+            ),
+            &session.events,
+        )
+        .await
+        {
+            Ok(Some(update)) => {
+                session.meta.credential_sha256 = update.baseline;
+                session.meta.credential_reported = update.reported;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                state.sessions.lock().await.insert(id, session);
+                return Err(error.into());
             }
         }
-        Ok(())
-    })();
-    if let Err(error) = settlement {
-        state.sessions.lock().await.insert(id, session);
-        return Err(error.into());
     }
     if session.meta.id.starts_with("auth-") {
         if let Some(Runtime::Terminal(runtime)) = session.runtime.as_mut() {
-            let succeeded = runtime
-                .child
-                .try_wait()
-                .ok()
-                .flatten()
-                .is_some_and(|status| status.success());
-            session.meta.login_completed = Some(succeeded);
-            if succeeded {
-                let root = state.state_file.parent().context("account root missing")?;
-                for name in ["credential-review-required", "pending-credential.json"] {
-                    match std::fs::remove_file(root.join(name)) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            state.sessions.lock().await.insert(id, session);
-                            return Err(error.into());
-                        }
-                    }
-                }
-            }
+            session.meta.login_completed = Some(
+                runtime
+                    .child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|status| status.success()),
+            );
+        }
+        // The sign-in wrote into the bridge's own login home, which is the one
+        // place a CLI is allowed to create this account's credential. Extract it
+        // now, so the next session starts from the new login.
+        //
+        // The flag and the lease are both held across the extraction, and taken
+        // in the order every other holder takes them (`login_flow` first, then
+        // the home), so there is no cycle. Clearing the flag before leasing left
+        // a window in which a probe saw "no sign-in running", took the home and
+        // materialized the OLD canonical credential over the file the CLI had
+        // just written — the sign-in then published nothing and the new
+        // credential was lost without a trace.
+        let mut login = state.login_flow.lock().await;
+        let home = finished_login_home(&state).await;
+        if login.as_deref() == Some(id.as_str()) {
+            *login = None;
+        }
+        let published = settle_login_credential(&state, &home).await;
+        drop(home);
+        drop(login);
+        if let Err(error) = published {
+            state.sessions.lock().await.insert(id, session);
+            return Err(error.into());
         }
     }
     session.runtime = None;
     session.meta.status = "closed".into();
     state.sessions.lock().await.insert(id.clone(), session);
-    if lease.as_deref() == Some(&id) {
-        *lease = None;
-    }
     persist(&state).await?;
     Ok(Json(
         json!({"closed": true, "process_state": state_after.as_str()}),
     ))
 }
 
+/// Drains the session's events and, on the way, looks at the credential it runs
+/// on. This is the poll Core already makes while a turn runs, which makes it the
+/// place a rotation is noticed within one interval of happening — no watcher, no
+/// second channel, and no work on an account nobody is using.
 async fn list_events(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let observed = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| ApiError::not_found("session not found"))?;
+        session
+            .meta
+            .profile_id
+            .clone()
+            .filter(|_| session.meta.status != "closed")
+            .map(|profile_id| {
+                (
+                    profile_id,
+                    (
+                        session.meta.credential_sha256.clone(),
+                        session.meta.credential_reported.clone(),
+                    ),
+                    session.events.clone(),
+                )
+            })
+    };
+    if let Some((profile_id, seen, events)) = observed {
+        if let Some(update) = settle_session_credential(&state, &profile_id, seen, &events)
+            .await
+            .map_err(|error| {
+                ApiError::internal(&format!("settle the account credential: {error}"))
+            })?
+        {
+            if let Some(session) = state.sessions.lock().await.get_mut(&id) {
+                session.meta.credential_sha256 = update.baseline;
+                session.meta.credential_reported = update.reported;
+            }
+        }
+    }
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&id)
@@ -2554,9 +3083,15 @@ struct ClaudeSpawn<'a> {
 }
 
 /// Login flows use a private terminal; Claude token output stays in the bridge.
+///
+/// A sign-in writes into the bridge's OWN login home, never into the canonical
+/// credential and never into a session profile. The caller leases that home
+/// (`lease_login_home`) and passes its environment here, so the directory the
+/// CLI writes into cannot be re-materialized while the terminal is starting.
 struct TerminalSpawn<'a> {
-    provider: Provider,
+    state: &'a AppState,
     workspace: &'a str,
+    overrides: &'a [(String, String)],
 }
 
 fn spawn_terminal(
@@ -2565,9 +3100,11 @@ fn spawn_terminal(
     processes: &process::Registry,
 ) -> Result<TerminalRuntime> {
     let TerminalSpawn {
-        provider,
+        state,
         workspace,
+        overrides,
     } = spawn;
+    let provider = state.provider;
     let pty = native_pty_system().openpty(PtySize {
         rows: 40,
         cols: 120,
@@ -2585,7 +3122,7 @@ fn spawn_terminal(
             "--device-auth".into(),
         ],
     };
-    let argv = sandbox_argv(argv, Path::new(workspace), &[])?;
+    let argv = sandbox_argv(argv, Path::new(workspace), overrides)?;
     let mut command = CommandBuilder::new(&argv[0]);
     if process_sandbox::supervisor_root(&argv)?.is_some() {
         command.set_controlling_tty(false);
@@ -2593,7 +3130,7 @@ fn spawn_terminal(
     command.args(&argv[1..]);
     command.cwd(workspace);
     command.env_clear();
-    for (name, value) in cli_environment(&[]) {
+    for (name, value) in cli_environment(overrides) {
         command.env(name, value);
     }
     let child = match pty.slave.spawn_command(command) {
@@ -2614,11 +3151,10 @@ fn spawn_terminal(
     )?;
     let mut reader = pty.master.try_clone_reader()?;
     let writer = Arc::new(SyncMutex::new(pty.master.take_writer()?));
-    let claude_token_path = if provider == Provider::ClaudeCode {
-        Some(PathBuf::from(env::var("CLAUDE_CONFIG_DIR")?).join("setup-token.json"))
-    } else {
-        None
-    };
+    // Claude Code prints its token instead of writing a file, so the BRIDGE
+    // captures it here and stores it itself; the CLI is never told where the
+    // account's credential lives.
+    let claude_token_sink = (provider == Provider::ClaudeCode).then(|| state.clone());
     let reader_thread = std::thread::spawn(move || {
         let mut buf = [0_u8; 4096];
         let mut startup = String::new();
@@ -2638,7 +3174,7 @@ fn spawn_terminal(
                         startup.drain(..boundary);
                     }
                     let plain = terminal_plain_text(&startup);
-                    if claude_token_path.is_some() {
+                    if claude_token_sink.is_some() {
                         for candidate in plain.split_whitespace() {
                             if (candidate.starts_with("https://claude.ai/oauth/")
                                 || candidate.starts_with("https://console.anthropic.com/oauth/"))
@@ -2659,10 +3195,10 @@ fn spawn_terminal(
                 }
             }
         }
-        if let Some(path) = claude_token_path {
+        if let Some(state) = claude_token_sink {
             let result = extract_claude_token(&terminal_plain_text(&startup))
                 .ok_or_else(|| anyhow!("Claude did not return a complete subscription token"))
-                .and_then(|token| store_claude_token(&path, &token));
+                .and_then(|token| store_claude_token(&state, &token));
             let text = if result.is_ok() {
                 "Claude subscription token saved privately. Authentication complete.\n"
             } else {
@@ -2903,16 +3439,12 @@ mod tests {
     use super::*;
 
     fn account_fixture(root: &Path) -> AppState {
-        std::fs::create_dir_all(root.join("codex")).unwrap();
-        std::fs::write(
-            root.join("codex/auth.json"),
-            br#"{"tokens":{"account_id":"synthetic","refresh_token":"first"}}"#,
-        )
-        .unwrap();
+        credentials::prepare(root).unwrap();
+        credentials::write(&credentials::root(root), Provider::Codex, FIRST).unwrap();
         AppState {
             bridge_token: Arc::new("a".repeat(64)),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            lease: Arc::new(Mutex::new(None)),
+            login_flow: Arc::new(Mutex::new(None)),
             provider: Provider::Codex,
             data_dir: root.to_path_buf(),
             state_file: root.join("sessions.json"),
@@ -2921,6 +3453,7 @@ mod tests {
             sandbox: Arc::new(SyncMutex::new(None)),
             probe: Arc::new(Mutex::new(ProbeCache::default())),
             probe_lock: Arc::new(Mutex::new(())),
+            login_home: Arc::new(Mutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             processes: Arc::new(process::Registry::new(root).unwrap()),
         }
@@ -3093,29 +3626,37 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_proof_blocks_further_account_processes() {
-        let temporary=tempfile::tempdir().unwrap();
-        let state=account_fixture(temporary.path());
-        let proof=shutdown_runtime(State(state.clone())).await.unwrap().0;
-        assert_eq!(proof["process_state"],"reaped");
-        assert_eq!(proof["bridge_pid"],std::process::id());
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let proof = shutdown_runtime(State(state.clone())).await.unwrap().0;
+        assert_eq!(proof["process_state"], "reaped");
+        assert_eq!(proof["bridge_pid"], std::process::id());
         assert!(transfer::available(&state).is_err());
         assert!(ensure_idle_runtime(&state).is_err());
-        let _=shutdown_runtime(State(state)).await.unwrap();
+        let _ = shutdown_runtime(State(state)).await.unwrap();
     }
 
     #[tokio::test]
     async fn closing_a_pending_client_session_prevents_its_delayed_start() {
-        let temporary=tempfile::tempdir().unwrap();
-        let state=account_fixture(temporary.path());
-        let id=uuid::Uuid::new_v4().to_string();
-        let closed=close_session(State(state.clone()),AxumPath(id.clone())).await.unwrap().0;
-        assert_eq!(closed["process_state"],"reaped");
-        let req:CreateSession=serde_json::from_value(json!({"session_id":id,"workspace_authorized":true,"workspace":temporary.path()})).unwrap();
-        assert!(create_session(State(state.clone()),Json(req)).await.is_err());
-        assert!(state.lease.lock().await.is_none());
-        let persisted:Value=serde_json::from_slice(&std::fs::read(&state.state_file).unwrap()).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let id = uuid::Uuid::new_v4().to_string();
+        let closed = close_session(State(state.clone()), AxumPath(id.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(closed["process_state"], "reaped");
+        let req: CreateSession = serde_json::from_value(
+            json!({"session_id":id,"workspace_authorized":true,"workspace":temporary.path()}),
+        )
+        .unwrap();
+        assert!(create_session(State(state.clone()), Json(req))
+            .await
+            .is_err());
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(&state.state_file).unwrap()).unwrap();
         assert!(persisted.to_string().contains(&id));
-        assert_eq!(state.sessions.lock().await[&id].meta.status,"closed");
+        assert_eq!(state.sessions.lock().await[&id].meta.status, "closed");
     }
 
     #[tokio::test]
@@ -3124,69 +3665,836 @@ mod tests {
         let state = account_fixture(temporary.path());
         let id = uuid::Uuid::new_v4().to_string();
         let request = json!({"transfer_id":id,"manifest":{"account_id":"test-account"}});
-        let first = transfer::freeze(State(state.clone()), Json(request.clone())).await.unwrap().0;
-        let second = transfer::freeze(State(state.clone()), Json(request.clone())).await.unwrap().0;
+        let first = transfer::freeze(State(state.clone()), Json(request.clone()))
+            .await
+            .unwrap()
+            .0;
+        let second = transfer::freeze(State(state.clone()), Json(request.clone()))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(first, second);
         assert!(transfer::available(&state).is_err());
-        let _ = transfer::retire(State(state.clone()), Json(json!({"transfer_id":id}))).await.unwrap();
-        let _ = transfer::retire(State(state.clone()), Json(json!({"transfer_id":id}))).await.unwrap();
-        assert!(transfer::freeze(State(state.clone()), Json(request)).await.is_err());
-        assert!(transfer::activate(State(state.clone()), Json(json!({"transfer_id":id}))).await.is_err());
+        let _ = transfer::retire(State(state.clone()), Json(json!({"transfer_id":id})))
+            .await
+            .unwrap();
+        let _ = transfer::retire(State(state.clone()), Json(json!({"transfer_id":id})))
+            .await
+            .unwrap();
+        assert!(transfer::freeze(State(state.clone()), Json(request))
+            .await
+            .is_err());
+        assert!(
+            transfer::activate(State(state.clone()), Json(json!({"transfer_id":id})))
+                .await
+                .is_err()
+        );
         assert!(transfer::available(&state).is_err());
-        transfer::write_private(&temporary.path().join("transfer.json"), &json!({"transfer_id":id,"phase":"target_staged"})).unwrap();
-        let _ = transfer::activate(State(state.clone()), Json(json!({"transfer_id":id}))).await.unwrap();
-        let _ = transfer::activate(State(state.clone()), Json(json!({"transfer_id":id}))).await.unwrap();
+        transfer::write_private(
+            &temporary.path().join("transfer.json"),
+            &json!({"transfer_id":id,"phase":"target_staged"}),
+        )
+        .unwrap();
+        let _ = transfer::activate(State(state.clone()), Json(json!({"transfer_id":id})))
+            .await
+            .unwrap();
+        let _ = transfer::activate(State(state.clone()), Json(json!({"transfer_id":id})))
+            .await
+            .unwrap();
         assert!(transfer::available(&state).is_ok());
     }
 
+    fn env_value(env: &[(String, String)], name: &str) -> String {
+        env.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("{name} is missing from the session environment"))
+    }
+
+    const FIRST: &[u8] = br#"{"tokens":{"account_id":"synthetic","refresh_token":"first"}}"#;
+    const ROTATED: &[u8] = br#"{"tokens":{"account_id":"synthetic","refresh_token":"rotated"}}"#;
+    const FOREIGN: &[u8] = br#"{"tokens":{"account_id":"someone-else","refresh_token":"theirs"}}"#;
+
+    /// A session record the way the map holds one while its CLI runs.
+    async fn insert_open_session(state: &AppState, profile_id: &str, baseline: Option<String>) {
+        state.sessions.lock().await.insert(
+            profile_id.to_string(),
+            Session {
+                meta: SessionMeta {
+                    id: profile_id.to_string(),
+                    vendor_session_id: "vendor".into(),
+                    workspace: state.data_dir.to_string_lossy().into_owned(),
+                    status: "idle".into(),
+                    model: None,
+                    profile_id: Some(profile_id.to_string()),
+                    login_completed: None,
+                    request_hash: None,
+                    credential_sha256: baseline.clone(),
+                    credential_reported: baseline,
+                    created_at_ms: now_ms(),
+                },
+                runtime: None,
+                events: Arc::new(SyncMutex::new(Vec::new())),
+            },
+        );
+    }
+
+    fn canonical_credential(state: &AppState) -> Vec<u8> {
+        credentials::read(&credentials::root(&state.data_dir), state.provider)
+            .unwrap()
+            .expect("the account has a credential")
+    }
+
+    fn private_credential(state: &AppState, profile_id: &str) -> Vec<u8> {
+        let profile = session_profile_root(state, profile_id).unwrap();
+        credentials::read(&profile, state.provider)
+            .unwrap()
+            .expect("the session has its own copy")
+    }
+
+    /// The product rule, as a test: one account, two sessions at once, and
+    /// nothing of one reaches the other. Each gets its OWN copy of the account's
+    /// credential — the canonical one is not shared, not referenced and not in
+    /// the profile at all, because everything a session can write is written by
+    /// the code it runs.
+    #[cfg(unix)]
     #[test]
-    fn session_profiles_keep_history_and_unverified_refresh_out_of_the_account() {
+    fn two_sessions_of_one_account_are_separate_down_to_the_credential() {
         let temporary = tempfile::tempdir().unwrap();
         let state = account_fixture(temporary.path());
-        std::fs::write(
-            temporary.path().join("codex/history.jsonl"),
-            "other actor history",
-        )
-        .unwrap();
+        let first_id = uuid::Uuid::new_v4().to_string();
+        let second_id = uuid::Uuid::new_v4().to_string();
+        let first = prepare_session_profile(&state, &first_id).unwrap();
+        let second = prepare_session_profile(&state, &second_id).unwrap();
+        let first_root = session_profile_root(&state, &first_id).unwrap();
+        let second_root = session_profile_root(&state, &second_id).unwrap();
+        assert_ne!(first_root, second_root);
+        assert_eq!(first.credential_sha256, second.credential_sha256);
+        assert_eq!(first.credential_sha256, Some(credentials::digest(FIRST)));
+
+        for name in [
+            "HOME",
+            "TMPDIR",
+            "CODEX_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "TENTAFLOW_AGENT_PRIVATE_ROOT",
+        ] {
+            let mine = env_value(&first.env, name);
+            assert_ne!(
+                mine,
+                env_value(&second.env, name),
+                "{name} is shared between two sessions"
+            );
+            assert!(Path::new(&mine).starts_with(&first_root), "{name} escaped");
+        }
+
+        // History is written where only its own session can read it.
+        std::fs::write(first_root.join("codex/history.jsonl"), "private history").unwrap();
+        assert!(!second_root.join("codex/history.jsonl").exists());
+
+        // Two copies of the same material, and neither is a link to the account's.
+        for root in [&first_root, &second_root] {
+            let credential = root.join(credentials::relative(Provider::Codex));
+            let metadata = std::fs::symlink_metadata(&credential).unwrap();
+            assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+            assert_eq!(std::fs::read(&credential).unwrap(), FIRST);
+        }
+
+        // What one session does to its own copy stays in that session until the
+        // bridge decides otherwise.
+        credentials::write(&first_root, Provider::Codex, ROTATED).unwrap();
+        assert_eq!(private_credential(&state, &second_id), FIRST);
+        assert_eq!(canonical_credential(&state), FIRST);
+    }
+
+    /// Closing one session is not an account-wide event: the other one keeps its
+    /// profile and its credential.
+    #[cfg(unix)]
+    #[test]
+    fn closing_one_session_leaves_the_other_untouched() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
         let first = uuid::Uuid::new_v4().to_string();
         let second = uuid::Uuid::new_v4().to_string();
         prepare_session_profile(&state, &first).unwrap();
-        let first_root = session_profile_root(&state, &first).unwrap();
-        assert!(!first_root.join("codex/history.jsonl").exists());
-        std::fs::write(
-            first_root.join("codex/history.jsonl"),
-            "first actor private history",
-        )
-        .unwrap();
-        std::fs::write(
-            first_root.join("codex/auth.json"),
-            br#"{"tokens":{"account_id":"synthetic","refresh_token":"refreshed"}}"#,
-        )
-        .unwrap();
         prepare_session_profile(&state, &second).unwrap();
-        reconcile_session_credential(&state, &first).unwrap();
-        let second_root = session_profile_root(&state, &second).unwrap();
-        assert!(!second_root.join("codex/history.jsonl").exists());
-        assert!(std::fs::read_to_string(second_root.join("codex/auth.json"))
+
+        rollback_session_start(&state, Some(&first), true).unwrap();
+        assert!(!session_profile_root(&state, &first).unwrap().exists());
+        assert_eq!(private_credential(&state, &second), FIRST);
+        assert_eq!(canonical_credential(&state), FIRST);
+    }
+
+    /// A refresh the provider wrote into a session's own copy is handed back to
+    /// the account, reported as a HASH, and given to the sessions running beside
+    /// it — but only because the material still names the same provider account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotation_is_published_once_and_reaches_the_other_sessions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let mine = uuid::Uuid::new_v4().to_string();
+        let sibling = uuid::Uuid::new_v4().to_string();
+        let baseline = prepare_session_profile(&state, &mine)
             .unwrap()
-            .contains("first"));
+            .credential_sha256;
+        prepare_session_profile(&state, &sibling).unwrap();
+        insert_open_session(&state, &sibling, baseline.clone()).await;
+        let events = Arc::new(SyncMutex::new(Vec::new()));
+
         assert!(
-            std::fs::read_to_string(temporary.path().join("pending-credential.json"))
+            settle_session_credential(&state, &mine, (baseline.clone(), baseline.clone()), &events)
+                .await
                 .unwrap()
-                .contains("refreshed")
+                .is_none(),
+            "an unchanged credential is not an event"
         );
-        assert!(prepare_session_profile(&state, &uuid::Uuid::new_v4().to_string()).is_err());
-        assert_ne!(first_root, second_root);
-        std::fs::write(
-            first_root.join("codex/auth.json"),
-            br#"{"tokens":{"account_id":"another","refresh_token":"foreign"}}"#,
+        assert!(events.lock().is_empty());
+
+        credentials::write(
+            &session_profile_root(&state, &mine).unwrap(),
+            Provider::Codex,
+            ROTATED,
         )
         .unwrap();
-        reconcile_session_credential(&state, &first).unwrap();
-        assert!(
-            !std::fs::read_to_string(temporary.path().join("codex/auth.json"))
+        let update =
+            settle_session_credential(&state, &mine, (baseline.clone(), baseline.clone()), &events)
+                .await
                 .unwrap()
-                .contains("foreign")
+                .expect("the rotation is settled");
+        let rotated = credentials::digest(ROTATED);
+        assert_eq!(update.baseline.as_deref(), Some(rotated.as_str()));
+        assert_eq!(canonical_credential(&state), ROTATED);
+
+        let event = events.lock().first().cloned().expect("one event");
+        assert_eq!(event.kind, "credential_changed");
+        assert_eq!(event.data["sha256"], json!(rotated));
+        assert!(
+            !event.data.to_string().contains("rotated"),
+            "the credential material must never reach the event stream"
+        );
+
+        // The session running beside it is given the new token instead of being
+        // left with one the provider has retired.
+        assert_eq!(private_credential(&state, &sibling), ROTATED);
+        let sessions = state.sessions.lock().await;
+        assert_eq!(
+            sessions[&sibling].meta.credential_sha256.as_deref(),
+            Some(rotated.as_str())
+        );
+        drop(sessions);
+
+        assert!(
+            settle_session_credential(&state, &mine, (update.baseline, update.reported), &events)
+                .await
+                .unwrap()
+                .is_none(),
+            "the same rotation must not be reported twice"
+        );
+        assert_eq!(events.lock().len(), 1);
+    }
+
+    /// The gate a session's credential has to pass, from the bridge's side: a
+    /// FOREIGN provider identity is refused — planting one would hand every
+    /// other user of this account to somebody else — and a session that ran
+    /// through a rotation it never saw cannot put its older token back.
+    ///
+    /// A refusal is reported with its reason, once, and the account's credential
+    /// does not move.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_foreign_or_stale_credential_never_becomes_the_accounts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let id = uuid::Uuid::new_v4().to_string();
+        let baseline = prepare_session_profile(&state, &id)
+            .unwrap()
+            .credential_sha256;
+        let profile = session_profile_root(&state, &id).unwrap();
+        let events = Arc::new(SyncMutex::new(Vec::new()));
+
+        credentials::write(&profile, Provider::Codex, FOREIGN).unwrap();
+        let update =
+            settle_session_credential(&state, &id, (baseline.clone(), baseline.clone()), &events)
+                .await
+                .unwrap()
+                .expect("a refusal is recorded");
+        assert_eq!(update.baseline, baseline, "the baseline is not moved");
+        assert_eq!(canonical_credential(&state), FIRST);
+        let event = events.lock().first().cloned().expect("one event");
+        assert_eq!(event.kind, "credential_rejected");
+        assert_eq!(event.data["reason"], json!("identity_mismatch"));
+        assert!(!event.data.to_string().contains("theirs"));
+
+        // Reported once: a copy that was refused is not re-examined every poll.
+        assert!(settle_session_credential(
+            &state,
+            &id,
+            (update.baseline.clone(), update.reported.clone()),
+            &events
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(events.lock().len(), 1);
+
+        // The account rotated elsewhere while this session held its own
+        // refresh: the session's material is newer than what it started from,
+        // but the account has moved on, and a late publication would put a
+        // retired token back.
+        credentials::write(
+            &credentials::root(&state.data_dir),
+            Provider::Codex,
+            ROTATED,
+        )
+        .unwrap();
+        let mine = br#"{"tokens":{"account_id":"synthetic","refresh_token":"mine"}}"#;
+        credentials::write(&profile, Provider::Codex, mine).unwrap();
+        settle_session_credential(&state, &id, (baseline, None), &events)
+            .await
+            .unwrap()
+            .expect("a refusal is recorded");
+        assert_eq!(canonical_credential(&state), ROTATED);
+        let event = events.lock().last().cloned().expect("a second event");
+        assert_eq!(event.kind, "credential_rejected");
+        assert_eq!(event.data["reason"], json!("stale_baseline"));
+    }
+
+    /// Closing a sign-in and a probe that is polling for one are the two things
+    /// that touch the login home, and the end of a sign-in is the moment its
+    /// result exists only there.
+    ///
+    /// Leasing the home materializes the canonical credential into it. A probe
+    /// that won the lease between "no sign-in is running any more" and "the
+    /// sign-in's result has been published" therefore wrote the OLD credential
+    /// over the new one, and the settle that followed found nothing to publish:
+    /// the sign-in was silently lost. Whenever the probe gets the home, the
+    /// publication has already happened — so it sees the new credential and
+    /// cannot overwrite it with the old one.
+    /// The window is a few instructions wide, so it is not raced for: the test
+    /// takes the home first and then watches what the close does with the flag
+    /// while it waits — which is the whole of the ordering the fix is about.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_probe_polling_through_the_end_of_a_sign_in_cannot_lose_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let flow = "auth-1".to_string();
+        *state.login_flow.lock().await = Some(flow.clone());
+        insert_open_session(&state, &flow, None).await;
+        state
+            .sessions
+            .lock()
+            .await
+            .get_mut(&flow)
+            .expect("the sign-in session")
+            .meta
+            .profile_id = None;
+
+        // What the CLI left in the bridge's private home when the person
+        // finished at the provider. Until it is published it exists nowhere
+        // else, and leasing the home copies the canonical credential over it.
+        let signed_in = br#"{"tokens":{"account_id":"acct-new","refresh_token":"fresh"}}"#;
+        credentials::write(
+            &credentials::login_root(temporary.path()),
+            Provider::Codex,
+            signed_in,
+        )
+        .unwrap();
+
+        // Somebody holds the home, so the close has to wait for it. Only the
+        // lock is taken here, not a probe's lease: a probe's first act is to
+        // materialize the canonical credential into the home, which is the very
+        // damage under test, and doing it from the test would destroy the
+        // sign-in's result before the close ever ran.
+        let held = state.login_home.clone().lock_owned().await;
+        let closing = tokio::spawn(close_session(State(state.clone()), AxumPath(flow.clone())));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Ok(claim) = state.login_flow.try_lock() {
+            assert!(
+                claim.is_some(),
+                "the sign-in gave up its claim before it held the home: a probe that leased in \
+                 that window materializes the OLD credential over the one the CLI just wrote, \
+                 and the settle that follows finds nothing to publish"
+            );
+        }
+        drop(held);
+
+        let Json(closed) = closing
+            .await
+            .expect("close task")
+            .expect("the sign-in closes");
+        assert_eq!(closed["closed"], json!(true));
+        assert_eq!(
+            canonical_credential(&state),
+            signed_in,
+            "the sign-in's result was lost"
+        );
+
+        // And the next probe runs on what the sign-in produced.
+        let after = login_home(&state).await.expect("the home is free again");
+        assert_eq!(
+            credentials::read(&credentials::login_root(&state.data_dir), state.provider)
+                .unwrap()
+                .expect("a credential is materialized"),
+            signed_in
+        );
+        drop(after);
+    }
+
+    /// A copy the bridge may not read is reported ONCE, over the route that
+    /// actually reports it.
+    ///
+    /// `list_events` is the poll Core makes while a turn runs — a second or two
+    /// apart — and it is what stores whatever the settle hands back. A refusal
+    /// with no digest used to store an empty string, which matched nothing on
+    /// the next poll, so the same refusal was raised again for the life of the
+    /// session: an audit row and an unindexed audit scan in Core every time.
+    /// Driving the handler is the only way to see what is really stored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_session_copy_is_reported_once_across_polls() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let id = uuid::Uuid::new_v4().to_string();
+        let baseline = prepare_session_profile(&state, &id)
+            .unwrap()
+            .credential_sha256;
+        insert_open_session(&state, &id, baseline).await;
+
+        // What an untrusted session can do to its own copy: point it at a file
+        // of its choosing. The bridge refuses to follow it, and the condition
+        // lasts as long as the session does.
+        let profile = session_profile_root(&state, &id).unwrap();
+        let elsewhere = temporary.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, FOREIGN).unwrap();
+        let copy = profile.join(credentials::relative(Provider::Codex));
+        std::fs::remove_file(&copy).ok();
+        std::os::unix::fs::symlink(&elsewhere, &copy).unwrap();
+
+        let poll = || {
+            list_events(
+                State(state.clone()),
+                AxumPath(id.clone()),
+                Query(EventQuery { after_seq: 0 }),
+            )
+        };
+        for _ in 0..3 {
+            let Json(answer) = poll().await.expect("the poll answers");
+            let refusals = answer["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .filter(|event| event["kind"] == json!("credential_rejected"))
+                .count();
+            assert_eq!(refusals, 1, "the refusal was reported again: {answer}");
+        }
+        let stored = state.sessions.lock().await[&id]
+            .meta
+            .credential_reported
+            .clone();
+        assert_eq!(
+            stored.as_deref(),
+            Some(credentials::UNSAFE_FILE_MARKER),
+            "the session must carry something that silences the repeat"
+        );
+        assert_eq!(canonical_credential(&state), FIRST);
+    }
+
+    /// A sign-in writes into the bridge's own login home — the one directory a
+    /// CLI may create this account's credential in — and the bridge extracts it
+    /// from there. Sessions still holding the previous token are given the new
+    /// one; a session that changed its own copy keeps it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sign_in_lands_in_the_bridges_own_home_and_reaches_the_sessions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let untouched = uuid::Uuid::new_v4().to_string();
+        let diverged = uuid::Uuid::new_v4().to_string();
+        let baseline = prepare_session_profile(&state, &untouched)
+            .unwrap()
+            .credential_sha256;
+        prepare_session_profile(&state, &diverged).unwrap();
+        insert_open_session(&state, &untouched, baseline.clone()).await;
+        insert_open_session(&state, &diverged, baseline).await;
+        credentials::write(
+            &session_profile_root(&state, &diverged).unwrap(),
+            Provider::Codex,
+            ROTATED,
+        )
+        .unwrap();
+
+        // What a sign-in's lease gives it: the bridge's login home, with the
+        // account's current credential copied in, and nothing that names the
+        // canonical directory.
+        let leased = lease_login_home(&state, credentials::LoginOrigin::SignIn)
+            .await
+            .unwrap();
+        let home = PathBuf::from(env_value(leased.env(), "CODEX_HOME"));
+        assert!(home.starts_with(credentials::login_root(temporary.path())));
+        assert!(!home.starts_with(credentials::root(temporary.path())));
+        assert_eq!(
+            credentials::read(&credentials::login_root(temporary.path()), Provider::Codex)
+                .unwrap()
+                .unwrap(),
+            FIRST
+        );
+
+        // The sign-in replaces it, exactly as a vendor CLI would.
+        let signed_in = br#"{"tokens":{"account_id":"after-login","refresh_token":"new"}}"#;
+        credentials::write(
+            &credentials::login_root(temporary.path()),
+            Provider::Codex,
+            signed_in,
+        )
+        .unwrap();
+        settle_login_credential(&state, &leased).await.unwrap();
+
+        assert_eq!(canonical_credential(&state), signed_in);
+        assert_eq!(
+            private_credential(&state, &untouched),
+            signed_in,
+            "a session still holding the old token is given the new one"
+        );
+        assert_eq!(
+            private_credential(&state, &diverged),
+            ROTATED,
+            "a session that changed its own copy is never overwritten"
+        );
+    }
+
+    /// Materialization from Core's side: Core hands over the account's stored
+    /// credential, the bridge makes it canonical and hands it to the sessions
+    /// holding the previous one, and reading it back returns the same bytes with
+    /// the identity the material names. Core is the trust root of the pair, so
+    /// this is the one route that carries material INTO the account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn core_materializes_the_accounts_credential_and_reads_it_back() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let open = uuid::Uuid::new_v4().to_string();
+        let baseline = prepare_session_profile(&state, &open)
+            .unwrap()
+            .credential_sha256;
+        insert_open_session(&state, &open, baseline).await;
+        let material = String::from_utf8(ROTATED.to_vec()).unwrap();
+
+        let Json(written) = write_account_credential(
+            State(state.clone()),
+            Json(CredentialRequest {
+                material: material.clone(),
+            }),
+        )
+        .await
+        .expect("the credential is installed");
+        assert_eq!(written["applied"], json!(true));
+        assert_eq!(written["sha256"], json!(credentials::digest(ROTATED)));
+        assert_eq!(canonical_credential(&state), ROTATED);
+        assert_eq!(
+            private_credential(&state, &open),
+            ROTATED,
+            "a session still on the previous token is given the materialized one"
+        );
+
+        let Json(held) = read_account_credential(State(state.clone()))
+            .await
+            .expect("the credential reads back");
+        assert_eq!(held["present"], json!(true));
+        assert_eq!(held["material"], json!(material));
+        assert_eq!(held["sha256"], written["sha256"]);
+        assert_eq!(held["identity"], json!("account:synthetic"));
+
+        // The same bytes again are not a rotation: re-writing them would fan a
+        // credential nobody changed out to every live session.
+        let Json(replay) =
+            write_account_credential(State(state.clone()), Json(CredentialRequest { material }))
+                .await
+                .unwrap();
+        assert_eq!(replay["applied"], json!(false));
+
+        // A document that authenticates nobody never replaces a working one.
+        for refused in ["{}", "not json", ""] {
+            assert!(
+                write_account_credential(
+                    State(state.clone()),
+                    Json(CredentialRequest {
+                        material: refused.to_string(),
+                    }),
+                )
+                .await
+                .is_err(),
+                "{refused:?} must not become the account's credential"
+            );
+        }
+
+        // A sign-in owns the credential while it runs: overwriting underneath it
+        // would make it finish onto material nobody asked for.
+        *state.login_flow.lock().await = Some("auth-1".to_string());
+        let error = write_account_credential(
+            State(state.clone()),
+            Json(CredentialRequest {
+                material: String::from_utf8(FIRST.to_vec()).unwrap(),
+            }),
+        )
+        .await
+        .expect_err("a sign-in in flight wins");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("login_in_progress"), "{}", error.1);
+        assert_eq!(canonical_credential(&state), ROTATED);
+    }
+
+    /// The account's canonical credential is not in the sandbox policy of a
+    /// session — for any of the four engines. This asserts the REAL policy the
+    /// platform's sandbox is given: the bwrap argv on Linux, the Seatbelt profile
+    /// carried inline in the argv on macOS.
+    #[cfg(unix)]
+    #[test]
+    fn no_engines_session_policy_names_the_accounts_credential() {
+        let mine = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        let workspace = mine.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        account_fixture(mine.path());
+        account_fixture(theirs.path());
+        let canonical = std::fs::canonicalize(credentials::root(mine.path())).unwrap();
+        let login = std::fs::canonicalize(credentials::login_root(mine.path())).unwrap();
+
+        for provider in [
+            Provider::Codex,
+            Provider::ClaudeCode,
+            Provider::MuseCode,
+            Provider::GrokBuild,
+        ] {
+            let mut state = account_fixture(mine.path());
+            state.provider = provider;
+            let material = if provider == Provider::ClaudeCode {
+                format!(r#"{{"oauth_token":"sk-ant-oat01-{}"}}"#, "x".repeat(96)).into_bytes()
+            } else {
+                FIRST.to_vec()
+            };
+            credentials::write(&credentials::root(mine.path()), provider, &material).unwrap();
+            let id = uuid::Uuid::new_v4().to_string();
+            let env = prepare_session_profile(&state, &id).unwrap().env;
+            let roots = profile_write_roots(&env);
+            assert!(
+                !roots.iter().any(|root| root.starts_with(&canonical)
+                    || root.starts_with(&login)
+                    || root.starts_with(theirs.path())),
+                "{provider:?} would be given a directory it must not have: {roots:?}"
+            );
+
+            let private = PathBuf::from(env_value(&env, "TENTAFLOW_AGENT_PRIVATE_ROOT"));
+            let policy =
+                process_sandbox::ProcessSandbox::new(&workspace, &private, false, &[], &roots)
+                    .expect("this host has the managed sandbox these tests measure");
+            let argv = policy
+                .wrap(
+                    &["/bin/echo".to_string(), "sandboxed".to_string()],
+                    &workspace,
+                )
+                .expect("a policy is produced");
+            let policy_text = argv.join("\u{1}");
+            for forbidden in [&canonical, &login, &theirs.path().to_path_buf()] {
+                assert!(
+                    !policy_text.contains(&forbidden.to_string_lossy().into_owned()),
+                    "{provider:?} sandbox policy names {}",
+                    forbidden.display()
+                );
+            }
+            // The session's own profile IS in it — otherwise the assertion above
+            // would pass on an empty policy.
+            assert!(policy_text.contains(&private.to_string_lossy().into_owned()));
+        }
+    }
+
+    /// The policy, executed. A real sandboxed process is told exactly where the
+    /// account's credential is and still cannot read it, cannot list its
+    /// directory and cannot write over it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_sandboxed_process_cannot_reach_the_accounts_credential() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let env = prepare_session_profile(&state, &id).unwrap().env;
+        let private = PathBuf::from(env_value(&env, "TENTAFLOW_AGENT_PRIVATE_ROOT"));
+        let canonical = std::fs::canonicalize(credentials::root(temporary.path())).unwrap();
+        let credential = canonical.join(credentials::relative(Provider::Codex));
+        let policy = process_sandbox::ProcessSandbox::new(
+            &workspace,
+            &private,
+            false,
+            &[],
+            &profile_write_roots(&env),
+        )
+        .expect("this host has bwrap");
+
+        let run = |argv: Vec<String>| {
+            let wrapped = policy
+                .wrap(&argv, &workspace)
+                .expect("a policy is produced");
+            std::process::Command::new(&wrapped[0])
+                .args(&wrapped[1..])
+                .current_dir(&workspace)
+                .output()
+                .expect("the sandbox runs")
+        };
+        let read = run(vec![
+            "/bin/cat".into(),
+            credential.to_string_lossy().into_owned(),
+        ]);
+        assert!(
+            !read.status.success(),
+            "a session read the account credential: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&read.stdout).contains("refresh_token"),
+            "credential material crossed the sandbox boundary"
+        );
+        let list = run(vec![
+            "/bin/ls".into(),
+            canonical.to_string_lossy().into_owned(),
+        ]);
+        assert!(
+            !list.status.success(),
+            "a session listed the credential directory: {}",
+            String::from_utf8_lossy(&list.stdout)
+        );
+        let write = run(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("echo planted > {}", credential.display()),
+        ]);
+        assert!(
+            !write.status.success(),
+            "a session wrote the account credential: {}",
+            String::from_utf8_lossy(&write.stderr)
+        );
+        assert_eq!(
+            canonical_credential(&state),
+            FIRST,
+            "the account's credential is exactly what it was"
+        );
+        // The session's own copy is reachable: the policy is not simply empty.
+        let own = run(vec![
+            "/bin/cat".into(),
+            private
+                .join(credentials::relative(Provider::Codex))
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+        assert!(own.status.success());
+    }
+
+    /// Sessions do not gate each other, and they do not gate a sign-in: only
+    /// another sign-in does. A relocation still needs an idle account, so it
+    /// asks the sessions rather than a lease.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_blocks_no_other_session_and_no_login() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let open = uuid::Uuid::new_v4().to_string();
+        state.sessions.lock().await.insert(
+            open.clone(),
+            Session {
+                meta: SessionMeta {
+                    id: open.clone(),
+                    vendor_session_id: "vendor".into(),
+                    workspace: temporary.path().to_string_lossy().into_owned(),
+                    status: "idle".into(),
+                    model: None,
+                    profile_id: None,
+                    login_completed: None,
+                    request_hash: None,
+                    credential_sha256: None,
+                    credential_reported: None,
+                    created_at_ms: now_ms(),
+                },
+                runtime: None,
+                events: Arc::new(SyncMutex::new(Vec::new())),
+            },
+        );
+
+        // Both of these fail on this host — it has no managed execution policy —
+        // but neither may fail because the account is already in use.
+        let refusal = |error: ApiError| error.1;
+        let request: CreateSession = serde_json::from_value(
+            json!({"session_id": uuid::Uuid::new_v4().to_string(), "workspace_authorized": true, "workspace": temporary.path()}),
+        )
+        .unwrap();
+        let second = create_session(State(state.clone()), Json(request))
+            .await
+            .map(|_| String::new())
+            .unwrap_or_else(refusal);
+        assert!(
+            !second.contains("account_busy"),
+            "a second session was refused: {second}"
+        );
+        let login = auth_start(State(state.clone()))
+            .await
+            .map(|_| String::new())
+            .unwrap_or_else(refusal);
+        assert!(
+            !login.contains("account_busy") && !login.contains("login_in_progress"),
+            "a session blocked a sign-in: {login}"
+        );
+
+        // A sign-in already in flight is the one thing that refuses a sign-in.
+        *state.login_flow.lock().await = Some("auth-1".to_string());
+        assert!(auth_start(State(state.clone()))
+            .await
+            .unwrap_err()
+            .1
+            .contains("login_in_progress"));
+        *state.login_flow.lock().await = None;
+
+        let moving = transfer::freeze(
+            State(state.clone()),
+            Json(json!({"transfer_id": uuid::Uuid::new_v4().to_string(), "manifest": {}})),
+        )
+        .await
+        .map(|_| String::new())
+        .unwrap_or_else(refusal);
+        assert!(
+            moving.contains("account_busy"),
+            "a move must still require an idle account: {moving}"
+        );
+    }
+
+    /// Two live sessions may share an account; they may not share one vendor
+    /// profile. Two CLIs on the same private profile would write the same
+    /// session files, history and lock files, and each would corrupt the other's
+    /// state — so resuming a session that is still open is refused by name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_live_sessions_never_share_one_vendor_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let profile_id = uuid::Uuid::new_v4().to_string();
+        prepare_session_profile(&state, &profile_id).unwrap();
+        insert_open_session(&state, &profile_id, None).await;
+
+        let request: CreateSession = serde_json::from_value(json!({
+            "session_id": uuid::Uuid::new_v4().to_string(),
+            "workspace_authorized": true,
+            "workspace": temporary.path(),
+            "resume_vendor_session_id": "vendor",
+        }))
+        .unwrap();
+        let refused = create_session(State(state.clone()), Json(request))
+            .await
+            .map(|_| String::new())
+            .unwrap_or_else(|error| error.1);
+        assert!(
+            refused.contains("profile_in_use"),
+            "a second CLI was allowed onto one vendor profile: {refused}"
         );
     }
 
@@ -3201,85 +4509,87 @@ mod tests {
         assert_eq!(extract_claude_token(&output), Some(token.clone()));
         assert!(extract_claude_token("sk-ant-oat01-incomplete").is_none());
         let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("setup-token.json");
-        store_claude_token(&path, &token).unwrap();
-        assert_eq!(read_claude_token(&path).unwrap(), token);
+        let mut state = account_fixture(temporary.path());
+        state.provider = Provider::ClaudeCode;
+        store_claude_token(&state, &token).unwrap();
+        assert_eq!(read_claude_token(&state).unwrap(), token);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let path = credentials::root(temporary.path())
+                .join(credentials::relative(Provider::ClaudeCode));
             assert_eq!(
                 std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
         }
-    }
-
-    #[test]
-    fn failed_session_start_preserves_refresh_and_removes_its_lease_marker() {
-        let temporary = tempfile::tempdir().unwrap();
-        let state = account_fixture(temporary.path());
+        // A Claude session carries the token in its environment and holds no
+        // credential file at all, so there is nothing for it to publish.
         let id = uuid::Uuid::new_v4().to_string();
-        prepare_session_profile(&state, &id).unwrap();
-        std::fs::write(temporary.path().join("active-profile"), &id).unwrap();
-        let profile = session_profile_root(&state, &id).unwrap();
-        std::fs::write(
-            profile.join("codex/auth.json"),
-            br#"{"tokens":{"account_id":"synthetic","refresh_token":"after-failed-start"}}"#,
-        )
-        .unwrap();
-        rollback_session_start(&state, Some(&id), true).unwrap();
-        assert!(!temporary.path().join("active-profile").exists());
-        assert!(!profile.exists());
-        assert!(
-            std::fs::read_to_string(temporary.path().join("pending-credential.json"))
-                .unwrap()
-                .contains("after-failed-start")
-        );
-        assert!(
-            std::fs::read_to_string(temporary.path().join("codex/auth.json"))
-                .unwrap()
-                .contains("first")
-        );
-        assert!(prepare_session_profile(&state, &uuid::Uuid::new_v4().to_string()).is_err());
+        let profile = prepare_session_profile(&state, &id).unwrap();
+        assert_eq!(profile.credential_sha256, None);
+        assert_eq!(env_value(&profile.env, "CLAUDE_CODE_OAUTH_TOKEN"), token);
+        assert!(!session_profile_root(&state, &id)
+            .unwrap()
+            .join(credentials::relative(Provider::ClaudeCode))
+            .exists());
     }
 
+    /// A start that never produced a CLI takes its profile — and the copy of the
+    /// credential inside it — with it, and leaves the account's own credential
+    /// exactly as it was.
     #[cfg(unix)]
     #[test]
-    fn private_profile_symlink_cannot_make_the_broker_read_another_account() {
+    fn a_failed_start_discards_its_profile_and_keeps_the_credential() {
         let temporary = tempfile::tempdir().unwrap();
         let state = account_fixture(temporary.path());
         let id = uuid::Uuid::new_v4().to_string();
         prepare_session_profile(&state, &id).unwrap();
         let profile = session_profile_root(&state, &id).unwrap();
-        let foreign = tempfile::tempdir().unwrap();
-        std::fs::write(
-            foreign.path().join("auth.json"),
-            br#"{"secret":"foreign-account"}"#,
-        )
-        .unwrap();
+        rollback_session_start(&state, Some(&id), true).unwrap();
+        assert!(!profile.exists());
+        assert_eq!(canonical_credential(&state), FIRST);
+
+        // A resumed profile carries the history the resume is made of, so a
+        // failed start of a resume keeps it.
+        prepare_session_profile(&state, &id).unwrap();
+        rollback_session_start(&state, Some(&id), false).unwrap();
+        assert!(profile.exists());
+    }
+
+    /// A profile directory replaced by a symlink is refused rather than
+    /// followed: that is how a foreign path would get into the bridge's own
+    /// reads and writes.
+    #[cfg(unix)]
+    #[test]
+    fn a_redirected_profile_directory_is_refused() {
+        let mine = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        let state = account_fixture(mine.path());
+        let id = uuid::Uuid::new_v4().to_string();
+        prepare_session_profile(&state, &id).unwrap();
+        let profile = session_profile_root(&state, &id).unwrap();
+
         std::fs::remove_dir_all(profile.join("codex")).unwrap();
-        std::os::unix::fs::symlink(foreign.path(), profile.join("codex")).unwrap();
+        std::os::unix::fs::symlink(theirs.path(), profile.join("codex")).unwrap();
         assert!(prepare_session_profile(&state, &id).is_err());
-        reconcile_session_credential(&state, &id).unwrap();
-        assert!(temporary.path().join("credential-review-required").exists());
-        assert!(!temporary.path().join("pending-credential.json").exists());
-        assert!(
-            !std::fs::read_to_string(temporary.path().join("codex/auth.json"))
-                .unwrap()
-                .contains("foreign-account")
-        );
+        assert!(credentials::read(&profile, Provider::Codex).is_err());
+        assert!(!theirs.path().join("auth.json").exists());
     }
 
     #[test]
     fn missing_exportable_credential_and_hardlink_are_refused() {
         let temporary = tempfile::tempdir().unwrap();
-        let destination = temporary.path().join("destination");
-        assert!(copy_credential(&temporary.path().join("missing"), &destination).is_err());
-        let source = temporary.path().join("credential");
-        std::fs::write(&source, "{}").unwrap();
-        std::fs::hard_link(&source, temporary.path().join("alias")).unwrap();
+        let root = credentials::root(temporary.path());
+        credentials::prepare(temporary.path()).unwrap();
+        assert!(credentials::read(&root, Provider::Codex).unwrap().is_none());
+        let path = root.join(credentials::relative(Provider::Codex));
+        std::fs::write(&path, "{}").unwrap();
         #[cfg(unix)]
-        assert!(copy_credential(&source, &destination).is_err());
+        {
+            std::fs::hard_link(&path, root.join("codex/alias.json")).unwrap();
+            assert!(credentials::read(&root, Provider::Codex).is_err());
+        }
     }
 
     #[test]
@@ -3594,5 +4904,111 @@ mod tests {
         assert!(configured_claude_models(&missing).is_err());
         std::fs::write(&missing, r#"[{"display_name":"nameless"}]"#).expect("write");
         assert!(configured_claude_models(&missing).is_err());
+    }
+
+    /// A bridge must not outlive the Core that started it: it holds
+    /// `account.lock`, so an orphan keeps the account unstartable on this node.
+    /// Core's own shutdown covers the ordinary case; the pipe covers the one it
+    /// cannot — a SIGKILLed Core runs no shutdown path at all. The watcher may
+    /// only fire on the parent's END, never on a quiet one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_bridge_ends_when_its_parents_pipe_closes_and_not_while_it_is_open() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let mut ends = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe(ends.as_mut_ptr()) },
+            0,
+            "the test needs a real pipe"
+        );
+        // SAFETY: `pipe` just created both descriptors and nothing else owns
+        // them; the read end is handed to tokio, the write end is closed by hand
+        // below to stand for the parent's death.
+        let read = unsafe { OwnedFd::from_raw_fd(ends[0]) };
+        let write = ends[1];
+        let receiver =
+            tokio::net::unix::pipe::Receiver::from_owned_fd(read).expect("pipe receiver");
+        let watcher = tokio::spawn(wait_for_parent_pipe_eof(receiver));
+
+        // A parent that is alive but silent keeps the bridge running, and so
+        // does one that writes: the pipe is a liveness token, not a channel.
+        assert_eq!(unsafe { libc::write(write, b"x".as_ptr().cast(), 1) }, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !watcher.is_finished(),
+            "the bridge stopped while its parent was still holding the pipe"
+        );
+
+        assert_eq!(unsafe { libc::close(write) }, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+            .await
+            .expect("the bridge must notice the closed pipe within seconds")
+            .expect("watcher task");
+    }
+
+    /// The login home is ONE directory for the whole account, so two runs that
+    /// materialize into it would trade credentials. A sign-in owns it outright,
+    /// and a probe that ran while the account's credential moved underneath it
+    /// must not publish what it found: its copy is older than the account's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_login_home_is_leased_and_a_sign_in_owns_it_alone() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+
+        // While a sign-in is registered, no probe may lease the home.
+        *state.login_flow.lock().await = Some("auth-1".to_string());
+        let refused = login_home(&state)
+            .await
+            .err()
+            .expect("a probe must not lease the home during a sign-in")
+            .to_string();
+        assert!(
+            refused.contains("login_in_progress"),
+            "a probe took the sign-in's home: {refused}"
+        );
+        *state.login_flow.lock().await = None;
+
+        // The lease is exclusive: a second one waits for the first to be
+        // dropped, so no two runs can be materializing into the directory at
+        // once.
+        let held = login_home(&state).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), login_home(&state))
+                .await
+                .is_err(),
+            "a second lease was handed out while the first was held"
+        );
+
+        // The account's credential moved while this probe was running. What the
+        // CLI left is therefore older than what the account holds, and a
+        // publication would put the superseded credential back.
+        credentials::write(
+            &credentials::root(temporary.path()),
+            Provider::Codex,
+            ROTATED,
+        )
+        .unwrap();
+        let left_behind = br#"{"tokens":{"account_id":"probe","refresh_token":"stale"}}"#;
+        credentials::write(
+            &credentials::login_root(temporary.path()),
+            Provider::Codex,
+            left_behind,
+        )
+        .unwrap();
+        settle_login_credential(&state, &held).await.unwrap();
+        assert_eq!(
+            canonical_credential(&state),
+            ROTATED,
+            "a probe published over a credential that moved under it"
+        );
+        drop(held);
+
+        // A sign-in is the account's own authority: it publishes what it
+        // produced, whatever the canonical credential became meanwhile.
+        let signing_in = finished_login_home(&state).await;
+        settle_login_credential(&state, &signing_in).await.unwrap();
+        assert_eq!(canonical_credential(&state), left_behind);
     }
 }

@@ -75,6 +75,13 @@ tf-select {
   display: block;
   width: 100%;
 }
+/* The rule above outranks the user-agent `[hidden] { display: none }`, so a
+   control a screen hides would otherwise stay on the page. */
+tf-input[hidden],
+tf-searchbox[hidden],
+tf-select[hidden] {
+  display: none;
+}
 /* Sloty tf-window (footer + actions) — auto-flex z gapem, bez koniecznosci
    inline-style w kazdym uzyciu. Wyrownanie pionowe + 10px gap miedzy
    przyciskami. */

@@ -20,7 +20,7 @@ import '/js/components/tf-spinner.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 import * as Access from '/js/modules/services/access.js';
-import { agentRequest, openAgentLogin, openAgentAccount } from '/js/modules/coding-agent.js';
+import { agentRequest } from '/js/modules/coding-agent.js';
 import * as AgentAccountsTab from '/js/modules/services/agent-accounts-tab.js';
 
 // Kolumna SILNIK tymczasowo ukryta na zyczenie — flip na true zeby przywrocic.
@@ -318,14 +318,6 @@ function bindTabEvents() {
   const body = byId('svc-tab-body');
   if (!body) return;
 
-  body.querySelectorAll('[data-agent-login]').forEach((button) => {
-    button.onclick = () => openAgentLogin(codingAgentById(button.dataset.agentLogin, button.dataset.agentNode))
-      .catch((error) => toast(error.message || String(error), 'error'));
-  });
-  body.querySelectorAll('[data-agent-account]').forEach((button) => {
-    button.onclick = () => openAgentAccount(codingAgentById(button.dataset.agentAccount, button.dataset.agentNode))
-      .catch((error) => toast(error.message || String(error), 'error'));
-  });
   body.querySelectorAll('[data-agent-open]').forEach((button) => {
     button.onclick = () => openCodingAgentConsole(codingAgentById(button.dataset.agentOpen, button.dataset.agentNode));
   });
@@ -1249,16 +1241,14 @@ function renderRow(s) {
           data-svc-method="${escapeAttr(s.deploy_method || '')}"
           title="${escapeAttr(I18n.t('services.btn_deploy_logs'))}"></tf-button>`
     : '';
+  // A coding-agent service row opens its own console and nothing else: signing
+  // an account in and administering it belong to the "Konta agentów" tab, where
+  // an account is not tied to one node's service row.
   const isCodingAgent = ['codex', 'claude-code', 'grok-build', 'muse-code'].includes(s.engine_id || s.engineId);
   const codingAgentActions = isCodingAgent
     ? `<tf-button variant="ghost" size="sm" icon="terminal"
           data-agent-open="${svcId}" data-agent-node="${svcNodeId}"
-          title="Sesje"></tf-button>
-       ${currentUserIsAdmin ? `<tf-button variant="ghost" size="sm" icon="key"
-          data-agent-login="${svcId}" data-agent-node="${svcNodeId}"
-          title="Logowanie"></tf-button>
-         <tf-button variant="ghost" size="sm" icon="users" data-agent-account="${svcId}" data-agent-node="${svcNodeId}"
-           title="${escapeAttr(I18n.t('agent_accounts.title'))}"></tf-button>` : ''}`
+          title="Sesje"></tf-button>`
     : '';
 
   // Karty GPU serwisu (z deploy configu): "all" | "0,1" | "CPU". Puste = nie

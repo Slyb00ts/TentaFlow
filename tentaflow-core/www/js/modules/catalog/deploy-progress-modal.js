@@ -30,7 +30,7 @@ const STICKY_BOTTOM_PX = 24;
 
 const TERMINAL_STATUSES = ['success', 'failed', 'interrupted', 'cancelled'];
 
-export function openDeployProgressModal({ deployId, engineId, deployMethod, nodeId }) {
+export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
   const win = document.createElement('tf-window');
   win.setAttribute('title', `${I18n.t('deploy.progress_title')}: ${engineId}`);
   win.setAttribute('buttons', 'close');
@@ -247,12 +247,6 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod, node
     if (status === 'success') {
       appendLine(`— ${I18n.t('deploy.success')} (${durationMs || 0} ms)`, { step: true });
       toast(I18n.t('deploy.success'), 'success');
-      if (engineId === 'codex' || engineId === 'claude-code') {
-        import('/js/modules/coding-agent.js').then(async (module) => {
-          const service = await module.findDeployedAgent(deployId, nodeId);
-          await module.openAgentLogin(service);
-        }).catch((error) => toast(error.message || String(error), 'error'));
-      }
     }
   }
 

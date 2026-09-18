@@ -76,10 +76,13 @@ class TfRadio extends HTMLElement {
   }
 
   // Card variant keeps renderer-provided light-DOM children (icon, title,
-  // description, badge) and wraps them in a .tf-radio-card-group__card label.
+  // description, badge) and wraps them in a .tf-radio-card-group__card box.
+  // A plain element, not a <label>: a card may carry its own control (a select
+  // that belongs to the option), and a label would adopt that control as the
+  // thing it labels — making the whole card inherit its disabled state.
   _buildCard() {
     const content = Array.from(this.childNodes);
-    const label = document.createElement('label');
+    const label = document.createElement('div');
     label.className = 'tf-radio-card-group__card';
     label.addEventListener('click', this._onClick);
     label.addEventListener('keydown', this._onKey);
@@ -125,7 +128,16 @@ class TfRadio extends HTMLElement {
     }
   }
 
+  // A card option may contain its own control (a select that belongs to the
+  // option). Operating that control — by pointer or by keyboard — is not an
+  // interaction with the option and must keep its own default behaviour.
+  _isOwnControl(e) {
+    return e.target !== this._root
+      && !!e.target.closest?.('select, input, textarea, button, a, [role="button"]');
+  }
+
   _onClick(e) {
+    if (this._isOwnControl(e)) return;
     e.preventDefault();
     if (this.hasAttribute('disabled')) return;
     const group = this.closest('tf-radio-group');
@@ -134,6 +146,7 @@ class TfRadio extends HTMLElement {
 
   _onKey(e) {
     if (this.hasAttribute('disabled')) return;
+    if (this._isOwnControl(e)) return;
     if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault();
       this._onClick(e);

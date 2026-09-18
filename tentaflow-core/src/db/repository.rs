@@ -12333,7 +12333,12 @@ pub fn update_user_account(
 }
 
 /// Usuwa uzytkownika z tabeli user_accounts (kaskadowo czlonkostwa w grupach).
-pub fn delete_user_account(pool: &DbPool, id: &str) -> Result<()> {
+///
+/// `actor` is who ordered it. It reaches the provider-account cascade, whose
+/// audit rows are the only record that somebody's personal accounts and their
+/// credentials were destroyed — an actor-less entry there says a deletion
+/// happened and leaves nobody to ask about it.
+pub fn delete_user_account(pool: &DbPool, id: &str, actor: Option<&str>) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
@@ -12346,7 +12351,7 @@ pub fn delete_user_account(pool: &DbPool, id: &str) -> Result<()> {
         // has not materialized), so the cascade a FK would have performed is
         // run explicitly — inside THIS transaction, or an interrupted commit
         // would leave a personal account, and its credential, owned by nobody.
-        crate::provider_accounts::repository::forget_user_tx(&tx, id, None)?;
+        crate::provider_accounts::repository::forget_user_tx(&tx, id, actor)?;
         let mut fields = BTreeMap::new();
         fields.insert("id".to_string(), field_string(id));
         record_core_capture_tx(

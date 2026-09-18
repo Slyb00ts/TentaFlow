@@ -204,9 +204,7 @@ pub fn lookup_workspace_names(db: &DbPool, ids: &[String]) -> Result<HashMap<Str
     crate::db::repository::lookup_in_chunks(
         &conn,
         ids,
-        |placeholders| {
-            format!("SELECT id, name FROM code_workspaces WHERE id IN ({placeholders})")
-        },
+        |placeholders| format!("SELECT id, name FROM code_workspaces WHERE id IN ({placeholders})"),
         |row| {
             out.insert(row.get::<_, String>(0)?, row.get::<_, String>(1)?);
             Ok(())

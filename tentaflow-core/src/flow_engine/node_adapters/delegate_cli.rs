@@ -73,6 +73,7 @@ use crate::db::DbPool;
 use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
+use crate::provider_accounts::credential_events;
 
 use super::patch_review::InteractionGate;
 
@@ -657,6 +658,38 @@ async fn pump(
                             &instance.id,
                             vendor_session_id,
                         )?;
+                    }
+                }
+                // The account's credential rotated under this session: the
+                // provider handed the CLI a new refresh token and retired the
+                // old one. The store has to follow, or every other node keeps
+                // materializing a token that is already dead — and the run goes
+                // on regardless, because it is holding the new one.
+                BridgeEvent::CredentialChanged {
+                    engine_id, sha256, ..
+                } => {
+                    if let Some(account_id) = bridge.account_id() {
+                        credential_events::observed_change(&account_id, engine_id, sha256).await;
+                    }
+                }
+                // The bridge would not take what this session's copy now holds.
+                // The account keeps the credential it had and the run is not
+                // disturbed; what the record decides is whether this is the
+                // second identity refusal, which is the one an operator has to
+                // act on.
+                BridgeEvent::CredentialRejected {
+                    engine_id,
+                    reason,
+                    sha256,
+                    ..
+                } => {
+                    if let Some(account_id) = bridge.account_id() {
+                        credential_events::observed_rejection(
+                            &account_id,
+                            engine_id,
+                            reason,
+                            sha256,
+                        );
                     }
                 }
                 BridgeEvent::Other { kind, .. } => {

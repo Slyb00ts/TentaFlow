@@ -8386,10 +8386,9 @@ export const encode = {
   // ===========================================================================
   // Agent provider accounts — MessageBody::ProviderAccountBody. The fields are
   // the wire's snake_case; an ABSENT filter is `null`, never an empty string —
-  // the core treats `Some("")` as a filter that matches nothing. The login
-  // exchange, session revoke and CLI install have no entry here: this node
-  // refuses them with NotAvailable, and a screen must not be able to send a
-  // request whose only outcome is a refusal.
+  // the core treats `Some("")` as a filter that matches nothing. A login id
+  // names the node running its terminal, so the login exchange needs no node
+  // parameter after the start.
   // ===========================================================================
 
   /** Konta agentów widoczne dla wołającego (A01; nie-admin dostaje własne + nadane). */
@@ -8529,6 +8528,84 @@ export const encode = {
     const body = _wasm.encodeProviderAccountRuntimeSetReceivesAccountsRequest(JSON.stringify({
       node_id: csText(payload.nodeId ?? payload.node_id),
       enabled: Boolean(payload.enabled),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * Rozpoczyna logowanie u dostawcy (A02). Bez `nodeId` konto loguje się na
+   * swoim nodzie macierzystym, a gdy go nie ma — na tym, który odpowiada.
+   */
+  // wire: LoginStartRequest
+  providerAccountLoginStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountLoginStartRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+      node_id: csOptText(payload.nodeId ?? payload.node_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Wpisuje kod weryfikacyjny do terminala logowania (A02 krok 3). */
+  // wire: LoginInputRequest
+  providerAccountLoginInputRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountLoginInputRequest(JSON.stringify({
+      login_id: csText(payload.loginId ?? payload.login_id),
+      value: csText(payload.value),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Odpytuje stan rozpoczętego logowania. */
+  // wire: LoginStatusRequest
+  providerAccountLoginStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountLoginStatusRequest(JSON.stringify({
+      login_id: csText(payload.loginId ?? payload.login_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Porzuca logowanie; konto zachowuje dotychczasowe poświadczenie. */
+  // wire: LoginCancelRequest
+  providerAccountLoginCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountLoginCancelRequest(JSON.stringify({
+      login_id: csText(payload.loginId ?? payload.login_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Kończy jedną żywą sesję konta (A03). */
+  // wire: SessionRevokeRequest
+  providerAccountSessionRevokeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountSessionRevokeRequest(JSON.stringify({
+      account_id: csText(payload.accountId ?? payload.account_id),
+      session_id: csText(payload.sessionId ?? payload.session_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Instaluje aplikację CLI i bridge na wskazanym nodzie (N01). */
+  // wire: RuntimeInstallRequest
+  providerAccountRuntimeInstallRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountRuntimeInstallRequest(JSON.stringify({
+      node_id: csText(payload.nodeId ?? payload.node_id),
+      engine_id: csText(payload.engineId ?? payload.engine_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Wycofuje aplikację CLI z macierzy noda i zatrzymuje jej bridge'e (N01). */
+  // wire: RuntimeUninstallRequest
+  providerAccountRuntimeUninstallRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProviderAccountRuntimeUninstallRequest(JSON.stringify({
+      node_id: csText(payload.nodeId ?? payload.node_id),
+      engine_id: csText(payload.engineId ?? payload.engine_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

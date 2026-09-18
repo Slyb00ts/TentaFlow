@@ -53,7 +53,6 @@ use tentaflow_core::bus::{
     self, field_policies, groups, topics, BusCallContext, ConsumerConfig, PublishBatch,
     PublishRecord, TopicPartition,
 };
-use tentaflow_core::crypto::SettingsCipher;
 use tentaflow_core::db::repository::{self, DbBusPartitionAssignment};
 use tentaflow_core::db::{self, DbPool};
 use tentaflow_core::dispatch::app_gate;
@@ -626,12 +625,11 @@ fn two_tentabus_instances_never_see_each_others_data() {
     );
 
     let second_db = db::init(Path::new(":memory:")).expect("second db init");
-    let cipher = Arc::new(SettingsCipher::new(&[3u8; 32]));
 
     let rows_applied_test =
-        apply_core_operation(&second_db, &cipher, &op_test).expect("materialize 'test' op");
+        apply_core_operation(&second_db, &op_test).expect("materialize 'test' op");
     let rows_applied_prod =
-        apply_core_operation(&second_db, &cipher, &op_prod).expect("materialize 'prod' op");
+        apply_core_operation(&second_db, &op_prod).expect("materialize 'prod' op");
     assert_eq!(rows_applied_test, 1);
     assert_eq!(rows_applied_prod, 1);
 

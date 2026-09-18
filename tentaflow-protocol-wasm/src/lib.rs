@@ -22718,15 +22718,10 @@ pub fn encode_code_studio_repo_tree_request(request_json: String) -> Result<Vec<
 // the dashboard hands over the payload it already holds and the enum is
 // deserialized from `{ variant: fields }`.
 //
-// The login exchange (`Login*`), `SessionRevokeRequest` and the runtime
-// install/uninstall pair have NO encoder here on purpose: this node answers
-// them with `NotAvailable`, and an encoder would invite a screen to send a
-// request whose only possible outcome is a refusal. They arrive with the
-// package that implements them.
-//
-// `CredentialSetRequest.material` is an API key. It rides the same encrypted
-// transport as every other field and the core stores it through the settings
-// cipher; nothing here logs or echoes it.
+// `CredentialSetRequest.material` is an API key and `LoginInputRequest.value`
+// is the device code the person pasted. Both ride the same encrypted transport
+// as every other field and the core stores what it must through the settings
+// cipher; nothing here logs or echoes either.
 // =============================================================================
 
 fn encode_provider_account_json_request(
@@ -22826,30 +22821,72 @@ pub fn encode_provider_account_runtime_set_receives_accounts_request(
     encode_provider_account_json_request("RuntimeSetReceivesAccountsRequest", &request_json)
 }
 
+/// Starts the provider sign-in of one account on one node (A02 step 1). The
+/// answer carries the address the person opens; the material never travels.
+#[wasm_bindgen(js_name = encodeProviderAccountLoginStartRequest)]
+pub fn encode_provider_account_login_start_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("LoginStartRequest", &request_json)
+}
+
+/// Types the verification code the provider showed into the sign-in terminal.
+#[wasm_bindgen(js_name = encodeProviderAccountLoginInputRequest)]
+pub fn encode_provider_account_login_input_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("LoginInputRequest", &request_json)
+}
+
+/// Polls how a started sign-in is going (A02 step 3).
+#[wasm_bindgen(js_name = encodeProviderAccountLoginStatusRequest)]
+pub fn encode_provider_account_login_status_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("LoginStatusRequest", &request_json)
+}
+
+/// Abandons a sign-in; the account keeps whatever credential it had.
+#[wasm_bindgen(js_name = encodeProviderAccountLoginCancelRequest)]
+pub fn encode_provider_account_login_cancel_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("LoginCancelRequest", &request_json)
+}
+
+/// Closes one live session of an account (A03 per-row action).
+#[wasm_bindgen(js_name = encodeProviderAccountSessionRevokeRequest)]
+pub fn encode_provider_account_session_revoke_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("SessionRevokeRequest", &request_json)
+}
+
+/// Installs the vendor CLI and this repository's bridge for one engine on one
+/// node (N01 cell action).
+#[wasm_bindgen(js_name = encodeProviderAccountRuntimeInstallRequest)]
+pub fn encode_provider_account_runtime_install_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("RuntimeInstallRequest", &request_json)
+}
+
+/// Takes one engine out of a node's matrix and stops every bridge running on
+/// it. The shared version cache stays on disk.
+#[wasm_bindgen(js_name = encodeProviderAccountRuntimeUninstallRequest)]
+pub fn encode_provider_account_runtime_uninstall_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_provider_account_json_request("RuntimeUninstallRequest", &request_json)
+}
+
 #[cfg(test)]
 mod provider_account_codec_tests {
     use super::*;
 
-    /// The variants this node answers with `NotAvailable`
-    /// (`dispatch/provider_account.rs`). They are on the wire because the family
-    /// is append-only, and they deliberately have NO encoder: a screen that
-    /// could send one would only ever get a refusal back.
-    ///
-    /// Adding an encoder for one of these means its package landed — drop the
-    /// name from here in the same commit.
-    const DEFERRED: &[&str] = &[
-        "LoginStartRequest",
-        "LoginInputRequest",
-        "LoginStatusRequest",
-        "LoginCancelRequest",
-        "SessionRevokeRequest",
-        "RuntimeInstallRequest",
-        "RuntimeUninstallRequest",
-    ];
-
     #[test]
     fn provider_account_encoders_roundtrip_the_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 12] = [
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 19] = [
             (
                 "AccountListRequest",
                 encode_provider_account_list_request,
@@ -22910,6 +22947,41 @@ mod provider_account_codec_tests {
                 encode_provider_account_runtime_set_receives_accounts_request,
                 r#"{"node_id":"node-1","enabled":true}"#,
             ),
+            (
+                "LoginStartRequest",
+                encode_provider_account_login_start_request,
+                r#"{"account_id":"acc-1","node_id":"node-1"}"#,
+            ),
+            (
+                "LoginInputRequest",
+                encode_provider_account_login_input_request,
+                r#"{"login_id":"node-1:7e0f","value":"WXYZ-1234"}"#,
+            ),
+            (
+                "LoginStatusRequest",
+                encode_provider_account_login_status_request,
+                r#"{"login_id":"node-1:7e0f"}"#,
+            ),
+            (
+                "LoginCancelRequest",
+                encode_provider_account_login_cancel_request,
+                r#"{"login_id":"node-1:7e0f"}"#,
+            ),
+            (
+                "SessionRevokeRequest",
+                encode_provider_account_session_revoke_request,
+                r#"{"account_id":"acc-1","session_id":"sess-1"}"#,
+            ),
+            (
+                "RuntimeInstallRequest",
+                encode_provider_account_runtime_install_request,
+                r#"{"node_id":"node-1","engine_id":"codex"}"#,
+            ),
+            (
+                "RuntimeUninstallRequest",
+                encode_provider_account_runtime_uninstall_request,
+                r#"{"node_id":"node-1","engine_id":"codex"}"#,
+            ),
         ];
         for (variant, encode, fields) in cases {
             let bytes = encode(fields.to_owned()).unwrap();
@@ -22924,14 +22996,13 @@ mod provider_account_codec_tests {
         }
     }
 
-    /// Every request variant of the family is either encodable from BOTH halves
-    /// (wasm + `codec.js`) or explicitly deferred. Mirrors the TentaNas test
-    /// below: the variant list is read from the protocol source, so appending a
-    /// variant there fails here until its encoder exists — a missing `codec.js`
-    /// entry is otherwise invisible until a real browser raises "unknown request
-    /// kind" at the click.
+    /// Every request variant of the family is encodable from BOTH halves
+    /// (wasm + `codec.js`). Mirrors the TentaNas test below: the variant list is
+    /// read from the protocol source, so appending a variant there fails here
+    /// until its encoder exists — a missing `codec.js` entry is otherwise
+    /// invisible until a real browser raises "unknown request kind" at the click.
     #[test]
-    fn every_request_variant_is_encodable_or_explicitly_deferred() {
+    fn every_request_variant_is_encodable_from_both_halves() {
         const PROTOCOL_SRC: &str = include_str!("../../tentaflow-protocol/src/provider_account.rs");
         const OWN_SRC: &str = include_str!("lib.rs");
         const CODEC_JS: &str = include_str!("../../tentaflow-core/www/js/protocol/codec.js");
@@ -22973,15 +23044,6 @@ mod provider_account_codec_tests {
             // `codec.js` names the entry after the variant with the family
             // prefix, minus the "Account"/"Request" noise the JS side drops.
             let has_codec_entry = CODEC_JS.contains(&format!("// wire: {variant}\n"));
-            if DEFERRED.contains(&variant.as_str()) {
-                if has_encoder || has_codec_entry {
-                    problems.push(format!(
-                        "{variant} is listed as deferred but already has an encoder — its \
-                         package landed, so remove it from DEFERRED"
-                    ));
-                }
-                continue;
-            }
             if !has_encoder {
                 problems.push(format!("{variant} has no wasm encoder"));
             }

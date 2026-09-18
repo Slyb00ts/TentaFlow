@@ -3,7 +3,7 @@
 // The registry lives in the main database (migration 156) and is carried by the
 // Sync Ledger, so an account added on the desktop is usable from the phone.
 //
-// Four invariants this module enforces rather than documents:
+// Five invariants this module enforces rather than documents:
 //   1. every write that touches a REPLICATED row captures it in the SAME
 //      transaction — a committed row without its capture replicates a state
 //      that never existed;
@@ -14,7 +14,11 @@
 //      the loser's token is the one the provider already rotated;
 //   4. a `scope='user'` account answers to its owner and to nobody else. There
 //      is no administrator bypass, and there is no grant table row that could
-//      create one.
+//      create one;
+//   5. every mutation writes ONE audit row in its own transaction. The capture
+//      journal binds no actor (see `sync_capture.rs`), so `audit_log` is the
+//      only record of who changed a subscription — and a credential is named
+//      there by a SHA-256 fingerprint, never by anything that could rebuild it.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -322,15 +326,6 @@ pub fn update_account(
 /// account was logged into twice with different credentials, and silently
 /// taking the newer one would leave every grant, session and agent pointing at
 /// somebody else's subscription.
-pub fn set_provider_subject(db: &DbPool, account_id: &str, subject: &str) -> Result<()> {
-    let mut conn = db.write().map_err(write_err)?;
-    let tx = conn.transaction().map_err(write_err)?;
-    apply_provider_subject_tx(&tx, account_id, subject)?;
-    sync_capture::capture_account(&tx, account_id)?;
-    tx.commit().map_err(write_err)?;
-    Ok(())
-}
-
 fn apply_provider_subject_tx(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
@@ -586,6 +581,47 @@ pub fn list_grants(db: &DbPool, account_id: &str) -> Result<Vec<GrantRecord>> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(read_err)?;
     Ok(rows)
+}
+
+/// `group_id -> how many of its members belong to `org_id``.
+///
+/// NOT the group's size: a group is installation-wide (`user_groups` has no
+/// organisation of its own), and the effective-grant SQL admits a member only
+/// if THEY are in the account's organisation. A count of the whole group would
+/// promise access to people the grant does not reach.
+pub fn group_member_counts_in_org(
+    db: &DbPool,
+    org_id: &str,
+    group_ids: &[String],
+) -> Result<HashMap<String, u32>> {
+    if group_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let conn = db.read().map_err(read_err)?;
+    let placeholders = vec!["?"; group_ids.len()].join(",");
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT gm.group_id, COUNT(*) FROM group_members gm \
+             JOIN org_memberships om ON om.user_id = gm.user_id AND om.org_id = ?1 \
+             WHERE gm.group_id IN ({placeholders}) GROUP BY gm.group_id"
+        ))
+        .map_err(read_err)?;
+    let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(group_ids.len() + 1);
+    bound.push(&org_id);
+    for id in group_ids {
+        bound.push(id);
+    }
+    let rows = stmt
+        .query_map(bound.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(read_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(read_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, count)| (id, u32::try_from(count).unwrap_or(u32::MAX)))
+        .collect())
 }
 
 /// `account_id -> number of grant rows` for the accounts asked about. An
@@ -981,7 +1017,27 @@ fn write_credential(
         .map_err(read_err)?;
     let local_revision = stored.as_ref().map(|(rev, _)| *rev).unwrap_or(0);
     let sha = sha256_hex(material);
+    let same_material = stored
+        .as_ref()
+        .is_some_and(|(_, stored_sha)| stored_sha == &sha);
     let revision = expected_revision.unwrap_or(local_revision + 1);
+    // Storing the SAME material again is a replay of a decision, not a new one.
+    // Bumping the revision for it would make every node that already holds this
+    // credential re-fetch and rewrite a file that did not change, and would
+    // record a rotation in the audit log that never happened at the provider.
+    //
+    // The account's STATUS is still settled here. An account that was moved to
+    // `needs_login` by a failed identity check is working again the moment its
+    // credential is confirmed, and an api_key account whose owner re-pastes the
+    // same key would otherwise stay locked out forever — the early return that
+    // skipped this was exactly that defect.
+    if same_material && (expected_revision.is_none() || revision == local_revision) {
+        reaffirm_credential_tx(&tx, account_id, &sha, meta)?;
+        tx.commit().map_err(write_err)?;
+        return Ok(CredentialWrite::Unchanged {
+            revision: local_revision,
+        });
+    }
 
     if revision < local_revision {
         tx.commit().map_err(write_err)?;
@@ -990,15 +1046,6 @@ fn write_credential(
         });
     }
     if revision == local_revision {
-        let same_material = stored
-            .as_ref()
-            .is_some_and(|(_, stored_sha)| stored_sha == &sha);
-        if same_material {
-            tx.commit().map_err(write_err)?;
-            return Ok(CredentialWrite::Unchanged {
-                revision: local_revision,
-            });
-        }
         set_status_tx(&tx, account_id, "needs_login")?;
         sync_capture::capture_account(&tx, account_id)?;
         // A conflict is the one credential outcome an operator has to act on —
@@ -1074,6 +1121,48 @@ fn write_credential(
     Ok(CredentialWrite::Applied { revision })
 }
 
+/// Settles the account around a credential write that changed no material.
+///
+/// Two things can still be new: the provider identity the material names (a
+/// first login through the CAS path carries one) and the account's status. An
+/// account whose stored credential is confirmed is usable, so a `needs_login`
+/// left by an earlier refusal is lifted — `disabled` is not, because that is an
+/// administrator's decision and no credential event may undo it.
+fn reaffirm_credential_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    material_sha256: &str,
+    meta: &CredentialMeta,
+) -> Result<()> {
+    if let Some(subject) = meta.provider_subject.as_deref() {
+        apply_provider_subject_tx(tx, account_id, subject)?;
+    }
+    let status: String = tx
+        .query_row(
+            "SELECT status FROM provider_accounts WHERE account_id = ?1",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .map_err(read_err)?;
+    if status == "active" || status == "disabled" {
+        return Ok(());
+    }
+    set_status_tx(tx, account_id, "active")?;
+    sync_capture::capture_account(tx, account_id)?;
+    // A status an operator's action moved is a decision somebody has to be able
+    // to read back, even though no material was written.
+    audit_tx(
+        tx,
+        meta.actor.as_deref(),
+        "provider_account.credential_reaffirmed",
+        account_id,
+        serde_json::json!({
+            "previous_status": status,
+            "fingerprint": credential_fingerprint(material_sha256),
+        }),
+    )
+}
+
 /// The decrypted material, or `None` when the account has no credential on this
 /// node. Decryption is bound to the account id: a ciphertext moved from another
 /// account's row fails the AEAD tag instead of decrypting under a borrowed
@@ -1099,6 +1188,74 @@ pub fn credential_material(
         .decrypt_bound(&stored, &super::credential_context(account_id))
         .map_err(|e| read_err(format!("open credential: {e}")))?;
     Ok(Some(plain.value))
+}
+
+/// Reasons a bridge refuses to publish a credential a session handed back that
+/// mean the material could not be tied to THIS account's provider identity.
+///
+/// The other two (`stale_baseline`, `unsafe_credential_file`) are about one
+/// session's own copy and say nothing about the account: a session that lost a
+/// race or corrupted its file leaves every other session working.
+const IDENTITY_REJECTIONS: &[&str] = &["identity_mismatch", "identity_unverifiable"];
+
+/// Records a credential the bridge refused, and decides whether the account has
+/// to be signed in again. Returns whether the account was moved to
+/// `needs_login`.
+///
+/// The two identity reasons are not the same measurement, so they do not carry
+/// the same weight:
+///
+/// * `identity_mismatch` is a comparison that SUCCEEDED and disagreed — both the
+///   canonical credential and the session's copy named a provider identity, and
+///   they were different accounts. One of those is what this account's runs are
+///   attributed to, and nobody can tell which except by signing in, so ONE is
+///   enough to ask for a new sign-in;
+/// * `identity_unverifiable` is a comparison that could not be made at all (the
+///   format carries no stable subject, or the account holds no credential to
+///   compare against). A single one of those is ordinary — it is the normal
+///   answer for muse and grok — so it takes a SECOND one within a day, which is
+///   the shape of a credential that keeps failing rather than a format that
+///   never had a subject.
+pub fn record_credential_rejection(
+    db: &DbPool,
+    account_id: &str,
+    engine_id: &str,
+    reason: &str,
+    material_sha256: &str,
+) -> Result<bool> {
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    let repeated = reason == "identity_mismatch"
+        || (IDENTITY_REJECTIONS.contains(&reason)
+            && tx
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_log \
+                     WHERE action = 'provider_account.credential_rejected' AND resource = ?1 \
+                       AND details LIKE '%\"identity\":true%' \
+                       AND timestamp >= datetime('now','-1 day')",
+                    params![account_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(read_err)?
+                > 0);
+    audit_tx(
+        &tx,
+        None,
+        "provider_account.credential_rejected",
+        account_id,
+        serde_json::json!({
+            "engine_id": engine_id,
+            "reason": reason,
+            "identity": IDENTITY_REJECTIONS.contains(&reason),
+            "fingerprint": credential_fingerprint(material_sha256),
+        }),
+    )?;
+    if repeated {
+        set_status_tx(&tx, account_id, "needs_login")?;
+        sync_capture::capture_account(&tx, account_id)?;
+    }
+    tx.commit().map_err(write_err)?;
+    Ok(repeated)
 }
 
 /// Removes the credential and leaves the account asking for a new one.
@@ -1244,9 +1401,89 @@ pub fn upsert_session(db: &DbPool, session: &SessionRecord) -> Result<()> {
     Ok(())
 }
 
+/// Forgets one session. Returns the node it ran on, so the caller knows where
+/// to close it, and `None` when there was no such session on this account.
+///
+/// The row is runtime state, not history: A03 lists what is OPEN, and a closed
+/// session that stayed in the list would be an invitation to close it again.
+pub fn delete_session(db: &DbPool, account_id: &str, session_id: &str) -> Result<Option<String>> {
+    let conn = db.write().map_err(write_err)?;
+    let node_id: Option<String> = conn
+        .query_row(
+            "DELETE FROM provider_account_sessions WHERE account_id = ?1 AND session_id = ?2 \
+             RETURNING node_id",
+            params![account_id, session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(write_err)?;
+    Ok(node_id)
+}
+
 // =============================================================================
 // Per-node state (node-local, never replicated)
 // =============================================================================
+
+/// What THIS installation did with one account on one node, or `None` when it
+/// has never touched it.
+pub fn node_state(db: &DbPool, account_id: &str, node_id: &str) -> Result<Option<NodeStateRecord>> {
+    let conn = db.read().map_err(read_err)?;
+    conn.query_row(
+        "SELECT account_id, node_id, applied_revision, runtime_state, last_error, updated_at \
+         FROM provider_account_node_state WHERE account_id = ?1 AND node_id = ?2",
+        params![account_id, node_id],
+        |row| {
+            Ok(NodeStateRecord {
+                account_id: row.get(0)?,
+                node_id: row.get(1)?,
+                applied_revision: row.get(2)?,
+                runtime_state: row.get(3)?,
+                last_error: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(read_err)
+}
+
+/// `account_id -> the nodes that hold its credential`, for the accounts asked
+/// about. Same rule as `materialized_account_counts`: a node that merely
+/// received the row through the ledger is not "using" the account until it has
+/// written the credential out.
+pub fn materialized_nodes(
+    db: &DbPool,
+    account_ids: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    if account_ids.is_empty() {
+        return Ok(out);
+    }
+    let conn = db.read().map_err(read_err)?;
+    let placeholders = vec!["?"; account_ids.len()].join(",");
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT account_id, node_id FROM provider_account_node_state \
+             WHERE applied_revision > 0 AND runtime_state = 'ready' \
+               AND account_id IN ({placeholders}) ORDER BY account_id, node_id"
+        ))
+        .map_err(read_err)?;
+    let bound: Vec<&dyn rusqlite::ToSql> = account_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt
+        .query_map(bound.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(read_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(read_err)?;
+    for (account_id, node_id) in rows {
+        out.entry(account_id).or_default().push(node_id);
+    }
+    Ok(out)
+}
 
 pub fn list_node_states(db: &DbPool, account_id: &str) -> Result<Vec<NodeStateRecord>> {
     let conn = db.read().map_err(read_err)?;
@@ -1326,6 +1563,29 @@ pub fn set_node_state(
             runtime_state,
             last_error
         ],
+    )
+    .map_err(write_err)?;
+    Ok(())
+}
+
+/// Records that this node could not apply the account's credential, WITHOUT
+/// moving the revision it already holds.
+///
+/// The revision is a claim about what this node was given, and a failure gives
+/// it nothing new. Writing a 0 here — which is what the error paths used to do —
+/// made the node look like one that had never held the credential, so the next
+/// rotation claimed revision 1 against a store already past it: a CAS conflict
+/// that moved the whole shared account to `needs_login` for a transient error.
+pub fn set_node_error(db: &DbPool, account_id: &str, node_id: &str, detail: &str) -> Result<()> {
+    let conn = db.write().map_err(write_err)?;
+    conn.execute(
+        "INSERT INTO provider_account_node_state \
+           (account_id, node_id, applied_revision, runtime_state, last_error) \
+         VALUES (?1, ?2, 0, 'error', ?3) \
+         ON CONFLICT(account_id, node_id) DO UPDATE SET \
+            runtime_state = 'error', last_error = excluded.last_error, \
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        params![account_id, node_id, detail],
     )
     .map_err(write_err)?;
     Ok(())
@@ -1440,6 +1700,86 @@ pub fn set_receives_accounts(
     Ok(())
 }
 
+/// Whether a node is allowed to hold account credentials at all.
+///
+/// A node with no row has had no decision made about it, and the column's
+/// default is the same answer: no. This is a gate, so the missing row and a
+/// stored `false` must read identically — anything else would make "never
+/// configured" a way past the check.
+pub fn receives_accounts(db: &DbPool, node_id: &str) -> Result<bool> {
+    let conn = db.read().map_err(read_err)?;
+    let enabled: Option<i64> = conn
+        .query_row(
+            "SELECT receives_accounts FROM agent_runtime_nodes WHERE node_id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(read_err)?;
+    Ok(enabled.unwrap_or(0) != 0)
+}
+
+/// What one engine looks like on one node, or `None` when nobody installed it
+/// there. A missing row and `install_state = 'absent'` mean the same thing to
+/// every caller, which is why an uninstall removes the row instead of storing
+/// the absence.
+pub fn engine_state(
+    db: &DbPool,
+    node_id: &str,
+    engine_id: &str,
+) -> Result<Option<RuntimeEngineRecord>> {
+    let conn = db.read().map_err(read_err)?;
+    conn.query_row(
+        "SELECT node_id, engine_id, install_state, version, installed_at, last_error \
+         FROM agent_runtime_engines WHERE node_id = ?1 AND engine_id = ?2",
+        params![node_id, engine_id],
+        |row| {
+            Ok(RuntimeEngineRecord {
+                node_id: row.get(0)?,
+                engine_id: row.get(1)?,
+                install_state: row.get(2)?,
+                version: row.get(3)?,
+                installed_at: row.get(4)?,
+                last_error: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(read_err)
+}
+
+/// Forgets an engine on THIS node. Same argument as `set_engine_state`: only a
+/// node may report its own installations, so the node is not a parameter.
+///
+/// `actor` is the administrator who asked for it, and it is audited for the same
+/// reason `set_receives_accounts` is: taking an engine off a node stops every
+/// account that was running on it, which is an operator decision somebody has to
+/// be able to read back.
+pub fn clear_engine_state(db: &DbPool, engine_id: &str, actor: Option<&str>) -> Result<bool> {
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    let node_id = local_node_id_tx(&tx)?
+        .ok_or_else(|| anyhow!("this installation has no node identity yet"))?;
+    let removed = tx
+        .execute(
+            "DELETE FROM agent_runtime_engines WHERE node_id = ?1 AND engine_id = ?2",
+            params![node_id.as_str(), engine_id],
+        )
+        .map_err(write_err)?;
+    if removed > 0 {
+        sync_capture::capture_runtime_engine(&tx, &node_id, engine_id)?;
+    }
+    audit_tx(
+        &tx,
+        actor,
+        "agent_runtime.engine_uninstall",
+        &node_id,
+        serde_json::json!({ "engine_id": engine_id, "removed": removed > 0 }),
+    )?;
+    tx.commit().map_err(write_err)?;
+    Ok(removed > 0)
+}
+
 /// Records what one engine looks like on THIS node. The runtime node row is
 /// created alongside, because the engine row's FK needs it and a node that has
 /// an engine installed is by definition a node somebody set up.
@@ -1448,12 +1788,18 @@ pub fn set_receives_accounts(
 /// only measure itself. Letting a caller name the node would let this
 /// installation assert an install state for a peer, which the materializer on
 /// that peer then refuses — the row would exist here and nowhere else.
+///
+/// `actor` is the administrator whose request produced the measurement, `None`
+/// when nobody asked (a node reporting its own state). It is audited: an install
+/// puts a vendor CLI on a machine, which is exactly the kind of change an
+/// operator has to be able to attribute afterwards.
 pub fn set_engine_state(
     db: &DbPool,
     engine_id: &str,
     install_state: &str,
     version: Option<&str>,
     last_error: Option<&str>,
+    actor: Option<&str>,
 ) -> Result<()> {
     if super::engine(engine_id).is_none() {
         return Err(anyhow!("unknown agent engine '{engine_id}'"));
@@ -1488,6 +1834,18 @@ pub fn set_engine_state(
         sync_capture::capture_runtime_node(&tx, node_id)?;
     }
     sync_capture::capture_runtime_engine(&tx, node_id, engine_id)?;
+    audit_tx(
+        &tx,
+        actor,
+        "agent_runtime.engine_install",
+        node_id,
+        serde_json::json!({
+            "engine_id": engine_id,
+            "install_state": install_state,
+            "version": version,
+            "last_error": last_error,
+        }),
+    )?;
     tx.commit().map_err(write_err)?;
     Ok(())
 }
@@ -1504,7 +1862,25 @@ mod tests {
         SettingsCipher::new(&[7u8; 32])
     }
 
+    const ORG: &str = crate::services::org::DEFAULT_ORG_ID;
+    const OTHER_ORG: &str = "org-other";
+
+    fn seed_org(db: &DbPool, org_id: &str) {
+        db.write()
+            .expect("db")
+            .execute(
+                "INSERT OR IGNORE INTO organizations (org_id, name, slug, created_at) \
+                 VALUES (?1, ?1, ?1, datetime('now'))",
+                params![org_id],
+            )
+            .expect("seed org");
+    }
+
     fn seed_user(db: &DbPool, user_id: &str) {
+        seed_user_in_org(db, user_id, ORG);
+    }
+
+    fn seed_user_in_org(db: &DbPool, user_id: &str, org_id: &str) {
         let conn = db.write().expect("db");
         conn.execute(
             "INSERT OR IGNORE INTO user_accounts \
@@ -1515,8 +1891,8 @@ mod tests {
         .expect("seed user");
         conn.execute(
             "INSERT OR IGNORE INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
-             VALUES ('org-default', ?1, 'role-org-viewer', datetime('now'), 'test')",
-            params![user_id],
+             VALUES (?2, ?1, 'role-org-viewer', datetime('now'), 'test')",
+            params![user_id, org_id],
         )
         .expect("seed membership");
     }
@@ -1542,7 +1918,7 @@ mod tests {
             db,
             &NewAccount {
                 account_id: account_id.to_string(),
-                org_id: "org-default".into(),
+                org_id: ORG.into(),
                 engine_id: "claude-code".into(),
                 display_name: format!("Account {account_id}"),
                 scope: "global".into(),
@@ -1559,7 +1935,7 @@ mod tests {
             db,
             &NewAccount {
                 account_id: account_id.to_string(),
-                org_id: "org-default".into(),
+                org_id: ORG.into(),
                 engine_id: "codex".into(),
                 display_name: format!("Account {account_id}"),
                 scope: "user".into(),
@@ -1569,6 +1945,46 @@ mod tests {
             },
         )
         .expect("create account")
+    }
+
+    /// Gives the in-memory installation the node identity `sync::runtime::init`
+    /// would have written, which is what binds an engine measurement to a node.
+    fn seed_local_node(db: &DbPool, node_id: &str) {
+        let conn = db.write().expect("db");
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![crate::db::repository::LOCAL_NODE_ID_SETTING, node_id],
+        )
+        .expect("seed node id");
+        conn.execute(
+            "INSERT OR IGNORE INTO sync_nodes (node_id, public_key, display_name) \
+             VALUES (?1, 'test-key', ?1)",
+            params![node_id],
+        )
+        .expect("seed node row");
+    }
+
+    fn audit_actions(db: &DbPool, resource: &str) -> Vec<String> {
+        let conn = db.read().expect("db");
+        let mut stmt = conn
+            .prepare("SELECT action FROM audit_log WHERE resource = ?1 ORDER BY id")
+            .expect("audit query");
+        let rows = stmt
+            .query_map(params![resource], |row| row.get::<_, String>(0))
+            .expect("audit rows")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("audit rows");
+        rows
+    }
+
+    fn audit_actor(db: &DbPool, action: &str, resource: &str) -> Option<String> {
+        let conn = db.read().expect("db");
+        conn.query_row(
+            "SELECT user_id FROM audit_log WHERE action = ?1 AND resource = ?2 ORDER BY id LIMIT 1",
+            params![action, resource],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("audit row")
     }
 
     fn grant(subject_type: &str, subject_id: &str) -> GrantInput {
@@ -1606,18 +2022,18 @@ mod tests {
         set_grants(&db, "by-org", &[grant("org", "")], "admin").unwrap();
 
         assert_eq!(
-            ids(&list_accounts_for_user(&db, "alice", None).unwrap()),
+            ids(&list_accounts_for_user(&db, ORG, "alice", None).unwrap()),
             vec!["by-org", "direct"]
         );
         assert_eq!(
-            ids(&list_accounts_for_user(&db, "bob", None).unwrap()),
+            ids(&list_accounts_for_user(&db, ORG, "bob", None).unwrap()),
             vec!["by-group", "by-org"]
         );
         assert_eq!(
-            ids(&list_accounts_for_user(&db, "carol", None).unwrap()),
+            ids(&list_accounts_for_user(&db, ORG, "carol", None).unwrap()),
             vec!["by-org"]
         );
-        assert!(list_accounts_for_user(&db, "outsider", None)
+        assert!(list_accounts_for_user(&db, ORG, "outsider", None)
             .unwrap()
             .is_empty());
 
@@ -1630,11 +2046,70 @@ mod tests {
             ("outsider", "by-org", false),
         ] {
             assert_eq!(
-                user_may_use_account(&db, account, user).unwrap(),
+                user_may_use_account(&db, ORG, account, user).unwrap(),
                 expected,
                 "{user} -> {account}"
             );
         }
+    }
+
+    /// Two organisations, one installation: a grant is bounded by the org of
+    /// the account, and a group — which has no organisation of its own — does
+    /// not carry access across that line.
+    #[test]
+    fn a_grant_never_reaches_across_organisations() {
+        let db = pool();
+        seed_org(&db, OTHER_ORG);
+        seed_user(&db, "alice");
+        seed_user_in_org(&db, "mallory", OTHER_ORG);
+        // One group with a member from each organisation — the case a group
+        // grant would leak through if membership were not checked.
+        seed_group(&db, "platform", &["alice", "mallory"]);
+        global_account(&db, "shared");
+        set_grants(&db, "shared", &[grant("group", "platform")], "admin").unwrap();
+
+        assert_eq!(
+            ids(&list_accounts_for_user(&db, ORG, "alice", None).unwrap()),
+            vec!["shared"]
+        );
+        assert!(
+            list_accounts_for_user(&db, OTHER_ORG, "mallory", None)
+                .unwrap()
+                .is_empty(),
+            "the other org's member shares a group, not an account"
+        );
+        assert!(!user_may_use_account(&db, ORG, "shared", "mallory").unwrap());
+        assert!(
+            !user_may_use_account(&db, OTHER_ORG, "shared", "alice").unwrap(),
+            "asking in the wrong organisation is not a way to reach the account"
+        );
+    }
+
+    /// A grant may only name somebody the organisation actually has. The
+    /// refusal is what keeps a raw id out of the detail window, which renders
+    /// an unresolvable subject verbatim.
+    #[test]
+    fn a_grant_subject_must_exist_in_the_organisation() {
+        let db = pool();
+        seed_org(&db, OTHER_ORG);
+        seed_user(&db, "alice");
+        seed_user_in_org(&db, "mallory", OTHER_ORG);
+        global_account(&db, "shared");
+
+        for (subject, needle) in [
+            (grant("user", "nobody"), "not a member"),
+            (grant("user", "mallory"), "not a member"),
+            (grant("group", "ghosts"), "not a member"),
+        ] {
+            let error = set_grants(&db, "shared", &[subject], "admin")
+                .expect_err("an unknown subject must be refused");
+            assert!(error.to_string().contains(needle), "{error}");
+        }
+        assert!(
+            list_grants(&db, "shared").unwrap().is_empty(),
+            "a refused save writes nothing"
+        );
+        set_grants(&db, "shared", &[grant("user", "alice")], "admin").unwrap();
     }
 
     /// A user account belongs to its owner alone: no grant can be written on
@@ -1647,10 +2122,12 @@ mod tests {
         user_account(&db, "alice-codex", "alice");
 
         assert_eq!(
-            ids(&list_accounts_for_user(&db, "alice", None).unwrap()),
+            ids(&list_accounts_for_user(&db, ORG, "alice", None).unwrap()),
             vec!["alice-codex"]
         );
-        assert!(list_accounts_for_user(&db, "bob", None).unwrap().is_empty());
+        assert!(list_accounts_for_user(&db, ORG, "bob", None)
+            .unwrap()
+            .is_empty());
         let refused = set_grants(&db, "alice-codex", &[grant("user", "bob")], "admin")
             .expect_err("a user account cannot be shared");
         assert!(refused.to_string().contains("global"), "{refused}");
@@ -1698,11 +2175,11 @@ mod tests {
         let db = pool();
         seed_user(&db, "alice");
         global_account(&db, "shared");
-        set_grants(&db, "shared", &[grant("org", "org-default")], "admin").unwrap();
+        set_grants(&db, "shared", &[grant("org", ORG)], "admin").unwrap();
         let grants = list_grants(&db, "shared").unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].subject_id, "");
-        assert!(user_may_use_account(&db, "shared", "alice").unwrap());
+        assert!(user_may_use_account(&db, ORG, "shared", "alice").unwrap());
     }
 
     /// Revision CAS: newer wins, a replay is a no-op, and two writers claiming
@@ -1850,7 +2327,7 @@ mod tests {
         let cipher = cipher();
         global_account(&db, "shared");
         mint_credential(&db, &cipher, "shared", "key", &CredentialMeta::default()).unwrap();
-        assert!(clear_credential(&db, "shared").unwrap());
+        assert!(clear_credential(&db, "shared", Some("admin")).unwrap());
         assert!(credential_material(&db, &cipher, "shared")
             .unwrap()
             .is_none());
@@ -1858,7 +2335,7 @@ mod tests {
             get_account(&db, "shared").unwrap().unwrap().status,
             "needs_login"
         );
-        assert!(!clear_credential(&db, "shared").unwrap());
+        assert!(!clear_credential(&db, "shared", Some("admin")).unwrap());
     }
 
     /// The provider identity is written once. A second, different one is
@@ -1866,16 +2343,29 @@ mod tests {
     #[test]
     fn a_provider_subject_is_immutable_once_set() {
         let db = pool();
+        let cipher = cipher();
         global_account(&db, "shared");
-        set_provider_subject(&db, "shared", "team@example.com").unwrap();
-        // Idempotent for the same identity.
-        set_provider_subject(&db, "shared", "team@example.com").unwrap();
-        let error = set_provider_subject(&db, "shared", "other@example.com")
-            .expect_err("a second identity must be refused");
-        assert!(
-            error.to_string().contains("different provider identity"),
-            "{error}"
-        );
+        let signed_in = |subject: &str| CredentialMeta {
+            provider_subject: Some(subject.to_string()),
+            ..CredentialMeta::default()
+        };
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "key",
+            &signed_in("team@example.com"),
+        )
+        .unwrap();
+        // Idempotent for the same identity: a re-login writes it again.
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "key2",
+            &signed_in("team@example.com"),
+        )
+        .unwrap();
         assert_eq!(
             get_account(&db, "shared")
                 .unwrap()
@@ -1885,17 +2375,12 @@ mod tests {
             "team@example.com"
         );
 
-        // The same rule applies when the identity arrives with a credential.
-        let cipher = cipher();
         let error = mint_credential(
             &db,
             &cipher,
             "shared",
-            "key",
-            &CredentialMeta {
-                provider_subject: Some("other@example.com".into()),
-                ..CredentialMeta::default()
-            },
+            "key3",
+            &signed_in("other@example.com"),
         )
         .expect_err("a credential cannot rebind the identity");
         assert!(
@@ -1918,6 +2403,7 @@ mod tests {
                 status: Some("disabled".into()),
                 ..AccountUpdate::default()
             },
+            Some("admin"),
         )
         .unwrap();
         mint_credential(&db, &cipher, "shared", "key", &CredentialMeta::default()).unwrap();
@@ -1936,7 +2422,7 @@ mod tests {
             &db,
             &NewAccount {
                 account_id: "grok".into(),
-                org_id: "org-default".into(),
+                org_id: ORG.into(),
                 engine_id: "grok-build".into(),
                 display_name: "Grok".into(),
                 scope: "global".into(),
@@ -1954,16 +2440,25 @@ mod tests {
     #[test]
     fn the_runtime_matrix_records_nodes_and_their_engines() {
         let db = pool();
+        seed_local_node(&db, "helios");
         set_engine_state(
             &db,
-            "helios",
             "claude-code",
             "installed",
             Some("2.1.0"),
             None,
+            Some("admin"),
         )
         .unwrap();
-        set_engine_state(&db, "helios", "codex", "error", None, Some("no artifact")).unwrap();
+        set_engine_state(
+            &db,
+            "codex",
+            "error",
+            None,
+            Some("no artifact"),
+            Some("admin"),
+        )
+        .unwrap();
         set_receives_accounts(&db, "helios", true, Some("admin")).unwrap();
 
         let nodes = list_runtime_nodes(&db).unwrap();
@@ -2005,11 +2500,467 @@ mod tests {
         )
         .unwrap();
 
-        assert!(delete_account(&db, "shared").unwrap());
+        assert!(delete_account(&db, "shared", Some("admin")).unwrap());
         assert!(get_account(&db, "shared").unwrap().is_none());
         assert!(list_grants(&db, "shared").unwrap().is_empty());
         assert!(list_sessions(&db, "shared").unwrap().is_empty());
         assert!(credential_summary(&db, "shared").unwrap().is_none());
-        assert!(!delete_account(&db, "shared").unwrap());
+        assert!(!delete_account(&db, "shared", Some("admin")).unwrap());
+    }
+
+    /// Deleting the user takes their personal accounts — and the credential
+    /// inside them — plus every grant that named them. The shared account they
+    /// were granted survives; only the grant goes.
+    #[test]
+    fn deleting_a_user_takes_their_personal_accounts_and_grants() {
+        let db = pool();
+        let cipher = cipher();
+        seed_user(&db, "alice");
+        seed_user(&db, "bob");
+        user_account(&db, "alice-codex", "alice");
+        global_account(&db, "shared");
+        set_grants(
+            &db,
+            "shared",
+            &[grant("user", "alice"), grant("user", "bob")],
+            "admin",
+        )
+        .unwrap();
+        mint_credential(
+            &db,
+            &cipher,
+            "alice-codex",
+            "alice-key",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        set_node_state(&db, "alice-codex", "helios", 1, "ready", None).unwrap();
+
+        crate::db::repository::delete_user_account(&db, "alice", Some("admin")).unwrap();
+
+        assert!(get_account(&db, "alice-codex").unwrap().is_none());
+        assert_eq!(
+            audit_actor(&db, "provider_account.delete", "alice-codex"),
+            Some("admin".to_string()),
+            "the cascade has to name who ordered the deletion"
+        );
+        assert!(credential_summary(&db, "alice-codex").unwrap().is_none());
+        assert!(list_node_states(&db, "alice-codex").unwrap().is_empty());
+        assert_eq!(
+            list_grants(&db, "shared")
+                .unwrap()
+                .into_iter()
+                .map(|g| g.subject_id)
+                .collect::<Vec<_>>(),
+            vec!["bob".to_string()],
+            "the shared account stays, the departed user's grant does not"
+        );
+    }
+
+    /// A deleted group leaves no grant behind, and the accounts it reached
+    /// survive it.
+    #[test]
+    fn deleting_a_group_takes_the_grants_that_named_it() {
+        let db = pool();
+        seed_user(&db, "alice");
+        seed_group(&db, "platform", &["alice"]);
+        global_account(&db, "shared");
+        set_grants(&db, "shared", &[grant("group", "platform")], "admin").unwrap();
+        assert!(user_may_use_account(&db, ORG, "shared", "alice").unwrap());
+
+        crate::db::repository::delete_group(&db, "platform").unwrap();
+
+        assert!(list_grants(&db, "shared").unwrap().is_empty());
+        assert!(!user_may_use_account(&db, ORG, "shared", "alice").unwrap());
+        assert!(get_account(&db, "shared").unwrap().is_some());
+    }
+
+    /// A node removed from the registry leaves the matrix and stops being
+    /// anybody's home node — an account homed nowhere asks for a new home, an
+    /// account homed on a node that does not exist asks for nothing.
+    #[test]
+    fn deleting_a_node_clears_its_matrix_row_and_the_accounts_homed_on_it() {
+        let db = pool();
+        seed_local_node(&db, "helios");
+        set_engine_state(
+            &db,
+            "claude-code",
+            "installed",
+            Some("2.1.0"),
+            None,
+            Some("admin"),
+        )
+        .unwrap();
+        set_receives_accounts(&db, "helios", true, Some("admin")).unwrap();
+        global_account(&db, "shared");
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                home_node_id: Some("helios".into()),
+                ..AccountUpdate::default()
+            },
+            Some("admin"),
+        )
+        .unwrap();
+        set_node_state(&db, "shared", "helios", 1, "ready", None).unwrap();
+
+        crate::db::repository::delete_sync_node(&db, "helios").unwrap();
+
+        assert!(list_runtime_nodes(&db).unwrap().is_empty());
+        assert!(list_node_states(&db, "shared").unwrap().is_empty());
+        assert!(get_account(&db, "shared")
+            .unwrap()
+            .unwrap()
+            .home_node_id
+            .is_none());
+    }
+
+    /// Every mutation leaves one audit row naming the actor, and a credential
+    /// row identifies the material without being able to reproduce it.
+    #[test]
+    fn every_account_mutation_is_audited_with_a_non_reversible_fingerprint() {
+        let db = pool();
+        let cipher = cipher();
+        seed_user(&db, "alice");
+        global_account(&db, "shared");
+        set_grants(&db, "shared", &[grant("user", "alice")], "admin").unwrap();
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "key-one",
+            &CredentialMeta {
+                actor: Some("admin".into()),
+                ..CredentialMeta::default()
+            },
+        )
+        .unwrap();
+        // A second writer claiming the same revision for other material.
+        set_credential(
+            &db,
+            &cipher,
+            "shared",
+            1,
+            "key-two",
+            &CredentialMeta {
+                actor: Some("admin".into()),
+                ..CredentialMeta::default()
+            },
+        )
+        .unwrap();
+        clear_credential(&db, "shared", Some("admin")).unwrap();
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                display_name: Some("Renamed".into()),
+                ..AccountUpdate::default()
+            },
+            Some("admin"),
+        )
+        .unwrap();
+        delete_account(&db, "shared", Some("admin")).unwrap();
+
+        assert_eq!(
+            audit_actions(&db, "shared"),
+            vec![
+                "provider_account.create",
+                "provider_account.grants_set",
+                "provider_account.credential_set",
+                "provider_account.credential_conflict",
+                "provider_account.credential_clear",
+                "provider_account.update",
+                "provider_account.delete",
+            ]
+        );
+
+        let conn = db.read().unwrap();
+        let (user, details): (String, String) = conn
+            .query_row(
+                "SELECT user_id, details FROM audit_log \
+                 WHERE action = 'provider_account.credential_set'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(user, "admin");
+        let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+        assert_eq!(details["rotated"], serde_json::json!(false));
+        assert_eq!(
+            details["fingerprint"],
+            serde_json::json!(credential_fingerprint(&sha256_hex("key-one"))),
+        );
+        assert!(
+            !details.to_string().contains("key-one"),
+            "the audit row must not carry the material"
+        );
+
+        // Putting a vendor CLI on a node and taking it away again are operator
+        // decisions about a machine, so they are attributed the same way.
+        seed_local_node(&db, "helios");
+        set_engine_state(
+            &db,
+            "codex",
+            "installed",
+            Some("0.60.0"),
+            None,
+            Some("admin"),
+        )
+        .unwrap();
+        clear_engine_state(&db, "codex", Some("admin")).unwrap();
+        assert_eq!(
+            audit_actions(&db, "helios"),
+            vec![
+                "agent_runtime.engine_install",
+                "agent_runtime.engine_uninstall"
+            ]
+        );
+        assert_eq!(
+            audit_actor(&db, "agent_runtime.engine_install", "helios").as_deref(),
+            Some("admin")
+        );
+    }
+
+    /// An account that a refusal moved to `needs_login` is working again the
+    /// moment its credential is confirmed — re-pasting the SAME api key used to
+    /// commit before the status was settled, which left the account locked out
+    /// with a key that works.
+    #[test]
+    fn re_confirming_the_stored_credential_takes_the_account_out_of_needs_login() {
+        let db = pool();
+        let cipher = cipher();
+        global_account(&db, "shared");
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "key-one",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        record_credential_rejection(&db, "shared", "codex", "identity_mismatch", "aa").unwrap();
+        assert_eq!(
+            get_account(&db, "shared").unwrap().unwrap().status,
+            "needs_login"
+        );
+
+        let outcome = mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "key-one",
+            &CredentialMeta {
+                actor: Some("admin".into()),
+                provider_subject: Some("account:acct-1".into()),
+                ..CredentialMeta::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, CredentialWrite::Unchanged { revision: 1 });
+        let account = get_account(&db, "shared").unwrap().unwrap();
+        assert_eq!(account.status, "active");
+        assert_eq!(
+            account.provider_subject.as_deref(),
+            Some("account:acct-1"),
+            "a replay still carries the identity the material names"
+        );
+        assert_eq!(
+            credential_summary(&db, "shared").unwrap().unwrap().revision,
+            1,
+            "nothing was rotated, so the revision may not move"
+        );
+        assert!(audit_actions(&db, "shared")
+            .contains(&"provider_account.credential_reaffirmed".to_string()));
+
+        // A disabled account is an administrator's decision, and confirming a
+        // credential is not a way around it.
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                status: Some("disabled".into()),
+                ..AccountUpdate::default()
+            },
+            Some("admin"),
+        )
+        .unwrap();
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "key-one",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            get_account(&db, "shared").unwrap().unwrap().status,
+            "disabled"
+        );
+    }
+
+    /// The two identity refusals carry different weight, because they are
+    /// different measurements: a comparison that disagreed is conclusive, one
+    /// that could not be made is not.
+    #[test]
+    fn a_single_identity_mismatch_asks_for_a_new_sign_in() {
+        let db = pool();
+        let cipher = cipher();
+        global_account(&db, "mismatch");
+        global_account(&db, "unverifiable");
+        for account in ["mismatch", "unverifiable"] {
+            mint_credential(&db, &cipher, account, "key", &CredentialMeta::default()).unwrap();
+        }
+
+        assert!(
+            record_credential_rejection(&db, "mismatch", "codex", "identity_mismatch", "aa")
+                .unwrap(),
+            "one credential naming another account is enough"
+        );
+        assert_eq!(
+            get_account(&db, "mismatch").unwrap().unwrap().status,
+            "needs_login"
+        );
+
+        assert!(
+            !record_credential_rejection(
+                &db,
+                "unverifiable",
+                "muse-code",
+                "identity_unverifiable",
+                "bb"
+            )
+            .unwrap(),
+            "a format with no subject is the ordinary answer for muse and grok"
+        );
+        assert_eq!(
+            get_account(&db, "unverifiable").unwrap().unwrap().status,
+            "active"
+        );
+        assert!(record_credential_rejection(
+            &db,
+            "unverifiable",
+            "muse-code",
+            "identity_unverifiable",
+            "cc"
+        )
+        .unwrap());
+        assert_eq!(
+            get_account(&db, "unverifiable").unwrap().unwrap().status,
+            "needs_login"
+        );
+    }
+
+    /// A node that failed to apply a credential keeps the revision it already
+    /// holds: reporting a 0 would make the next rotation claim a revision the
+    /// store already minted, and that conflict disables the shared account.
+    #[test]
+    fn a_failed_materialization_keeps_the_revision_the_node_holds() {
+        let db = pool();
+        global_account(&db, "shared");
+        set_node_state(&db, "shared", "helios", 3, "ready", None).unwrap();
+
+        set_node_error(&db, "shared", "helios", "the bridge did not answer").unwrap();
+        let state = node_state(&db, "shared", "helios").unwrap().unwrap();
+        assert_eq!(state.applied_revision, 3);
+        assert_eq!(state.runtime_state, "error");
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("the bridge did not answer")
+        );
+
+        // A node that never held anything records the failure with nothing.
+        set_node_error(&db, "shared", "selene", "engine is not installed").unwrap();
+        let fresh = node_state(&db, "shared", "selene").unwrap().unwrap();
+        assert_eq!(fresh.applied_revision, 0);
+        assert_eq!(fresh.runtime_state, "error");
+    }
+
+    /// The gate every credential-bearing operation asks: a node nobody decided
+    /// about reads exactly like a node somebody decided against.
+    #[test]
+    fn a_node_nobody_configured_does_not_receive_accounts() {
+        let db = pool();
+        seed_local_node(&db, "helios");
+        assert!(!receives_accounts(&db, "helios").unwrap());
+        set_receives_accounts(&db, "helios", true, Some("admin")).unwrap();
+        assert!(receives_accounts(&db, "helios").unwrap());
+        set_receives_accounts(&db, "helios", false, Some("admin")).unwrap();
+        assert!(!receives_accounts(&db, "helios").unwrap());
+    }
+
+    /// The grants audit names what changed, not the whole list: an editor who
+    /// removes one subject must be readable as having removed exactly that one.
+    #[test]
+    fn the_grants_audit_records_the_difference() {
+        let db = pool();
+        for user in ["alice", "bob"] {
+            seed_user(&db, user);
+        }
+        global_account(&db, "shared");
+        set_grants(&db, "shared", &[grant("user", "alice")], "admin").unwrap();
+        set_grants(&db, "shared", &[grant("user", "bob")], "admin").unwrap();
+
+        let conn = db.read().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT details FROM audit_log WHERE action = 'provider_account.grants_set' \
+                 ORDER BY id",
+            )
+            .unwrap();
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|d| serde_json::from_str(&d.unwrap()).unwrap())
+            .collect();
+        assert_eq!(rows[0]["added"], serde_json::json!(["user:alice"]));
+        assert_eq!(rows[0]["removed"], serde_json::json!([]));
+        assert_eq!(rows[1]["added"], serde_json::json!(["user:bob"]));
+        assert_eq!(rows[1]["removed"], serde_json::json!(["user:alice"]));
+    }
+
+    /// An engine row is a measurement of the local node, so it is written for
+    /// the local node and for no other.
+    #[test]
+    fn an_engine_state_is_recorded_for_the_local_node_only() {
+        let db = pool();
+        let refused = set_engine_state(&db, "claude-code", "installed", None, None, Some("admin"))
+            .expect_err("a node with no identity cannot measure itself");
+        assert!(refused.to_string().contains("node identity"), "{refused}");
+
+        seed_local_node(&db, "helios");
+        set_engine_state(&db, "claude-code", "installed", None, None, Some("admin")).unwrap();
+        let nodes = list_runtime_nodes(&db).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, "helios");
+    }
+
+    /// Turning the flag off on a node that carries nothing else removes the
+    /// row: "decided no" and "no decision" are the same state, and keeping both
+    /// would grow the matrix by one line per node ever toggled.
+    #[test]
+    fn disabling_a_node_that_holds_nothing_removes_its_row() {
+        let db = pool();
+        seed_local_node(&db, "helios");
+        set_receives_accounts(&db, "helios", true, Some("admin")).unwrap();
+        assert_eq!(list_runtime_nodes(&db).unwrap().len(), 1);
+
+        set_receives_accounts(&db, "helios", false, Some("admin")).unwrap();
+        assert!(list_runtime_nodes(&db).unwrap().is_empty());
+        assert_eq!(
+            audit_actions(&db, "helios"),
+            vec![
+                "agent_runtime.receives_accounts",
+                "agent_runtime.receives_accounts"
+            ]
+        );
+
+        // A node that reports engines keeps its row, flag and all.
+        set_engine_state(&db, "claude-code", "installed", None, None, Some("admin")).unwrap();
+        set_receives_accounts(&db, "helios", false, Some("admin")).unwrap();
+        let nodes = list_runtime_nodes(&db).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert!(!nodes[0].receives_accounts);
+        assert_eq!(nodes[0].engines.len(), 1);
     }
 }

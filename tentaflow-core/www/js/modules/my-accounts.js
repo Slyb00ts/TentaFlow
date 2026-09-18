@@ -17,12 +17,16 @@ import {
   AgentAccounts,
   T,
   accountSubtitle,
+  credentialKindLabel,
   engineName,
   engineTile,
+  errorText,
   statusChipHtml,
+  usedOnLabel,
   whenLabel,
 } from '/js/modules/agent-accounts.js';
 import { openCreateAccountWindow } from '/js/modules/agent-accounts-window.js';
+import { openLoginWizard } from '/js/modules/agent-accounts-login.js';
 
 let entries = [];
 // U01 — the caller's agent applications: the engine catalog and the accounts
@@ -412,7 +416,7 @@ async function loadAgentApps() {
   } catch (err) {
     agentEngines = [];
     agentAccounts = [];
-    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+    toast(errorText(err), 'error');
   }
   renderAgentApps();
 }
@@ -454,18 +458,36 @@ function renderAgentCard(engineId) {
 }
 
 function renderOwnAccount(account) {
-  const title = accountSubtitle(account) || account.display_name || '';
+  // The account's NAME leads, the way the mockup's connected card does; the
+  // provider identity, where it is in use and how it authenticates are the
+  // lines under it.
+  const title = account.display_name || accountSubtitle(account) || '';
   const lastUsed = account.last_used_at ?? account.lastUsedAt;
-  const meta = lastUsed ? T('apps_last_used', { when: whenLabel(lastUsed) }) : T('apps_never_used');
+  const used = lastUsed ? T('apps_last_used', { when: whenLabel(lastUsed) }) : T('apps_never_used');
+  const kind = credentialKindLabel(account.credential_kind ?? account.credentialKind);
+  const meta = [accountSubtitle(account), kind, used].filter(Boolean).join(' · ');
+  // "Używane na" and the session count are what THIS node measured; a session
+  // running on a peer is in neither, which is why the line says "tu".
+  const sessions = Number(account.session_count ?? account.sessionCount ?? 0);
+  const usage = [
+    T('apps_used_on', { nodes: usedOnLabel(account) }),
+    sessions > 0 ? T('apps_sessions', { count: sessions }) : '',
+  ].filter(Boolean).join(' · ');
   const canDelete = (account.can_delete ?? account.canDelete) !== false;
+  const canLogin = (account.can_login ?? account.canLogin) === true;
+  // U01 carries a status, not a credential revision: an account that is active
+  // holds one, and anything else is still waiting for a first sign-in.
+  const signedIn = account.status === 'active';
   return `
     <div class="myapp-linked">
       <div class="linked-avatar">${escapeHtml(initials(title))}</div>
       <div class="linked-info">
         <div class="linked-email">${escapeHtml(title)}</div>
         <div class="linked-meta">${escapeHtml(meta)}</div>
+        <div class="linked-meta">${escapeHtml(usage)}</div>
       </div>
       <div class="linked-actions">
+        ${canLogin ? `<tf-button variant="secondary" size="sm" data-role="app-login">${escapeHtml(T(signedIn ? 'action_relogin' : 'action_login'))}</tf-button>` : ''}
         ${canDelete ? `<tf-button variant="ghost" size="sm" data-role="app-disconnect">${escapeHtml(T('apps_disconnect'))}</tf-button>` : ''}
       </div>
     </div>
@@ -497,6 +519,26 @@ function renderConnectPrompt() {
   `;
 }
 
+/** The caller's OWN account for one engine, which is the only one they manage. */
+function ownAccount(engineId) {
+  return agentAccounts.find(
+    (a) => (a.engine_id ?? a.engineId) === engineId && a.scope === 'user',
+  ) ?? null;
+}
+
+// A02 for a personal account. The node is Core's to pick: reading the runtime
+// matrix is an administrator's right, so a user signing their own account in
+// names no node and the account's home (or this one) runs the terminal.
+function openOwnLogin(account, engineId) {
+  openLoginWizard({
+    accountId: account.account_id ?? account.accountId,
+    accountName: account.display_name ?? account.displayName ?? '',
+    engineId,
+    engines: agentEngines,
+    onFinished: () => loadAgentApps(),
+  });
+}
+
 function wireAgentCards(grid) {
   grid.querySelectorAll('.myapp-card[data-engine]').forEach((card) => {
     const engineId = card.dataset.engine;
@@ -505,13 +547,22 @@ function wireAgentCards(grid) {
       openCreateAccountWindow({
         engines: engine ? [engine] : agentEngines,
         scope: 'user',
-        onCreated: () => loadAgentApps(),
+        // Connecting is one step in the person's head: the account is created
+        // and the sign-in it exists for opens on top of it.
+        onCreated: () => loadAgentApps().then(() => {
+          const account = ownAccount(engineId);
+          if (account && (account.can_login ?? account.canLogin) === true) {
+            openOwnLogin(account, engineId);
+          }
+        }),
       });
     });
+    card.querySelector('[data-role="app-login"]')?.addEventListener('click', () => {
+      const account = ownAccount(engineId);
+      if (account) openOwnLogin(account, engineId);
+    });
     card.querySelector('[data-role="app-disconnect"]')?.addEventListener('click', async () => {
-      const account = agentAccounts.find(
-        (a) => (a.engine_id ?? a.engineId) === engineId && a.scope === 'user',
-      );
+      const account = ownAccount(engineId);
       if (!account) return;
       const ok = await TfWindow.confirm({
         title: T('apps_disconnect_confirm_title'),
@@ -526,7 +577,7 @@ function wireAgentCards(grid) {
         toast(T('apps_disconnected'), 'success');
         await loadAgentApps();
       } catch (err) {
-        toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+        toast(errorText(err), 'error');
       }
     });
   });

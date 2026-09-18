@@ -1589,7 +1589,6 @@ async fn child_main() {
         match handle_child_command(
             &line,
             &db,
-            &cipher,
             &security,
             &mesh,
             &svc,
@@ -1609,7 +1608,6 @@ async fn child_main() {
 async fn handle_child_command(
     line: &str,
     db: &tentaflow_core::db::DbPool,
-    cipher: &Arc<tentaflow_core::crypto::SettingsCipher>,
     security: &MeshSecurity,
     mesh: &IrohMeshManager,
     svc: &Arc<tentaflow_core::bus::BusService>,
@@ -1777,7 +1775,7 @@ async fn handle_child_command(
             // together instead of the leader racing ahead.
             let operation = tentaflow_core::sync::runtime::get_operation(op_id)?
                 .ok_or_else(|| anyhow::anyhow!("just-authored operation not found in ledger"))?;
-            tentaflow_core::sync::core_materializer::apply_core_operation(db, cipher, &operation)?;
+            tentaflow_core::sync::core_materializer::apply_core_operation(db, &operation)?;
             Ok("ASSIGN".to_string())
         }
         ["ROLE", org, topic, partition] => {

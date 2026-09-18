@@ -3619,7 +3619,6 @@ async function startDeploy() {
       deployId: id,
       engineId: eng.id,
       deployMethod: selection.deployMethod,
-      nodeId: selection.nodeId,
     });
   } catch (err) {
     deployInFlight = false;
