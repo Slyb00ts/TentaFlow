@@ -922,6 +922,57 @@ test('a disk alert drills down to that disk', async () => {
   Screen.unmount();
 });
 
+test('an alert subline prints a subject name but never a machine id', async () => {
+  // The node passes a NAME as `subjectId` for most kinds, and the row prints it
+  // ("target vm-store"). A disk alert carries `wwn-<hex>` instead and an
+  // approval carries the request UUID — neither says anything the title has
+  // not said, and the mockups show no identifier in an alert row at all. The
+  // value stays reachable as the tooltip.
+  stubTransport({
+    ...fixtures,
+    tentaNasAlertsListRequest: {
+      alerts: [
+        { alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'wwn-5000cca27dc7a4c6', title: 'Disk sdg: warning', detail: '1 UDMA CRC errors', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
+        { alertId: 'a2', severity: 'warning', subjectKind: 'approval', subjectId: '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70', title: 'Operacja czeka na drugiego admina', detail: 'pool tank', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
+        { alertId: 'a3', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'produkt', title: 'Macierz oczekuje na przywrócenie', detail: 'wymagane jawne Przywróć', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
+      ],
+    },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const rows = [...root.querySelectorAll('#nas-ov-alerts .alert-row')];
+  assert.equal(rows.length, 3);
+
+  const disk = rows[0].querySelector('.a-sub');
+  assert.doesNotMatch(disk.textContent, /wwn-/);
+  assert.equal(disk.getAttribute('title'), 'wwn-5000cca27dc7a4c6');
+
+  assert.doesNotMatch(rows[1].querySelector('.a-sub').textContent, /0191f2c0/);
+
+  // …and a real name still shows, next to the translated kind.
+  assert.match(rows[2].querySelector('.a-sub').textContent, /produkt/);
+  Screen.unmount();
+});
+
+test('the fleet node table names a node instead of printing its node id', async () => {
+  // n16 prints `atlas` and `orion`. The 64-hex node id is not a name; it is the
+  // tooltip, for the one case two nodes answer to the same hostname.
+  stubTransport(fixtures);
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  Screen.switchTab('environment');
+  await flush();
+  await flush();
+  const others = root.querySelector('#nas-others-table').rows;
+  assert.equal(others.length, 2);
+  for (const row of others) {
+    assert.match(row.name, new RegExp(row._node.nodeName), 'the node is named');
+    assert.doesNotMatch(row.name, /class="l2 mono"/, 'no id sub-line');
+    assert.match(row.name, new RegExp(`title="${row._node.nodeId}"`), 'the id is the tooltip');
+  }
+  Screen.unmount();
+});
+
 test('overview feeds every poll into the live throughput and temperature charts', async () => {
   stubTransport(fixtures);
   const root = await mountScreen({ node: LOCAL });

@@ -214,7 +214,60 @@ fn staging_dir(g: &Gate) -> Result<std::path::PathBuf, ProtocolError> {
         .map_err(|e| internal("data dir", format!("{e:?}")))
 }
 
-fn job_response(job: tentaflow_protocol::tentanas::NasJob) -> MessageBody {
+/// A job's `started_by` and an approval's `requested_by` / `decided_by` hold a
+/// USER UUID, and the record must keep it that way: an account can be renamed,
+/// and an audit trail that moves with the name proves nothing about who acted.
+/// It is not what belongs on screen — the mockups name a person ("Anna ·
+/// Admin") and a bare `0191f2c0-…` is the one thing an admin cannot recognise.
+/// So the id is resolved HERE, at the read boundary, for display only.
+///
+/// An id with no account behind it is returned unchanged, which is what keeps
+/// the scheduler's own `started_by = "scheduler"` readable, and what a deleted
+/// account falls back to.
+fn display_names(
+    ctx: &HandlerContext,
+    ids: &[String],
+) -> std::collections::HashMap<String, String> {
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    crate::db::repository::lookup_user_names(&ctx.state.db, ids)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, row)| {
+            let name = if row.display_name.is_empty() {
+                row.username
+            } else {
+                row.display_name
+            };
+            (!name.is_empty()).then_some((id, name))
+        })
+        .collect()
+}
+
+fn name_jobs(ctx: &HandlerContext, jobs: &mut [tentaflow_protocol::tentanas::NasJob]) {
+    let ids: Vec<String> = jobs.iter().map(|j| j.started_by.clone()).collect();
+    let names = display_names(ctx, &ids);
+    for job in jobs.iter_mut() {
+        if let Some(name) = names.get(&job.started_by) {
+            job.started_by = name.clone();
+        }
+        // A job's `subject` is a NAME for every kind but one: a SMART test is
+        // spawned on the `disk_id`, because that string is also the key the
+        // spawn refuses a second job on — two call sites depend on it, so the
+        // stored subject stays the id and only the shown one becomes `sdg`.
+        // n15 reads "SMART long: sdd".
+        if job.kind == "smart_test" {
+            if let Some(name) = tentanas::disks::disk_name(&job.subject) {
+                job.subject = name;
+            }
+        }
+    }
+}
+
+fn job_response(ctx: &HandlerContext, job: tentaflow_protocol::tentanas::NasJob) -> MessageBody {
+    let mut job = job;
+    name_jobs(ctx, std::slice::from_mut(&mut job));
     tn(P::JobResponse { job })
 }
 
@@ -264,7 +317,7 @@ async fn elevation_provision(ctx: &HandlerContext, secret: &SudoSecret) -> Resul
         tentanas::jobs::provision_helper(h, token, staging, admin)
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 fn elevation_catalog(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
@@ -316,7 +369,7 @@ async fn elevation_remove(ctx: &HandlerContext, secret: &SudoSecret) -> Result<M
         tentanas::jobs::remove_helper(h, token)
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 async fn packages_install(
@@ -340,13 +393,14 @@ async fn packages_install(
         tentanas::jobs::install_packages(h, manager, packages, explicit)
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 fn jobs_list(ctx: &HandlerContext, limit: u32) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let jobs = store::list_jobs(&g.db, if limit == 0 { 50 } else { limit })
+    let mut jobs = store::list_jobs(&g.db, if limit == 0 { 50 } else { limit })
         .map_err(|e| internal("jobs", e))?;
+    name_jobs(ctx, &mut jobs);
     Ok(tn(P::JobsListResponse { jobs }))
 }
 
@@ -355,7 +409,7 @@ fn job_get(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolEr
     let job = store::job(&g.db, job_id)
         .map_err(|e| internal("jobs", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 fn job_cancel(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolError> {
@@ -373,7 +427,7 @@ fn job_cancel(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, Protoco
             "job is not running on this node",
         ));
     }
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 async fn disks_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
@@ -459,7 +513,7 @@ async fn disk_smart_test(
         tentanas::jobs::smart_self_test(h, device, kind, explicit)
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 async fn disk_locate(ctx: &HandlerContext, disk_id: &str, enable: bool) -> Result<MessageBody, ProtocolError> {
@@ -576,7 +630,7 @@ async fn disk_wipe(
         move |h| tentanas::disks::wipe_job(h, command, explicit),
     )
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 // ----- pools ------------------------------------------------------------------------
@@ -734,7 +788,7 @@ async fn pool_create(
         tentanas::pools::create_job(h, command, key, explicit)
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// `PoolCreateRequest` without the protocol's borrow shape, so the handler
@@ -759,6 +813,7 @@ fn catalog_error(e: tentanas_helper::CatalogError) -> BrokerError {
 
 /// Spawns a one-command pool job and answers with it.
 fn spawn_pool_job(
+    ctx: &HandlerContext,
     g: &Gate,
     kind: &str,
     subject: &str,
@@ -773,11 +828,12 @@ fn spawn_pool_job(
         tentanas::pools::command_job(h, command, explicit)
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// A destroy job: the command, then the encryption keys of what it removed.
 fn spawn_destroy_job(
+    ctx: &HandlerContext,
     g: &Gate,
     kind: &str,
     subject: &str,
@@ -795,7 +851,7 @@ fn spawn_destroy_job(
         tentanas::datasets::destroy_job(h, command, addon_id, name, subtree, explicit)
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// Runs one catalog command right now and maps its exit into a protocol
@@ -864,6 +920,7 @@ async fn pool_destroy(
         );
     }
     let answer = spawn_destroy_job(
+        ctx,
         &g,
         "pool_destroy",
         name,
@@ -895,7 +952,7 @@ async fn pool_scrub(
             tentanas::pools::scrub_job(h, pool, explicit)
         })
         .map_err(|e| internal("job", e))?;
-        return Ok(job_response(job));
+        return Ok(job_response(ctx, job));
     }
     let scrub_action = match action {
         "pause" => tentanas_helper::ScrubAction::Pause,
@@ -996,7 +1053,7 @@ async fn pool_add_vdev(
         Ok(())
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 async fn pool_device_state(
@@ -1102,7 +1159,7 @@ async fn pool_trim(
             tentanas::pools::trim_job(h, pool, explicit)
         })
         .map_err(|e| internal("job", e))?;
-        return Ok(job_response(job));
+        return Ok(job_response(ctx, job));
     }
     let trim_action = match action {
         "suspend" => tentanas_helper::TrimAction::Suspend,
@@ -1291,6 +1348,7 @@ async fn dataset_destroy(
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
     let answer = spawn_destroy_job(
+        ctx,
         &g,
         "dataset_destroy",
         name,
@@ -1518,7 +1576,7 @@ async fn snapshot_destroy(
         }
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 async fn snapshot_rollback(
@@ -1531,6 +1589,7 @@ async fn snapshot_rollback(
     let g = gate(ctx, PERM_POOLS)?;
     require_confirm(name, confirm_name)?;
     spawn_pool_job(
+        ctx,
         &g,
         "snapshot_rollback",
         name,
@@ -1854,7 +1913,7 @@ fn spawn_apply_job(
         Ok(())
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// The two transport gates of a share, read from the CACHED environment the
@@ -2350,7 +2409,7 @@ fn spawn_target_job(
         Ok(())
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// Turns the wizard's authentication choice into the row's four columns,
@@ -2804,7 +2863,7 @@ async fn target_delete(
         Ok(())
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 fn fleet_mounts_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
@@ -2904,7 +2963,7 @@ async fn config_import_apply(
         outcome
     })
     .map_err(|e| internal("job", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 // ----- ARC ---------------------------------------------------------------------------
@@ -3049,7 +3108,7 @@ async fn snapshot_protection_release(
     require_confirm(snapshot, confirm_snapshot)?;
     let job = tentanas::snapshots::spawn_release(&g.db, snapshot, &g.user_id, secret.map(token))
         .map_err(|e| internal("snapshot release", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 // ----- the file access audit (§5.10) --------------------------------------------------
@@ -3132,8 +3191,22 @@ fn approvals_view(
     include_closed: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let a = actor(ctx, g)?;
-    let approvals =
+    let mut approvals =
         tentanas::approvals::list(&a, include_closed).map_err(|e| internal("approvals", e))?;
+    let ids: Vec<String> = approvals
+        .iter()
+        .flat_map(|r| [Some(r.requested_by.clone()), r.decided_by.clone()])
+        .flatten()
+        .collect();
+    let names = display_names(ctx, &ids);
+    for row in approvals.iter_mut() {
+        if let Some(name) = names.get(&row.requested_by) {
+            row.requested_by = name.clone();
+        }
+        if let Some(name) = row.decided_by.as_ref().and_then(|id| names.get(id)).cloned() {
+            row.decided_by = Some(name);
+        }
+    }
     Ok(tn(P::ApprovalsListResponse {
         approvals,
         settings: tentanas::approvals::settings(a.main_db, a.checker, a.org_id, a.addon_id),
@@ -3247,7 +3320,7 @@ async fn execute_approved(
             let explicit = secret.map(token);
             let job = tentanas::snapshots::spawn_release(&g.db, snapshot, &g.user_id, explicit)
                 .map_err(|e| internal("snapshot release", e))?;
-            Ok(job_response(job))
+            Ok(job_response(ctx, job))
         }
         other => Err(ProtocolError::bad_request(format!(
             "'{}' is not an approvable operation",
@@ -3351,7 +3424,7 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     let intent = tentanas::jobs::ElasticJobIntent::Create(spec.clone());
     let job = tentanas::jobs::spawn(&g.db,"elastic_create",name,&g.user_id,Some(intent),None,
         move |h| tentanas::elastic::create_job(h,spec,explicit)).map_err(|e| internal("elastic create",e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSecret>) -> Result<MessageBody,ProtocolError> {
@@ -3361,7 +3434,7 @@ async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSec
         .ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
     let job = tentanas::elastic::spawn_restore(&g.db,&row,&g.user_id,secret.map(token),None)
         .map_err(|e| internal("elastic restore",e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// A refusal from the import path is an answer the admin has to read — "this
@@ -3560,7 +3633,7 @@ async fn elastic_snapraid(
     }
     let job = tentanas::elastic::spawn_snapraid(&g.db, &array, &g.user_id, secret.map(token), kind)
         .map_err(|e| internal("elastic snapraid", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// §5.3's headline: one more data disk on an array that keeps serving.
@@ -3713,7 +3786,7 @@ async fn elastic_add_disk(
     }
     let job = tentanas::elastic::spawn_add_disk(&g.db, &array, &g.user_id, explicit, disk)
         .map_err(|e| internal("elastic add disk", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// DISK REPLACEMENT IS WITHDRAWN (round 4, owner's decision), and this handler
@@ -3849,7 +3922,7 @@ async fn elastic_destroy(
     }
     let job = tentanas::elastic::spawn_dissolve(&g.db, &array, &g.user_id, secret.map(token))
         .map_err(|e| internal("elastic destroy", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// "Uruchom mover teraz" (n11): one mover run, started by hand.
@@ -3918,7 +3991,7 @@ async fn elastic_mover(
     }
     let job = tentanas::elastic::spawn_mover(&g.db, &array, &g.user_id, secret.map(token))
         .map_err(|e| internal("elastic mover", e))?;
-    Ok(job_response(job))
+    Ok(job_response(ctx, job))
 }
 
 /// The cadence in words, for the approval row an admin has to read and agree
@@ -4406,6 +4479,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         } => {
             let g = gate_destructive(ctx)?;
             let answer = spawn_pool_job(
+                ctx,
                 &g,
                 "pool_export",
                 name,
@@ -4429,6 +4503,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         } => {
             let g = gate_destructive(ctx)?;
             spawn_pool_job(
+                ctx,
                 &g,
                 "pool_import",
                 if new_name.is_empty() { guid } else { new_name },
@@ -4456,6 +4531,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             let g = gate(ctx, PERM_POOLS)?;
             let disks = disks_by_id(std::slice::from_ref(disk_id), true)?;
             spawn_pool_job(
+                ctx,
                 &g,
                 "pool_expand_vdev",
                 name,
@@ -4474,6 +4550,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         } => {
             let g = gate(ctx, PERM_POOLS)?;
             spawn_pool_job(
+                ctx,
                 &g,
                 "pool_remove_vdev",
                 name,
@@ -4508,7 +4585,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 tentanas::pools::replace_job(h, pool, command, explicit)
             })
             .map_err(|e| internal("job", e))?;
-            Ok(job_response(job))
+            Ok(job_response(ctx, job))
         }
         P::PoolDeviceStateRequest {
             name,

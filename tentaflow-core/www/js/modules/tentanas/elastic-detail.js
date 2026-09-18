@@ -150,7 +150,7 @@ function diskHtml(disk, filesystem, repair = '') {
     <span class="health-dot ${healthClass(disk.health)}"></span>
     <div class="dc-main"><div class="dc-name"><span class="mono">${escapeHtml(disk.name)}</span></div>
       <div class="dc-sub"><span data-fig="disk-usage"></span> · ${escapeHtml(filesystem.toUpperCase())}</div>
-      <div class="dc-sub">${escapeHtml(disk.device || disk.diskId)}</div>
+      <div class="dc-sub">${escapeHtml(disk.device || disk.name)}</div>
       <div class="dc-sub">${escapeHtml(T('elastic.mounted'))}: ${escapeHtml(triState(disk.mounted))} · ${escapeHtml(T('elastic.present'))}: ${escapeHtml(triState(disk.devicePresent))}</div>
       <div class="dc-sub mono">${escapeHtml(disk.mountpoint)}</div>
     </div>${repair ? `<tf-button variant="danger" size="sm" icon="shield" data-act="fix" title="${escapeAttr(repair)}">${escapeHtml(T('elastic.repair'))}</tf-button>` : ''}<tf-button variant="ghost" size="sm" icon="external-link" data-act="disk" title="${escapeAttr(T('elastic.disk_details', { name: disk.name }))}"></tf-button>

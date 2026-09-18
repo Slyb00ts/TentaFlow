@@ -311,7 +311,19 @@ fn prefixed_map(db: &DbPool, addon_id: &str, prefix: &str) -> HashMap<String, St
         .collect()
 }
 
+/// THE PEER STORE NEVER HOLDS THIS NODE. `seed_discovered_peer` returns early
+/// on `node_id == local_node_id`, so asking it for the local hostname always
+/// answers `None` and the fallback used to publish the 64-hex node id as the
+/// node's NAME — on every install, in every fleet view. The machine's own
+/// hostname is what the rest of the core already shows for itself, so it is
+/// what this asks first for the local row.
 fn node_name(ctx: &HandlerContext, node_id: &str) -> String {
+    if node_id == ctx.state.local_node_id.to_string() {
+        let local = crate::mesh::node_info_collector::local_hostname();
+        if !local.is_empty() && local != "unknown" {
+            return local;
+        }
+    }
     ctx.state
         .mesh_peer_store
         .get_hostname(node_id)

@@ -1484,6 +1484,18 @@ pub fn disk(disk_id: &str) -> Option<NasDisk> {
 /// Device path of a known disk, for privileged commands (the catalog then
 /// validates it again — the id → path mapping is this node's own inventory,
 /// never a caller-supplied path).
+/// The kernel name (`sdg`) behind a `disk_id` (`wwn-5000cca27dc7a4c6`), for
+/// the surfaces that must SHOW a disk rather than identify it. `disk()` would
+/// answer too, but it clones the whole I/O history with it.
+pub fn disk_name(disk_id: &str) -> Option<String> {
+    state()
+        .read()
+        .disks
+        .get(disk_id)
+        .map(|l| l.disk.name.clone())
+        .filter(|n| !n.is_empty())
+}
+
 pub fn device_path(disk_id: &str) -> Option<String> {
     state().read().disks.get(disk_id).map(|l| l.disk.path.clone())
 }

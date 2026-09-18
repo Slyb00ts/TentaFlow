@@ -1630,6 +1630,9 @@ const TentaNasScreen = {
       patchHtml(el, `<div class="muted">${escapeHtml(T('alerts.none'))}</div>`);
       return;
     }
+    // `subjectId` is a machine id — wwn-5000cca27dc7a4c6 for a disk, a request
+    // UUID for an approval — and the title already names the subject, so the
+    // subline carries only the kind. The fleet alert table never printed it.
     const html = alerts.map((a, i) => {
       const target = alertTarget(a);
       return `
@@ -1637,7 +1640,7 @@ const TentaNasScreen = {
         ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
         <div class="a-main">
           <div class="a-title">${escapeHtml(a.title)}</div>
-          <div class="a-sub">${escapeHtml(a.detail)} · ${escapeHtml(subjectKindLabel(a.subjectKind))} ${escapeHtml(a.subjectId)} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
+          <div class="a-sub" title="${escapeAttr(a.subjectId)}">${escapeHtml(a.detail)} · ${escapeHtml([subjectKindLabel(a.subjectKind), alertSubjectName(a.subjectId)].filter(Boolean).join(' '))} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
         </div>
         ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
         <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${i}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
@@ -2639,7 +2642,10 @@ const TentaNasScreen = {
     const otable = body.querySelector('#nas-others-table');
     otable.rows = others.map((n) => ({
       _node: n,
-      name: `<div class="cell-2"><div class="l1">${escapeHtml(n.nodeName)}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div><div class="l2 mono">${escapeHtml(n.nodeId.slice(0, 16))}…</div></div>`,
+      // The node id is NOT a name and the mockups never show one (n16 prints
+      // `atlas`, `orion`). It stays reachable as the tooltip, for the one case
+      // two nodes answer to the same hostname.
+      name: `<div class="cell-2" title="${escapeAttr(n.nodeId)}"><div class="l1">${escapeHtml(n.nodeName)}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div></div>`,
       platform: n.instanceStatus === 'ready' ? (n.osName || '—') : T('instance.' + n.instanceStatus),
       channel: { status: channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok', label: T('elevation.mode_' + channelMode(n.elevationMode)), dot: true },
       features: (n.features || []).join(' · ') || (n.instanceStatus === 'ready' ? T('env.features_unknown') : T('instance.' + n.instanceStatus)),
@@ -3213,6 +3219,20 @@ function subjectKindLabel(kind) {
   const key = `alerts.subject.${kind}`;
   const label = T(key);
   return label === key ? kind : label;
+}
+
+// An alert's `subjectId` is a NAME for most kinds — the node passes `spec.name`
+// for an array, `row.name` for a target — and printing it is the point: "target
+// vm-store" is what an admin recognises. For two kinds it is a machine id
+// instead: a disk raises on `wwn-5000cca27dc7a4c6` (disks.rs builds it as
+// `wwn-<hex>` / `sn-<serial>`) and an approval on the request UUID. Those say
+// nothing the title has not already said, so the subline drops them rather
+// than deciding per kind — a kind added later must not silently start
+// printing a GUID.
+const MACHINE_ID = /^(wwn-|sn-|eui\.|nqn\.)|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function alertSubjectName(subjectId) {
+  const value = String(subjectId || '');
+  return MACHINE_ID.test(value) ? '' : value;
 }
 
 function alertTarget(alert) {

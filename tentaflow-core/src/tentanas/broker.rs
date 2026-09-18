@@ -433,12 +433,12 @@ fn version_gate(command: &HelperCommand, installed: Option<&str>) -> Result<(), 
         Some(version) => Err(BrokerError::HelperVersion(format!(
             "{HELPER_VERSION_MARKER}: zainstalowany helper ma wersję {version}, a ten rdzeń wymaga \
              {expected}. Operacja nie została uruchomiona — powtórz nadanie uprawnień systemowych \
-             (Środowisko → kanał uprawnień), aby zainstalować pasującą wersję helpera."
+             (TentaNas → Środowisko → kanał uprawnień), aby zainstalować pasującą wersję helpera."
         ))),
         None => Err(BrokerError::HelperVersion(format!(
             "{HELPER_VERSION_MARKER}: nie udało się odczytać wersji zainstalowanego helpera (ten \
              rdzeń wymaga {expected}). Operacja nie została uruchomiona — powtórz nadanie uprawnień \
-             systemowych (Środowisko → kanał uprawnień)."
+             systemowych (TentaNas → Środowisko → kanał uprawnień)."
         ))),
     }
 }
