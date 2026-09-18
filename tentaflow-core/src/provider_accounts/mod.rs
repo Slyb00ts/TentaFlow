@@ -12,6 +12,7 @@
 // operation.
 
 pub mod credential_events;
+pub mod credential_sync;
 pub mod login;
 pub mod repository;
 pub mod sync_capture;
@@ -115,6 +116,13 @@ pub struct AccountRecord {
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
+    /// High-water mark of credential revisions that must not be used anywhere.
+    /// `0` means nothing was ever revoked. It travels on the ledger with the
+    /// rest of the row because it is the only way a node holding a copy of a
+    /// cleared credential learns that it has to drop it: the material itself
+    /// never travels through the ledger, so the ABSENCE of a credential frame
+    /// is indistinguishable from the node that cleared it being offline.
+    pub credential_revoked_revision: i64,
 }
 
 impl AccountRecord {

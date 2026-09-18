@@ -138,6 +138,18 @@ pub fn write(root: &Path, provider: Provider, material: &[u8]) -> Result<()> {
     write_within(root, &relative(provider), material)
 }
 
+/// Removes the credential of `provider` under `root`, and answers whether there
+/// was one. Used when the account's credential is revoked: the bridge owns this
+/// file, so nothing else may unlink it, and leaving it behind would keep a token
+/// the organisation has retired in front of the next session.
+///
+/// A path component that is a link is refused rather than followed, exactly as
+/// on the read and write paths — a revocation must not become a way to delete an
+/// arbitrary file a link points at.
+pub fn remove(root: &Path, provider: Provider) -> Result<bool> {
+    remove_within(root, &relative(provider))
+}
+
 #[cfg(unix)]
 fn open_directory(root: &Path, relative: &Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::{
@@ -230,6 +242,42 @@ fn read_within(root: &Path, relative: &Path) -> Result<Option<Vec<u8>>> {
         bail!("a provider credential must be a bounded regular file");
     }
     Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn remove_within(root: &Path, relative: &Path) -> Result<bool> {
+    use std::os::unix::{ffi::OsStrExt, io::AsRawFd};
+    let name = relative.file_name().context("credential name missing")?;
+    let Some(directory) = open_directory(root, relative.parent().unwrap_or(Path::new("")))? else {
+        return Ok(false);
+    };
+    let file_name = std::ffi::CString::new(name.as_bytes())?;
+    // SAFETY: `directory` owns its descriptor across the call and `file_name` is
+    // a NUL-terminated buffer that outlives it.
+    let removed = unsafe { libc::unlinkat(directory.as_raw_fd(), file_name.as_ptr(), 0) };
+    if removed < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(false),
+            _ => Err(error.into()),
+        };
+    }
+    directory.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn remove_within(root: &Path, relative: &Path) -> Result<bool> {
+    let name = relative.file_name().context("credential name missing")?;
+    let Some(directory) = resolve_directory(root, relative.parent().unwrap_or(Path::new("")))?
+    else {
+        return Ok(false);
+    };
+    match std::fs::remove_file(directory.join(name)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(unix)]

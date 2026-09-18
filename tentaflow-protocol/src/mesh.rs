@@ -1648,6 +1648,10 @@ pub const MESH_MSG_CAMERA_STREAM_SUBSCRIBE: u8 = 0x52;
 /// Like the camera relay this is NOT a UFP/2 channel kind — it never travels as a
 /// UFP/2 unicast envelope, so the channel-kind range is untouched.
 pub const MESH_MSG_LIDAR_STREAM_SUBSCRIBE: u8 = 0x53;
+/// Agent-account credentials, each sealed for the one peer that receives the
+/// frame. Same reason as `MESH_MSG_SHARED_SECRETS_SYNC`: a provider token must
+/// not sit in a ledger body that a node which may not hold it stores and relays.
+pub const MESH_MSG_PROVIDER_CREDENTIALS_SYNC: u8 = 0x54;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)
@@ -1802,6 +1806,47 @@ pub struct SharedSecretEntry {
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct SharedSecretsSyncPayload {
     pub entries: Vec<SharedSecretEntry>,
+}
+
+/// One agent-account credential inside `ProviderCredentialsSyncPayload`.
+///
+/// `revision` is the account store's CAS counter, not a clock: the receiver
+/// applies the entry only when it is strictly newer than the revision it holds,
+/// and the same revision with different material is a conflict that leaves the
+/// stored credential alone. `sealed` opens only on the addressed peer and is
+/// bound to the account, the revision and the digest, so an entry cannot be
+/// replanted under another account or passed off as a different revision.
+/// `material_sha256` is the digest of the PLAINTEXT and is re-computed after
+/// opening — the receiver never stores material the sender did not name.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct ProviderCredentialEntry {
+    pub account_id: String,
+    pub revision: i64,
+    pub material_sha256: String,
+    pub provider_subject: Option<String>,
+    pub expires_at: Option<String>,
+    /// The node the sender believes owns rotation for this account. The
+    /// receiver decides by its OWN copy of `provider_accounts.home_node_id`;
+    /// this field is what an operator reads in a refusal, not an authorisation.
+    pub home_node_id: Option<String>,
+    /// The node that minted this revision, carried so the receiving store keeps
+    /// naming the node the PROVIDER's rotation happened on rather than whichever
+    /// peer handed the entry over.
+    pub refreshed_by_node: Option<String>,
+    #[serde(with = "serde_bytes")]
+    pub sealed: Vec<u8>,
+}
+
+/// Payload of `MESH_MSG_PROVIDER_CREDENTIALS_SYNC` — the agent-account
+/// credentials the sender may hand to THIS peer.
+///
+/// Unlike the sync ledger, whose operation bodies are stored and relayed in
+/// plaintext, this frame carries provider tokens: every entry is sealed for one
+/// recipient, and the sender only builds entries for a peer that is flagged
+/// `agent_runtime_nodes.receives_accounts`.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct ProviderCredentialsSyncPayload {
+    pub entries: Vec<ProviderCredentialEntry>,
 }
 
 /// F1b P3.C — wire-stable mirror of `services::frame_storage::FrameMetadata`.

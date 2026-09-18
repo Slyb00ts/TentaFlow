@@ -612,6 +612,11 @@ async fn adopt_credential(
         Some(actor_user_id),
     )?;
     store::set_node_state(db, account_id, node_id, revision, "ready", None)?;
+    // Every other node in the account fleet gets the new credential now. Without
+    // this a user whose agent runs on another node would be refused until that
+    // node reconnected, which is exactly the "sign in once, use anywhere"
+    // promise this feature exists to keep.
+    super::credential_sync::publish_to_fleet();
     // The digest identifies WHICH credential a node holds, so it belongs in the
     // audit row the store already writes, not in a log line that ships to
     // whatever collects stdout.

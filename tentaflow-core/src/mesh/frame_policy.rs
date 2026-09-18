@@ -8,8 +8,8 @@
 use tentaflow_protocol::mesh::{
     MESH_MSG_COMMAND, MESH_MSG_HEARTBEAT, MESH_MSG_HELLO, MESH_MSG_HMAC_KEYS_SYNC,
     MESH_MSG_KNOWN_PEERS, MESH_MSG_NODE_INFO, MESH_MSG_PAIRING_CONFIRM, MESH_MSG_PAIRING_REJECT,
-    MESH_MSG_PAIRING_REQUEST, MESH_MSG_SHARED_SECRETS_SYNC, MESH_MSG_TOPOLOGY_ANNOUNCE,
-    MESH_MSG_TRUSTED_KEYS_SYNC, MESH_MSG_TRUST_REVOKED,
+    MESH_MSG_PAIRING_REQUEST, MESH_MSG_PROVIDER_CREDENTIALS_SYNC, MESH_MSG_SHARED_SECRETS_SYNC,
+    MESH_MSG_TOPOLOGY_ANNOUNCE, MESH_MSG_TRUSTED_KEYS_SYNC, MESH_MSG_TRUST_REVOKED,
 };
 
 /// Returns `true` for frames that may be accepted from peers that are NOT yet
@@ -58,6 +58,7 @@ pub fn is_replay_guarded_frame(frame_type: u8) -> bool {
             | MESH_MSG_TRUST_REVOKED
             | MESH_MSG_HMAC_KEYS_SYNC
             | MESH_MSG_SHARED_SECRETS_SYNC
+            | MESH_MSG_PROVIDER_CREDENTIALS_SYNC
     )
 }
 
@@ -74,6 +75,7 @@ mod tests {
             MESH_MSG_TRUST_REVOKED,
             MESH_MSG_HMAC_KEYS_SYNC,
             MESH_MSG_SHARED_SECRETS_SYNC,
+            MESH_MSG_PROVIDER_CREDENTIALS_SYNC,
         ] {
             assert!(is_replay_guarded_frame(guarded));
         }

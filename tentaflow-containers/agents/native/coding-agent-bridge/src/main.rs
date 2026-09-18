@@ -491,7 +491,9 @@ async fn run() -> Result<()> {
         .route("/usage", get(usage))
         .route(
             "/account/credential",
-            get(read_account_credential).put(write_account_credential),
+            get(read_account_credential)
+                .put(write_account_credential)
+                .delete(delete_account_credential),
         )
         .route("/account/transfer/freeze", post(transfer::freeze))
         .route("/account/transfer/retire", post(transfer::retire))
@@ -2243,6 +2245,31 @@ async fn write_account_credential(
     fan_out_credential(&state, &sha256, previous.as_deref(), None, &material).await;
     drop(login);
     Ok(Json(json!({"applied": true, "sha256": sha256})))
+}
+
+/// Drops the account's canonical credential.
+///
+/// Core calls this when the credential was revoked — cleared by its owner, or
+/// covered by a revocation that reached this node through the account row. The
+/// bridge owns the file, so nothing else may unlink it, and a node that kept it
+/// would keep handing a retired token to the next session that starts.
+///
+/// A sign-in in flight wins here for the same reason it wins over the write: it
+/// is about to settle a credential onto this path, and removing the file
+/// underneath it would make the sign-in publish against a baseline that
+/// disappeared. The live sessions are NOT chased: each holds its own copy, the
+/// provider is the only place that copy can be invalidated, and pretending
+/// otherwise would be the one promise this design must not make.
+async fn delete_account_credential(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let login = state.login_flow.lock().await;
+    if login.is_some() {
+        return Err(ApiError::bad_request(
+            "login_in_progress: this account is signing in",
+        ));
+    }
+    let removed = credentials::remove(&credentials::root(&state.data_dir), state.provider)?;
+    drop(login);
+    Ok(Json(json!({"removed": removed})))
 }
 
 /// Extracts whatever a sign-in, an authentication probe or a discovery run left

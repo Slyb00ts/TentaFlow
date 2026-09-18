@@ -46,7 +46,7 @@ fn write_err(e: impl std::fmt::Display) -> anyhow::Error {
 
 const ACCOUNT_COLS: &str = "account_id, org_id, engine_id, display_name, scope, owner_user_id, \
      credential_kind, provider_subject, plan_label, home_node_id, status, created_by, created_at, \
-     updated_at";
+     updated_at, credential_revoked_revision";
 
 fn read_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
     Ok(AccountRecord {
@@ -64,6 +64,7 @@ fn read_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
         created_by: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+        credential_revoked_revision: row.get(14)?,
     })
 }
 
@@ -994,17 +995,18 @@ fn write_credential(
     }
     let mut conn = db.write().map_err(write_err)?;
     let tx = conn.transaction().map_err(write_err)?;
-    let account_exists: bool = tx
+    let account: Option<(i64, Option<String>)> = tx
         .query_row(
-            "SELECT EXISTS (SELECT 1 FROM provider_accounts WHERE account_id = ?1)",
+            "SELECT credential_revoked_revision, home_node_id FROM provider_accounts \
+             WHERE account_id = ?1",
             params![account_id],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map(|found| found != 0)
+        .optional()
         .map_err(read_err)?;
-    if !account_exists {
+    let Some((revoked_revision, home_node_id)) = account else {
         return Err(anyhow!("provider account '{account_id}' does not exist"));
-    }
+    };
 
     let stored: Option<(i64, String)> = tx
         .query_row(
@@ -1020,7 +1022,11 @@ fn write_credential(
     let same_material = stored
         .as_ref()
         .is_some_and(|(_, stored_sha)| stored_sha == &sha);
-    let revision = expected_revision.unwrap_or(local_revision + 1);
+    // A revoked revision is spent for good. Minting from the stored revision
+    // alone would re-issue a number the fleet has already been told to drop, and
+    // every node that saw the revocation would refuse the new credential as
+    // covered by it — so a sign-in after a clear starts ABOVE the tombstone.
+    let revision = expected_revision.unwrap_or_else(|| local_revision.max(revoked_revision) + 1);
     // Storing the SAME material again is a replay of a decision, not a new one.
     // Bumping the revision for it would make every node that already holds this
     // credential re-fetch and rewrite a file that did not change, and would
@@ -1039,10 +1045,14 @@ fn write_credential(
         });
     }
 
-    if revision < local_revision {
+    // A revision at or below the revocation mark is a credential the fleet was
+    // told to stop using. It is refused with the same answer as an older one:
+    // nothing is written, and the peer still holding it learns from the account
+    // row that it has to purge, not from this write.
+    if revision < local_revision || revision <= revoked_revision {
         tx.commit().map_err(write_err)?;
         return Ok(CredentialWrite::Stale {
-            revision: local_revision,
+            revision: local_revision.max(revoked_revision),
         });
     }
     if revision == local_revision {
@@ -1096,6 +1106,25 @@ fn write_credential(
     .map_err(write_err)?;
     if let Some(subject) = meta.provider_subject.as_deref() {
         apply_provider_subject_tx(&tx, account_id, subject)?;
+    }
+    // An account whose credential this node MINTED and which nobody has homed
+    // yet is homed here. The home node is the account's single refresher (§C.5),
+    // and a credential with no home is one no node may publish to the others —
+    // so leaving it NULL after a mint would replicate nothing at all. A home
+    // that already exists is never taken over: moving it is an explicit
+    // administrator action, and a node that claimed it by minting would make two
+    // rotating nodes swap ownership back and forth.
+    let homed_here = expected_revision.is_none() && home_node_id.is_none();
+    if homed_here {
+        if let Some(local_node) = local_node_id_tx(&tx)? {
+            tx.execute(
+                "UPDATE provider_accounts SET home_node_id = ?2, \
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
+                 WHERE account_id = ?1 AND home_node_id IS NULL",
+                params![account_id, local_node],
+            )
+            .map_err(write_err)?;
+        }
     }
     // A stored credential is what makes an account usable; a disabled one stays
     // disabled, because disabling is an administrator's decision and not a
@@ -1278,6 +1307,18 @@ pub fn clear_credential(db: &DbPool, account_id: &str, actor: Option<&str>) -> R
         )
         .map_err(write_err)?;
     if let Some((revision, sha)) = dropped {
+        // The revocation mark is what carries the removal to the nodes holding a
+        // copy: they never receive material for a revision at or below it, and
+        // they purge what they already have. MAX, never assignment — a clear of
+        // an older revision must not lower a mark a later one already raised.
+        tx.execute(
+            "UPDATE provider_accounts \
+             SET credential_revoked_revision = MAX(credential_revoked_revision, ?2), \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
+             WHERE account_id = ?1",
+            params![account_id, revision],
+        )
+        .map_err(write_err)?;
         set_status_tx(&tx, account_id, "needs_login")?;
         sync_capture::capture_account(&tx, account_id)?;
         audit_tx(
@@ -1289,6 +1330,270 @@ pub fn clear_credential(db: &DbPool, account_id: &str, actor: Option<&str>) -> R
                 "revision": revision,
                 "fingerprint": credential_fingerprint(&sha),
             }),
+        )?;
+    }
+    tx.commit().map_err(write_err)?;
+    Ok(removed > 0)
+}
+
+// =============================================================================
+// Credential exchange between nodes (docs/agent-accounts-technical-design.md
+// binding correction 13)
+//
+// The material never travels through the ledger, whose operation bodies are
+// stored and relayed in plaintext by every node on the path. It is sealed for
+// one recipient on the mesh instead (`mesh/provider_credentials.rs`), and the
+// three questions that decide whether a credential may cross at all are
+// answered HERE, where the store is, rather than in the transport:
+//
+//   1. may that node hold a credential at all (`receives_accounts`);
+//   2. is one of the two ends the account's home node — the single refresher;
+//   3. is the revision above the account's revocation mark.
+// =============================================================================
+
+/// One credential this node is allowed to hand to one peer.
+pub struct PublishableCredential {
+    pub account_id: String,
+    pub revision: i64,
+    pub material: String,
+    pub material_sha256: String,
+    pub provider_subject: Option<String>,
+    pub expires_at: Option<String>,
+    pub home_node_id: Option<String>,
+    pub refreshed_by_node: Option<String>,
+}
+
+/// Whether a credential of an account homed at `home_node_id` may pass between
+/// `local_node_id` and `peer_node_id`, in either direction.
+///
+/// Exactly one of the two ends must be the home node, which is what makes
+/// rotation single-owner without making a satellite's own rotation unreachable:
+/// the home FANS OUT to its satellites, and a satellite whose CLI rotated the
+/// token SUBMITS it to the home, which applies the CAS and fans the result out.
+/// Two satellites never exchange credentials directly, so they cannot take turns
+/// overwriting each other's revision.
+///
+/// An account with NO home is closed in both directions. That state is reached
+/// only by deleting the home node from the registry (`forget_node_tx`), and the
+/// honest answer is that an administrator has to name a new home — not that any
+/// node may start minting.
+pub fn credential_exchange_allowed(
+    local_node_id: &str,
+    peer_node_id: &str,
+    home_node_id: Option<&str>,
+) -> bool {
+    match home_node_id {
+        Some(home) => home == local_node_id || home == peer_node_id,
+        None => false,
+    }
+}
+
+/// Every credential this node may hand to `peer_node_id`, decrypted.
+///
+/// Empty for a peer the administrator has not put in the account fleet: that
+/// flag is the gate, and it is applied here — before the material is read out of
+/// the store — rather than only where a bridge would write it.
+pub fn publishable_credentials(
+    db: &DbPool,
+    cipher: &SettingsCipher,
+    local_node_id: &str,
+    peer_node_id: &str,
+) -> Result<Vec<PublishableCredential>> {
+    if !receives_accounts(db, peer_node_id)? {
+        return Ok(Vec::new());
+    }
+    struct StoredRow {
+        account_id: String,
+        revision: i64,
+        material_enc: String,
+        material_sha256: String,
+        provider_subject: Option<String>,
+        expires_at: Option<String>,
+        refreshed_by_node: Option<String>,
+        home_node_id: Option<String>,
+        revoked_revision: i64,
+    }
+    let rows: Vec<StoredRow> = {
+        let conn = db.read().map_err(read_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.account_id, c.revision, c.material_enc, c.material_sha256, \
+                        c.provider_subject, c.expires_at, c.refreshed_by_node, a.home_node_id, \
+                        a.credential_revoked_revision \
+                 FROM provider_account_credentials c \
+                 JOIN provider_accounts a ON a.account_id = c.account_id \
+                 ORDER BY c.account_id",
+            )
+            .map_err(read_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredRow {
+                    account_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    material_enc: row.get(2)?,
+                    material_sha256: row.get(3)?,
+                    provider_subject: row.get(4)?,
+                    expires_at: row.get(5)?,
+                    refreshed_by_node: row.get(6)?,
+                    home_node_id: row.get(7)?,
+                    revoked_revision: row.get(8)?,
+                })
+            })
+            .map_err(read_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(read_err)?;
+        rows
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        if row.revision <= row.revoked_revision {
+            continue;
+        }
+        if !credential_exchange_allowed(local_node_id, peer_node_id, row.home_node_id.as_deref()) {
+            continue;
+        }
+        let material = cipher
+            .decrypt_bound(
+                &row.material_enc,
+                &super::credential_context(&row.account_id),
+            )
+            .map_err(|e| read_err(format!("open credential: {e}")))?
+            .value;
+        out.push(PublishableCredential {
+            account_id: row.account_id,
+            revision: row.revision,
+            material,
+            material_sha256: row.material_sha256,
+            provider_subject: row.provider_subject,
+            expires_at: row.expires_at,
+            home_node_id: row.home_node_id,
+            refreshed_by_node: row.refreshed_by_node,
+        });
+    }
+    Ok(out)
+}
+
+/// Records a credential a peer offered and this node would not take.
+///
+/// It is an audit row rather than a log line because every reason is somebody's
+/// decision colliding with somebody else's: a node that is not the home trying
+/// to rotate, material for a revision an operator revoked, or a peer handing a
+/// credential to a node that was taken out of the account fleet. None of those
+/// is visible in the resulting state — nothing changes — so the refusal IS the
+/// record.
+pub fn record_credential_refusal(
+    db: &DbPool,
+    account_id: &str,
+    peer_node_id: &str,
+    reason: &str,
+    revision: i64,
+) -> Result<()> {
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    audit_tx(
+        &tx,
+        None,
+        "provider_account.credential_refused",
+        account_id,
+        serde_json::json!({
+            "peer_node_id": peer_node_id,
+            "reason": reason,
+            "revision": revision,
+        }),
+    )?;
+    tx.commit().map_err(write_err)?;
+    Ok(())
+}
+
+/// One local credential copy that must not stay on this node.
+pub struct StaleCredential {
+    pub account_id: String,
+    pub revision: i64,
+    /// `revoked` — the fleet cleared this credential; `not_receiving` — this
+    /// node is no longer in the account fleet.
+    pub reason: &'static str,
+}
+
+/// Every credential this node holds that it may no longer hold.
+///
+/// Two independent reasons, and both are decisions made elsewhere: an operator
+/// cleared the credential (the mark travels on the account row), or an
+/// administrator took this node out of the account fleet (the flag travels on
+/// the runtime-node row). Neither decision can be enforced by refusing to
+/// RECEIVE something — the material is already here — so it is enforced by
+/// looking at what is here.
+pub fn stale_local_credentials(db: &DbPool, node_id: &str) -> Result<Vec<StaleCredential>> {
+    let receiving = receives_accounts(db, node_id)?;
+    let conn = db.read().map_err(read_err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.account_id, c.revision, a.credential_revoked_revision \
+             FROM provider_account_credentials c \
+             JOIN provider_accounts a ON a.account_id = c.account_id \
+             ORDER BY c.account_id",
+        )
+        .map_err(read_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(read_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(read_err)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(account_id, revision, revoked)| {
+            let reason = if revision <= revoked {
+                "revoked"
+            } else if !receiving {
+                "not_receiving"
+            } else {
+                return None;
+            };
+            Some(StaleCredential {
+                account_id,
+                revision,
+                reason,
+            })
+        })
+        .collect())
+}
+
+/// Removes this node's copy of a credential, leaving the account itself alone.
+///
+/// Node-local and therefore NOT captured: the account row already carries what
+/// the fleet has to know (the revocation mark, or the runtime flag), and
+/// capturing the removal would replicate one node's purge as everybody's.
+pub fn purge_local_credential(
+    db: &DbPool,
+    account_id: &str,
+    node_id: &str,
+    reason: &str,
+) -> Result<bool> {
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    let removed = tx
+        .execute(
+            "DELETE FROM provider_account_credentials WHERE account_id = ?1",
+            params![account_id],
+        )
+        .map_err(write_err)?;
+    tx.execute(
+        "DELETE FROM provider_account_node_state WHERE account_id = ?1 AND node_id = ?2",
+        params![account_id, node_id],
+    )
+    .map_err(write_err)?;
+    if removed > 0 {
+        audit_tx(
+            &tx,
+            None,
+            "provider_account.credential_purged",
+            account_id,
+            serde_json::json!({ "node_id": node_id, "reason": reason }),
         )?;
     }
     tx.commit().map_err(write_err)?;
@@ -1655,6 +1960,14 @@ pub fn list_runtime_nodes(db: &DbPool) -> Result<Vec<RuntimeNodeRecord>> {
 /// and "no decision" and "decided no" mean the same thing to every reader of
 /// it — keeping the row would replicate a fact that never changes anything and
 /// would make the node matrix grow one permanent line per node ever toggled.
+///
+/// Turning it off is REFUSED while the node is some account's home. The flag is
+/// a gate: the node stops holding credentials, and its copy is purged on the
+/// next reconcile — which on the home node is the copy every other node's is
+/// fanned out FROM. The account would be left with a credential nobody may
+/// publish and, for the accounts whose material exists only there, with none at
+/// all. Signing the account in on another node moves the home, and that is the
+/// operation this refusal points at.
 pub fn set_receives_accounts(
     db: &DbPool,
     node_id: &str,
@@ -1663,6 +1976,21 @@ pub fn set_receives_accounts(
 ) -> Result<()> {
     let mut conn = db.write().map_err(write_err)?;
     let tx = conn.transaction().map_err(write_err)?;
+    if !enabled {
+        let homed: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM provider_accounts WHERE home_node_id = ?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .map_err(read_err)?;
+        if homed > 0 {
+            return Err(anyhow!(
+                "node '{node_id}' is the home of {homed} agent account(s); sign those accounts in \
+                 on another node before taking it out of the account fleet"
+            ));
+        }
+    }
     let has_engines: bool = tx
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM agent_runtime_engines WHERE node_id = ?1)",
@@ -2338,6 +2666,169 @@ mod tests {
         assert!(!clear_credential(&db, "shared", Some("admin")).unwrap());
     }
 
+    /// The revision a clear revokes is spent for the whole fleet: a node that
+    /// still holds it purges, and nobody may hand it out again. So the sign-in
+    /// after a clear starts ABOVE the mark — minting revision 1 again would be
+    /// refused by every node that saw the revocation.
+    #[test]
+    fn a_sign_in_after_a_clear_mints_above_the_revoked_revision() {
+        let db = pool();
+        let cipher = cipher();
+        global_account(&db, "shared");
+        seed_local_node(&db, "node-a");
+        mint_credential(&db, &cipher, "shared", "first", &CredentialMeta::default()).unwrap();
+        mint_credential(&db, &cipher, "shared", "second", &CredentialMeta::default()).unwrap();
+        clear_credential(&db, "shared", Some("admin")).unwrap();
+        assert_eq!(
+            get_account(&db, "shared")
+                .unwrap()
+                .unwrap()
+                .credential_revoked_revision,
+            2
+        );
+
+        // The revoked revision cannot be re-offered by a peer either.
+        assert_eq!(
+            set_credential(
+                &db,
+                &cipher,
+                "shared",
+                2,
+                "second",
+                &CredentialMeta::default()
+            )
+            .unwrap(),
+            CredentialWrite::Stale { revision: 2 }
+        );
+        assert!(credential_material(&db, &cipher, "shared")
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            mint_credential(&db, &cipher, "shared", "third", &CredentialMeta::default()).unwrap(),
+            CredentialWrite::Applied { revision: 3 }
+        );
+        assert_eq!(
+            get_account(&db, "shared").unwrap().unwrap().status,
+            "active"
+        );
+    }
+
+    /// The node that MINTS a credential nobody has homed yet becomes the
+    /// account's home — the single refresher every other node's copy comes
+    /// from. A home that already exists is never taken over by a mint: moving it
+    /// is an administrator's decision, and a node claiming it by rotating would
+    /// make two nodes swap ownership back and forth.
+    #[test]
+    fn the_first_node_to_mint_a_credential_becomes_the_accounts_home() {
+        let db = pool();
+        let cipher = cipher();
+        global_account(&db, "shared");
+        seed_local_node(&db, "node-a");
+        assert_eq!(
+            get_account(&db, "shared").unwrap().unwrap().home_node_id,
+            None
+        );
+
+        mint_credential(&db, &cipher, "shared", "first", &CredentialMeta::default()).unwrap();
+        assert_eq!(
+            get_account(&db, "shared").unwrap().unwrap().home_node_id,
+            Some("node-a".to_string())
+        );
+
+        // A credential arriving from the home node through the mesh (the CAS
+        // path) leaves the home where it is.
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                home_node_id: Some("node-b".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        set_credential(
+            &db,
+            &cipher,
+            "shared",
+            2,
+            "second",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            get_account(&db, "shared").unwrap().unwrap().home_node_id,
+            Some("node-b".to_string())
+        );
+    }
+
+    /// The three gates a credential passes before it is handed to a peer, each
+    /// measured on its own: the peer has to be in the account fleet, one of the
+    /// two ends has to be the home node, and the revision has to be above the
+    /// revocation mark.
+    #[test]
+    fn only_a_fleet_peer_on_the_home_axis_is_offered_a_credential() {
+        let db = pool();
+        let cipher = cipher();
+        global_account(&db, "shared");
+        seed_local_node(&db, "node-home");
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "material",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+
+        // Not in the fleet: nothing is offered and the material is never read.
+        assert!(
+            publishable_credentials(&db, &cipher, "node-home", "node-out")
+                .unwrap()
+                .is_empty()
+        );
+
+        set_receives_accounts(&db, "node-sat", true, Some("admin")).unwrap();
+        let offered = publishable_credentials(&db, &cipher, "node-home", "node-sat").unwrap();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].revision, 1);
+        assert_eq!(offered[0].material, "material");
+        assert_eq!(offered[0].home_node_id.as_deref(), Some("node-home"));
+
+        // Two satellites never exchange credentials: neither end is the home.
+        set_receives_accounts(&db, "node-other", true, Some("admin")).unwrap();
+        assert!(
+            publishable_credentials(&db, &cipher, "node-sat", "node-other")
+                .unwrap()
+                .is_empty()
+        );
+
+        clear_credential(&db, "shared", Some("admin")).unwrap();
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "material",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        db.write()
+            .unwrap()
+            .execute(
+                "UPDATE provider_accounts SET credential_revoked_revision = 2 \
+                 WHERE account_id = 'shared'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            publishable_credentials(&db, &cipher, "node-home", "node-sat")
+                .unwrap()
+                .is_empty(),
+            "material at or below the revocation mark is never handed out"
+        );
+    }
+
     /// The provider identity is written once. A second, different one is
     /// refused — under one account id it would mean a different subscription.
     #[test]
@@ -2962,5 +3453,52 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert!(!nodes[0].receives_accounts);
         assert_eq!(nodes[0].engines.len(), 1);
+    }
+
+    /// Taking a node out of the account fleet purges the credentials it holds,
+    /// and on the home node those are the ones every other node's copy is fanned
+    /// out FROM. The flip is therefore refused while the node is some account's
+    /// home, and the refusal says what to do instead.
+    #[test]
+    fn a_node_that_is_some_accounts_home_cannot_be_taken_out_of_the_fleet() {
+        let db = pool();
+        let cipher = cipher();
+        seed_local_node(&db, "helios");
+        set_receives_accounts(&db, "helios", true, Some("admin")).unwrap();
+        global_account(&db, "shared");
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "material",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+
+        let refused = set_receives_accounts(&db, "helios", false, Some("admin"))
+            .expect_err("the home of an account may not leave the fleet");
+        assert!(
+            refused.to_string().contains("sign those accounts in"),
+            "{refused}"
+        );
+        assert!(
+            receives_accounts(&db, "helios").unwrap(),
+            "a refused flip changes nothing"
+        );
+
+        // Once the account is homed elsewhere — which is what a sign-in on
+        // another node does — the node may leave.
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                home_node_id: Some("other-node".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        set_receives_accounts(&db, "helios", false, Some("admin")).unwrap();
+        assert!(!receives_accounts(&db, "helios").unwrap());
     }
 }

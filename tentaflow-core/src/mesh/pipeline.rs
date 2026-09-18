@@ -770,6 +770,14 @@ async fn handle_peer_connected(
             if let Err(e) = qm_events.send_shared_secrets_sync(&node_id).await {
                 warn!("SharedSecretsSync to {} failed: {}", node_id, e);
             }
+
+            // Anti-entropy for agent-account credentials: a node that was added
+            // to the account fleet, or that was offline through a sign-in, has
+            // no other way to learn of a credential minted meanwhile — the
+            // material never travels on the ledger.
+            if let Err(e) = qm_events.send_provider_credentials_sync(&node_id).await {
+                warn!("ProviderCredentialsSync to {} failed: {}", node_id, e);
+            }
         }
 
         // Pull-on-connect: poprosic peera o pelny snapshot jego serwisow.
@@ -2317,6 +2325,58 @@ fn spawn_quic_event_handler(
                             qm_events.push_shared_secrets_to_trusted(Some(&node_id)).await;
                         }
                         Err(e) => warn!(from = %node_id, "SharedSecretsSync rejected: {e}"),
+                    }
+                }
+                Ok(IrohMeshEvent::ProviderCredentialsSyncReceived { node_id, payload }) => {
+                    let Some(sec) = &mesh_security else {
+                        continue;
+                    };
+                    match crate::mesh::provider_credentials::ingest(sec, &node_id, payload) {
+                        Ok(adopted) if adopted.is_empty() => {}
+                        Ok(adopted) => {
+                            info!(
+                                from = %node_id,
+                                accounts = adopted.len(),
+                                "ProviderCredentialsSync: adopted newer account credentials"
+                            );
+                            // A bridge already running for one of these accounts
+                            // is still holding the credential the provider has
+                            // rotated away from; the store moving is exactly the
+                            // moment to hand it the new one.
+                            for account in &adopted {
+                                if crate::services::agent_runtime::running_bridge(
+                                    &account.account_id,
+                                )
+                                .await
+                                .is_some()
+                                {
+                                    if let Err(e) =
+                                        crate::services::agent_runtime::ensure_account_materialized(
+                                            &sec.db,
+                                            sec.settings_cipher(),
+                                            &local_node_id,
+                                            &account.account_id,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            account_id = %account.account_id,
+                                            "a synced credential did not reach the running bridge: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            // Not every node that may hold a credential is
+                            // connected to the one that minted it; a node that
+                            // adopted from the home node passes it on. Adoption
+                            // requires a strictly newer revision, which ends the
+                            // relay once the fleet has converged, and a node that
+                            // is not the home offers nothing to anybody but it.
+                            qm_events
+                                .push_provider_credentials_to_trusted(Some(&node_id))
+                                .await;
+                        }
+                        Err(e) => warn!(from = %node_id, "ProviderCredentialsSync rejected: {e}"),
                     }
                 }
                 Ok(IrohMeshEvent::MeshCommandReceived {

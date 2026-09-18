@@ -369,6 +369,11 @@ async fn run_server(args: Args) -> Result<()> {
         Err(e) => error!("Sync Ledger nie zarejestrował zaufanych nodów mesh: {}", e),
         _ => {}
     }
+    // A revocation, or an administrator taking this node out of the account
+    // fleet, can land while the node is DOWN: the account row arrives at the
+    // next sync, but nothing looks at what is stored on this disk until
+    // somebody uses the account. Startup is that look.
+    tentaflow_core::provider_accounts::credential_sync::spawn_reconcile(&db);
     // Auto-harmonogram drainu ingestu dla addonów z toolem `ingest_drain` (np. RAG):
     // bez tego kolejka ingestu stoi bez ręcznego joba, a reset TentaFlow nie wznawia
     // przetwarzania. Idempotentne — odtwarza harmonogram po każdym restarcie.

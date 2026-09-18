@@ -601,3 +601,76 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
     hold. Leaving it `active` would keep every session on a token whose owner has already changed.
     `identity_unverifiable` keeps the two-in-24-hours rule: it is the answer for an engine whose
     format carries no stable subject (muse, grok), so it says nothing about the credential at all.
+13. **§C.2's credential-on-the-ledger is replaced: the material travels sealed per recipient on the
+    mesh, and only the account's METADATA travels on the ledger.** §C.2 was written against a
+    reading of `SharedSettingSecret` that the code no longer supports: a fleet secret does NOT
+    ride the ledger re-encrypted by the receiver — `sync/runtime.rs::carries_shared_secret` turns
+    an operation naming one into a REDACTED chain position whose body is never stored, served or
+    materialized, and the value reaches its peers through `MESH_MSG_SHARED_SECRETS_SYNC`
+    (`mesh/shared_secrets.rs`), sealed for exactly one recipient. The reason is stated in
+    `repository.rs:1036-1039`: a ledger operation body is stored and relayed in plaintext by every
+    node on the path, and migration 158 exists only to scrub the secrets an earlier build left in
+    the capture journal. A provider OAuth token has a larger blast radius than `hf_token`, so it
+    takes the same route, not the one that was abandoned:
+    - new frame `MESH_MSG_PROVIDER_CREDENTIALS_SYNC` (0x54) carrying
+      `ProviderCredentialsSyncPayload`, built by `mesh/provider_credentials.rs::build_for_peer` and
+      taken in by `::ingest`. Each entry is sealed with `MeshSecurity::seal_for_peer` bound to
+      `provider-credential|<account>|<revision>|<sha256>`, so it opens on ONE peer and cannot be
+      replanted under another account or revision. The receiver re-computes the digest of what it
+      opened before storing, and stores it with the local `SettingsCipher::encrypt_bound`;
+    - no `MeshCommandType` is added (correction 8 stands) and `SCHEMA_VERSION` stays 29 (correction
+      6): the frame is a new mesh discriminator, and an older peer that does not know it drops it;
+    - the ledger keeps `provider_accounts`, `provider_account_grants`, `agent_runtime_nodes` and
+      `agent_runtime_engines` exactly as §C.1 registered them. `provider_account_credentials` is
+      still NOT a sync resource and `sync_resource_acl` is not used for it: with the material off
+      the ledger there is no ledger row to restrict, and the gate is applied where the material is
+      read out of the store instead (`repository::publishable_credentials`).
+    Three gates decide every crossing, all three in the store rather than in the transport:
+    1. **fleet** — the peer must have `agent_runtime_nodes.receives_accounts = 1`. The sender builds
+       no entry for any other node, and the receiver refuses the whole frame when its own flag is
+       off. That flag is replicated, so both ends answer from the same administrator decision;
+    2. **home** — `credential_exchange_allowed(local, peer, home_node_id)`: one of the two ends must
+       be `provider_accounts.home_node_id`. The home node FANS OUT to its satellites, and a
+       satellite whose CLI rotated the token SUBMITS it to the home, which applies the revision CAS
+       and fans the result out. Two satellites never exchange credentials, so they cannot take turns
+       overwriting each other's revision. A refusal is audited as
+       `provider_account.credential_refused {reason: "not_home_node"}` — nothing in the resulting
+       state records it, so the refusal IS the record. An account with NO home is closed in both
+       directions (that state is only reached by deleting the home node, and the honest answer is
+       that an administrator must name a new one);
+    3. **revocation** — the revision must be above `provider_accounts.credential_revoked_revision`.
+    **The home node is the node that MINTED the current credential.** `login.rs::adopt_credential`
+    already recorded it; `write_credential` now does the same for a local mint that finds it NULL
+    (the pasted API key), and a mint NEVER takes over a home that exists — except a SIGN-IN, which
+    is the one operation that produces a credential on a chosen node and therefore moves the home to
+    it (`login.rs:605`, unchanged). That is what makes the rule stable: a rotation cannot promote its
+    node, only a deliberate sign-in can. `AccountUpdate.home_node_id` exists in the store but no wire
+    variant carries it, so there is no "move home" button and the operator moves it by signing in on
+    the target node; exposing a separate control would let an administrator name a node that never
+    minted anything, and is not part of this package.
+    **Revocation is metadata, because a removal has no material to travel.** Migration 159 adds
+    `provider_accounts.credential_revoked_revision` (0 = nothing revoked). `clear_credential` raises
+    it to the revision it dropped, the materializer applies the incoming value as
+    `MAX(stored, incoming)` (HLC-LWW decides which EDIT is newer; a revocation must not be undone by
+    an older row arriving late), and every node purges its own copy on the reconcile that the
+    materializer starts after applying a `ProviderAccount` or `AgentRuntimeNode` row
+    (`provider_accounts/credential_sync.rs`, also run at startup). A purge is BOTH halves: the store
+    row and the file the bridge owns (new bridge route `DELETE /account/credential`, refused while a
+    sign-in is running, exactly as the PUT is — correction 11). A sign-in after a clear mints ABOVE
+    the mark, or every node that saw the revocation would refuse the new credential as covered by it.
+    The same reconcile enforces the fleet flag: a node whose `receives_accounts` goes to 0 purges the
+    material it already holds, and an account deleted anywhere drops the bridge copy from the arm
+    that observed the delete (the FK cascade has already taken the row, so the reconcile cannot see
+    it). Because that purge is unconditional, `set_receives_accounts` REFUSES to turn the flag off
+    for a node that is some account's home: there the purge would drop the one copy every other
+    node's is fanned out from, and for an account whose material exists only there, the credential
+    itself. The refusal names the count and the remedy (sign those accounts in elsewhere) and is
+    returned to the dashboard as a bad request, not swallowed as an internal error.
+    What this does NOT do, stated rather than hidden: the material is only re-sent on a reconnect or
+    a local write, so a node that is offline through BOTH the mint and every later push stays without
+    the credential until it reconnects (anti-entropy is a full rebuild per peer on connect, which is
+    what makes that self-healing rather than lost). A node outside the fleet never relays credentials,
+    so two account nodes that can only reach each other THROUGH a non-account node converge only when
+    one of them reaches the other directly. And a revocation reaches a node that never comes back
+    online never at all — the material on its disk is exactly as retired as the token itself, which
+    only the provider can invalidate.

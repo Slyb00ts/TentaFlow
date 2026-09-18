@@ -25,6 +25,7 @@ pub mod peer_registry;
 pub mod peer_store;
 pub mod pipeline;
 pub mod proto_conv;
+pub mod provider_credentials;
 #[cfg(any(feature = "rdma-probe", target_os = "macos"))]
 pub mod rdma_probe;
 pub mod reconnect;

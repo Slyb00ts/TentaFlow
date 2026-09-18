@@ -592,9 +592,17 @@ async fn account_delete(
     }
     // A sign-in still running for the account now has nowhere to store what it
     // obtains, and its bridge would keep a provider terminal open against an
-    // account this organisation no longer has.
+    // account this organisation no longer has. The credential goes with it:
+    // stopping the bridge alone would leave the account's token on this disk
+    // with no row left to say whose it was.
     login::forget_account(account_id);
-    crate::services::agent_runtime::stop(account_id).await;
+    if let Err(error) = crate::services::agent_runtime::drop_account_credential(account_id).await {
+        tracing::warn!(
+            %account_id,
+            error = %format!("{error:#}"),
+            "a deleted agent account left a credential in its bridge"
+        );
+    }
     Ok(ack(account_id, None))
 }
 
@@ -638,7 +646,13 @@ fn credential_set(
     )
     .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let message_key = match outcome {
-        CredentialWrite::Applied { .. } => None,
+        CredentialWrite::Applied { .. } => {
+            // Every node in the account fleet gets the key now rather than at
+            // its next reconnect: an agent scheduled on another node would
+            // otherwise refuse for as long as the peers stay connected.
+            crate::provider_accounts::credential_sync::publish_to_fleet();
+            None
+        }
         // The same key pasted twice is not an error and must not bump the
         // revision: every node that already materialized it would re-fetch a
         // credential that did not change.
@@ -653,12 +667,30 @@ fn credential_set(
     Ok(ack(account_id, message_key))
 }
 
-fn credential_clear(ctx: &HandlerContext, account_id: &str) -> Result<MessageBody, ProtocolError> {
+async fn credential_clear(
+    ctx: &HandlerContext,
+    account_id: &str,
+) -> Result<MessageBody, ProtocolError> {
     let caller = caller(ctx)?;
     let account = visible_account(ctx, &caller, account_id)?;
     caller.require_account_keeper(&account, "removing a credential")?;
     let cleared = store::clear_credential(&ctx.state.db, account_id, Some(&caller.user_id))
         .map_err(|e| internal("credential clear", e))?;
+    if cleared {
+        // This node's own copy goes now; the other nodes learn from the
+        // revocation mark the account row carries and purge on their own
+        // reconcile. There is nothing to "push" for a removal — the material
+        // never travels, so its absence carries nothing.
+        if let Err(error) =
+            crate::services::agent_runtime::drop_account_credential(account_id).await
+        {
+            tracing::warn!(
+                %account_id,
+                error = %format!("{error:#}"),
+                "a cleared agent credential could not be dropped from its bridge"
+            );
+        }
+    }
     Ok(ack(
         account_id,
         (!cleared).then_some("agent_accounts.credential_absent"),
@@ -1058,8 +1090,11 @@ fn runtime_set_receives_accounts(
     if !node_catalog(ctx)?.order.iter().any(|id| id == node_id) {
         return Err(not_found());
     }
+    // A refusal here is the store telling the administrator what to do first
+    // (move the home of the accounts living on that node), so its text is the
+    // answer — not an internal error that hides it.
     store::set_receives_accounts(&ctx.state.db, node_id, enabled, Some(&caller.user_id))
-        .map_err(|e| internal("runtime flag", e))?;
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     Ok(pa(P::AccountOpAck {
         account_id: None,
         ok: true,
@@ -1449,7 +1484,7 @@ pub async fn provider_account_dispatch(
             account_id,
             material,
         } => credential_set(ctx, account_id, material),
-        P::CredentialClearRequest { account_id } => credential_clear(ctx, account_id),
+        P::CredentialClearRequest { account_id } => credential_clear(ctx, account_id).await,
         P::GrantsSetRequest { account_id, grants } => grants_set(ctx, account_id, grants),
         P::SessionListRequest { account_id } => session_list(ctx, account_id),
         P::MyAccountListRequest { engine_id } => my_account_list(ctx, engine_id),

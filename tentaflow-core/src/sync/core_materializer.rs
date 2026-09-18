@@ -346,6 +346,30 @@ pub fn apply_core_operation(
     {
         crate::bus::schema_registry::bump_generation();
     }
+    // An agent-account credential is NOT on the ledger, so these two rows are
+    // the only way a revocation and a withdrawn runtime flag reach the node
+    // holding a copy: the account row carries the revoked revision, and the
+    // runtime-node row carries whether this node may hold credentials at all.
+    // Both decisions are only enforced once somebody looks at what is stored
+    // here, which is what the reconcile does.
+    if rows > 0
+        && matches!(
+            descriptor.kind,
+            CoreSyncResourceKind::ProviderAccount | CoreSyncResourceKind::AgentRuntimeNode
+        )
+    {
+        // A replicated account DELETE took its credential row with it through
+        // the FK cascade, so the reconcile — which looks at stored rows — can no
+        // longer see it. The file the bridge holds is dropped from here instead.
+        if descriptor.kind == CoreSyncResourceKind::ProviderAccount
+            && operation.body.action == ActionType::Delete
+        {
+            crate::provider_accounts::credential_sync::spawn_account_drop(
+                &operation.body.resource_id,
+            );
+        }
+        crate::provider_accounts::credential_sync::spawn_reconcile(pool);
+    }
     Ok(rows)
 }
 
@@ -4139,8 +4163,8 @@ fn apply_provider_account(
                 "INSERT INTO provider_accounts \
                    (account_id, org_id, engine_id, display_name, scope, owner_user_id, \
                     credential_kind, provider_subject, plan_label, home_node_id, status, \
-                    created_by, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                    created_by, created_at, credential_revoked_revision, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
                     strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
                  ON CONFLICT(account_id) DO UPDATE SET \
                     org_id = excluded.org_id, engine_id = excluded.engine_id, \
@@ -4150,6 +4174,9 @@ fn apply_provider_account(
                     provider_subject = excluded.provider_subject, \
                     plan_label = excluded.plan_label, home_node_id = excluded.home_node_id, \
                     status = excluded.status, \
+                    credential_revoked_revision = MAX(\
+                        provider_accounts.credential_revoked_revision, \
+                        excluded.credential_revoked_revision), \
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
                 rusqlite::params![
                     account_id,
@@ -4165,6 +4192,12 @@ fn apply_provider_account(
                     field_string(operation, "status")?,
                     field_string(operation, "created_by")?,
                     field_string(operation, "created_at")?,
+                    // Absent in an operation minted before the mark existed,
+                    // which means exactly what 0 means: nothing revoked. The
+                    // upsert takes the HIGHER of stored and incoming, because
+                    // HLC-LWW decides which EDIT is newer and a revocation must
+                    // survive an older row that took the long way round.
+                    field_i64_or(operation, "credential_revoked_revision", 0)?,
                 ],
             )
             .map_err(sql_error)
@@ -6866,6 +6899,84 @@ mod tests {
             apply_core_operation(&db, &redelivered_delete_op).unwrap(),
             0
         );
+    }
+
+    /// The credential material never travels on the ledger, so the account row
+    /// is the ONLY thing that can tell a node holding a copy to drop it. The
+    /// mark therefore only ever moves up: a row restated from an older state —
+    /// a re-seed, a peer that was offline through the clear — must not un-revoke
+    /// a credential every node was told to stop using.
+    #[test]
+    fn a_credential_revocation_never_travels_backwards() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+
+        let row = |revoked: i64| {
+            field_map(&[
+                ("org_id", FieldValue::String("default".into())),
+                ("engine_id", FieldValue::String("codex".into())),
+                ("display_name", FieldValue::String("Shared codex".into())),
+                ("scope", FieldValue::String("global".into())),
+                ("owner_user_id", FieldValue::Null),
+                (
+                    "credential_kind",
+                    FieldValue::String("provider_login".into()),
+                ),
+                ("provider_subject", FieldValue::Null),
+                ("plan_label", FieldValue::Null),
+                ("home_node_id", FieldValue::String("node-home".into())),
+                ("status", FieldValue::String("active".into())),
+                ("created_by", FieldValue::String("admin".into())),
+                (
+                    "created_at",
+                    FieldValue::String("2026-09-18T00:00:00Z".into()),
+                ),
+                ("credential_revoked_revision", FieldValue::I64(revoked)),
+            ])
+        };
+        let operation = |revoked: i64| {
+            matrix_operation(
+                "core.provider_account",
+                "provider_accounts",
+                "account_id",
+                &["acc-1"],
+                ActionType::Insert,
+                row(revoked),
+            )
+        };
+        let account_id = operation(0).body.resource_id.clone();
+        let stored_mark = |tx: &rusqlite::Transaction<'_>| -> i64 {
+            tx.query_row(
+                "SELECT credential_revoked_revision FROM provider_accounts WHERE account_id = ?1",
+                rusqlite::params![account_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(apply_provider_account(&tx, &operation(0)).unwrap(), 1);
+        assert_eq!(stored_mark(&tx), 0, "a fresh account revokes nothing");
+
+        assert_eq!(apply_provider_account(&tx, &operation(3)).unwrap(), 1);
+        assert_eq!(stored_mark(&tx), 3, "the clear reaches this node");
+
+        assert_eq!(apply_provider_account(&tx, &operation(0)).unwrap(), 1);
+        assert_eq!(
+            stored_mark(&tx),
+            3,
+            "an older restatement of the row must not un-revoke the credential"
+        );
+
+        // An operation minted before the mark existed says nothing about it,
+        // which is what the default answers — not "nothing is revoked".
+        let mut without_mark = operation(0);
+        without_mark
+            .body
+            .changed_fields
+            .remove("credential_revoked_revision");
+        assert_eq!(apply_provider_account(&tx, &without_mark).unwrap(), 1);
+        assert_eq!(stored_mark(&tx), 3);
     }
 
     /// An engine row is what ONE node measured on its own filesystem. A peer

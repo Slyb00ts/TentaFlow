@@ -652,6 +652,28 @@ pub async fn ensure_account_materialized(
     }
 }
 
+/// Takes this node's copy of an account's credential out of service.
+///
+/// Both halves matter and neither is enough on its own: the store row goes (that
+/// is the caller's `purge_local_credential`), and the bridge — the only writer of
+/// the canonical file — is told to drop the file and then stopped. A node that
+/// kept the file would hand a retired token to the next session; a node that
+/// kept the bridge would keep serving the sessions already on it.
+///
+/// A bridge that is not running is not started for this: with the store row gone
+/// there is nothing it could be given, and the file it holds cannot be
+/// materialized back.
+pub async fn drop_account_credential(account_id: &str) -> Result<()> {
+    let Some(bridge) = running_bridge(account_id).await else {
+        return Ok(());
+    };
+    let dropped = bridge
+        .call(reqwest::Method::DELETE, "/account/credential", None)
+        .await;
+    stop(account_id).await;
+    dropped.map(|_| ())
+}
+
 /// Reads the account's canonical credential back out of its bridge.
 ///
 /// Core is the trust root of the pair: the bridge holds the file, Core holds

@@ -257,6 +257,13 @@ pub enum IrohMeshEvent {
         node_id: String,
         payload: tentaflow_protocol::mesh::SharedSecretsSyncPayload,
     },
+    /// A peer pushed the agent-account credentials it may hand to this node,
+    /// each sealed for it. The pipeline checks the home-node rule and the
+    /// account fleet flag before adopting any.
+    ProviderCredentialsSyncReceived {
+        node_id: String,
+        payload: tentaflow_protocol::mesh::ProviderCredentialsSyncPayload,
+    },
     /// F1b P3.C-1 — trust-paired peer asked us for a frame whose `frame_url`
     /// they hold. Server-side handling (lookup in local frame store, build
     /// `FrameProxyResponsePayload`) is wired in P3.C-2.
@@ -2175,6 +2182,47 @@ impl IrohMeshManager {
         .await
     }
 
+    /// Sends the agent-account credentials this node may hand to one trusted
+    /// peer, sealed for it. Does nothing for an untrusted peer, for a peer that
+    /// is not in the account fleet, or when nothing here is that peer's to hold.
+    pub async fn send_provider_credentials_sync(&self, node_id: &str) -> Result<()> {
+        if !self.security.is_trusted(node_id) {
+            return Ok(());
+        }
+        let Some(payload) =
+            crate::mesh::provider_credentials::build_for_peer(&self.security, node_id)?
+        else {
+            return Ok(());
+        };
+        let data = crate::mesh::cbor::encode(&payload)
+            .map_err(|e| anyhow::anyhow!("ProviderCredentialsSync encode failed: {e}"))?;
+        self.send_ufp2_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_PROVIDER_CREDENTIALS_SYNC,
+            &data,
+        )
+        .await
+    }
+
+    /// Pushes the agent-account credentials to every connected trusted peer
+    /// except `exclude`. Each peer gets its own frame, built from what THAT peer
+    /// is allowed to hold — a peer outside the account fleet gets none.
+    pub async fn push_provider_credentials_to_trusted(&self, exclude: Option<&str>) {
+        let trusted = self.security.trusted_node_ids_snapshot();
+        let peers: Vec<String> = self
+            .connections
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|id| trusted.contains(id) && Some(id.as_str()) != exclude)
+            .collect();
+        futures::future::join_all(peers.iter().map(|node_id| async move {
+            if let Err(e) = self.send_provider_credentials_sync(node_id).await {
+                warn!(peer = %node_id, "iroh_mesh: ProviderCredentialsSync send failed: {e}");
+            }
+        }))
+        .await;
+    }
+
     /// Pushes the fleet secrets to every connected trusted peer except `exclude`.
     /// Each peer gets its own frame because the values are sealed per recipient.
     pub async fn push_shared_secrets_to_trusted(&self, exclude: Option<&str>) {
@@ -3362,6 +3410,21 @@ impl IrohMeshManagerRef {
                     },
                     Err(e) => {
                         warn!(peer = %remote_hex, "iroh_mesh: failed to decode SharedSecretsSync: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
+            x if x == MESH_MSG_PROVIDER_CREDENTIALS_SYNC => {
+                match crate::mesh::cbor::decode::<
+                    tentaflow_protocol::mesh::ProviderCredentialsSyncPayload,
+                >(&payload)
+                {
+                    Ok(p) => IrohMeshEvent::ProviderCredentialsSyncReceived {
+                        node_id: remote_hex,
+                        payload: p,
+                    },
+                    Err(e) => {
+                        warn!(peer = %remote_hex, "iroh_mesh: failed to decode ProviderCredentialsSync: {}", e);
                         return Ok(());
                     }
                 }

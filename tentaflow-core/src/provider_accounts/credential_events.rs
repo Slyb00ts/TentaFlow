@@ -143,6 +143,13 @@ async fn adopt(
     match store::set_credential(db, cipher, account_id, base + 1, &material, &meta)? {
         CredentialWrite::Applied { revision } | CredentialWrite::Unchanged { revision } => {
             store::set_node_state(db, account_id, node_id, revision, "ready", None)?;
+            // The provider rotated the token while a session was running, so
+            // every node still holding the previous one is now working with a
+            // credential the provider has retired. On the home node this is the
+            // fan-out; on a satellite it is the submission the home node applies
+            // the CAS to — both are the same frame, aimed at the peers the store
+            // says may have it.
+            super::credential_sync::publish_to_fleet();
             Ok(())
         }
         CredentialWrite::Conflict { revision } => anyhow::bail!(

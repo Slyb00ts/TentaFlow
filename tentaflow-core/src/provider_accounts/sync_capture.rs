@@ -59,6 +59,7 @@ struct AccountCaptureRow {
     status: String,
     created_by: String,
     created_at: String,
+    credential_revoked_revision: i64,
 }
 
 /// Captures the account as it now stands: present → a full-row Insert (the
@@ -70,7 +71,8 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
     let row = tx
         .query_row(
             "SELECT org_id, engine_id, display_name, scope, owner_user_id, credential_kind, \
-                    provider_subject, plan_label, home_node_id, status, created_by, created_at \
+                    provider_subject, plan_label, home_node_id, status, created_by, created_at, \
+                    credential_revoked_revision \
              FROM provider_accounts WHERE account_id = ?1",
             rusqlite::params![account_id],
             |row| {
@@ -87,6 +89,7 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
                     status: row.get(9)?,
                     created_by: row.get(10)?,
                     created_at: row.get(11)?,
+                    credential_revoked_revision: row.get(12)?,
                 })
             },
         )
@@ -128,6 +131,14 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
             fields.insert("status".to_string(), text(&row.status));
             fields.insert("created_by".to_string(), text(&row.created_by));
             fields.insert("created_at".to_string(), text(&row.created_at));
+            // The material never travels on the ledger, so this mark is how a
+            // node holding a copy of a CLEARED credential learns to drop it.
+            // The receiver takes the HIGHER of the two — a revocation is not
+            // undone by an older row arriving late.
+            fields.insert(
+                "credential_revoked_revision".to_string(),
+                FieldValue::I64(row.credential_revoked_revision),
+            );
             SqlWriteAction::Insert
         }
         None => SqlWriteAction::Delete,

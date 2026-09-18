@@ -993,6 +993,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "purge_shared_secrets_from_sync_journal",
             MigrationStep::Rust(purge_shared_secrets_from_sync_journal),
         ),
+        (
+            159,
+            "provider_account_credential_revocation",
+            MigrationStep::Sql(PROVIDER_ACCOUNT_CREDENTIAL_REVOCATION),
+        ),
     ]
 }
 
@@ -1182,6 +1187,23 @@ CREATE TABLE agent_runtime_engines (
 );
 
 ALTER TABLE agents ADD COLUMN runtime_json TEXT NOT NULL DEFAULT '{"kind":"llm"}';
+"#;
+
+// v159 — how a cleared agent-account credential reaches the nodes that hold a
+// copy of it.
+//
+// The material never travels through the ledger (it is sealed per recipient on
+// the mesh, see `mesh/provider_credentials.rs`), so a node that already holds a
+// credential cannot learn about its removal from the absence of a frame: the
+// node that cleared it simply stops sending, which is indistinguishable from
+// being offline. The revocation therefore travels as durable METADATA on the
+// account row — a high-water mark of the last revision that must not be used
+// anywhere — and every node purges its own material when it sees one that
+// covers what it holds. `0` means "nothing revoked", which is what every
+// existing row means.
+const PROVIDER_ACCOUNT_CREDENTIAL_REVOCATION: &str = r#"
+ALTER TABLE provider_accounts
+    ADD COLUMN credential_revoked_revision INTEGER NOT NULL DEFAULT 0;
 "#;
 
 const CODING_AGENT_ACCOUNT_MOVES: &str = r#"
@@ -11626,21 +11648,21 @@ mod tests {
                 name TEXT NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            INSERT INTO _migrations (version, name) VALUES (159, 'from_a_newer_build');",
+            INSERT INTO _migrations (version, name) VALUES (160, 'from_a_newer_build');",
         )
         .unwrap();
 
         let err =
             run(&conn).expect_err("a database ahead of this build's ladder head must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("159"), "{msg}");
-        assert!(msg.contains("head 158"), "{msg}");
+        assert!(msg.contains("160"), "{msg}");
+        assert!(msg.contains("head 159"), "{msg}");
     }
 
     /// The counterpart of the guard test above, and the reason 145/146 are
     /// `retired_migration` rather than renumbered-away: a database left at 146
     /// by a build that still carried the ORIGINAL 145/146 is NOT ahead of this
-    /// ladder (head 158), so the guard must let it through to be upgraded the
+    /// ladder (head 159), so the guard must let it through to be upgraded the
     /// rest of the way. Before the rungs were retired the head was 144 and the
     /// very same database was refused.
     #[test]
@@ -11669,12 +11691,12 @@ mod tests {
     #[test]
     fn a_database_exactly_at_this_builds_ladder_head_still_passes() {
         let conn = Connection::open_in_memory().unwrap();
-        run(&conn).expect("fresh install migrates cleanly to head 158");
-        run(&conn).expect("a database already at head 158 must still pass the guard");
+        run(&conn).expect("fresh install migrates cleanly to head 159");
+        run(&conn).expect("a database already at head 159 must still pass the guard");
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 158);
+        assert_eq!(head, 159);
     }
 
     #[test]
@@ -11706,7 +11728,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 158, "158 must be the highest applied migration");
+        assert_eq!(head, 159, "159 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -11714,7 +11736,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 158);
+        assert_eq!(head_again, 159);
     }
 
     /// v155 leaves the Flow Builder with the one harness Code Studio pins: the
@@ -12068,7 +12090,7 @@ mod tests {
         // authorizer rewrite and the instance-db handle that made them dead.
         // Their NUMBERS stay occupied by `retired_migration` so the rungs
         // above them keep the versions databases already recorded.
-        assert_eq!(*sorted.last().unwrap(), 158);
+        assert_eq!(*sorted.last().unwrap(), 159);
 
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
