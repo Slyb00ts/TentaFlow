@@ -71,6 +71,9 @@ pub fn smb_section(share: &ShareRow) -> String {
     line(&mut out, "path", &share.source_path);
     line(&mut out, "browseable", "yes");
     line(&mut out, "read only", "no");
+    // An Elastic mover's in-flight copy and quarantined original appear in a
+    // union's root; no client may see, open or delete them.
+    line(&mut out, "veto files", tentanas_helper::SMB_VETO_FILES);
     line(&mut out, "guest ok", if smb.guests { "yes" } else { "no" });
     if smb.guests {
         // A guest connection maps to a user outside the share group, so the
@@ -633,6 +636,60 @@ pub fn share_state(
 // apply
 // =============================================================================
 
+/// Who asked for the rewrite.
+///
+/// W-B of the third review. An unattended rewrite runs on whatever the node
+/// happens to answer at that instant, and at core start that may be a node
+/// whose pools are not imported yet: every ZFS-backed share would then resolve
+/// to nothing, be written out of `smb.conf` and `/etc/exports`, and stay out
+/// until the next core start or share edit. A transient reading must never
+/// rewrite the configs, so the unattended caller refuses instead of acting on
+/// one. An admin's own change is a different thing: it reflects the node as it
+/// is, including a pool that really is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyTrigger {
+    /// A share mutation, a share-user delete or a config import.
+    Change,
+    /// The unattended rewrite of the startup queue.
+    Startup,
+}
+
+/// The dataset listing a rewrite may work from. An unreadable listing is
+/// UNKNOWN, not "no datasets": the unattended rewrite refuses it rather than
+/// resolving every ZFS-backed share to nothing and writing them out of the
+/// configs. An admin's change goes on — a node without ZFS has no listing to
+/// read and its folder shares must still be editable.
+pub fn readable_datasets(
+    listing: std::result::Result<Vec<NasDataset>, super::broker::BrokerError>,
+    trigger: ApplyTrigger,
+) -> Result<Vec<NasDataset>> {
+    match listing {
+        Ok(datasets) => Ok(datasets),
+        Err(error) if trigger == ApplyTrigger::Startup => Err(anyhow!(
+            "Nie można odczytać listy datasetów ZFS ({error}); konfiguracje share pozostają bez zmian"
+        )),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// The refusal an unattended rewrite answers with when this reading of the
+/// node would drop a share that was serving: the shares that would leave
+/// `active`, named. `None` when nothing working would be lost.
+pub fn transient_reading(shares: &[ShareRow], computed: &[(&'static str, String)]) -> Option<String> {
+    let dropped: Vec<&str> = shares
+        .iter()
+        .zip(computed)
+        .filter(|(share, (state, _))| share.state == "active" && *state != "active")
+        .map(|(share, _)| share.name.as_str())
+        .collect();
+    (!dropped.is_empty()).then(|| {
+        format!(
+            "Odczyt węzła nie potwierdza źródeł działających share ({}); konfiguracje pozostają bez zmian",
+            dropped.join(", ")
+        )
+    })
+}
+
 /// Recomputes every share's state and rewrites the app-owned configs. Returns
 /// the log lines the calling job records.
 ///
@@ -643,8 +700,9 @@ pub async fn apply(
     main_db: &DbPool,
     addon_id: &str,
     explicit: Option<&ElevationToken>,
+    trigger: ApplyTrigger,
 ) -> Result<Vec<String>> {
-    let datasets = super::datasets::list("").await.unwrap_or_default();
+    let datasets = readable_datasets(super::datasets::list("").await, trigger)?;
     // Every owner's arrays, not this request's: the union is a mountpoint of
     // the NODE, and whether a path is one is not a question about who asked.
     // Read with `?` — an unreadable array table would otherwise silently put
@@ -659,9 +717,22 @@ pub async fn apply(
     let ksmbd = super::ksmbd::probe();
     let refusal = (!ksmbd.ready()).then(|| super::ksmbd::refusal(&ksmbd));
 
-    for share in shares.iter_mut() {
-        let source = resolve_source(&datasets, &arrays, &share.source_path);
-        let (state, detail) = share_state(share, &source, &service_installed, refusal.as_deref());
+    // Every state is computed BEFORE anything is persisted or written: an
+    // unattended rewrite that would drop a serving share acts on nothing.
+    let computed: Vec<(&'static str, String)> = shares
+        .iter()
+        .map(|share| {
+            let source = resolve_source(&datasets, &arrays, &share.source_path);
+            share_state(share, &source, &service_installed, refusal.as_deref())
+        })
+        .collect();
+    if trigger == ApplyTrigger::Startup {
+        if let Some(refusal) = transient_reading(&shares, &computed) {
+            anyhow::bail!(refusal);
+        }
+    }
+
+    for (share, (state, detail)) in shares.iter_mut().zip(computed) {
         if share.state != state || share.state_detail != detail {
             store::set_share_state(db, &share.share_id, state, &detail)?;
         }
@@ -1312,6 +1383,75 @@ mod tests {
         }
     }
 
+    /// W-B of the third review: the unattended rewrite at core start must not
+    /// act on a reading of the node that would drop a share that was serving —
+    /// pools not imported yet, an encrypted pool without its key, a broker
+    /// timeout. An admin's own change acts on the node as it is.
+    #[test]
+    fn an_unattended_rewrite_refuses_a_reading_that_would_drop_a_serving_share() {
+        let serving = smb_share(NasSmbOptions::default());
+        let mut broken = serving.clone();
+        broken.share_id = "s2".into();
+        broken.name = "archiwum".into();
+        broken.state = "error".into();
+        let shares = vec![serving, broken];
+        // The listing came back without the pool: both shares resolve to
+        // nothing, and one of them was active.
+        let gone = vec![("error", "source path is not mounted".to_string()), ("error", String::new())];
+        let refusal = transient_reading(&shares, &gone).expect("the rewrite is refused");
+        assert!(refusal.contains("projekty"), "{refusal}");
+        assert!(!refusal.contains("archiwum"), "a share that was already broken loses nothing: {refusal}");
+        // A share that was NOT serving may change freely, and so may a share
+        // that stays active.
+        assert_eq!(transient_reading(&shares, &[("active", String::new()), ("active", String::new())]), None);
+        assert_eq!(
+            transient_reading(&shares, &[("active", String::new()), ("error", "still broken".into())]),
+            None
+        );
+        // A disabled share is its admin's decision, not a transient reading.
+        let mut disabled = shares.clone();
+        disabled[0].state = "disabled".into();
+        assert_eq!(transient_reading(&disabled, &gone), None);
+    }
+
+    /// An unreadable dataset listing is not an empty node: the unattended
+    /// rewrite refuses it, an admin's change goes on (a node without ZFS has
+    /// no listing and its folder shares must stay editable).
+    #[test]
+    fn an_unreadable_dataset_listing_stops_only_the_unattended_rewrite() {
+        let unreadable = || Err(super::super::broker::BrokerError::InvalidArgument("zfs unavailable".into()));
+        let refusal = readable_datasets(unreadable(), ApplyTrigger::Startup)
+            .expect_err("the startup rewrite refuses a reading it does not have")
+            .to_string();
+        assert!(refusal.contains("datasetów ZFS") && refusal.contains("pozostają bez zmian"), "{refusal}");
+        assert_eq!(readable_datasets(unreadable(), ApplyTrigger::Change).expect("an admin's change goes on").len(), 0);
+        for trigger in [ApplyTrigger::Startup, ApplyTrigger::Change] {
+            let listed = vec![dataset("tank", "/mnt/tank", true)];
+            assert_eq!(readable_datasets(Ok(listed.clone()), trigger).expect("passed through"), listed);
+        }
+    }
+
+    /// The same rule through `apply` itself: in a test process the node cannot
+    /// be read at all (no privileged channel is armed), and the unattended
+    /// rewrite must then touch nothing — not the share states, not the configs.
+    #[tokio::test]
+    async fn the_startup_rewrite_touches_nothing_when_the_node_cannot_be_read() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        store::migrate(&conn).expect("migrate");
+        let db = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let share = smb_share(NasSmbOptions::default());
+        store::upsert_share(&db, &share).expect("share");
+        let error = apply(&db, &db, "addontentanas", None, ApplyTrigger::Startup)
+            .await
+            .expect_err("an unreadable node is not an empty node");
+        // Whatever the node answered — an unreadable listing, or a listing
+        // without this share's pool — the refusal says the configs were left
+        // alone, and they were.
+        assert!(error.to_string().contains("pozostają bez zmian"), "{error}");
+        let stored = store::list_shares(&db).expect("shares");
+        assert_eq!((stored[0].state.as_str(), stored[0].state_detail.as_str()), ("active", ""));
+    }
+
     #[test]
     fn a_plain_share_generates_the_minimal_section() {
         let section = smb_section(&smb_share(NasSmbOptions::default()));
@@ -1321,6 +1461,7 @@ mod tests {
              \tpath = /mnt/tank/projekty\n\
              \tbrowseable = yes\n\
              \tread only = no\n\
+             \tveto files = /.tentanas-transfer-*/.tentanas-quarantine-*/\n\
              \tguest ok = no\n\
              \tcreate mask = 0660\n\
              \tdirectory mask = 2770\n"
@@ -1353,6 +1494,7 @@ mod tests {
              \tpath = /mnt/tank/projekty\n\
              \tbrowseable = yes\n\
              \tread only = no\n\
+             \tveto files = /.tentanas-transfer-*/.tentanas-quarantine-*/\n\
              \tguest ok = no\n\
              \tcreate mask = 0660\n\
              \tdirectory mask = 2770\n\
@@ -1447,6 +1589,7 @@ mod tests {
              \tpath = /mnt/tank/projekty\n\
              \tbrowseable = yes\n\
              \tread only = no\n\
+             \tveto files = /.tentanas-transfer-*/.tentanas-quarantine-*/\n\
              \tguest ok = yes\n\
              \tforce group = tentanas-share\n\
              \tvalid users = anna, jan\n\

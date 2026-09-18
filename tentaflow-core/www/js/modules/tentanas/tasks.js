@@ -106,9 +106,9 @@ export async function drawTasks(screen, body) {
     const rows = state.done.filter((j) => {
       if (state.filter === 'errors') return j.status === 'failed' || j.status === 'blocked';
       if (state.filter === 'scrub') return /scrub|resilver|replace/.test(String(j.kind));
-      // Cache drains are the runs an admin chases when the cache fills up, and
-      // they are the one job kind whose name nobody guesses — so they get a
-      // chip of their own instead of being found by reading the whole history.
+      // Cache drains are the runs an admin chases when the cache fills up —
+      // automatic ones included — so they get a chip of their own, named for
+      // what they do, instead of being found by reading the whole history.
       if (state.filter === 'mover') return /mover/.test(String(j.kind));
       return true;
     });
@@ -259,7 +259,14 @@ export async function drawTasks(screen, body) {
         // The stored result is the scheduler's own sentence ("started job …"),
         // not one of the `result_*` labels, so the row says WHEN it last ran
         // and leaves the outcome to the job the log links to.
-        sub: r.lastRunAt ? T('schedules.last_run', { t: fmtAgo(r.lastRunAt) }) : T('schedules.never_ran'),
+        //
+        // The mover row is not a cadence the array needs: moving is automatic,
+        // and this row exists only because an admin saved a WINDOW that
+        // restricts it. So it also says what its switch means for the files.
+        sub: [
+          r.lastRunAt ? T('schedules.last_run', { t: fmtAgo(r.lastRunAt) }) : T('schedules.never_ran'),
+          ...(verb === 'mover' ? [T(r.enabled ? 'schedules.elastic_mover_window_on' : 'schedules.elastic_mover_window_off')] : []),
+        ].join(' · '),
       };
     }
     // The scrub and the TRIM (§5.10) are the same row with a different verb:

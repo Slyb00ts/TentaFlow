@@ -27,10 +27,10 @@ pub enum ElasticJobIntent {
     Create(ElasticCreateSpec),
     Restore { owner: ElasticOwner, array_id: String, operation_id: String },
     Snapraid { owner: ElasticOwner, array_id: String, operation_id: String, kind: ElasticSnapraidKind },
-    /// One mover run. `resume_operation_id` is reserved up front because the
-    /// helper needs a SEPARATE operation to close a run that stopped
-    /// part-way, and `validate_observation` refuses a resume that reuses the
-    /// run's own operation or the array's create.
+    /// One mover run. `resume_operation_id` is reserved up front: the helper
+    /// records it with the run and refuses a command whose resume repeats its
+    /// operation, and it is the UUID the Resume of a Hold an older helper's run
+    /// left must carry. Movers no longer hold the union themselves.
     /// `rules` and `coupled_sync` travel WITH the intent because they are
     /// derived from the array row (its mover settings and its folders' cache
     /// policies) and cannot be rebuilt from the persisted `ElasticCreateSpec`
@@ -45,6 +45,23 @@ pub enum ElasticJobIntent {
     /// UUID its mkfs is given — is written down before anything is formatted.
     AddDisk { owner: ElasticOwner, array_id: String, operation_id: String,
         disk: tentanas_helper::elastic::ElasticDiskSpec },
+    /// DORMANT: disk replacement is withdrawn (round 4). `db::insert_job`
+    /// refuses this intent outright, so no `replace_disk` operation can be
+    /// opened by any caller; the variant and its command builder stay for the
+    /// task that finishes the feature.
+    ///
+    /// The disk of ONE data slot replaced by a new one, and the array rebuilt
+    /// onto it. `branch` names the slot (`d1`, `d2`, …) and `disk` the
+    /// replacement: as with an add, nothing else records the new identity —
+    /// including the filesystem UUID its mkfs will stamp — until the operation
+    /// closes, so the request row is where it is written down first.
+    /// `rebuild_operation_id` and `sync_operation_id` reserve the two SnapRAID
+    /// runs the flow records; `accept_stale_parity` is the admin's explicit
+    /// word that a rebuild from parity which is not current leaves some blocks
+    /// unrecoverable.
+    ReplaceDisk { owner: ElasticOwner, array_id: String, operation_id: String,
+        rebuild_operation_id: String, sync_operation_id: String, branch: String,
+        disk: tentanas_helper::elastic::ElasticDiskSpec, accept_stale_parity: bool },
     /// Stops serving the array and deletes its rows. Formats nothing.
     Dissolve { owner: ElasticOwner, array_id: String, operation_id: String },
 }
@@ -249,12 +266,14 @@ fn command_label(command: &HelperCommand) -> &'static str {
         }
         HelperCommand::NvmetSessionsRead {} => "the NVMe-oF controller list",
         HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
-        | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. }
+        | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticCacheAge { .. }
+        | HelperCommand::ElasticClaims { .. }
         | HelperCommand::ElasticJournals {} | HelperCommand::ElasticAdopt { .. }
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
         | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. }
         | HelperCommand::ElasticMover { .. }
         | HelperCommand::ElasticFix { .. } | HelperCommand::ElasticAddDisk { .. }
+        | HelperCommand::ElasticReplaceDisk { .. }
         | HelperCommand::ElasticDestroy { .. } => "Elastic Array",
         HelperCommand::DiskWipe { .. } => "wipefs",
     }
@@ -302,6 +321,7 @@ where
             ElasticJobIntent::Snapraid { .. }
                 | ElasticJobIntent::Mover { .. }
                 | ElasticJobIntent::AddDisk { .. }
+                | ElasticJobIntent::ReplaceDisk { .. }
         )
     );
     let mut registry = running().lock().unwrap_or_else(|p| p.into_inner());
@@ -1347,6 +1367,10 @@ pub async fn provision_helper(
     }
     let _ = std::fs::remove_file(&staged);
     drop(token);
+    // The binary on disk has just changed, so the cached version probe is
+    // stale: drop it before the verification reads it again, and so that the
+    // next Elastic operation is admitted without waiting out the TTL.
+    super::broker::forget_helper_version();
     let status = super::elevation::helper_status().await;
     h.log(format!("helper state after provisioning: {}", status.state));
     if status.state != "ok" {
@@ -1367,6 +1391,9 @@ pub async fn remove_helper(h: JobHandle, token: Arc<ElevationToken>) -> Result<(
         h.log(super::elevation::run_plan_step(&token, &argv).await?);
     }
     drop(token);
+    // The binary is gone: the cached probe would otherwise still vouch for it
+    // for up to its TTL.
+    super::broker::forget_helper_version();
     if super::elevation::mode(h.db()) == super::elevation::Mode::Helper {
         super::elevation::set_mode(h.db(), super::elevation::Mode::Unset)?;
     }

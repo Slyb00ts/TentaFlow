@@ -11,14 +11,121 @@
 //! repeated on every invocation instead of being stored, because a moved file
 //! has left the cache and an unmoved one is still there to be found again, so
 //! the durable state does not grow with the number of files.
-
+//!
+//! # Moving a file while the share stays writable
+//!
+//! The union is never made read-only. What keeps a client's write from being
+//! lost is a kernel write LEASE (`F_SETLEASE F_WRLCK`) the helper holds on the
+//! cache original and on its copy. The kernel grants such a lease only while
+//! no other open file description of the inode exists anywhere on the node — a
+//! descriptor of any process in any namespace, or a mapping — and while it
+//! stands, every `open(2)` and `truncate(2)` of the inode runs into it
+//! (`do_dentry_open` → `break_lease`), so the helper sees the break and the
+//! opener waits until the helper lets go. The content of a leased file cannot
+//! change without such a break; only path-based metadata calls (chmod, chown,
+//! xattrs, utimes) can, and those are compared. Per file, each phase written
+//! to the journal before its syscall:
+//!
+//! 1. `CopyIntent` — lease the original (refused: someone has it open, the
+//!    file is left for a later run); measure it against the record; copy it
+//!    FD-relatively to `.tentanas-transfer-<op>-<seq>` in the data branch
+//!    root, leased too, with owner, mode, times, ACLs and xattrs; every chunk
+//!    is written out to the medium before both leases are polled, and every
+//!    later hash of either file polls both leases per chunk too. A client
+//!    opening either file therefore waits for one chunk of work, not for a
+//!    whole copy, fsync or hash — the only other waits under a lease are the
+//!    journal writes and directory fsyncs between the steps. The open breaks
+//!    the lease: the copy is withdrawn at once and the client's open proceeds
+//!    on the untouched original. Clients see: the original. The temporary is
+//!    a dotfile in the share root; SMB shares veto it (`SMB_VETO_FILES`), an
+//!    NFS client can still see it.
+//! 2. `CopyConfirmed`/`RenameIntent` — rename the temporary to the file's path
+//!    on the data branch (`RENAME_NOREPLACE`). `RenameConfirmed` pins it.
+//!    Clients see: still the original. mergerfs lists the cache branch first
+//!    and every open resolves there (`ff`); `func.getattr=newest` finds two
+//!    inodes with the same mtime and reports the first. Path-based actions
+//!    (`epall`) reach both copies, which is why metadata is compared.
+//! 3. `QuarantineIntent` — with both leases still standing, re-check the
+//!    original's and the copy's metadata, then rename the original to
+//!    `.tentanas-quarantine-<op>-<seq>` in the cache branch root: one
+//!    `renameat2` on one filesystem. From this instant a lookup of the path
+//!    finds no cache entry and resolves to the copy. `QuarantineConfirmed`
+//!    records it. Clients see: the copy, byte-identical to the original.
+//! 4. The decision. The original's lease still standing means nothing opened
+//!    or truncated it since before the copy: `UnlinkIntent`, drop the copy's
+//!    lease, check the original's lease one last time, unlink the quarantine
+//!    name, `UnlinkConfirmed`, `Done`. A broken lease or changed metadata
+//!    means somebody reached the original: `RestoreIntent` renames the
+//!    quarantine back to the path (NOREPLACE), removes the copy only if its
+//!    own lease proves nobody opened it and it is unchanged, and `Restored`
+//!    leaves the original — with whatever the opener writes after the helper
+//!    lets go — under its name for a later run. A copy that clients already
+//!    use keeps the path and the original stays as the quarantine file: both
+//!    are kept, and the record sticks for an admin. A quarantined original
+//!    somebody removed ends the record as a move, with a notice.
+//!
+//! Crash recovery reopens both files, takes the leases again and measures the
+//! content in full, then continues the same decision from the phase on disk:
+//! before the quarantine rename the move is finished only if both files are
+//! unchanged and unopened, after it the original is released only if it is,
+//! and anything else is withdrawn. Every step finds its files by pinned
+//! (device, inode), so a repeated step recognises its own earlier effect.
+//!
+//! Clients may have used the files between the crash and the reopen. After a
+//! reboot the array's Restore settles the record BEFORE it publishes the
+//! union, so nobody can; but a helper killed in the same boot leaves the union
+//! serving until the next run. That is why a reversal never trusts the phase
+//! alone: once the copy has owned the path, a copy no longer found under it
+//! means a client replaced, renamed or deleted the file, and the original is
+//! then never renamed back over the client's result — the record sticks with
+//! both names.
+//!
+//! # The residual lost-write window
+//!
+//! A lease is met by an opener only in `do_dentry_open`, AFTER its path
+//! lookup. Step 4 checks the original's lease a last time, calls `unlinkat`,
+//! checks it once more and closes the descriptor. Writes are lost for exactly
+//! one interleaving: an `open(2)` whose lookup resolved to the cache original —
+//! by the file's path before step 3's rename, or by the quarantine name before
+//! the `unlinkat` — and whose `do_dentry_open` runs AFTER that last check.
+//! If it runs before the helper closes the descriptor, it waits on the lease,
+//! the check after the unlink sees the break and the run reports it
+//! (a notice on the run); if it runs after, nothing sees it. Either way its descriptor
+//! refers to an unlinked inode and what it writes is gone. The same holds for a
+//! path-based metadata change (chmod, chown, xattrs, utimes) whose lookup
+//! resolved to the original and which lands after the last metadata check.
+//! Content cannot change any other way while the lease stands.
+//!
+//! How wide it is: a lookup by path must precede the rename, so the opener has
+//! to stall inside one `open(2)` across the rename, a directory fsync, two
+//! journal writes and the checks (milliseconds) — normally the gap between its
+//! lookup and `do_dentry_open` is microseconds. A lookup by the quarantine name
+//! needs a client that listed the share root and opens that exact dotfile in
+//! the instants before it is unlinked.
+//!
+//! The reversal has the mirror image of this window. It proves the copy
+//! unopened and unchanged, renames the original back under the path, checks
+//! the copy's lease ONCE more — an open that had resolved the path to the copy
+//! before that rename is seen here, and any failure of that check gives the
+//! path back to the copy with both files kept — and unlinks the copy with no
+//! other check in between. An open that resolved the path to the copy before
+//! the rename back and reaches the copy's lease only after that last check
+//! (the gap is the `unlinkat` call itself) holds an unlinked copy: seen and
+//! reported if it lands before the helper closes the copy, unseen after. The copy owned the path only since
+//! step 3 and is byte-identical to the restored original, so what is lost is
+//! that one client's writes through that one descriptor.
+//!
+//! Why the kernel does not let it close further: an open in progress holds a
+//! dentry reference, not a descriptor or an open file description, so neither
+//! a lease, `/proc/*/fd` nor fanotify can see it before `do_dentry_open`; and
+//! an unlinked inode cannot be linked back (`linkat` refuses `i_nlink == 0`
+//! unless the inode was created `O_TMPFILE`), so the helper cannot undo the
+//! unlink once it notices.
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString};
 #[cfg(target_os = "linux")]
 use std::fs::File;
-#[cfg(target_os = "linux")]
-use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
@@ -36,9 +143,35 @@ pub(crate) enum TransferFilePhase {
     CopyConfirmed,
     RenameIntent,
     RenameConfirmed,
+    /// The original is about to be renamed to its quarantine name.
+    QuarantineIntent,
+    /// The original is under its quarantine name; the copy owns the path.
+    QuarantineConfirmed,
+    /// The quarantined original is about to be unlinked.
     UnlinkIntent,
     UnlinkConfirmed,
     Done,
+    /// The move is being reversed: the original goes back under its path and
+    /// the copy is removed.
+    RestoreIntent,
+    /// The move was reversed; the file waits on the cache for a later run.
+    Restored,
+}
+
+/// The prefix of the copy's temporary name in the data branch root.
+pub(crate) const TEMPORARY_PREFIX: &str = ".tentanas-transfer-";
+/// The prefix of the original's quarantine name in the cache branch root.
+pub(crate) const QUARANTINE_PREFIX: &str = ".tentanas-quarantine-";
+
+/// Where the original waits while its copy takes over the path: the record's
+/// temporary name under the quarantine prefix, so it needs no field of its own
+/// and names the same operation and sequence.
+pub(crate) fn quarantine_name(temporary: &str) -> Result<String, String> {
+    temporary
+        .strip_prefix(TEMPORARY_PREFIX)
+        .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+        .map(|rest| format!("{QUARANTINE_PREFIX}{rest}"))
+        .ok_or_else(|| "nazwa tymczasowa bez prefiksu transferu".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -146,15 +279,26 @@ pub(crate) struct TransferFile {
     pub phase: TransferFilePhase,
 }
 
-/// How a record reached Done.
+/// How a record ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TransferEnd {
-    /// Every re-read of the source matched the measured identity.
-    Verified,
-    /// After the rename the source could no longer be read (the error is
-    /// kept); it was unlinked on a stat-only identity match against the
-    /// pinned, re-verified destination.
-    SourceUnreadable(String),
+    /// `Done`: the copy owns the path and the original is gone.
+    Moved {
+        /// After the rename the original could no longer be read (the error is
+        /// kept); it was released on a stat-only identity match against the
+        /// pinned copy, re-read from its medium.
+        unreadable: Option<String>,
+        /// What an admin must hear about this file although it moved: an open
+        /// that reached the original's lease between the last check and the
+        /// unlink (the residual window the module doc names), a quarantined
+        /// original somebody else removed, an unlink whose directory entry
+        /// could not be confirmed on disk.
+        notices: Vec<String>,
+    },
+    /// `Restored`: the original is under its path again, the copy is gone,
+    /// and the file waits for a later run. `reason` says why; `notices` as
+    /// above, for the reversal.
+    Withdrawn { reason: String, notices: Vec<String> },
 }
 
 /// One regular file the cache walk found, measured without reading it.
@@ -355,7 +499,8 @@ pub(crate) fn worst_case_record(file: &TransferFile) -> TransferFile {
     // A stuck record may set this before the closing write, and it only ever
     // costs bytes when true.
     pinned.temporary_removed = true;
-    pinned.phase = TransferFilePhase::UnlinkConfirmed;
+    // The longest phase name the record can carry.
+    pinned.phase = TransferFilePhase::QuarantineConfirmed;
     pinned
 }
 
@@ -580,6 +725,9 @@ fn exists_at(dirfd: i32, name: &str) -> Result<bool, String> {
 #[cfg(target_os = "linux")]
 enum MeasureError {
     MediaRead(String),
+    /// The measurement ran under this descriptor's own write lease and
+    /// somebody opened the file: it stopped at once, so they do not wait.
+    LeaseBroken,
     Other(String),
 }
 
@@ -588,6 +736,7 @@ impl MeasureError {
     fn into_message(self) -> String {
         match self {
             Self::MediaRead(message) | Self::Other(message) => message,
+            Self::LeaseBroken => "plik otwarty przez inny proces podczas pomiaru".into(),
         }
     }
 }
@@ -623,8 +772,60 @@ fn media_read_error(error: &std::io::Error) -> bool {
 
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
+    /// `(device, inode)` of every chunk `measure_fd` read in this test thread.
+    static MEASURED_CHUNKS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Called after each measured chunk with the file's identity and the
+    /// leases the measurement polls.
+    static MEASURE_HOOK: std::cell::RefCell<Option<MeasureHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+type MeasureHook = Box<dyn FnMut((u64, u64), &[&OwnedFd])>;
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
     /// `(device, inode)` whose content reads fail with EIO in this test thread.
     static UNREADABLE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// A moment at which a test may act on a file the state machine holds leased.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseMoment {
+    /// After one chunk of the original was written to the temporary.
+    CopyChunk,
+    /// The original is under its quarantine name and leased, before the
+    /// checks that decide whether it is released.
+    BeforeRelease,
+    /// A reversal just renamed the original back under its path; the copy is
+    /// still leased and has not been checked again.
+    AfterRenameBack,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+type LeaseHook = Box<dyn FnMut(LeaseMoment, &OwnedFd)>;
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static LEASE_HOOK: std::cell::RefCell<Option<LeaseHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Installs (or clears) the calling test's action at a `LeaseMoment`. It is
+/// handed the leased original, so it can wait for its own opener to reach the
+/// lease instead of guessing at timing.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn on_lease_moment(hook: Option<LeaseHook>) {
+    LEASE_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(target_os = "linux")]
+fn lease_moment(_moment: LeaseMoment, _original: &OwnedFd) {
+    #[cfg(test)]
+    LEASE_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow_mut().as_mut() {
+            hook(_moment, _original);
+        }
+    });
 }
 
 /// Makes content reads of one inode fail with EIO for the calling test.
@@ -633,8 +834,12 @@ pub(crate) fn fail_content_reads(identity: Option<(u64, u64)>) {
     UNREADABLE.with(|cell| cell.set(identity));
 }
 
+/// Reads the whole file and its attributes. Every descriptor in `leases`
+/// carries a write lease of the session, and all of them are checked between
+/// chunks: a client opening EITHER file while the other is being read waits
+/// one chunk, not the whole read.
 #[cfg(target_os = "linux")]
-fn measure_fd(fd: &OwnedFd) -> Result<TransferIdentity, MeasureError> {
+fn measure_fd(fd: &OwnedFd, leases: &[&OwnedFd]) -> Result<TransferIdentity, MeasureError> {
     let stat = stat_fd(fd.as_raw_fd())?;
     let mode = stat.st_mode as u32;
     if stat.st_nlink != 1 || (mode & libc::S_IFMT as u32) != libc::S_IFREG as u32 {
@@ -657,6 +862,8 @@ fn measure_fd(fd: &OwnedFd) -> Result<TransferIdentity, MeasureError> {
     }
     let input = File::from(fd.try_clone().map_err(|e| e.to_string())?);
     let mut hash = Sha256::new();
+    #[cfg(test)]
+    let measured = (stat.st_dev as u64, stat.st_ino as u64);
     let mut size = 0u64;
     let mut buffer = [0u8; 1024 * 1024];
     loop {
@@ -674,6 +881,20 @@ fn measure_fd(fd: &OwnedFd) -> Result<TransferIdentity, MeasureError> {
             .checked_add(count as u64)
             .ok_or("rozmiar pliku przekracza limit")?;
         hash.update(&buffer[..count]);
+        #[cfg(test)]
+        {
+            MEASURED_CHUNKS.with(|chunks| chunks.borrow_mut().push(measured));
+            MEASURE_HOOK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(measured, leases);
+                }
+            });
+        }
+        for lease in leases {
+            if !lease_intact(lease)? {
+                return Err(MeasureError::LeaseBroken);
+            }
+        }
     }
     let after = stat_fd(fd.as_raw_fd())?;
     if after.st_dev != stat.st_dev
@@ -705,14 +926,15 @@ fn measure_fd(fd: &OwnedFd) -> Result<TransferIdentity, MeasureError> {
 
 #[cfg(target_os = "linux")]
 fn identity_fd(fd: &OwnedFd) -> Result<TransferIdentity, String> {
-    measure_fd(fd).map_err(MeasureError::into_message)
+    measure_fd(fd, &[]).map_err(MeasureError::into_message)
 }
 
 /// Makes the next read of `fd` come from the medium: dirty pages are written
 /// back, then the clean ones are dropped from the page cache. The kernel
 /// treats DONTNEED as advice: pages another process has mapped or locked stay
 /// resident, so this guarantees a re-read from disk only for a file nobody
-/// maps, which under the RO Hold is every branch file.
+/// maps — which a write lease on `fd` proves, since a mapping is an open file
+/// description the lease is refused for.
 #[cfg(target_os = "linux")]
 fn drop_cached_pages(fd: i32) -> Result<(), String> {
     if unsafe { libc::fdatasync(fd) } != 0 {
@@ -723,13 +945,6 @@ fn drop_cached_pages(fd: i32) -> Result<(), String> {
         return Err(std::io::Error::from_raw_os_error(result).to_string());
     }
     Ok(())
-}
-
-fn transfer_end(file: &TransferFile) -> TransferEnd {
-    match &file.unread_source {
-        Some(error) => TransferEnd::SourceUnreadable(error.clone()),
-        None => TransferEnd::Verified,
-    }
 }
 
 /// The measured identity without reading content: the same single-linked
@@ -823,14 +1038,6 @@ fn restore_attributes<'a>(
 }
 
 #[cfg(target_os = "linux")]
-fn same_identity(fd: &OwnedFd, expected: &TransferIdentity) -> Result<(), String> {
-    if identity_fd(fd)? != *expected {
-        return Err("plik zmienił tożsamość względem journalu".into());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
 fn same_content_metadata(actual: &TransferIdentity, source: &TransferIdentity) -> bool {
     actual.size == source.size
         && actual.sha256 == source.sha256
@@ -868,12 +1075,46 @@ fn rename_without_replace(rootfd: i32, source: &str, target: &str) -> Result<(),
             )
         })
         .transpose()?;
-    let source_dirfd = source_parent.as_ref().map_or(rootfd, AsRawFd::as_raw_fd);
-    let target_dirfd = target_parent.as_ref().map_or(rootfd, AsRawFd::as_raw_fd);
-    let source = CString::new(source.rsplit_once('/').map_or(source, |(_, name)| name))
-        .map_err(|_| "źródło zawiera NUL".to_string())?;
-    let target = CString::new(target.rsplit_once('/').map_or(target, |(_, name)| name))
-        .map_err(|_| "cel zawiera NUL".to_string())?;
+    rename_at_noreplace(
+        source_parent.as_ref().map_or(rootfd, AsRawFd::as_raw_fd),
+        source.rsplit_once('/').map_or(source, |(_, name)| name),
+        target_parent.as_ref().map_or(rootfd, AsRawFd::as_raw_fd),
+        target.rsplit_once('/').map_or(target, |(_, name)| name),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Writes one written range out to the medium and waits for it, so a later
+/// `fsync` of the file has almost nothing left to do.
+#[cfg(target_os = "linux")]
+fn flush_range(fd: i32, offset: u64, count: usize) -> Result<(), String> {
+    let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER;
+    let offset = i64::try_from(offset).map_err(|_| "przesunięcie poza zakresem")?;
+    let count = i64::try_from(count).map_err(|_| "rozmiar poza zakresem")?;
+    if unsafe { libc::sync_file_range(fd, offset, count, flags) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+/// One `renameat2(RENAME_NOREPLACE)` of a single name between two directory
+/// descriptors: the target is never replaced, and the caller reads the errno.
+#[cfg(target_os = "linux")]
+fn rename_at_noreplace(
+    source_dirfd: i32,
+    source: &str,
+    target_dirfd: i32,
+    target: &str,
+) -> Result<(), std::io::Error> {
+    for name in [source, target] {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(std::io::Error::other("nieprawidłowa nazwa wpisu"));
+        }
+    }
+    let source = CString::new(source)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "źródło zawiera NUL"))?;
+    let target = CString::new(target)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "cel zawiera NUL"))?;
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
@@ -885,7 +1126,7 @@ fn rename_without_replace(rootfd: i32, source: &str, target: &str) -> Result<(),
         )
     };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -1081,6 +1322,9 @@ pub(crate) fn plan_file(
     if exists_at(destination_root.as_raw_fd(), temporary)? {
         return Err("nazwa tymczasowa jest zajęta".into());
     }
+    if exists_at(source_root.as_raw_fd(), &quarantine_name(temporary)?)? {
+        return Err("nazwa odsunięcia oryginału jest zajęta".into());
+    }
     Ok(TransferFile {
         source: path.into(),
         destination: path.into(),
@@ -1197,8 +1441,9 @@ where
 }
 
 /// `(device, inode)` of every file another process holds open, read from
-/// `/proc`. The helper's own descriptors are left out. This is a snapshot
-/// taken under the global RO barrier, not a barrier of its own.
+/// `/proc`. The helper's own descriptors are left out. This is a snapshot for
+/// choosing and counting what a run skips, not a barrier: what protects a file
+/// while it moves is the write lease `transfer_file` holds on it.
 ///
 /// It sees union clients only through `daemon`, the private mergerfs: the
 /// worker unshares CLONE_NEWNS alone (no PID namespace), and with
@@ -1415,45 +1660,906 @@ pub(crate) fn remove_orphan_temporary(_: &Path, _: &TransferFile) -> Result<Orph
     Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
 }
 
-/// Withdraws a record whose source was never touched (CopyIntent up to
-/// RenameIntent): removes the helper's own copy, found by its pinned inode
-/// under the temporary name or already renamed into place, and the private
-/// directory this record was still creating.
+/// Why a step of the state machine stopped: a decision to reverse the move,
+/// or a failure the caller handles.
 #[cfg(target_os = "linux")]
-pub(crate) fn roll_back(
-    source_root: &Path,
-    destination_root: &Path,
-    file: &TransferFile,
-) -> Result<(), String> {
-    if !matches!(
-        file.phase,
-        TransferFilePhase::CopyIntent | TransferFilePhase::CopyConfirmed | TransferFilePhase::RenameIntent
-    ) {
-        return Err("rekordu po potwierdzonej zmianie nazwy nie można wycofać".into());
+enum Stop {
+    /// The file must stay on the cache; the text is why.
+    Withdraw(String),
+    Fail(String),
+}
+
+#[cfg(target_os = "linux")]
+impl From<String> for Stop {
+    fn from(message: String) -> Self {
+        Self::Fail(message)
     }
-    let source_root = open_root_directory(source_root)?;
-    let destination_root = open_root_directory(destination_root)?;
-    let source = open_relative(
-        source_root.as_raw_fd(),
-        &file.source,
-        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+}
+
+#[cfg(target_os = "linux")]
+impl From<&str> for Stop {
+    fn from(message: &str) -> Self {
+        Self::Fail(message.into())
+    }
+}
+
+/// A descriptor this session holds under its own write lease.
+#[cfg(target_os = "linux")]
+struct Leased {
+    fd: OwnedFd,
+    /// The content was measured while this lease stood: as long as the lease
+    /// still stands, nobody has opened or truncated the inode since, so only
+    /// its path-reachable metadata can differ from that measurement.
+    measured: bool,
+}
+
+/// One invocation's view of a record: both branch roots and the leases it
+/// holds. Dropping it closes the descriptors, which releases the leases.
+#[cfg(target_os = "linux")]
+struct Session {
+    source_root: OwnedFd,
+    destination_root: OwnedFd,
+    original: Option<Leased>,
+    copy: Option<Leased>,
+    /// The original could not be read after the copy was renamed into place,
+    /// and its stat identity still matched.
+    unreadable: Option<String>,
+    /// Notices for the record's end (`TransferEnd`).
+    notices: Vec<String>,
+}
+
+/// Where the pinned original is on the cache branch.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Path,
+    Quarantine,
+}
+
+/// Where the pinned copy is on the data branch.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyPlace {
+    Temporary,
+    Path,
+}
+
+#[cfg(target_os = "linux")]
+fn quiet_lease_breaks() {
+    static IGNORED: std::sync::Once = std::sync::Once::new();
+    // A broken lease is announced with SIGIO, whose default action ends the
+    // process. The state machine polls F_GETLEASE instead, and the owner is
+    // cleared after every F_SETLEASE; ignoring the signal only covers the
+    // instant between the two calls.
+    IGNORED.call_once(|| unsafe {
+        libc::signal(libc::SIGIO, libc::SIG_IGN);
+    });
+}
+
+/// Takes a write lease on `fd`. `Ok(false)` means another open file
+/// description of the inode exists — an open descriptor or a mapping, in any
+/// process and any namespace — which is exactly what the kernel refuses a
+/// write lease for.
+#[cfg(target_os = "linux")]
+fn take_lease(fd: &OwnedFd) -> Result<bool, String> {
+    quiet_lease_breaks();
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::EBUSY) | Some(libc::ETXTBSY) => Ok(false),
+            _ => Err(format!("lease: {error}")),
+        };
+    }
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETOWN, 0) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(true)
+}
+
+/// Whether the write lease on `fd` still stands. Any open or truncate of the
+/// inode since it was taken turns it into a pending break.
+#[cfg(target_os = "linux")]
+fn lease_intact(fd: &OwnedFd) -> Result<bool, String> {
+    let lease = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETLEASE) };
+    if lease < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(lease == libc::F_WRLCK)
+}
+
+#[cfg(target_os = "linux")]
+fn temporary_of(file: &TransferFile) -> Result<&str, String> {
+    file.temporary
+        .as_deref()
+        .ok_or_else(|| "brak trwałej ścieżki tymczasowej".to_string())
+}
+
+/// Whether `name` in `dirfd` is the pinned regular inode; a missing name is
+/// `false`, never an error.
+#[cfg(target_os = "linux")]
+fn pinned_at(dirfd: i32, name: &str, pin: (u64, u64)) -> Result<bool, String> {
+    match stat_at_io(dirfd, name) {
+        Ok(stat) => Ok((stat.st_dev as u64, stat.st_ino as u64) == pin
+            && (stat.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The parent directory of `path` beneath `rootfd` and its last component,
+/// or `None` when that directory no longer exists.
+#[cfg(target_os = "linux")]
+fn existing_parent(rootfd: i32, path: &str) -> Result<Option<(OwnedFd, String)>, String> {
+    let parent = parent_path(path)?;
+    let name = path.rsplit_once('/').map_or(path, |(_, name)| name).to_string();
+    if parent.is_empty() {
+        return Ok(Some((duplicate_fd(rootfd)?, name)));
+    }
+    match open_relative_io(
+        rootfd,
+        parent,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         0,
-    )?;
-    let source_stat = stat_fd(source.as_raw_fd())?;
-    if (source_stat.st_dev as u64, source_stat.st_ino as u64)
-        != (file.source_identity.device, file.source_identity.inode)
-    {
-        return Err("źródło wycofywanego pliku zmieniło inode".into());
+    ) {
+        Ok(directory) => Ok(Some((directory, name))),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(error) => Err(error.to_string()),
     }
-    let unlink = |dirfd: i32, name: &str| -> Result<(), String> {
-        let name = CString::new(name).map_err(|_| "nazwa zawiera NUL".to_string())?;
-        if unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) } != 0 {
+}
+
+#[cfg(target_os = "linux")]
+fn original_pin(file: &TransferFile) -> (u64, u64) {
+    (file.source_identity.device, file.source_identity.inode)
+}
+
+#[cfg(target_os = "linux")]
+fn locate_original(session: &Session, file: &TransferFile) -> Result<Option<Place>, String> {
+    let pin = original_pin(file);
+    let at_path = match existing_parent(session.source_root.as_raw_fd(), &file.source)? {
+        Some((parent, name)) => pinned_at(parent.as_raw_fd(), &name, pin)?,
+        None => false,
+    };
+    let quarantined = pinned_at(
+        session.source_root.as_raw_fd(),
+        &quarantine_name(temporary_of(file)?)?,
+        pin,
+    )?;
+    match (at_path, quarantined) {
+        (true, false) => Ok(Some(Place::Path)),
+        (false, true) => Ok(Some(Place::Quarantine)),
+        (false, false) => Ok(None),
+        (true, true) => Err("oryginał jest pod ścieżką i pod nazwą odsunięcia".into()),
+    }
+}
+
+/// Where the copy pinned at its creation is, if it is still there.
+#[cfg(target_os = "linux")]
+fn locate_copy(session: &Session, file: &TransferFile) -> Result<Option<CopyPlace>, String> {
+    let Some(pin) = file.temporary_pin else {
+        return Ok(None);
+    };
+    let destination_root = session.destination_root.as_raw_fd();
+    let at_temporary = pinned_at(destination_root, temporary_of(file)?, pin)?;
+    let at_path = match existing_parent(destination_root, &file.destination)? {
+        Some((parent, name)) => pinned_at(parent.as_raw_fd(), &name, pin)?,
+        None => false,
+    };
+    match (at_temporary, at_path) {
+        (true, false) => Ok(Some(CopyPlace::Temporary)),
+        (false, true) => Ok(Some(CopyPlace::Path)),
+        (false, false) => Ok(None),
+        (true, true) => Err("kopia jest pod nazwą tymczasową i pod ścieżką".into()),
+    }
+}
+
+/// Opens the original where it is and leases it, once per session.
+#[cfg(target_os = "linux")]
+fn hold_original(session: &mut Session, file: &TransferFile, place: Place) -> Result<(), Stop> {
+    if session.original.is_some() {
+        return Ok(());
+    }
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let fd = match place {
+        Place::Path => {
+            let (parent, name) = existing_parent(session.source_root.as_raw_fd(), &file.source)?
+                .ok_or("katalog oryginału zniknął")?;
+            open_relative(parent.as_raw_fd(), &name, flags, 0)?
+        }
+        Place::Quarantine => open_relative(
+            session.source_root.as_raw_fd(),
+            &quarantine_name(temporary_of(file)?)?,
+            flags,
+            0,
+        )?,
+    };
+    let stat = stat_fd(fd.as_raw_fd())?;
+    if (stat.st_dev as u64, stat.st_ino as u64) != original_pin(file) {
+        return Err(Stop::Withdraw("plik zmienił się od skanu".into()));
+    }
+    if !take_lease(&fd)? {
+        return Err(Stop::Withdraw("plik otwarty przez inny proces".into()));
+    }
+    session.original = Some(Leased { fd, measured: false });
+    Ok(())
+}
+
+/// Opens the copy where it is and leases it, once per session.
+#[cfg(target_os = "linux")]
+fn hold_copy(session: &mut Session, file: &TransferFile) -> Result<CopyPlace, Stop> {
+    let place = locate_copy(session, file)?.ok_or("kopia zniknęła z dysku danych")?;
+    if session.copy.is_some() {
+        return Ok(place);
+    }
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let destination_root = session.destination_root.as_raw_fd();
+    let fd = match place {
+        CopyPlace::Temporary => open_relative(destination_root, temporary_of(file)?, flags, 0)?,
+        CopyPlace::Path => {
+            let (parent, name) = existing_parent(destination_root, &file.destination)?
+                .ok_or("katalog kopii zniknął")?;
+            open_relative(parent.as_raw_fd(), &name, flags, 0)?
+        }
+    };
+    let stat = stat_fd(fd.as_raw_fd())?;
+    if Some((stat.st_dev as u64, stat.st_ino as u64)) != file.temporary_pin {
+        return Err(Stop::Fail("kopia zmieniła przypięty inode".into()));
+    }
+    if !take_lease(&fd)? {
+        return Err(Stop::Withdraw("kopia na dysku danych otwarta przez inny proces".into()));
+    }
+    session.copy = Some(Leased { fd, measured: false });
+    Ok(place)
+}
+
+/// The original's stat identity and attributes against the record.
+#[cfg(target_os = "linux")]
+fn original_metadata_matches(fd: &OwnedFd, identity: &TransferIdentity) -> Result<bool, String> {
+    if !same_stat(&stat_fd(fd.as_raw_fd())?, identity) {
+        return Ok(false);
+    }
+    let (acl, xattr) = attributes_fd(fd.as_raw_fd())?;
+    Ok(acl == identity.acl && xattr == identity.xattr)
+}
+
+/// The copy's pinned inode with the content metadata of the original.
+#[cfg(target_os = "linux")]
+fn copy_metadata_matches(fd: &OwnedFd, pin: &TransferPin, identity: &TransferIdentity) -> Result<bool, String> {
+    let stat = stat_fd(fd.as_raw_fd())?;
+    let (acl, xattr) = attributes_fd(fd.as_raw_fd())?;
+    Ok(stat.st_nlink == 1
+        && (stat.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32
+        && (stat.st_dev as u64, stat.st_ino as u64) == (pin.device, pin.inode)
+        && u64::try_from(stat.st_size).ok() == Some(pin.size)
+        && stat.st_mtime as i128 * 1_000_000_000 + stat.st_mtime_nsec as i128 == identity.mtime_ns
+        && stat.st_uid == identity.uid
+        && stat.st_gid == identity.gid
+        && stat.st_mode as u32 & 0o7777 == identity.mode
+        && acl == identity.acl
+        && xattr == identity.xattr)
+}
+
+/// Whether the leased original still is what the record measured. An
+/// unreadable original is accepted on its stat identity only when
+/// `unreadable_allowed`, i.e. once its copy stands verified under the path.
+#[cfg(target_os = "linux")]
+fn check_original(session: &mut Session, file: &TransferFile, unreadable_allowed: bool) -> Result<(), Stop> {
+    let Session { original, copy, .. } = session;
+    let held = original.as_mut().ok_or("brak trzymanego oryginału")?;
+    if !lease_intact(&held.fd)? {
+        return Err(Stop::Withdraw("plik otwarty przez inny proces".into()));
+    }
+    if held.measured {
+        if !original_metadata_matches(&held.fd, &file.source_identity)? {
+            return Err(Stop::Withdraw("metadane pliku zmieniły się podczas przenoszenia".into()));
+        }
+        return Ok(());
+    }
+    let leases: Vec<&OwnedFd> = std::iter::once(&held.fd).chain(copy.as_ref().map(|copy| &copy.fd)).collect();
+    let unreadable = match measure_fd(&held.fd, &leases) {
+        Ok(identity) if identity == file.source_identity => None,
+        Ok(_) => return Err(Stop::Withdraw("plik zmienił się podczas przenoszenia".into())),
+        Err(MeasureError::LeaseBroken) => {
+            return Err(Stop::Withdraw("plik lub jego kopia otwarte przez inny proces".into()));
+        }
+        Err(MeasureError::MediaRead(error))
+            if unreadable_allowed && same_stat(&stat_fd(held.fd.as_raw_fd())?, &file.source_identity) =>
+        {
+            Some(error)
+        }
+        Err(error) => return Err(Stop::Fail(error.into_message())),
+    };
+    if !lease_intact(&held.fd)? {
+        return Err(Stop::Withdraw("plik otwarty przez inny proces".into()));
+    }
+    held.measured = true;
+    if unreadable.is_some() {
+        session.unreadable = unreadable;
+    }
+    Ok(())
+}
+
+/// Whether the leased copy still is the verified copy of the original. After
+/// an unreadable original its content is re-read from the medium, not from
+/// the page cache: that hash is what releases an original nobody could read.
+#[cfg(target_os = "linux")]
+fn check_copy(session: &mut Session, file: &TransferFile) -> Result<(), Stop> {
+    let pin = file
+        .temporary_identity
+        .clone()
+        .ok_or("brak tożsamości kopii")?;
+    let reread = session.unreadable.is_some();
+    let Session { original, copy, .. } = session;
+    let held = copy.as_mut().ok_or("brak trzymanej kopii")?;
+    if !lease_intact(&held.fd)? {
+        return Err(Stop::Withdraw("kopia na dysku danych otwarta przez inny proces".into()));
+    }
+    if held.measured && !reread {
+        if !copy_metadata_matches(&held.fd, &pin, &file.source_identity)? {
+            return Err(Stop::Fail("kopia ma inne metadane niż źródło".into()));
+        }
+        return Ok(());
+    }
+    if reread {
+        drop_cached_pages(held.fd.as_raw_fd())?;
+    }
+    let leases: Vec<&OwnedFd> = std::iter::once(&held.fd).chain(original.as_ref().map(|original| &original.fd)).collect();
+    let actual = match measure_fd(&held.fd, &leases) {
+        Ok(actual) => actual,
+        Err(MeasureError::LeaseBroken) => {
+            return Err(Stop::Withdraw("plik lub jego kopia otwarte przez inny proces".into()));
+        }
+        Err(error) => return Err(Stop::Fail(error.into_message())),
+    };
+    if pin_of(&actual) != pin || !same_content_metadata(&actual, &file.source_identity) {
+        return Err(Stop::Fail("kopia nie odpowiada przypiętej tożsamości i metadanym źródła".into()));
+    }
+    if !lease_intact(&held.fd)? {
+        return Err(Stop::Withdraw("kopia na dysku danych otwarta przez inny proces".into()));
+    }
+    held.measured = true;
+    Ok(())
+}
+
+/// Bytes copied, and written out to the medium, between two lease checks: a
+/// client that opens either file during a long copy waits at most for one
+/// chunk to be read, written and flushed before the copy is abandoned. The
+/// flush per chunk is what keeps the closing `fsync` from becoming a wait of
+/// its own under the lease.
+#[cfg(target_os = "linux")]
+const COPY_CHUNK: usize = 1024 * 1024;
+
+/// `CopyIntent`: the leased original into the leased temporary.
+#[cfg(target_os = "linux")]
+fn copy_original<F>(session: &mut Session, file: &mut TransferFile, persist: &mut F) -> Result<(), Stop>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    let temporary = temporary_of(file)?.to_string();
+    persist(file)?;
+    if locate_original(session, file)? != Some(Place::Path) {
+        return Err(Stop::Withdraw("plik zmienił się od skanu".into()));
+    }
+    hold_original(session, file, Place::Path)?;
+    check_original(session, file, false)?;
+    let destination_fd = session.destination_root.as_raw_fd();
+    let target = match open_relative_io(
+        destination_fd,
+        &temporary,
+        libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(target) => {
+            // The name is unique to this operation and sequence, so an
+            // unpinned file there is this record's own create cut short
+            // before its pin was written: adopt it, but only in that fresh
+            // state.
+            if file.temporary_pin.is_none() && !fresh_temporary(&stat_fd(target.as_raw_fd())?) {
+                return Err(Stop::Fail("plik tymczasowy bez pina nie jest świeżą kopią tej operacji".into()));
+            }
+            target
+        }
+        // A pinned temporary that is not there did not survive a power loss
+        // (its directory entry never reached the disk) or was removed by
+        // somebody else. Recreating it could only fail its pin: the record is
+        // withdrawn instead, and a later run copies the file afresh.
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) && file.temporary_pin.is_some() => {
+            return Err(Stop::Withdraw("kopia tymczasowa zniknęła przed potwierdzeniem".into()));
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => open_relative(
+            destination_fd,
+            &temporary,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600,
+        )?,
+        Err(error) => return Err(Stop::Fail(error.to_string())),
+    };
+    let temporary_stat = stat_fd(target.as_raw_fd())?;
+    if temporary_stat.st_nlink != 1
+        || (temporary_stat.st_mode as u32 & libc::S_IFMT as u32) != libc::S_IFREG as u32
+    {
+        return Err(Stop::Fail("mover odmawia tymczasowego hardlinku lub pliku specjalnego".into()));
+    }
+    let temporary_pin = (temporary_stat.st_dev as u64, temporary_stat.st_ino as u64);
+    match file.temporary_pin {
+        Some(pin) if pin != temporary_pin => {
+            return Err(Stop::Fail("plik tymczasowy zmienił przypięty inode".into()));
+        }
+        Some(_) => {}
+        None => {
+            file.temporary_pin = Some(temporary_pin);
+            persist(file)?;
+        }
+    }
+    if !take_lease(&target)? {
+        return Err(Stop::Withdraw("kopia tymczasowa otwarta przez inny proces".into()));
+    }
+    if unsafe { libc::ftruncate(target.as_raw_fd(), 0) } != 0 {
+        return Err(Stop::Fail(std::io::Error::last_os_error().to_string()));
+    }
+    {
+        let original = session.original.as_ref().ok_or("brak trzymanego oryginału")?;
+        let input = File::from(original.fd.try_clone().map_err(|e| e.to_string())?);
+        let output = File::from(target.try_clone().map_err(|e| e.to_string())?);
+        let mut buffer = vec![0u8; COPY_CHUNK];
+        let mut offset = 0u64;
+        loop {
+            let count = input.read_at(&mut buffer, offset).map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            output
+                .write_all_at(&buffer[..count], offset)
+                .map_err(|e| e.to_string())?;
+            flush_range(output.as_raw_fd(), offset, count)?;
+            offset = offset.checked_add(count as u64).ok_or("rozmiar pliku przekracza limit")?;
+            lease_moment(LeaseMoment::CopyChunk, &original.fd);
+            if !lease_intact(&original.fd)? {
+                return Err(Stop::Withdraw("plik otwarty przez inny proces podczas kopiowania".into()));
+            }
+            if !lease_intact(&target)? {
+                return Err(Stop::Withdraw("kopia tymczasowa otwarta przez inny proces".into()));
+            }
+        }
+    }
+    if unsafe { libc::fchown(target.as_raw_fd(), file.source_identity.uid, file.source_identity.gid) } != 0 {
+        return Err(Stop::Fail(std::io::Error::last_os_error().to_string()));
+    }
+    strip_foreign_acls(target.as_raw_fd(), &file.source_identity.acl)?;
+    restore_attributes(
+        target.as_raw_fd(),
+        file.source_identity.acl.iter().chain(file.source_identity.xattr.iter()),
+    )?;
+    // The temporary stays 0600 until here: the final mode, set-id bits
+    // included, comes after `fchown`, which would clear them.
+    if unsafe { libc::fchmod(target.as_raw_fd(), file.source_identity.mode) } != 0 {
+        return Err(Stop::Fail(std::io::Error::last_os_error().to_string()));
+    }
+    let seconds = file.source_identity.mtime_ns.div_euclid(1_000_000_000);
+    let nanos = file.source_identity.mtime_ns.rem_euclid(1_000_000_000);
+    let times = [
+        libc::timespec { tv_sec: seconds as _, tv_nsec: nanos as _ },
+        libc::timespec { tv_sec: seconds as _, tv_nsec: nanos as _ },
+    ];
+    if unsafe { libc::futimens(target.as_raw_fd(), times.as_ptr()) } != 0 {
+        return Err(Stop::Fail(std::io::Error::last_os_error().to_string()));
+    }
+    fsync_fd(target.as_raw_fd())?;
+    // Compared before CopyConfirmed: a copy the branch altered (an inherited
+    // ACL, a label) is withdrawn instead of being published.
+    let original_fd = &session.original.as_ref().ok_or("brak trzymanego oryginału")?.fd;
+    if !lease_intact(original_fd)? {
+        return Err(Stop::Withdraw("plik otwarty przez inny proces podczas kopiowania".into()));
+    }
+    let actual = match measure_fd(&target, &[&target, original_fd]) {
+        Ok(actual) => actual,
+        Err(MeasureError::LeaseBroken) => {
+            return Err(Stop::Withdraw("plik lub kopia tymczasowa otwarte przez inny proces".into()));
+        }
+        Err(error) => return Err(Stop::Fail(error.into_message())),
+    };
+    if !same_content_metadata(&actual, &file.source_identity) {
+        return Err(Stop::Fail("kopia tymczasowa ma inną treść lub metadane niż źródło".into()));
+    }
+    if !lease_intact(&target)? {
+        return Err(Stop::Withdraw("kopia tymczasowa otwarta przez inny proces".into()));
+    }
+    check_original(session, file, false)?;
+    file.temporary_identity = Some(pin_of(&actual));
+    session.copy = Some(Leased { fd: target, measured: true });
+    file.phase = TransferFilePhase::CopyConfirmed;
+    persist(file)?;
+    Ok(())
+}
+
+/// `RenameIntent`: the verified copy under the file's path on the data branch.
+/// The original still owns the path in the union: mergerfs resolves it on the
+/// cache branch, which comes first.
+#[cfg(target_os = "linux")]
+fn rename_copy<F>(session: &mut Session, file: &mut TransferFile, persist: &mut F) -> Result<(), Stop>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    file.phase = TransferFilePhase::RenameIntent;
+    persist(file)?;
+    // A copy is never put under the path of an original that is gone or was
+    // replaced: that file is somebody else's now.
+    if locate_original(session, file)? != Some(Place::Path) {
+        return Err(Stop::Withdraw("plik zmienił się od skanu".into()));
+    }
+    let place = hold_copy(session, file)?;
+    check_copy(session, file)?;
+    let destination_fd = session.destination_root.as_raw_fd();
+    if place == CopyPlace::Temporary {
+        rename_without_replace(destination_fd, temporary_of(file)?, &file.destination)?;
+    }
+    let (parent, _) = existing_parent(destination_fd, &file.destination)?.ok_or("katalog kopii zniknął")?;
+    fsync_fd(parent.as_raw_fd())?;
+    fsync_fd(destination_fd)?;
+    file.destination_identity = file.temporary_identity.clone();
+    file.phase = TransferFilePhase::RenameConfirmed;
+    persist(file)?;
+    Ok(())
+}
+
+/// Renames the original from its path to its quarantine name, after checking
+/// under both leases that neither file was opened or changed. From the rename
+/// on, the path resolves to the copy.
+#[cfg(target_os = "linux")]
+fn move_aside(session: &mut Session, file: &TransferFile) -> Result<(), Stop> {
+    hold_original(session, file, Place::Path)?;
+    check_original(session, file, true)?;
+    if hold_copy(session, file)? != CopyPlace::Path {
+        return Err(Stop::Fail("kopia nie stoi pod ścieżką pliku".into()));
+    }
+    check_copy(session, file)?;
+    let original = session.original.as_ref().ok_or("brak trzymanego oryginału")?;
+    if !lease_intact(&original.fd)? {
+        return Err(Stop::Withdraw("plik otwarty przez inny proces".into()));
+    }
+    let copy = session.copy.as_ref().ok_or("brak trzymanej kopii")?;
+    if !lease_intact(&copy.fd)? {
+        return Err(Stop::Withdraw("kopia na dysku danych otwarta przez inny proces".into()));
+    }
+    let source_root = session.source_root.as_raw_fd();
+    let quarantine = quarantine_name(temporary_of(file)?)?;
+    let (parent, name) = existing_parent(source_root, &file.source)?.ok_or("katalog oryginału zniknął")?;
+    rename_at_noreplace(parent.as_raw_fd(), &name, source_root, &quarantine).map_err(|error| error.to_string())?;
+    // The name was resolved again by the rename: what moved must be the leased
+    // inode, or a file swapped in under the path goes straight back.
+    if !pinned_at(source_root, &quarantine, original_pin(file))? {
+        return Err(Stop::Fail(match rename_at_noreplace(source_root, &quarantine, parent.as_raw_fd(), &name) {
+            Ok(()) => "pod ścieżką pliku leżał inny plik niż przypięty oryginał; przywrócono go".to_string(),
+            Err(error) => format!("pod ścieżką pliku leżał inny plik niż przypięty oryginał; nie przywrócono go: {error}"),
+        }));
+    }
+    fsync_fd(parent.as_raw_fd())?;
+    fsync_fd(source_root)?;
+    Ok(())
+}
+
+/// `QuarantineIntent`: the original steps aside and the copy takes the path.
+#[cfg(target_os = "linux")]
+fn quarantine_original<F>(session: &mut Session, file: &mut TransferFile, persist: &mut F) -> Result<(), Stop>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    if file.phase == TransferFilePhase::RenameConfirmed {
+        file.phase = TransferFilePhase::QuarantineIntent;
+        persist(file)?;
+    }
+    match locate_original(session, file)? {
+        // The rename landed before an interruption; the release checks the
+        // original again before anything is removed.
+        Some(Place::Quarantine) => {}
+        Some(Place::Path) => move_aside(session, file)?,
+        None => return Err(Stop::Fail("oryginał zniknął spod swojej ścieżki".into())),
+    }
+    if let Some(error) = session.unreadable.as_deref() {
+        file.unread_source = Some(bounded_error(error));
+    }
+    file.phase = TransferFilePhase::QuarantineConfirmed;
+    persist(file)?;
+    Ok(())
+}
+
+/// `QuarantineConfirmed`/`UnlinkIntent`: the original is released only while
+/// its lease proves nobody opened or truncated it since before the copy.
+#[cfg(target_os = "linux")]
+fn release_original<F>(session: &mut Session, file: &mut TransferFile, persist: &mut F) -> Result<TransferEnd, Stop>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    match locate_original(session, file)? {
+        // The rename did not survive an interruption; it is still covered by
+        // the persisted intent.
+        Some(Place::Path) if file.phase == TransferFilePhase::QuarantineConfirmed => move_aside(session, file)?,
+        Some(Place::Path) => {
+            return Err(Stop::Fail("oryginał wrócił pod swoją ścieżkę po zamiarze usunięcia".into()));
+        }
+        Some(Place::Quarantine) => {}
+        None if file.phase == TransferFilePhase::UnlinkIntent => {
+            file.phase = TransferFilePhase::UnlinkConfirmed;
+            persist(file)?;
+            return finish_release(session, file, persist);
+        }
+        // Somebody removed the quarantined original — the dotfile is in the
+        // share root. The copy under the path is the file, byte-identical to
+        // the original when it stepped aside: the move is complete, and the
+        // admin hears whose delete it was.
+        None if locate_copy(session, file)? == Some(CopyPlace::Path) => {
+            session.notices.push(format!(
+                "odsunięty oryginał {} usunięto spoza movera; plik pozostaje jako kopia na dysku danych",
+                quarantine_name(temporary_of(file)?)?
+            ));
+            file.phase = TransferFilePhase::UnlinkConfirmed;
+            persist(file)?;
+            return finish_release(session, file, persist);
+        }
+        None => return Err(Stop::Fail("odsunięty oryginał i kopia zniknęły".into())),
+    }
+    hold_original(session, file, Place::Quarantine)?;
+    if let Some(original) = session.original.as_ref() {
+        lease_moment(LeaseMoment::BeforeRelease, &original.fd);
+    }
+    // An original that could not be read is released only on the identity its
+    // verified copy was re-read against BEFORE it stepped aside: after that,
+    // the copy is the live file and may legitimately change.
+    check_original(session, file, file.unread_source.is_some())?;
+    if session.unreadable.is_some() && file.unread_source.is_none() {
+        return Err(Stop::Fail("nieczytelny oryginał bez potwierdzonej kopii".into()));
+    }
+    if file.phase == TransferFilePhase::QuarantineConfirmed {
+        file.phase = TransferFilePhase::UnlinkIntent;
+        persist(file)?;
+    }
+    let source_root = session.source_root.as_raw_fd();
+    let quarantine = quarantine_name(temporary_of(file)?)?;
+    let opened = || Stop::Withdraw("oryginał otwarto po jego odsunięciu".into());
+    // Checked once while the copy is still leased, so a withdrawal decided
+    // here finds the copy provably untouched, and once more after its lease
+    // is dropped — the copy owns the path, and its clients must not wait for
+    // the unlink.
+    if !lease_intact(&session.original.as_ref().ok_or("brak trzymanego oryginału")?.fd)? {
+        return Err(opened());
+    }
+    session.copy = None;
+    let original = session.original.as_ref().ok_or("brak trzymanego oryginału")?;
+    if !lease_intact(&original.fd)? {
+        return Err(opened());
+    }
+    let name = CString::new(quarantine.as_str()).map_err(|_| "nazwa zawiera NUL".to_string())?;
+    if unsafe { libc::unlinkat(source_root, name.as_ptr(), 0) } != 0 {
+        return Err(Stop::Fail(std::io::Error::last_os_error().to_string()));
+    }
+    if !lease_intact(&original.fd)? {
+        session.notices.push(
+            "oryginał otwarto w chwili jego usuwania z cache; zapis przez ten deskryptor mógł zostać utracony".into(),
+        );
+    }
+    session.original = None;
+    // THE UNLINK DECIDED IT: the original is gone. A directory fsync that fails
+    // afterwards leaves only the durability of that in doubt, and reporting the
+    // move as failed would send the record into a reversal that cannot happen.
+    if let Err(error) = fsync_after_unlink(source_root) {
+        session.notices.push(format!("usunięcie oryginału niepotwierdzone na dysku: {error}"));
+    }
+    file.phase = TransferFilePhase::UnlinkConfirmed;
+    persist(file)?;
+    finish_release(session, file, persist)
+}
+
+/// `UnlinkConfirmed`/`Done`. The copy is the live file by now: clients may
+/// have changed, renamed or deleted it, so only the original's absence is
+/// checked.
+#[cfg(target_os = "linux")]
+fn finish_release<F>(session: &mut Session, file: &mut TransferFile, persist: &mut F) -> Result<TransferEnd, Stop>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    if pinned_at(
+        session.source_root.as_raw_fd(),
+        &quarantine_name(temporary_of(file)?)?,
+        original_pin(file),
+    )? {
+        return Err(Stop::Fail("odsunięty oryginał nadal istnieje po usunięciu".into()));
+    }
+    if file.phase == TransferFilePhase::UnlinkConfirmed {
+        file.phase = TransferFilePhase::Done;
+        persist(file)?;
+    }
+    Ok(TransferEnd::Moved { unreadable: file.unread_source.clone(), notices: std::mem::take(&mut session.notices) })
+}
+
+/// Holds the copy under the path and proves removing it discards nothing:
+/// nobody has it open and its content is the pinned one. While the original
+/// still owns the path only the content matters — a path-based change
+/// (`epall`) reached the original too. Once the copy owned the path its
+/// metadata must be untouched as well.
+#[cfg(target_os = "linux")]
+fn copy_removable(session: &mut Session, file: &TransferFile, owned_path: bool) -> Result<(), String> {
+    let changed = || "kopia na dysku danych zmieniła się".to_string();
+    match hold_copy(session, file) {
+        Ok(_) => {}
+        Err(Stop::Withdraw(reason) | Stop::Fail(reason)) => return Err(reason),
+    }
+    let pin = file.temporary_identity.clone().ok_or("brak tożsamości kopii")?;
+    let held = session.copy.as_ref().ok_or("brak trzymanej kopii")?;
+    if !lease_intact(&held.fd)? {
+        return Err("kopia na dysku danych otwarta przez inny proces".into());
+    }
+    if !held.measured {
+        // The original's lease, while the session holds it, is polled too: an
+        // opener of the original waits for one chunk of this hash, not all of
+        // it. An opener of the original is let go at once and the hash starts
+        // over on the copy's lease alone.
+        let actual = loop {
+            let mut leases = vec![&held.fd];
+            leases.extend(session.original.as_ref().map(|original| &original.fd));
+            match measure_fd(&held.fd, &leases) {
+                Ok(actual) => break actual,
+                Err(MeasureError::LeaseBroken) if lease_intact(&held.fd)? && session.original.is_some() => {
+                    session.original = None;
+                }
+                Err(MeasureError::LeaseBroken) => return Err("kopia na dysku danych otwarta przez inny proces".into()),
+                Err(_) => return Err(changed()),
+            }
+        };
+        if pin_of(&actual) != pin {
+            return Err(changed());
+        }
+        if !lease_intact(&held.fd)? {
+            return Err("kopia na dysku danych otwarta przez inny proces".into());
+        }
+        session.copy.as_mut().ok_or("brak trzymanej kopii")?.measured = true;
+    }
+    let held = session.copy.as_ref().ok_or("brak trzymanej kopii")?;
+    if owned_path && !copy_metadata_matches(&held.fd, &pin, &file.source_identity)? {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+/// `RestoreIntent`: reverses the move from whichever point it reached. The
+/// original goes back under its path first, so the path never resolves to
+/// nothing; the copy is removed only while its own lease proves nobody opened
+/// it. A copy clients already changed keeps the path and the original stays
+/// under its quarantine name: the error names it and nothing is removed.
+#[cfg(target_os = "linux")]
+fn withdraw<F>(session: &mut Session, file: &mut TransferFile, persist: &mut F) -> Result<Withdrawal, String>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    match file.phase {
+        TransferFilePhase::Restored => return Ok(Withdrawal::Restored),
+        TransferFilePhase::UnlinkConfirmed | TransferFilePhase::Done => {
+            return Err("rekordu po usunięciu oryginału nie można wycofać".into());
+        }
+        TransferFilePhase::RestoreIntent => {}
+        _ => {
+            file.phase = TransferFilePhase::RestoreIntent;
+            persist(file)?;
+        }
+    }
+    let source_root = session.source_root.as_raw_fd();
+    let destination_root = session.destination_root.as_raw_fd();
+    let quarantine = quarantine_name(temporary_of(file)?)?;
+    let copy = locate_copy(session, file)?;
+    // Whether the copy under the path was proven removable AFTER the original
+    // took the path back, so nothing between that proof and the unlink below
+    // runs a second check whose failure could no longer give the path back.
+    let mut removable_after_rename_back = false;
+    match locate_original(session, file)? {
+        Some(Place::Quarantine) => {
+            // The quarantine name exists only after the copy took the path. A
+            // copy no longer under it means a client replaced, renamed or
+            // deleted the live file since, and the client's action wins:
+            // renaming the original back would put old content over a newer
+            // save, or bring a deleted file back. Both stay as they are.
+            if copy != Some(CopyPlace::Path) {
+                return Err(format!(
+                    "konflikt: plik pod ścieżką zastąpiono, przeniesiono lub usunięto po odsunięciu oryginału; \
+                     oryginał zostaje jako {quarantine}"
+                ));
+            }
+            copy_removable(session, file, true)
+                .map_err(|reason| format!("konflikt: {reason}; oryginał zostaje jako {quarantine}"))?;
+            let (parent, name) = existing_parent(source_root, &file.source)?.ok_or_else(|| {
+                format!("konflikt: katalog pliku zniknął z cache; oryginał zostaje jako {quarantine}")
+            })?;
+            rename_at_noreplace(source_root, &quarantine, parent.as_raw_fd(), &name).map_err(|error| {
+                format!("konflikt: ścieżka pliku jest zajęta na cache ({error}); oryginał zostaje jako {quarantine}")
+            })?;
+            if let Some(held) = session.copy.as_ref() {
+                lease_moment(LeaseMoment::AfterRenameBack, &held.fd);
+            }
+            // Until that rename the path resolved to the copy. An open that
+            // looked it up then reaches the copy's lease only now; if one did,
+            // the copy is in use and removing or shadowing it would hide what
+            // that client writes. This is the LAST check before the copy is
+            // unlinked, and any failure of it gives the path back to the copy,
+            // with both files kept.
+            if let Err(reason) = copy_removable(session, file, false) {
+                return Err(match rename_at_noreplace(parent.as_raw_fd(), &name, source_root, &quarantine) {
+                    Ok(()) => {
+                        let _ = fsync_fd(parent.as_raw_fd());
+                        let _ = fsync_fd(source_root);
+                        format!("konflikt: {reason} w trakcie wycofania; oryginał zostaje jako {quarantine}")
+                    }
+                    Err(error) => format!(
+                        "konflikt: {reason} w trakcie wycofania, a ścieżki nie oddano kopii ({error}); \
+                         oryginał jest pod ścieżką, kopia zostaje na dysku danych"
+                    ),
+                });
+            }
+            removable_after_rename_back = true;
+            fsync_fd(source_root)?;
+            fsync_fd(parent.as_raw_fd())?;
+        }
+        Some(Place::Path) => {}
+        // The quarantined original was removed by somebody else while the
+        // copy owned the path: nothing is left to restore, and the copy is the
+        // file. The record ends as a move.
+        None if copy == Some(CopyPlace::Path) => {
+            session.original = None;
+            session.notices.push(format!(
+                "odsunięty oryginał {quarantine} usunięto spoza movera; plik pozostaje jako kopia na dysku danych"
+            ));
+            file.phase = TransferFilePhase::Done;
+            persist(file)?;
+            return Ok(Withdrawal::CopyKept);
+        }
+        // Neither file is where the record left it after the copy had taken
+        // the path on the data branch. A client's rename moves BOTH (mergerfs
+        // renames the path on every branch that has it): the copy then sits
+        // under the new name, untracked, and would silently fall behind the
+        // cache original. A client's delete removes both. Only a copy this
+        // session still holds can tell the two apart; otherwise the record
+        // sticks and names the copy, instead of ending as a clean reversal.
+        None if copy.is_none() && file.destination_identity.is_some() => {
+            let deleted = session
+                .copy
+                .as_ref()
+                .map(|held| stat_fd(held.fd.as_raw_fd()).map(|stat| stat.st_nlink == 0))
+                .transpose()?;
+            if deleted != Some(true) {
+                let pin = file.temporary_pin.unwrap_or_default();
+                return Err(format!(
+                    "plik przeniesiono lub usunięto podczas przenoszenia; kopia na dysku danych (urządzenie {}, i-węzeł {}) mogła zostać pod nową ścieżką",
+                    pin.0, pin.1
+                ));
+            }
+            session.notices.push("plik usunięto podczas przenoszenia; nic nie zostało do wycofania".into());
+        }
+        None => {}
+    }
+    // The original is under its path again: an opener waiting on its lease
+    // may go on.
+    session.original = None;
+    if copy == Some(CopyPlace::Path) {
+        if !removable_after_rename_back {
+            copy_removable(session, file, false)?;
+        }
+        let (parent, name) = existing_parent(destination_root, &file.destination)?.ok_or("katalog kopii zniknął")?;
+        let c_name = CString::new(name.as_str()).map_err(|_| "nazwa zawiera NUL".to_string())?;
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), c_name.as_ptr(), 0) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        fsync_fd(dirfd)
-    };
-    let temporary = file.temporary.as_deref().ok_or("brak trwałej ścieżki tymczasowej")?;
-    match stat_at_io(destination_root.as_raw_fd(), temporary) {
+        // The same residual window as the forward path's, on the copy: an open
+        // that resolved the path to the copy before the rename back and reached
+        // the copy's lease between the last check and this unlink holds an
+        // unlinked inode now. It is seen and said; it cannot be undone.
+        if !lease_intact(&session.copy.as_ref().ok_or("brak trzymanej kopii")?.fd)? {
+            session.notices.push(
+                "kopię otwarto w chwili jej usuwania z dysku danych; zapis przez ten deskryptor mógł zostać utracony".into(),
+            );
+        }
+        if let Err(error) = fsync_fd(parent.as_raw_fd()) {
+            session.notices.push(format!("usunięcie kopii niepotwierdzone na dysku: {error}"));
+        }
+    }
+    session.copy = None;
+    let temporary = temporary_of(file)?.to_string();
+    match stat_at_io(destination_root, &temporary) {
         Ok(stat) => {
             let ours = match file.temporary_pin {
                 Some(pin) => (stat.st_dev as u64, stat.st_ino as u64) == pin,
@@ -1462,41 +2568,16 @@ pub(crate) fn roll_back(
             if !ours {
                 return Err("pod nazwą tymczasową leży obcy plik".into());
             }
-            unlink(destination_root.as_raw_fd(), temporary)?;
+            let c_name = CString::new(temporary.as_str()).map_err(|_| "nazwa zawiera NUL".to_string())?;
+            if unsafe { libc::unlinkat(destination_root, c_name.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
         }
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
         Err(error) => return Err(error.to_string()),
     }
-    if let (TransferFilePhase::RenameIntent, Some(pin)) = (file.phase, file.temporary_pin) {
-        let parent = parent_path(&file.destination)?;
-        let parent = if parent.is_empty() {
-            Some(duplicate_fd(destination_root.as_raw_fd())?)
-        } else {
-            match open_relative_io(
-                destination_root.as_raw_fd(),
-                parent,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                0,
-            ) {
-                Ok(parent) => Some(parent),
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => None,
-                Err(error) => return Err(error.to_string()),
-            }
-        };
-        if let Some(parent) = parent {
-            let name = file.destination.rsplit_once('/').map_or(file.destination.as_str(), |(_, name)| name);
-            match stat_at_io(parent.as_raw_fd(), name) {
-                Ok(stat) if (stat.st_dev as u64, stat.st_ino as u64) == pin => {
-                    unlink(parent.as_raw_fd(), name)?;
-                }
-                Ok(_) => {}
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-    }
     if let Some(intent) = &file.directory_intent {
-        let (parent, name) = directory_parent(destination_root.as_raw_fd(), intent)?;
+        let (parent, name) = directory_parent(destination_root, intent)?;
         match open_relative_io(
             parent.as_raw_fd(),
             &name,
@@ -1517,15 +2598,80 @@ pub(crate) fn roll_back(
             Err(error) => return Err(error.to_string()),
         }
     }
-    fsync_fd(destination_root.as_raw_fd())
+    fsync_fd(destination_root)?;
+    file.phase = TransferFilePhase::Restored;
+    persist(file)?;
+    Ok(Withdrawal::Restored)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn roll_back(_: &Path, _: &Path, _: &TransferFile) -> Result<(), String> {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+/// How a reversal ended.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withdrawal {
+    /// `Restored`: the original is under its path, the copy is gone.
+    Restored,
+    /// `Done`: the original was removed by somebody else and the copy owns the
+    /// path, so the record ended as a move.
+    CopyKept,
 }
 
-/// Wykonuje jeden rekord i zapisuje każdą zmianę fazy przed syscall.
+#[cfg(target_os = "linux")]
+fn open_session(source_root: &Path, destination_root: &Path) -> Result<Session, String> {
+    Ok(Session {
+        source_root: open_root_directory(source_root)?,
+        destination_root: open_root_directory(destination_root)?,
+        original: None,
+        copy: None,
+        unreadable: None,
+        notices: Vec::new(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn ended(session: &mut Session, file: &TransferFile, withdrawal: Withdrawal, reason: String) -> TransferEnd {
+    let notices = std::mem::take(&mut session.notices);
+    match withdrawal {
+        Withdrawal::Restored => TransferEnd::Withdrawn { reason, notices },
+        Withdrawal::CopyKept => TransferEnd::Moved { unreadable: file.unread_source.clone(), notices },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drive<F>(session: &mut Session, file: &mut TransferFile, persist: &mut F) -> Result<TransferEnd, Stop>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    loop {
+        match file.phase {
+            TransferFilePhase::CopyIntent => copy_original(session, file, persist)?,
+            TransferFilePhase::CopyConfirmed | TransferFilePhase::RenameIntent => {
+                rename_copy(session, file, persist)?
+            }
+            TransferFilePhase::RenameConfirmed | TransferFilePhase::QuarantineIntent => {
+                quarantine_original(session, file, persist)?
+            }
+            TransferFilePhase::QuarantineConfirmed | TransferFilePhase::UnlinkIntent => {
+                return release_original(session, file, persist);
+            }
+            TransferFilePhase::UnlinkConfirmed | TransferFilePhase::Done => {
+                return finish_release(session, file, persist);
+            }
+            TransferFilePhase::RestoreIntent => {
+                let withdrawal = withdraw(session, file, persist)?;
+                return Ok(ended(session, file, withdrawal, "wycofanie dokończone po przerwaniu".into()));
+            }
+            TransferFilePhase::Restored => {
+                return Ok(ended(session, file, Withdrawal::Restored, "przeniesienie wycofane przed przerwaniem".into()));
+            }
+        }
+    }
+}
+
+/// Drives one record to `Done` or `Restored`, persisting every phase before
+/// its syscall. A decision to keep the file on the cache (it was opened or
+/// changed) is carried out here and ends as `Withdrawn`; a failure is returned
+/// as it is, with the record at the phase it reached, for the caller to
+/// withdraw or keep.
 #[cfg(target_os = "linux")]
 pub(crate) fn transfer_file<F>(
     source_root: &Path,
@@ -1536,342 +2682,16 @@ pub(crate) fn transfer_file<F>(
 where
     F: FnMut(&TransferFile) -> Result<(), String>,
 {
-    let source_root = open_root_directory(source_root)?;
-    let destination_root = open_root_directory(destination_root)?;
-    let source_fd = source_root.as_raw_fd();
-    let destination_fd = destination_root.as_raw_fd();
-    let source = match open_relative_io(
-        source_fd,
-        &file.source,
-        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        0,
-    ) {
-        Ok(source) => Some(source),
-        Err(error)
-            if matches!(
-                file.phase,
-                TransferFilePhase::UnlinkIntent
-                    | TransferFilePhase::UnlinkConfirmed
-                    | TransferFilePhase::Done
-            ) && error.raw_os_error() == Some(libc::ENOENT) =>
-        {
-            None
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    if source.is_none()
-        && matches!(
-            file.phase,
-            TransferFilePhase::UnlinkIntent
-                | TransferFilePhase::UnlinkConfirmed
-                | TransferFilePhase::Done
-        )
-    {
-        let parent = parent_path(&file.source)?;
-        if !parent.is_empty() {
-            open_relative(
-                source_fd,
-                parent,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                0,
-            )?;
+    let mut session = open_session(source_root, destination_root)?;
+    match drive(&mut session, file, &mut persist) {
+        Ok(end) => Ok(end),
+        Err(Stop::Fail(error)) => Err(error),
+        Err(Stop::Withdraw(reason)) => {
+            let withdrawal = withdraw(&mut session, file, &mut persist)
+                .map_err(|error| format!("{reason}; wycofanie nieudane: {error}"))?;
+            Ok(ended(&mut session, file, withdrawal, reason))
         }
     }
-    // After the rename the destination is the verified, pinned copy and the
-    // source cannot change under the RO Hold. A source its medium no longer
-    // reads is then finished on a stat-only identity instead of failing every
-    // retry; before the rename, or for any other error, it is never.
-    let mut unreadable = None;
-    if let Some(source) = &source {
-        match measure_fd(source) {
-            Ok(identity) if identity == file.source_identity => {}
-            Ok(_) => return Err("plik zmienił tożsamość względem journalu".into()),
-            Err(MeasureError::MediaRead(error))
-                if matches!(
-                    file.phase,
-                    TransferFilePhase::RenameConfirmed | TransferFilePhase::UnlinkIntent
-                ) && same_stat(&stat_fd(source.as_raw_fd())?, &file.source_identity) =>
-            {
-                unreadable = Some(error);
-            }
-            Err(error) => return Err(error.into_message()),
-        }
-    }
-    // A copy is accepted only as a pinned inode whose content and metadata
-    // equal the measured source.
-    let source_identity = file.source_identity.clone();
-    let verified = |fd: &OwnedFd, pin: &TransferPin| -> Result<(), String> {
-        let actual = identity_fd(fd)?;
-        if pin_of(&actual) != *pin || !same_content_metadata(&actual, &source_identity) {
-            return Err("kopia nie odpowiada przypiętej tożsamości i metadanym źródła".into());
-        }
-        Ok(())
-    };
-    if file.phase == TransferFilePhase::CopyIntent {
-        let temporary = file
-            .temporary
-            .clone()
-            .ok_or("brak trwałej ścieżki tymczasowej")?;
-        persist(file)?;
-        let target = match open_relative_io(
-            destination_fd,
-            &temporary,
-            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0,
-        ) {
-            Ok(target) => {
-                // The name is unique to this operation and sequence and the
-                // branch is private under Hold, so an unpinned file there is
-                // this record's own create cut short before its pin was
-                // written: adopt it, but only in that fresh state.
-                if file.temporary_pin.is_none() && !fresh_temporary(&stat_fd(target.as_raw_fd())?) {
-                    return Err("plik tymczasowy bez pina nie jest świeżą kopią tej operacji".into());
-                }
-                target
-            }
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => open_relative(
-                destination_fd,
-                &temporary,
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                0o600,
-            )?,
-            Err(error) => return Err(error.to_string()),
-        };
-        let temporary_stat = stat_fd(target.as_raw_fd())?;
-        if temporary_stat.st_nlink != 1
-            || (temporary_stat.st_mode as u32 & libc::S_IFMT as u32) != libc::S_IFREG as u32
-        {
-            return Err("mover odmawia tymczasowego hardlinku lub pliku specjalnego".into());
-        }
-        let temporary_pin = (temporary_stat.st_dev as u64, temporary_stat.st_ino as u64);
-        match file.temporary_pin {
-            Some(pin) if pin != temporary_pin => {
-                return Err("plik tymczasowy zmienił przypięty inode".into());
-            }
-            Some(_) => {}
-            None => {
-                file.temporary_pin = Some(temporary_pin);
-                persist(file)?;
-            }
-        }
-        if unsafe { libc::ftruncate(target.as_raw_fd(), 0) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let input_clone = source
-            .as_ref()
-            .ok_or("brak źródła przed kopiowaniem")?
-            .try_clone()
-            .map_err(|e| e.to_string())?;
-        let target_clone = target.try_clone().map_err(|e| e.to_string())?;
-        let mut input = File::from(input_clone);
-        let mut output = File::from(target_clone);
-        std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
-        output.flush().map_err(|e| e.to_string())?;
-        if unsafe {
-            libc::fchown(
-                target.as_raw_fd(),
-                file.source_identity.uid,
-                file.source_identity.gid,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        strip_foreign_acls(target.as_raw_fd(), &file.source_identity.acl)?;
-        restore_attributes(
-            target.as_raw_fd(),
-            file.source_identity
-                .acl
-                .iter()
-                .chain(file.source_identity.xattr.iter()),
-        )?;
-        // The temporary stays 0600 until here: the final mode, set-id bits
-        // included, comes after `fchown`, which would clear them.
-        if unsafe { libc::fchmod(target.as_raw_fd(), file.source_identity.mode) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let seconds = file.source_identity.mtime_ns.div_euclid(1_000_000_000);
-        let nanos = file.source_identity.mtime_ns.rem_euclid(1_000_000_000);
-        let times = [
-            libc::timespec {
-                tv_sec: seconds as _,
-                tv_nsec: nanos as _,
-            },
-            libc::timespec {
-                tv_sec: seconds as _,
-                tv_nsec: nanos as _,
-            },
-        ];
-        if unsafe { libc::futimens(target.as_raw_fd(), times.as_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        fsync_fd(target.as_raw_fd())?;
-        // Compared before CopyConfirmed: a copy the branch altered (an
-        // inherited ACL, a label) is withdrawn instead of being published.
-        let actual = identity_fd(&target)?;
-        if !same_content_metadata(&actual, &file.source_identity) {
-            return Err("kopia tymczasowa ma inną treść lub metadane niż źródło".into());
-        }
-        file.temporary_identity = Some(pin_of(&actual));
-        file.phase = TransferFilePhase::CopyConfirmed;
-        persist(file)?;
-    }
-    if matches!(
-        file.phase,
-        TransferFilePhase::CopyConfirmed | TransferFilePhase::RenameIntent
-    ) {
-        let temporary = file
-            .temporary
-            .clone()
-            .ok_or("brak trwałej ścieżki tymczasowej")?;
-        let temporary_identity = file
-            .temporary_identity
-            .clone()
-            .ok_or("brak tożsamości pliku tymczasowego")?;
-        file.phase = TransferFilePhase::RenameIntent;
-        persist(file)?;
-        let already_renamed = match open_relative(
-            destination_fd,
-            &file.destination,
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0,
-        ) {
-            Ok(destination) => pin_of(&identity_fd(&destination)?) == temporary_identity,
-            Err(_) => false,
-        };
-        if already_renamed {
-            let destination = open_relative(
-                destination_fd,
-                &file.destination,
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                0,
-            )?;
-            verified(&destination, &temporary_identity)?;
-        } else {
-            let temporary_fd = open_relative(
-                destination_fd,
-                &temporary,
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                0,
-            )?;
-            verified(&temporary_fd, &temporary_identity)?;
-            rename_without_replace(destination_fd, &temporary, &file.destination)?;
-        }
-        let parent = parent_path(&file.destination)?;
-        if parent.is_empty() {
-            fsync_fd(destination_fd)?;
-        } else {
-            let destination_parent = open_relative(
-                destination_fd,
-                parent,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                0,
-            )?;
-            fsync_fd(destination_parent.as_raw_fd())?;
-        }
-        file.phase = TransferFilePhase::RenameConfirmed;
-        persist(file)?;
-    }
-    if matches!(
-        file.phase,
-        TransferFilePhase::UnlinkConfirmed | TransferFilePhase::Done
-    ) {
-        if source.is_some() {
-            return Err("źródło nadal istnieje po potwierdzonym unlinku".into());
-        }
-        let destination = open_relative(
-            destination_fd,
-            &file.destination,
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0,
-        )?;
-        let pinned = file
-            .destination_identity
-            .clone()
-            .ok_or("brak tożsamości potwierdzonego celu")?;
-        verified(&destination, &pinned).map_err(|_| "cel zmienił tożsamość po unlinku".to_string())?;
-        if file.phase == TransferFilePhase::UnlinkConfirmed {
-            file.phase = TransferFilePhase::Done;
-            persist(file)?;
-        }
-        return Ok(transfer_end(file));
-    }
-    if matches!(
-        file.phase,
-        TransferFilePhase::RenameConfirmed | TransferFilePhase::UnlinkIntent
-    ) {
-        let destination = open_relative(
-            destination_fd,
-            &file.destination,
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0,
-        )?;
-        // The hash that authorises an unlink without reading the source must
-        // come from the destination's medium, not from its page cache.
-        if unreadable.is_some() {
-            drop_cached_pages(destination.as_raw_fd())?;
-        }
-        let actual = identity_fd(&destination)?;
-        if !same_content_metadata(&actual, &file.source_identity) {
-            return Err("cel ma inną treść lub metadane źródła".into());
-        }
-        if file.phase == TransferFilePhase::UnlinkIntent {
-            if file.destination_identity.as_ref() != Some(&pin_of(&actual)) {
-                return Err("cel nie odpowiada przypiętej tożsamości".into());
-            }
-        } else {
-            file.destination_identity = Some(pin_of(&actual));
-        }
-        // A source already gone was unlinked by this record: the intent it
-        // wrote before that unlink stays as it is.
-        if source.is_some() {
-            file.unread_source = unreadable.as_deref().map(bounded_error);
-        }
-        file.phase = TransferFilePhase::UnlinkIntent;
-        persist(file)?;
-        let source_parent_path = parent_path(&file.source)?;
-        let source_parent = if source_parent_path.is_empty() {
-            None
-        } else {
-            Some(open_relative(
-                source_fd,
-                source_parent_path,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                0,
-            )?)
-        };
-        let source_parent_fd = source_parent.as_ref().map_or(source_fd, AsRawFd::as_raw_fd);
-        let source_name_text = file
-            .source
-            .rsplit_once('/')
-            .map_or(file.source.as_str(), |(_, name)| name);
-        let source_name =
-            CString::new(source_name_text).map_err(|_| "źródło zawiera NUL".to_string())?;
-        if source.is_some() {
-            let current = open_relative(
-                source_parent_fd,
-                source_name_text,
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                0,
-            )?;
-            if unreadable.is_some() {
-                if !same_stat(&stat_fd(current.as_raw_fd())?, &file.source_identity) {
-                    return Err("nieczytelne źródło zmieniło tożsamość".into());
-                }
-            } else {
-                same_identity(&current, &file.source_identity)?;
-            }
-            if unsafe { libc::unlinkat(source_parent_fd, source_name.as_ptr(), 0) } != 0 {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-        }
-        fsync_fd(source_parent_fd)?;
-        file.phase = TransferFilePhase::UnlinkConfirmed;
-        persist(file)?;
-        file.phase = TransferFilePhase::Done;
-        persist(file)?;
-    }
-    Ok(transfer_end(file))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1882,15 +2702,50 @@ where
     Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
 }
 
+/// Reverses a record after a failure, from a fresh session: every file is
+/// found again by its pin and leased again before anything is removed.
+#[cfg(target_os = "linux")]
+pub(crate) fn withdraw_record<F>(
+    source_root: &Path,
+    destination_root: &Path,
+    file: &mut TransferFile,
+    mut persist: F,
+) -> Result<TransferEnd, String>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    let mut session = open_session(source_root, destination_root)?;
+    withdraw(&mut session, file, &mut persist).map(|withdrawal| ended(&mut session, file, withdrawal, String::new()))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn withdraw_record<F>(_: &Path, _: &Path, _: &mut TransferFile, _: F) -> Result<TransferEnd, String>
+where
+    F: FnMut(&TransferFile) -> Result<(), String>,
+{
+    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::io::Write;
+    use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    /// Every test here takes leases or starts processes. A fork carries the
+    /// parent's descriptors — close-on-exec ones included — until its exec, and
+    /// such a descriptor is an open file description a write lease is refused
+    /// for; so no fork of another test may overlap a lease of this one.
+    fn isolated() -> std::sync::MutexGuard<'static, ()> {
+        crate::elastic::execution::tests::FORK_REOPEN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn unique(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1969,8 +2824,17 @@ mod tests {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
+    /// The SMB veto value names exactly the two names this module creates.
+    #[test]
+    fn the_smb_veto_names_the_temporary_and_the_quarantine() {
+        assert_eq!(crate::SMB_VETO_FILES, format!("/{TEMPORARY_PREFIX}*/{QUARANTINE_PREFIX}*/"));
+        assert!(crate::validate_smb_config(&format!("[x]\n\tpath = /mnt/media\n\tveto files = {}\n", crate::SMB_VETO_FILES)).is_ok());
+        assert!(crate::validate_smb_config("[x]\n\tpath = /mnt/media\n\tveto files = /*/\n").is_err());
+    }
+
     #[test]
     fn plan_refuses_existing_destination_before_any_write() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"transfer payload").unwrap();
         fs::write(destination_root.join("payload.bin"), b"existing").unwrap();
@@ -1991,6 +2855,7 @@ mod tests {
 
     #[test]
     fn transfer_never_replaces_destination_created_after_planning() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"transfer payload").unwrap();
         let mut file = planned(&source_root, &destination_root, "payload.bin");
@@ -2011,6 +2876,7 @@ mod tests {
 
     #[test]
     fn transfer_completes_and_records_each_boundary() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"transfer payload").unwrap();
         let mut file = planned(&source_root, &destination_root, "payload.bin");
@@ -2028,16 +2894,35 @@ mod tests {
             b"transfer payload"
         );
         assert!(!source_root.join("payload.bin").exists());
-        assert!(phases.contains(&TransferFilePhase::CopyIntent));
-        assert!(phases.contains(&TransferFilePhase::CopyConfirmed));
-        assert!(phases.contains(&TransferFilePhase::RenameConfirmed));
-        assert!(phases.contains(&TransferFilePhase::UnlinkConfirmed));
+        let mut first_seen: Vec<TransferFilePhase> = Vec::new();
+        for phase in phases {
+            if first_seen.last() != Some(&phase) {
+                first_seen.push(phase);
+            }
+        }
+        assert_eq!(
+            first_seen,
+            vec![
+                TransferFilePhase::CopyIntent,
+                TransferFilePhase::CopyConfirmed,
+                TransferFilePhase::RenameIntent,
+                TransferFilePhase::RenameConfirmed,
+                TransferFilePhase::QuarantineIntent,
+                TransferFilePhase::QuarantineConfirmed,
+                TransferFilePhase::UnlinkIntent,
+                TransferFilePhase::UnlinkConfirmed,
+                TransferFilePhase::Done,
+            ],
+            "every phase is written, in order, before its step"
+        );
+        assert_eq!(fs::read_dir(&source_root).unwrap().count(), 0, "no quarantine name left behind");
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
     }
 
     #[test]
     fn persisted_record_reopens_after_copy_boundary_and_finishes() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"transfer payload").unwrap();
         let mut file = planned(&source_root, &destination_root, "payload.bin");
@@ -2078,6 +2963,7 @@ mod tests {
 
     #[test]
     fn unpinned_partial_temporary_is_refused_without_touching_source() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"source").unwrap();
         let mut file = planned(&source_root, &destination_root, "payload.bin");
@@ -2096,23 +2982,39 @@ mod tests {
         fs::remove_dir_all(destination_root).unwrap();
     }
 
+    /// Once the original is released the copy is the file clients use: a
+    /// finished record never judges what they did to it. An original still
+    /// under its quarantine name after a confirmed unlink is a contradiction.
     #[test]
-    fn renamed_destination_with_replaced_inode_is_refused() {
+    fn a_released_record_leaves_the_live_copy_to_its_clients() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"source").unwrap();
         let mut file = planned(&source_root, &destination_root, "payload.bin");
         transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).unwrap();
         fs::remove_file(destination_root.join("payload.bin")).unwrap();
-        fs::write(destination_root.join("payload.bin"), b"source").unwrap();
-        file.phase = TransferFilePhase::Done;
-        let result = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
-        assert!(result.is_err());
+        fs::write(destination_root.join("payload.bin"), b"rewritten by a client").unwrap();
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        assert_eq!(end, Ok(TransferEnd::Moved { unreadable: None, notices: Vec::new() }));
+        assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"rewritten by a client");
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"source").unwrap();
+        let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::UnlinkIntent);
+        file.phase = TransferFilePhase::UnlinkConfirmed;
+        let quarantine = source_root.join(quarantine_name(file.temporary.as_deref().unwrap()).unwrap());
+        assert!(quarantine.exists());
+        assert!(transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).is_err());
+        assert_eq!(fs::read(&quarantine).unwrap(), b"source", "nothing removed on a contradiction");
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
     }
 
     #[test]
     fn scan_refuses_symlink_root_and_reports_symlinks_per_entry() {
+        let _isolation = isolated();
         let real_root = unique("real-root");
         fs::write(real_root.join("payload.bin"), b"source").unwrap();
         let linked_root = real_root.with_file_name(format!(
@@ -2160,6 +3062,7 @@ mod tests {
 
     #[test]
     fn scan_reports_hardlink_sparse_fifo_and_non_utf8_per_entry() {
+        let _isolation = isolated();
         let (root, destination_root) = fixture();
         fs::write(root.join("ok.bin"), b"ok").unwrap();
         fs::write(root.join("payload.bin"), b"source").unwrap();
@@ -2212,6 +3115,7 @@ mod tests {
 
     #[test]
     fn scan_prunes_paths_without_descending() {
+        let _isolation = isolated();
         let root = unique("prune");
         fs::create_dir_all(root.join("foto/deep")).unwrap();
         fs::write(root.join("foto/deep/keep.bin"), b"keep").unwrap();
@@ -2236,13 +3140,14 @@ mod tests {
     }
 
     #[test]
-    fn unlink_refuses_replaced_leaf_under_pinned_parent() {
+    fn quarantine_refuses_a_file_swapped_under_the_path() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"source").unwrap();
         let mut file = planned(&source_root, &destination_root, "payload.bin");
         let mut replaced = false;
         let result = transfer_file(&source_root, &destination_root, &mut file, |record| {
-            if record.phase == TransferFilePhase::UnlinkIntent && !replaced {
+            if record.phase == TransferFilePhase::QuarantineIntent && !replaced {
                 fs::rename(
                     source_root.join("payload.bin"),
                     source_root.join("original.bin"),
@@ -2268,6 +3173,7 @@ mod tests {
 
     #[test]
     fn prepare_parents_creates_nested_directories_with_source_metadata() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::create_dir_all(source_root.join("nested/inner")).unwrap();
         fs::write(source_root.join("nested/inner/payload.bin"), b"nested payload").unwrap();
@@ -2333,6 +3239,7 @@ mod tests {
 
     #[test]
     fn prepare_parents_adopts_only_its_own_interrupted_directory() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::create_dir(source_root.join("nested")).unwrap();
         fs::set_permissions(source_root.join("nested"), fs::Permissions::from_mode(0o755))
@@ -2392,6 +3299,7 @@ mod tests {
 
     #[test]
     fn symlinked_destination_parent_is_refused_without_writing_outside() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         let outside = unique("outside-parent");
         fs::create_dir(source_root.join("nested")).unwrap();
@@ -2422,6 +3330,7 @@ mod tests {
 
     #[test]
     fn open_descriptor_of_other_process_is_reported() {
+        let _isolation = isolated();
         let root = unique("open");
         let path = root.join("held.bin");
         fs::write(&path, b"held").unwrap();
@@ -2474,6 +3383,7 @@ mod tests {
 
     #[test]
     fn unpinned_temporary_is_adopted_only_in_its_fresh_state() {
+        let _isolation = isolated();
         // A crash right after O_CREAT: the fresh 0600 file exists, its pin was never written.
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"payload").unwrap();
@@ -2503,6 +3413,7 @@ mod tests {
 
     #[test]
     fn copy_under_an_inherited_default_acl_equals_its_source() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::create_dir(source_root.join("nested")).unwrap();
         fs::write(source_root.join("nested/payload.bin"), b"payload").unwrap();
@@ -2519,6 +3430,7 @@ mod tests {
 
     #[test]
     fn temporary_stays_private_until_the_final_mode_is_set() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("tool.bin"), b"tool").unwrap();
         fs::set_permissions(source_root.join("tool.bin"), fs::Permissions::from_mode(0o4750)).unwrap();
@@ -2540,48 +3452,45 @@ mod tests {
     }
 
     #[test]
-    fn roll_back_removes_only_the_pinned_copy_of_an_untouched_source() {
+    fn withdrawal_removes_only_the_pinned_copy_and_never_a_released_original() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"payload").unwrap();
-        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::RenameIntent);
         let temporary = destination_root.join(file.temporary.as_ref().unwrap());
-        assert!(transfer_file(&source_root, &destination_root, &mut file, |record| {
-            if record.phase == TransferFilePhase::RenameIntent {
-                return Err("wstrzymanie przed zmianą nazwy".into());
-            }
-            Ok(())
-        })
-        .is_err());
         assert!(temporary.exists());
-        roll_back(&source_root, &destination_root, &file).expect("wycofanie");
+        let mut foreign = file.clone();
+        withdraw_record(&source_root, &destination_root, &mut file, |_| Ok(())).expect("wycofanie");
+        assert_eq!(file.phase, TransferFilePhase::Restored);
         assert!(!temporary.exists());
         assert!(!destination_root.join("payload.bin").exists());
         assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payload");
 
         // A file under the temporary name that is not the pinned inode stays.
         fs::write(&temporary, b"foreign").unwrap();
-        assert!(roll_back(&source_root, &destination_root, &file).is_err());
+        assert!(withdraw_record(&source_root, &destination_root, &mut foreign, |_| Ok(())).is_err());
         assert_eq!(fs::read(&temporary).unwrap(), b"foreign");
         fs::remove_file(&temporary).unwrap();
 
-        // After the rename is confirmed the record can only go forward.
-        let mut renamed = planned(&source_root, &destination_root, "payload.bin");
-        assert!(transfer_file(&source_root, &destination_root, &mut renamed, |record| {
-            if record.phase == TransferFilePhase::RenameConfirmed {
-                return Err("wstrzymanie po zmianie nazwy".into());
-            }
-            Ok(())
-        })
-        .is_err());
-        assert!(roll_back(&source_root, &destination_root, &renamed).is_err());
-        assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
+        // With the copy already under the path the original still owns it in
+        // the union, so the copy goes and the original stays.
+        let mut renamed = stopped_at(&source_root, &destination_root, TransferFilePhase::QuarantineIntent);
+        withdraw_record(&source_root, &destination_root, &mut renamed, |_| Ok(())).expect("wycofanie");
+        assert!(!destination_root.join("payload.bin").exists());
         assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payload");
+
+        // Once the original is released nothing can bring it back.
+        let mut released = stopped_at(&source_root, &destination_root, TransferFilePhase::Done);
+        assert!(withdraw_record(&source_root, &destination_root, &mut released, |_| Ok(())).is_err());
+        assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
+        assert!(!source_root.join("payload.bin").exists());
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
     }
 
     #[test]
     fn entry_exists_resolves_beneath_the_branch_without_symlinks() {
+        let _isolation = isolated();
         let root = unique("exists");
         let outside = unique("exists-outside");
         fs::create_dir(root.join("a")).unwrap();
@@ -2612,6 +3521,7 @@ mod tests {
 
     #[test]
     fn unreadable_source_is_finished_by_identity_only_after_the_rename() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"payload").unwrap();
         let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::RenameConfirmed);
@@ -2619,7 +3529,10 @@ mod tests {
         fail_content_reads(Some((source.dev(), source.ino())));
         let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
         fail_content_reads(None);
-        assert!(matches!(end, Ok(TransferEnd::SourceUnreadable(ref error)) if error.contains("os error 5")), "{end:?}");
+        assert!(
+            matches!(end, Ok(TransferEnd::Moved { unreadable: Some(ref error), ref notices }) if error.contains("os error 5") && notices.is_empty()),
+            "{end:?}"
+        );
         assert_eq!(file.phase, TransferFilePhase::Done);
         assert!(!source_root.join("payload.bin").exists());
         assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
@@ -2628,15 +3541,16 @@ mod tests {
     }
 
     #[test]
-    fn identity_finish_is_refused_before_the_rename_and_for_other_errors() {
-        // Before the rename an unreadable source is an error, never an unlink.
+    fn identity_finish_is_refused_before_the_copy_and_for_other_errors() {
+        let _isolation = isolated();
+        // Before a verified copy exists an unreadable source is an error, never an unlink.
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"payload").unwrap();
-        let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::CopyConfirmed);
+        let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::CopyIntent);
         let source = fs::metadata(source_root.join("payload.bin")).unwrap();
         fail_content_reads(Some((source.dev(), source.ino())));
         let error = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()))
-            .expect_err("przed zmianą nazwy");
+            .expect_err("przed kopią");
         fail_content_reads(None);
         assert!(error.contains("os error 5"), "{error}");
         assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payload");
@@ -2644,7 +3558,8 @@ mod tests {
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
 
-        // After the rename, a source that changed is not a read error.
+        // After the rename, a source that changed is not a read error: the move
+        // is reversed and the changed file stays where it is.
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"payload").unwrap();
         let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::RenameConfirmed);
@@ -2654,8 +3569,10 @@ mod tests {
             .unwrap()
             .write_all(b"+")
             .unwrap();
-        assert!(transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).is_err());
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        assert!(matches!(end, Ok(TransferEnd::Withdrawn { .. })), "{end:?}");
         assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payload+");
+        assert!(!destination_root.join("payload.bin").exists());
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
 
@@ -2676,6 +3593,7 @@ mod tests {
 
     #[test]
     fn media_read_errors_are_exactly_the_medium_failures() {
+        let _isolation = isolated();
         for errno in [libc::EIO, libc::ENXIO, libc::ENODATA, libc::EBADMSG, libc::EUCLEAN, libc::EREMOTEIO] {
             assert!(media_read_error(&std::io::Error::from_raw_os_error(errno)), "{errno}");
         }
@@ -2687,6 +3605,7 @@ mod tests {
 
     #[test]
     fn scan_reports_unreadable_directories_listings_and_entries_and_walks_on() {
+        let _isolation = isolated();
         let root = unique("faults");
         fs::write(root.join("a.bin"), b"a").unwrap();
         fs::create_dir(root.join("locked")).unwrap();
@@ -2735,6 +3654,7 @@ mod tests {
 
     #[test]
     fn identity_finish_survives_a_crash_after_the_unlink() {
+        let _isolation = isolated();
         let (source_root, destination_root) = fixture();
         fs::write(source_root.join("payload.bin"), b"payload").unwrap();
         let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::RenameConfirmed);
@@ -2756,7 +3676,7 @@ mod tests {
         assert_eq!(reopened.phase, TransferFilePhase::UnlinkIntent);
         assert!(reopened.unread_source.is_some(), "zamiar zapisany przed unlinkiem");
         let end = transfer_file(&source_root, &destination_root, &mut reopened, |_| Ok(()));
-        assert!(matches!(end, Ok(TransferEnd::SourceUnreadable(_))), "{end:?}");
+        assert!(matches!(end, Ok(TransferEnd::Moved { unreadable: Some(_), .. })), "{end:?}");
         assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
@@ -2764,11 +3684,14 @@ mod tests {
 
     #[test]
     fn every_persist_boundary_reopens_safely() {
+        let _isolation = isolated();
         let phases = [
             TransferFilePhase::CopyIntent,
             TransferFilePhase::CopyConfirmed,
             TransferFilePhase::RenameIntent,
             TransferFilePhase::RenameConfirmed,
+            TransferFilePhase::QuarantineIntent,
+            TransferFilePhase::QuarantineConfirmed,
             TransferFilePhase::UnlinkIntent,
             TransferFilePhase::UnlinkConfirmed,
             TransferFilePhase::Done,
@@ -2861,6 +3784,612 @@ mod tests {
                         b"boundary payload"
                     );
                     assert!(!source_root.join("payload.bin").exists());
+                    fs::remove_dir_all(record_path.parent().unwrap()).unwrap();
+                    fs::remove_dir_all(source_root).unwrap();
+                    fs::remove_dir_all(destination_root).unwrap();
+                }
+            }
+        }
+    }
+
+    /// A `sh` that appends `bytes` to `path` with a plain blocking open, the
+    /// way any client writes.
+    fn writer(path: &Path, bytes: &str) -> std::process::Child {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf %s \"$1\" >> \"$2\"")
+            .arg("sh")
+            .arg(bytes)
+            .arg(path)
+            .spawn()
+            .unwrap()
+    }
+
+    /// Waits until something has run into the lease on `fd`. A test opener
+    /// is then provably inside its `open(2)`, past its path lookup.
+    fn wait_for_break(fd: &OwnedFd) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while lease_intact(fd).unwrap() {
+            assert!(std::time::Instant::now() < deadline, "otwierający nie dotarł do lease");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// The names this module leaves in a branch root.
+    fn helper_names(root: &Path) -> Vec<String> {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(TEMPORARY_PREFIX) || name.starts_with(QUARANTINE_PREFIX))
+            .collect()
+    }
+
+    #[test]
+    fn an_open_original_is_skipped_before_anything_is_written() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let mut reader = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(File::open(source_root.join("payload.bin")).unwrap())
+            .spawn()
+            .unwrap();
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        reader.kill().unwrap();
+        reader.wait().unwrap();
+        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "plik otwarty przez inny proces".into(), notices: Vec::new() }));
+        assert_eq!(file.phase, TransferFilePhase::Restored);
+        assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payload");
+        assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0, "nothing written to the data branch");
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// A client that opens the original to write while it is being copied
+    /// waits for the copy to be abandoned, then writes into the original,
+    /// which never left its path.
+    #[test]
+    fn a_writer_during_the_copy_withdraws_it_and_keeps_its_write() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        let payload: Vec<u8> = (0..3 * COPY_CHUNK).map(|index| (index % 251) as u8).collect();
+        fs::write(source_root.join("payload.bin"), &payload).unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let child = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hooked, path) = (child.clone(), source_root.join("payload.bin"));
+        on_lease_moment(Some(Box::new(move |moment, original| {
+            if moment == LeaseMoment::CopyChunk && hooked.borrow().is_none() {
+                *hooked.borrow_mut() = Some(writer(&path, "MORE"));
+                wait_for_break(original);
+            }
+        })));
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        on_lease_moment(None);
+        let status = child.borrow_mut().take().expect("pisarz uruchomiony").wait().unwrap();
+        assert!(status.success());
+        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "plik otwarty przez inny proces podczas kopiowania".into(), notices: Vec::new() }));
+        let mut expected = payload.clone();
+        expected.extend_from_slice(b"MORE");
+        assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), expected, "the write landed in the original");
+        assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0, "no copy and no temporary left");
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// The residual-window case that CAN be closed: an opener that reaches the
+    /// original after it stepped aside but before the release checks. The
+    /// original goes back under its path, the copy goes, and the opener's
+    /// write lands in the original.
+    #[test]
+    fn an_opener_after_the_quarantine_rename_gets_the_original_back_with_its_write() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let quarantine = source_root.join(quarantine_name(file.temporary.as_deref().unwrap()).unwrap());
+        let child = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hooked, path) = (child.clone(), quarantine.clone());
+        on_lease_moment(Some(Box::new(move |moment, original| {
+            if moment == LeaseMoment::BeforeRelease && hooked.borrow().is_none() {
+                assert!(path.exists(), "the original is under its quarantine name");
+                *hooked.borrow_mut() = Some(writer(&path, "NEW"));
+                wait_for_break(original);
+            }
+        })));
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        on_lease_moment(None);
+        let status = child.borrow_mut().take().expect("pisarz uruchomiony").wait().unwrap();
+        assert!(status.success());
+        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "plik otwarty przez inny proces".into(), notices: Vec::new() }));
+        assert_eq!(file.phase, TransferFilePhase::Restored);
+        assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payloadNEW");
+        assert!(!destination_root.join("payload.bin").exists(), "no copy left on the data branch");
+        assert!(!quarantine.exists());
+        assert!(helper_names(&source_root).is_empty() && helper_names(&destination_root).is_empty());
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    #[test]
+    fn a_metadata_change_after_the_quarantine_rename_restores_the_original() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        fs::set_permissions(source_root.join("payload.bin"), fs::Permissions::from_mode(0o644)).unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let quarantine = source_root.join(quarantine_name(file.temporary.as_deref().unwrap()).unwrap());
+        let path = quarantine.clone();
+        on_lease_moment(Some(Box::new(move |moment, _| {
+            if moment == LeaseMoment::BeforeRelease {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        })));
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        on_lease_moment(None);
+        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "metadane pliku zmieniły się podczas przenoszenia".into(), notices: Vec::new() }));
+        assert_eq!(mode(&source_root.join("payload.bin")), 0o600, "the change is kept");
+        assert!(!destination_root.join("payload.bin").exists());
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// Once the path resolves to the copy, clients use the copy: a reader of
+    /// it is no reason to keep the original, and it gets its bytes.
+    #[test]
+    fn a_client_reading_the_copy_does_not_stop_the_release() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let reader = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hooked, copy) = (reader.clone(), destination_root.join("payload.bin"));
+        on_lease_moment(Some(Box::new(move |moment, _| {
+            if moment == LeaseMoment::BeforeRelease && hooked.borrow().is_none() {
+                *hooked.borrow_mut() = Some(
+                    std::process::Command::new("cat")
+                        .arg(&copy)
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+        })));
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        on_lease_moment(None);
+        let output = reader.borrow_mut().take().expect("czytelnik").wait_with_output().unwrap();
+        assert_eq!(end, Ok(TransferEnd::Moved { unreadable: None, notices: Vec::new() }));
+        assert_eq!(output.stdout, b"payload");
+        assert!(!source_root.join("payload.bin").exists());
+        assert!(helper_names(&source_root).is_empty());
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// Somebody reached the original after it stepped aside AND somebody uses
+    /// the copy under the path: any reversal would discard one of them. Both
+    /// stay, the original under its quarantine name, and the error says where.
+    #[test]
+    fn both_files_touched_after_the_quarantine_rename_keep_both() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let quarantine_file = quarantine_name(file.temporary.as_deref().unwrap()).unwrap();
+        let quarantine = source_root.join(&quarantine_file);
+        let child = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hooked, path, copy) = (child.clone(), quarantine.clone(), destination_root.join("payload.bin"));
+        on_lease_moment(Some(Box::new(move |moment, original| {
+            if moment == LeaseMoment::BeforeRelease && hooked.borrow().is_none() {
+                *hooked.borrow_mut() = Some(writer(&path, "NEW"));
+                wait_for_break(original);
+                let refused = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&copy)
+                    .expect_err("the copy is leased");
+                assert_eq!(refused.raw_os_error(), Some(libc::EWOULDBLOCK));
+            }
+        })));
+        let error = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).expect_err("konflikt");
+        on_lease_moment(None);
+        assert!(child.borrow_mut().take().expect("pisarz").wait().unwrap().success());
+        assert!(error.contains("konflikt") && error.contains(&quarantine_file), "{error}");
+        assert_eq!(file.phase, TransferFilePhase::RestoreIntent);
+        assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
+        assert_eq!(fs::read(&quarantine).unwrap(), b"payloadNEW", "the opener's write is kept");
+        assert!(!source_root.join("payload.bin").exists());
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// A power loss after ANY durable phase — on both sides of each write,
+    /// on the move and on the reversal — followed by a client writing to the
+    /// file as the union shows it. The resumed record must end with exactly
+    /// one copy under the path, holding that write, and nothing of the
+    /// helper's left in either branch root. The one outcome that keeps two
+    /// copies is the conflict: a reversal already decided when the client
+    /// wrote to the live copy.
+    /// H1 of the 2026-09-17 review. A reversal renames the original back
+    /// under the path; an open that had resolved the path to the copy just
+    /// before reaches the copy's lease only then. The path must go back to
+    /// the copy, so that client's save lands where the share shows it — and
+    /// the late opener of the original keeps its write under the quarantine
+    /// name. Both files are kept and the record sticks.
+    #[test]
+    fn a_client_opening_the_copy_during_a_reversal_keeps_the_path() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let quarantine = source_root.join(quarantine_name(file.temporary.as_deref().unwrap()).unwrap());
+        let children = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (hooked, late, copy) = (children.clone(), quarantine.clone(), destination_root.join("payload.bin"));
+        on_lease_moment(Some(Box::new(move |moment, leased| match moment {
+            LeaseMoment::BeforeRelease if hooked.borrow().is_empty() => {
+                hooked.borrow_mut().push(writer(&late, "A"));
+                wait_for_break(leased);
+            }
+            LeaseMoment::AfterRenameBack => {
+                hooked.borrow_mut().push(writer(&copy, "B"));
+                wait_for_break(leased);
+            }
+            _ => {}
+        })));
+        let error = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).expect_err("konflikt");
+        on_lease_moment(None);
+        for child in children.borrow_mut().iter_mut() {
+            assert!(child.wait().unwrap().success());
+        }
+        assert!(error.contains("otwarta przez inny proces w trakcie wycofania"), "{error}");
+        assert!(!source_root.join("payload.bin").exists(), "the path resolves to the copy again");
+        assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payloadB", "B's save is visible");
+        assert_eq!(fs::read(&quarantine).unwrap(), b"payloadA", "A's save is kept");
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// M2: a client opening the original while the COPY is being hashed
+    /// waits one chunk, not the whole hash — every lease the session holds is
+    /// polled while either file is read.
+    #[test]
+    fn opening_the_original_while_the_copy_is_hashed_stops_the_hash_within_a_chunk() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        let payload: Vec<u8> = (0..4 * COPY_CHUNK).map(|index| (index % 253) as u8).collect();
+        fs::write(source_root.join("payload.bin"), &payload).unwrap();
+        let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::RenameConfirmed);
+        let original = fs::metadata(source_root.join("payload.bin")).unwrap();
+        let copy = fs::metadata(destination_root.join("payload.bin")).unwrap();
+        let copy_id = (copy.dev(), copy.ino());
+        // A fresh session re-hashes both files: the original first, with only
+        // its own lease, then the copy with both.
+        MEASURED_CHUNKS.with(|chunks| chunks.borrow_mut().clear());
+        let child = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (hooked, path) = (child.clone(), source_root.join("payload.bin"));
+        let original_id = (original.dev(), original.ino());
+        // Chunks of the copy read while BOTH leases were polled: the hash the
+        // open has to wait on. The reversal re-reads the copy afterwards with
+        // the original already released, which no client waits on.
+        let guarded_chunks = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counted = guarded_chunks.clone();
+        MEASURE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |measured, leases: &[&OwnedFd]| {
+                if measured != copy_id || leases.len() < 2 {
+                    return;
+                }
+                counted.set(counted.get() + 1);
+                if hooked.borrow().is_some() {
+                    return;
+                }
+                let original_fd = leases
+                    .iter()
+                    .find(|fd| stat_fd(fd.as_raw_fd()).is_ok_and(|stat| (stat.st_dev as u64, stat.st_ino as u64) == original_id))
+                    .expect("the original's lease is polled while the copy is hashed");
+                *hooked.borrow_mut() = Some(writer(&path, "X"));
+                wait_for_break(original_fd);
+            }))
+        });
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        MEASURE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        let status = child.borrow_mut().take().expect("pisarz").wait().unwrap();
+        assert!(status.success());
+        assert!(matches!(end, Ok(TransferEnd::Withdrawn { .. })), "{end:?}");
+        assert_eq!(guarded_chunks.get(), 1, "the copy's hash stopped at the chunk the open arrived in");
+        assert!(MEASURED_CHUNKS.with(|chunks| chunks.borrow().iter().any(|id| *id == copy_id)));
+        let mut expected = payload.clone();
+        expected.extend_from_slice(b"X");
+        assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), expected);
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// M3: the quarantine name is a dotfile in the share root, and a client
+    /// may delete it. Before the release decision that ends the record as a
+    /// move — the copy is the file — and during a reversal it does too; in
+    /// both the admin hears about it, and nothing is stuck.
+    #[test]
+    fn a_client_deleting_the_quarantined_original_ends_the_record_as_a_move() {
+        let _isolation = isolated();
+        for opened_first in [false, true] {
+            let (source_root, destination_root) = fixture();
+            fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+            let mut file = planned(&source_root, &destination_root, "payload.bin");
+            let quarantine = source_root.join(quarantine_name(file.temporary.as_deref().unwrap()).unwrap());
+            let child = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let (hooked, path) = (child.clone(), quarantine.clone());
+            on_lease_moment(Some(Box::new(move |moment, leased| {
+                if moment == LeaseMoment::BeforeRelease && hooked.borrow().is_none() {
+                    if opened_first {
+                        *hooked.borrow_mut() = Some(
+                            std::process::Command::new("cat").arg(&path).stdout(std::process::Stdio::null()).spawn().unwrap(),
+                        );
+                        wait_for_break(leased);
+                    }
+                    fs::remove_file(&path).unwrap();
+                }
+            })));
+            let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+            on_lease_moment(None);
+            if let Some(mut child) = child.borrow_mut().take() {
+                child.wait().unwrap();
+            }
+            match &end {
+                Ok(TransferEnd::Moved { unreadable: None, notices }) => {
+                    assert!(notices.iter().any(|notice| notice.contains("usunięto spoza movera")), "{notices:?}");
+                }
+                other => panic!("opened_first={opened_first}: {other:?}"),
+            }
+            assert_eq!(file.phase, TransferFilePhase::Done);
+            assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
+            assert!(!source_root.join("payload.bin").exists() && !quarantine.exists());
+            fs::remove_dir_all(source_root).unwrap();
+            fs::remove_dir_all(destination_root).unwrap();
+        }
+    }
+
+    /// D1 of the second review: a reversal that finds the copy gone from the
+    /// path after the original was quarantined never renames the original
+    /// back. A client replaced the file (an editor's save renames its own
+    /// temporary over the path) or deleted it, and its action wins: the newer
+    /// content stays visible, a deleted file stays deleted, and the record
+    /// sticks naming the quarantined original.
+    #[test]
+    fn a_reversal_never_puts_the_original_back_over_a_replaced_or_deleted_copy() {
+        let _isolation = isolated();
+        for replaced in [true, false] {
+            for stop in [TransferFilePhase::QuarantineConfirmed, TransferFilePhase::RestoreIntent] {
+                let (source_root, destination_root) = fixture();
+                fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+                let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::QuarantineConfirmed);
+                if stop == TransferFilePhase::RestoreIntent {
+                    file.phase = TransferFilePhase::RestoreIntent;
+                }
+                let quarantine = source_root.join(quarantine_name(file.temporary.as_deref().unwrap()).unwrap());
+                let copy = destination_root.join("payload.bin");
+                if replaced {
+                    let save = destination_root.join(".payload.bin.swp");
+                    fs::write(&save, b"newer save").unwrap();
+                    fs::rename(&save, &copy).unwrap();
+                } else {
+                    fs::remove_file(&copy).unwrap();
+                }
+                let error = withdraw_record(&source_root, &destination_root, &mut file, |_| Ok(()))
+                    .expect_err("the record sticks");
+                assert!(error.contains("zastąpiono, przeniesiono lub usunięto"), "{replaced} {stop:?}: {error}");
+                assert!(!source_root.join("payload.bin").exists(), "{replaced} {stop:?}: the original stays aside");
+                assert_eq!(fs::read(&quarantine).unwrap(), b"payload", "{replaced} {stop:?}");
+                if replaced {
+                    assert_eq!(fs::read(&copy).unwrap(), b"newer save", "{stop:?}");
+                } else {
+                    assert!(!copy.exists(), "{stop:?}");
+                }
+                fs::remove_dir_all(source_root).unwrap();
+                fs::remove_dir_all(destination_root).unwrap();
+            }
+        }
+    }
+
+    /// M3, after a restart: the helper stopped with the original quarantined
+    /// and a client deleted the dotfile before the next run. The next run
+    /// finds only the copy under the path and ends the record as a move.
+    #[test]
+    fn a_quarantined_original_deleted_between_runs_ends_the_record_as_a_move() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::QuarantineConfirmed);
+        let quarantine = source_root.join(quarantine_name(file.temporary.as_deref().unwrap()).unwrap());
+        fs::remove_file(&quarantine).unwrap();
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        match &end {
+            Ok(TransferEnd::Moved { unreadable: None, notices }) => {
+                assert!(notices.iter().any(|notice| notice.contains("usunięto spoza movera")), "{notices:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(file.phase, TransferFilePhase::Done);
+        assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
+        assert!(!source_root.join("payload.bin").exists());
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// M5: power lost right after the temporary's pin was written, before its
+    /// directory entry reached the disk. The pinned name is gone; the record is
+    /// withdrawn instead of creating a file its own pin refuses, and the file
+    /// moves on the next attempt.
+    #[test]
+    fn a_pinned_temporary_lost_to_a_power_cut_withdraws_the_record_cleanly() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        let mut durable = file.clone();
+        assert!(transfer_file(&source_root, &destination_root, &mut file, |record| {
+            durable = record.clone();
+            if record.phase == TransferFilePhase::CopyIntent && record.temporary_pin.is_some() {
+                return Err("utrata zasilania".into());
+            }
+            Ok(())
+        })
+        .is_err());
+        assert!(durable.temporary_pin.is_some());
+        fs::remove_file(destination_root.join(durable.temporary.as_deref().unwrap())).unwrap();
+        let end = transfer_file(&source_root, &destination_root, &mut durable, |_| Ok(()));
+        assert!(matches!(end, Ok(TransferEnd::Withdrawn { ref reason, .. }) if reason.contains("zniknęła")), "{end:?}");
+        assert_eq!(durable.phase, TransferFilePhase::Restored);
+        assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
+        assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payload");
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// M6: the unlink of the quarantined original succeeded and only the
+    /// directory fsync after it failed. The move is complete — a reversal
+    /// could not bring the original back — and the doubt is a notice.
+    #[test]
+    fn a_failed_fsync_after_the_original_is_unlinked_is_a_notice_not_a_failure() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = planned(&source_root, &destination_root, "payload.bin");
+        on_lease_moment(Some(Box::new(|moment, _| {
+            if moment == LeaseMoment::BeforeRelease {
+                fail_directory_fsync(true);
+            }
+        })));
+        let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
+        on_lease_moment(None);
+        fail_directory_fsync(false);
+        match &end {
+            Ok(TransferEnd::Moved { notices, .. }) => {
+                assert!(notices.iter().any(|notice| notice.contains("niepotwierdzone na dysku")), "{notices:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(file.phase, TransferFilePhase::Done);
+        assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    /// M1: a client renames the file while its copy already holds the path on
+    /// the data branch; mergerfs renames it on both branches. The reversal
+    /// must not end as if nothing were left: the copy sits under the new name
+    /// and the record says so.
+    #[test]
+    fn a_client_rename_during_the_move_is_named_not_silently_withdrawn() {
+        let _isolation = isolated();
+        let (source_root, destination_root) = fixture();
+        fs::write(source_root.join("payload.bin"), b"payload").unwrap();
+        let mut file = stopped_at(&source_root, &destination_root, TransferFilePhase::QuarantineIntent);
+        for root in [&source_root, &destination_root] {
+            fs::rename(root.join("payload.bin"), root.join("renamed.bin")).unwrap();
+        }
+        let error = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).expect_err("zniknął");
+        assert!(error.contains("zniknął"), "{error}");
+        let refusal = withdraw_record(&source_root, &destination_root, &mut file, |_| Ok(())).expect_err("named");
+        assert!(refusal.contains("mogła zostać pod nową ścieżką"), "{refusal}");
+        assert_eq!(fs::read(destination_root.join("renamed.bin")).unwrap(), b"payload", "nothing removed");
+        assert_eq!(fs::read(source_root.join("renamed.bin")).unwrap(), b"payload");
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    #[test]
+    fn every_phase_recovers_to_one_visible_copy_with_the_newest_content() {
+        let _isolation = isolated();
+        let moving = [
+            TransferFilePhase::CopyIntent,
+            TransferFilePhase::CopyConfirmed,
+            TransferFilePhase::RenameIntent,
+            TransferFilePhase::RenameConfirmed,
+            TransferFilePhase::QuarantineIntent,
+            TransferFilePhase::QuarantineConfirmed,
+            TransferFilePhase::UnlinkIntent,
+            TransferFilePhase::UnlinkConfirmed,
+            TransferFilePhase::Done,
+        ];
+        let reversing = [TransferFilePhase::RestoreIntent, TransferFilePhase::Restored];
+        let cases = moving
+            .iter()
+            .map(|phase| (*phase, false))
+            .chain(reversing.iter().map(|phase| (*phase, true)));
+        for (stop, reverse) in cases {
+            let calls: &[usize] = if stop == TransferFilePhase::CopyIntent { &[0, 1] } else { &[0] };
+            for &target_call in calls {
+                for before_write in [true, false] {
+                    let case = format!("{stop:?} call={target_call} before_write={before_write}");
+                    let (source_root, destination_root) = fixture();
+                    fs::write(source_root.join("payload.bin"), b"boundary payload").unwrap();
+                    let mut file = planned(&source_root, &destination_root, "payload.bin");
+                    let quarantine = quarantine_name(file.temporary.as_deref().unwrap()).unwrap();
+                    let record_path = unique("record").join("record.json");
+                    fs::write(&record_path, serde_json::to_vec(&file).unwrap()).unwrap();
+                    let durable = |record: &TransferFile, path: &Path| {
+                        let mut output = File::create(path).unwrap();
+                        output.write_all(&serde_json::to_vec(record).unwrap()).unwrap();
+                        output.sync_all().unwrap();
+                    };
+                    if reverse {
+                        let path = source_root.join(&quarantine);
+                        on_lease_moment(Some(Box::new(move |moment, _| {
+                            if moment == LeaseMoment::BeforeRelease {
+                                let _ = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&path);
+                            }
+                        })));
+                    }
+                    let mut seen = 0usize;
+                    let mut interrupted = false;
+                    let first = transfer_file(&source_root, &destination_root, &mut file, |record| {
+                        let hit = record.phase == stop && {
+                            let call = seen;
+                            seen += 1;
+                            call == target_call
+                        };
+                        if hit && !interrupted {
+                            interrupted = true;
+                            if before_write {
+                                return Err("utrata zasilania przed zapisem".into());
+                            }
+                            durable(record, &record_path);
+                            return Err("utrata zasilania po zapisie".into());
+                        }
+                        durable(record, &record_path);
+                        Ok(())
+                    });
+                    on_lease_moment(None);
+                    assert!(interrupted, "{case}: granica nieosiągnięta ({first:?})");
+                    // The client writes to the path as the union resolves it:
+                    // the cache branch first.
+                    let visible = if source_root.join("payload.bin").exists() {
+                        source_root.join("payload.bin")
+                    } else {
+                        destination_root.join("payload.bin")
+                    };
+                    fs::OpenOptions::new().append(true).open(&visible).unwrap().write_all(b"NEWER").unwrap();
+                    let mut reopened: TransferFile = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+                    let resumed = transfer_file(&source_root, &destination_root, &mut reopened, |record| {
+                        durable(record, &record_path);
+                        Ok(())
+                    });
+                    let on_cache = source_root.join("payload.bin").exists();
+                    let on_data = destination_root.join("payload.bin").exists();
+                    if reverse && stop == TransferFilePhase::RestoreIntent && !before_write {
+                        let error = resumed.expect_err(&case);
+                        assert!(error.contains("konflikt"), "{case}: {error}");
+                        assert!(!on_cache && on_data, "{case}");
+                        assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"boundary payloadNEWER", "{case}");
+                        assert_eq!(fs::read(source_root.join(&quarantine)).unwrap(), b"boundary payload", "{case}: the original is kept");
+                    } else {
+                        resumed.unwrap_or_else(|error| panic!("{case}: {error}"));
+                        assert!(on_cache != on_data, "{case}: exactly one copy under the path");
+                        assert_eq!(fs::read(&visible).unwrap(), b"boundary payloadNEWER", "{case}: the newest content");
+                        assert!(helper_names(&source_root).is_empty(), "{case}: {:?}", helper_names(&source_root));
+                        assert!(helper_names(&destination_root).is_empty(), "{case}: {:?}", helper_names(&destination_root));
+                        assert!(matches!(reopened.phase, TransferFilePhase::Done | TransferFilePhase::Restored), "{case}");
+                    }
                     fs::remove_dir_all(record_path.parent().unwrap()).unwrap();
                     fs::remove_dir_all(source_root).unwrap();
                     fs::remove_dir_all(destination_root).unwrap();

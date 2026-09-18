@@ -21,10 +21,17 @@ import '/js/components/tf-toggle.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-window.js';
 
-// Every `OP_*` constant of `tentanas/approvals.rs`. A parked operation missing
-// from this list degrades to the generic "Operacja" label, which tells the
-// approving admin nothing about what they are approving.
-const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import', 'elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'elastic_schedule'];
+// Every REACHABLE `OP_*` constant of `tentanas/approvals.rs`. A parked
+// operation missing from this list degrades to the generic "Operacja" label,
+// which tells the approving admin nothing about what they are approving — and
+// `elastic_fix` (a repair that overwrites blocks), `elastic_add_disk` (a disk
+// gets formatted) and `elastic_destroy` (an array stops serving) were all
+// missing, which is exactly the set where the label matters most.
+//
+// `elastic_replace_disk` is deliberately NOT here: disk replacement is
+// withdrawn, the node refuses the request before anything is parked, so a
+// label for it would describe an operation that cannot appear.
+const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import', 'elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'elastic_fix', 'elastic_add_disk', 'elastic_destroy', 'elastic_schedule'];
 
 export const operationLabel = (op) => T('approvals.op_' + (OPERATIONS.includes(op) ? op : 'unknown'));
 

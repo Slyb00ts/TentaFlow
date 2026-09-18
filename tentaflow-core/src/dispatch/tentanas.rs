@@ -75,6 +75,14 @@ fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
         BrokerError::ToolMissing(tool) => {
             ProtocolError::new(ProtocolErrorCode::NotAvailable, format!("{tool} is not installed"))
         }
+        // The version gate. Its text already names the versions and the remedy
+        // (it is written for the admin, in Polish, by `broker::version_gate`),
+        // so it is forwarded whole rather than turned into "tentanas … failed"
+        // by the fallthrough — this is the one refusal an admin fixes by
+        // re-running provisioning, and they can only do that if they are told.
+        BrokerError::HelperVersion(why) => {
+            ProtocolError::new(ProtocolErrorCode::NotAvailable, why)
+        }
         BrokerError::InvalidArgument(d) => ProtocolError::bad_request(d),
         other => internal(scope, other),
     }
@@ -509,7 +517,7 @@ async fn wipe_plan_of(
     let journals = tentanas::elastic::journals(&g.db, explicit)
         .await
         .map_err(|e| privileged_error("elastic journals", e))?;
-    let claim = tentanas::disks::journal_claim_of(&disk, &journals);
+    let claim = tentanas::disks::journal_claim_of(&disk, &journals.arrays);
     Ok(tentanas::disks::plan_wipe(&disk, claim))
 }
 
@@ -1838,7 +1846,7 @@ fn spawn_apply_job(
     let addon_id = g.addon_id.clone();
     let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, None, move |h| async move {
         let db = h.db().clone();
-        for line in tentanas::shares::apply(&db, &main_db, &addon_id, explicit.as_deref()).await? {
+        for line in tentanas::shares::apply(&db, &main_db, &addon_id, explicit.as_deref(), tentanas::shares::ApplyTrigger::Change).await? {
             h.log(line);
         }
         drop(explicit);
@@ -2142,7 +2150,7 @@ async fn share_user_delete(
     // longer exists.
     let main_db = ctx.state.db.clone();
     let addon_id = g.addon_id.clone();
-    if let Err(e) = tentanas::shares::apply(&g.db, &main_db, &addon_id, explicit.as_deref()).await {
+    if let Err(e) = tentanas::shares::apply(&g.db, &main_db, &addon_id, explicit.as_deref(), tentanas::shares::ApplyTrigger::Change).await {
         tracing::warn!("tentanas: share config not rewritten after user delete: {e}");
     }
     share_users_response(&g)
@@ -3203,6 +3211,9 @@ async fn execute_approved(
         }
         P::ElasticArrayAddDiskRequest {name,disk_id,confirm_name,..} =>
             elastic_add_disk(ctx,name,disk_id,confirm_name,secret,Origin::Approved).await,
+        P::ElasticArrayReplaceDiskRequest {name,disk,confirm_disk,replacement_disk_id,accept_stale_parity,..} =>
+            elastic_replace_disk(ctx,name,disk,confirm_disk,replacement_disk_id,*accept_stale_parity,
+                secret,Origin::Approved).await,
         P::ElasticArrayDestroyRequest {name,confirm_name,..} =>
             elastic_destroy(ctx,name,confirm_name,secret,Origin::Approved).await,
         P::ElasticArrayMoverRequest {name,..} => elastic_mover(ctx,name,secret,Origin::Approved).await,
@@ -3479,10 +3490,14 @@ async fn elastic_snapraid(
                 ),
             ));
         }
-    } else if array.state != "active" {
+    } else if !array.parity_run_available {
+        // A Sync and a full Scrub are what settle a parity run that ended
+        // without success, so they are offered on the array such a run left
+        // behind; everything else — a mover record in flight, a half-finished
+        // add — still refuses (`db::parity_admission`).
         return Err(ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
-            "SnapRAID wymaga zakończonej aktywnej macierzy z parity",
+            "SnapRAID wymaga macierzy z parity bez nierozwiązanej operacji poza parity",
         ));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
@@ -3493,7 +3508,22 @@ async fn elastic_snapraid(
                     name: name.into(),
                     sudo_password: None,
                 },
-                "Zapisuje nowy checkpoint parity i content".to_string(),
+                // A Sync over an array whose scrub reported errors is not the
+                // same operation as a Sync over a healthy one, and the approver
+                // reads only this sentence. MEASURED on rig11 (snapraid
+                // 13.0-1): the marked blocks stay repairable across a Sync —
+                // an unchanged file reads `equal` and gets no new parity — but
+                // the files the scrub could NOT read are removed from the
+                // content file by that same Sync, and parity then holds nothing
+                // of them. So the sentence names what the approval costs, and
+                // the repair is the operation to take first.
+                match tentanas::elastic::unresolved_parity_fault(&array.snapraid_history) {
+                    Some(run) => format!(
+                        "Zapisuje nowy checkpoint parity i content. UWAGA: scrub tej macierzy zgłosił {} błędów,                          których nic jeszcze nie naprawiło. Zaznaczone bloki pozostaną naprawialne, ale pliki,                          których scrub nie mógł odczytać, zostaną usunięte z content i parity przestanie je                          obejmować. Najpierw uruchom naprawę z parity.",
+                        run.errors.unwrap_or_default()
+                    ),
+                    None => "Zapisuje nowy checkpoint parity i content".to_string(),
+                },
             ),
             ElasticSnapraidKind::Scrub => (
                 tentanas::approvals::OP_ELASTIC_SCRUB,
@@ -3515,7 +3545,15 @@ async fn elastic_snapraid(
                 // overwriting THAT disk with what parity says it should hold,
                 // and an approval reading only "repair" would be an approval
                 // for whichever disk the author chose after it was granted.
-                format!("Odbudowuje dysk danych '{disk}' z parity, nadpisując jego obecną treść"),
+                // What it authorises is `-e fix` on THAT disk: the blocks the
+                // last Scrub marked bad, in files unchanged since the last
+                // Sync. Saying "rebuilds the disk, overwriting its content"
+                // described an unfiltered `fix` this product never runs, and an
+                // approver who believed it would refuse a safe operation — or
+                // approve it expecting deleted files back.
+                format!(
+                    "Zapisuje z parity bloki zaznaczone przez ostatni scrub, w plikach niezmienionych od                      ostatniego Sync; operacja jest zapisana przy dysku '{disk}'"
+                ),
             ),
         };
         return park(ctx, &g, operation, name, &description, &request);
@@ -3678,6 +3716,75 @@ async fn elastic_add_disk(
     Ok(job_response(job))
 }
 
+/// DISK REPLACEMENT IS WITHDRAWN (round 4, owner's decision), and this handler
+/// is the refusal.
+///
+/// It refuses BEFORE it looks at the array, and that placement is the point:
+/// the previous version failed at the helper's first hop (the command was
+/// missing from `actions::run`) and its error path wrote both the operation row
+/// and the array row `needs_attention` — and only a SUCCEEDED `fix` cleared a
+/// `replace_disk` row, so one click cost the array every later Sync, Scrub,
+/// mover and add. So nothing here reads a spec, opens a job, opens an operation
+/// or asks the helper anything. Nothing can write a `replace_disk` row: the
+/// store refuses that intent outright (`db::insert_job`).
+///
+/// The refusal says what an admin CAN do, because a disk that is gone is a real
+/// situation with a real answer: the array goes on serving the disks it still
+/// has, `snapraid` can still repair blocks a scrub marked on the disks that are
+/// present, and the array can be dissolved and imported again once the member
+/// is back. A replacement is its own task.
+///
+/// WHAT THE NEXT TASK HAS TO SOLVE (fourth review, so it is not rediscovered):
+/// * the command must reach `actions::run` — a sixth table the five-tables test
+///   did not cover (finding 1/W3b), now covered;
+/// * a failed attempt must not wedge the array: write the row `failed` when
+///   nothing ran, or let a later replacement supersede it (W3b/W7);
+/// * `private_operation`'s fresh-boot block resolves EVERY member, so the dead
+///   disk fails it before the executor runs, and `replaceable_slot` refuses on
+///   `anchor.is_some()` while `private_operation` needs an anchor when the boot
+///   is not fresh — two mutually exclusive guards, with the anchor guard also
+///   ignoring the anchor's boot id (finding 5/W4);
+/// * the journal swap is durable while the core DB is written only on full
+///   success, so any failure in between desynchronises them and every later
+///   Restore and Inspect of that array fails validation (finding 4/W1);
+/// * a repeat hard-errors on the `Mkfs` step (`formatowanie już rozpoczęte`)
+///   instead of skipping it the way `plan_add_data_disk` does, so an
+///   interrupted replacement cannot be finished (finding 7/W2);
+/// * `accept_stale_parity` admits a rebuild whose own verdict then rejects the
+///   `error_unrecoverable > 0` result it produces (finding 6/W3);
+/// * the union stays read-write across the multi-hour rebuild, and on a
+///   cacheless array `mfs` sends every new client file onto the branch snapraid
+///   is rebuilding (DL1);
+/// * the approval surface: `OP_ELASTIC_REPLACE_DISK` is not in the UI allowlist
+///   `approvals.js`, the parked record names the array but neither the slot,
+///   the replacement disk nor the acknowledgement, `approvals::without_secret`
+///   has no arm for the variant, and `jobs.kind_elastic_replace_disk` is
+///   missing from all five locales.
+#[allow(clippy::too_many_arguments)]
+async fn elastic_replace_disk(
+    ctx: &HandlerContext,
+    name: &str,
+    branch: &str,
+    confirm_disk: &str,
+    replacement_disk_id: &str,
+    accept_stale_parity: bool,
+    secret: Option<&SudoSecret>,
+    origin: Origin,
+) -> Result<MessageBody, ProtocolError> {
+    // The permission gate first, so a reader learns nothing about the node's
+    // arrays from a withdrawn feature either.
+    let _g = gate_destructive(ctx)?;
+    let _ = (branch, confirm_disk, replacement_disk_id, accept_stale_parity, secret, origin);
+    Err(ProtocolError::new(
+        ProtocolErrorCode::NotAvailable,
+        format!(
+            "Wymiana dysku macierzy '{name}' nie jest udostępniona w tej wersji. Macierz serwuje \
+             dalej z dysków, które ma; naprawa z parity działa dla dysków obecnych na węźle, a \
+             macierz z brakującym dyskiem można rozwiązać i przejąć ponownie po jego podłączeniu."
+        ),
+    ))
+}
+
 /// The danger zone of the array detail screen: stop serving this array and
 /// forget it here.
 ///
@@ -3759,7 +3866,9 @@ async fn elastic_mover(
     let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
         .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
-    if array.state != "active" {
+    // An array whose only unresolved operations are mover runs takes the
+    // next run: that run is what settles them.
+    if array.state != "active" && !array.mover_settles_unresolved {
         return Err(ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
             "Mover wymaga zakończonej aktywnej macierzy",
@@ -3780,7 +3889,7 @@ async fn elastic_mover(
     // OUTLIVES the array returning to 'active': a Restore after a failed sync
     // does exactly that, which is how an enabled button used to meet an opaque
     // error. Clearing such an operation is E2-13, not this path.
-    if array.unresolved_operation {
+    if array.unresolved_operation && !array.mover_settles_unresolved {
         return Err(ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
             "Macierz ma niepotwierdzoną operację; rozwiąż ją przed uruchomieniem movera",
@@ -3917,7 +4026,9 @@ async fn elastic_schedule_set(
     //
     // EXACTLY ONE thing escapes four eyes: standing an existing cadence down
     // and changing nothing else. Requiring a second admin to stop a runaway
-    // mover would make an incident worse, and a pure switch-off arms nothing.
+    // cadence would make an incident worse, and a pure switch-off arms nothing.
+    // For the mover a switch-off lifts a restriction: moving returns to the
+    // automatic default every array with a cache has anyway.
     //
     // Everything else parks, `enabled: false` included, because gating on the
     // switch alone was a hole with a three-click exploit: n15's dialog sends
@@ -4650,6 +4761,9 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         }
         P::ElasticArrayAddDiskRequest {name,disk_id,confirm_name,sudo_password} =>
             elastic_add_disk(ctx,name,disk_id,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
+        P::ElasticArrayReplaceDiskRequest {name,disk,confirm_disk,replacement_disk_id,accept_stale_parity,sudo_password} =>
+            elastic_replace_disk(ctx,name,disk,confirm_disk,replacement_disk_id,*accept_stale_parity,
+                sudo_password.as_ref(),Origin::Direct).await,
         P::ElasticArrayDestroyRequest {name,confirm_name,sudo_password} =>
             elastic_destroy(ctx,name,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
         P::ElasticArrayMoverRequest {name,sudo_password} => elastic_mover(ctx,name,sudo_password.as_ref(),Origin::Direct).await,
@@ -5025,6 +5139,10 @@ register_tentanas_variant!(
     "tentaflow_ws_handler_nas_elastic_add_disk"
 );
 register_tentanas_variant!(
+    "TentaNasElasticArrayReplaceDiskRequest",
+    "tentaflow_ws_handler_nas_elastic_replace_disk"
+);
+register_tentanas_variant!(
     "TentaNasElasticArrayDestroyRequest",
     "tentaflow_ws_handler_nas_elastic_destroy"
 );
@@ -5288,6 +5406,7 @@ mod registration_tests {
     /// A scrub of this array that ended without success — the parity fault a
     /// repair is reached for, and the only thing that arms one.
     fn failed_scrub(g: &Gate, spec: &tentanas_helper::elastic::ElasticCreateSpec) {
+        let operation_id = uuid::Uuid::now_v7().to_string();
         let scrub = tentaflow_protocol::tentanas::NasJob {
             job_id: uuid::Uuid::now_v7().to_string(),
             kind: "elastic_scrub".into(),
@@ -5302,9 +5421,23 @@ mod registration_tests {
             Some(&tentanas::jobs::ElasticJobIntent::Snapraid {
                 owner: spec.owner.clone(),
                 array_id: spec.array_id.clone(),
-                operation_id: uuid::Uuid::now_v7().to_string(),
+                operation_id: operation_id.clone(),
                 kind: tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
             }),
+        )
+        .unwrap();
+        // A scrub that FOUND errors reports them: a scrub with no result is
+        // only interrupted, and that is no fault a repair could address.
+        store::record_snapraid_result(
+            &g.db,
+            &spec.owner,
+            &operation_id,
+            &tentanas::elastic::tests::snapraid_result(
+                spec,
+                &operation_id,
+                tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
+                tentanas_helper::elastic::ElasticSnapraidOutcome::Failed,
+            ),
         )
         .unwrap();
         store::finish_job(&g.db, &scrub.job_id, "failed", Some("parity errors")).unwrap();
@@ -5313,8 +5446,8 @@ mod registration_tests {
     /// What a REPAIR refuses, in the order it refuses it, and the proof that
     /// none of the refusals reaches storage.
     ///
-    /// `snapraid fix -d <disk>` WRITES the named disk back from the parity
-    /// checkpoint. So there are three separate ways for the request to be
+    /// A repair WRITES the named disk back from the parity checkpoint (only
+    /// where a Scrub marked it bad, or where a replaced disk has nothing). So there are three separate ways for the request to be
     /// wrong, and each has to arrive as its own sentence: no parity to rebuild
     /// from, a disk this array does not carry, and — the one that keeps a
     /// healthy array healthy — nothing to repair at all.
@@ -5404,6 +5537,96 @@ mod registration_tests {
         assert_eq!(tentanas::elevation::audit_entries(&g.db), 0);
     }
 
+    /// DISK REPLACEMENT IS WITHDRAWN, and this is the proof that asking for one
+    /// changes nothing on the node.
+    ///
+    /// The previous version of this handler wrote an operation row and an
+    /// `elastic_replace_disk` job, asked the helper, and the helper refused at
+    /// its very first hop because the command was missing from `actions::run`.
+    /// The failure then left BOTH the operation row and the array row
+    /// `needs_attention`, and only a succeeded `fix` cleared a `replace_disk`
+    /// row — so a single click cost the array every later Sync, Scrub, mover
+    /// run and disk addition. Hence the refusal has to land BEFORE the first
+    /// write, and hence this test counts rows rather than reading a message:
+    /// a refusal that still writes is the defect, not the message.
+    #[tokio::test]
+    async fn a_replacement_is_refused_before_it_writes_anything() {
+        let mut fixture = dispatch_fixture();
+        // A reader cannot even ask: the permission gate stays first.
+        let denied = elastic_replace_disk(
+            &fixture.ctx, "media", "d1", "d1", "wwn-new", false, None, Origin::Direct,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+
+        let spec = active_array(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+        // The state a replacement was meant for: the slot's disk is gone.
+        g.db.write()
+            .unwrap()
+            .execute(
+                "DELETE FROM nas_disks WHERE disk_id=?1",
+                rusqlite::params![spec.data[0].disk_id],
+            )
+            .unwrap();
+        // Four eyes on, so a version that parked would leave an approval row.
+        tentanas::approvals::set_settings(&actor(&fixture.ctx, &g).unwrap(), true, 24).unwrap();
+        let jobs_before = store::list_jobs(&g.db, 100).unwrap().len();
+        let state_before: String = g
+            .db
+            .read()
+            .unwrap()
+            .query_row("SELECT state FROM nas_elastic_arrays WHERE name='media'", [], |r| r.get(0))
+            .unwrap();
+
+        // Every shape of the request is refused, with a sentence that tells the
+        // admin what the array can still do.
+        for (name, disk, confirm, replacement, stale) in [
+            ("media", "d1", "d1", "wwn-new-disk", false),
+            ("media", "d1", "d1", "wwn-new-disk", true),
+            ("media", "d9", "d9", "wwn-new-disk", false),
+            ("inna", "d1", "d1", "wwn-new-disk", false),
+        ] {
+            let refused = elastic_replace_disk(
+                &fixture.ctx,
+                name,
+                disk,
+                confirm,
+                replacement,
+                stale,
+                Some(&SudoSecret("never-store-replace-secret".into())),
+                Origin::Direct,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.code, ProtocolErrorCode::NotAvailable, "{}", refused.message);
+            assert!(refused.message.contains("naprawa"), "{}", refused.message);
+        }
+
+        // NOTHING WAS WRITTEN: no operation of any kind, no job, no approval,
+        // no change to the array row, and nothing in the elevation audit that
+        // would mean the helper was asked.
+        let db = g.db.read().unwrap();
+        let replacements: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM nas_elastic_operations WHERE kind='replace_disk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(replacements, 0, "no replace_disk operation may ever exist");
+        let approvals: i64 = db.query_row("SELECT COUNT(*) FROM nas_pending_approvals", [], |r| r.get(0)).unwrap();
+        assert_eq!(approvals, 0, "a withdrawn request must not park for a second admin");
+        let state_after: String = db
+            .query_row("SELECT state FROM nas_elastic_arrays WHERE name='media'", [], |r| r.get(0))
+            .unwrap();
+        drop(db);
+        assert_eq!(state_after, state_before, "the array row must be untouched");
+        assert_eq!(store::list_jobs(&g.db, 100).unwrap().len(), jobs_before, "no job");
+        assert_eq!(tentanas::elevation::audit_entries(&g.db), 0, "the helper was never asked");
+    }
+
     /// A REPAIR parks for a second admin, and the approval row names the disk.
     ///
     /// Without this the `Fix` arm of `elastic_maintenance_gates_and_approval_…`
@@ -5452,6 +5675,34 @@ mod registration_tests {
             tentanas::approvals::claim(&actor(&fixture.ctx, &g).unwrap(), &approval.request_id),
             Err(tentanas::approvals::ApprovalError::OwnRequest)
         ));
+        // The repair's own sentence describes `-e fix`, not the unfiltered
+        // rebuild this product never runs.
+        assert!(stored.approval.detail.contains("zaznaczone"), "{}", stored.approval.detail);
+        assert!(!stored.approval.detail.contains("nadpisując"), "{}", stored.approval.detail);
+
+        // AND THE SYNC PARKED ON THE SAME ARRAY SAYS WHAT IT COSTS. A Sync over
+        // an array whose scrub reported errors is a different operation from a
+        // Sync over a healthy one — measured: the marked blocks stay
+        // repairable, the unreadable files leave the content file for good —
+        // and the approver reads only this sentence.
+        let parked_sync = elastic_snapraid(
+            &fixture.ctx,
+            "media",
+            Some(&SudoSecret("never-store-sync-secret".into())),
+            Origin::Direct,
+            ElasticSnapraidKind::Sync,
+        )
+        .await
+        .unwrap();
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval: sync_approval }) = parked_sync
+        else {
+            panic!("a sync on a four-eyes fleet has to park")
+        };
+        let sync_row = store::approval(&g.db, &sync_approval.request_id).unwrap().unwrap();
+        assert_eq!(sync_row.approval.operation, tentanas::approvals::OP_ELASTIC_SYNC);
+        for phrase in ["scrub", "naprawę", "content"] {
+            assert!(sync_row.approval.detail.contains(phrase), "{}", sync_row.approval.detail);
+        }
     }
 
     /// What ADDING A DISK refuses.

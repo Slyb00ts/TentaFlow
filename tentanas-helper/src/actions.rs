@@ -55,7 +55,8 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
         | HelperCommand::ElasticFix { .. } | HelperCommand::ElasticAddDisk { .. }
         | HelperCommand::ElasticDestroy { .. }
-        | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. }
+        | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticCacheAge { .. }
+        | HelperCommand::ElasticClaims { .. }
         | HelperCommand::ElasticJournals {} | HelperCommand::ElasticAdopt { .. } => {
             crate::elastic::execution::execute(command)
         }
@@ -97,6 +98,19 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
             block::remove_nvmet(Path::new(block::NVMET_CONFIGFS), nqn).map(|log| log.join("\n"))
         }
         HelperCommand::NvmetSessionsRead {} => nvmet_sessions_read(),
+        // DISK REPLACEMENT IS WITHDRAWN (round 4, owner's decision). The arm is
+        // written out rather than left to the fallback below on purpose: the
+        // fallback's "is not a builtin" reads like a packaging mistake and sent
+        // a reviewer looking for a missing table, whereas the caller needs to
+        // learn that the feature is not offered. The executor
+        // (`elastic::execution::execute`) and `Root::replace_data_disk` stay in
+        // place, dormant, for the task that finishes the feature; the core
+        // refuses the request long before it reaches a helper at all
+        // (`dispatch::tentanas::elastic_replace_disk`), so this line is the
+        // backstop for an older core talking to this helper.
+        HelperCommand::ElasticReplaceDisk { .. } => {
+            Err("elastic_replace_disk is withdrawn in this version".into())
+        }
         other => Err(format!("{other:?} is not a builtin")),
     }
 }

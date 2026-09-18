@@ -316,6 +316,15 @@
 .nas-root .nas-snapraid-history .stat-rows .k { flex: 1; }
 .nas-root .nas-snapraid-history .stat-rows .v { flex: 0 1 auto; }
 .nas-root .nas-mover > .section-card-head, .nas-root .nas-mover .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+/* The mover is automatic, so its section starts collapsed: the summary is the
+   card head, with the same disclosure marker the modals use. */
+.nas-root details.nas-mover > summary { cursor: pointer; list-style: none; }
+.nas-root details.nas-mover > summary::-webkit-details-marker { display: none; }
+.nas-root details.nas-mover > summary::before { content: '▸'; color: var(--text-3); }
+.nas-root details.nas-mover[open] > summary::before { content: '▾'; }
+.nas-root details.nas-mover:not([open]) > summary { margin-bottom: 0; }
+.nas-root details.nas-mover > summary:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
+.nas-root .nas-cache-pending { margin-top: 8px; }
 .nas-root .mover-hist { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; font-size: 11px; color: var(--text-2); }
 .nas-root .mover-hist span { padding: 2px 8px; border-radius: 999px; background: var(--bg-3); white-space: nowrap; }
 /* Foldery (n11): the union's top level, one row per folder, the Cache cell

@@ -1,7 +1,7 @@
 // =============================================================================
 // File: tentanas/scheduler.rs — the node's recurring work (plan-02 §5.2, tab
-//       "Zadania"): scrubs, automatic snapshots with GFS retention and SMART
-//       self-tests. One loop per node, one tick a minute, every decision made
+//       "Zadania"): scrubs, automatic snapshots with GFS retention, SMART
+//       self-tests and the automatic Elastic cache mover. One loop per node, one tick a minute, every decision made
 //       in the node's LOCAL time — "daily at 02:00" means 02:00 where the
 //       disks are, not 02:00 UTC.
 //
@@ -22,7 +22,10 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use tentaflow_protocol::tentanas::{NasSchedule, NasSnapshotSchedule};
 
+use tentanas_helper::elastic::ElasticCacheAge;
+
 use super::db as store;
+use super::elastic::{mover_trigger, ArrayObservation, CacheStuckVerdict, ElasticArrayRow, MoverClock, MoverTrigger};
 use super::snapshots;
 use crate::db::DbPool;
 
@@ -243,6 +246,31 @@ async fn tick(main_db: &DbPool, db: &DbPool) {
             .collect(),
     )
     .await;
+    run_elastic_passes(db, now, super::elastic::MoverClock::global(), &HelperCacheObserver { db }).await;
+    // The access audit and the outbound forwarding are per-minute work of the
+    // same loop: both are cheap when there is nothing to do, and neither may
+    // depend on somebody having a tab open (§5.10).
+    super::access_log::collect_tick(db).await;
+    super::forward::forward_tick(main_db, db).await;
+}
+
+/// The Elastic passes of one tick: scheduled SnapRAID runs and the automatic
+/// mover.
+///
+/// NOTHING RUNS WHILE THE STARTUP RESTORES DO (A1 of the second review).
+/// After a boot every private array waits for its Restore; a run started
+/// before it is refused by the helper — and for the mover that refusal cost
+/// the whole retrigger cooldown — while the probe it takes first holds the
+/// node lock the Restore needs, which refused the Restore as busy.
+async fn run_elastic_passes(
+    db: &DbPool,
+    now: DateTime<Local>,
+    clock: &super::elastic::MoverClock,
+    observer: &impl CacheObserver,
+) {
+    if super::elastic::startup_restores_pending() {
+        return;
+    }
     // Both Elastic passes read ONE snapshot of the arrays: the second pass
     // would otherwise re-read rows the first pass has just changed, and the
     // work below is the same for both.
@@ -254,12 +282,7 @@ async fn tick(main_db: &DbPool, db: &DbPool) {
         }
     };
     run_due_elastic_tasks(db, &arrays, now).await;
-    run_cache_low_movers(db, &arrays).await;
-    // The access audit and the outbound forwarding are per-minute work of the
-    // same loop: both are cheap when there is nothing to do, and neither may
-    // depend on somebody having a tab open (§5.10).
-    super::access_log::collect_tick(db).await;
-    super::forward::forward_tick(main_db, db).await;
+    run_automatic_movers(db, &arrays, clock, observer).await;
 }
 
 /// The recurring scrub and the recurring TRIM (§5.10) are the same loop over
@@ -351,6 +374,60 @@ async fn run_due_elastic_tasks(
                 }
                 continue;
             }
+            // AN UNATTENDED SYNC DOES NOT RUN OVER A SCRUB'S REPORTED ERRORS.
+            //
+            // A Sync is admitted on an array that needs attention — that is
+            // what gives a failed or interrupted parity run a way out — but the
+            // cadence must not take it while a scrub's errors are still
+            // unrepaired. MEASURED on rig11 (snapraid 13.0-1, probe f1-f3): a
+            // Sync leaves a marked block repairable, so the case the repair
+            // exists for survives it; but the files a scrub could NOT read are
+            // removed from the content file by that same Sync, and parity then
+            // holds nothing of them. An admin who is told can weigh that; a
+            // cadence cannot, so it skips, says why in the schedule row, and
+            // raises an alert that repairing clears.
+            //
+            // Only the Sync. A full Scrub writes no parity and is how the array
+            // is re-measured, and the mover has its own gate (an unresolved
+            // parity run keeps it off the array entirely).
+            let parity_fault = if task == store::ElasticTask::Sync {
+                super::elastic::scheduled_sync_blocker(&array.snapraid_history)
+            } else {
+                None
+            };
+            // The alert belongs to the SYNC slot alone. Raising or clearing it
+            // from the scrub's or the mover's pass over the same array would
+            // undo whatever the sync's pass decided, which is how the first
+            // version of this guard cleared its own alert and skipped silently.
+            if task == store::ElasticTask::Sync {
+            let repair_key = super::elastic::repair_alert_key(&array.name);
+            let alerted = match &parity_fault {
+                Some(_) => store::raise_alert(
+                    db,
+                    &repair_key,
+                    "warning",
+                    "elastic-array",
+                    &array.name,
+                    "Zaplanowany Sync wstrzymany: parity zgłasza błędy",
+                    "Scrub tej macierzy zgłosił błędy, których nic jeszcze nie naprawiło. Węzeł nie uruchamia                      zaplanowanego Sync, bo usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom                      naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
+                )
+                .map(|_| ()),
+                None => store::resolve_alert(db, &repair_key),
+            };
+            if let Err(e) = alerted {
+                tracing::warn!("tentanas scheduler: repair alert of {} not recorded: {e}", array.name);
+            }
+            }
+            if let Some(reason) = parity_fault {
+                // The advanced `next_run_at` goes in with the reason, so the
+                // slot is skipped once and not re-tried every tick.
+                if let Err(e) =
+                    store::record_elastic_schedule_run(db, &row.array_id, task, &reason, next.as_deref())
+                {
+                    tracing::warn!("tentanas scheduler: elastic sync skip of {} not recorded: {e}", array.name);
+                }
+                continue;
+            }
             let started = match task {
                 store::ElasticTask::Mover => {
                     super::elastic::spawn_mover(db, array, STARTED_BY, None)
@@ -371,10 +448,10 @@ async fn run_due_elastic_tasks(
                 ),
             };
             // A scheduled mover marks the retrigger clock too. Without it the
-            // cache-pressure pass later in this SAME tick finds an unmarked
-            // array, measures a cache the run it just started has not drained
-            // yet, and asks for a second run `insert_job` can only refuse —
-            // a recurring warning, and the 20-minute cooldown burned on a run
+            // automatic pass later in this SAME tick finds an unmarked array,
+            // measures a cache the run it just started has not drained yet,
+            // and asks for a second run `insert_job` can only refuse — a
+            // recurring warning, and the 20-minute cooldown burned on a run
             // that did happen.
             if task == store::ElasticTask::Mover && started.is_ok() {
                 super::elastic::MoverClock::global().started(&array.name);
@@ -398,59 +475,177 @@ async fn run_due_elastic_tasks(
     }
 }
 
-/// The cache-pressure trigger of §5.3, owner decision (1).
+/// The two privileged reads the automatic mover acts on. A trait so the pass
+/// below can be exercised against a real database with canned measurements:
+/// a unit test has no helper to ask.
+trait CacheObserver {
+    /// The branch free space `mover_trigger` checks for cache pressure.
+    async fn cache(&self, array: &ElasticArrayRow) -> anyhow::Result<ArrayObservation>;
+    /// What a run would move right now (`ElasticCacheAge`).
+    async fn age(&self, array: &ElasticArrayRow) -> anyhow::Result<ElasticCacheAge>;
+}
+
+struct HelperCacheObserver<'a> {
+    db: &'a DbPool,
+}
+
+impl CacheObserver for HelperCacheObserver<'_> {
+    async fn cache(&self, array: &ElasticArrayRow) -> anyhow::Result<ArrayObservation> {
+        super::elastic::observe_cache(self.db, array).await
+    }
+
+    async fn age(&self, array: &ElasticArrayRow) -> anyhow::Result<ElasticCacheAge> {
+        super::elastic::observe_cache_age(self.db, array).await
+    }
+}
+
+/// The automatic mover (§5.3; owner decision 2026-09-17: moving files off the
+/// cache is automatic, like any cache, and nobody has to configure it).
 ///
-/// This is the ONLY thing the minimum-free-space setting does. It starts an
-/// EXTRA run outside the cadence; it is emphatically NOT a gate on the
-/// scheduled ones, which move every aged file however roomy the cache is.
-/// Gating them on it would mean that on an array whose cache never fills, no
-/// file ever reaches parity at all — the failure would look like nothing
-/// happening, which is the hardest kind to see.
+/// Two triggers start a run, both through `mover_trigger`:
+/// * cache pressure — the cache fell below its minimum free space. Measured
+///   every tick for an array that is cooled down, exactly as before, and it
+///   overrides a restricting schedule;
+/// * aged files — the helper's age probe found files a run would move. The
+///   probe walks the cache as root, so it runs at most once per cooldown per
+///   array, only when pressure did not already fire, and never while an
+///   operation of the array runs (the helper would hold its lock). A schedule
+///   that is switched on restricts this trigger
+///   to its own slots (`run_due_elastic_tasks` fires those).
 ///
-/// The cooldown is checked BEFORE the helper is asked anything: `mover_trigger`
-/// would answer `None` for a cooling array anyway, and this way a node under
-/// sustained cache pressure inspects each array once per cooldown instead of
-/// once a minute.
-async fn run_cache_low_movers(db: &DbPool, arrays: &[super::elastic::ElasticArrayRow]) {
-    let clock = super::elastic::MoverClock::global();
+/// Every probe also decides the stuck-cache alert (`cache_stuck_verdict`).
+///
+/// A REFUSED SPAWN IS NORMAL. `insert_job` refuses a mover on an array that is
+/// not active, has an unresolved operation, or already runs one; that refusal
+/// is the serialisation, and the clock mark before the spawn keeps it from
+/// being re-asked every minute.
+async fn run_automatic_movers(
+    db: &DbPool,
+    arrays: &[ElasticArrayRow],
+    clock: &MoverClock,
+    observer: &impl CacheObserver,
+) {
     for array in arrays {
-        if !array.enabled || !array.mover.enabled || array.cache().next().is_none() {
+        if !array.enabled || array.cache().next().is_none() || !clock.cooled_down(&array.name) {
             continue;
         }
-        if !clock.cooled_down(&array.name) {
+        let Some(array_id) = array.array_id() else {
             continue;
-        }
-        let observed = match super::elastic::observe_cache(db, array).await {
-            Ok(o) => o,
+        };
+        match store::elastic_operation_running(db, array_id) {
+            Ok(false) => {}
+            Ok(true) => continue,
             Err(e) => {
-                // Unknown free space is not low free space: nothing fires.
-                tracing::warn!(
-                    "tentanas scheduler: cache of {} not measured: {e}",
-                    array.name
-                );
+                tracing::warn!("tentanas scheduler: operations of {} unreadable: {e}", array.name);
                 continue;
             }
-        };
-        if super::elastic::mover_trigger(array, &observed, clock)
-            != super::elastic::MoverTrigger::CacheLow
-        {
-            continue;
         }
-        // Marked before the spawn, not after. A refusal here means the array
-        // is already busy with an operation — which is the outcome the trigger
-        // wanted — and retrying it a minute later would re-ask the helper for
-        // the same answer.
-        clock.started(&array.name);
-        match super::elastic::spawn_mover(db, array, STARTED_BY, None) {
-            Ok(job) => tracing::info!(
-                "tentanas scheduler: cache low on {}, started mover job {}",
-                array.name,
-                job.job_id
-            ),
-            Err(e) => tracing::warn!(
-                "tentanas scheduler: cache low on {}, mover not started: {e}",
-                array.name
-            ),
+        // The automatic settling stopped after its attempts: an admin is told,
+        // once, and the alert goes when a run succeeds.
+        let settle_key = super::elastic::settle_alert_key(&array.name);
+        let settle_recorded = if array.mover_settles_unresolved && array.mover_failed_runs >= super::elastic::SETTLE_ATTEMPTS {
+            store::raise_alert(
+                db,
+                &settle_key,
+                "warning",
+                "elastic-array",
+                &array.name,
+                "Automatyczne dokończenie przenoszenia wstrzymane",
+                &format!(
+                    "{} kolejnych przebiegów przenoszenia zakończyło się niepowodzeniem, więc węzeł nie uruchamia \
+                     następnych sam. Sprawdź przyczynę w historii przenoszenia i uruchom przenoszenie ręcznie.",
+                    array.mover_failed_runs
+                ),
+            )
+            .map(|_| ())
+        } else {
+            store::resolve_alert(db, &settle_key)
+        };
+        if let Err(e) = settle_recorded {
+            tracing::warn!("tentanas scheduler: settle alert of {} not recorded: {e}", array.name);
+        }
+        // Settling what an earlier run left needs no measurement, and it must
+        // not wait for one: the helper refuses nothing a settling run needs.
+        //
+        // ONCE THE SETTLING HAS STOPPED the cache is measured again. Skipping
+        // it for ever would silence the very alerts that say the cache is
+        // filling and that a file was left in two versions, for exactly the
+        // array whose runs are failing — and the measurement is what the
+        // stuck-cache and conflict alerts are made of.
+        let settling = array.mover_settles_unresolved
+            && array.mover_failed_runs < super::elastic::SETTLE_ATTEMPTS;
+        let mut observed = if settling {
+            ArrayObservation::default()
+        } else {
+            match observer.cache(array).await {
+                Ok(o) => {
+                    if let Err(e) = super::elastic::record_conflict_alert(db, &array.name, &o.conflicts) {
+                        tracing::warn!("tentanas scheduler: conflict alert of {} not recorded: {e}", array.name);
+                    }
+                    o
+                }
+                Err(e) => {
+                    // Unknown free space is not low free space: nothing fires.
+                    tracing::warn!("tentanas scheduler: cache of {} not measured: {e}", array.name);
+                    continue;
+                }
+            }
+        };
+        if mover_trigger(array, &observed, clock) == MoverTrigger::None && clock.probe_due(&array.name) {
+            // Marked before the probe: a probe that fails is not retried a
+            // minute later either.
+            clock.probed(&array.name);
+            match observer.age(array).await {
+                Ok(age) => observed.cache_age = Some(age),
+                Err(e) => tracing::warn!(
+                    "tentanas scheduler: files waiting on the cache of {} not measured: {e}",
+                    array.name
+                ),
+            }
+        }
+        let trigger = mover_trigger(array, &observed, clock);
+        let mut run_started = false;
+        if trigger != MoverTrigger::None {
+            // Marked before the spawn, not after. A refusal here means the
+            // array cannot take a run now, and asking again a minute later
+            // would re-ask the helper for the same answer.
+            clock.started(&array.name);
+            let why = match trigger {
+                MoverTrigger::CacheLow => "cache low",
+                MoverTrigger::Settle => "an earlier run left something unresolved",
+                _ => "aged files waiting",
+            };
+            match super::elastic::spawn_mover(db, array, STARTED_BY, None) {
+                Ok(job) => {
+                    run_started = true;
+                    tracing::info!(
+                        "tentanas scheduler: {why} on {}, started mover job {}",
+                        array.name,
+                        job.job_id
+                    );
+                }
+                Err(e) => tracing::warn!("tentanas scheduler: {why} on {}, mover not started: {e}", array.name),
+            }
+        }
+        if let Some(age) = observed.cache_age.as_ref() {
+            let key = super::elastic::protection_alert_key(&array.name);
+            let recorded = match super::elastic::cache_stuck_verdict(array, age, run_started) {
+                CacheStuckVerdict::Raise { title, detail } => store::raise_alert(
+                    db,
+                    &key,
+                    "warning",
+                    "elastic-array",
+                    &array.name,
+                    &title,
+                    &detail,
+                )
+                .map(|_| ()),
+                CacheStuckVerdict::Clear => store::resolve_alert(db, &key),
+                CacheStuckVerdict::Keep => Ok(()),
+            };
+            if let Err(e) = recorded {
+                tracing::warn!("tentanas scheduler: cache alert of {} not recorded: {e}", array.name);
+            }
         }
     }
 }
@@ -828,7 +1023,13 @@ mod tests {
     /// Settles an array in this instance so the scheduler can find it: the
     /// create job, its operation closed successfully, and the job finished.
     fn settled_array(p: &DbPool, name: &str) -> tentanas_helper::elastic::ElasticCreateSpec {
-        let spec = crate::tentanas::elastic::tests::create_spec(name);
+        settle(p, crate::tentanas::elastic::tests::create_spec(name))
+    }
+
+    fn settle(
+        p: &DbPool,
+        spec: tentanas_helper::elastic::ElasticCreateSpec,
+    ) -> tentanas_helper::elastic::ElasticCreateSpec {
         let job = tentaflow_protocol::tentanas::NasJob {
             job_id: uuid::Uuid::now_v7().to_string(),
             kind: "elastic_create".to_string(),
@@ -924,6 +1125,144 @@ mod tests {
         assert_eq!(off.last_run_at, fired.last_run_at, "no second run");
     }
 
+    /// A SCHEDULED SYNC DOES NOT RUN over a scrub's reported errors, it says
+    /// why in the schedule row, it raises an alert an admin can act on, and the
+    /// scheduled SCRUB beside it still runs.
+    ///
+    /// The admission rule that unblocked the repair (`parity_admission`) admits
+    /// a Sync on an array that needs attention — deliberately, because a failed
+    /// or interrupted parity run must have a way out. The cadence must not take
+    /// that way out by itself. MEASURED on rig11 (snapraid 13.0-1, probe f1-f3):
+    /// a Sync leaves a marked block repairable, so what it costs is the other
+    /// half of a scrub's report — the files the scrub could not read, which the
+    /// Sync removes from the content file, after which parity holds nothing of
+    /// them. An admin who is told can weigh that; a cadence cannot.
+    #[tokio::test]
+    async fn a_scheduled_sync_skips_an_array_whose_scrub_reported_errors() {
+        use tentanas_helper::elastic::{ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome};
+        let p = db();
+        let spec = settled_array(&p, "media");
+        // A full scrub that counted errors: the array needs attention and
+        // nothing has repaired it.
+        let (job, intent) = snapraid_job(&spec, Kind::Scrub);
+        let crate::tentanas::jobs::ElasticJobIntent::Snapraid { operation_id, .. } = &intent else {
+            panic!("a scrub intent")
+        };
+        let scrub_id = operation_id.clone();
+        store::insert_job(&p, &job, Some(&intent)).expect("scrub job");
+        store::record_snapraid_result(
+            &p,
+            &spec.owner,
+            &scrub_id,
+            &crate::tentanas::elastic::tests::snapraid_result(&spec, &scrub_id, Kind::Scrub, Outcome::Failed),
+        )
+        .expect("result");
+        store::finish_job(&p, &job.job_id, "failed", Some("parity errors")).expect("finish");
+
+        for task in [store::ElasticTask::Sync, store::ElasticTask::Scrub] {
+            store::set_elastic_schedule(&p, &spec.array_id, task, true, &hourly(), None).expect("arm");
+        }
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        // The array still admits a MANUAL parity run: this test is about who
+        // starts it, not about whether it may be started.
+        assert!(arrays[0].parity_run_available);
+        let now = at(2026, 9, 1, 14, 45);
+        run_due_elastic_tasks(&p, &arrays, now).await;
+        let due = DateTime::parse_from_rfc3339(
+            store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Sync)
+                .expect("read")
+                .expect("row")
+                .next_run_at
+                .as_deref()
+                .expect("next"),
+        )
+        .expect("parse")
+        .with_timezone(&Local)
+            + chrono::Duration::minutes(1);
+        run_due_elastic_tasks(&p, &arrays, due).await;
+
+        // The Sync slot is SKIPPED, with the reason in the row and the cadence
+        // re-armed forward so it is not retried every tick.
+        let sync_row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Sync)
+            .expect("read")
+            .expect("row");
+        assert!(sync_row.last_result.contains("pominięto"), "{}", sync_row.last_result);
+        assert!(sync_row.last_result.contains("naprawę"), "{}", sync_row.last_result);
+        let rearmed = DateTime::parse_from_rfc3339(sync_row.next_run_at.as_deref().expect("next"))
+            .expect("parse")
+            .with_timezone(&Local);
+        assert!(rearmed > due, "the skipped slot is re-armed forward");
+        assert_eq!(
+            store::list_jobs(&p, 100)
+                .expect("jobs")
+                .into_iter()
+                .filter(|job| job.kind == "elastic_sync")
+                .count(),
+            0,
+            "no unattended sync was started"
+        );
+        // And an admin is told, in a way repairing clears.
+        let alert = store::list_alerts(&p, true)
+            .expect("alerts")
+            .into_iter()
+            .find(|alert| alert.subject_id == "media" && alert.title.contains("Sync wstrzymany"))
+            .expect("the skip raises an alert");
+        assert_eq!(alert.severity, "warning");
+        assert_eq!(alert.subject_kind, "elastic-array");
+        assert!(alert.detail.contains("naprawę"), "{}", alert.detail);
+
+        // THE SCRUB SLOT STILL RUNS: a full scrub writes no parity, and it is
+        // how the array gets re-measured after a repair.
+        let scrub_row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub)
+            .expect("read")
+            .expect("row");
+        assert!(scrub_row.last_run_at.is_some(), "the scrub cadence is untouched");
+        assert!(!scrub_row.last_result.contains("pominięto"), "{}", scrub_row.last_result);
+
+        // The scheduled scrub above is still running, and one array runs one
+        // operation at a time — close it the way a lost helper answer does.
+        for job in store::list_jobs(&p, 100).expect("jobs").into_iter().filter(|job| job.status == "running") {
+            store::finish_job(&p, &job.job_id, "failed", Some("test: helper unavailable")).expect("close");
+        }
+        // A SUCCEEDED REPAIR clears the fault, and the next slot runs: the skip
+        // is a state an admin action leaves, not a dead end.
+        let (fix_job, fix_intent) = snapraid_job(&spec, Kind::Fix { disk: "d1".into() });
+        let crate::tentanas::jobs::ElasticJobIntent::Snapraid { operation_id, .. } = &fix_intent else {
+            panic!("a fix intent")
+        };
+        let fix_id = operation_id.clone();
+        store::insert_job(&p, &fix_job, Some(&fix_intent)).expect("fix job");
+        let mut repaired = crate::tentanas::elastic::tests::snapraid_result(
+            &spec,
+            &fix_id,
+            Kind::Fix { disk: "d1".into() },
+            Outcome::Succeeded,
+        );
+        repaired.run.errors_data = Some(7);
+        repaired.run.checked_blocks = None;
+        repaired.state.last_run = Some(repaired.run.clone());
+        store::record_snapraid_result(&p, &spec.owner, &fix_id, &repaired).expect("repair result");
+        store::finish_job(&p, &fix_job.job_id, "succeeded", None).expect("finish");
+        let healed = store::elastic_arrays_all(&p).expect("arrays");
+        run_due_elastic_tasks(&p, &healed, rearmed + chrono::Duration::minutes(1)).await;
+        assert_eq!(
+            store::list_jobs(&p, 100)
+                .expect("jobs")
+                .into_iter()
+                .filter(|job| job.kind == "elastic_sync")
+                .count(),
+            1,
+            "with the fault repaired the cadence syncs again"
+        );
+        assert!(
+            store::list_alerts(&p, true)
+                .expect("alerts")
+                .into_iter()
+                .all(|alert| !alert.title.contains("Sync wstrzymany")),
+            "and the alert is resolved"
+        );
+    }
+
     /// A refused spawn is NORMAL and must not stop the sweep.
     ///
     /// `insert_job` already refuses a second running operation on one array,
@@ -995,6 +1334,639 @@ mod tests {
             started.last_result
         );
     }
+    // ----- the automatic mover ------------------------------------------------
+
+    /// An array settled like `settled_array`, WITH a cache disk.
+    fn settled_cached_array(p: &DbPool, name: &str) -> tentanas_helper::elastic::ElasticCreateSpec {
+        let mut spec = crate::tentanas::elastic::tests::create_spec(name);
+        let mut cache = spec.data[0].clone();
+        cache.disk_id = format!("{name}-cache");
+        cache.wwn = Some(format!("wwn-{name}-cache"));
+        cache.serial = Some(format!("serial-{name}-cache"));
+        cache.expected_uuid = uuid::Uuid::new_v4().to_string();
+        spec.cache = Some(cache);
+        settle(p, spec)
+    }
+
+    /// Canned helper answers, counted, so a test can say not only what the
+    /// pass started but what it paid to find out.
+    struct Canned {
+        cache_free_pct: u64,
+        age: ElasticCacheAge,
+        cache_reads: std::sync::atomic::AtomicUsize,
+        age_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Canned {
+        fn new(cache_free_pct: u64, age: ElasticCacheAge) -> Self {
+            Self { cache_free_pct, age, cache_reads: Default::default(), age_reads: Default::default() }
+        }
+        fn reads(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (self.cache_reads.load(Relaxed), self.age_reads.load(Relaxed))
+        }
+    }
+
+    impl CacheObserver for Canned {
+        async fn cache(&self, array: &ElasticArrayRow) -> anyhow::Result<ArrayObservation> {
+            self.cache_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut observed = ArrayObservation::default();
+            for branch in array.cache() {
+                observed.probes.insert(
+                    tentanas_helper::elastic::cache_branch_path(&array.name, &branch.name),
+                    crate::tentanas::elastic::BranchProbe {
+                        mounted: Some(true),
+                        device_present: Some(true),
+                        size_bytes: Some(1_000),
+                        used_bytes: Some(1_000 - self.cache_free_pct * 10),
+                        free_bytes: Some(self.cache_free_pct * 10),
+                    },
+                );
+            }
+            Ok(observed)
+        }
+
+        async fn age(&self, _: &ElasticArrayRow) -> anyhow::Result<ElasticCacheAge> {
+            self.age_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.age)
+        }
+    }
+
+    fn waiting(due_files: u64, held_files: u64, oldest_secs: u64) -> ElasticCacheAge {
+        ElasticCacheAge { due_files, due_bytes: due_files * 1024, held_files, oldest_secs: Some(oldest_secs) }
+    }
+
+    fn mover_jobs(p: &DbPool, subject: &str) -> i64 {
+        p.read()
+            .expect("read")
+            .query_row(
+                "SELECT COUNT(*) FROM nas_jobs WHERE kind = 'elastic_mover' AND subject = ?1",
+                [subject],
+                |r| r.get(0),
+            )
+            .expect("count")
+    }
+
+    fn stuck_alerts(p: &DbPool, subject: &str) -> Vec<tentaflow_protocol::tentanas::NasAlert> {
+        store::list_alerts(p, true)
+            .expect("alerts")
+            .into_iter()
+            .filter(|a| a.subject_kind == "elastic-array" && a.subject_id == subject)
+            .collect()
+    }
+
+    /// The owner's decision (2026-09-17), end to end over a real database: an
+    /// array with a cache, NO schedule and a roomy cache starts a run by
+    /// itself once aged files wait — and then, cooling down, asks the helper
+    /// nothing at all until the cooldown has passed.
+    #[tokio::test]
+    async fn aged_files_start_a_run_with_no_schedule_and_a_roomy_cache_then_the_array_cools_down() {
+        let p = db();
+        settled_cached_array(&p, "media");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        assert!(arrays[0].cache().next().is_some(), "the fixture has a cache");
+        assert!(store::elastic_schedule(&p, &arrays[0].array_id().unwrap().to_string(), store::ElasticTask::Mover)
+            .expect("schedule")
+            .is_none());
+        let clock = MoverClock::new();
+        let helper = Canned::new(90, waiting(3, 0, 9_000));
+
+        run_automatic_movers(&p, &arrays, &clock, &helper).await;
+        assert_eq!(mover_jobs(&p, "media"), 1, "aged files started a run");
+        assert_eq!(helper.reads(), (1, 1));
+        assert!(!clock.cooled_down("media"));
+
+        run_automatic_movers(&p, &arrays, &clock, &helper).await;
+        assert_eq!(mover_jobs(&p, "media"), 1, "no second run while cooling down");
+        assert_eq!(helper.reads(), (1, 1), "a cooling array costs no privileged call");
+    }
+
+    /// Fresh files are what a cache is for: probed, no run, no alert.
+    #[tokio::test]
+    async fn fresh_files_on_a_roomy_cache_start_nothing_and_raise_nothing() {
+        let p = db();
+        settled_cached_array(&p, "media");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        let helper = Canned::new(90, waiting(0, 0, 3_600));
+        let clock = MoverClock::new();
+        run_automatic_movers(&p, &arrays, &clock, &helper).await;
+        assert_eq!(mover_jobs(&p, "media"), 0);
+        assert!(stuck_alerts(&p, "media").is_empty());
+        // Probed once per cooldown, not once a minute.
+        run_automatic_movers(&p, &arrays, &clock, &helper).await;
+        assert_eq!(helper.reads(), (2, 1));
+    }
+
+    /// A run already going is the answer: no second run, and the helper — whose
+    /// lock that run holds — is not asked anything. A cacheless array has
+    /// nothing to move and is never measured.
+    #[tokio::test]
+    async fn a_running_operation_and_a_missing_cache_start_nothing() {
+        let p = db();
+        let busy = settled_cached_array(&p, "busy");
+        settled_array(&p, "plain");
+        let running = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_mover".to_string(),
+            subject: busy.name.clone(),
+            status: "running".to_string(),
+            started_by: "admin".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &p,
+            &running,
+            Some(&crate::tentanas::jobs::ElasticJobIntent::Mover {
+                owner: busy.owner.clone(),
+                array_id: busy.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                resume_operation_id: uuid::Uuid::now_v7().to_string(),
+                rules: tentanas_helper::elastic::MoverRules::default(),
+                coupled_sync: true,
+            }),
+        )
+        .expect("a run is going");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        assert_eq!(arrays.len(), 2);
+        let helper = Canned::new(5, waiting(3, 0, 90_000));
+        run_automatic_movers(&p, &arrays, &MoverClock::new(), &helper).await;
+        assert_eq!(mover_jobs(&p, "busy"), 1, "only the run that was already going");
+        assert_eq!(mover_jobs(&p, "plain"), 0);
+        assert_eq!(helper.reads(), (0, 0));
+    }
+
+    /// Cache pressure still starts a run, and does not pay for an age probe
+    /// it does not need — also on an array whose schedule restricts moving.
+    #[tokio::test]
+    async fn cache_pressure_still_starts_a_run_without_an_age_probe() {
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        store::set_elastic_schedule(
+            &p,
+            &spec.array_id,
+            store::ElasticTask::Mover,
+            true,
+            &NasSchedule { every: "daily".into(), hour: 3, ..Default::default() },
+            Some("2099-01-01T03:00:00Z"),
+        )
+        .expect("restrict");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        let helper = Canned::new(5, waiting(0, 0, 60));
+        run_automatic_movers(&p, &arrays, &MoverClock::new(), &helper).await;
+        assert_eq!(mover_jobs(&p, "media"), 1);
+        assert_eq!(helper.reads(), (1, 0));
+    }
+
+    /// Files past the threshold for which this pass starts a run do not open
+    /// the alert: the run is the answer, and the next probe after it decides.
+    #[tokio::test]
+    async fn files_past_the_threshold_with_a_run_starting_raise_nothing() {
+        let p = db();
+        settled_cached_array(&p, "media");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        let limit = crate::tentanas::elastic::cache_stuck_after_secs(&arrays[0]);
+        let moving = Canned::new(90, waiting(3, 0, limit + 60));
+        run_automatic_movers(&p, &arrays, &MoverClock::new(), &moving).await;
+        assert_eq!(mover_jobs(&p, "media"), 1);
+        assert!(stuck_alerts(&p, "media").is_empty());
+    }
+
+    /// A switched-on schedule restricts the age trigger to its own slots. The
+    /// probe still runs, because the stuck alert depends on it.
+    #[tokio::test]
+    async fn a_restricting_schedule_holds_aged_files_for_its_slot() {
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        store::set_elastic_schedule(
+            &p,
+            &spec.array_id,
+            store::ElasticTask::Mover,
+            true,
+            &NasSchedule { every: "daily".into(), hour: 3, ..Default::default() },
+            Some("2099-01-01T03:00:00Z"),
+        )
+        .expect("restrict");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        let helper = Canned::new(90, waiting(3, 0, 9_000));
+        run_automatic_movers(&p, &arrays, &MoverClock::new(), &helper).await;
+        assert_eq!(mover_jobs(&p, "media"), 0);
+        assert_eq!(helper.reads(), (1, 1));
+    }
+
+    /// The stuck alert, through the node's own alert table: nothing below the
+    /// threshold however much is pending, raised once files that cannot move
+    /// have waited past it, and resolved by the first probe that finds nothing
+    /// that old.
+    #[tokio::test]
+    async fn the_stuck_alert_opens_past_its_threshold_and_resolves_when_the_cache_drains() {
+        let p = db();
+        settled_cached_array(&p, "media");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        let limit = crate::tentanas::elastic::cache_stuck_after_secs(&arrays[0]);
+
+        let pending = Canned::new(90, waiting(0, 40, limit - 60));
+        run_automatic_movers(&p, &arrays, &MoverClock::new(), &pending).await;
+        assert!(stuck_alerts(&p, "media").is_empty(), "files below the threshold are not stuck");
+
+        let held = Canned::new(90, waiting(0, 2, limit + 60));
+        run_automatic_movers(&p, &arrays, &MoverClock::new(), &held).await;
+        let open = stuck_alerts(&p, "media");
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].severity, "warning");
+        assert!(open[0].detail.contains("otwarte"), "{}", open[0].detail);
+        assert!(open[0].resolved_at.is_none());
+
+        let drained = Canned::new(90, waiting(0, 0, 120));
+        run_automatic_movers(&p, &arrays, &MoverClock::new(), &drained).await;
+        assert!(stuck_alerts(&p, "media").is_empty(), "the first probe below the threshold resolves it");
+    }
+
+    /// A mover job that stopped with nothing recorded — the helper killed, the
+    /// job timed out, core restarted — as `finish_job` closes it.
+    fn lost_mover_run(p: &DbPool, spec: &tentanas_helper::elastic::ElasticCreateSpec) -> String {
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_mover".to_string(),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_by: "scheduler".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        store::insert_job(
+            p,
+            &job,
+            Some(&crate::tentanas::jobs::ElasticJobIntent::Mover {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: operation_id.clone(),
+                resume_operation_id: uuid::Uuid::now_v7().to_string(),
+                rules: tentanas_helper::elastic::MoverRules::default(),
+                coupled_sync: true,
+            }),
+        )
+        .expect("mover");
+        store::finish_job(p, &job.job_id, "failed", Some("Brak wiarygodnego wyniku movera")).expect("finish");
+        operation_id
+    }
+
+    /// H2 of the 2026-09-17 review: an unresolved mover run used to hold the
+    /// array until a `fix` the helper refuses while that run is open. Now the
+    /// scheduler starts the settling run on its own — with no cache
+    /// measurement, since none is needed — and the array is active again as
+    /// soon as a run completes. An unresolved PARITY operation still blocks.
+    #[tokio::test]
+    async fn an_unresolved_mover_run_is_settled_by_the_next_run_not_by_a_fix() {
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        lost_mover_run(&p, &spec);
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        assert_eq!(arrays[0].state, "needs_attention");
+        assert!(arrays[0].unresolved_operation);
+        assert!(arrays[0].mover_settles_unresolved, "only a mover is unresolved");
+        // A Sync still waits: nothing knows what the unresolved run moved.
+        let sync_job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_sync".to_string(),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        assert!(store::insert_job(
+            &p,
+            &sync_job,
+            Some(&crate::tentanas::jobs::ElasticJobIntent::Snapraid {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                kind: tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+            }),
+        )
+        .is_err());
+        // The cache cannot even be measured; the settling run starts anyway.
+        struct Unmeasurable;
+        impl CacheObserver for Unmeasurable {
+            async fn cache(&self, _: &ElasticArrayRow) -> anyhow::Result<ArrayObservation> {
+                Err(anyhow::anyhow!("Elastic busy"))
+            }
+            async fn age(&self, _: &ElasticArrayRow) -> anyhow::Result<ElasticCacheAge> {
+                Err(anyhow::anyhow!("Elastic busy"))
+            }
+        }
+        run_automatic_movers(&p, &arrays, &MoverClock::new(), &Unmeasurable).await;
+        assert_eq!(mover_jobs(&p, "media"), 2, "the settling run was started");
+        // That run completes: the array serves again and nothing is unresolved.
+        let (operation_id, job_id): (String, String) = p
+            .read()
+            .expect("read")
+            .query_row(
+                "SELECT operation_id, job_id FROM nas_elastic_operations WHERE kind='mover' AND state='running'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("running mover");
+        let resume: String = p
+            .read()
+            .expect("read")
+            .query_row("SELECT request_json FROM nas_elastic_operations WHERE operation_id=?1", [&operation_id], |r| r.get::<_, String>(0))
+            .map(|json| match serde_json::from_str::<tentanas_helper::HelperCommand>(&json).expect("request") {
+                tentanas_helper::HelperCommand::ElasticMover { resume_operation_id, .. } => resume_operation_id,
+                other => panic!("{other:?}"),
+            })
+            .expect("request");
+        let mut result = crate::tentanas::elastic::tests::mover_result(
+            &spec,
+            &operation_id,
+            &resume,
+            tentanas_helper::elastic::ElasticMoverPhase::Complete,
+            true,
+        );
+        result.state.last_mover = Some(result.run.clone());
+        store::record_mover_result(&p, &spec.owner, &operation_id, &result).expect("wynik");
+        store::finish_job(&p, &job_id, "succeeded", None).expect("finish");
+        let settled = store::elastic_arrays_all(&p).expect("arrays").remove(0);
+        assert_eq!(settled.state, "active");
+        assert!(!settled.unresolved_operation, "a later successful mover supersedes the lost one");
+        assert!(!settled.mover_settles_unresolved);
+
+        // An unresolved repair is not a mover's to settle.
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        let scrub = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_fix".to_string(),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &p,
+            &scrub,
+            Some(&crate::tentanas::jobs::ElasticJobIntent::Snapraid {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                kind: tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: "d1".into() },
+            }),
+        )
+        .expect("fix");
+        store::finish_job(&p, &scrub.job_id, "failed", Some("Brak wyniku operacji SnapRAID")).expect("finish");
+        let blocked = store::elastic_arrays_all(&p).expect("arrays").remove(0);
+        assert!(blocked.unresolved_operation && !blocked.mover_settles_unresolved);
+        run_automatic_movers(&p, &[blocked], &MoverClock::new(), &Unmeasurable).await;
+        assert_eq!(mover_jobs(&p, "media"), 0, "no settling run over an unresolved repair");
+    }
+
+    /// One SnapRAID job of `kind`, with its intent.
+    fn snapraid_job(
+        spec: &tentanas_helper::elastic::ElasticCreateSpec,
+        kind: tentanas_helper::elastic::ElasticSnapraidKind,
+    ) -> (tentaflow_protocol::tentanas::NasJob, crate::tentanas::jobs::ElasticJobIntent) {
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: format!("elastic_{}", crate::tentanas::elastic::snapraid_kind(&kind)),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        let intent = crate::tentanas::jobs::ElasticJobIntent::Snapraid {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            kind,
+        };
+        (job, intent)
+    }
+
+    /// A SnapRAID job of `kind` that ended with no result — core restarted
+    /// under it, or the helper died — as `finish_job` closes it.
+    fn lost_snapraid_run(p: &DbPool, spec: &tentanas_helper::elastic::ElasticCreateSpec, kind: tentanas_helper::elastic::ElasticSnapraidKind) {
+        let (job, intent) = snapraid_job(spec, kind);
+        store::insert_job(p, &job, Some(&intent)).expect("snapraid job");
+        store::finish_job(p, &job.job_id, "failed", Some("interrupted by core restart")).expect("finish");
+    }
+
+    /// D2 of the second review: a Sync or a Scrub whose process never reported
+    /// is INTERRUPTED. It blocks nothing — the next Sync is what settles it —
+    /// it reads as interrupted, and it is no evidence for a repair, which on a
+    /// disk in use would revert users' files. A lost repair stays unresolved.
+    #[tokio::test]
+    async fn an_interrupted_sync_or_scrub_blocks_nothing_and_offers_no_repair() {
+        for kind in [
+            tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+            tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
+        ] {
+            let p = db();
+            let spec = settled_cached_array(&p, "media");
+            lost_snapraid_run(&p, &spec, kind.clone());
+            // W-D of the third review: the ARRAY is left as it was. A state of
+            // needs_attention would refuse the very Sync the row says will
+            // finish it, and only a manual Restore would clear it.
+            let array = store::elastic_arrays_all(&p).expect("arrays").remove(0);
+            assert_eq!(array.state, "active", "{kind:?}");
+            assert!(!array.unresolved_operation, "{kind:?}");
+            assert_eq!(array.snapraid_history[0].outcome, store::INTERRUPTED_OUTCOME, "{kind:?}");
+            let wire = crate::tentanas::elastic::to_protocol(
+                &array,
+                &std::collections::BTreeMap::new(),
+                &ArrayObservation::default(),
+                true,
+                "13.0",
+                ("active", ""),
+            );
+            assert_eq!(crate::tentanas::elastic::repair_evidence(&wire), None, "{kind:?}");
+            // The Sync the history row promises really is admitted — that is
+            // the whole point of leaving the array active.
+            let (sync, sync_intent) = snapraid_job(&spec, tentanas_helper::elastic::ElasticSnapraidKind::Sync);
+            store::insert_job(&p, &sync, Some(&sync_intent)).expect("the next Sync settles it");
+        }
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        lost_snapraid_run(&p, &spec, tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: "d1".into() });
+        assert!(store::elastic_arrays_all(&p).expect("arrays").remove(0).unresolved_operation, "a lost repair stays unresolved");
+
+        // A run whose result WAS recorded before core lost the job reads the
+        // same way in the history as in the admission: interrupted, not a
+        // fault with counters an admin would take to the repair dialog.
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        let (job, intent) = snapraid_job(&spec, tentanas_helper::elastic::ElasticSnapraidKind::Sync);
+        let crate::tentanas::jobs::ElasticJobIntent::Snapraid { operation_id, .. } = &intent else {
+            panic!("snapraid_job returns a SnapRAID intent");
+        };
+        let operation_id = operation_id.clone();
+        store::insert_job(&p, &job, Some(&intent)).expect("sync job");
+        store::record_snapraid_result(
+            &p,
+            &spec.owner,
+            &operation_id,
+            &crate::tentanas::elastic::tests::snapraid_result(
+                &spec,
+                &operation_id,
+                tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+                tentanas_helper::elastic::ElasticSnapraidOutcome::Failed,
+            ),
+        )
+        .expect("result");
+        store::fail_orphaned_jobs(&p).expect("core restart");
+        p.write().expect("write").execute("UPDATE nas_elastic_arrays SET state='active'", []).expect("restore");
+        let lost = store::elastic_arrays_all(&p).expect("arrays").remove(0);
+        assert_eq!(lost.snapraid_history[0].outcome, store::INTERRUPTED_OUTCOME);
+        assert!(!lost.unresolved_operation, "the admission and the history agree");
+        let wire = crate::tentanas::elastic::to_protocol(
+            &lost,
+            &std::collections::BTreeMap::new(),
+            &ArrayObservation::default(),
+            true,
+            "13.0",
+            ("active", ""),
+        );
+        assert_eq!(crate::tentanas::elastic::repair_evidence(&wire), None);
+    }
+
+    /// A2 of the second review: settling runs back off — one cooldown, then
+    /// two, then four — and after `SETTLE_ATTEMPTS` failures in a row nothing
+    /// starts on its own and an admin is told. W3: a run refused as busy is no
+    /// failure and does not stop the settling.
+    #[tokio::test]
+    async fn settling_backs_off_and_stops_for_an_admin_after_repeated_failures() {
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        struct Unmeasurable;
+        impl CacheObserver for Unmeasurable {
+            async fn cache(&self, _: &ElasticArrayRow) -> anyhow::Result<ArrayObservation> {
+                Err(anyhow::anyhow!("not measured"))
+            }
+            async fn age(&self, _: &ElasticArrayRow) -> anyhow::Result<ElasticCacheAge> {
+                Err(anyhow::anyhow!("not measured"))
+            }
+        }
+        let clock = MoverClock::new();
+        for failed in 1..=crate::tentanas::elastic::SETTLE_ATTEMPTS {
+            lost_mover_run(&p, &spec);
+            let array = store::elastic_arrays_all(&p).expect("arrays").remove(0);
+            assert_eq!(array.mover_failed_runs, failed);
+            assert!(array.mover_settles_unresolved, "{failed}");
+            let wait = super::super::elastic::MOVER_RETRIGGER_COOLDOWN * (1 << (failed - 1));
+            clock.started("media");
+            clock.rewind_for_test("media", wait - Duration::from_secs(60));
+            assert_eq!(crate::tentanas::elastic::mover_trigger(&array, &ArrayObservation::default(), &clock), MoverTrigger::None, "{failed}: still waiting");
+            clock.rewind_for_test("media", wait);
+            let expected = if failed < crate::tentanas::elastic::SETTLE_ATTEMPTS { MoverTrigger::Settle } else { MoverTrigger::None };
+            assert_eq!(crate::tentanas::elastic::mover_trigger(&array, &ArrayObservation::default(), &clock), expected, "{failed}");
+        }
+        let stopped = store::elastic_arrays_all(&p).expect("arrays").remove(0);
+        run_automatic_movers(&p, &[stopped], &MoverClock::new(), &Unmeasurable).await;
+        assert_eq!(mover_jobs(&p, "media"), i64::from(crate::tentanas::elastic::SETTLE_ATTEMPTS), "nothing more started");
+        assert!(
+            stuck_alerts(&p, "media").iter().any(|alert| alert.title.contains("wstrzymane")),
+            "the admin is told"
+        );
+        // W3: a busy refusal after the failed run is not an operation that
+        // settled anything, and it must not switch the settling off.
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        lost_mover_run(&p, &spec);
+        let busy = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_mover".to_string(),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &p,
+            &busy,
+            Some(&crate::tentanas::jobs::ElasticJobIntent::Mover {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                resume_operation_id: uuid::Uuid::now_v7().to_string(),
+                rules: tentanas_helper::elastic::MoverRules::default(),
+                coupled_sync: true,
+            }),
+        )
+        .expect("busy mover");
+        store::finish_job(
+            &p,
+            &busy.job_id,
+            "failed",
+            Some(&format!("elastic_mover exited with 69: {} Resource temporarily unavailable", tentanas_helper::elastic::ELASTIC_BUSY)),
+        )
+        .expect("finish");
+        let array = store::elastic_arrays_all(&p).expect("arrays").remove(0);
+        assert!(array.mover_settles_unresolved, "one lock collision does not switch the settling off");
+        assert_eq!(array.mover_failed_runs, 1, "and is no failed run");
+    }
+
+    /// Round 4: while the settling runs the tick pays for no measurement, but
+    /// once the settling has STOPPED the cache is measured again — the
+    /// stuck-cache and conflict alerts are made of that measurement, and the
+    /// array whose runs keep failing is the last one that should go quiet.
+    #[tokio::test]
+    async fn a_stopped_settling_does_not_stop_the_cache_measurement() {
+        for failures in [1, crate::tentanas::elastic::SETTLE_ATTEMPTS] {
+            let p = db();
+            let spec = settled_cached_array(&p, "media");
+            for _ in 0..failures {
+                lost_mover_run(&p, &spec);
+            }
+            let arrays = store::elastic_arrays_all(&p).expect("arrays");
+            assert_eq!(arrays[0].mover_failed_runs, failures);
+            assert!(arrays[0].mover_settles_unresolved);
+            let observer = Canned::new(90, ElasticCacheAge::default());
+            run_automatic_movers(&p, &arrays, &MoverClock::new(), &observer).await;
+            let (cache_reads, _) = observer.reads();
+            if failures < crate::tentanas::elastic::SETTLE_ATTEMPTS {
+                assert_eq!(cache_reads, 0, "the settling run needs no measurement");
+                assert_eq!(mover_jobs(&p, "media"), failures as i64 + 1, "and it starts");
+            } else {
+                assert_eq!(cache_reads, 1, "the stopped array is measured again");
+                assert_eq!(mover_jobs(&p, "media"), failures as i64, "nothing more is started");
+            }
+        }
+    }
+
+    /// A1 of the second review: the Elastic passes wait while a startup restore
+    /// queue runs — a settling mover started before its Restore is refused by
+    /// the helper and costs the whole cooldown — and run once it is done.
+    #[tokio::test]
+    async fn the_elastic_passes_wait_for_the_startup_restores() {
+        let p = db();
+        let spec = settled_cached_array(&p, "media");
+        lost_mover_run(&p, &spec);
+        struct Unmeasurable;
+        impl CacheObserver for Unmeasurable {
+            async fn cache(&self, _: &ElasticArrayRow) -> anyhow::Result<ArrayObservation> {
+                Err(anyhow::anyhow!("not measured"))
+            }
+            async fn age(&self, _: &ElasticArrayRow) -> anyhow::Result<ElasticCacheAge> {
+                Err(anyhow::anyhow!("not measured"))
+            }
+        }
+        let clock = MoverClock::new();
+        let pending = crate::tentanas::elastic::StartupRestores::begin();
+        run_elastic_passes(&p, Local::now(), &clock, &Unmeasurable).await;
+        assert_eq!(mover_jobs(&p, "media"), 1, "nothing started while the restores run");
+        assert!(clock.cooled_down("media"), "and no cooldown was spent");
+        drop(pending);
+        // Another test may hold its own queue for a moment.
+        for _ in 0..100 {
+            if !crate::tentanas::elastic::startup_restores_pending() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        run_elastic_passes(&p, Local::now(), &clock, &Unmeasurable).await;
+        assert_eq!(mover_jobs(&p, "media"), 2, "the settling run starts once they are done");
+    }
+
     // ----- SMART self-tests ---------------------------------------------------
 
     /// Arms both SMART cadences at an explicit deadline. `run_due_smart_tests`

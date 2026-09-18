@@ -334,11 +334,40 @@ pub enum HelperCommand {
     ElasticFix { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: String },
     /// One more data disk, on a LIVE array. The union is never taken down.
     ElasticAddDisk { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: elastic::ElasticDiskSpec },
+    /// Replaces the disk of ONE data slot with a new one and rebuilds the
+    /// array onto it: the journal's slot identity is swapped, the replacement
+    /// is formatted as that branch, the array is restored, the disk is
+    /// rebuilt from parity (`snapraid -d <branch> fix`) and a Sync records it.
+    ///
+    /// `branch` is the array's own data-branch name (`d1`, `d2`, …), never a
+    /// device: the disk being replaced is by definition the one that is gone.
+    /// `rebuild_operation_id` and `sync_operation_id` are the reservations of
+    /// the two SnapRAID runs the flow records, so a restart of the flow is
+    /// recognisable rather than a second history row.
+    /// `accept_stale_parity` is the admin's explicit acknowledgement that a
+    /// rebuild from parity which is not current leaves some blocks
+    /// unrecoverable.
+    ElasticReplaceDisk {
+        array_id: String,
+        owner: elastic::ElasticOwner,
+        operation_id: String,
+        rebuild_operation_id: String,
+        sync_operation_id: String,
+        branch: String,
+        disk: elastic::ElasticDiskSpec,
+        accept_stale_parity: bool,
+    },
     /// Stops serving the array and releases its mounts. Formats nothing and
     /// removes nothing: the journal, the configs and every filesystem stay, so
     /// the array import can take the array back whole.
     ElasticDestroy { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticInspect { array_id: String, owner: elastic::ElasticOwner },
+    /// What a mover run would find on the cache right now, measured without
+    /// moving anything: the files it would move under `rules`, and how long
+    /// the oldest file there has been waiting. Read-only. It is what lets the
+    /// core start a run only when aged files are actually waiting, instead of
+    /// starting privileged runs on a timer to discover there was nothing.
+    ElasticCacheAge { array_id: String, owner: elastic::ElasticOwner, rules: elastic::MoverRules },
     ElasticClaims { name: Option<String> },
     /// Every Elastic journal on this node, whatever its owner. Owner-blind on
     /// purpose: a journal whose owner no longer matches the addon asking is
@@ -911,6 +940,15 @@ const SMB_AUDIT_OPERATIONS: &[&str] = &[
 
 /// Group every share user is created in and every share root is given to.
 pub const SHARE_GROUP: &str = "tentanas-share";
+
+/// The `veto files` value of every app-generated SMB share: the copy an
+/// Elastic mover run writes into a data branch root and the original it steps
+/// aside into the cache branch root while a file moves
+/// (`elastic_transfer::TEMPORARY_PREFIX`, `QUARANTINE_PREFIX`). Both surface
+/// in the share root of a union, and a client that deletes or opens one only
+/// interferes with a move in flight. Pinned, not free-form, like the audit
+/// prefix: the channel accepts exactly this value.
+pub const SMB_VETO_FILES: &str = "/.tentanas-transfer-*/.tentanas-quarantine-*/";
 /// Where a share of another node lands on this one.
 pub const FLEET_MOUNT_ROOT: &str = "/mnt/tentanas/";
 
@@ -1468,6 +1506,7 @@ const SMB_PARAMETERS: &[&str] = &[
     "full_audit:success",
     "full_audit:failure",
     "full_audit:prefix",
+    "veto files",
 ];
 
 /// VFS modules the channel may load. `vfs objects` names shared libraries that
@@ -1559,6 +1598,9 @@ pub fn validate_smb_config(text: &str) -> Result<(), CatalogError> {
         if key == "path" {
             validate_share_path(value)?;
         }
+        if key == "veto files" && value != SMB_VETO_FILES {
+            return Err(invalid(format!("veto files must be '{SMB_VETO_FILES}'")));
+        }
         if key == "interfaces" {
             for name in value.split_whitespace() {
                 validate_interface_name(name)?;
@@ -1600,6 +1642,7 @@ const KSMBD_PARAMETERS: &[&str] = &[
     "create mask",
     "directory mask",
     "force group",
+    "veto files",
 ];
 
 /// The whole app-owned `/etc/ksmbd/ksmbd.conf`. ksmbd-tools ship no dry-run
@@ -1651,6 +1694,9 @@ pub fn validate_ksmbd_config(text: &str) -> Result<(), CatalogError> {
         }
         match key {
             "path" => validate_share_path(value)?,
+            "veto files" if value != SMB_VETO_FILES => {
+                return Err(invalid(format!("veto files must be '{SMB_VETO_FILES}'")));
+            }
             "interfaces" => {
                 for name in value.split_whitespace() {
                     validate_interface_name(name)?;
@@ -2062,8 +2108,10 @@ impl HelperCommand {
             Self::ElasticScrub { .. } => Some("elastic_scrub"),
             Self::ElasticFix { .. } => Some("elastic_fix"),
             Self::ElasticAddDisk { .. } => Some("elastic_add_disk"),
+            Self::ElasticReplaceDisk { .. } => Some("elastic_replace_disk"),
             Self::ElasticDestroy { .. } => Some("elastic_destroy"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
+            Self::ElasticCacheAge { .. } => Some("elastic_cache_age"),
             Self::ElasticClaims { .. } => Some("elastic_claims"),
             Self::ElasticJournals {} => Some("elastic_journals"),
             Self::ElasticAdopt { .. } => Some("elastic_adopt"),
@@ -2131,6 +2179,33 @@ impl HelperCommand {
                 }
                 owner.validate()
             }
+            Self::ElasticReplaceDisk {
+                array_id,
+                owner,
+                operation_id,
+                rebuild_operation_id,
+                sync_operation_id,
+                branch,
+                disk,
+                accept_stale_parity: _,
+            } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                for id in [operation_id, rebuild_operation_id, sync_operation_id] {
+                    elastic::validate_elastic_uuid(id)?;
+                }
+                if operation_id == rebuild_operation_id
+                    || operation_id == sync_operation_id
+                    || rebuild_operation_id == sync_operation_id
+                {
+                    return Err(CatalogError::InvalidArgument("powtórzone UUID wymiany dysku".into()));
+                }
+                elastic::validate_data_branch_name(branch)?;
+                elastic::validate_elastic_uuid(&disk.expected_uuid)?;
+                if !matches!(disk.bytes, 1..=u64::MAX) {
+                    return Err(CatalogError::InvalidArgument("dysk zamienny bez rozmiaru".into()));
+                }
+                owner.validate()
+            }
             Self::ElasticDestroy { array_id, owner, operation_id }
             | Self::ElasticSync { array_id, owner, operation_id }
             | Self::ElasticScrub { array_id, owner, operation_id } => {
@@ -2154,6 +2229,11 @@ impl HelperCommand {
             }
             Self::ElasticRestore { array_id, owner } | Self::ElasticInspect { array_id, owner } => {
                 elastic::validate_elastic_uuid(array_id)?;
+                owner.validate()
+            }
+            Self::ElasticCacheAge { array_id, owner, rules } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                rules.validate()?;
                 owner.validate()
             }
             Self::ElasticClaims { name } => match name {
@@ -2840,8 +2920,10 @@ impl HelperCommand {
             Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
             Self::ElasticFix { .. } => ("builtin", "Odbudowuje wskazany dysk danych własnej macierzy Elastic z parity."),
             Self::ElasticAddDisk { .. } => ("builtin", "Dodaje dysk danych do działającej unii własnej macierzy Elastic."),
+            Self::ElasticReplaceDisk { .. } => ("builtin", "Wymienia dysk danych własnej macierzy Elastic i odbudowuje go z parity."),
             Self::ElasticDestroy { .. } => ("builtin", "Zatrzymuje udostępnianie własnej macierzy Elastic bez formatowania dysków."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
+            Self::ElasticCacheAge { .. } => ("builtin", "Odczytuje, ile plików na cache własnej macierzy Elastic czeka na przeniesienie, bez przenoszenia."),
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
             Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym węźle."),
             Self::ElasticAdopt { .. } => ("builtin", "Przepisuje właściciela dziennika macierzy Elastic na przejmującą instancję."),
@@ -3029,8 +3111,13 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ElasticFix { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), disk: s() },
         HelperCommand::ElasticAddDisk { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(),
             disk: elastic::ElasticDiskSpec { disk_id: s(), wwn: None, serial: None, bytes: 0, expected_uuid: s() } },
+        HelperCommand::ElasticReplaceDisk { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(),
+            rebuild_operation_id: s(), sync_operation_id: s(), branch: "d1".into(),
+            disk: elastic::ElasticDiskSpec { disk_id: s(), wwn: None, serial: None, bytes: 0, expected_uuid: s() },
+            accept_stale_parity: false },
         HelperCommand::ElasticDestroy { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
+        HelperCommand::ElasticCacheAge { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, rules: elastic::MoverRules::default() },
         HelperCommand::ElasticClaims { name: Some(s()) },
         HelperCommand::ElasticJournals {},
         HelperCommand::ElasticAdopt { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
@@ -4419,7 +4506,7 @@ mod tests {
             .collect()
     }
 
-    /// EVERY Elastic command is a builtin, and every one of the five tables
+    /// EVERY Elastic command is a builtin, and every one of the SIX tables
     /// that decide what happens to it knows it.
     ///
     /// `describe` and `validate_builtin` are exhaustive matches, so the
@@ -4429,8 +4516,17 @@ mod tests {
     /// EXEC channel: the wrapper would look for a program named after it,
     /// fail to find one, and the array operation would surface as a missing
     /// tool. That is the failure this test exists to make impossible.
+    ///
+    /// THE SIXTH TABLE is `actions::run`, and it was the one that was missed:
+    /// `elastic_replace_disk` passed all five checks above and still died at
+    /// the wrapper, because `run` ends in `other => Err("… is not a builtin")`
+    /// and the variant was never listed there. So the dispatch itself is
+    /// checked here, by reading its source rather than by calling it — calling
+    /// it would format disks. A textual check is weaker than the compiler, but
+    /// it is exactly as strong as the defect requires: a variant absent from
+    /// `run` cannot appear in `run`'s text.
     #[test]
-    fn every_elastic_command_is_a_builtin_the_five_tables_know() {
+    fn every_elastic_command_is_a_builtin_the_six_tables_know() {
         let elastic: Vec<String> = declared_variant_names()
             .into_iter()
             .filter(|name| name.starts_with("elastic_"))
@@ -4440,7 +4536,7 @@ mod tests {
             "parsed {} Elastic variants: {elastic:?}",
             elastic.len()
         );
-        for name in ["elastic_fix", "elastic_add_disk", "elastic_destroy"] {
+        for name in ["elastic_fix", "elastic_add_disk", "elastic_replace_disk", "elastic_destroy"] {
             assert!(elastic.contains(&name.to_string()), "{name} is not declared");
         }
         let listed: Vec<String> = catalog().into_iter().map(|e| e.name).collect();
@@ -4472,7 +4568,61 @@ mod tests {
                 Ok(Plan::Exec(r)) => panic!("{name} resolved to exec {:?}", r.args),
                 Err(_) => (),
             }
+            // The sixth table: the variant is named in `actions::run`'s match,
+            // above its "is not a builtin" fallback.
+            let camel: String = name
+                .split('_')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                        None => String::new(),
+                    }
+                })
+                .collect();
+            assert!(
+                run_dispatch().contains(&format!("HelperCommand::{camel} ")),
+                "{name} is missing from actions::run, so the wrapper would refuse it \
+                 as 'not a builtin'"
+            );
         }
+    }
+
+    /// THE WITHDRAWN COMMAND FAILS CLEANLY, at the first hop and with a reason
+    /// that names the decision.
+    ///
+    /// It reached the wrapper before and died with "is not a builtin", which
+    /// reads like a packaging fault, after the core had already written an
+    /// operation row and a job row — and only a succeeded `fix` cleared that
+    /// row, so the click cost the array every later Sync, Scrub, mover run and
+    /// disk addition. The core now refuses the request before it writes
+    /// anything; this is the backstop for an older core, and it must not touch
+    /// the executor: no journal is opened, nothing is mounted, nothing is
+    /// formatted.
+    #[test]
+    fn the_withdrawn_replacement_is_refused_by_the_runner_itself() {
+        let command = catalog_examples()
+            .into_iter()
+            .find(|command| command.variant_name() == "elastic_replace_disk")
+            .expect("example");
+        assert!(!command.guards_storage(), "it must not travel the ZFS guard road");
+        let refused = actions::run(&command, &[]).expect_err("withdrawn");
+        assert!(refused.contains("withdrawn"), "{refused}");
+        assert!(!refused.contains("is not a builtin"), "{refused}");
+    }
+
+    /// `actions::run`'s match, down to the fallback that refuses everything it
+    /// does not name.
+    fn run_dispatch() -> &'static str {
+        const SOURCE: &str = include_str!("actions.rs");
+        let start = SOURCE
+            .find("pub fn run(command: &HelperCommand")
+            .expect("actions::run moved or was renamed");
+        let end = SOURCE[start..]
+            .find("other => Err(format!(")
+            .expect("actions::run no longer ends in a fallback")
+            + start;
+        &SOURCE[start..end]
     }
 
     #[test]

@@ -49,6 +49,17 @@ pub const OP_ELASTIC_FIX: &str = "elastic_fix";
 /// so this destroys whatever was on it — the same blast radius as one disk of
 /// a create.
 pub const OP_ELASTIC_ADD_DISK: &str = "elastic_add_disk";
+/// DORMANT: disk replacement is withdrawn (round 4), the dispatch handler
+/// refuses the request before anything is parked, and this operation therefore
+/// cannot appear in the queue — which is why the UI's label allowlist
+/// (`approvals.js`) deliberately does not carry it.
+///
+/// Replacing one data disk and rebuilding the array onto it. The replacement
+/// is FORMATTED and a whole disk is written from parity, so it carries the
+/// blast radius of an add and of a repair at once — and it is the operation
+/// whose truth an admin is least likely to know without being told: a rebuild
+/// restores the disk to its state at the last sync.
+pub const OP_ELASTIC_REPLACE_DISK: &str = "elastic_replace_disk";
 /// Dissolving the array.
 ///
 /// It joins the four-eyes list even though it is REVERSIBLE — the disks keep

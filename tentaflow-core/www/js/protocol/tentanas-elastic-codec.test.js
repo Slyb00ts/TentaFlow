@@ -67,6 +67,16 @@ const cases = [
   }, {
     name: 'archiwum', enabled: false, schedule: { every: 'weekly', hour: 4, minute: 0, weekday: 0, day: 1 },
   }],
+  // Wymiana dysku danych: nazwa slotu przepisana przez admina, wybrany dysk
+  // zamienny i jawna zgoda na odbudowę z nieaktualnej parity. Bez wpisu w
+  // codec.js i bez enkodera WASM przycisk nie dosięga sieci.
+  ['ElasticArrayReplaceDisk', {
+    name: 'archiwum', disk: 'd2', confirmDisk: 'd2', replacementDiskId: 'wwn-0x5000c500a1b2c3d4',
+    acceptStaleParity: true, sudoPassword: 'test-secret-not-real',
+  }, {
+    name: 'archiwum', disk: 'd2', confirm_disk: 'd2', replacement_disk_id: 'wwn-0x5000c500a1b2c3d4',
+    accept_stale_parity: true, sudo_password: 'test-secret-not-real',
+  }],
   // Polityka cache jednego folderu. Wszystkie trzy pola są wymagane, a „yes"
   // jest powrotem do domyślnej — nie ma tu kształtu „bez wartości".
   ['ElasticFolderCacheSet', { name: 'archiwum', folder: 'foto', cachePolicy: 'only' },

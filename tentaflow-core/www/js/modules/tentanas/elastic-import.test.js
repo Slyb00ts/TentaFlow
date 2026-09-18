@@ -96,6 +96,36 @@ test('the scan is a separate action and its result names the owner, the counts a
   screen.dispose();
 });
 
+// A journal the node cannot load is not hidden from the scan: it is listed as
+// unreadable with the node's own reason, and nothing offers to adopt it.
+test('an unreadable journal is listed with its reason and cannot be adopted', async () => {
+  const unreadable = candidate({
+    arrayId: ARCHIVE,
+    name: ARCHIVE,
+    filesystem: '',
+    dataDisks: 0,
+    parityDisks: 0,
+    disksMatched: 0,
+    unionMounted: false,
+    status: 'unreadable',
+    detail: 'journal: unknown variant `exploded`',
+  });
+  const screen = fakeScreen({ tentaNasElasticArrayImportScanRequest: { candidates: [candidate({}), unreadable] } });
+  const win = openElasticImportDialog(screen, () => {});
+  await flush();
+  click(win.querySelector('[data-act="scan"]'));
+  await flush();
+  const listed = row(win, ARCHIVE);
+  assert.ok(listed, 'listed, not hidden');
+  const chip = listed.querySelector('tf-chip');
+  assert.equal(chip.getAttribute('status'), 'err');
+  assert.equal(chip.getAttribute('label'), 'nieczytelny dziennik');
+  assert.match(listed.querySelector('.num-err').textContent, /unknown variant `exploded`/);
+  assert.ok(adoptButton(listed).hasAttribute('disabled'));
+  win.remove();
+  screen.dispose();
+});
+
 test('an empty scan says so, and a cancelled sudo prompt leaves the dialog saying it has not looked', async () => {
   const empty = fakeScreen({ tentaNasElasticArrayImportScanRequest: { candidates: [] } });
   const first = openElasticImportDialog(empty, () => {});

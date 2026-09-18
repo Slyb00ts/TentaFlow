@@ -325,6 +325,9 @@ pub fn ksmbd_section(share: &ShareRow) -> String {
     line(&mut out, "path", &share.source_path);
     line(&mut out, "browseable", "yes");
     line(&mut out, "read only", "no");
+    // An Elastic mover's in-flight copy and quarantined original appear in a
+    // union's root; no client may see, open or delete them.
+    line(&mut out, "veto files", tentanas_helper::SMB_VETO_FILES);
     line(&mut out, "guest ok", if smb.guests { "yes" } else { "no" });
     if smb.guests {
         line(&mut out, "force group", tentanas_helper::SHARE_GROUP);
@@ -622,6 +625,7 @@ mod tests {
              \tpath = /mnt/tank/modele\n\
              \tbrowseable = yes\n\
              \tread only = no\n\
+             \tveto files = /.tentanas-transfer-*/.tentanas-quarantine-*/\n\
              \tguest ok = no\n\
              \tvalid users = anna, jan\n\
              \twrite list = anna\n\

@@ -8,9 +8,11 @@
 // `followResponse`. Runs under happy-dom.
 // =============================================================================
 
-import { fakeScreen, flush, click, confirmWindow, window } from './_test-setup.js';
+import { fakeScreen, flush, click, confirmWindow, window, WWW_ROOT } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const { approvalsCardHtml, wireApprovals, operationLabel, reportParked } = await import('./approvals.js');
 const { followResponse } = await import('./dialogs.js');
@@ -100,6 +102,33 @@ test('etykiety Elastic opisują operację zatwierdzenia', () => {
   // mówi zatwierdzającemu nic o tym, na co się zgadza.
   assert.equal(operationLabel('elastic_schedule'), 'Uzbrojenie harmonogramu Elastic');
   assert.notEqual(operationLabel('elastic_schedule'), operationLabel('nonsense'));
+});
+
+// EVERY operation the node can park has a label, checked against the Rust
+// constants rather than against a list written here.
+//
+// The hand-written test above named three operations and passed while
+// `elastic_fix` (a repair that overwrites blocks), `elastic_add_disk` (a disk
+// gets formatted) and `elastic_destroy` (an array stops serving) all rendered
+// as the generic „Operacja" — the three where the approving admin most needs
+// to be told what they are agreeing to. A list of constants cannot be kept in
+// step by hand, so the source is the list.
+test('every operation the node can park has its own label', () => {
+  const source = readFileSync(join(WWW_ROOT, '..', 'src/tentanas/approvals.rs'), 'utf8');
+  const declared = [...source.matchAll(/pub const OP_[A-Z_]+: &str = "([a-z_]+)"/g)].map((m) => m[1]);
+  assert.ok(declared.length >= 13, `parsed ${declared.length} operations: ${declared}`);
+  const generic = operationLabel('nonsense');
+  for (const op of declared) {
+    // Disk replacement is WITHDRAWN: the node refuses the request before
+    // anything is parked, so it is the one operation with no label, and this
+    // assertion is what makes that a decision rather than an omission.
+    if (op === 'elastic_replace_disk') {
+      assert.equal(operationLabel(op), generic, 'a withdrawn operation needs no label');
+      continue;
+    }
+    assert.notEqual(operationLabel(op), generic, `${op} degrades to the generic label`);
+    assert.ok(!operationLabel(op).startsWith('approvals.'), `${op} has no string in the bundle`);
+  }
 });
 
 for (const change of ['node', 'surface', 'sudo']) {

@@ -494,6 +494,7 @@ export function openElasticImportDialog(screen, onDone) {
     importable: ['ok', 'status_importable'],
     incomplete: ['warn', 'status_incomplete'],
     already_known: ['neutral', 'status_already_known'],
+    unreadable: ['err', 'status_unreadable'],
   };
 
   const candidateHtml = (c) => {
@@ -511,6 +512,7 @@ export function openElasticImportDialog(screen, onDone) {
         <div class="hint">${escapeHtml(T('elastic_import.matched', { n: c.disksMatched || 0, total }))}${c.unionMounted ? ` · ${escapeHtml(T('elastic_import.union_mounted'))}` : ''}</div>
         ${(c.disksMissing || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.missing', { disks: c.disksMissing.join(', ') }))}</div>` : ''}
         ${(c.disksReused || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.reused', { disks: c.disksReused.join(', ') }))}</div>` : ''}
+        ${c.status === 'unreadable' ? `<div class="num-err">${escapeHtml(c.detail || '')}</div>` : ''}
         <div class="row">
           <tf-button size="sm" variant="primary" icon="download" data-act="adopt" ${c.status === 'importable' ? '' : 'disabled'}>${escapeHtml(T('elastic_import.adopt'))}</tf-button>
         </div>

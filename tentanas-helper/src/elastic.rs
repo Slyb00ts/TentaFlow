@@ -238,6 +238,25 @@ pub struct ElasticResult {
     /// boot stopped part-way, and only the next boot retries it.
     #[serde(default)]
     pub restart_required: bool,
+    /// Files a mover run left in two versions that both still exist: one
+    /// under the file's path and one kept out of every share's sight. Each is
+    /// data an admin has to look at. Measured on every observation made inside
+    /// the array's namespace; empty when the branches could not be read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ElasticConflict>,
+}
+
+/// One file a stuck mover record left in two versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticConflict {
+    pub operation_id: String,
+    /// The file's path relative to the array, as the stuck record keeps it.
+    pub path: String,
+    /// Where clients see the file: its path under the union.
+    pub visible: String,
+    /// Where the other version sits, on a branch no share exposes.
+    pub kept: String,
 }
 
 /// Which snapraid operation a run records.
@@ -262,6 +281,20 @@ pub enum ElasticSnapraidOutcome {
     Failed,
     NeedsAttention,
     Refused,
+    /// A Sync that ran to its end while files changed under it: snapraid
+    /// skipped exactly the blocks of the files that changed or disappeared
+    /// ("Unexpected attribute change", "Open ENOENT") and wrote parity for the
+    /// rest. Parity stays marked out of date and those files wait for the next
+    /// Sync; nothing about the array is wrong.
+    Partial,
+    /// A repair that wrote NOTHING: it ran to its end and recovered zero
+    /// blocks. Measured (rig11, snapraid 13.0-1): `-e fix` with no scrub
+    /// behind it reports `summary:error:0`, `error_recovered:0`,
+    /// `summary:exit:ok` and "Everything OK" — a clean log for a repair that
+    /// did not repair. It is NOT a success: the fault it was started for is
+    /// still there, so the array keeps its state and its unresolved operation
+    /// while the run says what it could not do.
+    NothingRepaired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +322,20 @@ pub struct ElasticSnapraidResult {
     pub run: ElasticSnapraidRun,
 }
 
+/// What a disk replacement did: the array's state afterwards, the rebuild that
+/// wrote the new disk from parity, and the Sync that recorded it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticReplaceResult {
+    pub state: ElasticResult,
+    /// The branch whose disk was replaced (`d1`, `d2`, …).
+    pub branch: String,
+    /// The identity now recorded for that slot.
+    pub disk: ElasticDiskSpec,
+    pub rebuild: ElasticSnapraidRun,
+    pub sync: ElasticSnapraidRun,
+}
+
 /// What a dissolve released, and what it deliberately did not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,7 +360,11 @@ pub struct ElasticDissolveResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElasticMoverPhase {
-    Holding,
+    /// The run is recorded and has not walked the cache yet. An older helper
+    /// wrote this phase as `holding` (the write that also entered its Hold); a
+    /// journal it left in that phase must still load.
+    #[serde(alias = "holding")]
+    Announced,
     Moving,
     Syncing,
     NeedsAttention,
@@ -417,6 +468,26 @@ pub struct ElasticMoverResult {
     pub run: ElasticMoverRun,
 }
 
+/// The cache as a mover run would see it at this moment, measured without
+/// moving anything (`ElasticCacheAge`).
+///
+/// `due_*` is what a run started now would move: every eager-folder file and
+/// every other file at least `min_age_secs` old, minus the files a run skips
+/// (open, or on a stuck record's path). `held_files` is that skipped part, so
+/// the core can tell "nothing is old enough" from "old files are there and a
+/// run could not touch them" without starting a run to find out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticCacheAge {
+    pub due_files: u64,
+    pub due_bytes: u64,
+    pub held_files: u64,
+    /// How long, in whole seconds, the OLDEST file outside pinned folders has
+    /// been on the cache by its mtime, whether or not a run could move it.
+    /// `None` = there is no such file.
+    pub oldest_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElasticClaim {
@@ -487,6 +558,45 @@ pub struct ElasticJournalEntry {
 #[serde(deny_unknown_fields)]
 pub struct ElasticJournalsResult {
     pub arrays: Vec<ElasticJournalEntry>,
+    /// Journals that cannot be operated: every command that loads one fails.
+    /// A journal whose spec could still be read is ALSO listed in `arrays`
+    /// (it claims its disks and its name); one nothing could be read from is
+    /// only here. Either way the import scan shows it with the reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<ElasticUnreadableJournal>,
+}
+
+/// A journal file the helper cannot load, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticUnreadableJournal {
+    /// The file's name: the array id it was written for.
+    pub array_id: String,
+    pub reason: String,
+}
+
+/// How the helper refuses a command because another Elastic command holds the
+/// node or the array lock. It is the first thing a command does, before it
+/// reads a device or writes a journal, so a refusal carrying it proves nothing
+/// ran — the core closes such an operation as merely failed.
+pub const ELASTIC_BUSY: &str = "Elastic busy:";
+
+/// Whether the helper runs `command` for a private array whose journal was
+/// written in an earlier boot. Only these two bring an array back; every
+/// other command is refused until one of them has run in this boot, so a job
+/// that must work after a reboot — the startup Restore — may send nothing else
+/// first. The helper's own admission check is this function.
+pub fn runs_after_a_boot(command: &crate::HelperCommand) -> bool {
+    matches!(
+        command,
+        crate::HelperCommand::ElasticRestore { .. }
+            | crate::HelperCommand::ElasticResume { .. }
+            // An array whose data disk is gone cannot be restored at all until
+            // the disk is replaced, so the replacement is one of the commands
+            // that brings an array back after a boot. It runs a Restore of its
+            // own, once the replacement is formatted.
+            | crate::HelperCommand::ElasticReplaceDisk { .. }
+    )
 }
 
 pub fn validate_elastic_uuid(value: &str) -> Result<(), CatalogError> {
@@ -1434,9 +1544,74 @@ pub enum SnapraidAction {
     /// / 0 copied / 0 relocated / 0 restored`) and `There are differences!`,
     /// and it EXITS 2. See `snapraid_outcome`.
     Diff,
-    /// Rebuild one named data disk from parity — the recovery wizard's engine.
-    Fix { disk: String },
+    /// Repair one named data disk from parity, with the filter `scope`
+    /// allows. There is no unfiltered repair: see `FixScope`.
+    Fix { disk: String, scope: FixScope },
 }
+
+/// Which blocks a repair may write. `MarkedBlocks` is the ONLY form a manual
+/// repair runs; `ReplacedDisk` belongs to the disk-replacement flow, which
+/// formats the disk first, so there is nothing on it to overwrite.
+///
+/// MEASURED (rig11, 2026-09-17, snapraid 13.0-1, scratch arrays with a synced
+/// state, then on the data disk: a file rewritten, a file deleted, a file
+/// created, a file silently corrupted with its size and mtime kept, and in
+/// other runs a single file removed or the whole disk emptied). The manual says
+/// it and the runs showed it: `fix` "does not differentiate between errors and
+/// intentional modifications. It unconditionally reverts the file state to the
+/// last 'sync'."
+///
+/// * `-d <disk> fix` (what this app ran until now) and `fix` REVERTED the
+///   rewritten file and BROUGHT BACK the deleted one; on a replaced disk they
+///   also overwrote a file written to it before the repair.
+/// * `-m fix` and `-d <disk> -m fix` kept the rewritten file but brought back
+///   the deleted one, and left the corruption.
+/// * `-e fix` after a full scrub repaired ONLY the corrupted blocks the scrub
+///   marked bad, kept the rewrite, the delete and the new file, and skipped a
+///   file rewritten between the scrub and the repair. Without a scrub it
+///   repaired nothing. It does not restore missing files, and snapraid refuses
+///   it together with `-d`.
+/// * On an emptied disk `-d <disk> -m fix` restored every file and kept a file
+///   written there before the repair; `-e fix` restored nothing.
+///
+/// No invocation restores a file missing from a disk that is present and in
+/// use without also bringing back what users deleted since the last Sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixScope {
+    /// `-e fix`: blocks a Scrub marked bad, in files unchanged since the last
+    /// Sync. The repair of a disk that holds files, and the only one offered.
+    MarkedBlocks,
+    /// `-d <disk> fix`: everything parity says belongs on one disk, written
+    /// back. ONLY the disk-replacement flow runs it, on a disk it has just
+    /// formatted and proved empty (`fresh_branch`) — so there is nothing on it
+    /// to overwrite and nothing of a user's to revert.
+    ///
+    /// MEASURED (rig11, 2026-09-17, snapraid 13.0-1) against `-d <disk> -m
+    /// fix`, which writes only files that are ABSENT: on a freshly emptied
+    /// disk the two are identical (313 of 313 blocks recovered, exit 0,
+    /// `lost+found` untouched by either), but after an INTERRUPTED rebuild
+    /// they differ — `-m` left a half-written file corrupt and still reported
+    /// "Everything OK" with exit 0, while the plain form repaired both the
+    /// truncated file and the missing one. A rebuild has to be re-runnable,
+    /// so the plain form is the one that runs.
+    ReplacedDisk,
+}
+
+/// Whether a data branch is a FRESHLY FORMATTED one: it holds nothing but the
+/// `lost+found` an ext4 mkfs leaves. The replacement flow asks this right
+/// before it rebuilds, and that question is what makes `FixScope::ReplacedDisk`
+/// safe: on any other branch the same invocation would revert every file
+/// changed since the last Sync.
+pub fn fresh_branch(branch: &std::path::Path) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(branch)? {
+        if entry?.file_name() != "lost+found" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 
 /// What a snapraid exit code MEANS for the action that produced it.
 ///
@@ -1481,7 +1656,7 @@ pub fn snapraid_outcome(action: &SnapraidAction, code: i32) -> SnapraidOutcome {
 ///
 /// MEASURED (2026-09-06, snapraid 14.7) for `-c <conf>` with `status`, `sync`,
 /// `scrub` and `diff`: all four ran and returned the codes `snapraid_outcome`
-/// classifies. UNVERIFIED: `-p` / `-o` on `scrub`, and `-d <disk> fix`.
+/// classifies. The two repairs were measured on snapraid 13.0-1 (`FixScope`).
 pub fn snapraid_args(spec: &ElasticSpec, action: &SnapraidAction) -> Result<Vec<String>, CatalogError> {
     let mut args = vec!["-c".to_string(), spec.config_path()];
     match action {
@@ -1493,7 +1668,7 @@ pub fn snapraid_args(spec: &ElasticSpec, action: &SnapraidAction) -> Result<Vec<
             args.push("full".to_string());
             args.push("scrub".to_string());
         }
-        SnapraidAction::Fix { disk } => {
+        SnapraidAction::Fix { disk, scope } => {
             // The disk must be one THIS array carries. A `fix -d` naming
             // anything else would either do nothing or, with a name snapraid
             // does know from another config, rebuild the wrong disk from the
@@ -1504,8 +1679,15 @@ pub fn snapraid_args(spec: &ElasticSpec, action: &SnapraidAction) -> Result<Vec<
                     spec.name
                 )));
             }
-            args.push("-d".to_string());
-            args.push(disk.clone());
+            // Never an unfiltered `fix`: it reverts every file changed since
+            // the last Sync and brings deleted files back (`FixScope`).
+            match scope {
+                FixScope::MarkedBlocks => args.push("-e".to_string()),
+                FixScope::ReplacedDisk => {
+                    args.push("-d".to_string());
+                    args.push(disk.clone());
+                }
+            }
             args.push("fix".to_string());
         }
     }
@@ -1954,6 +2136,71 @@ pub fn plan_mount(
     Ok(steps)
 }
 
+/// The ONE step a disk replacement adds to what a Restore already does:
+/// format the replacement as the array's filesystem, with the identity the
+/// journal has already recorded for that slot.
+///
+/// Everything else the replacement needs is the mount plan: the branch is
+/// mounted at the SAME path the old disk used, so the union's branch list does
+/// not change and `plan_mount` needs no special case.
+///
+/// DORMANT: disk replacement is withdrawn — see the banner on
+/// `execution::replace_data_disk`.
+pub fn plan_replace_data_disk(
+    spec: &ElasticSpec,
+    replaced: &Branch,
+    tools: &Tools,
+) -> Result<Vec<ElasticStep>, CatalogError> {
+    validate_spec(spec)?;
+    if !spec.has_parity() {
+        return Err(invalid(format!(
+            "array '{}' has no parity disk, so a replaced disk cannot be rebuilt",
+            spec.name
+        )));
+    }
+    if !spec.data.iter().any(|branch| branch.disk == replaced.disk) {
+        return Err(invalid(format!(
+            "'{}' is not a data disk of array '{}'",
+            replaced.disk, spec.name
+        )));
+    }
+    let slot = spec
+        .data
+        .iter()
+        .position(|branch| branch.disk == replaced.disk)
+        .ok_or_else(|| invalid("replaced branch is not a data disk".to_string()))?;
+    Ok(vec![ElasticStep::Mkfs {
+        program: tools.mkfs(&spec.filesystem)?.to_string(),
+        device: replaced.device.clone(),
+        filesystem: spec.filesystem.clone(),
+        // The slot's own label, so a replaced disk carries what a create would
+        // have given it.
+        label: branch_label('d', slot + 1, &replaced.disk),
+    }])
+}
+
+/// Splits a mount plan where the UNION begins: every step that mounts a
+/// branch first, then the steps that create, mount and publish the union.
+///
+/// W-A of the third review. The mergerfs step PUBLISHES the union
+/// (`execute_steps` calls `publish_private`), and publishing is refused while
+/// a mover record is unsettled — so a Restore that ran the whole plan in one
+/// go could never reach the settle it was supposed to do first, and failed
+/// instead. The record's files live on the branches alone, so the plan is run
+/// in two halves with the settle in between.
+pub fn split_before_union(steps: Vec<ElasticStep>, union_path: &str) -> (Vec<ElasticStep>, Vec<ElasticStep>) {
+    let union_step = |step: &ElasticStep| match step {
+        ElasticStep::Mkdir { path } => path == union_path,
+        ElasticStep::MergerfsMount { mountpoint, .. } => mountpoint == union_path,
+        ElasticStep::Note(text) => text.starts_with(union_path),
+        _ => false,
+    };
+    let at = steps.iter().position(union_step).unwrap_or(steps.len());
+    let mut branches = steps;
+    let union = branches.split_off(at);
+    (branches, union)
+}
+
 /// The array's headline feature: one more disk, at any time, ONLINE.
 ///
 /// The branch is added to the running union rather than remounted into a new
@@ -2260,10 +2507,14 @@ pub(crate) mod execution {
     #[serde(deny_unknown_fields)]
     struct TransferJournal {
         operation_id: String,
+        /// Reserved by the core with the run. Movers no longer enter a Hold; it
+        /// names a restart of the same operation, and it is the UUID the Resume
+        /// of a Hold an older helper's run left must carry.
         resume_operation_id: String,
         started_at: String,
-        /// Set at Complete, or when the declared Resume closes an unfinished
-        /// run. An unfinished transfer blocks every other consumer.
+        /// Set at Complete, or when the next run (or the Resume of an older
+        /// helper's Hold) closes an unfinished run. An unfinished transfer
+        /// blocks EnterService and a Sync, Scrub or Fix until then.
         finished_at: Option<String>,
         rules: MoverRules,
         coupled_sync: bool,
@@ -2280,8 +2531,8 @@ pub(crate) mod execution {
         #[serde(default, skip_serializing_if = "is_zero")]
         evicted: u64,
         /// Why the in-flight record's last attempt could neither finish nor
-        /// withdraw it. Such a record no longer blocks the declared Resume;
-        /// it stays as history and a re-run tries it again.
+        /// withdraw it. A restart of the same operation tries it again; the
+        /// next operation closes it into the stuck history instead.
         current_failed: Option<String>,
         moved_files: u64,
         moved_bytes: u64,
@@ -2334,8 +2585,26 @@ pub(crate) mod execution {
         deserializer.deserialize_option(ServiceVisitor)
     }
 
+    /// UNKNOWN FIELDS ARE IGNORED HERE, and that is deliberate (round 4).
+    ///
+    /// Every other type in this catalog is `deny_unknown_fields`, because it
+    /// decodes something an outside caller sent. The journal is different: this
+    /// helper is its only writer, and the file is the one durable record of an
+    /// array. With the strict attribute, any field a NEWER helper added made
+    /// every journal undecodable for an older one — so rolling the binary back
+    /// after a single write took out not only the Elastic arrays but every
+    /// zpool and zfs guard on the node, which all read the claims through
+    /// `Root::claims`. Rejecting a field nobody understands buys nothing: it
+    /// cannot make the older helper handle the state that field describes.
+    ///
+    /// THE INVARIANTS ARE THE GUARD, not the field list: `decode_journal`
+    /// pins the schema against the presence of `private`, and
+    /// `validate_topology`, `validate_operation_record` and
+    /// `ElasticCreateSpec::validate` are re-run on every load and every save.
+    /// A journal that does not describe a legal array is still refused; one
+    /// that merely carries a field from a later version loads, and its arrays
+    /// keep serving.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct Journal {
         schema: u8,
         spec: ElasticCreateSpec,
@@ -2348,40 +2617,208 @@ pub(crate) mod execution {
         last_run: Option<ElasticSnapraidRun>,
         #[serde(skip_serializing_if = "Option::is_none")]
         private: Option<PrivateTopology>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// ALWAYS SERIALISED, like the three fields below it: see
+        /// `fields_complete`. An absent key here is what let `forgettable`
+        /// delete the journal of an array with a file record in flight.
+        #[serde(default)]
         transfer: Option<TransferJournal>,
         /// Bytes the mover put on data branches after the last confirmed Sync:
         /// `Some` means parity is out of date. Only a successful Sync clears it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// ALWAYS SERIALISED: absent, it reports parity as current.
+        #[serde(default)]
         stale_parity_bytes: Option<u64>,
-        /// The mover operation whose coupled Sync ended without success and
-        /// left parity stale. Its finished run is the one operation record
-        /// that may stand without a pending; a successful Sync clears it.
+        /// The Sync that ended without making parity current and left it marked
+        /// stale: a mover's coupled Sync that failed, or any Sync that met files
+        /// changing under it (`Partial`). Its finished run is the one operation
+        /// record that may stand without a pending; a successful Sync clears it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stale_sync_operation: Option<String>,
+        /// A Scrub or a Fix that a reboot or a killed helper left Running and
+        /// that Restore closed as interrupted: its finished run may stand
+        /// without a pending. A Sync uses `stale_sync_operation` instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interrupted_operation: Option<String>,
         /// Full stuck records of closed operations, oldest first, capped at
         /// `STUCK_LIMIT`; the oldest is summarised away when a newer one
         /// arrives. Its path stays in `stuck_paths`.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// ALWAYS SERIALISED: absent, the two-version conflict history simply
+        /// vanishes.
+        #[serde(default)]
         stuck: Vec<ElasticStuckRecord>,
         /// Every path a record stuck on: what a walk skips. FIFO at
         /// `STUCK_PATH_LIMIT` — an insert may evict the oldest digest, so the
         /// newest stuck path is always the one protected.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// ALWAYS SERIALISED: absent, the skip set empties and the mover
+        /// walks a path it must not touch again.
+        #[serde(default)]
         stuck_paths: Vec<StuckPath>,
         /// How many digests have been evicted over this array's LIFE. Those
         /// paths are no longer skipped. This figure never decays, so it
         /// belongs to the array state, never to one run's result.
-        #[serde(default, skip_serializing_if = "is_zero")]
+        ///
+        /// ALWAYS SERIALISED and pinned by `fields_complete`: dropped together
+        /// with `evicted_paths` below, the pair silently RESET a counter this
+        /// doc calls lifelong (the fourth review's F5) — each alone is caught
+        /// by the two invariants that relate them, but neither invariant can
+        /// see both go.
+        #[serde(default)]
         stuck_evicted: u64,
         /// The identity of the last `EVICTED_RING` evictions. The ring is
-        /// bounded; the system log keeps every one.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// bounded; the system log keeps every one. ALWAYS SERIALISED, with
+        /// `stuck_evicted`.
+        #[serde(default)]
         evicted_paths: Vec<StuckPath>,
+        /// THIS JOURNAL WAS WRITTEN WITH EVERY CONTEXT-CRITICAL KEY PRESENT,
+        /// which is what lets `decode_journal` tell a field that is MISSING
+        /// from a field that is EMPTY.
+        ///
+        /// WHAT IT DOES NOT DO, stated because it was described too widely
+        /// once (the fourth review's F6): the check is over key PRESENCE, so a
+        /// journal edited to `"transfer": null` — or `"stuck": []` — passes it
+        /// and reads as "that never happened", exactly as a deleted key did
+        /// before the marker existed. That is a tampering scenario, not a
+        /// version-skew one (the file is 0600, single-link, uid-checked in a
+        /// 0700 directory), and the only defence against it is a value
+        /// invariant: `stuck_evicted` has one below, `transfer` and
+        /// `stale_parity_bytes` have none that is sound (a mover's coupled Sync
+        /// legitimately clears the stale marker with moved bytes still on the
+        /// branches, and an array can legitimately have no transfer at all).
+        ///
+        /// Ignoring unknown fields (round 4) left four `#[serde(default)]`
+        /// fields — `transfer`, `stale_parity_bytes`, `stuck`, `stuck_paths` —
+        /// passing every invariant when their key was absent, each absence
+        /// reading as "that never happened". The worst is `transfer`:
+        /// `forgettable` then lets a wipe delete the journal of an array with a
+        /// file record in flight, and Sync, Scrub, Fix and EnterService all run
+        /// over it, orphaning the transfer copy and the quarantined original
+        /// with nothing left that could finish or reverse them.
+        ///
+        /// The four cannot simply be made mandatory: a journal an EARLIER build
+        /// wrote omits them when they are empty, and refusing one journal takes
+        /// out every storage guard on the node (`Claims::complete`), not just
+        /// its own array. So the writer says whether it wrote them. It is
+        /// serialised as `true` unconditionally (`always_true`), while the
+        /// decoded value records what was READ — so a journal from a build that
+        /// did not write the keys stays readable, and every journal written
+        /// from here on is checked strictly. A journal already on disk is
+        /// therefore covered from its FIRST save on this build (the startup
+        /// Restore is one), and not before.
+        ///
+        /// WHAT THIS STILL DOES NOT COVER, stated rather than implied:
+        ///
+        /// * Roll back to a build that does not know a field, let it save, and
+        ///   the field and this marker go together — the newer build then reads
+        ///   a journal that is honestly incomplete and cannot tell. No field in
+        ///   a file an older program rewrites can survive that; only the core's
+        ///   own row can, and that is where the operation record lives.
+        /// * A ROLLBACK IS NOT A BINARY SWAP. The build now on the node keeps
+        ///   `#[serde(deny_unknown_fields)]` on this struct, so it cannot read a
+        ///   journal this build wrote AT ALL — and its `journals()` fails whole
+        ///   when one journal fails, which its zpool/zfs guard and its disk
+        ///   wipe both call. Rolling the binary back after one save therefore
+        ///   refuses every storage operation on the node until the journals are
+        ///   restored too. Copy `ROOT/*.json` (with modes and ownership) before
+        ///   deploying, and write the rollback plan as "binary AND journals".
+        #[serde(default, serialize_with = "always_true")]
+        fields_complete: bool,
+        /// EVERY FIELD THIS HELPER DOES NOT KNOW, kept verbatim so a load and
+        /// a save give it back unchanged.
+        ///
+        /// Ignoring unknown fields (round 4) is what makes a helper rollback
+        /// survivable, but ignoring them on the way IN and dropping them on the
+        /// way OUT is not a rollback — it is a slower deletion: roll back, run
+        /// one operation, roll forward, and the newer version's state is gone.
+        /// `save` serialises this map back into the same object, so a field a
+        /// LATER helper added outlives every operation this one performs.
+        ///
+        /// It is not a place for anything this helper means: nothing reads it,
+        /// no invariant is expressed over it, and `JOURNAL_LIMIT` bounds it
+        /// together with the rest of the file.
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    }
+
+    /// A journal that may be dropped: not publishing and nothing in flight.
+    /// A half-finished operation is a state a later Restore has to read.
+    fn forgettable(journal: &Journal) -> Result<(), String> {
+        if journal.private.as_ref().is_some_and(|private| private.anchor.is_some()) {
+            return Err("macierz nadal publikuje unię".into());
+        }
+        if journal.pending.is_some()
+            || journal
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.finished_at.is_none())
+        {
+            return Err("dziennik ma otwartą operację macierzy".into());
+        }
+        Ok(())
     }
 
     fn is_zero(value: &u64) -> bool {
         *value == 0
+    }
+
+    /// Serialises `fields_complete` as `true` whatever the in-memory value is:
+    /// what it claims is that THIS write carried every context-critical key,
+    /// and this writer always does.
+    fn always_true<S>(_value: &bool, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bool(true)
+    }
+
+    /// One array's claim on this node's disks, names and paths.
+    struct Claim {
+        spec: ElasticCreateSpec,
+        /// Whether its private union is anchored in the journal. `None` when
+        /// only the spec of the journal could be read.
+        anchored: Option<bool>,
+        /// Why the whole journal did not load, when it did not.
+        load_error: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct Claims {
+        arrays: Vec<Claim>,
+        /// Journal files nothing could be recovered from, with the reason.
+        unreadable: Vec<String>,
+    }
+
+    impl Claims {
+        /// The claims a guard may decide on. A journal nothing could be read
+        /// from might claim the very disk or name in question, so every guard
+        /// refuses while one exists — naming the file — rather than proving a
+        /// disk free against an incomplete list.
+        fn complete(self) -> Result<Vec<Claim>, String> {
+            if !self.unreadable.is_empty() {
+                return Err(format!(
+                    "nieczytelny dziennik macierzy; rezerwacji nie da się sprawdzić: {}",
+                    self.unreadable.join("; ")
+                ));
+            }
+            Ok(self.arrays)
+        }
+    }
+
+    /// Every journal no command can load, for the import scan: those only a
+    /// spec could be read from and those nothing could be read from.
+    fn unreadable_journals(claims: &Claims) -> Vec<ElasticUnreadableJournal> {
+        claims
+            .arrays
+            .iter()
+            .filter_map(|claim| {
+                claim.load_error.as_ref().map(|reason| ElasticUnreadableJournal {
+                    array_id: claim.spec.array_id.clone(),
+                    reason: bounded_text(reason, TRANSFER_TEXT_LIMIT),
+                })
+            })
+            .chain(claims.unreadable.iter().map(|line| {
+                let (id, reason) = line.split_once(": ").unwrap_or((line.as_str(), ""));
+                ElasticUnreadableJournal { array_id: id.to_string(), reason: bounded_text(reason, TRANSFER_TEXT_LIMIT) }
+            }))
+            .collect()
     }
 
     /// One path the mover no longer touches, by digest, and the operation that
@@ -2505,6 +2942,16 @@ pub(crate) mod execution {
                 {
                     return Err("nieprawidłowy znacznik nieudanego Sync movera".into());
                 }
+                // A digest is evicted only when the skip set is FULL, and
+                // nothing else ever removes a path, so a non-zero eviction
+                // count cannot stand over an empty set. A value invariant, so
+                // it holds whether the list went missing as a dropped key or
+                // as an edit — unlike the key-presence rule in
+                // `decode_journal`, which can only speak for journals this
+                // helper family wrote.
+                if journal.stuck_evicted > 0 && journal.stuck_paths.is_empty() {
+                    return Err("wyparte ścieżki bez listy pominiętych".into());
+                }
                 if journal.stuck.len() > STUCK_LIMIT
                     || !journal.stuck.iter().all(|record| valid_stuck_record(&journal.spec, record))
                 {
@@ -2600,15 +3047,31 @@ pub(crate) mod execution {
             // Only the mover's own coupled Sync that ended without success
             // pins no pending: it left parity marked stale instead, so the
             // array may mount (and remount after a boot) around it.
-            let stale_mover_sync = run.kind == ElasticSnapraidKind::Sync
+            let stale_mover_sync = (run.kind == ElasticSnapraidKind::Sync
                 && run.finished_at.is_some()
                 && journal.stale_parity_bytes.is_some()
-                && journal.stale_sync_operation.as_deref() == Some(run.operation_id.as_str());
+                && journal.stale_sync_operation.as_deref() == Some(run.operation_id.as_str()))
+                || (run.kind != ElasticSnapraidKind::Sync
+                    && run.outcome == ElasticSnapraidOutcome::NeedsAttention
+                    && run.finished_at.is_some()
+                    && journal.interrupted_operation.as_deref() == Some(run.operation_id.as_str()));
+            // A repair that wrote nothing changed nothing, so it holds no
+            // intent: it is terminal with no pending, like a success.
+            if run.outcome == ElasticSnapraidOutcome::NothingRepaired {
+                if run.finished_at.is_none() || journal.pending == pending {
+                    return Err("niespójny wynik operacji i pending".into());
+                }
+                return Ok(());
+            }
             if (run.outcome == ElasticSnapraidOutcome::Running && (run.finished_at.is_some() || journal.pending != pending))
                 || (matches!(run.outcome, ElasticSnapraidOutcome::Failed | ElasticSnapraidOutcome::NeedsAttention)
                     && journal.pending != pending
                     && !stale_mover_sync)
-                || (run.outcome == ElasticSnapraidOutcome::Succeeded && (run.finished_at.is_none() || journal.pending == pending)) {
+                || (run.outcome == ElasticSnapraidOutcome::Succeeded && (run.finished_at.is_none() || journal.pending == pending))
+                // A Sync that skipped changing files is finished, pins nothing,
+                // and is exactly what left parity marked out of date.
+                || (run.outcome == ElasticSnapraidOutcome::Partial
+                    && (!stale_mover_sync || journal.pending == pending)) {
                 return Err("niespójny wynik operacji i pending".into());
             }
         }
@@ -2635,6 +3098,26 @@ pub(crate) mod execution {
                     }) =>
             {}
             _ => return Err("niezgodna schema i obecność private".into()),
+        }
+        // A journal whose writer says it wrote every context-critical key must
+        // still have all of them: for those journals an absent key is a field
+        // that was REMOVED, and `#[serde(default)]` would turn it into "that
+        // never happened" — no transfer in flight, parity current, no stuck
+        // history, an empty skip set. `fields_complete` explains the rest.
+        if object.get("fields_complete").and_then(serde_json::Value::as_bool) == Some(true) {
+            if let Some(missing) = [
+                "transfer",
+                "stale_parity_bytes",
+                "stuck",
+                "stuck_paths",
+                "stuck_evicted",
+                "evicted_paths",
+            ]
+            .into_iter()
+            .find(|key| !object.contains_key(*key))
+            {
+                return Err(format!("dziennik bez wymaganego pola '{missing}'"));
+            }
         }
         let journal: Journal = serde_json::from_slice(bytes).map_err(|e| format!("journal: {e}"))?;
         validate_topology(&journal)?;
@@ -2717,7 +3200,7 @@ pub(crate) mod execution {
             return Err("obcy plik blokady Elastic".into());
         }
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(format!("Elastic busy: {}", std::io::Error::last_os_error()));
+            return Err(format!("{ELASTIC_BUSY} {}", std::io::Error::last_os_error()));
         }
         Ok(file)
     }
@@ -2773,19 +3256,66 @@ pub(crate) mod execution {
             Ok(journal)
         }
 
-        fn journals(&self) -> Result<Vec<Journal>, String> {
-            let mut result = Vec::new();
+        /// What every journal on this node claims, read so that ONE journal
+        /// this helper cannot load as a whole does not take the node down.
+        ///
+        /// A journal whose full decode fails (a phase an older helper wrote, a
+        /// broken invariant) still carries a readable `spec`, and the spec is
+        /// all a claim needs: the array's name, its disks and its paths. That
+        /// journal keeps its own per-array error on every command that loads
+        /// it. Only a file whose spec cannot be recovered at all is listed as
+        /// `unreadable`: it names its array id and why.
+        fn claims(&self) -> Result<Claims, String> {
+            let mut claims = Claims::default();
             for entry in std::fs::read_dir(&self.path).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                    let id = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .ok_or("nazwa journala")?;
-                    result.push(self.load(id)?);
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or("nazwa journala")?
+                    .to_string();
+                match self.load(&id) {
+                    Ok(journal) => claims.arrays.push(Claim {
+                        anchored: Some(journal.private.as_ref().is_some_and(|private| private.anchor.is_some())),
+                        spec: journal.spec,
+                        load_error: None,
+                    }),
+                    Err(error) => match self.recover_spec(&id) {
+                        Ok(spec) => claims.arrays.push(Claim { spec, anchored: None, load_error: Some(error) }),
+                        Err(recovery) => claims.unreadable.push(format!("{id}: {error}; {recovery}")),
+                    },
                 }
             }
-            Ok(result)
+            Ok(claims)
+        }
+
+        /// The persisted intention alone, from a journal whose whole decode
+        /// failed. It is held to the same checks as a loaded one: our own
+        /// private file, the spec's validation, and the file's name.
+        fn recover_spec(&self, id: &str) -> Result<ElasticCreateSpec, String> {
+            validate_elastic_uuid(id).map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            private_file(&self.path.join(format!("{id}.json")), self.uid)?
+                .take(JOURNAL_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > JOURNAL_LIMIT {
+                return Err("journal zbyt duży".into());
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| format!("journal: {e}"))?;
+            let spec: ElasticCreateSpec = serde_json::from_value(
+                value.get("spec").cloned().ok_or("journal bez specyfikacji")?,
+            )
+            .map_err(|e| format!("specyfikacja: {e}"))?;
+            spec.validate().map_err(|e| e.to_string())?;
+            if spec.array_id != id {
+                return Err("specyfikacja innej macierzy".into());
+            }
+            Ok(spec)
         }
 
         fn save(&self, journal: &Journal) -> Result<(), String> {
@@ -2840,18 +3370,39 @@ pub(crate) mod execution {
         /// a later Restore has to be able to read.
         fn forget(&self, journal: &Journal) -> Result<(), String> {
             let _array_lock = self.array_lock(&journal.spec.array_id)?;
-            if journal.private.as_ref().is_some_and(|private| private.anchor.is_some()) {
-                return Err("macierz nadal publikuje unię".into());
+            forgettable(journal)?;
+            self.remove_journal(&journal.spec.array_id)
+        }
+
+        /// Whether a wipe's acknowledgement may release this array's journal:
+        /// asked BEFORE the disk is erased, so a journal that cannot be
+        /// released refuses the wipe instead of outliving it. A journal only
+        /// its spec can be read from (W2 of the second review) is releasable:
+        /// nothing can operate it — Restore, Destroy and Adopt all need the
+        /// whole journal — and without this its disks and its name stay
+        /// reserved for good. Whether it still serves is the wipe verdict's
+        /// question, answered from the mount table.
+        fn releasable(&self, array_id: &str) -> Result<(), String> {
+            match self.load(array_id) {
+                Ok(journal) => forgettable(&journal),
+                Err(error) => self.recover_spec(array_id).map(|_| ()).map_err(|recovery| format!("{error}; {recovery}")),
             }
-            if journal.pending.is_some()
-                || journal
-                    .transfer
-                    .as_ref()
-                    .is_some_and(|transfer| transfer.finished_at.is_none())
-            {
-                return Err("dziennik ma otwartą operację macierzy".into());
+        }
+
+        /// Releases the journal a wipe was acknowledged for.
+        fn release(&self, array_id: &str) -> Result<(), String> {
+            match self.load(array_id) {
+                Ok(journal) => self.forget(&journal),
+                Err(_) => {
+                    let _array_lock = self.array_lock(array_id)?;
+                    self.recover_spec(array_id)?;
+                    self.remove_journal(array_id)
+                }
             }
-            let target = self.path.join(format!("{}.json", journal.spec.array_id));
+        }
+
+        fn remove_journal(&self, array_id: &str) -> Result<(), String> {
+            let target = self.path.join(format!("{array_id}.json"));
             // Validated as ours before it is removed, exactly as a journal
             // write validates its target: a foreign file, a symlink or a mode
             // we did not write is not a journal and is never deleted.
@@ -2964,6 +3515,72 @@ pub(crate) mod execution {
             Ok(journal)
         }
 
+        /// DORMANT: disk replacement is withdrawn — see the banner on
+        /// `execution::replace_data_disk` for why and for what is outstanding.
+        ///
+        /// Swaps the identity of exactly ONE data slot: the disk that died for
+        /// the one that replaces it. Nothing else about the spec can change —
+        /// the function reads the stored journal again under the caller's array
+        /// lock, writes the five identity fields of one slot and re-runs every
+        /// invariant, so a caller holding a stale copy of the journal cannot
+        /// smuggle anything else in (and `save` refuses that copy afterwards,
+        /// because it refuses any spec change).
+        ///
+        /// The slot also leaves `formatted`: the replacement carries no
+        /// filesystem of this array yet, and that list is what gates the mkfs.
+        /// JOURNAL FIRST, DURABLY — a crash between this write and the format
+        /// comes back to a journal that names the new disk and calls it
+        /// unformatted, which is exactly the state a repeat of the command
+        /// resumes from.
+        fn replace_data_disk(
+            &self,
+            array_id: &str,
+            slot: usize,
+            disk: &ElasticDiskSpec,
+        ) -> Result<Journal, String> {
+            let mut journal = self.load(array_id)?;
+            let role = ElasticRole::Data(u16::try_from(slot + 1).map_err(|_| "numer slotu")?);
+            let old = journal.spec.data.get(slot).ok_or("macierz nie ma tego slotu danych")?.clone();
+            if &old == disk {
+                // A repeat: the swap is already durable. The mkfs is gated by
+                // `formatted`, so the caller goes on from wherever it stopped.
+                return Ok(journal);
+            }
+            if journal
+                .spec
+                .data
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != slot)
+                .map(|(_, member)| member)
+                .chain(journal.spec.cache.iter())
+                .chain(&journal.spec.parity)
+                .any(|member| member.disk_id == disk.disk_id)
+            {
+                return Err("dysk jest już członkiem tej macierzy".into());
+            }
+            let slot_spec = journal.spec.data.get_mut(slot).ok_or("macierz nie ma tego slotu danych")?;
+            slot_spec.disk_id = disk.disk_id.clone();
+            slot_spec.wwn = disk.wwn.clone();
+            slot_spec.serial = disk.serial.clone();
+            slot_spec.bytes = disk.bytes;
+            slot_spec.expected_uuid = disk.expected_uuid.clone();
+            journal.formatted.retain(|formatted| *formatted != role);
+            journal.spec.validate().map_err(|e| e.to_string())?;
+            validate_topology(&journal)?;
+            validate_operation_record(&journal)?;
+            let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > JOURNAL_LIMIT {
+                return Err("journal przekroczyłby limit odczytu".into());
+            }
+            atomic_write(
+                &self.path.join(format!("{}.json", journal.spec.array_id)),
+                &bytes,
+                self.uid,
+            )?;
+            Ok(journal)
+        }
+
         fn reserve(
             &self,
             spec: &ElasticCreateSpec,
@@ -2971,7 +3588,7 @@ pub(crate) mod execution {
             guard: impl FnOnce() -> Result<(), String>,
         ) -> Result<Journal, String> {
             spec.validate().map_err(|e| e.to_string())?;
-            let journals = self.journals()?;
+            let journals = self.claims()?.complete()?;
             if journals.iter().any(|j| j.spec.array_id == spec.array_id) {
                 return Err("macierz ma już journal; create nie jest ponawiane".into());
             }
@@ -2991,10 +3608,13 @@ pub(crate) mod execution {
                 transfer: None,
                 stale_parity_bytes: None,
                 stale_sync_operation: None,
+                interrupted_operation: None,
                 stuck: Vec::new(),
                 stuck_paths: Vec::new(),
                 stuck_evicted: 0,
                 evicted_paths: Vec::new(),
+                fields_complete: true,
+                extra: serde_json::Map::new(),
             };
             self.save(&journal)?;
             Ok(journal)
@@ -3963,7 +4583,57 @@ pub(crate) mod execution {
             stuck_hidden: hidden,
             stuck_evicted: journal.stuck_evicted,
             restart_required: false,
+            conflicts: if journal.spec.cache.is_some() && (journal.private.is_none() || worker.is_some()) {
+                conflicts(journal, Path::new(&mount_path(&journal.spec, ElasticRole::Cache)), &|disk| {
+                    PathBuf::from(data_branch_path(&journal.spec.name, disk))
+                })
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    /// The versions stuck records left beside the file's own, found on the
+    /// branches: a quarantined original still in the cache root, or a copy
+    /// still pinned under the path on its data branch while the cache holds
+    /// the path too (the union then shows the cache's). A record whose path
+    /// was cut for display cannot be looked up by path; its quarantine name
+    /// still can.
+    fn conflicts(journal: &Journal, cache: &Path, data: &dyn Fn(&str) -> PathBuf) -> Vec<ElasticConflict> {
+        let mut found = Vec::new();
+        for record in stuck_records(journal) {
+            let visible = format!("{}/{}", union_path(&journal.spec.name), record.path);
+            let quarantine = record
+                .temporary
+                .as_deref()
+                .and_then(|temporary| crate::elastic_transfer::quarantine_name(temporary).ok())
+                .map(|name| cache.join(name));
+            if let Some(quarantine) = quarantine.filter(|path| std::fs::symlink_metadata(path).is_ok()) {
+                found.push(ElasticConflict {
+                    operation_id: record.operation_id.clone(),
+                    path: record.path.clone(),
+                    visible,
+                    kept: quarantine.display().to_string(),
+                });
+                continue;
+            }
+            let (Some(target), Some(pin)) = (record.target.as_deref(), record.destination.as_ref()) else {
+                continue;
+            };
+            let copy = data(target).join(&record.path);
+            let hidden = std::fs::symlink_metadata(&copy)
+                .is_ok_and(|stat| stat.dev() == pin.device && stat.ino() == pin.inode)
+                && std::fs::symlink_metadata(cache.join(&record.path)).is_ok();
+            if hidden {
+                found.push(ElasticConflict {
+                    operation_id: record.operation_id.clone(),
+                    path: record.path.clone(),
+                    visible,
+                    kept: copy.display().to_string(),
+                });
+            }
+        }
+        found
     }
 
     /// The array in this boot without an anchor: a recovery after a boot
@@ -4021,10 +4691,9 @@ pub(crate) mod execution {
     }
 
     /// What a mover run needs beyond the branch directories and the journal:
-    /// the step system below `execute_steps`, the branch check and the
-    /// SnapRAID guard and argv. Every journal decision stays in this module.
+    /// the branch check and the SnapRAID guard and argv. Every journal
+    /// decision stays in this module.
     trait MoverHost {
-        fn steps(&mut self) -> &mut dyn StepSystem;
         /// The paths the walk acts on are the array's own mounted branches.
         fn verify_branches(&mut self, journal: &Journal) -> Result<(), String>;
         /// Everything that must hold before SnapRAID starts: its guard over
@@ -4122,8 +4791,10 @@ pub(crate) mod execution {
     }
 
     /// Whether this run owes a coupled Sync: parity is out of date and no
-    /// Sync of this operation has succeeded yet. A new run owes it even when
-    /// it moves nothing, until one of its Syncs makes parity current.
+    /// Sync of this operation has settled it yet. A new run owes it even when
+    /// it moves nothing. A Sync that met files changing under it settles the
+    /// run too: those files wait for the next run's Sync, and running the same
+    /// Sync again at once would meet the same writers.
     fn transfer_sync_owed(journal: &Journal, transfer: &TransferJournal) -> bool {
         transfer.coupled_sync
             && !journal.spec.parity.is_empty()
@@ -4131,14 +4802,14 @@ pub(crate) mod execution {
             && !transfer
                 .coupled_sync_result
                 .as_ref()
-                .is_some_and(|run| coupled_sync_success(run, &transfer.operation_id))
+                .is_some_and(|run| coupled_sync_settled(run, &transfer.operation_id))
     }
 
-    /// Whether this transfer forbids a Resume under `operation_id`. The Hold a
-    /// mover entered is released only by the Resume UUID it announced. An
-    /// unfinished run blocks it only while a file is in flight that its last
-    /// attempt did not give up on; an owed Sync never does — the array then
-    /// comes back with parity marked stale and the next run owes the Sync.
+    /// Whether this transfer forbids a Resume under `operation_id`. Movers no
+    /// longer enter a Hold; this answers for a Hold an older helper left, which
+    /// is released only by the Resume UUID that run announced. An unfinished
+    /// run blocks it only while a file is in flight that its last attempt did
+    /// not give up on; an owed Sync never does.
     fn transfer_blocks_resume(journal: &Journal, transfer: &TransferJournal, operation_id: &str) -> bool {
         let own_hold = journal
             .private
@@ -4148,24 +4819,41 @@ pub(crate) mod execution {
         if transfer.finished_at.is_some() {
             return own_hold && operation_id != transfer.resume_operation_id;
         }
+        // A file the run left in flight does not block its own Resume: at every
+        // phase of a record exactly one copy owns the path, so the union may
+        // serve read-write around it, and the next run finishes or reverses it.
         operation_id != transfer.resume_operation_id
-            || (transfer.current.is_some() && transfer.current_failed.is_none())
     }
 
-    /// A Resume that finishes under the transfer's declared UUID closes an
-    /// unfinished run. It stays NeedsAttention in the history, with a stuck
-    /// record kept as it was and appended to the array's stuck history, which
-    /// outlives every later operation.
+    /// The Resume UUID that releases a Hold an older helper's mover left, or
+    /// `None` when the array is not in such a Hold.
+    ///
+    /// The helper before this one entered a Hold for every mover run and
+    /// released it only to the Resume UUID that run declared, which nothing in
+    /// the product ever sent. The Hold is the run's when the service names the
+    /// run's operation; the UUID is the one the run recorded. Restore and the
+    /// mover release it themselves, finished run or not, so neither a reboot
+    /// nor an upgrade leaves such an array read-only or unrestorable.
+    fn legacy_mover_hold(journal: &Journal) -> Option<String> {
+        let service = journal
+            .private
+            .as_ref()
+            .and_then(|private| private.service.as_ref())
+            .filter(|service| service.mode == ElasticServiceMode::Hold)?;
+        let transfer = journal.transfer.as_ref()?;
+        (service.operation_id == transfer.operation_id).then(|| transfer.resume_operation_id.clone())
+    }
+
+    /// Closes the journal's unfinished run: the next run does it before it
+    /// starts its own, and a Resume of an older helper's Hold does it for the
+    /// run that declared it. It stays NeedsAttention in the history, with a
+    /// stuck record kept as it was and appended to the array's stuck history,
+    /// which outlives every later operation.
     /// Returns the identity the write evicted from the skip set, if any: the
-    /// caller says so only once the write is durable, because this runs on a
-    /// CLONE and a refused save drops it.
-    fn close_transfer(
-        journal: &mut Journal,
-        service_operation_id: &str,
-    ) -> Result<Option<StuckPath>, String> {
-        let Some(transfer) = journal.transfer.as_mut().filter(|transfer| {
-            transfer.finished_at.is_none() && transfer.resume_operation_id == service_operation_id
-        }) else {
+    /// caller says so only once the write is durable, because this may run on
+    /// a CLONE and a refused save drops it.
+    fn close_transfer(journal: &mut Journal) -> Result<Option<StuckPath>, String> {
+        let Some(transfer) = journal.transfer.as_mut().filter(|transfer| transfer.finished_at.is_none()) else {
             return Ok(None);
         };
         if transfer.current.is_some() && transfer.current_failed.is_none() {
@@ -4245,7 +4933,7 @@ pub(crate) mod execution {
     /// The journal this operation could still be asked to write before it can
     /// end: the record at its worst case, the failure text a stuck record
     /// writes, every detail and the issue list at their bounds, and the entry
-    /// the closing Resume appends to the history and to the skip set. A save
+    /// the closing write appends to the history and to the skip set. A save
     /// the limit refuses in mid-record cannot be retried away, so a file whose
     /// projection does not fit is refused before it is started.
     /// A finished Sync record at its largest, for pricing a run that has not
@@ -4340,7 +5028,7 @@ pub(crate) mod execution {
         // What this projection models, so the next reader can check it against
         // the journal's fields: the in-flight record at its worst, the failure
         // text, every detail and the issue list at their bounds, the entry the
-        // closing Resume appends to the history and to the skip set (with the
+        // closing write appends to the history and to the skip set (with the
         // eviction it may force, into the ring), both eviction counters, the
         // coupled Sync record and `last_run` at their worst, and the two stale
         // markers.
@@ -4366,7 +5054,20 @@ pub(crate) mod execution {
         //   - the five run counters (`moved_files`, `moved_bytes`,
         //     `skipped_files`, `skipped_bytes`, `refused_files`), each growing
         //     by digits alone and each bounded by `u64::MAX` at 20 digits, so
-        //     under +100 B for all five together.
+        //     under +100 B for all five together;
+        //   - `journal.interrupted_operation`, null to an operation UUID
+        //     (+38 B), which only `close_interrupted_maintenance` writes — from
+        //     Restore, so never between this projection and a mover's closing
+        //     write;
+        //   - `journal.fields_complete`, a constant `true` in the projection
+        //     and in every write (+0 B);
+        //   - `journal.extra`, the unknown fields of a LATER helper: they ride
+        //     in the `journal.clone()` this projection starts from, so they are
+        //     already priced here — and nothing in this build ever adds to
+        //     them.
+        // (The three above were added after this list was written; the fourth
+        // review found them missing from it, which is exactly the omission the
+        // paragraph below warns about.)
         // That is under 230 B in total, against a cushion worth about 2,050 B:
         // this projection prices `journal.detail` at its bound while `finish`
         // writes `detail = None` on the very write it prices. Any FIELD added
@@ -4506,9 +5207,13 @@ pub(crate) mod execution {
             TransferFilePhase::CopyConfirmed => 1,
             TransferFilePhase::RenameIntent => 2,
             TransferFilePhase::RenameConfirmed => 3,
-            TransferFilePhase::UnlinkIntent => 4,
-            TransferFilePhase::UnlinkConfirmed => 5,
-            TransferFilePhase::Done => 6,
+            TransferFilePhase::QuarantineIntent => 4,
+            TransferFilePhase::QuarantineConfirmed => 5,
+            TransferFilePhase::UnlinkIntent => 6,
+            TransferFilePhase::UnlinkConfirmed => 7,
+            TransferFilePhase::Done => 8,
+            TransferFilePhase::RestoreIntent => 9,
+            TransferFilePhase::Restored => 10,
         }
     }
 
@@ -4546,7 +5251,7 @@ pub(crate) mod execution {
                 let phase_allowed = previous.phase == next.phase
                     || matches!(
                         (previous.phase, next.phase),
-                        (Phase::Holding, Phase::Moving | Phase::NeedsAttention)
+                        (Phase::Announced, Phase::Moving | Phase::NeedsAttention)
                             | (Phase::Moving, Phase::Syncing | Phase::Complete | Phase::NeedsAttention)
                             | (Phase::Syncing, Phase::Moving | Phase::Complete | Phase::NeedsAttention)
                             | (Phase::NeedsAttention, Phase::Moving)
@@ -4569,12 +5274,22 @@ pub(crate) mod execution {
                             || before.temporary != after.temporary
                             || before.source_identity != after.source_identity
                             || next.sequence != previous.sequence
-                            || file_phase_rank(after.phase) < file_phase_rank(before.phase)
                             || (before.temporary_pin.is_some() && before.temporary_pin != after.temporary_pin)
                             || (before.temporary_identity.is_some()
                                 && before.temporary_identity != after.temporary_identity)
                             || (before.destination_identity.is_some()
                                 && before.destination_identity != after.destination_identity)
+                            // Only one step goes back in rank: a reversal that
+                            // found the quarantined original removed by
+                            // somebody else ends as the move it then is.
+                            || (file_phase_rank(after.phase) < file_phase_rank(before.phase)
+                                && !(before.phase == TransferFilePhase::RestoreIntent
+                                    && after.phase == TransferFilePhase::Done))
+                            // A released original cannot be brought back, and
+                            // a finished reversal does not become a move.
+                            || (file_phase_rank(before.phase) >= file_phase_rank(TransferFilePhase::UnlinkConfirmed)
+                                && file_phase_rank(before.phase) <= file_phase_rank(TransferFilePhase::Done)
+                                && file_phase_rank(after.phase) > file_phase_rank(TransferFilePhase::Done))
                         {
                             return refuse("cofnięty lub podmieniony plik w toku");
                         }
@@ -4582,8 +5297,7 @@ pub(crate) mod execution {
                     (Some(before), None) => {
                         let completed = before.phase == TransferFilePhase::Done
                             && previous.moved_files.checked_add(1) == Some(next.moved_files);
-                        let withdrawn = file_phase_rank(before.phase)
-                            <= file_phase_rank(TransferFilePhase::RenameIntent)
+                        let withdrawn = before.phase == TransferFilePhase::Restored
                             && next.moved_files == previous.moved_files;
                         if !completed && !withdrawn {
                             return refuse("plik w toku zniknął bez potwierdzenia");
@@ -4595,7 +5309,7 @@ pub(crate) mod execution {
                 if previous.as_ref().is_some_and(|previous| previous.finished_at.is_none()) {
                     return refuse("zastąpienie niedokończonego transferu");
                 }
-                if next.phase != Phase::Holding
+                if next.phase != Phase::Announced
                     || next.finished_at.is_some()
                     || next.current.is_some()
                     || next.evicted != 0
@@ -4607,7 +5321,7 @@ pub(crate) mod execution {
                     || next.coupled_sync_result.is_some()
                     || next.sync_attempt != 0
                 {
-                    return refuse("nowy transfer zaczyna się od Holding");
+                    return refuse("nowy transfer zaczyna się od zapowiedzi");
                 }
             }
         }
@@ -4738,12 +5452,12 @@ pub(crate) mod execution {
         }
     }
 
-    fn persisted_target(env: &MoverEnv, transfer: &TransferJournal) -> Result<PathBuf, String> {
+    fn persisted_target(data: &[MoverTarget], transfer: &TransferJournal) -> Result<PathBuf, String> {
         let disk = transfer
             .target
             .as_deref()
             .ok_or("transfer w toku bez utrwalonego brancha docelowego")?;
-        env.data
+        data
             .iter()
             .find(|target| target.disk == disk)
             .map(|target| target.path.clone())
@@ -4769,15 +5483,16 @@ pub(crate) mod execution {
         }) else {
             return error;
         };
+        // The RUN needs attention, not the array: the union serves read-write
+        // at every phase of a record, and the next run finishes or reverses
+        // what this one left. An array stage of NeedsAttention here would
+        // outlive that run and refuse the settling run's own result.
         transfer.phase = ElasticMoverPhase::NeedsAttention;
         transfer.detail = Some(bounded_text(&error, TRANSFER_DETAIL_LIMIT));
-        stored.stage = ElasticStage::NeedsAttention;
-        stored.detail = Some(bounded_text(&error, TRANSFER_DETAIL_LIMIT));
         match root.save(&stored) {
             Ok(()) => error,
             Err(save) => {
                 // The detail may be what the limit refused: retry short.
-                stored.detail = Some(SHORT_ATTENTION.into());
                 if let Some(transfer) = stored.transfer.as_mut() {
                     transfer.detail = Some(SHORT_ATTENTION.into());
                     transfer.issues.clear();
@@ -4788,6 +5503,23 @@ pub(crate) mod execution {
                 }
             }
         }
+    }
+
+    /// The stage an array returns to when a Sync of it ends without making
+    /// parity current: `Ready` where the journal may say so — the union was
+    /// published and no service state holds it — because stale parity is
+    /// recorded on its own marker and is no reason to call the array broken.
+    /// Anything else keeps it `NeedsAttention`.
+    fn settled_stage(journal: &Journal) -> ElasticStage {
+        let ready = journal.private.as_ref().is_none_or(|private| {
+            private.published
+                && private.anchor.is_some()
+                && !private
+                    .service
+                    .as_ref()
+                    .is_some_and(|service| service.mode == ElasticServiceMode::Hold || service.pending)
+        });
+        if ready { ElasticStage::Ready } else { ElasticStage::NeedsAttention }
     }
 
     /// Closes this operation's Sync that a gone process left Running: the
@@ -4809,7 +5541,7 @@ pub(crate) mod execution {
         journal.stale_parity_bytes.get_or_insert(0);
         journal.stale_sync_operation = Some(operation_id.to_string());
         if journal.stage == ElasticStage::SyncPending {
-            journal.stage = ElasticStage::NeedsAttention;
+            journal.stage = settled_stage(journal);
         }
         if let Some(transfer) = journal
             .transfer
@@ -4841,14 +5573,17 @@ pub(crate) mod execution {
     /// What became of the in-flight record.
     enum FileOutcome {
         Moved,
-        /// A syscall failed while the source was untouched; the copy was
-        /// withdrawn and the file stays on the cache.
+        /// A syscall failed and the move was reversed; the file stays on the
+        /// cache.
         RolledBack(String),
+        /// The file was opened or changed while it moved, and the move was
+        /// reversed; it waits for a later run.
+        Skipped(String),
     }
 
     /// The in-flight record could be neither finished nor withdrawn. It stays
-    /// exactly as it is and both copies stay on disk; parity is marked stale
-    /// and the record no longer blocks the declared Resume.
+    /// exactly as it is and both copies stay on disk; parity is marked stale,
+    /// and the next run closes this one with the record in its stuck history.
     /// Gives up on one record, and takes its orphaned copy with it.
     ///
     /// ORDERING: the delete happens BEFORE the durable write, and that
@@ -4940,10 +5675,10 @@ pub(crate) mod execution {
     }
 
     /// A journal write the size limit refused leaves the record exactly as
-    /// the disk holds it, with nothing saying its attempt gave up — and a
-    /// record like that blocks the declared Resume. The last durable state
-    /// gets a SHORT, FIXED failure text instead, never the error itself (which
-    /// may be what overflowed), and the run becomes releasable.
+    /// the disk holds it, with nothing saying its attempt gave up — and the
+    /// next run would retry a record that cannot be written. The last durable
+    /// state gets a SHORT, FIXED failure text instead, never the error itself
+    /// (which may be what overflowed), and the next run can close it.
     const SHORT_STUCK_REASON: &str = "rekord nierozwiązany: zapis dziennika odrzucony";
     const SHORT_ATTENTION: &str = "operacja przerwana; szczegóły nie zmieściły się w dzienniku";
 
@@ -4968,8 +5703,6 @@ pub(crate) mod execution {
         if parity {
             stored.stale_parity_bytes.get_or_insert(size);
         }
-        stored.stage = ElasticStage::NeedsAttention;
-        stored.detail = Some(SHORT_STUCK_REASON.into());
         match root.save(&stored) {
             Ok(()) => {
                 *journal = stored;
@@ -4979,8 +5712,9 @@ pub(crate) mod execution {
         }
     }
 
-    /// Drives the one in-flight record to Done: parents first, then the
-    /// per-file state machine. Every durable step goes through `Root::save`.
+    /// Drives the one in-flight record to `Done` or `Restored`: parents first,
+    /// then the per-file state machine. Every durable step goes through
+    /// `Root::save`.
     fn finish_file(
         root: &Root,
         journal: &mut Journal,
@@ -4988,7 +5722,7 @@ pub(crate) mod execution {
         target: &Path,
         array_lock: &File,
         mut file: TransferFile,
-        host: &mut impl MoverHost,
+        host: &mut dyn MoverHost,
     ) -> Result<FileOutcome, String> {
         let durable = std::cell::Cell::new(true);
         // A refused journal write and a failed checkpoint are different: the
@@ -5009,65 +5743,28 @@ pub(crate) mod execution {
             }
             checked
         };
-        let rollbackable = |phase| {
-            matches!(
-                phase,
-                TransferFilePhase::CopyIntent | TransferFilePhase::CopyConfirmed | TransferFilePhase::RenameIntent
-            )
-        };
-        let mut executed = Ok(TransferEnd::Verified);
-        if rollbackable(file.phase) {
-            executed = crate::elastic_transfer::prepare_parents(source, target, &mut file, &mut persist)
-                .map(|()| TransferEnd::Verified);
+        let mut executed = Ok(());
+        if file_phase_rank(file.phase) <= file_phase_rank(TransferFilePhase::RenameIntent) {
+            executed = crate::elastic_transfer::prepare_parents(source, target, &mut file, &mut persist);
         }
-        if executed.is_ok() {
-            executed = transfer_file(source, target, &mut file, &mut persist);
-        }
+        let executed = executed.and_then(|()| transfer_file(source, target, &mut file, &mut persist));
         match executed {
-            Ok(end) if file.phase == TransferFilePhase::Done => {
-                let size = file.source_identity.size;
-                let transfer = transfer_mut(journal)?;
-                transfer.moved_files = transfer
-                    .moved_files
-                    .checked_add(1)
-                    .ok_or("przepełnienie licznika plików")?;
-                transfer.moved_bytes = transfer.moved_bytes.saturating_add(size);
-                transfer.current = None;
-                transfer.current_failed = None;
-                if let TransferEnd::SourceUnreadable(error) = end {
-                    note_issue(
-                        transfer,
-                        &file.source,
-                        ElasticMoverIssueKind::Attention,
-                        &format!("źródło usunięte po tożsamości po błędzie odczytu: {error}"),
-                        0,
-                    );
-                }
-                // Parity no longer describes a data branch that just gained a file.
-                if !journal.spec.parity.is_empty() {
-                    journal.stale_parity_bytes =
-                        Some(journal.stale_parity_bytes.unwrap_or(0).saturating_add(size));
-                }
-                root.save(journal)?;
-                Ok(FileOutcome::Moved)
-            }
-            Ok(_) => Err("transfer pliku bez potwierdzenia".into()),
+            Ok(end) => record_end(root, journal, &file, end, None),
             // A refused journal write is a crash for the state machine, with
             // one difference: the durable record still looks healthy, so it
-            // gets the short fixed failure text and the Resume can release.
+            // gets the short fixed failure text the next run can close.
             Err(error) if save_refused.get() => Err(stick_short_record(root, journal, error)),
             // A failed checkpoint leaves the record exactly as persisted.
             Err(error) if !durable.get() => Err(error),
-            // A syscall failed while the source was untouched: withdraw the copy.
-            Err(error) if rollbackable(file.phase) => {
-                match crate::elastic_transfer::roll_back(source, target, &file) {
-                    Ok(()) => {
-                        let transfer = transfer_mut(journal)?;
-                        transfer.current = None;
-                        transfer.current_failed = None;
-                        root.save(journal)?;
-                        Ok(FileOutcome::RolledBack(error))
-                    }
+            // A syscall failed: reverse the move from wherever it got to, unless
+            // the original is already gone or the reversal itself is what failed.
+            Err(error)
+                if file_phase_rank(file.phase) < file_phase_rank(TransferFilePhase::UnlinkConfirmed) =>
+            {
+                match crate::elastic_transfer::withdraw_record(source, target, &mut file, &mut persist) {
+                    Ok(end) => record_end(root, journal, &file, end, Some(error)),
+                    Err(_) if save_refused.get() => Err(stick_short_record(root, journal, error)),
+                    Err(_) if !durable.get() => Err(error),
                     Err(rollback) => Err(stick_record(
                         root,
                         journal,
@@ -5080,6 +5777,54 @@ pub(crate) mod execution {
             }
             Err(error) => Err(stick_record(root, journal, target, array_lock, &file, error)),
         }
+    }
+
+    /// Records how a record ended: a move is counted and marks parity stale, a
+    /// reversal only clears the record. `failure` is the syscall error a
+    /// reversal answered. Every notice of the end is an Attention issue.
+    fn record_end(
+        root: &Root,
+        journal: &mut Journal,
+        file: &TransferFile,
+        end: TransferEnd,
+        failure: Option<String>,
+    ) -> Result<FileOutcome, String> {
+        let (outcome, notices) = match end {
+            TransferEnd::Moved { unreadable, mut notices } if file.phase == TransferFilePhase::Done => {
+                if let Some(error) = unreadable {
+                    notices.insert(0, format!("źródło usunięte po tożsamości po błędzie odczytu: {error}"));
+                }
+                let size = file.source_identity.size;
+                let transfer = transfer_mut(journal)?;
+                transfer.moved_files = transfer
+                    .moved_files
+                    .checked_add(1)
+                    .ok_or("przepełnienie licznika plików")?;
+                transfer.moved_bytes = transfer.moved_bytes.saturating_add(size);
+                // Parity no longer describes a data branch that just gained a file.
+                if !journal.spec.parity.is_empty() {
+                    journal.stale_parity_bytes =
+                        Some(journal.stale_parity_bytes.unwrap_or(0).saturating_add(size));
+                }
+                (FileOutcome::Moved, notices)
+            }
+            TransferEnd::Withdrawn { reason, notices } if file.phase == TransferFilePhase::Restored => (
+                match failure {
+                    Some(error) => FileOutcome::RolledBack(error),
+                    None => FileOutcome::Skipped(reason),
+                },
+                notices,
+            ),
+            _ => return Err("transfer pliku bez potwierdzenia".into()),
+        };
+        let transfer = transfer_mut(journal)?;
+        transfer.current = None;
+        transfer.current_failed = None;
+        for notice in notices {
+            note_issue(transfer, &file.source, ElasticMoverIssueKind::Attention, &notice, 0);
+        }
+        root.save(journal)?;
+        Ok(outcome)
     }
 
     /// The files one walk wants to move, in move order: every "no" (eager)
@@ -5098,6 +5843,10 @@ pub(crate) mod execution {
         for entry in entries {
             match entry {
                 ScanEntry::Refused { path, reason } => refused.push((path, reason)),
+                ScanEntry::File(file) if quarantined(&file.path) => refused.push((
+                    file.path,
+                    "odsunięty oryginał nierozwiązanego przeniesienia; zostaje dla administratora".into(),
+                )),
                 ScanEntry::File(file)
                     if rules
                         .eager_folders
@@ -5119,6 +5868,57 @@ pub(crate) mod execution {
         (eager, refused)
     }
 
+    /// What a walk of the cache means for the next run, without a target or a
+    /// write: the same selection `plan_walk` makes, with the files a run would
+    /// skip counted apart. Age is taken by mtime like the selection itself, and
+    /// an mtime in the future counts as zero seconds old.
+    fn cache_age(
+        entries: Vec<ScanEntry>,
+        rules: &MoverRules,
+        stuck: &BTreeSet<String>,
+        open: &BTreeSet<(u64, u64)>,
+        now_ns: i128,
+    ) -> ElasticCacheAge {
+        let oldest_ns = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ScanEntry::File(file) => Some(now_ns.saturating_sub(file.mtime_ns).max(0)),
+                ScanEntry::Refused { .. } => None,
+            })
+            .max();
+        let mut age = ElasticCacheAge {
+            oldest_secs: oldest_ns.map(|ns| u64::try_from(ns / 1_000_000_000).unwrap_or(u64::MAX)),
+            held_files: entries
+                .iter()
+                .filter(|entry| matches!(entry, ScanEntry::File(file) if quarantined(&file.path)))
+                .count() as u64,
+            ..ElasticCacheAge::default()
+        };
+        let (candidates, _) = select_candidates(entries, rules, now_ns);
+        for file in candidates {
+            if open.contains(&(file.device, file.inode)) || stuck.contains(&path_digest(&file.path)) {
+                age.held_files += 1;
+            } else {
+                age.due_files += 1;
+                age.due_bytes = age.due_bytes.saturating_add(file.size);
+            }
+        }
+        age
+    }
+
+    /// The entries a mover walk never reaches: the branch filesystem's own
+    /// lost+found and every pinned ("use cache: only") subtree.
+    fn walk_prunes(rules: &MoverRules) -> impl Fn(&str) -> bool + '_ {
+        |path| path == "lost+found" || rules.pinned_folders.iter().any(|folder| under_folder(path, folder))
+    }
+
+    /// An original a record left under its quarantine name in the cache root:
+    /// never moved as a file of its own, but still a file on the unprotected
+    /// cache, so the age probe counts it and the walk reports it.
+    fn quarantined(path: &str) -> bool {
+        !path.contains('/') && path.starts_with(crate::elastic_transfer::QUARANTINE_PREFIX)
+    }
+
     /// Another data branch holding the same path would shadow the moved file
     /// in the union, or be shadowed by it.
     fn shadowing_branch(env: &MoverEnv, target: &MoverTarget, path: &str) -> Option<String> {
@@ -5133,8 +5933,8 @@ pub(crate) mod execution {
     }
 
     /// The owed coupled Sync through the host's guard and argv. A failure
-    /// before SnapRAID starts records no attempt; the declared Resume still
-    /// releases the array with parity marked stale.
+    /// before SnapRAID starts records no attempt; parity stays marked stale
+    /// and a later run owes the Sync.
     fn run_owed_sync(
         root: &Root,
         journal: &mut Journal,
@@ -5166,25 +5966,8 @@ pub(crate) mod execution {
     /// the cache root, the open-file scan or a free-space probe failed. One
     /// unreadable directory or entry never does; it comes back refused.
     fn plan_walk<'e>(journal: &Journal, env: &'e MoverEnv<'_>, rules: &MoverRules) -> Result<Walk<'e>, String> {
-        // lost+found belongs to the branch filesystem, not to the union's data.
-        let entries = crate::elastic_transfer::scan_cache(&env.cache, |path| {
-            path == "lost+found"
-                || rules
-                    .pinned_folders
-                    .iter()
-                    .any(|folder| under_folder(path, folder))
-        })?;
-        let open = if rules.skip_open_files {
-            let daemon = journal
-                .private
-                .as_ref()
-                .and_then(|private| private.anchor.as_ref())
-                .map(|anchor| anchor.pid)
-                .ok_or("skip_open_files wymaga kotwicy prywatnego mergerfs")?;
-            (env.open_files)(daemon)?
-        } else {
-            BTreeSet::new()
-        };
+        let entries = crate::elastic_transfer::scan_cache(&env.cache, walk_prunes(rules))?;
+        let open = open_identities(journal, rules, env.open_files)?;
         let (candidates, refused) = select_candidates(entries, rules, env.now_ns);
         let target = if candidates.is_empty() {
             None
@@ -5215,6 +5998,25 @@ pub(crate) mod execution {
             })
         };
         Ok(Walk { candidates, refused, open, target })
+    }
+
+    /// The descriptors a run must not move files out from under, when its rules
+    /// ask for that. The private mergerfs daemon has to be readable among them.
+    fn open_identities(
+        journal: &Journal,
+        rules: &MoverRules,
+        open_files: &dyn Fn(u32) -> Result<BTreeSet<(u64, u64)>, String>,
+    ) -> Result<BTreeSet<(u64, u64)>, String> {
+        if !rules.skip_open_files {
+            return Ok(BTreeSet::new());
+        }
+        let daemon = journal
+            .private
+            .as_ref()
+            .and_then(|private| private.anchor.as_ref())
+            .map(|anchor| anchor.pid)
+            .ok_or("skip_open_files wymaga kotwicy prywatnego mergerfs")?;
+        open_files(daemon)
     }
 
     /// The writing half of a walk: every candidate that passes its checks and
@@ -5307,7 +6109,7 @@ pub(crate) mod execution {
                     return Err("rekord pliku przekroczyłby limit dziennika".into());
                 }
                 // Everything this operation could still write for the file,
-                // including the entry its Resume appends, must fit.
+                // including the entry its closing write appends, must fit.
                 if worst_case_journal_size(journal, &record)? > JOURNAL_LIMIT as usize {
                     return Err("dziennik z tym plikiem przekroczyłby limit odczytu".into());
                 }
@@ -5331,25 +6133,33 @@ pub(crate) mod execution {
             transfer.current = Some(record.clone());
             root.save(journal)?;
             host.checkpoint(&record)?;
-            if let FileOutcome::RolledBack(reason) =
-                finish_file(root, journal, &env.cache, &target.path, request.array_lock, record, host)?
-            {
-                note_issue(
-                    transfer_mut(journal)?,
-                    &file.path,
-                    ElasticMoverIssueKind::Refused,
-                    &format!("wycofano kopię: {reason}"),
-                    0,
-                );
-            }
+            let outcome = finish_file(root, journal, &env.cache, &target.path, request.array_lock, record, host)?;
+            note_outcome(journal, &file.path, file.size, outcome)?;
         }
         Ok(())
     }
 
-    /// One walk of the cache under the held Hold: finish the file in flight,
-    /// move the selected files that fit the target and run the Sync owed. A
-    /// walk that cannot go on is reported, and the Sync its operation owes
-    /// still runs before the run stops.
+    /// Counts a record that ended without moving its file.
+    fn note_outcome(journal: &mut Journal, path: &str, size: u64, outcome: FileOutcome) -> Result<(), String> {
+        let transfer = transfer_mut(journal)?;
+        match outcome {
+            FileOutcome::Moved => {}
+            FileOutcome::RolledBack(reason) => note_issue(
+                transfer,
+                path,
+                ElasticMoverIssueKind::Refused,
+                &format!("wycofano kopię: {reason}"),
+                0,
+            ),
+            FileOutcome::Skipped(reason) => note_issue(transfer, path, ElasticMoverIssueKind::Skipped, &reason, size),
+        }
+        Ok(())
+    }
+
+    /// One walk of the cache with the union serving: finish the file in
+    /// flight, move the selected files that fit the target and run the Sync
+    /// owed. A walk that cannot go on is reported on the run, and the Sync its
+    /// operation owes still runs.
     fn transfer_all(
         root: &Root,
         journal: &mut Journal,
@@ -5367,19 +6177,10 @@ pub(crate) mod execution {
         transfer.detail = None;
         root.save(journal)?;
         if let Some(file) = transfer_ref(journal)?.current.clone() {
-            let target = persisted_target(env, transfer_ref(journal)?)?;
-            let path = file.source.clone();
-            if let FileOutcome::RolledBack(reason) =
-                finish_file(root, journal, &env.cache, &target, request.array_lock, file, host)?
-            {
-                note_issue(
-                    transfer_mut(journal)?,
-                    &path,
-                    ElasticMoverIssueKind::Refused,
-                    &format!("wycofano kopię: {reason}"),
-                    0,
-                );
-            }
+            let target = persisted_target(&env.data, transfer_ref(journal)?)?;
+            let (path, size) = (file.source.clone(), file.source_identity.size);
+            let outcome = finish_file(root, journal, &env.cache, &target, request.array_lock, file, host)?;
+            note_outcome(journal, &path, size, outcome)?;
         }
         // The rules the operation announced: a restart runs under them
         // whatever its request carries.
@@ -5418,118 +6219,135 @@ pub(crate) mod execution {
                 });
             }
         }
-        if let Some(error) = walk_error {
-            return Err(error);
-        }
+        // Nothing is left in flight and nothing is inconsistent: a walk that
+        // stopped part-way is a partial run, reported on its issues and its
+        // unknown counts, and the next run walks again.
         let transfer = transfer_mut(journal)?;
         transfer.phase = ElasticMoverPhase::Complete;
         transfer.finished_at = Some(timestamp()?);
-        journal.detail = Some("service Hold: mover zakończony, wymagany Resume".into());
+        transfer.detail = transfer
+            .coupled_sync_result
+            .as_ref()
+            .filter(|run| run.outcome == ElasticSnapraidOutcome::Partial)
+            .map(|_| PARTIAL_SYNC_NOTE.to_string());
+        journal.detail = None;
         root.save(journal)
     }
 
-    /// Restore's mount plan and executor after a fresh boot, stopped before
-    /// publishing: the branches and a new private union come back, RO.
-    fn recover_private_mounts(
-        root: &Root,
-        journal: &mut Journal,
-        array_lock: &File,
-        boot: &str,
-        system: &mut dyn StepSystem,
-    ) -> Result<(), String> {
-        let spec = layout_with(&journal.spec, |disk| system.device(disk).map(|device| device.path))?;
-        for role in roles(&journal.spec) {
-            let device = system.device(role_disk(&journal.spec, role)?)?;
-            system.filesystem_matches(&journal.spec, role, &device)?;
-        }
-        if spec.has_parity() {
-            system.config_matches(&spec, root.uid)?;
-        }
-        let private = journal.private.as_mut().ok_or("brak prywatnej topologii")?;
-        private.anchor = None;
-        private.published = false;
-        journal.boot_id = boot.into();
-        journal.stage = ElasticStage::Mounting;
-        root.save(journal)?;
-        let mut observed = Observed::nothing_mounted();
-        for role in roles(&journal.spec) {
-            let device = system.device(role_disk(&journal.spec, role)?)?;
-            if system.branch_mounted(&journal.spec, role, &device)? {
-                observed.mounted.insert(mount_path(&journal.spec, role), true);
-            }
-        }
-        if system.union_mounted(&spec)? {
-            observed.mounted.insert(spec.union_path(), true);
-        }
-        let tools = system.tools(&spec)?;
-        let steps = plan_mount(&spec, &observed, &tools).map_err(|e| e.to_string())?;
-        execute_steps(root, array_lock, journal, &spec, steps, StepMode::Recover, system)?;
-        system.set_union_readonly(true)
+    /// What a run whose coupled Sync met files changing under it says.
+    const PARTIAL_SYNC_NOTE: &str =
+        "pliki zmieniały się podczas Sync; parity obejmie je następny Sync";
+
+    /// Whether the journal holds a file record a run left in flight that no
+    /// attempt has given up on: a record that must be finished or reversed
+    /// before clients may use the union. A stuck record (`current_failed`) is
+    /// no such thing: nothing ever reverses it, so nothing can later put an
+    /// old copy over what clients do meanwhile.
+    fn unsettled_record(journal: &Journal) -> bool {
+        journal.transfer.as_ref().is_some_and(|transfer| {
+            transfer.finished_at.is_none() && transfer.current.is_some() && transfer.current_failed.is_none()
+        })
     }
 
-    /// A fresh boot left the last durable state of an interrupted run: close
-    /// whatever was running as interrupted, forget mount intents the boot
-    /// made void, remount privately without publishing and stand the Hold up
-    /// again on the new private union.
-    fn recover_after_boot(
+    /// D1 (second review): the union is never published, and never switched
+    /// read-write, over an unsettled record. Until the record is settled the
+    /// phase on disk is the only witness of what happened to its files; clients
+    /// using the union meanwhile could replace or delete the file the record
+    /// would later reverse.
+    fn serving_guard(journal: &Journal) -> Result<(), String> {
+        if unsettled_record(journal) {
+            return Err("przenoszenie pliku przerwane i nierozstrzygnięte; unia nie zostanie udostępniona".into());
+        }
+        Ok(())
+    }
+
+    /// Settles the record a run left in flight, on the mounted branches, while
+    /// no client can reach them: Restore calls it after mounting and before it
+    /// publishes the union. The record ends moved, reversed, or stuck with both
+    /// copies kept; anything else leaves it unsettled and the union
+    /// unpublished (`serving_guard`), and the next Restore tries again.
+    fn settle_before_serving(
+        root: &Root,
+        journal: &mut Journal,
+        cache: &Path,
+        data: &[MoverTarget],
+        array_lock: &File,
+        host: &mut dyn MoverHost,
+    ) -> Result<(), String> {
+        if !unsettled_record(journal) {
+            return Ok(());
+        }
+        let transfer = transfer_ref(journal)?;
+        let file = transfer.current.clone().ok_or("brak rekordu w toku")?;
+        let target = persisted_target(data, transfer)?;
+        let (path, size) = (file.source.clone(), file.source_identity.size);
+        match finish_file(root, journal, cache, &target, array_lock, file, host) {
+            Ok(outcome) => note_outcome(journal, &path, size, outcome),
+            Err(_) if !unsettled_record(journal) => Ok(()),
+            Err(error) => Err(format!("rozstrzygnięcie przerwanego przenoszenia: {error}")),
+        }
+    }
+
+    /// The branch roots a record's files live under, as the mover sees them.
+    fn record_branches(spec: &ElasticSpec, journal: &Journal) -> Result<(PathBuf, Vec<MoverTarget>), String> {
+        let cache = spec.cache.first().ok_or("macierz nie ma cache")?;
+        Ok((
+            PathBuf::from(cache_branch_path(&spec.name, &cache.disk)),
+            spec.data
+                .iter()
+                .zip(&journal.spec.data)
+                .map(|(branch, disk)| MoverTarget {
+                    disk: branch.disk.clone(),
+                    disk_id: disk.disk_id.clone(),
+                    path: PathBuf::from(data_branch_path(&spec.name, &branch.disk)),
+                })
+                .collect(),
+        ))
+    }
+
+    /// Closes an unfinished run an interruption or a stuck record left, before
+    /// a new operation starts: its record in flight is finished or reversed
+    /// first, unless its last attempt already gave up on it, and whatever it
+    /// could not resolve goes to the stuck history. The Sync it owed is owed by
+    /// the journal's stale-parity marker, which the new run's Sync settles.
+    fn close_previous_run(
         root: &Root,
         journal: &mut Journal,
         request: &MoverRequest,
         env: &MoverEnv,
         host: &mut impl MoverHost,
     ) -> Result<(), String> {
-        let mut recovered = journal.clone();
-        close_interrupted_sync(&mut recovered, request.operation_id, "Sync przerwany zmianą boot")?;
-        // A new boot took every earlier mount with it: an intent to mount a
-        // branch, the union or the config describes nothing that still exists.
-        if matches!(
-            recovered.pending,
-            Some(Pending::Mount(_) | Pending::Union | Pending::Config)
-        ) {
-            recovered.pending = None;
+        let previous = transfer_ref(journal)?.clone();
+        // Its Sync cannot still run: SnapRAID would hold the array lock this
+        // run holds. It closes as an interrupted attempt with parity stale.
+        let mut interrupted = journal.clone();
+        if close_interrupted_sync(&mut interrupted, &previous.operation_id, "Sync przerwany; zamknięty przez następne przenoszenie")? {
+            root.save(&interrupted)?;
+            *journal = interrupted;
         }
-        if recovered.pending.is_some() {
-            return Err("po zmianie boot pozostał obcy pending".into());
+        if let Some(file) = previous.current.clone().filter(|_| previous.current_failed.is_none()) {
+            let target = persisted_target(&env.data, &previous)?;
+            let (path, size) = (file.source.clone(), file.source_identity.size);
+            match finish_file(root, journal, &env.cache, &target, request.array_lock, file, host) {
+                Ok(outcome) => note_outcome(journal, &path, size, outcome)?,
+                // A record that stuck is closed below with its failure kept.
+                Err(_) if transfer_ref(journal)?.current_failed.is_some() => {}
+                Err(error) => return Err(error),
+            }
         }
-        let transfer = transfer_mut(&mut recovered)?;
-        if transfer.phase != ElasticMoverPhase::NeedsAttention {
-            transfer.phase = ElasticMoverPhase::NeedsAttention;
-            transfer.detail = Some("transfer przerwany zmianą boot".into());
+        let mut closed = journal.clone();
+        let evicted = close_transfer(&mut closed)?;
+        root.save(&closed)?;
+        if let Some(dropped) = evicted {
+            log_eviction(&dropped);
         }
-        recovered.stage = ElasticStage::NeedsAttention;
-        root.save(&recovered)?;
-        *journal = recovered;
-        recover_private_mounts(root, journal, request.array_lock, &env.boot_id, host.steps())?;
-        let private = journal.private.as_ref().ok_or("brak prywatnej topologii")?;
-        if journal.boot_id != env.boot_id
-            || private.published
-            || !private.anchor.as_ref().is_some_and(|anchor| anchor.boot_id == env.boot_id)
-        {
-            return Err("odtworzenie po zmianie boot bez prywatnej, niepublikowanej unii".into());
-        }
-        if !host.steps().union_readonly()? {
-            return Err("odtworzona unia nie jest RO".into());
-        }
-        // Recover mode never publishes, so nothing else clears the union
-        // intent: the private union is confirmed here, whatever ran the steps.
-        match journal.pending {
-            None | Some(Pending::Union) => journal.pending = None,
-            Some(_) => return Err("odtworzenie zostawiło niedokończony krok montowania".into()),
-        }
-        // The new private union is RO: the Hold barrier stands again.
-        journal
-            .private
-            .as_mut()
-            .and_then(|private| private.service.as_mut())
-            .ok_or("brak stanu service")?
-            .pending = false;
-        journal.stage = ElasticStage::NeedsAttention;
-        root.save(journal)
+        *journal = closed;
+        Ok(())
     }
 
-    /// The whole mover operation under the one held array lock: Hold (or its
-    /// recovery after a boot), the per-file transfer, the coupled Sync and
-    /// Complete. Everything beyond the branches goes through `host`.
+    /// The whole mover operation under the one held array lock, with the union
+    /// published read-write throughout: the per-file transfer, the coupled
+    /// Sync and Complete. Everything beyond the branches goes through `host`.
     fn run_mover(
         root: &Root,
         journal: &mut Journal,
@@ -5549,39 +6367,46 @@ pub(crate) mod execution {
         if journal.spec.cache.is_none() {
             return Err("macierz nie ma cache".into());
         }
-        // A restart is the same operation under the same Resume. It runs with
-        // the rules and coupling that operation announced, so a core that lost
-        // its own intent can still finish it.
+        // A restart is the same operation under the same declared UUIDs. It
+        // runs with the rules and coupling that operation announced, so a core
+        // that lost its own intent can still finish it.
         let restarting = journal.transfer.as_ref().is_some_and(|transfer| {
             transfer.operation_id == request.operation_id
                 && transfer.resume_operation_id == request.resume_operation_id
         });
-        if journal
+        if journal.transfer.as_ref().is_some_and(|transfer| {
+            (transfer.operation_id == request.operation_id) != restarting
+        }) {
+            return Err("operacja movera nie zgadza się z zapowiedzianym Resume".into());
+        }
+        if journal.boot_id != env.boot_id {
+            return Err("po zmianie boot macierz wymaga Restore przed przenoszeniem".into());
+        }
+        // The only intent a run may find is a Sync of the mover operation it
+        // continues: its own on a restart, the unfinished one it closes first
+        // otherwise.
+        let continued_sync = journal
             .transfer
             .as_ref()
-            .is_some_and(|transfer| transfer.finished_at.is_none())
-            && !restarting
-        {
-            return Err("unfinished transfer wymaga tego samego operation_id i resume_operation_id".into());
-        }
-        let fresh = journal.boot_id != env.boot_id;
-        let owned_sync = Pending::Maintenance {
-            operation_id: request.operation_id.to_string(),
-            kind: ElasticSnapraidKind::Sync,
-        };
-        if journal.pending.as_ref().is_some_and(|pending| {
-            !(restarting
-                && (*pending == owned_sync
-                    || (fresh && matches!(pending, Pending::Mount(_) | Pending::Union | Pending::Config))))
-        }) {
+            .filter(|transfer| restarting || transfer.finished_at.is_none())
+            .map(|transfer| Pending::Maintenance {
+                operation_id: transfer.operation_id.clone(),
+                kind: ElasticSnapraidKind::Sync,
+            });
+        if journal.pending.as_ref().is_some_and(|pending| Some(pending) != continued_sync.as_ref()) {
             return Err("mover wymaga braku zwykłego pending".into());
         }
-        let hold = journal
+        // An older helper's mover left the union read-only under a Hold only
+        // its Resume releases. Nothing moves until that has happened.
+        if journal
             .private
             .as_ref()
             .and_then(|private| private.service.as_ref())
-            .filter(|service| service.mode == ElasticServiceMode::Hold)
-            .cloned();
+            .is_some_and(|service| service.mode == ElasticServiceMode::Hold || service.pending)
+        {
+            return Err("macierz jest w service Hold; wymagany Resume przed przenoszeniem".into());
+        }
+        host.verify_branches(journal)?;
         let array_id = journal.spec.array_id.clone();
         if restarting {
             let transfer = transfer_ref(journal)?;
@@ -5591,33 +6416,21 @@ pub(crate) mod execution {
             if transfer.finished_at.is_some() {
                 return Err("operacja movera została już zamknięta".into());
             }
-            if !hold.is_some_and(|service| {
-                service.operation_id == request.operation_id && (fresh || !service.pending)
-            }) {
-                return Err("wznowienie transferu wymaga potwierdzonego service Hold tej operacji".into());
-            }
-            if fresh {
-                if let Err(error) = recover_after_boot(root, journal, request, env, host) {
-                    let error = mark_attention(root, &array_id, request.operation_id, error);
+        } else {
+            if let Some(previous) = journal
+                .transfer
+                .as_ref()
+                .filter(|transfer| transfer.finished_at.is_none())
+                .map(|transfer| transfer.operation_id.clone())
+            {
+                if let Err(error) = close_previous_run(root, journal, request, env, host) {
+                    let error = mark_attention(root, &array_id, &previous, error);
                     if let Ok(stored) = root.load(&array_id) {
                         *journal = stored;
                     }
                     return Err(error);
                 }
             }
-            host.verify_branches(journal)?;
-            // The Hold barrier must still stand before anything moves.
-            if !host.steps().union_readonly()? {
-                return Err("wznowienie transferu wymaga unii potwierdzonej jako RO".into());
-            }
-        } else {
-            if fresh {
-                return Err("po zmianie boot mover wznawia wyłącznie własny niedokończony transfer".into());
-            }
-            if hold.is_some() {
-                return Err("mover wymaga Online przed rozpoczęciem Hold".into());
-            }
-            host.verify_branches(journal)?;
             let mut announced = journal.clone();
             announced.transfer = Some(TransferJournal {
                 operation_id: request.operation_id.into(),
@@ -5628,7 +6441,7 @@ pub(crate) mod execution {
                 coupled_sync: request.coupled_sync,
                 coupled_sync_result: None,
                 sync_attempt: 0,
-                phase: ElasticMoverPhase::Holding,
+                phase: ElasticMoverPhase::Announced,
                 target: None,
                 sequence: 0,
                 current: None,
@@ -5643,18 +6456,8 @@ pub(crate) mod execution {
                 walked: false,
                 detail: None,
             });
-            // The transfer is announced in the same durable write as the Hold
-            // intent, before the union goes RO.
-            if let Err(error) = enter_service_with(
-                root,
-                announced,
-                request.operation_id,
-                request.array_lock,
-                || host.steps().set_union_readonly(true),
-            ) {
-                return Err(mark_attention(root, &array_id, request.operation_id, error));
-            }
-            *journal = root.load(&array_id)?;
+            root.save(&announced)?;
+            *journal = announced;
         }
         if let Err(error) = transfer_all(root, journal, request, env, host) {
             let error = mark_attention(root, &array_id, request.operation_id, error);
@@ -5679,10 +6482,8 @@ pub(crate) mod execution {
             || transfer.current.is_some()
             // Never overwrite another operation's intent.
             || prepared.pending.as_ref().is_some_and(|pending| *pending != owned)
-            || prepared.private.as_ref().and_then(|private| private.service.as_ref())
-                .is_none_or(|service| service.mode != ElasticServiceMode::Hold)
         {
-            return Err("coupled Sync wymaga własnego transferu w Hold po zakończeniu plików".into());
+            return Err("coupled Sync wymaga własnego transferu po zakończeniu plików".into());
         }
         let attempt = transfer.sync_attempt
             .checked_add(1).ok_or("przepełnienie licznika prób sync")?;
@@ -5712,7 +6513,7 @@ pub(crate) mod execution {
                 .transfer
                 .as_ref()
                 .and_then(|transfer| transfer.coupled_sync_result.as_ref())
-                .is_some_and(|run| coupled_sync_success(run, operation_id))
+                .is_some_and(|run| coupled_sync_settled(run, operation_id))
         {
             return Ok(());
         }
@@ -5751,7 +6552,7 @@ pub(crate) mod execution {
             || post_guard(&guard_journal),
             true,
         ) {
-            Ok(run) if run.outcome == ElasticSnapraidOutcome::Succeeded => Ok(()),
+            Ok(run) if matches!(run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial) => Ok(()),
             Ok(run) => Err(run.detail.unwrap_or_else(|| "proces SnapRAID nie zakończył się sukcesem".into())),
             Err(error) => {
                 // An attempt recorded as Running must not outlive this call.
@@ -5765,16 +6566,11 @@ pub(crate) mod execution {
         }
     }
 
-    /// The production host: the private worker of this invocation.
-    struct WorkerHost<'a, 'w> {
-        steps: LiveSteps<'a, 'w>,
-    }
-
-    impl MoverHost for WorkerHost<'_, '_> {
-        fn steps(&mut self) -> &mut dyn StepSystem {
-            &mut self.steps
-        }
-
+    /// The live system is also the mover's production host: the same worker
+    /// serves the mount steps and the per-file transfer, so the settle between
+    /// the halves of a Restore's mount plan can ask for it
+    /// (`StepSystem::settle_host`).
+    impl MoverHost for LiveSteps<'_, '_> {
         fn verify_branches(&mut self, journal: &Journal) -> Result<(), String> {
             // An unmounted mountpoint would hand the walk an empty directory
             // of the root filesystem.
@@ -5805,6 +6601,24 @@ pub(crate) mod execution {
         }
     }
 
+    /// The read-only half of a mover walk, run inside the array's namespace
+    /// where its cache branch is mounted.
+    fn probe_cache_age(journal: &Journal, rules: &MoverRules) -> Result<ElasticCacheAge, String> {
+        rules.validate().map_err(|error| error.to_string())?;
+        if journal.spec.cache.is_none() {
+            return Err("macierz nie ma cache".into());
+        }
+        let cache = PathBuf::from(mount_path(&journal.spec, ElasticRole::Cache));
+        let entries = crate::elastic_transfer::scan_cache(&cache, walk_prunes(rules))?;
+        let open = open_identities(journal, rules, &crate::elastic_transfer::open_file_identities)?;
+        let stuck = journal
+            .stuck_paths
+            .iter()
+            .map(|path| path.path_sha256.clone())
+            .collect();
+        Ok(cache_age(entries, rules, &stuck, &open, now_ns()?))
+    }
+
     fn mover(
         root: &Root,
         journal: &mut Journal,
@@ -5812,34 +6626,23 @@ pub(crate) mod execution {
         worker: &mut Worker<'_>,
     ) -> Result<ElasticMoverResult, String> {
         let spec = layout(&journal.spec, &inventory()?)?;
-        let cache = spec.cache.first().ok_or("macierz nie ma cache")?;
+        let (cache, data) = record_branches(&spec, journal)?;
         let space = |path: &Path| -> Result<(u64, u64), String> {
             let (size, _, free) = capacity(path.to_str().ok_or("ścieżka brancha nie jest UTF-8")?)?;
             Ok((size, free))
         };
         let env = MoverEnv {
-            cache: PathBuf::from(cache_branch_path(&spec.name, &cache.disk)),
-            data: spec
-                .data
-                .iter()
-                .zip(&journal.spec.data)
-                .map(|(branch, disk)| MoverTarget {
-                    disk: branch.disk.clone(),
-                    disk_id: disk.disk_id.clone(),
-                    path: PathBuf::from(data_branch_path(&spec.name, &branch.disk)),
-                })
-                .collect(),
+            cache,
+            data,
             min_free_bytes: min_free_space_bytes(&spec)?,
             space: &space,
             open_files: &crate::elastic_transfer::open_file_identities,
             now_ns: now_ns()?,
             boot_id: boot_id()?,
         };
-        let mut host = WorkerHost {
-            steps: LiveSteps { worker: Some(worker) },
-        };
+        let mut host = LiveSteps { worker: Some(worker) };
         run_mover(root, journal, request, &env, &mut host)?;
-        let state = observe(journal, host.steps.worker.as_deref());
+        let state = observe(journal, host.worker.as_deref());
         let run = state.last_mover.clone().ok_or("brak wyniku movera")?;
         Ok(ElasticMoverResult { state, run })
     }
@@ -5884,6 +6687,22 @@ pub(crate) mod execution {
         day >= 1 && day <= days[(month - 1) as usize]
     }
 
+    /// A coupled Sync of this operation that left parity current, or that ran
+    /// to its end with only files changing under it (`Partial`).
+    fn coupled_sync_settled(run: &ElasticSnapraidRun, operation_id: &str) -> bool {
+        coupled_sync_success(run, operation_id)
+            || (run.operation_id == operation_id
+                && run.kind == ElasticSnapraidKind::Sync
+                && run.outcome == ElasticSnapraidOutcome::Partial
+                && run.finished_at.as_ref().is_some_and(|finished| {
+                    valid_timestamp(finished) && valid_timestamp(&run.started_at) && finished.as_str() >= run.started_at.as_str()
+                })
+                && run.exit_code == Some(1)
+                && run.errors_file.is_some_and(|value| value > 0)
+                && run.errors_io == Some(0)
+                && run.errors_data == Some(0))
+    }
+
     fn coupled_sync_success(run: &ElasticSnapraidRun, operation_id: &str) -> bool {
         run.operation_id == operation_id
             && run.kind == ElasticSnapraidKind::Sync
@@ -5916,14 +6735,17 @@ pub(crate) mod execution {
         Create,
         /// Restore: never formats; publishes the union.
         Restore,
-        /// Mover recovery after a boot: never formats and never publishes;
-        /// the private union waits under Hold for the declared Resume.
-        Recover,
         /// Adding one data disk to a LIVE array: formats exactly the slot the
         /// journal has just gained, mounts it, adds it to the running union
         /// and syncs. It never mounts a union of its own — the one that is
         /// already serving is the point — so `MergerfsMount` stays refused.
         AddDisk,
+        /// Replacing the disk of one data slot: formats exactly that slot,
+        /// whose role the identity swap took out of `formatted`. It mounts
+        /// nothing and syncs nothing — the Restore that follows mounts every
+        /// branch and publishes the union, and the rebuild and the Sync run as
+        /// their own recorded operations.
+        Replace,
     }
 
     /// The effects below `execute_steps`: devices, filesystems, mounts, tools
@@ -5964,10 +6786,11 @@ pub(crate) mod execution {
         fn has_worker(&self) -> bool;
         fn start_mergerfs(&mut self, program: &Path, args: &[String], log: &File) -> Result<Anchor, String>;
         fn publish(&mut self, anchor: &Anchor) -> Result<(), String>;
-        fn set_union_readonly(&mut self, readonly: bool) -> Result<(), String>;
-        fn union_readonly(&mut self) -> Result<bool, String>;
-        fn config_matches(&mut self, spec: &ElasticSpec, uid: u32) -> Result<(), String>;
-        fn tools(&mut self, spec: &ElasticSpec) -> Result<Tools, String>;
+        /// The mover host over this same system, when it has a private worker:
+        /// what the settle between the halves of a mount plan drives the
+        /// per-file transfer through. `None` means there is no private array
+        /// here, and so no record to settle.
+        fn settle_host(&mut self) -> Option<&mut dyn MoverHost>;
     }
 
     /// The live system: real devices and tools, and the private worker if any.
@@ -6059,6 +6882,10 @@ pub(crate) mod execution {
             self.worker.is_some()
         }
 
+        fn settle_host(&mut self) -> Option<&mut dyn MoverHost> {
+            self.worker.is_some().then(|| self as &mut dyn MoverHost)
+        }
+
         fn start_mergerfs(&mut self, program: &Path, args: &[String], log: &File) -> Result<Anchor, String> {
             self.worker
                 .as_deref_mut()
@@ -6074,34 +6901,26 @@ pub(crate) mod execution {
                 .map(|_| ())
         }
 
-        fn set_union_readonly(&mut self, readonly: bool) -> Result<(), String> {
-            self.worker
-                .as_deref_mut()
-                .ok_or("brak prywatnego wykonawcy")?
-                .set_union_readonly(readonly)
-        }
+    }
 
-        fn union_readonly(&mut self) -> Result<bool, String> {
-            self.worker
-                .as_deref()
-                .ok_or("brak prywatnego wykonawcy")?
-                .union_readonly()
-        }
-
-        fn config_matches(&mut self, spec: &ElasticSpec, uid: u32) -> Result<(), String> {
-            let mut content = String::new();
-            private_file(Path::new(&spec.config_path()), uid)?
-                .read_to_string(&mut content)
-                .map_err(|e| e.to_string())?;
-            if content != snapraid_config(spec).map_err(|e| e.to_string())? {
-                return Err("konfiguracja niezgodna z journalem".into());
-            }
-            Ok(())
-        }
-
-        fn tools(&mut self, spec: &ElasticSpec) -> Result<Tools, String> {
-            Tools::resolve(spec).map_err(|e| e.to_string())
-        }
+    /// The Restore's mount sequence: the branch mounts, then `settle` on those
+    /// branches, then the union — whose step publishes it. The ORDER is the
+    /// guarantee: `publish_private` refuses an unsettled record, so a Restore
+    /// that published first would fail instead of settling (W-A of the third
+    /// review), and one Restore has to be enough.
+    fn mount_then_settle(
+        root: &Root,
+        array_lock: &File,
+        journal: &mut Journal,
+        plan: &ElasticSpec,
+        steps: Vec<ElasticStep>,
+        system: &mut dyn StepSystem,
+        settle: &mut dyn FnMut(&mut Journal, &mut dyn StepSystem) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let (branches, union) = split_before_union(steps, &plan.union_path());
+        execute_steps(root, array_lock, journal, plan, branches, StepMode::Restore, system)?;
+        settle(journal, system)?;
+        execute_steps(root, array_lock, journal, plan, union, StepMode::Restore, system)
     }
 
     fn execute_steps(
@@ -6113,11 +6932,6 @@ pub(crate) mod execution {
         mode: StepMode,
         system: &mut dyn StepSystem,
     ) -> Result<(), String> {
-        // Recovery stands its union up in a private namespace; without a
-        // worker the executor would mount it in the host namespace, public.
-        if mode == StepMode::Recover && !system.has_worker() {
-            return Err("odtworzenie wymaga prywatnego wykonawcy".into());
-        }
         let locks = [root.node_lock.as_raw_fd(), array_lock.as_raw_fd()];
         for step in steps {
             match step {
@@ -6133,8 +6947,8 @@ pub(crate) mod execution {
                     // slot the journal has just gained, which the `formatted`
                     // check below is what actually enforces — every older
                     // slot is already in it.
-                    if !matches!(mode, StepMode::Create | StepMode::AddDisk) {
-                        return Err("tylko create i dodanie dysku formatują".into());
+                    if !matches!(mode, StepMode::Create | StepMode::AddDisk | StepMode::Replace) {
+                        return Err("tylko create, dodanie dysku i wymiana formatują".into());
                     }
                     let role = plan_role(plan, &device)?;
                     if journal.formatted.contains(&role) || journal.pending.is_some() {
@@ -6261,11 +7075,7 @@ pub(crate) mod execution {
                         if !system.union_mounted(plan)? {
                             return Err("brak potwierdzonej prywatnej unii".into());
                         }
-                        // Recovery stops here: its caller confirms the private
-                        // union and clears the union intent without publishing.
-                        if mode != StepMode::Recover {
-                            publish_private(root, journal, |anchor| system.publish(anchor))?;
-                        }
+                        publish_private(root, journal, |anchor| system.publish(anchor))?;
                         continue;
                     }
                     // Demon FUSE nie dziedziczy blokad krótkich operacji dyskowych.
@@ -6380,7 +7190,15 @@ pub(crate) mod execution {
                     let service_operation_id = service.operation_id.clone();
                     completed.private.as_mut().ok_or("brak prywatnej topologii")?.service.as_mut()
                         .ok_or("brak stanu service")?.pending = false;
-                    evicted = close_transfer(&mut completed, &service_operation_id)?;
+                    // The run the released Hold belonged to is closed, unless a
+                    // file of it is still in flight: the next run finishes or
+                    // reverses that record and closes the run itself.
+                    if completed.transfer.as_ref().is_some_and(|transfer| {
+                        transfer.resume_operation_id == service_operation_id
+                            && !(transfer.current.is_some() && transfer.current_failed.is_none())
+                    }) {
+                        evicted = close_transfer(&mut completed)?;
+                    }
                 }
                 completed.stage = ElasticStage::Ready;
                 completed.detail = None;
@@ -6408,6 +7226,7 @@ pub(crate) mod execution {
         journal: &mut Journal,
         publish: impl FnOnce(&Anchor) -> Result<(), String>,
     ) -> Result<(), String> {
+        serving_guard(journal)?;
         let private = journal.private.as_mut().ok_or("brak private journala")?;
         let anchor = private.anchor.clone().ok_or("brak trwałej kotwicy")?;
         private.published = false;
@@ -6427,6 +7246,38 @@ pub(crate) mod execution {
         Ok(())
     }
 
+    /// What a log that passed its contract says the run did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SnapraidVerdict {
+        Complete,
+        /// A repair that ran to its end and wrote nothing: it is reported as
+        /// `NothingRepaired`, which is not a success (see that outcome).
+        NothingWritten,
+        /// A Sync that ran to its end and skipped only files that changed or
+        /// disappeared while it ran. snapraid 13.0 (`cmdline/sync.c`) reports
+        /// each such block as `error:<block>:<disk>:<file>: Unexpected attribute
+        /// change` or `...: Open ENOENT error.`, counts it in
+        /// `summary:error_file`, ends with `summary:exit:error`, prints
+        /// "WARNING! Unexpected file errors!" and exits 1 — while the source
+        /// calls it "not a serious error ... Rerun the sync command". Measured
+        /// on rig11 (2026-09-17): a Sync over files being appended to logged
+        /// 9 815 such tags, `summary:error_file:9815`, `error_io:0`,
+        /// `error_data:0`, "100% completed" and exit 1, and the next Sync of
+        /// the unchanged files ended "Everything OK" with exit 0.
+        FilesChanged,
+    }
+
+    /// `msg:error:` lines snapraid writes next to a changed-file tag, and
+    /// only there.
+    const CHANGED_FILE_MESSAGES: [&str; 6] = [
+        "msg:error: Unexpected size change at file '",
+        "msg:error: Unexpected time change at file '",
+        "msg:error: Unexpected inode change from ",
+        "msg:error: WARNING! You cannot modify files during a sync.",
+        "msg:error: Rerun the sync command when finished.",
+        "msg:error: Missing file '",
+    ];
+
     #[derive(Default)]
     struct SnapraidLog {
         fields: BTreeMap<String, Vec<String>>,
@@ -6434,6 +7285,12 @@ pub(crate) mod execution {
         nothing: usize,
         nothing_status: usize,
         clean: usize,
+        /// `error:` tags of a file that changed or vanished during the run.
+        changed_files: u64,
+        /// The `argv:` lines: what the tool was actually invoked with.
+        argv: Vec<String>,
+        /// A verdict marker that is anything else.
+        other_fault: bool,
         /// Markers in the tool's OWN log that are a verdict — `error:`,
         /// `parity_error:`, `msg:error:` — verbatim and bounded, so a run can
         /// say what the tool actually reported instead of only that something
@@ -6534,6 +7391,12 @@ pub(crate) mod execution {
                 if line == "msg:status: Nothing to do" {
                     result.nothing_status += 1;
                 }
+                if let Some((_, value)) = line.strip_prefix("argv:").and_then(|rest| rest.split_once(':')) {
+                    if result.argv.len() >= 64 {
+                        return Err("zbyt wiele argumentów w logu".into());
+                    }
+                    result.argv.push(value.to_string());
+                }
                 let prefix = if line.starts_with("summary:") {
                     "summary:"
                 } else if line.starts_with("conf:file:") {
@@ -6574,6 +7437,17 @@ pub(crate) mod execution {
                     || line.starts_with("msg:error:")
                 {
                     record_marker(&mut result.fault, line);
+                    // A tag is `error:<block>:<disk>:<file>: <message>`; the
+                    // file is escaped, so the message follows the last ": ".
+                    let changed_tag = line.starts_with("error:")
+                        && line.rsplit_once(": ").is_some_and(|(_, message)| {
+                            message == "Unexpected attribute change" || message.starts_with("Open ENOENT error.")
+                        });
+                    if changed_tag {
+                        result.changed_files += 1;
+                    } else if !CHANGED_FILE_MESSAGES.iter().any(|message| line.starts_with(message)) {
+                        result.other_fault = true;
+                    }
                 }
                 // `msg:fatal:` is snapraid's marker for "something you should
                 // know", not for "this run failed": it carries advice and
@@ -6622,7 +7496,9 @@ pub(crate) mod execution {
                         | "summary:moved"
                         | "summary:copied"
                         | "summary:restored"
-                ) {
+                ) && !(command == "fix"
+                    && matches!(key.as_str(), "summary:error" | "summary:error_recovered" | "summary:error_unrecoverable"))
+                {
                     return Err("nieznane podsumowanie narzędzia".into());
                 }
             }
@@ -6662,7 +7538,7 @@ pub(crate) mod execution {
             run: &mut ElasticSnapraidRun,
             spec: &ElasticSpec,
             empty_parity: bool,
-        ) -> Result<(), String> {
+        ) -> Result<SnapraidVerdict, String> {
             let command = match &run.kind {
                 ElasticSnapraidKind::Sync => "sync",
                 ElasticSnapraidKind::Scrub => "scrub",
@@ -6673,27 +7549,11 @@ pub(crate) mod execution {
             run.errors_file = self.number("summary:error_file")?;
             run.errors_io = self.number("summary:error_io")?;
             run.errors_data = self.number("summary:error_data")?;
-            if matches!(run.kind, ElasticSnapraidKind::Fix { .. }) {
-                // A repair REPORTS the errors it repaired, so nonzero counters
-                // are its success and not its failure, and the `error:` /
-                // `parity_error:` lines name the blocks it rebuilt from
-                // parity. Judging a fix by the rules below would fail every
-                // run that actually did something. The verdict is the tool's
-                // own exit summary plus the exit code `perform_maintenance`
-                // checks, and the counters travel with the run as the record
-                // of how much was recovered.
-                //
-                // UNVERIFIED (snapraid 14.7): `-d <disk> fix` has never been
-                // run against this parser — `snapraid_args` carries the same
-                // note. A summary key `identity` does not know therefore fails
-                // the run, and that direction is deliberate: a repair reported
-                // as needing attention is recoverable by reading the run, a
-                // repair falsely reported as complete is not.
-                if self.field("summary:exit") != ["ok"] {
-                    return Err("niepełne zakończenie fix".into());
-                }
-                run.accessed_mb = self.progress.first().map(|(_, mb)| *mb);
-                return Ok(());
+            if let ElasticSnapraidKind::Fix { disk } = run.kind.clone() {
+                return self.repair(run, spec, &disk);
+            }
+            if run.kind == ElasticSnapraidKind::Sync && self.changed_files > 0 && !self.other_fault {
+                return self.changed_files_sync(run);
             }
             // Only the markers that ARE a verdict stop the run here, and the
             // reason names what the tool said. A `msg:fatal:` advisory does
@@ -6722,7 +7582,7 @@ pub(crate) mod execution {
                     && self.field("summary:exit") == [scan]
                 {
                     run.total_blocks = Some(0);
-                    return Ok(());
+                    return Ok(SnapraidVerdict::Complete);
                 }
                 if self.field("summary:exit") != [scan, "ok"] {
                     return Err("niepełne zakończenie sync".into());
@@ -6757,7 +7617,113 @@ pub(crate) mod execution {
                 return Err("brak liczników błędów".into());
             }
             run.accessed_mb = self.progress.first().map(|(_, mb)| *mb);
-            Ok(())
+            Ok(SnapraidVerdict::Complete)
+        }
+
+        /// The contract of a repair, from its own log.
+        ///
+        /// The invocation is read back from the log's `argv:` lines and must be
+        /// one of the two filtered repairs `FixScope` allows: a log of any other
+        /// `fix` fails the run whatever it recovered. A repair REPORTS the
+        /// errors it met, so its `error:` lines are its work, not its failure;
+        /// the verdict is the summary. MEASURED (snapraid 13.0-1): the summary
+        /// is `summary:error`, `summary:error_recovered`,
+        /// `summary:error_unrecoverable` and `summary:exit` — `ok` with nothing
+        /// to do, otherwise `recovered` EVEN WHEN NOTHING WAS RECOVERED (a
+        /// block of a file rewritten since the last Sync is counted and
+        /// skipped), so the counters decide.
+        fn repair(&self, run: &mut ElasticSnapraidRun, spec: &ElasticSpec, disk: &str) -> Result<SnapraidVerdict, String> {
+            let config = spec.config_path();
+            let invoked: Vec<&str> = self.argv.iter().skip(1).map(String::as_str).collect();
+            let args = match invoked.as_slice() {
+                ["-l", _, args @ ..] => args,
+                _ => return Err("log naprawy bez wywołania".into()),
+            };
+            let scope = if args == ["-c", config.as_str(), "-e", "fix"] {
+                FixScope::MarkedBlocks
+            } else if args == ["-c", config.as_str(), "-d", disk, "fix"] {
+                FixScope::ReplacedDisk
+            } else {
+                return Err("naprawa uruchomiona bez bezpiecznego filtra".into());
+            };
+            let count = |key: &str| -> Result<u64, String> {
+                self.number(key)?.ok_or_else(|| format!("niepełne podsumowanie fix: {key}"))
+            };
+            let (errors, recovered, unrecoverable) =
+                (count("summary:error")?, count("summary:error_recovered")?, count("summary:error_unrecoverable")?);
+            if unrecoverable != 0 {
+                return Err(format!("naprawa: {unrecoverable} błędów nie do odzyskania z parity"));
+            }
+            if recovered > errors {
+                return Err("niespójne liczniki naprawy".into());
+            }
+            let exit: Vec<&str> = self.field("summary:exit").iter().map(String::as_str).collect();
+            if !matches!(self.progress.as_slice(), [] | [(100, _)]) {
+                return Err("niepełna praca fix".into());
+            }
+            run.accessed_mb = self.progress.first().map(|(_, mb)| *mb);
+            // A REPAIR THAT WROTE NOTHING IS NOT A SUCCESS. snapraid says
+            // "Everything OK" and exits 0 for it — measured with `-e fix` and
+            // no scrub behind it, and with `-e fix` over a file rewritten
+            // since the Sync — so only the counters tell the two apart.
+            let verdict = match (exit.as_slice(), scope) {
+                (["ok"], _) if errors == 0 => {
+                    run.detail = Some(
+                        "nic nie naprawiono: parity nie ma zaznaczonych błędów — uruchom scrub, który je zaznaczy, \
+                         albo wymień dysk"
+                            .into(),
+                    );
+                    SnapraidVerdict::NothingWritten
+                }
+                (["recovered"], _) if recovered == 0 => {
+                    run.detail = Some(format!(
+                        "nic nie naprawiono: wszystkie {errors} zaznaczonych bloków należą do plików zmienionych \
+                         od ostatniego Sync, a tych naprawa nie dotyka"
+                    ));
+                    SnapraidVerdict::NothingWritten
+                }
+                (["recovered"], _) if recovered == errors => {
+                    run.detail = Some(format!("naprawiono {recovered} bloków"));
+                    SnapraidVerdict::Complete
+                }
+                // `-e` repairs only files unchanged since the last Sync; the
+                // rest of what the Scrub marked belongs to files users have
+                // rewritten since, which the next Sync covers.
+                (["recovered"], FixScope::MarkedBlocks) => {
+                    run.detail = Some(format!(
+                        "naprawiono {recovered} z {errors} bloków; pozostałe należą do plików zmienionych od ostatniego Sync"
+                    ));
+                    SnapraidVerdict::Complete
+                }
+                _ => return Err("niepełne zakończenie fix".into()),
+            };
+            Ok(verdict)
+        }
+
+        /// The contract of a Sync that skipped files changing under it, with
+        /// the same demand for positive evidence as a clean one: the whole
+        /// summary, the run carried to 100%, file errors only, and none of the
+        /// markers that mean anything else.
+        fn changed_files_sync(&self, run: &mut ElasticSnapraidRun) -> Result<SnapraidVerdict, String> {
+            let scan = if self.scan()? { "diff" } else { "equal" };
+            if self.field("summary:exit") != [scan, "error"]
+                || run.errors_io != Some(0)
+                || run.errors_data != Some(0)
+                || !run.errors_file.is_some_and(|count| count > 0)
+                || !matches!(self.progress.as_slice(), [(100, _)])
+                || self.clean != 0
+                || self.nothing != 0
+            {
+                return Err(bounded_text(
+                    &format!(
+                        "niepełne zakończenie sync ze zmienionymi plikami: {}",
+                        self.fault.as_deref().unwrap_or("")
+                    ),
+                    TRANSFER_DETAIL_LIMIT,
+                ));
+            }
+            run.accessed_mb = self.progress.first().map(|(_, mb)| *mb);
+            Ok(SnapraidVerdict::FilesChanged)
         }
     }
 
@@ -6928,11 +7894,27 @@ pub(crate) mod execution {
         Ok((status.code(), parsed))
     }
 
+    /// A manual SnapRAID operation. A repair started by an admin only ever
+    /// fixes the blocks a Scrub marked bad (`FixScope::MarkedBlocks`); the
+    /// whole-disk rebuild belongs to the replacement flow, which asks for it
+    /// by name.
     fn maintenance(
+        root: &Root,
+        journal: Journal,
+        operation_id: &str,
+        kind: ElasticSnapraidKind,
+        worker: Option<&Worker>,
+        held_array_lock: Option<&File>,
+    ) -> Result<ElasticSnapraidResult, String> {
+        maintenance_with_scope(root, journal, operation_id, kind, FixScope::MarkedBlocks, worker, held_array_lock)
+    }
+
+    fn maintenance_with_scope(
         root: &Root,
         mut journal: Journal,
         operation_id: &str,
         kind: ElasticSnapraidKind,
+        scope: FixScope,
         worker: Option<&Worker>,
         held_array_lock: Option<&File>,
     ) -> Result<ElasticSnapraidResult, String> {
@@ -7072,7 +8054,7 @@ pub(crate) mod execution {
         let action = match &kind {
             ElasticSnapraidKind::Sync => SnapraidAction::Sync,
             ElasticSnapraidKind::Scrub => SnapraidAction::Scrub,
-            ElasticSnapraidKind::Fix { disk } => SnapraidAction::Fix { disk: disk.clone() },
+            ElasticSnapraidKind::Fix { disk } => SnapraidAction::Fix { disk: disk.clone(), scope },
         };
         // `snapraid_args` refuses a disk this array does not carry, and that
         // refusal is a hard error rather than a recorded refusal on purpose:
@@ -7105,10 +8087,15 @@ pub(crate) mod execution {
         spec: &ElasticSpec,
         operation: impl FnOnce() -> Result<(Option<i32>, Result<SnapraidLog, String>), String>,
         post_guard: impl FnOnce() -> Result<bool, String>,
-        hold_after_success: bool,
+        coupled: bool,
     ) -> Result<ElasticSnapraidRun, String> {
         let kind = run.kind.clone();
-        if hold_after_success {
+        // What the array looked like before this run: a repair that wrote
+        // nothing puts it back exactly, because nothing about the array
+        // changed and the fault it was started for is still there.
+        let stage_before = journal.stage;
+        let detail_before = journal.detail.clone();
+        if coupled {
             let transfer = journal.transfer.as_ref().ok_or("mover Sync wymaga trwałego transferu")?;
             let owned = Pending::Maintenance {
                 operation_id: run.operation_id.clone(),
@@ -7119,10 +8106,8 @@ pub(crate) mod execution {
                 || run.outcome != ElasticSnapraidOutcome::Running
                 || journal.pending.as_ref().is_some_and(|pending| *pending != owned)
                 || transfer.current.is_some()
-                || journal.private.as_ref().and_then(|private| private.service.as_ref())
-                    .is_none_or(|service| service.mode != ElasticServiceMode::Hold)
             {
-                return Err("mover Sync wymaga zgodnego transferu w Hold".into());
+                return Err("mover Sync wymaga zgodnego transferu".into());
             }
         }
         journal.last_run = Some(run.clone());
@@ -7145,12 +8130,18 @@ pub(crate) mod execution {
             run.exit_code = *code;
             let log = parsed.as_ref().map_err(Clone::clone)?;
             let checked = post_guard();
-            let parsed = log.apply(&mut run, spec, checked.as_ref().copied().unwrap_or(false));
+            let verdict = log.apply(&mut run, spec, checked.as_ref().copied().unwrap_or(false));
             checked?;
-            if *code != Some(0) {
-                return Err("proces SnapRAID nie zakończył się sukcesem".into());
+            // The exit code is read together with the log: snapraid exits 1
+            // for a Sync that skipped files changing under it, and only the
+            // log says that this is all it did.
+            match (verdict, *code) {
+                (Ok(SnapraidVerdict::FilesChanged), Some(1)) => Ok(SnapraidVerdict::FilesChanged),
+                (Ok(SnapraidVerdict::Complete), Some(0)) => Ok(SnapraidVerdict::Complete),
+                (Ok(SnapraidVerdict::NothingWritten), Some(0)) => Ok(SnapraidVerdict::NothingWritten),
+                (Err(error), Some(0)) => Err(error),
+                _ => Err("proces SnapRAID nie zakończył się sukcesem".to_string()),
             }
-            parsed
         });
         // What the tool said on stderr or under `msg:fatal:`, whatever the
         // verdict was. It rides in the RUN's detail, where an operator reads
@@ -7167,23 +8158,51 @@ pub(crate) mod execution {
             (Err(error), Some(warning)) => Err(format!("{error}; {SNAPRAID_WARNING_PREFIX}{warning}")),
             (outcome, _) => outcome,
         };
+        let with_warning = |text: Option<String>| {
+            let text = match (text, &warning) {
+                (Some(text), Some(warning)) => Some(format!("{text}; {SNAPRAID_WARNING_PREFIX}{warning}")),
+                (None, Some(warning)) => Some(format!("{SNAPRAID_WARNING_PREFIX}{warning}")),
+                (text, None) => text,
+            };
+            text.map(|text| bounded_text(&text, TRANSFER_DETAIL_LIMIT))
+        };
         match outcome {
-            Ok(()) => {
+            Ok(SnapraidVerdict::Complete) => {
                 run.outcome = ElasticSnapraidOutcome::Succeeded;
-                run.detail = warning.map(|warning| {
-                    bounded_text(
-                        &format!("{SNAPRAID_WARNING_PREFIX}{warning}"),
-                        TRANSFER_DETAIL_LIMIT,
-                    )
-                });
+                // Only a repair says what it did here (`SnapraidLog::repair`).
+                run.detail = with_warning(run.detail.take());
                 if kind == ElasticSnapraidKind::Sync {
                     journal.sync_completed_at = run.finished_at.clone();
                     journal.stale_parity_bytes = None;
                     journal.stale_sync_operation = None;
                 }
                 journal.pending = None;
-                journal.stage = if hold_after_success { ElasticStage::NeedsAttention } else { ElasticStage::Ready };
+                journal.stage = ElasticStage::Ready;
                 journal.detail = None;
+            }
+            // The union was serving throughout, so files may change under a
+            // Sync; snapraid then skips exactly their blocks. Parity is not
+            // current, which the stale marker says, and the checkpoint stays
+            // where the last complete Sync put it. Nothing needs an admin.
+            Ok(SnapraidVerdict::FilesChanged) => {
+                run.outcome = ElasticSnapraidOutcome::Partial;
+                run.detail = with_warning(Some(PARTIAL_SYNC_NOTE.to_string()));
+                journal.stale_parity_bytes.get_or_insert(0);
+                journal.stale_sync_operation = Some(run.operation_id.clone());
+                journal.pending = None;
+                journal.stage = ElasticStage::Ready;
+                journal.detail = None;
+            }
+            // A REPAIR THAT WROTE NOTHING. The run says what it could not do
+            // and the array is left exactly as it was: the scrub row that
+            // reported the fault still holds it, so the product keeps offering
+            // the way forward instead of declaring the array healthy.
+            Ok(SnapraidVerdict::NothingWritten) => {
+                run.outcome = ElasticSnapraidOutcome::NothingRepaired;
+                run.detail = with_warning(run.detail.take());
+                journal.pending = None;
+                journal.stage = stage_before;
+                journal.detail = detail_before.clone();
             }
             Err(error) => {
                 run.outcome = if run.exit_code.is_some_and(|code| code != 0) {
@@ -7192,15 +8211,23 @@ pub(crate) mod execution {
                     ElasticSnapraidOutcome::NeedsAttention
                 };
                 run.detail = Some(bounded_text(&error, TRANSFER_DETAIL_LIMIT));
-                journal.stage = ElasticStage::NeedsAttention;
-                journal.detail = Some(bounded_text(&error, TRANSFER_DETAIL_LIMIT));
+                // A manual run that failed is the array's to resolve. A mover's
+                // coupled Sync that failed is its run's: parity is marked stale
+                // below and the next run owes the Sync again.
+                if coupled {
+                    journal.stage = settled_stage(journal);
+                    journal.detail = None;
+                } else {
+                    journal.stage = ElasticStage::NeedsAttention;
+                    journal.detail = Some(bounded_text(&error, TRANSFER_DETAIL_LIMIT));
+                }
             }
         }
         journal.last_run = Some(run.clone());
-        if hold_after_success {
+        if coupled {
             if let Some(transfer) = journal.transfer.as_mut() {
                 transfer.coupled_sync_result = Some(run.clone());
-                if run.outcome != ElasticSnapraidOutcome::Succeeded {
+                if !matches!(run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial) {
                     transfer.phase = ElasticMoverPhase::NeedsAttention;
                     transfer.detail = run
                         .detail
@@ -7209,7 +8236,7 @@ pub(crate) mod execution {
                 }
             }
             // A mover's failed Sync does not pin a pending: the array records
-            // parity as out of date, so the declared Resume can release it.
+            // parity as out of date, so the next run can owe and retry it.
             if run.outcome != ElasticSnapraidOutcome::Succeeded {
                 journal.pending = None;
                 journal.stale_parity_bytes.get_or_insert(0);
@@ -7247,27 +8274,83 @@ pub(crate) mod execution {
     }
 
     fn restore_checkpoint_guard(journal: &Journal) -> Result<(), String> {
+        // A Hold an older helper's mover left is released by this Restore
+        // (`legacy_mover_hold`); any other Hold is its own operation's.
         if journal.private.as_ref().and_then(|private| private.service.as_ref())
             .is_some_and(|service| service.mode == ElasticServiceMode::Hold)
+            && legacy_mover_hold(journal).is_none()
         {
             return Err("Restore nie konsumuje trwałego service Hold".into());
         }
-        if journal.transfer.as_ref().is_some_and(|transfer| {
-            transfer.finished_at.is_none()
-                && !journal.private.as_ref().and_then(|private| private.service.as_ref())
-                    .is_some_and(|service| service.mode == ElasticServiceMode::Online && service.pending
-                        && service.operation_id == transfer.resume_operation_id)
-        }) {
-            return Err("Restore nie konsumuje niedokończonego transferu".into());
-        }
-        if matches!(
-            journal.pending,
-            Some(Pending::Sync | Pending::Maintenance { .. })
-        ) || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
+        // An unfinished mover run does not keep the union down: Restore settles
+        // the record it left in flight on the mounted branches before it
+        // publishes the union (`settle_before_serving`), and never publishes
+        // over one it could not settle (`serving_guard`).
+        // A Sync, a Scrub or a Fix left Running is closed as interrupted under
+        // the array lock (`settle_interrupted_sync`); the first Sync of a
+        // Create still stops it.
+        let interrupted_maintenance = matches!(&journal.pending, Some(Pending::Maintenance { .. }));
+        if (matches!(journal.pending, Some(Pending::Sync | Pending::Maintenance { .. })) && !interrupted_maintenance)
+            || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
         {
             return Err("sync niepotwierdzony; restore nie wykonuje sync".into());
         }
         Ok(())
+    }
+
+    /// Closes a Sync, a Scrub or a Fix a reboot or a killed helper left
+    /// Running, before Restore brings the array back. None can still run:
+    /// every one holds the array lock — its snapraid child inherits it — and
+    /// the caller holds it now. The attempt stays in the history as
+    /// interrupted and the intent is cleared.
+    ///
+    /// * A Sync marks parity out of date; snapraid picks the Sync up again on
+    ///   its next run.
+    /// * A Scrub changed nothing on the disks: only its verdict is missing, and
+    ///   the next Scrub gives one.
+    /// * A Fix may have rewritten part of what it was repairing. It closes
+    ///   the same way, and the repair can be asked again: the core keeps an
+    ///   interrupted repair as the unresolved operation it is.
+    fn settle_interrupted_sync(root: &Root, journal: &mut Journal, _array_lock: &File) -> Result<(), String> {
+        let Some(Pending::Maintenance { operation_id, kind }) = journal.pending.clone() else {
+            return Ok(());
+        };
+        let mut settled = journal.clone();
+        let closed = match kind {
+            ElasticSnapraidKind::Sync => close_interrupted_sync(&mut settled, &operation_id, "Sync przerwany; zamknięty przez Restore")?,
+            ElasticSnapraidKind::Scrub | ElasticSnapraidKind::Fix { .. } => {
+                close_interrupted_maintenance(&mut settled, &operation_id, &kind)?
+            }
+        };
+        if !closed {
+            return Err("intencja SnapRAID bez zapisu próby".into());
+        }
+        root.save(&settled)?;
+        *journal = settled;
+        Ok(())
+    }
+
+    /// Closes a Scrub or a Fix a gone process left Running. Returns whether
+    /// there was one.
+    fn close_interrupted_maintenance(journal: &mut Journal, operation_id: &str, kind: &ElasticSnapraidKind) -> Result<bool, String> {
+        let Some(run) = journal.last_run.as_mut().filter(|run| {
+            run.operation_id == operation_id && &run.kind == kind && run.outcome == ElasticSnapraidOutcome::Running
+        }) else {
+            return Ok(false);
+        };
+        run.outcome = ElasticSnapraidOutcome::NeedsAttention;
+        run.finished_at = Some(timestamp()?);
+        run.detail = Some(
+            match kind {
+                ElasticSnapraidKind::Fix { .. } => "Fix przerwany; zamknięty przez Restore — naprawę można zlecić ponownie",
+                _ => "Scrub przerwany; zamknięty przez Restore",
+            }
+            .into(),
+        );
+        journal.pending = None;
+        journal.interrupted_operation = Some(operation_id.to_string());
+        journal.stage = settled_stage(journal);
+        Ok(true)
     }
 
     fn service_guard(journal: &Journal, operation_id: &str) -> Result<(), String> {
@@ -7276,8 +8359,9 @@ pub(crate) mod execution {
         if operation_id == journal.spec.operation_id {
             return Err("operacja service nie może zastępować Create".into());
         }
-        // A mover owns its Hold until its declared Resume, finished or not, and
-        // an unfinished mover blocks every other operation.
+        // An unfinished mover run blocks a service operation until the next run
+        // closes it, and a Hold an older helper's run left belongs to that run
+        // until its declared Resume, finished or not.
         let hold_owner = journal
             .private
             .as_ref()
@@ -7411,6 +8495,7 @@ pub(crate) mod execution {
         };
         let outcome = (|| -> Result<(), String> {
             let current_boot = boot_id()?;
+            settle_interrupted_sync(root, &mut journal, array_lock)?;
             restore_checkpoint_guard(&journal)?;
             let devices = inventory()?;
             let spec = layout(&journal.spec, &devices)?;
@@ -7458,14 +8543,29 @@ pub(crate) mod execution {
             journal.pending = None;
             root.save(&journal)?;
             let tools = Tools::resolve(&spec).map_err(|e| e.to_string())?;
-            execute_steps(
+            let plan = plan_mount(&spec, &observed, &tools).map_err(|e| e.to_string())?;
+            let settling = spec.clone();
+            mount_then_settle(
                 root,
                 &array_lock,
                 &mut journal,
                 &spec,
-                plan_mount(&spec, &observed, &tools).map_err(|e| e.to_string())?,
-                StepMode::Restore,
+                plan,
                 &mut LiveSteps { worker: worker.as_deref_mut() },
+                &mut |journal, system| {
+                    // The branches are mounted and nothing has published the
+                    // union yet: the record a run left in flight is settled
+                    // here, before any client can reach its files.
+                    if !unsettled_record(journal) {
+                        return Ok(());
+                    }
+                    let Some(host) = system.settle_host() else {
+                        return Ok(());
+                    };
+                    let (cache, data) = record_branches(&settling, journal)?;
+                    host.verify_branches(journal)?;
+                    settle_before_serving(root, journal, &cache, &data, array_lock, host)
+                },
             )?;
             if let Some(worker) = worker.as_deref_mut() {
                 let private = journal.private.as_ref().ok_or("worker bez private journala")?;
@@ -7480,6 +8580,7 @@ pub(crate) mod execution {
                 if worker.public_mount().is_none() {
                     return Err("Resume nie potwierdził publikacji RW".into());
                 }
+                serving_guard(&journal)?;
                 worker.set_union_readonly(false)?;
                 if worker.union_readonly()? {
                     return Err("Resume nie potwierdził publikacji RW".into());
@@ -7565,8 +8666,9 @@ pub(crate) mod execution {
                     {
                         return Err("dysk pełni w tej macierzy inną rolę".into());
                     }
-                    let others: Vec<Journal> = root
-                        .journals()?
+                    let others: Vec<Claim> = root
+                        .claims()?
+                        .complete()?
                         .into_iter()
                         .filter(|other| other.spec.array_id != journal.spec.array_id)
                         .collect();
@@ -7641,6 +8743,281 @@ pub(crate) mod execution {
             Ok(())
         })();
         finish(root, &mut journal, outcome, worker.as_deref())
+    }
+
+    /// One typed disk-replacement request: the operation ids of the three
+    /// recorded steps, the slot, the replacement and the admin's explicit
+    /// acknowledgement of a rebuild from parity that is not current.
+    struct ReplaceRequest<'a> {
+        operation_id: &'a str,
+        rebuild_operation_id: &'a str,
+        sync_operation_id: &'a str,
+        branch: &'a str,
+        disk: &'a ElasticDiskSpec,
+        accept_stale_parity: bool,
+    }
+
+    /// WITHDRAWN (round 4, the owner's decision): this code is DORMANT and no
+    /// caller reaches it. The core refuses the request in
+    /// `dispatch::tentanas::elastic_replace_disk` before it writes anything,
+    /// `db::insert_job` refuses the intent so no `replace_disk` operation can
+    /// be opened, and `actions::run` refuses the command. It is kept, rather
+    /// than deleted, because the measurements it is built on (which snapraid
+    /// invocation rebuilds a replaced disk, and what `-m fix` leaves behind)
+    /// cost real runs, and because the shape of the journal-first swap is the
+    /// part that was reviewed and found sound.
+    ///
+    /// WHAT THE NEXT TASK MUST SOLVE BEFORE IT IS OFFERED AGAIN (from the
+    /// fourth review, so it is not rediscovered):
+    /// * `private_operation`'s fresh-boot block resolves EVERY member, so the
+    ///   dead disk fails it before this function runs; and `replaceable_slot`
+    ///   refuses while `anchor.is_some()` although `private_operation` demands
+    ///   an anchor whenever the boot is not fresh — two guards that cannot both
+    ///   be satisfied, the second of which also ignores the anchor's boot id
+    ///   (findings 5/W4).
+    /// * The journal swap is durable while the core's row is rewritten only on
+    ///   full success, so a failure in between desynchronises them and every
+    ///   later Restore and Inspect of that array fails validation: the close
+    ///   has to be recoverable from the journal alone (finding 4/W1).
+    /// * A repeat hard-errors on the `Mkfs` step ("formatowanie już
+    ///   rozpoczęte") instead of skipping it the way `plan_add_data_disk` does,
+    ///   so an interrupted replacement cannot be finished (finding 7/W2).
+    /// * `accept_stale_parity` admits a rebuild whose own verdict then rejects
+    ///   the `error_unrecoverable > 0` result that rebuild produces — one of
+    ///   the two has to give (finding 6/W3).
+    /// * The union stays read-write across the multi-hour rebuild, so on a
+    ///   cacheless array `mfs` can send new client files onto the very branch
+    ///   snapraid is rebuilding (DL1).
+    /// * A failed attempt must not cost the array everything else: the row has
+    ///   to end `failed` when nothing ran, or be supersedable (W3b/W7).
+    /// * The approval surface is incomplete: no entry in the UI's
+    ///   `approvals.js` allowlist, no `jobs.kind_elastic_replace_disk` string
+    ///   in the five locales, no `approvals::without_secret` arm, and the
+    ///   parked record names the array but not the slot, the replacement or the
+    ///   acknowledgement.
+    ///
+    /// REPLACING A DEAD DATA DISK, and rebuilding the array onto the new one.
+    ///
+    /// Until this existed a genuinely replaced disk could not be rebuilt at
+    /// all: every command resolves a member by the filesystem UUID the journal
+    /// recorded (`filesystem_matches`), and a new disk does not carry it. So
+    /// the identity has to change in the journal first, and that is the whole
+    /// risk of the operation — a swap that touched anything else would point
+    /// the array at storage that is not its own. `Root::replace_data_disk`
+    /// writes exactly five fields of exactly one data slot and re-runs every
+    /// invariant.
+    ///
+    /// ORDER, and what a crash in each window leaves:
+    /// 1. The guards below, which write nothing.
+    /// 2. The journal swap, durable. A crash here leaves the new identity
+    ///    recorded and its slot unformatted, which is where a repeat resumes.
+    /// 3. `mkfs` on the replacement, gated by `formatted`. A crash leaves
+    ///    either an unformatted disk (step 3 again) or a formatted one whose
+    ///    role is recorded (step 4).
+    /// 4. The Restore: every branch mounted, the union published, and the file
+    ///    record a mover left in flight settled before anything serves.
+    /// 5. The rebuild, `-d <branch> fix`, recorded as its own operation, and
+    ///    only after `fresh_branch` proves the branch holds nothing but what
+    ///    mkfs left. That check is what makes the invocation safe.
+    /// 6. The Sync, recorded as its own operation: the rebuild restores files
+    ///    parity knew, and the content file has to learn their new inodes.
+    ///
+    /// THE UNION IS NOT PUBLISHED IN THIS BOOT while this runs, and the guard
+    /// insists on it. A filesystem mounted under a live mergerfs is not
+    /// reliably seen by it — it resolved its branch paths when it started —
+    /// so a rebuild under a serving union could write into a directory of the
+    /// ROOT filesystem that the new mount now shadows. After a boot an array
+    /// with a missing member cannot be restored anyway, so the natural order
+    /// is: the disk dies, the node restarts, the disk is replaced.
+    fn replace_data_disk(
+        root: &Root,
+        journal: Journal,
+        request: &ReplaceRequest<'_>,
+        worker: &mut Worker<'_>,
+        array_lock: &File,
+    ) -> Result<ElasticReplaceResult, String> {
+        validate_elastic_uuid(request.operation_id).map_err(|e| e.to_string())?;
+        validate_elastic_uuid(request.rebuild_operation_id).map_err(|e| e.to_string())?;
+        validate_elastic_uuid(request.sync_operation_id).map_err(|e| e.to_string())?;
+        validate_data_branch_name(request.branch).map_err(|e| e.to_string())?;
+        let distinct = [request.operation_id, request.rebuild_operation_id, request.sync_operation_id];
+        if distinct.iter().any(|id| *id == journal.spec.operation_id)
+            || distinct[0] == distinct[1]
+            || distinct[1] == distinct[2]
+            || distinct[0] == distinct[2]
+        {
+            return Err("nieprawidłowe UUID wymiany dysku".into());
+        }
+        let array_id = journal.spec.array_id.clone();
+        let slot = replaceable_slot(&journal, request)?;
+        let role = ElasticRole::Data(u16::try_from(slot + 1).map_err(|_| "numer slotu")?);
+        if journal.spec.data[slot].disk_id != request.disk.disk_id
+            && old_disk_is_healthy(&journal, slot, &inventory()?)
+        {
+            return Err(format!(
+                "dysk {} jest obecny i nadal ma system plików tej macierzy; użyj naprawy, nie wymiany",
+                request.branch
+            ));
+        }
+        // 2. The journal first, and nothing else of the spec with it.
+        let journal = root.replace_data_disk(&array_id, slot, request.disk)?;
+        let devices = inventory()?;
+        let spec = layout(&journal.spec, &devices)?;
+        let replaced = spec.data.get(slot).ok_or("brak brancha wymienianego dysku")?.clone();
+        let tools = Tools::resolve(&spec).map_err(|e| e.to_string())?;
+        // 3. The format, which `formatted` gates, so a repeat does not redo it.
+        let mut formatting = journal.clone();
+        execute_steps(
+            root,
+            array_lock,
+            &mut formatting,
+            &spec,
+            plan_replace_data_disk(&spec, &replaced, &tools).map_err(|e| e.to_string())?,
+            StepMode::Replace,
+            &mut LiveSteps { worker: Some(worker) },
+        )?;
+        // 4. The Restore: mounts, union, publication, and the settle.
+        let restored = restore(root, root.load(&array_id)?, Some(worker), Some(array_lock))?;
+        if restored.stage != ElasticStage::Ready {
+            return Err(restored
+                .detail
+                .unwrap_or_else(|| "wymiana dysku: macierz nie wróciła do stanu Ready".into()));
+        }
+        // 5. The rebuild, on a branch proved empty first.
+        let branch = mount_path(&journal.spec, role);
+        if !fresh_branch(Path::new(&branch)).map_err(|error| format!("odczyt nowego brancha: {error}"))? {
+            return Err("nowy branch nie jest pusty; odbudowa nie nadpisuje danych".into());
+        }
+        let rebuild = maintenance_with_scope(
+            root,
+            root.load(&array_id)?,
+            request.rebuild_operation_id,
+            ElasticSnapraidKind::Fix { disk: replaced.disk.clone() },
+            FixScope::ReplacedDisk,
+            Some(worker),
+            Some(array_lock),
+        )?;
+        if rebuild.run.outcome != ElasticSnapraidOutcome::Succeeded {
+            return Err(rebuild
+                .run
+                .detail
+                .unwrap_or_else(|| "odbudowa dysku z parity nie zakończyła się sukcesem".into()));
+        }
+        // 6. The Sync: the restored files are the same bytes with new inodes,
+        // and the content file has to say so.
+        let synced = maintenance_with_scope(
+            root,
+            root.load(&array_id)?,
+            request.sync_operation_id,
+            ElasticSnapraidKind::Sync,
+            FixScope::MarkedBlocks,
+            Some(worker),
+            Some(array_lock),
+        )?;
+        if !matches!(synced.run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial) {
+            return Err(synced
+                .run
+                .detail
+                .unwrap_or_else(|| "sync po odbudowie nie zakończył się sukcesem".into()));
+        }
+        Ok(ElasticReplaceResult {
+            state: synced.state,
+            branch: replaced.disk.clone(),
+            disk: request.disk.clone(),
+            rebuild: rebuild.run,
+            sync: synced.run,
+        })
+    }
+
+    /// Whether the disk a slot records is still there AND still carries this
+    /// array's filesystem. Such a disk is not a replacement case: the repair
+    /// is, and swapping the identity would abandon a working disk's data. It
+    /// takes the inventory as an argument because the caller has already read
+    /// it — and because the rest of the guard is a question about the journal
+    /// alone.
+    fn old_disk_is_healthy(journal: &Journal, slot: usize, devices: &[Device]) -> bool {
+        let Some(old) = journal.spec.data.get(slot) else {
+            return false;
+        };
+        let Ok(role) = u16::try_from(slot + 1).map(ElasticRole::Data) else {
+            return false;
+        };
+        resolve(old, devices).is_ok_and(|device| filesystem_matches(&journal.spec, role, device).is_ok())
+    }
+
+    /// The slot a replacement may take, with every reason it may not — all of
+    /// them answered from the journal and the request, so nothing here depends
+    /// on what the node's inventory happens to say.
+    fn replaceable_slot(journal: &Journal, request: &ReplaceRequest<'_>) -> Result<usize, String> {
+        let private = journal.private.as_ref().ok_or("wymiana dysku wymaga prywatnej topologii")?;
+        // The union must not be serving in this boot (see the note above).
+        if private.anchor.is_some() {
+            return Err("macierz publikuje unię w tym uruchomieniu; zrestartuj węzeł przed wymianą dysku".into());
+        }
+        if journal.spec.parity.is_empty() {
+            return Err("macierz bez parity nie ma z czego odbudować dysku".into());
+        }
+        if journal.sync_completed_at.is_none() {
+            return Err("macierz bez potwierdzonego sync nie ma z czego odbudować dysku".into());
+        }
+        if matches!(journal.pending, Some(Pending::Sync | Pending::Maintenance { .. })) {
+            return Err("przerwana operacja SnapRAID; wymiana dysku wymaga jej zamknięcia".into());
+        }
+        // A rebuild writes the disk back to its state at the LAST SYNC. With
+        // parity out of date the blocks changed elsewhere since cannot be
+        // recovered: MEASURED (rig11, snapraid 13.0-1) an in-place rewrite on
+        // another disk left 10 blocks unrecoverable and the files behind them
+        // as `*.unrecoverable`. It is refused unless the admin says otherwise,
+        // and it CAN only be an acknowledgement rather than a precondition,
+        // because a Sync needs every disk and a dead disk is why we are here.
+        if journal.stale_parity_bytes.is_some() && !request.accept_stale_parity {
+            return Err(
+                "parity nie jest aktualna: odbudowa odtworzy dysk do stanu z ostatniego Sync, a bloki zmienione \
+                 na innych dyskach od tego czasu będą nieodtwarzalne — wymaga jawnej zgody"
+                    .into(),
+            );
+        }
+        let slot = journal
+            .spec
+            .data
+            .iter()
+            .enumerate()
+            .position(|(index, _)| data_branch_name(index + 1) == request.branch)
+            .ok_or("macierz nie ma tego dysku danych")?;
+        let old = &journal.spec.data[slot];
+        if old.disk_id == request.disk.disk_id {
+            // A repeat of this very replacement: the recorded identity must be
+            // the SAME disk down to the filesystem UUID the mkfs was given.
+            if old != request.disk {
+                return Err("slot ma już inną tożsamość tego dysku".into());
+            }
+            return Ok(slot);
+        }
+        if journal
+            .spec
+            .data
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != slot)
+            .map(|(_, member)| member)
+            .chain(journal.spec.cache.iter())
+            .chain(&journal.spec.parity)
+            .any(|member| member.disk_id == request.disk.disk_id)
+        {
+            return Err("dysk pełni w tej macierzy inną rolę".into());
+        }
+        if request.disk.bytes < old.bytes {
+            return Err(format!(
+                "nowy dysk ma {} bajtów, a slot potrzebuje co najmniej {}",
+                request.disk.bytes, old.bytes
+            ));
+        }
+        if let Some(parity) = journal.spec.parity.iter().map(|parity| parity.bytes).min() {
+            if request.disk.bytes > parity {
+                return Err("nowy dysk jest większy niż parity macierzy; parity nie pokryłaby go w całości".into());
+            }
+        }
+        Ok(slot)
     }
 
     /// Taking the array apart without taking the data apart.
@@ -7767,6 +9144,8 @@ pub(crate) mod execution {
         State(Box<ElasticResult>),
         Maintenance(Box<ElasticSnapraidResult>),
         Mover(Box<ElasticMoverResult>),
+        Replace(Box<ElasticReplaceResult>),
+        CacheAge(ElasticCacheAge),
     }
 
     impl PrivateResponse {
@@ -7775,12 +9154,18 @@ pub(crate) mod execution {
                 Self::State(state) => state.as_mut(),
                 Self::Maintenance(result) => &mut result.state,
                 Self::Mover(result) => &mut result.state,
+                Self::Replace(result) => &mut result.state,
+                // No array state travels with it, so there is no publication
+                // to mask.
+                Self::CacheAge(age) => return serde_json::to_value(*age).map_err(|e| e.to_string()),
             };
             state.union_mounted = state.union_mounted.map(|mounted| mounted && published);
             match self {
                 Self::State(state) => serde_json::to_value(state),
                 Self::Maintenance(result) => serde_json::to_value(result),
                 Self::Mover(result) => serde_json::to_value(result),
+                Self::Replace(result) => serde_json::to_value(result),
+                Self::CacheAge(age) => serde_json::to_value(age),
             }
             .map_err(|e| e.to_string())
         }
@@ -7818,7 +9203,7 @@ pub(crate) mod execution {
     }
 
     fn private_create(root: &Root, spec: &ElasticCreateSpec) -> Result<serde_json::Value, String> {
-        let journals = root.journals()?;
+        let journals = root.claims()?.complete()?;
         if journals
             .iter()
             .any(|journal| journal.spec.array_id == spec.array_id)
@@ -7854,7 +9239,6 @@ pub(crate) mod execution {
         let current_boot = boot_id()?;
         let fresh = current_boot != journal.boot_id;
         let restoring = matches!(command, crate::HelperCommand::ElasticRestore { .. });
-        let mover_command = matches!(command, crate::HelperCommand::ElasticMover { .. });
         let add_disk_command = matches!(command, crate::HelperCommand::ElasticAddDisk { .. });
         let service_command = matches!(command,
             crate::HelperCommand::ElasticEnterService { .. } | crate::HelperCommand::ElasticResume { .. });
@@ -7884,7 +9268,7 @@ pub(crate) mod execution {
             restore_checkpoint_guard(&journal)?;
         }
         if fresh {
-            if !restoring && !matches!(command, crate::HelperCommand::ElasticResume { .. }) && !mover_command {
+            if !runs_after_a_boot(command) {
                 return Err("prywatna macierz wymaga Restore po zmianie boot".into());
             }
             if add_disk_command {
@@ -7909,23 +9293,11 @@ pub(crate) mod execution {
             .ok_or("brak prywatnej topologii")?
             .anchor
             .clone();
-        // A recovery after a boot that stopped part-way: either before its
-        // new anchor (no anchor in this boot) or after it, with a mount step
-        // of the held, unfinished mover still open. Both wait for the next
-        // boot, and both are refused for every other command, so Inspect
+        // A Restore after a boot that stopped before its new anchor waits for
+        // the next boot, and every other command is refused for it, so Inspect
         // reports the state with the restart instead of failing.
-        let held_recovery = journal
-            .private
-            .as_ref()
-            .and_then(|private| private.service.as_ref())
-            .is_some_and(|service| service.mode == ElasticServiceMode::Hold)
-            && journal.transfer.as_ref().is_some_and(|transfer| transfer.finished_at.is_none())
-            && matches!(
-                journal.pending,
-                Some(Pending::Mount(_) | Pending::Union | Pending::Config)
-            );
         if !fresh
-            && (anchor.is_none() || held_recovery)
+            && anchor.is_none()
             && matches!(command, crate::HelperCommand::ElasticInspect { .. })
         {
             return PrivateResponse::State(Box::new(restart_required_state(&journal))).public_result(false);
@@ -7942,6 +9314,23 @@ pub(crate) mod execution {
         let array_lock = root.array_lock(&spec.array_id)?;
         if let crate::HelperCommand::ElasticResume { operation_id, .. } = command {
             authorize_resume(root, &mut journal, operation_id)?;
+        }
+        // Restore and the mover release a Hold an older helper's mover left,
+        // with the Resume UUID that run recorded; the Restore below (or the one
+        // the mover runs first) then publishes the union read-write.
+        let releasing = match command {
+            crate::HelperCommand::ElasticRestore { .. } | crate::HelperCommand::ElasticMover { .. } => {
+                legacy_mover_hold(&journal)
+            }
+            _ => None,
+        };
+        if let Some(resume_operation_id) = &releasing {
+            if fresh && matches!(journal.pending, Some(Pending::Mount(_) | Pending::Union | Pending::Config)) {
+                // A new boot took every earlier mount with it; Restore plans
+                // the mounts again.
+                journal.pending = None;
+            }
+            authorize_resume(root, &mut journal, resume_operation_id)?;
         }
         let result = elastic_namespace::run(
             &private_paths(&spec),
@@ -7963,20 +9352,61 @@ pub(crate) mod execution {
                 .map(|stored| PrivateResponse::State(Box::new(observe(&stored, Some(worker))))),
                 crate::HelperCommand::ElasticResume { .. } => restore(root, journal, Some(worker), Some(&array_lock))
                     .map(|state| PrivateResponse::State(Box::new(state))),
-                crate::HelperCommand::ElasticMover { operation_id, resume_operation_id, rules, coupled_sync, .. } => mover(
+                crate::HelperCommand::ElasticMover { operation_id, resume_operation_id, rules, coupled_sync, .. } => {
+                    (|| -> Result<PrivateResponse, String> {
+                        let mut journal = journal;
+                        if releasing.is_some() {
+                            let released = restore(root, journal, Some(&mut *worker), Some(&array_lock))?;
+                            if released.stage != ElasticStage::Ready {
+                                return Err(released
+                                    .detail
+                                    .unwrap_or_else(|| "zwolnienie starego service Hold nie przywróciło macierzy".into()));
+                            }
+                            journal = root.load(&spec.array_id)?;
+                        }
+                        mover(
+                            root,
+                            &mut journal,
+                            &MoverRequest {
+                                operation_id,
+                                resume_operation_id,
+                                rules,
+                                coupled_sync: *coupled_sync,
+                                array_lock: &array_lock,
+                            },
+                            worker,
+                        )
+                        .map(|run| PrivateResponse::Mover(Box::new(run)))
+                    })()
+                }
+                crate::HelperCommand::ElasticReplaceDisk {
+                    operation_id,
+                    rebuild_operation_id,
+                    sync_operation_id,
+                    branch,
+                    disk,
+                    accept_stale_parity,
+                    ..
+                } => replace_data_disk(
                     root,
-                    &mut journal,
-                    &MoverRequest {
+                    journal,
+                    &ReplaceRequest {
                         operation_id,
-                        resume_operation_id,
-                        rules,
-                        coupled_sync: *coupled_sync,
-                        array_lock: &array_lock,
+                        rebuild_operation_id,
+                        sync_operation_id,
+                        branch,
+                        disk,
+                        accept_stale_parity: *accept_stale_parity,
                     },
                     worker,
-                ).map(|run| PrivateResponse::Mover(Box::new(run))),
+                    &array_lock,
+                )
+                .map(|result| PrivateResponse::Replace(Box::new(result))),
                 crate::HelperCommand::ElasticInspect { .. } => {
                     Ok(PrivateResponse::State(Box::new(observe(&journal, Some(worker)))))
+                }
+                crate::HelperCommand::ElasticCacheAge { rules, .. } => {
+                    probe_cache_age(&journal, rules).map(PrivateResponse::CacheAge)
                 }
                 crate::HelperCommand::ElasticSync { operation_id, .. } => maintenance(
                     root,
@@ -8027,7 +9457,9 @@ pub(crate) mod execution {
             }
             crate::HelperCommand::ElasticEnterService { array_id, owner, .. }
             | crate::HelperCommand::ElasticResume { array_id, owner, .. }
-            | crate::HelperCommand::ElasticMover { array_id, owner, .. } => {
+            | crate::HelperCommand::ElasticMover { array_id, owner, .. }
+            | crate::HelperCommand::ElasticReplaceDisk { array_id, owner, .. }
+            | crate::HelperCommand::ElasticCacheAge { array_id, owner, .. } => {
                 let journal = root.load(array_id)?;
                 if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
                 if journal.private.is_none() {
@@ -8087,7 +9519,12 @@ pub(crate) mod execution {
                 serde_json::to_value(result)
             }
             crate::HelperCommand::ElasticJournals {} => {
-                let journals = root.journals()?;
+                // An import scan lists what can be listed: a journal nothing
+                // can be read from is left out here and keeps failing on its
+                // own, instead of hiding every other array from the scan.
+                let claims = root.claims()?;
+                let unreadable = unreadable_journals(&claims);
+                let journals = claims.arrays;
                 // The mount table is read ONCE for the whole scan, and only
                 // for the union path: `union_mounted` resolves every device of
                 // the layout and validates the mergerfs options, which answers
@@ -8110,6 +9547,7 @@ pub(crate) mod execution {
                             spec: journal.spec,
                         })
                         .collect(),
+                    unreadable,
                 })
             }
             crate::HelperCommand::ElasticAdopt { array_id, owner } => {
@@ -8118,7 +9556,7 @@ pub(crate) mod execution {
                 serde_json::to_value(root.reown(journal, owner)?)
             }
             crate::HelperCommand::ElasticClaims { name } => {
-                let journals = root.journals()?;
+                let journals = root.claims()?.complete()?;
                 let disks = journals
                     .iter()
                     .flat_map(|j| j.spec.data.iter().chain(j.spec.cache.iter()).chain(&j.spec.parity))
@@ -8142,7 +9580,7 @@ pub(crate) mod execution {
         serde_json::to_string(&value).map_err(|e| e.to_string())
     }
 
-    fn claims_guard(journals: &[Journal], spec: &ElasticCreateSpec) -> Result<(), String> {
+    fn claims_guard(journals: &[Claim], spec: &ElasticCreateSpec) -> Result<(), String> {
         for journal in journals {
             if journal.spec.name == spec.name {
                 return Err("nazwa zarezerwowana".into());
@@ -8174,7 +9612,7 @@ pub(crate) mod execution {
         Ok(())
     }
 
-    fn zfs_name_guard(journals: &[Journal], name: &str) -> Result<(), String> {
+    fn zfs_name_guard(journals: &[Claim], name: &str) -> Result<(), String> {
         let pool = name.split('/').next().ok_or("brak nazwy puli")?;
         if journals.iter().any(|j| j.spec.name == pool) {
             return Err("nazwa zarezerwowana przez Elastic".into());
@@ -8182,7 +9620,7 @@ pub(crate) mod execution {
         Ok(())
     }
 
-    fn zfs_path_guard(journals: &[Journal], path: &str) -> Result<(), String> {
+    fn zfs_path_guard(journals: &[Claim], path: &str) -> Result<(), String> {
         if path == "none" || path == "legacy" || path == "-" {
             return Ok(());
         }
@@ -8234,7 +9672,7 @@ pub(crate) mod execution {
         Ok(found[0].clone())
     }
 
-    fn zfs_disk_guard(journals: &[Journal], device: &Device) -> Result<(), String> {
+    fn zfs_disk_guard(journals: &[Claim], device: &Device) -> Result<(), String> {
         if device.wwn.is_none() && device.serial.is_none() && !journals.is_empty() {
             return Err("brak tożsamości do porównania rezerwacji ZFS".into());
         }
@@ -8314,7 +9752,7 @@ pub(crate) mod execution {
 
     fn zfs_namespace_command(
         command: &crate::HelperCommand,
-        journals: &[Journal],
+        journals: &[Claim],
         zfs: &Path,
     ) -> Result<(), String> {
         use crate::HelperCommand::*;
@@ -8400,7 +9838,7 @@ pub(crate) mod execution {
 
     fn mount_imported(
         name: &str,
-        journals: &[Journal],
+        journals: &[Claim],
         datasets: &[ZfsDataset],
         mut mount: impl FnMut(&str) -> Result<(), String>,
     ) -> Result<String, String> {
@@ -8782,7 +10220,7 @@ pub(crate) mod execution {
         }
         confirm_device(resolved)?;
         let numbers = device_numbers(resolved)?;
-        let journals = root.journals()?;
+        let journals = root.claims()?.complete()?;
         let rows = mount_rows().ok();
         let claiming = journals.iter().find(|journal| {
             journal
@@ -8812,11 +10250,7 @@ pub(crate) mod execution {
             claim: claiming.map(|journal| WipeClaim {
                 array_id: journal.spec.array_id.clone(),
                 name: journal.spec.name.clone(),
-                serving: if journal
-                    .private
-                    .as_ref()
-                    .is_some_and(|private| private.anchor.is_some())
-                {
+                serving: if journal.anchored == Some(true) {
                     Some(true)
                 } else {
                     rows.as_ref().map(|rows| {
@@ -8857,6 +10291,11 @@ pub(crate) mod execution {
             WipeVerdict::Erase { release } => release,
         };
         let gate = gate?;
+        if let Some(array_id) = &release {
+            root.releasable(array_id).map_err(|error| {
+                format!("{device}: dziennika macierzy nie można zwolnić ({error}); dysk nie został wyczyszczony")
+            })?;
+        }
         // The steps are the privileged operations AS THEY RAN, in order, for
         // the job log. They are commands, not prose: the sentence explaining
         // what the admin lost belongs to the core, which owns the UI language.
@@ -8891,12 +10330,11 @@ pub(crate) mod execution {
         }
         let mut journal_released = None;
         if let Some(array_id) = &release {
-            let journal = root.load(array_id)?;
-            let name = journal.spec.name.clone();
+            let name = facts.acknowledged.clone().unwrap_or_else(|| array_id.clone());
             // The disk is already erased at this point, so a failure here is
             // NOT "nothing happened". Say both halves: the operation did not
             // complete, and what it did do is irreversible.
-            root.forget(&journal).map_err(|e| {
+            root.release(array_id).map_err(|e| {
                 format!(
                     "{}: urządzenie zostało wyczyszczone, ale dziennik macierzy '{}' nie został \
                      zwolniony ({e}) — dysk jest już pusty, a rezerwacja pozostaje; powtórz \
@@ -8924,7 +10362,7 @@ pub(crate) mod execution {
             return Err("guard ZFS wymaga root".into());
         }
         let root = Root::open(Path::new(ROOT), 0)?;
-        let journals = root.journals()?;
+        let journals = root.claims()?.complete()?;
         let resolved = command.resolve_exec().map_err(|e| e.to_string())?;
         let zfs = tool(&["/usr/sbin/zfs", "/sbin/zfs", "/usr/bin/zfs"])?;
         let locks = [root.node_lock.as_raw_fd()];
@@ -9036,7 +10474,7 @@ pub(crate) mod execution {
                         panic!("błędny odczyt nie może dopuścić formatowania")
                     })
                     .is_err());
-                assert!(root.journals().expect("journal").is_empty());
+                assert!(root.claims().expect("journal").complete().expect("journal").is_empty());
             }
             assert!(parse_blkid(output(2, "", ""))
                 .expect("brak sygnatur blkid")
@@ -9173,7 +10611,7 @@ pub(crate) mod execution {
                 Ok(())
             }).is_err());
             assert_eq!(callback_calls, 0);
-            assert_eq!(root.journals().expect("journals").len(), 1);
+            assert_eq!(root.claims().expect("journals").complete().expect("journals").len(), 1);
             let mut distinct = other.clone();
             distinct.array_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into();
             distinct.operation_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into();
@@ -9191,7 +10629,7 @@ pub(crate) mod execution {
             let dir = Temp::new();
             let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
             root.reserve(&cached, boot(), || Ok(())).expect("reserve");
-            let journals = root.journals().expect("journals");
+            let journals = root.claims().expect("journals").complete().expect("journals");
             let base = Device {
                 path: "/dev/vdc".into(), kernel: "vdc".into(), bytes: 16 << 30,
                 wwn: None, serial: Some("cache".into()), major_minor: "252:32".into(), occupied: false,
@@ -9579,7 +11017,7 @@ pub(crate) mod execution {
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
             let journal = root.reserve(&spec(), boot(), || Ok(())).expect("dziennik");
-            assert_eq!(root.journals().expect("lista").len(), 1);
+            assert_eq!(root.claims().expect("lista").complete().expect("lista").len(), 1);
             // While the array still publishes its union the journal stays, so
             // an acknowledgement can never be the thing that erases a live
             // array's metadata.
@@ -9592,13 +11030,13 @@ pub(crate) mod execution {
                 ..journal.clone()
             };
             assert!(root.forget(&serving).is_err(), "publikująca macierz zachowuje dziennik");
-            assert_eq!(root.journals().expect("lista").len(), 1, "nic nie usunięto");
+            assert_eq!(root.claims().expect("lista").complete().expect("lista").len(), 1, "nic nie usunięto");
 
             root.forget(&journal).expect("zwolnienie rezerwacji");
-            assert!(root.journals().expect("lista").is_empty(), "rezerwacja zwolniona");
+            assert!(root.claims().expect("lista").complete().expect("lista").is_empty(), "rezerwacja zwolniona");
             // And the name is free again: a claims read is what reported the
             // dissolved array's disks AND its name as taken.
-            assert!(claims_guard(&root.journals().expect("lista"), &spec()).is_ok());
+            assert!(claims_guard(&root.claims().expect("lista").complete().expect("lista"), &spec()).is_ok());
         }
 
         /// The identity match is what stops a kernel rename from redirecting a
@@ -9720,6 +11158,715 @@ pub(crate) mod execution {
             )
         }
 
+        /// A Sync over files being appended to while it ran, as snapraid 13.0
+        /// wrote it on rig11 (2026-09-17, `snapraid sync` against a scratch
+        /// array; `/home/critix/snapraid-probe-36580` is that scratch path).
+        /// Kept verbatim except for the run's own header, which `log_text`
+        /// supplies for the fixture array, and the repeated tags: that run
+        /// logged 9 815 of them, identical but for the block number.
+        const CHANGED_DURING_SYNC_BODY: &str = "msg:fatal: WARNING! UUID is unsupported for disks: 'd2'msg:fatal: . Not using inodes to detect move operations.
+summary:equal:349
+summary:added:0
+summary:removed:0
+summary:updated:251
+summary:moved:0
+summary:copied:0
+summary:restored:0
+summary:exit:diff
+msg:progress: Syncing...
+error:0:d1:f150.bin: Unexpected attribute change
+msg:error: Unexpected size change at file '/home/critix/snapraid-probe-36580/d1/f150.bin' from 4194357 to 4194629.
+msg:error: WARNING! You cannot modify files during a sync.
+msg:error: Rerun the sync command when finished.
+error:1:d1:f150.bin: Unexpected attribute change
+msg:error: Unexpected size change at file '/home/critix/snapraid-probe-36580/d1/f150.bin' from 4194357 to 4194629.
+msg:error: WARNING! You cannot modify files during a sync.
+msg:error: Rerun the sync command when finished.
+error:2:d1:f150.bin: Unexpected attribute change
+msg:error: Unexpected size change at file '/home/critix/snapraid-probe-36580/d1/f150.bin' from 4194357 to 4194629.
+msg:error: WARNING! You cannot modify files during a sync.
+msg:error: Rerun the sync command when finished.
+msg:status:\x20
+msg:status:     9815 file errors
+msg:status:        0 io errors
+msg:status:        0 data errors
+msg:fatal: WARNING! Unexpected file errors!
+summary:error_file:9815
+summary:error_io:0
+summary:error_data:0
+summary:exit:error
+";
+
+        /// The same run's stdout, progress bars included.
+        const CHANGED_DURING_SYNC_STDOUT: &str = "Self test...\nLoading state from /home/critix/snapraid-probe-36580/c/snapraid.content...\nScanning...\nScanned d2 in 0 seconds\nScanned d1 in 0 seconds\nSyncing...\n100% completed, 424 MB accessed in 0:00\n\n    9815 file errors\n       0 io errors\n       0 data errors\n";
+
+        // Repairs as snapraid 13.0-1 logged them on rig11 (2026-09-17), against
+        // scratch arrays under `/home/critix/snapraid-fix-probe` (deleted
+        // afterwards). Kept verbatim from `selftest:` on, except for the run's
+        // own header — `log_text` supplies `command`, `conf:file`, `blocksize`
+        // and `mode` for the fixture array, and each test writes the `argv:`
+        // lines of the invocation it claims — and, in the two long runs, the
+        // repeated per-block tags cut to the first six.
+        /// `snapraid -e fix` after a full scrub marked the silently corrupted block of `sub/D.bin` (run p6).
+        const FIX_MARKED_BLOCKS_BODY: &str = "selftest:
+msg:progress: Self test...
+uuid:by-uuid:65:130:a94faca5-1363-4d04-a4ad-a989ceba45cf: found ../../sdy2
+resolve:proc:0:27: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:27: not found
+data:d1:/home/critix/snapraid-fix-probe/p6/d1/
+data:d2:/dev/shm/snapraid-fix-probe/p6/d2/
+parity:0:/run/user/1000/snapraid-fix-probe/p6/parity/snapraid.parity
+content:/home/critix/snapraid-fix-probe/p6/snapraid.content
+msg:progress: Loading state from /home/critix/snapraid-fix-probe/p6/snapraid.content...
+msg:verbose:        7 files
+msg:verbose:        0 hardlinks
+msg:verbose:        0 symlinks
+msg:verbose:        0 empty dirs
+resolve:proc:0:58: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:58: not found
+msg:progress: Searching disk d1...
+msg:progress: Searching disk d2...
+msg:progress: Selecting...
+msg:verbose: \t<error>
+memory:used:293607
+memory:block:17
+memory:extent:88
+memory:file:192
+memory:link:88
+memory:dir:80
+msg:progress: Using 0 MiB of memory for the file-system.
+msg:progress: Initializing...
+msg:progress: Selecting...
+msg:progress: Fixing...
+error:880:d1:sub/D.bin: Data error at position 146, diff bits 68/128
+entry:0:block:known:bad:d1:sub/D.bin:146:
+fixed:880:d1:sub/D.bin: Fixed data error at position 146
+status:recovered:d1:sub/D.bin
+msg:status:\x20
+msg:status:        1 errors
+msg:status:        1 recovered errors
+msg:status:        0 unrecoverable errors
+msg:status: Everything OK
+summary:error:1
+summary:error_recovered:1
+summary:error_unrecoverable:0
+summary:exit:recovered
+";
+
+        /// `snapraid -e fix` with nothing marked bad (run x8).
+        const FIX_NOTHING_MARKED_BODY: &str = "selftest:
+msg:progress: Self test...
+uuid:by-uuid:65:130:a94faca5-1363-4d04-a4ad-a989ceba45cf: found ../../sdy2
+resolve:proc:0:27: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:27: not found
+data:d1:/home/critix/snapraid-fix-probe/x8/d1/
+data:d2:/dev/shm/snapraid-fix-probe/x8/d2/
+parity:0:/run/user/1000/snapraid-fix-probe/x8/parity/snapraid.parity
+content:/home/critix/snapraid-fix-probe/x8/snapraid.content
+msg:progress: Loading state from /home/critix/snapraid-fix-probe/x8/snapraid.content...
+msg:verbose:        7 files
+msg:verbose:        0 hardlinks
+msg:verbose:        0 symlinks
+msg:verbose:        0 empty dirs
+resolve:proc:0:58: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:58: not found
+msg:progress: Searching disk d1...
+msg:progress: Searching disk d2...
+msg:progress: Selecting...
+msg:verbose: \t<error>
+memory:used:293023
+memory:block:17
+memory:extent:88
+memory:file:192
+memory:link:88
+memory:dir:80
+msg:progress: Using 0 MiB of memory for the file-system.
+msg:progress: Initializing...
+msg:progress: Selecting...
+msg:progress: Fixing...
+msg:status: Nothing to check.
+msg:status: Everything OK
+summary:error:0
+summary:error_recovered:0
+summary:error_unrecoverable:0
+summary:exit:ok
+";
+
+        /// `snapraid -e fix` after the scrub, with `sub/D.bin` rewritten by a user in between: 391 blocks counted, none written (run x2).
+        const FIX_CHANGED_SINCE_SYNC_BODY: &str = "selftest:
+msg:progress: Self test...
+uuid:by-uuid:65:130:a94faca5-1363-4d04-a4ad-a989ceba45cf: found ../../sdy2
+resolve:proc:0:27: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:27: not found
+data:d1:/home/critix/snapraid-fix-probe/x2/d1/
+data:d2:/dev/shm/snapraid-fix-probe/x2/d2/
+parity:0:/run/user/1000/snapraid-fix-probe/x2/parity/snapraid.parity
+content:/home/critix/snapraid-fix-probe/x2/snapraid.content
+msg:progress: Loading state from /home/critix/snapraid-fix-probe/x2/snapraid.content...
+msg:verbose:        7 files
+msg:verbose:        0 hardlinks
+msg:verbose:        0 symlinks
+msg:verbose:        0 empty dirs
+resolve:proc:0:58: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:58: not found
+msg:progress: Searching disk d1...
+msg:progress: Searching disk d2...
+msg:progress: Selecting...
+msg:verbose: \t<error>
+memory:used:293607
+memory:block:17
+memory:extent:88
+memory:file:192
+memory:link:88
+memory:dir:80
+msg:progress: Using 0 MiB of memory for the file-system.
+msg:progress: Initializing...
+msg:progress: Selecting...
+msg:progress: Fixing...
+error:832:d1:sub/D.bin: Data error at position 0, diff bits 65/128
+entry:0:block:known:bad:d1:sub/D.bin:0:
+error:833:d1:sub/D.bin: Data error at position 1, diff bits 76/128
+entry:0:block:known:bad:d1:sub/D.bin:1:
+error:834:d1:sub/D.bin: Data error at position 2, diff bits 78/128
+entry:0:block:known:bad:d1:sub/D.bin:2:
+msg:status:\x20
+msg:status:      391 errors
+msg:status:        0 recovered errors
+msg:status:        0 unrecoverable errors
+msg:status: Everything OK
+summary:error:391
+summary:error_recovered:0
+summary:error_unrecoverable:0
+summary:exit:recovered
+";
+
+        /// `snapraid -d d1 fix` rebuilding a freshly emptied disk that carries a `lost+found`: 313 of 313 blocks recovered (run r1d); 1251 repeated per-block tag lines cut.
+        const REBUILD_REPLACED_DISK_BODY: &str = "selftest:
+msg:progress: Self test...
+uuid:by-uuid:65:130:a94faca5-1363-4d04-a4ad-a989ceba45cf: found ../../sdy2
+resolve:proc:0:27: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:27: not found
+data:d1:/home/critix/snapraid-replace-probe/r1d/d1/
+data:d2:/dev/shm/snapraid-replace-probe/r1d/d2/
+parity:0:/run/user/1000/snapraid-replace-probe/r1d/parity/snapraid.parity
+content:/home/critix/snapraid-replace-probe/r1d/snapraid.content
+msg:progress: Loading state from /home/critix/snapraid-replace-probe/r1d/snapraid.content...
+msg:verbose:        7 files
+msg:verbose:        0 hardlinks
+msg:verbose:        0 symlinks
+msg:verbose:        0 empty dirs
+resolve:proc:0:58: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:58: not found
+msg:progress: Searching disk d1...
+msg:progress: Searching disk d2...
+msg:progress: Selecting...
+msg:verbose: \td1//
+memory:used:275808
+memory:block:17
+memory:extent:88
+memory:file:192
+memory:link:88
+memory:dir:80
+msg:progress: Using 0 MiB of memory for the file-system.
+msg:progress: Initializing...
+msg:progress: Selecting...
+msg:progress: Fixing...
+msg:error: Reading data from missing file '/home/critix/snapraid-replace-probe/r1d/d1/D.bin' at offset 0.
+error:0:d1:D.bin: Read error at position 0
+entry:0:block:known:bad:d1:D.bin:0:
+fixed:0:d1:D.bin: Fixed data error at position 0
+msg:error: Reading data from missing file '/home/critix/snapraid-replace-probe/r1d/d1/D.bin' at offset 4096.
+error:1:d1:D.bin: Read error at position 1
+msg:status:\x20
+msg:status:      313 errors
+msg:status:      313 recovered errors
+msg:status:        0 unrecoverable errors
+msg:status: Everything OK
+summary:error:313
+summary:error_recovered:313
+summary:error_unrecoverable:0
+summary:exit:recovered
+";
+
+        /// the same rebuild while parity was out of date — a file on the OTHER disk rewritten in place after the last Sync: 10 blocks unrecoverable, exit 1 (run r5); 977 repeated per-block tag lines cut.
+        const REBUILD_STALE_PARITY_BODY: &str = "selftest:
+msg:progress: Self test...
+uuid:by-uuid:65:130:a94faca5-1363-4d04-a4ad-a989ceba45cf: found ../../sdy2
+resolve:proc:0:27: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:27: not found
+data:d1:/home/critix/snapraid-replace-probe/r5/d1/
+data:d2:/dev/shm/snapraid-replace-probe/r5/d2/
+parity:0:/run/user/1000/snapraid-replace-probe/r5/parity/snapraid.parity
+content:/home/critix/snapraid-replace-probe/r5/snapraid.content
+msg:progress: Loading state from /home/critix/snapraid-replace-probe/r5/snapraid.content...
+msg:verbose:        7 files
+msg:verbose:        0 hardlinks
+msg:verbose:        0 symlinks
+msg:verbose:        0 empty dirs
+resolve:proc:0:58: match skipped for not /dev/ mountsource for tmpfs tmpfs
+resolve:proc:0:58: not found
+msg:progress: Searching disk d1...
+msg:progress: Searching disk d2...
+msg:progress: Selecting...
+msg:verbose: \td1//
+msg:verbose: \t<missing>
+msg:progress: Scanning disk d1...
+msg:progress: Scanning disk d2...
+memory:used:275848
+memory:block:17
+memory:extent:88
+memory:file:192
+memory:link:88
+memory:dir:80
+msg:progress: Using 0 MiB of memory for the file-system.
+msg:progress: Initializing...
+msg:progress: Selecting...
+msg:progress: Fixing...
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 0.
+error:0:d1:D.bin: Read error at position 0
+entry:0:block:known:bad:d1:D.bin:0:
+fixed:0:d1:D.bin: Fixed data error at position 0
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 4096.
+error:1:d1:D.bin: Read error at position 1
+entry:0:block:known:bad:d1:D.bin:1:
+fixed:1:d1:D.bin: Fixed data error at position 1
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 8192.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 12288.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 16384.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 20480.
+strategy_error:5: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:5:2: Failed with no attempts
+recover_unsync:5:2: Skipped for nothing unsynced
+strategy_error:6: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:6:2: Failed with no attempts
+recover_unsync:6:2: Skipped for nothing unsynced
+strategy_error:7: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:7:2: Failed with no attempts
+recover_unsync:7:2: Skipped for nothing unsynced
+strategy_error:8: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:8:2: Failed with no attempts
+recover_unsync:8:2: Skipped for nothing unsynced
+strategy_error:9: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:9:2: Failed with no attempts
+recover_unsync:9:2: Skipped for nothing unsynced
+strategy_error:10: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:10:2: Failed with no attempts
+recover_unsync:10:2: Skipped for nothing unsynced
+strategy_error:11: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:11:2: Failed with no attempts
+recover_unsync:11:2: Skipped for nothing unsynced
+strategy_error:12: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:12:2: Failed with no attempts
+recover_unsync:12:2: Skipped for nothing unsynced
+strategy_error:13: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:13:2: Failed with no attempts
+recover_unsync:13:2: Skipped for nothing unsynced
+strategy_error:14: No strategy to recover from 2 failures with 1 parity with hash
+recover_sync:14:2: Failed with no attempts
+recover_unsync:14:2: Skipped for nothing unsynced
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 65536.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 69632.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 73728.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 77824.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 81920.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 86016.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 90112.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 94208.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 98304.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 102400.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 106496.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 110592.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 114688.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 118784.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 122880.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 126976.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 131072.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 135168.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 139264.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 143360.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 147456.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 151552.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 155648.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 159744.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 163840.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 167936.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 172032.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 176128.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 180224.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 184320.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 188416.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 192512.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 196608.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 200704.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 204800.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 208896.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 212992.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 217088.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 221184.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 225280.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 229376.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 233472.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 237568.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 241664.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 245760.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 249856.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/D.bin' at offset 253952.
+status:unrecoverable:d1:D.bin
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 0.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 4096.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 8192.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 12288.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 16384.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 20480.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 24576.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 28672.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 32768.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 36864.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 40960.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 45056.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 49152.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 53248.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 57344.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 61440.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 65536.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 69632.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 73728.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 77824.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 81920.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 86016.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 90112.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 94208.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 98304.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 102400.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 106496.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 110592.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 114688.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 118784.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 122880.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 126976.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 131072.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 135168.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 139264.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 143360.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 147456.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 151552.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 155648.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 159744.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 163840.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 167936.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 172032.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 176128.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 180224.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 184320.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 188416.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 192512.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 196608.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 200704.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 204800.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 208896.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 212992.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 217088.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 221184.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 225280.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 229376.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 233472.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 237568.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 241664.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 245760.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 249856.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 253952.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 258048.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 262144.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 266240.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 270336.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 274432.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 278528.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 282624.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 286720.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 290816.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 294912.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 299008.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/A.bin' at offset 303104.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 0.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 4096.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 8192.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 12288.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 16384.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 20480.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 24576.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 28672.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 32768.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 36864.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 40960.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 45056.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 49152.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 53248.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 57344.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 61440.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 65536.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 69632.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 73728.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 77824.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 81920.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 86016.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 90112.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 94208.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/E.bin' at offset 98304.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 0.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 4096.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 8192.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 12288.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 16384.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 20480.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 24576.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 28672.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 32768.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 36864.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 40960.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 45056.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 49152.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 53248.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 57344.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 61440.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 65536.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 69632.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 73728.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 77824.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 81920.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 86016.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 90112.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 94208.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 98304.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 102400.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 106496.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 110592.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 114688.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 118784.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 122880.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 126976.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 131072.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 135168.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 139264.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 143360.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 147456.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 151552.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 155648.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 159744.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 163840.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 167936.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 172032.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 176128.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 180224.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 184320.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 188416.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 192512.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 196608.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/B.bin' at offset 200704.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 0.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 4096.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 8192.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 12288.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 16384.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 20480.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 24576.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 28672.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 32768.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 36864.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 40960.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 45056.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 49152.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 53248.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 57344.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 61440.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 65536.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 69632.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 73728.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 77824.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 81920.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 86016.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 90112.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 94208.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 98304.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 102400.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 106496.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 110592.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 114688.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 118784.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 122880.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 126976.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 131072.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 135168.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 139264.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 143360.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 147456.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 151552.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 155648.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 159744.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 163840.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 167936.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 172032.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 176128.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 180224.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 184320.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 188416.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 192512.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 196608.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 200704.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 204800.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 208896.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 212992.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 217088.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 221184.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 225280.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 229376.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 233472.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 237568.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 241664.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 245760.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 249856.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 253952.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 258048.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 262144.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 266240.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 270336.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 274432.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 278528.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 282624.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 286720.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 290816.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 294912.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 299008.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 303104.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 307200.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 311296.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 315392.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 319488.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 323584.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 327680.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 331776.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 335872.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 339968.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 344064.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 348160.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 352256.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 356352.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 360448.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 364544.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 368640.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 372736.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 376832.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 380928.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 385024.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 389120.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 393216.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 397312.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 401408.
+msg:expected: Reading data from missing file '/home/critix/snapraid-replace-probe/r5/d1/sub/C.bin' at offset 405504.
+msg:status:\x20
+msg:status:      323 errors
+msg:status:      303 recovered errors
+msg:status:       10 UNRECOVERABLE errors
+msg:fatal: DANGER! Unrecoverable errors detected!
+summary:error:323
+summary:error_recovered:303
+summary:error_unrecoverable:10
+summary:exit:unrecoverable
+";
+        fn fix_log(args: &[&str], body: &str) -> String {
+            let argv = std::iter::once("/usr/bin/snapraid")
+                .chain(["-l", "/proc/self/fd/9"])
+                .chain(args.iter().copied())
+                .enumerate()
+                .map(|(index, arg)| format!("argv:{index}:{arg}\n"))
+                .collect::<String>();
+            log_text("fix", &format!("{argv}{body}"))
+        }
+
+        /// A repair passes only as one of the two filtered invocations measured
+        /// not to revert users' data, read back from the tool's own log, and is
+        /// judged by its counters — snapraid says `recovered` and even
+        /// "Everything OK" when it recovered nothing.
+        #[test]
+        fn a_repair_passes_only_as_a_filtered_fix_and_is_judged_by_its_counters() {
+            let spec = snap_spec();
+            let config = spec.config_path();
+            let marked = ["-c", config.as_str(), "-e", "fix"];
+            let rebuilt = ["-c", config.as_str(), "-d", "d1", "fix"];
+            let judge = |args: &[&str], body: &str, stdout: &str| {
+                let mut run = run_record(ElasticSnapraidKind::Fix { disk: "d1".into() });
+                parsed_log(&fix_log(args, body), stdout)
+                    .expect("parse")
+                    .apply(&mut run, &spec, false)
+                    .map(|verdict| (verdict, run.detail.clone().unwrap_or_default(), run.accessed_mb))
+            };
+            let done = "100% completed, 1 MB accessed in 0:00\n\n       1 errors\n       1 recovered errors\n       0 unrecoverable errors\nEverything OK\n";
+            assert_eq!(
+                judge(&marked, FIX_MARKED_BLOCKS_BODY, done),
+                Ok((SnapraidVerdict::Complete, "naprawiono 1 bloków".into(), Some(1)))
+            );
+            // The rebuild of a replaced disk, as measured on rig11.
+            assert_eq!(
+                judge(&rebuilt, REBUILD_REPLACED_DISK_BODY, done),
+                Ok((SnapraidVerdict::Complete, "naprawiono 313 bloków".into(), Some(1)))
+            );
+            // NOTHING REPAIRED is not a success, whichever way snapraid says
+            // it: no marked blocks at all, or marked blocks that all belong to
+            // files changed since the last Sync.
+            let nothing = judge(&marked, FIX_NOTHING_MARKED_BODY, "Nothing to check.\nEverything OK\n")
+                .expect("a repair with nothing to do is not a failure either");
+            assert_eq!(nothing.0, SnapraidVerdict::NothingWritten);
+            assert!(nothing.1.contains("uruchom scrub"), "{nothing:?}");
+            let skipped = judge(&marked, FIX_CHANGED_SINCE_SYNC_BODY, done).expect("a rewritten file is skipped, not a failure");
+            assert_eq!(skipped.0, SnapraidVerdict::NothingWritten);
+            assert!(skipped.1.contains("391") && skipped.1.contains("zmienionych"), "{skipped:?}");
+            // Parity that no longer describes the other disks: the rebuild
+            // reports unrecoverable blocks and the run fails.
+            let stale = judge(&rebuilt, REBUILD_STALE_PARITY_BODY, done).expect_err("unrecoverable blocks fail the run");
+            assert!(stale.contains("nie do odzyskania"), "{stale}");
+            // THE UNFILTERED FORMS reverts users' files: their logs fail the
+            // run whatever they recovered, and so does the old `-m` rebuild
+            // this flow no longer runs.
+            for args in [
+                vec!["-c", config.as_str(), "-d", "d1", "-m", "fix"],
+                vec!["-c", config.as_str(), "fix"],
+                vec!["-c", config.as_str(), "-m", "fix"],
+                vec!["-c", config.as_str(), "-d", "d2", "fix"],
+                vec![],
+            ] {
+                let result = judge(&args, REBUILD_REPLACED_DISK_BODY, done);
+                assert!(result.is_err(), "{args:?}: {result:?}");
+            }
+            let incomplete = FIX_MARKED_BLOCKS_BODY.replace("summary:exit:recovered\n", "");
+            assert!(judge(&marked, &incomplete, done).is_err());
+            assert!(judge(&marked, FIX_MARKED_BLOCKS_BODY, "41% completed, 1 MB accessed in 0:00\n").is_err());
+        }
+
+        /// A branch holding nothing but `lost+found` is a freshly formatted
+        /// disk. The replacement flow asks this immediately before it rebuilds:
+        /// the rebuild writes back everything parity says belongs on the disk,
+        /// which is safe on an empty filesystem and a revert of users' files on
+        /// any other.
+        #[test]
+        fn only_a_freshly_formatted_branch_is_fresh() {
+            let dir = Temp::new();
+            assert!(fresh_branch(&dir.0).expect("fresh"));
+            std::fs::create_dir(dir.0.join("lost+found")).expect("lost+found");
+            assert!(fresh_branch(&dir.0).expect("fresh"), "what mkfs leaves is still fresh");
+            std::fs::write(dir.0.join("written-after-the-replacement.txt"), b"x").expect("plik");
+            assert!(!fresh_branch(&dir.0).expect("fresh"));
+            assert!(fresh_branch(&dir.0.join("absent")).is_err(), "an unreadable branch decides nothing");
+        }
+
+        /// The recorded Sync with three tags and a matching three-error summary.
+        fn changed_during_sync_log() -> String {
+            log_text(
+                "sync",
+                &CHANGED_DURING_SYNC_BODY
+                    .replace("9815 file errors", "3 file errors")
+                    .replace("summary:error_file:9815", "summary:error_file:3"),
+            )
+        }
+
         fn parsed_log(log: &str, output: &str) -> Result<SnapraidLog, String> {
             let dir = Temp::new();
             std::fs::write(dir.0.join("log"), log).expect("log");
@@ -9776,6 +11923,130 @@ pub(crate) mod execution {
                 false,
             )
             .expect("sync CR");
+        }
+
+        /// A Sync the share kept writing to during its run is PARTIAL: the
+        /// recorded rig11 run passes as exactly that, with its counters, and
+        /// every other fault the same log could carry still fails the run.
+        #[test]
+        fn a_sync_that_met_changing_files_is_partial_and_nothing_else_is() {
+            let literal = log_text("sync", CHANGED_DURING_SYNC_BODY);
+            let mut run = run_record(ElasticSnapraidKind::Sync);
+            let verdict = parsed_log(&literal, CHANGED_DURING_SYNC_STDOUT)
+                .expect("parse")
+                .apply(&mut run, &snap_spec(), false)
+                .expect("a sync over changing files is not a failure");
+            assert_eq!(verdict, SnapraidVerdict::FilesChanged);
+            assert_eq!((run.errors_file, run.errors_io, run.errors_data), (Some(9815), Some(0), Some(0)));
+            assert_eq!(run.accessed_mb, Some(424));
+            // A file removed during the run is the same kind of skip.
+            let removed = literal.replace(
+                "error:1:d1:f150.bin: Unexpected attribute change",
+                "error:1:d1:gone.bin: Open ENOENT error. No such file or directory",
+            ) .replace(
+                "msg:error: Unexpected size change at file '/home/critix/snapraid-probe-36580/d1/f150.bin' from 4194357 to 4194629.\nmsg:error: WARNING! You cannot modify files during a sync.\nmsg:error: Rerun the sync command when finished.\nerror:2",
+                "msg:error: Missing file '/home/critix/snapraid-probe-36580/d1/gone.bin'.\nmsg:error: WARNING! You cannot modify files during a sync.\nmsg:error: Rerun the sync command when finished.\nerror:2",
+            );
+            assert_eq!(
+                parsed_log(&removed, CHANGED_DURING_SYNC_STDOUT)
+                    .expect("parse")
+                    .apply(&mut run_record(ElasticSnapraidKind::Sync), &snap_spec(), false),
+                Ok(SnapraidVerdict::FilesChanged)
+            );
+            let refused = |why: &str, log: String, stdout: &str, kind: ElasticSnapraidKind| {
+                let result = parsed_log(&log, stdout)
+                    .expect("parse")
+                    .apply(&mut run_record(kind), &snap_spec(), false);
+                assert!(result.is_err(), "{why}: {result:?}");
+            };
+            refused(
+                "a data error beside the changed files",
+                literal.replace("summary:exit:error", "error:9:d1:x.bin: Data error at position 0, diff bits 3/128\nsummary:exit:error"),
+                CHANGED_DURING_SYNC_STDOUT,
+                ElasticSnapraidKind::Sync,
+            );
+            refused(
+                "unexpected data change is not a changed file",
+                literal.replace("error:2:d1:f150.bin: Unexpected attribute change", "error:2:d1:f150.bin: Unexpected data change"),
+                CHANGED_DURING_SYNC_STDOUT,
+                ElasticSnapraidKind::Sync,
+            );
+            refused(
+                "an io error counted",
+                literal.replace("summary:error_io:0", "summary:error_io:1"),
+                CHANGED_DURING_SYNC_STDOUT,
+                ElasticSnapraidKind::Sync,
+            );
+            refused(
+                "a foreign msg:error line",
+                literal.replace("msg:progress: Syncing...", "msg:progress: Syncing...\nmsg:error: DANGER! Unexpected input/output read error"),
+                CHANGED_DURING_SYNC_STDOUT,
+                ElasticSnapraidKind::Sync,
+            );
+            refused(
+                "a run that did not reach 100%",
+                literal.clone(),
+                "Syncing...\n41% completed, 12 MB accessed in 0:00\n",
+                ElasticSnapraidKind::Sync,
+            );
+            refused(
+                "a summary that says ok",
+                literal.replace("summary:exit:error", "summary:exit:ok"),
+                CHANGED_DURING_SYNC_STDOUT,
+                ElasticSnapraidKind::Sync,
+            );
+            refused(
+                "a scrub is never partial",
+                log_text("scrub", CHANGED_DURING_SYNC_BODY),
+                CHANGED_DURING_SYNC_STDOUT,
+                ElasticSnapraidKind::Scrub,
+            );
+        }
+
+        /// The manual Sync runs with the union serving too: files changing under
+        /// it leave the array Ready with parity marked out of date, the pending
+        /// cleared, and the checkpoint where the last complete Sync put it.
+        #[test]
+        fn manual_sync_over_changing_files_keeps_the_array_ready_with_stale_parity() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            let checkpoint = journal.sync_completed_at.clone();
+            let run = perform_maintenance(
+                &root,
+                &mut journal,
+                run_record(ElasticSnapraidKind::Sync),
+                &snap_spec(),
+                || Ok((Some(1), parsed_log(&changed_during_sync_log(), CHANGED_DURING_SYNC_STDOUT))),
+                || Ok(false),
+                false,
+            )
+            .expect("wynik");
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::Partial);
+            assert!(run.detail.as_deref().is_some_and(|detail| detail.starts_with(PARTIAL_SYNC_NOTE)), "{:?}", run.detail);
+            let stored = root.load(&journal.spec.array_id).expect("load");
+            assert_eq!(stored.stage, ElasticStage::Ready);
+            assert!(stored.pending.is_none());
+            assert_eq!(stored.stale_parity_bytes, Some(0));
+            assert_eq!(stored.stale_sync_operation.as_deref(), Some(run.operation_id.as_str()));
+            assert_eq!(stored.sync_completed_at, checkpoint);
+            // The same log with a clean exit code is not trusted: snapraid exits
+            // 1 for this, and a 0 means the log and the process disagree.
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut disagreeing = ready_service_journal(&root);
+            let run = perform_maintenance(
+                &root,
+                &mut disagreeing,
+                run_record(ElasticSnapraidKind::Sync),
+                &snap_spec(),
+                || Ok((Some(0), parsed_log(&changed_during_sync_log(), CHANGED_DURING_SYNC_STDOUT))),
+                || Ok(false),
+                false,
+            )
+            .expect("wynik");
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::NeedsAttention);
+            assert_eq!(disagreeing.stage, ElasticStage::NeedsAttention);
         }
 
         #[test]
@@ -10047,19 +12318,19 @@ Nothing to do
             }
         }
 
+
+        /// The coupled Sync records every verdict on the transfer and the array
+        /// without a Hold: success leaves the array Ready with parity current, a
+        /// Sync that met changing files leaves it Ready with parity marked out of
+        /// date, and a failure pins nothing and marks parity stale.
         #[test]
-        fn mover_sync_hold_result_persists_success_and_failure_states() {
+        fn mover_sync_result_persists_success_partial_and_failure_states() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            for code in [Some(0), Some(1), None] {
+            for case in ["ok", "changed", "failed", "lost"] {
                 let dir = Temp::new();
                 let uid = unsafe { libc::geteuid() };
                 let root = Root::open(&dir.0, uid).expect("root");
                 let mut journal = ready_service_journal(&root);
-                journal.stage = ElasticStage::NeedsAttention;
-                journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                    mode: ElasticServiceMode::Hold,
-                    operation_id: "55555555-5555-4555-8555-555555555555".into(), pending: false,
-                });
                 journal.transfer = Some(TransferJournal {
                     operation_id: "66666666-6666-4666-8666-666666666666".into(),
                     resume_operation_id: "77777777-7777-4777-8777-777777777777".into(),
@@ -10070,53 +12341,72 @@ Nothing to do
                 skipped_files: 0, skipped_bytes: 0, refused_files: 0, issues: Vec::new(), walked: false, detail: None,
                 });
                 seed(&root, &journal);
-                let body = scan_text(false) + "msg:status: Nothing to do\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n";
-                let sync_log = log_text("sync", &body);
-                parsed_log(&sync_log, "Nothing to do\n").expect("valid sync fixture").apply(&mut run_record(ElasticSnapraidKind::Sync), &snap_spec(), false).expect("valid sync log");
+                let (sync_log, stdout, code) = match case {
+                    "ok" => (
+                        log_text("sync", &(scan_text(false) + "msg:status: Nothing to do\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n")),
+                        "Nothing to do\n".to_string(),
+                        Some(0),
+                    ),
+                    "changed" => (changed_during_sync_log(), CHANGED_DURING_SYNC_STDOUT.to_string(), Some(1)),
+                    "failed" => (
+                        log_text("sync", &(scan_text(false) + "msg:status: Nothing to do\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n")),
+                        "Nothing to do\n".to_string(),
+                        Some(1),
+                    ),
+                    _ => (
+                        log_text("sync", &(scan_text(false) + "msg:status: Nothing to do\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n")),
+                        "Nothing to do\n".to_string(),
+                        None,
+                    ),
+                };
                 let mut run = run_record(ElasticSnapraidKind::Sync);
                 run.operation_id = "66666666-6666-4666-8666-666666666666".into();
                 let result = perform_maintenance(
                     &root, &mut journal, run, &snap_spec(),
-                    || Ok((code, parsed_log(&sync_log, "Nothing to do\n"))),
+                    || Ok((code, parsed_log(&sync_log, &stdout))),
                     || Ok(false), true,
                 ).expect("typed result");
                 drop(root);
                 let reopened = Root::open(&dir.0, uid).expect("reopen");
                 let stored = reopened.load(&journal.spec.array_id).expect("load");
-                assert_eq!(stored.private.as_ref().unwrap().service.as_ref().unwrap().mode, ElasticServiceMode::Hold);
-                assert_ne!(stored.stage, ElasticStage::Ready);
+                assert!(stored.private.as_ref().unwrap().service.is_none(), "{case}: no service state is ever written");
+                assert!(stored.pending.is_none(), "{case}");
                 assert_eq!(stored.transfer.as_ref().unwrap().coupled_sync_result.as_ref().unwrap(), &result);
-                match code {
-                    Some(0) => {
+                match case {
+                    "ok" => {
                         assert_eq!(result.outcome, ElasticSnapraidOutcome::Succeeded);
-                        assert!(stored.pending.is_none());
+                        assert_eq!(stored.stage, ElasticStage::Ready);
                         assert_eq!(stored.stale_parity_bytes, None);
                     }
-                    Some(1) | None => {
+                    "changed" => {
+                        assert_eq!(result.outcome, ElasticSnapraidOutcome::Partial);
+                        assert_eq!((result.exit_code, result.errors_file, result.errors_io, result.errors_data), (Some(1), Some(3), Some(0), Some(0)));
+                        assert_eq!(stored.stage, ElasticStage::Ready, "a Sync over changing files holds nothing");
+                        assert!(stored.stale_parity_bytes.is_some(), "parity waits for the next Sync");
+                        assert_eq!(stored.sync_completed_at, journal.sync_completed_at, "no new checkpoint");
+                        assert_eq!(stored.transfer.as_ref().unwrap().phase, ElasticMoverPhase::Syncing);
+                        assert!(coupled_sync_settled(&result, "66666666-6666-4666-8666-666666666666"));
+                        assert!(!transfer_sync_owed(&stored, stored.transfer.as_ref().unwrap()));
+                    }
+                    _ => {
                         let expected = if code.is_some() { ElasticSnapraidOutcome::Failed } else { ElasticSnapraidOutcome::NeedsAttention };
                         assert_eq!(result.outcome, expected);
-                        // Kept as history with parity out of date, not as a pending.
-                        assert!(stored.pending.is_none());
+                        assert_eq!(stored.stage, ElasticStage::Ready, "{case}: the run needs attention, the array serves");
                         assert!(stored.stale_parity_bytes.is_some());
                         assert_eq!(stored.transfer.as_ref().unwrap().phase, ElasticMoverPhase::NeedsAttention);
                     }
-                    _ => unreachable!(),
                 }
             }
         }
 
+
         #[test]
-        fn mover_sync_post_guard_failure_keeps_hold_and_marks_parity_stale() {
+        fn mover_sync_post_guard_failure_marks_parity_stale_without_a_hold() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let dir = Temp::new();
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
             let mut journal = ready_service_journal(&root);
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: "55555555-5555-4555-8555-555555555555".into(), pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 operation_id: "55555555-5555-4555-8555-555555555555".into(),
                 resume_operation_id: "77777777-7777-4777-8777-777777777777".into(),
@@ -10135,8 +12425,8 @@ Nothing to do
             assert_ne!(result.outcome, ElasticSnapraidOutcome::Succeeded);
             assert!(journal.pending.is_none());
             assert!(journal.stale_parity_bytes.is_some());
-            assert_eq!(journal.private.as_ref().unwrap().service.as_ref().unwrap().mode, ElasticServiceMode::Hold);
-            assert_eq!(journal.stage, ElasticStage::NeedsAttention);
+            assert!(journal.private.as_ref().unwrap().service.is_none());
+            assert_eq!(journal.stage, ElasticStage::Ready, "a coupled Sync failure is its run's, not the array's");
         }
 
         #[test]
@@ -10146,11 +12436,6 @@ Nothing to do
             let uid = unsafe { libc::geteuid() };
             let mut root = Root::open(&dir.0, uid).expect("root");
             let mut journal = ready_service_journal(&root);
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: "55555555-5555-4555-8555-555555555555".into(), pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 operation_id: "66666666-6666-4666-8666-666666666666".into(),
                 resume_operation_id: "77777777-7777-4777-8777-777777777777".into(),
@@ -10188,11 +12473,6 @@ Nothing to do
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
             let mut journal = ready_service_journal(&root);
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: "55555555-5555-4555-8555-555555555555".into(), pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 operation_id: "66666666-6666-4666-8666-666666666666".into(),
                 resume_operation_id: "77777777-7777-4777-8777-777777777777".into(),
@@ -10218,11 +12498,6 @@ Nothing to do
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
             let mut journal = ready_service_journal(&root);
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: "55555555-5555-4555-8555-555555555555".into(), pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 operation_id: "66666666-6666-4666-8666-666666666666".into(),
                 resume_operation_id: "77777777-7777-4777-8777-777777777777".into(),
@@ -10348,6 +12623,62 @@ Nothing to do
                 .load(&spec().array_id)
                 .expect("saved result");
             (run, stored)
+        }
+
+        /// A REPAIR THAT WROTE NOTHING leaves the array exactly as it was: its
+        /// stage, its detail and its unresolved fault. snapraid reports such a
+        /// run as "Everything OK" with exit 0 (measured: `-e fix` with no scrub
+        /// behind it), so this is the whole difference between the product
+        /// telling an admin the array is healthy and telling them what to do.
+        #[test]
+        fn a_repair_that_repaired_nothing_leaves_the_array_and_its_fault_alone() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            let array = root.array_lock(&spec().array_id).expect("array lock");
+            let mut journal = legacy_journal(&root);
+            // The state a scrub that found errors left behind.
+            journal.stage = ElasticStage::NeedsAttention;
+            journal.detail = Some("scrub zgłosił błędy danych".into());
+            journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
+            root.save(&journal).expect("save");
+            let mut record = run_record(ElasticSnapraidKind::Fix { disk: "d1".into() });
+            record.operation_id = NEXT_OPERATION.into();
+            let log = fix_log(
+                &["-c", snap_spec().config_path().as_str(), "-e", "fix"],
+                FIX_NOTHING_MARKED_BODY,
+            );
+            let program = stderr_tool(&dir.0, &log, "Nothing to check.\nEverything OK\n", "", 0);
+            let run = perform_maintenance(
+                &root,
+                &mut journal,
+                record,
+                &snap_spec(),
+                || {
+                    capture_snapraid(
+                        &root,
+                        &array,
+                        &dir.0,
+                        "run",
+                        program.to_str().expect("program"),
+                        &["-e".into(), "fix".into()],
+                    )
+                },
+                || Ok(false),
+                false,
+            )
+            .expect("a repair with nothing to do is a recorded run, not an error");
+            assert_eq!(run.outcome, ElasticSnapraidOutcome::NothingRepaired);
+            assert_eq!(run.exit_code, Some(0));
+            assert!(run.detail.as_deref().is_some_and(|detail| detail.contains("uruchom scrub")), "{run:?}");
+            drop(root);
+            let stored = Root::open(&dir.0, uid).expect("reopen").load(&spec().array_id).expect("stan");
+            assert_eq!(stored.stage, ElasticStage::NeedsAttention, "the fault still holds the array");
+            assert_eq!(stored.detail.as_deref(), Some("scrub zgłosił błędy danych"));
+            assert!(stored.pending.is_none(), "and nothing is left in flight");
+            assert_eq!(stored.last_run.as_ref(), Some(&run));
+            assert_eq!(stored.sync_completed_at.as_deref(), Some("2026-09-08T10:00:00Z"));
         }
 
         /// THE rig11 REGRESSION. The mover's coupled Sync did everything right
@@ -10678,7 +13009,7 @@ Nothing to do
                 .reserve(&spec(), boot(), || Err("obcy podpis FS".into()))
                 .expect_err("guard");
             assert_eq!(error, "obcy podpis FS");
-            assert!(root.journals().expect("list").is_empty());
+            assert!(root.claims().expect("list").complete().expect("list").is_empty());
         }
 
         #[test]
@@ -10775,6 +13106,207 @@ Nothing to do
                 .is_err());
         }
 
+        /// An array beside `spec()`'s, with its own id, name and disk.
+        fn other_spec() -> ElasticCreateSpec {
+            let mut other = spec();
+            other.array_id = "44444444-4444-4444-8444-444444444444".into();
+            other.operation_id = "45454545-4545-4545-8545-454545454545".into();
+            other.name = "archiwum".into();
+            other.data[0].disk_id = "serial:other".into();
+            other.data[0].serial = Some("other".into());
+            other.data[0].expected_uuid = "46464646-4646-4646-8646-464646464646".into();
+            other
+        }
+
+        /// An older helper wrote the announcing phase as `holding`. A journal it
+        /// left there loads, and the node's claims still read every array.
+        #[test]
+        fn a_journal_an_older_helper_left_in_holding_still_loads() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            journal.stage = ElasticStage::NeedsAttention;
+            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Hold,
+                operation_id: "66666666-6666-4666-8666-666666666666".into(),
+                pending: true,
+            });
+            journal.transfer = Some(transfer_fixture("66666666-6666-4666-8666-666666666666", ElasticMoverPhase::Announced, true));
+            let bytes = serde_json::to_string(&journal).expect("json");
+            assert!(bytes.contains("\"phase\":\"announced\""));
+            let legacy = bytes.replace("\"phase\":\"announced\"", "\"phase\":\"holding\"");
+            atomic_write(&dir.0.join(format!("{}.json", spec().array_id)), legacy.as_bytes(), root.uid).expect("zapis");
+            let loaded = root.load(&spec().array_id).expect("the legacy phase loads");
+            assert_eq!(loaded.transfer.expect("transfer").phase, ElasticMoverPhase::Announced);
+            assert_eq!(root.claims().expect("lista").complete().expect("lista").len(), 1);
+        }
+
+        /// ONE journal the helper cannot load must not take the node down: the
+        /// import scan still lists every array, and the guards still see the
+        /// broken journal's disks and name through its spec. Only a journal
+        /// nothing can be read from makes the guards refuse, naming it.
+        #[test]
+        fn one_unloadable_journal_does_not_take_the_node_down() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            root.reserve(&other_spec(), boot(), || Ok(())).expect("reserve");
+            let path = dir.0.join(format!("{}.json", other_spec().array_id));
+            let broken = std::fs::read_to_string(&path).expect("journal").replace("\"stage\":\"prepared\"", "\"stage\":\"exploded\"");
+            atomic_write(&path, broken.as_bytes(), root.uid).expect("zapis");
+            assert!(root.load(&other_spec().array_id).is_err(), "the array keeps its own error");
+            let claims = root.claims().expect("the list survives").complete().expect("its spec is readable");
+            assert_eq!(claims.len(), 2);
+            let broken_claim = claims.iter().find(|claim| claim.spec.array_id == other_spec().array_id).expect("listed");
+            assert_eq!(broken_claim.anchored, None);
+            // A7: the import scan names it, with the reason, beside its claim.
+            let listed = unreadable_journals(&root.claims().expect("claims"));
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].array_id, other_spec().array_id);
+            assert!(listed[0].reason.contains("exploded"), "{listed:?}");
+            // Its disk and its name are still reserved.
+            let mut taking_disk = spec();
+            taking_disk.array_id = "47474747-4747-4747-8747-474747474747".into();
+            taking_disk.name = "nowa".into();
+            taking_disk.data = other_spec().data;
+            assert_eq!(claims_guard(&claims, &taking_disk).expect_err("dysk"), "nośnik zarezerwowany");
+            assert!(zfs_name_guard(&claims, "archiwum/dane").is_err());
+            // A file nothing can be read from: listed nowhere, and every guard
+            // refuses while it exists instead of proving a disk free without it.
+            std::fs::write(&path, b"{").expect("zapis");
+            let claims = root.claims().expect("the list survives");
+            assert_eq!(claims.arrays.len(), 1, "the import scan still lists the readable array");
+            assert_eq!(claims.unreadable.len(), 1);
+            let unreadable = unreadable_journals(&claims);
+            assert_eq!(unreadable.len(), 1);
+            assert_eq!(unreadable[0].array_id, other_spec().array_id);
+            assert!(!unreadable[0].reason.is_empty());
+            let refusal = claims.complete().err().expect("guards refuse");
+            assert!(refusal.contains(&other_spec().array_id), "{refusal}");
+        }
+
+        /// W2 of the second review: a wipe acknowledged for an array whose
+        /// journal loads only as a spec used to erase the disk and then fail
+        /// to release the journal, keeping the erased disk and the name
+        /// reserved for good. The release is decided before the erase, and a
+        /// spec-only journal is released; one nothing can be read from is not,
+        /// and that refusal comes before the erase.
+        #[test]
+        fn a_journal_only_its_spec_can_be_read_from_is_released_by_its_wipe() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            root.reserve(&other_spec(), boot(), || Ok(())).expect("reserve");
+            let path = dir.0.join(format!("{}.json", other_spec().array_id));
+            let broken = std::fs::read_to_string(&path).expect("journal").replace("\"stage\":\"prepared\"", "\"stage\":\"exploded\"");
+            atomic_write(&path, broken.as_bytes(), root.uid).expect("zapis");
+            assert!(root.load(&other_spec().array_id).is_err());
+            root.releasable(&other_spec().array_id).expect("a spec-only journal is releasable");
+            root.release(&other_spec().array_id).expect("released");
+            let claims = root.claims().expect("claims").complete().expect("complete");
+            assert_eq!(claims.len(), 1);
+            assert!(claims_guard(&claims, &other_spec()).is_ok(), "its disks and its name are free again");
+            // Nothing readable at all: refused before anything is erased.
+            root.reserve(&other_spec(), boot(), || Ok(())).expect("reserve again");
+            std::fs::write(&path, b"{").expect("zapis");
+            assert!(root.releasable(&other_spec().array_id).is_err());
+            assert!(root.release(&other_spec().array_id).is_err());
+            assert!(path.exists(), "an unreadable file is never removed");
+        }
+
+        /// Round 4: a journal a NEWER helper wrote still loads here, so rolling
+        /// the binary back stays possible — the invariants, not the field list,
+        /// are what refuse a journal that does not describe a legal array.
+        #[test]
+        fn a_field_a_newer_helper_added_still_loads_while_a_broken_invariant_does_not() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("journal")).expect("json");
+            let object = value.as_object_mut().expect("object");
+            object.insert("interrupted_scrub_marker".into(), serde_json::json!("from-0.14"));
+            object.insert("future_counters".into(), serde_json::json!({ "repairs": 3 }));
+            atomic_write(&path, serde_json::to_vec(&value).expect("bytes").as_slice(), root.uid).expect("zapis");
+            let loaded = root.load(&journal.spec.array_id).expect("a later helper's field is not a broken journal");
+            assert_eq!(loaded.spec.array_id, journal.spec.array_id);
+            assert_eq!(root.claims().expect("claims").complete().expect("complete").len(), 1);
+            // AND THE ROUND TRIP: a save gives the later helper's fields back
+            // unchanged. Without this, ignoring unknown fields is not a
+            // rollback but a slower deletion — roll back, run one operation,
+            // roll forward, and the newer version's state is gone for good.
+            root.save(&loaded).expect("save");
+            let rewritten: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("journal")).expect("json");
+            let rewritten = rewritten.as_object().expect("object");
+            assert_eq!(rewritten.get("interrupted_scrub_marker"), Some(&serde_json::json!("from-0.14")));
+            assert_eq!(rewritten.get("future_counters"), Some(&serde_json::json!({ "repairs": 3 })));
+            // EVERY CONTEXT-CRITICAL KEY IS WRITTEN, empty or not, and the
+            // journal says so — that marker is what lets the next load tell a
+            // field that is empty from a field that is gone.
+            assert_eq!(rewritten.get("fields_complete"), Some(&serde_json::json!(true)));
+            for key in [
+                "transfer",
+                "stale_parity_bytes",
+                "stuck",
+                "stuck_paths",
+                "stuck_evicted",
+                "evicted_paths",
+            ] {
+                assert!(rewritten.contains_key(key), "{key} must be written even when it is empty");
+            }
+
+            // A KEY REMOVED FROM A JOURNAL THAT CLAIMS TO HAVE WRITTEN IT is
+            // refused, one field at a time. Serde's `default` would otherwise
+            // read each absence as "that never happened": no record in flight
+            // (so a wipe may delete the journal), parity current, no stuck
+            // history, nothing left in the skip set.
+            let pristine: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("journal")).expect("json");
+            for key in [
+                "transfer",
+                "stale_parity_bytes",
+                "stuck",
+                "stuck_paths",
+                // Pinned after the fourth review: dropped TOGETHER these two
+                // silently reset an eviction counter the field's own doc calls
+                // lifelong, and no invariant can see both go.
+                "stuck_evicted",
+                "evicted_paths",
+            ] {
+                let mut stripped = pristine.clone();
+                stripped.as_object_mut().expect("object").remove(key);
+                atomic_write(&path, serde_json::to_vec(&stripped).expect("bytes").as_slice(), root.uid).expect("zapis");
+                let refused = root.load(&journal.spec.array_id).expect_err(key);
+                assert!(refused.contains(key), "{key}: {refused}");
+                // And the array still CLAIMS its disks: the spec-only recovery
+                // keeps the claim, records why the journal did not load and
+                // leaves `anchored` unknown, so no guard reads the refusal as
+                // "this array is not using its disks" — and `forgettable`,
+                // which is the one that would delete a journal with a record in
+                // flight, is never reached at all.
+                let claims = root.claims().expect("lista").complete().expect("spec-only recovery");
+                let claim = claims.iter().find(|claim| claim.spec.array_id == journal.spec.array_id);
+                let claim = claim.unwrap_or_else(|| panic!("{key}: claim zniknął"));
+                assert!(claim.load_error.is_some(), "{key}");
+                assert_eq!(claim.anchored, None, "{key}");
+                // A journal an EARLIER build wrote omits the same key without
+                // the marker, and that one still loads: refusing it would take
+                // out every storage guard on the node, not only this array.
+                stripped.as_object_mut().expect("object").remove("fields_complete");
+                atomic_write(&path, serde_json::to_vec(&stripped).expect("bytes").as_slice(), root.uid).expect("zapis");
+                root.load(&journal.spec.array_id).unwrap_or_else(|e| panic!("{key} bez znacznika: {e}"));
+            }
+            atomic_write(&path, serde_json::to_vec(&value).expect("bytes").as_slice(), root.uid).expect("zapis");
+            // The guard that stayed: a journal whose topology is illegal is
+            // still refused, unknown fields or not.
+            let mut illegal = value.clone();
+            illegal.as_object_mut().expect("object").insert("formatted".into(), serde_json::json!(["cache"]));
+            atomic_write(&path, serde_json::to_vec(&illegal).expect("bytes").as_slice(), root.uid).expect("zapis");
+            assert!(root.load(&journal.spec.array_id).is_err(), "an illegal topology is still refused");
+        }
+
         #[test]
         fn journals_refuse_symlinks_hardlinks_modes_and_corrupt_json() {
             for kind in ["symlink", "hardlink", "mode", "json"] {
@@ -10794,7 +13326,7 @@ Nothing to do
                     }
                     _ => std::fs::write(&path, b"{").expect("corrupt"),
                 }
-                assert!(root.journals().is_err(), "{kind}");
+                assert!(root.claims().expect("lista").complete().is_err(), "{kind}");
             }
         }
 
@@ -10846,6 +13378,173 @@ Nothing to do
         /// online add could not work at all, and no test called the persist
         /// path to find out. `grow_data` is the narrow road it needs, and the
         /// refusal `save` carries has to keep refusing everything else.
+        /// The array a replacement flow works on: two data disks, a cache and
+        /// parity, created, synced and NOT publishing a union in this boot.
+        fn replaceable_journal(root: &Root) -> Journal {
+            let mut request = spec();
+            request.data.push(ElasticDiskSpec {
+                disk_id: "serial:data2".into(),
+                serial: Some("data2".into()),
+                wwn: None,
+                bytes: 32 << 30,
+                expected_uuid: "dededede-dede-4ede-8ede-dededededede".into(),
+            });
+            request.cache = Some(cache_disk());
+            request.parity.push(ElasticDiskSpec {
+                disk_id: "serial:parity".into(),
+                serial: Some("parity".into()),
+                wwn: None,
+                bytes: 64 << 30,
+                expected_uuid: "99999999-9999-4999-8999-999999999999".into(),
+            });
+            let mut journal = root.reserve(&request, boot(), || Ok(())).expect("reserve");
+            journal.formatted = roles(&journal.spec);
+            journal.sync_completed_at = Some("2026-09-08T11:00:00Z".into());
+            journal.stage = ElasticStage::NeedsAttention;
+            journal.private = Some(PrivateTopology { anchor: None, published: false, service: None });
+            root.save(&journal).expect("ready to replace");
+            journal
+        }
+
+        fn replacement_disk() -> ElasticDiskSpec {
+            ElasticDiskSpec {
+                disk_id: "serial:fresh".into(),
+                serial: Some("fresh".into()),
+                wwn: None,
+                bytes: 32 << 30,
+                expected_uuid: "5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a".into(),
+            }
+        }
+
+        fn replace_request<'a>(branch: &'a str, disk: &'a ElasticDiskSpec, accept_stale_parity: bool) -> ReplaceRequest<'a> {
+            ReplaceRequest {
+                operation_id: "c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3",
+                rebuild_operation_id: "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4",
+                sync_operation_id: "e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e5",
+                branch,
+                disk,
+                accept_stale_parity,
+            }
+        }
+
+        /// The identity swap of a disk replacement: exactly one data slot's
+        /// five identity fields, the slot's role out of `formatted`, and
+        /// nothing else — on disk, before anything is formatted.
+        #[test]
+        fn replacing_a_disk_swaps_one_slot_and_nothing_else() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let before = replaceable_journal(&root);
+            let fresh = replacement_disk();
+
+            let swapped = root
+                .replace_data_disk(&before.spec.array_id, 0, &fresh)
+                .expect("one slot may be replaced");
+            assert_eq!(swapped.spec.data[0], fresh);
+            // NOTHING ELSE MOVED: the other slot, the cache, the parity, the
+            // name, the ids, the owner, the stage, the sync receipt.
+            assert_eq!(swapped.spec.data[1], before.spec.data[1]);
+            assert_eq!((&swapped.spec.cache, &swapped.spec.parity), (&before.spec.cache, &before.spec.parity));
+            assert_eq!(
+                (swapped.spec.name.as_str(), swapped.spec.array_id.as_str(), swapped.spec.operation_id.as_str(), &swapped.spec.owner),
+                (before.spec.name.as_str(), before.spec.array_id.as_str(), before.spec.operation_id.as_str(), &before.spec.owner)
+            );
+            assert_eq!((swapped.stage, &swapped.sync_completed_at), (before.stage, &before.sync_completed_at));
+            // The replacement carries no filesystem of this array yet, and
+            // that list is what gates the mkfs.
+            assert!(!swapped.formatted.contains(&ElasticRole::Data(1)));
+            assert!(swapped.formatted.contains(&ElasticRole::Data(2)) && swapped.formatted.contains(&ElasticRole::Cache));
+            // Durable before anything is formatted, and idempotent: a repeat
+            // of the same replacement is the state it already wrote.
+            let stored = root.load(&before.spec.array_id).expect("load");
+            assert_eq!(stored.spec, swapped.spec);
+            assert_eq!(stored.formatted, swapped.formatted);
+            let again = root.replace_data_disk(&before.spec.array_id, 0, &fresh).expect("a repeat");
+            assert_eq!(again.spec, swapped.spec);
+
+            // A STALE PRE-SWAP COPY IS REFUSED, which is what keeps a caller
+            // that kept one from putting the dead disk back into the spec.
+            assert!(root.save(&before).is_err(), "the journal from before the swap no longer saves");
+            assert_eq!(root.load(&before.spec.array_id).expect("load").spec, swapped.spec);
+            // A disk this array already holds in another role is refused.
+            let other = before.spec.data[1].clone();
+            assert!(root.replace_data_disk(&before.spec.array_id, 0, &other).is_err());
+            let cache = before.spec.cache.clone().expect("cache");
+            assert!(root.replace_data_disk(&before.spec.array_id, 0, &cache).is_err());
+            // And a slot the array does not have.
+            assert!(root.replace_data_disk(&before.spec.array_id, 7, &replacement_disk()).is_err());
+        }
+
+        /// Every reason a replacement is refused before it writes anything.
+        #[test]
+        fn a_replacement_is_refused_for_each_guard_before_it_writes() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = replaceable_journal(&root);
+            let fresh = replacement_disk();
+            replaceable_slot(&journal, &replace_request("d1", &fresh, false)).expect("a replaceable slot");
+
+            // The union is serving in this boot: a filesystem mounted under a
+            // live mergerfs is not reliably seen by it.
+            let mut serving = journal.clone();
+            serving.private = Some(PrivateTopology { anchor: Some(anchor_fixture()), published: true, service: None });
+            let error = replaceable_slot(&serving, &replace_request("d1", &fresh, false)).expect_err("serving");
+            assert!(error.contains("zrestartuj węzeł"), "{error}");
+
+            // No parity, or no confirmed first sync: nothing to rebuild from.
+            let mut bare = journal.clone();
+            bare.spec.parity.clear();
+            bare.formatted.retain(|role| !matches!(role, ElasticRole::Parity(_)));
+            assert!(replaceable_slot(&bare, &replace_request("d1", &fresh, false)).is_err());
+            let mut unsynced = journal.clone();
+            unsynced.sync_completed_at = None;
+            assert!(replaceable_slot(&unsynced, &replace_request("d1", &fresh, false)).is_err());
+
+            // An interrupted SnapRAID operation has to be closed first.
+            let mut pending = journal.clone();
+            let mut run = run_record(ElasticSnapraidKind::Scrub);
+            run.operation_id = NEXT_OPERATION.into();
+            pending.last_run = Some(run);
+            pending.pending = Some(Pending::Maintenance { operation_id: NEXT_OPERATION.into(), kind: ElasticSnapraidKind::Scrub });
+            assert!(replaceable_slot(&pending, &replace_request("d1", &fresh, false)).is_err());
+
+            // PARITY THAT IS NOT CURRENT: refused without the admin's word,
+            // allowed with it, because a Sync needs the disk that is gone.
+            let mut stale = journal.clone();
+            stale.stale_parity_bytes = Some(4096);
+            let error = replaceable_slot(&stale, &replace_request("d1", &fresh, false)).expect_err("stale parity");
+            assert!(error.contains("nieodtwarzalne") && error.contains("jawnej zgody"), "{error}");
+            replaceable_slot(&stale, &replace_request("d1", &fresh, true)).expect("with the acknowledgement");
+
+            // A slot the array does not have, and a replacement that is
+            // already a member of it.
+            assert!(replaceable_slot(&journal, &replace_request("d9", &fresh, false)).is_err());
+            let member = journal.spec.data[1].clone();
+            let error = replaceable_slot(&journal, &replace_request("d1", &member, false)).expect_err("member");
+            assert!(error.contains("inną rolę"), "{error}");
+
+            // Sizes: at least what the slot held, and no larger than parity.
+            let mut small = fresh.clone();
+            small.bytes = journal.spec.data[0].bytes - 1;
+            let error = replaceable_slot(&journal, &replace_request("d1", &small, false)).expect_err("too small");
+            assert!(error.contains("co najmniej"), "{error}");
+            let mut huge = fresh.clone();
+            huge.bytes = journal.spec.parity[0].bytes + 1;
+            let error = replaceable_slot(&journal, &replace_request("d1", &huge, false)).expect_err("too large");
+            assert!(error.contains("większy niż parity"), "{error}");
+
+            // A REPEAT of the same replacement is admitted, and only for the
+            // identity the journal already recorded.
+            let swapped = root.replace_data_disk(&journal.spec.array_id, 0, &fresh).expect("swap");
+            assert_eq!(replaceable_slot(&swapped, &replace_request("d1", &fresh, false)).expect("repeat"), 0);
+            let mut reused_id = fresh.clone();
+            reused_id.expected_uuid = "abababab-abab-4bab-8bab-abababababab".into();
+            let error = replaceable_slot(&swapped, &replace_request("d1", &reused_id, false)).expect_err("another identity");
+            assert!(error.contains("inną tożsamość"), "{error}");
+            // Nothing above wrote anything beyond the swap under test.
+            assert_eq!(root.load(&journal.spec.array_id).expect("load").spec, swapped.spec);
+        }
+
         #[test]
         fn a_persisted_spec_grows_by_one_data_disk_and_by_nothing_else() {
             let dir = Temp::new();
@@ -11136,7 +13835,7 @@ Nothing to do
             let mut other = spec();
             other.array_id = "88888888-8888-4888-8888-888888888888".into();
             other.name = "other".into();
-            assert!(claims_guard(&root.journals().expect("obie topologie"), &other).is_err());
+            assert!(claims_guard(&root.claims().expect("obie topologie").complete().expect("obie topologie"), &other).is_err());
         }
 
         #[test]
@@ -11444,9 +14143,12 @@ Nothing to do
                         Ok(true)
                     })
                 });
-                if matches!(case, "zero" | "synced") {
+                // A Sync or a Scrub left Running is closed by Restore under the
+                // array lock (`settle_interrupted_sync`); the guard lets it through.
+                if matches!(case, "zero" | "synced" | "maintenance_sync" | "maintenance_scrub") {
                     result.expect("potwierdzony checkpoint lub brak parity");
-                    assert_eq!(calls.get(), 1, "{case}");
+                    // Only a union intent asks the probe.
+                    assert_eq!(calls.get(), usize::from(!case.starts_with("maintenance_")), "{case}");
                 } else {
                     assert_eq!(
                         result.expect_err("odmowa przed sondą mount"),
@@ -11579,7 +14281,7 @@ Nothing to do
                 &mut LiveSteps { worker: None },
             )
             .expect_err("restore odmawia mkfs");
-            assert_eq!(error, "tylko create i dodanie dysku formatują");
+            assert_eq!(error, "tylko create, dodanie dysku i wymiana formatują");
             assert_eq!(
                 std::fs::read(dir.0.join(format!("{}.json", journal.spec.array_id)))
                     .expect("after"),
@@ -11690,7 +14392,7 @@ Nothing to do
                 union: plan.union_path(),
                 branch: format!("{}=RW", data_branch_path("media", "d1")),
             };
-            for mode in [StepMode::Create, StepMode::Restore, StepMode::Recover] {
+            for mode in [StepMode::Create, StepMode::Restore] {
                 assert_eq!(
                     run(branch.clone(), mode).expect_err("only an add grows a live union"),
                     "tylko dodanie dysku rozszerza żywą unię",
@@ -11721,12 +14423,7 @@ Nothing to do
             );
             // An unmount never runs through this executor at all — the dissolve
             // walks its own plan, in the namespace that can see the mounts.
-            for mode in [
-                StepMode::Create,
-                StepMode::Restore,
-                StepMode::Recover,
-                StepMode::AddDisk,
-            ] {
+            for mode in [StepMode::Create, StepMode::Restore, StepMode::AddDisk] {
                 assert_eq!(
                     run(
                         ElasticStep::Unmount {
@@ -11917,7 +14614,8 @@ Nothing to do
         fn imported_namespace_is_checked_as_a_whole_before_first_mount() {
             let dir = Temp::new();
             let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
-            let journals = vec![root.reserve(&spec(), boot(), || Ok(())).expect("reserve")];
+            root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            let journals = root.claims().expect("lista").complete().expect("lista");
             let mut datasets = vec![
                 ZfsDataset {
                     name: "tank".into(),
@@ -12105,18 +14803,17 @@ Nothing to do
             assert_eq!(std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes"), before);
         }
 
+
+        /// An unfinished mover run no longer keeps the union down: Restore
+        /// brings the array back around it. Only a Hold an older helper left
+        /// still stops Restore, because only its Resume may release it.
         #[test]
-        fn restore_guard_rejects_unfinished_transfer_after_reopen() {
+        fn restore_serves_an_unfinished_mover_run_but_not_a_legacy_hold_after_reopen() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let dir = Temp::new();
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
             let mut journal = ready_service_journal(&root);
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: "55555555-5555-4555-8555-555555555555".into(), pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 operation_id: "66666666-6666-4666-8666-666666666666".into(),
                 resume_operation_id: "77777777-7777-4777-8777-777777777777".into(),
@@ -12130,7 +14827,15 @@ Nothing to do
             drop(root);
             let root = Root::open(&dir.0, uid).expect("reopen");
             let stored = root.load(&journal.spec.array_id).expect("load");
-            assert_eq!(restore_checkpoint_guard(&stored).expect_err("hold"), "Restore nie konsumuje trwałego service Hold");
+            restore_checkpoint_guard(&stored).expect("an unfinished run does not keep the union down");
+            let mut held = stored.clone();
+            held.stage = ElasticStage::NeedsAttention;
+            held.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Hold,
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                pending: false,
+            });
+            assert_eq!(restore_checkpoint_guard(&held).expect_err("hold"), "Restore nie konsumuje trwałego service Hold");
         }
 
         #[test]
@@ -12212,7 +14917,6 @@ Nothing to do
         const NEXT_OPERATION: &str = "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4";
         const NEXT_RESUME: &str = "e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e5";
         const NEW_BOOT: &str = "f6f6f6f6-f6f6-4f6f-8f6f-f6f6f6f6f6f6";
-        const NEXT_BOOT: &str = "f7f7f7f7-f7f7-4f7f-8f7f-f7f7f7f7f7f7";
 
         /// Private cache and data directories standing in for mounted branches,
         /// next to a real `Root` whose array has a cache and, usually, parity.
@@ -12431,21 +15135,6 @@ Nothing to do
             }
         }
 
-        /// What `authorize_resume` and a successful `finish` persist once the
-        /// private union is published RW again.
-        fn release(root: &Root, journal: &mut Journal, resume: &str) {
-            authorize_resume(root, journal, resume).expect("zapowiedziany Resume");
-            let evicted = close_transfer(journal, resume).expect("zamknięcie transferu");
-            journal.private.as_mut().expect("private").service.as_mut().expect("service").pending = false;
-            journal.stage = ElasticStage::Ready;
-            journal.detail = None;
-            root.save(journal).expect("Online");
-            // The same order as `finish`: durable first, then said.
-            if let Some(dropped) = evicted {
-                log_eviction(&dropped);
-            }
-        }
-
         fn capture(snapshot: &std::cell::RefCell<Option<Vec<u8>>>, path: &Path) -> Result<(), String> {
             *snapshot.borrow_mut() = Some(std::fs::read(path).expect("journal"));
             Err("utrata zasilania".into())
@@ -12463,7 +15152,7 @@ Nothing to do
             if [ -f \"$control.before\" ]; then . \"$control.before\"; fi\n\
             code=$(sed -n \"${n}p\" \"$control.codes\")\n\
             cat \"$control.log\" > \"$2\"\n\
-            echo 'Nothing to do'\n\
+            if [ -f \"$control.stdout\" ]; then cat \"$control.stdout\"; else echo 'Nothing to do'; fi\n\
             exit \"${code:-1}\"\n";
 
         fn fake_snapraid_program() -> &'static Path {
@@ -12507,6 +15196,13 @@ Nothing to do
                 std::fs::write(self.part("before"), snippet).expect("hook");
             }
 
+            /// Every attempt writes this log and this stdout instead of the
+            /// clean nothing-to-do pair.
+            fn reporting(&self, log: &str, stdout: &str) {
+                std::fs::write(self.part("log"), log).expect("log");
+                std::fs::write(self.part("stdout"), stdout).expect("stdout");
+            }
+
             fn attempts(&self) -> usize {
                 std::fs::read_to_string(self.part("attempts"))
                     .ok()
@@ -12518,11 +15214,10 @@ Nothing to do
         /// The lowest level below `execute_steps`: devices, mount table, mount
         /// calls and the private mergerfs of one namespace. Every pending
         /// intent, save and mode decision above it runs for real.
-        struct FakeSteps<'a> {
+        struct FakeSteps {
             devices: Vec<Device>,
             mounted: BTreeSet<String>,
             union: bool,
-            readonly: bool,
             boot: String,
             fail_mount: Option<String>,
             /// Whether a private worker hosts the union.
@@ -12531,10 +15226,9 @@ Nothing to do
             published: usize,
             /// Branch specs the executor appended to the live union, in order.
             branches: Vec<String>,
-            on_readonly: Box<dyn FnMut() -> Result<(), String> + 'a>,
         }
 
-        impl FakeSteps<'_> {
+        impl FakeSteps {
             /// A namespace after a boot: the array's disks, nothing mounted.
             fn fresh(spec: &ElasticCreateSpec, boot: &str) -> Self {
                 let devices = spec
@@ -12560,14 +15254,12 @@ Nothing to do
                     devices,
                     mounted: BTreeSet::new(),
                     union: false,
-                    readonly: false,
                     boot: boot.into(),
                     fail_mount: None,
                     worker: true,
                     log: Vec::new(),
                     published: 0,
                     branches: Vec::new(),
-                    on_readonly: Box::new(|| Ok(())),
                 }
             }
 
@@ -12576,12 +15268,11 @@ Nothing to do
                 let mut steps = Self::fresh(spec, boot);
                 steps.mounted = roles(spec).into_iter().map(|role| mount_path(spec, role)).collect();
                 steps.union = true;
-                steps.readonly = true;
                 steps
             }
         }
 
-        impl StepSystem for FakeSteps<'_> {
+        impl StepSystem for FakeSteps {
             fn device(&mut self, disk: &ElasticDiskSpec) -> Result<Device, String> {
                 self.devices
                     .iter()
@@ -12646,10 +15337,15 @@ Nothing to do
                 self.worker
             }
 
+            /// The fake system never settles anything itself: the test that
+            /// drives `mount_then_settle` passes its own settle closure.
+            fn settle_host(&mut self) -> Option<&mut dyn MoverHost> {
+                None
+            }
+
             fn start_mergerfs(&mut self, _: &Path, _: &[String], _: &File) -> Result<Anchor, String> {
                 self.log.push("mergerfs".into());
                 self.union = true;
-                self.readonly = false;
                 Ok(Anchor { boot_id: self.boot.clone(), pid: 4242, ..anchor_fixture() })
             }
 
@@ -12658,32 +15354,12 @@ Nothing to do
                 Ok(())
             }
 
-            fn set_union_readonly(&mut self, readonly: bool) -> Result<(), String> {
-                if readonly {
-                    (self.on_readonly)()?;
-                }
-                self.log.push(format!("readonly {readonly}"));
-                self.readonly = readonly;
-                Ok(())
-            }
-
-            fn union_readonly(&mut self) -> Result<bool, String> {
-                Ok(self.readonly)
-            }
-
-            fn config_matches(&mut self, _: &ElasticSpec, _: u32) -> Result<(), String> {
-                Ok(())
-            }
-
-            fn tools(&mut self, _: &ElasticSpec) -> Result<Tools, String> {
-                Ok(Tools::for_preview())
-            }
         }
 
         /// The mover's host over fakes: the step system above, the branch
         /// check on its mount table and SnapRAID as a real process.
         struct TestHost<'a> {
-            steps: FakeSteps<'a>,
+            steps: FakeSteps,
             snapraid: FakeSnapraid,
             prepare_error: Option<String>,
             guard_error: Option<String>,
@@ -12699,16 +15375,6 @@ Nothing to do
                     guard_error: None,
                     on_checkpoint: Box::new(|_| Ok(())),
                 }
-            }
-
-            fn after_boot(mut self, bench: &MoverBench, boot: &str) -> Self {
-                self.steps = FakeSteps::fresh(&bench.spec, boot);
-                self
-            }
-
-            fn with_enter(mut self, hook: impl FnMut() -> Result<(), String> + 'a) -> Self {
-                self.steps.on_readonly = Box::new(hook);
-                self
             }
 
             fn with_checkpoint(mut self, hook: impl FnMut(&TransferFile) -> Result<(), String> + 'a) -> Self {
@@ -12728,10 +15394,6 @@ Nothing to do
         }
 
         impl MoverHost for TestHost<'_> {
-            fn steps(&mut self) -> &mut dyn StepSystem {
-                &mut self.steps
-            }
-
             fn verify_branches(&mut self, journal: &Journal) -> Result<(), String> {
                 for role in roles(&journal.spec) {
                     if matches!(role, ElasticRole::Parity(_)) {
@@ -12783,13 +15445,7 @@ Nothing to do
         fn coupled_sync_runs_only_with_parity_and_only_until_confirmed() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, mut journal) = mover_bench(1);
-            journal.stage = ElasticStage::NeedsAttention;
             journal.stale_parity_bytes = Some(5);
-            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: MOVER_OPERATION.into(),
-                pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 resume_operation_id: MOVER_RESUME.into(),
                 target: Some("d1".into()),
@@ -12842,8 +15498,31 @@ Nothing to do
             .expect("potwierdzony Sync");
         }
 
+
+        /// Asserts the durable array state a client of the share depends on:
+        /// no service state (so no Hold, and nothing to Resume) and a stage
+        /// that is serving — `Ready`, or `SyncPending` while the coupled Sync
+        /// runs.
+        fn assert_serving(journal: &Journal, when: &str) {
+            assert!(
+                journal.private.as_ref().expect("private").service.is_none(),
+                "{when}: a mover never writes a service state: {:?}",
+                journal.private.as_ref().and_then(|private| private.service.as_ref())
+            );
+            assert!(
+                matches!(journal.stage, ElasticStage::Ready | ElasticStage::SyncPending),
+                "{when}: stage {:?}",
+                journal.stage
+            );
+            assert!(journal.private.as_ref().expect("private").published, "{when}: the union stays published");
+        }
+
+        /// The owner's rule (2026-09-17): the share is never frozen by a move.
+        /// Every durable state a run writes — before its first file, at every
+        /// phase of every record, inside the coupled Sync and after it — keeps
+        /// the array serving with no Hold, and the run needs no Resume.
         #[test]
-        fn mover_moves_by_rules_syncs_and_releases_hold_only_to_its_resume() {
+        fn mover_moves_by_rules_and_syncs_without_ever_holding_the_array() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, mut journal) = mover_bench(1);
             write_aged(&bench.cache.join("old.bin"), b"old payload", 7200);
@@ -12863,11 +15542,14 @@ Nothing to do
             };
             let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
             let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+            let journal_path = bench.journal_path();
+            // The journal as the disk holds it while SnapRAID runs.
+            snapraid.before(&format!("cp '{}' '{}.during-sync'\n", journal_path.display(), journal_path.display()));
             let (root_ref, array_id) = (&root, bench.spec.array_id.clone());
-            let mut host = TestHost::new(&bench, &snapraid).with_enter(move || {
-                let stored = root_ref.load(&array_id).expect("zamiar Hold");
-                assert_eq!(stored.transfer.expect("zapowiedziany transfer").phase, ElasticMoverPhase::Holding);
-                assert!(stored.private.expect("private").service.expect("service").pending);
+            let checkpoints = std::cell::Cell::new(0usize);
+            let mut host = TestHost::new(&bench, &snapraid).with_checkpoint(|record| {
+                checkpoints.set(checkpoints.get() + 1);
+                assert_serving(&root_ref.load(&array_id).expect("stan"), &format!("{} {:?}", record.source, record.phase));
                 Ok(())
             });
             run_mover(
@@ -12878,9 +15560,16 @@ Nothing to do
                 &mut host,
             )
             .expect("mover");
-            assert_eq!(host.steps.log, vec!["readonly true".to_string()]);
+            assert!(host.steps.log.is_empty(), "no mount or union step: {:?}", host.steps.log);
             drop(host);
+            assert!(checkpoints.get() >= 4 * 9, "every phase of every record was observed: {}", checkpoints.get());
             assert_eq!(snapraid.attempts(), 1);
+            let during_sync: Journal = decode_journal(
+                &std::fs::read(format!("{}.during-sync", journal_path.display())).expect("stan w trakcie Sync"),
+            )
+            .expect("journal");
+            assert_serving(&during_sync, "during the coupled Sync");
+            assert_eq!(during_sync.stage, ElasticStage::SyncPending);
             assert_eq!(
                 tree(&bench.data[0]),
                 vec!["fotoalbum.bin", "inbox/new.bin", "nested/deep/older.bin", "old.bin"]
@@ -12901,6 +15590,8 @@ Nothing to do
             drop(root);
             let root = bench.reopen();
             let mut stored = root.load(&bench.spec.array_id).expect("reopen");
+            assert_serving(&stored, "after the run");
+            assert_eq!((stored.stage, stored.detail.as_deref()), (ElasticStage::Ready, None));
             let transfer = stored.transfer.clone().expect("transfer");
             assert_eq!(transfer.phase, ElasticMoverPhase::Complete);
             assert!(transfer.finished_at.is_some());
@@ -12912,20 +15603,23 @@ Nothing to do
             assert_eq!((run.moved_files, run.skipped_files, run.refused_files), (4, 0, 0));
             assert_eq!(run.moved_bytes, (11 + 13 + 13 + 19) as u64);
             assert!(run.counts_known);
-            let service = stored.private.as_ref().unwrap().service.clone().unwrap();
-            assert_eq!((service.mode, service.operation_id.as_str()), (ElasticServiceMode::Hold, MOVER_OPERATION));
+            // Nothing is left for a Resume to release, and Restore has nothing to refuse.
             let before = bench.journal_bytes();
-            assert!(authorize_resume(&root, &mut stored.clone(), FOREIGN_RESUME).is_err());
+            assert!(authorize_resume(&root, &mut stored.clone(), MOVER_RESUME).is_err());
             assert_eq!(bench.journal_bytes(), before);
-            authorize_resume(&root, &mut stored, MOVER_RESUME).expect("zapowiedziany Resume");
-            let online = root.load(&bench.spec.array_id).expect("online");
-            let service = online.private.as_ref().unwrap().service.clone().unwrap();
-            assert_eq!(
-                (service.mode, service.pending, service.operation_id.as_str()),
-                (ElasticServiceMode::Online, true, MOVER_RESUME)
-            );
-            restore_checkpoint_guard(&online).expect("Restore dokończy autoryzowany Resume");
+            restore_checkpoint_guard(&stored).expect("Restore");
+            // A later run starts straight away: nothing waits to be released.
+            let lock = root.array_lock(&bench.spec.array_id).expect("lock");
+            let next = MoverRequest {
+                operation_id: NEXT_OPERATION,
+                resume_operation_id: NEXT_RESUME,
+                ..mover_request(&rules, &lock)
+            };
+            run_mover(&root, &mut stored, &next, &bench.env(&roomy, &nothing_open), &mut TestHost::new(&bench, &snapraid))
+                .expect("następny przebieg");
+            assert_serving(&stored, "after the next run");
         }
+
 
         #[test]
         fn mover_resumes_an_interrupted_file_without_a_second_copy() {
@@ -12934,6 +15628,8 @@ Nothing to do
                 TransferFilePhase::CopyIntent,
                 TransferFilePhase::CopyConfirmed,
                 TransferFilePhase::RenameConfirmed,
+                TransferFilePhase::QuarantineIntent,
+                TransferFilePhase::QuarantineConfirmed,
                 TransferFilePhase::UnlinkIntent,
                 TransferFilePhase::UnlinkConfirmed,
             ] {
@@ -12964,12 +15660,13 @@ Nothing to do
                 assert!(transfer.current_failed.is_none(), "przerwanie nie jest błędem pliku");
                 assert_eq!(transfer.moved_files, 1);
                 assert!(!mover_run(&transfer, &[], 0, 0).counts_known);
+                assert!(stored.private.as_ref().unwrap().service.is_none(), "{stop:?}: no Hold to release");
+                // The union can come back around the record at any phase.
+                restore_checkpoint_guard(&stored).unwrap_or_else(|error| panic!("{stop:?}: {error}"));
                 let before = bench.journal_bytes();
-                assert!(authorize_resume(&root, &mut stored.clone(), MOVER_RESUME).is_err());
-                assert!(restore_checkpoint_guard(&stored).is_err());
                 let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
                 let foreign = MoverRequest {
-                    operation_id: FOREIGN_RESUME,
+                    resume_operation_id: FOREIGN_RESUME,
                     ..mover_request(&rules, &array_lock)
                 };
                 assert!(run_mover(
@@ -12980,7 +15677,7 @@ Nothing to do
                     &mut TestHost::new(&bench, &snapraid),
                 )
                 .is_err());
-                assert_eq!(bench.journal_bytes(), before, "obca operacja nie zmienia journala");
+                assert_eq!(bench.journal_bytes(), before, "ta sama operacja z innym Resume nie zmienia journala");
                 let mut host = TestHost::new(&bench, &snapraid);
                 run_mover(
                     &root,
@@ -12990,7 +15687,7 @@ Nothing to do
                     &mut host,
                 )
                 .unwrap_or_else(|error| panic!("wznowienie po {stop:?}: {error}"));
-                assert!(host.steps.log.is_empty(), "wznowienie nie wchodzi ponownie w Hold");
+                assert!(host.steps.log.is_empty());
                 assert_eq!(tree(&bench.data[0]), vec!["a.bin", "b/b.bin"], "{stop:?}");
                 assert!(tree(&bench.cache).is_empty(), "{stop:?}");
                 assert_eq!(std::fs::read(bench.data[0].join("b/b.bin")).expect("cel"), b"second");
@@ -13000,6 +15697,60 @@ Nothing to do
                     (transfer.phase, transfer.moved_files, transfer.moved_bytes, transfer.sequence),
                     (ElasticMoverPhase::Complete, 2, 11, 2)
                 );
+            }
+        }
+
+        /// The product never restarts an operation: the NEXT run finishes or
+        /// reverses the record an interruption left, closes that run, and moves
+        /// on. Whatever phase the record reached, exactly one copy of the file
+        /// ends under its path.
+        #[test]
+        fn the_next_run_settles_an_interrupted_record_at_every_phase() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for stop in [
+                TransferFilePhase::CopyIntent,
+                TransferFilePhase::CopyConfirmed,
+                TransferFilePhase::RenameIntent,
+                TransferFilePhase::RenameConfirmed,
+                TransferFilePhase::QuarantineIntent,
+                TransferFilePhase::QuarantineConfirmed,
+                TransferFilePhase::UnlinkIntent,
+                TransferFilePhase::UnlinkConfirmed,
+                TransferFilePhase::Done,
+            ] {
+              // Without parity there is no Sync to put the array back to
+              // Ready: the stopped run must not have taken it away.
+              for parity in [true, false] {
+                let (bench, root, mut journal) = mover_bench_with(1, parity);
+                write_aged(&bench.cache.join("a.bin"), b"first", 9000);
+                let rules = move_everything_aged();
+                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+                let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+                run_mover(
+                    &root,
+                    &mut journal,
+                    &mover_request(&rules, &array_lock),
+                    &bench.env(&roomy, &nothing_open),
+                    &mut TestHost::new(&bench, &snapraid).with_checkpoint(stop_at("a.bin", stop)),
+                )
+                .expect_err("przerwany mover");
+                let next = MoverRequest {
+                    operation_id: NEXT_OPERATION,
+                    resume_operation_id: NEXT_RESUME,
+                    ..mover_request(&rules, &array_lock)
+                };
+                run_mover(&root, &mut journal, &next, &bench.env(&roomy, &nothing_open), &mut TestHost::new(&bench, &snapraid))
+                    .unwrap_or_else(|error| panic!("{stop:?}: {error}"));
+                let on_cache = bench.cache.join("a.bin").exists();
+                let on_data = bench.data[0].join("a.bin").exists();
+                assert!(!on_cache && on_data, "{stop:?}: the next run moved it");
+                assert_eq!(std::fs::read(bench.data[0].join("a.bin")).expect("plik"), b"first");
+                assert!(tree(&bench.cache).is_empty() && tree(&bench.data[0]) == vec!["a.bin"], "{stop:?}: nothing left behind");
+                let transfer = journal.transfer.clone().expect("transfer");
+                assert_eq!((transfer.operation_id.as_str(), transfer.phase), (NEXT_OPERATION, ElasticMoverPhase::Complete));
+                assert!(journal.stuck.is_empty(), "{stop:?}");
+                assert_eq!(journal.stage, ElasticStage::Ready, "{stop:?} parity={parity}");
+              }
             }
         }
 
@@ -13044,11 +15795,13 @@ Nothing to do
             assert_eq!((transfer.phase, transfer.sync_attempt), (ElasticMoverPhase::Complete, 2));
             assert!(stored.pending.is_none());
             assert_eq!(stored.stale_parity_bytes, None);
-            authorize_resume(&root, &mut stored, MOVER_RESUME).expect("Resume po Sync");
+            assert_eq!(stored.stage, ElasticStage::Ready, "the retried Sync leaves the array serving");
+            assert!(stored.private.as_ref().unwrap().service.is_none());
         }
 
+
         #[test]
-        fn failed_coupled_sync_releases_with_stale_parity_and_the_next_run_syncs() {
+        fn failed_coupled_sync_leaves_stale_parity_and_the_next_run_syncs() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, mut journal) = mover_bench(1);
             write_aged(&bench.cache.join("a.bin"), b"payload", 9000);
@@ -13063,22 +15816,16 @@ Nothing to do
                 &mut TestHost::new(&bench, &snapraid),
             )
             .expect_err("nieudany Sync");
-            let mut stored = root.load(&bench.spec.array_id).expect("load");
-            assert_eq!(stored.last_run.as_ref().expect("historia Sync").outcome, ElasticSnapraidOutcome::Failed);
-            assert_eq!(stored.stale_parity_bytes, Some(7));
-            assert!(authorize_resume(&root, &mut stored.clone(), FOREIGN_RESUME).is_err());
-            release(&root, &mut stored, MOVER_RESUME);
             drop(array_lock);
             drop(root);
             let root = bench.reopen();
-            let mut online = root.load(&bench.spec.array_id).expect("reopen");
-            let closed = online.transfer.clone().expect("historia");
-            assert_eq!(closed.phase, ElasticMoverPhase::NeedsAttention);
-            assert!(closed.finished_at.is_some());
-            assert_eq!(online.stale_parity_bytes, Some(7), "parity pozostaje nieaktualna po zwolnieniu");
-            let observed = observe(&online, None);
+            let mut stored = root.load(&bench.spec.array_id).expect("reopen");
+            assert_eq!(stored.last_run.as_ref().expect("historia Sync").outcome, ElasticSnapraidOutcome::Failed);
+            assert_eq!(stored.stale_parity_bytes, Some(7), "parity pozostaje nieaktualna");
+            assert!(stored.private.as_ref().unwrap().service.is_none(), "a failed Sync holds nothing");
+            let observed = observe(&stored, None);
             assert_eq!((observed.parity_stale, observed.stale_parity_bytes), (true, Some(7)));
-            // A new run owes the Sync before parity is current, even with nothing to move.
+            // A new run closes the failed one and owes the Sync, even with nothing to move.
             let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
             let next = MoverRequest {
                 operation_id: NEXT_OPERATION,
@@ -13087,18 +15834,68 @@ Nothing to do
             };
             run_mover(
                 &root,
-                &mut online,
+                &mut stored,
                 &next,
                 &bench.env(&roomy, &nothing_open),
                 &mut TestHost::new(&bench, &snapraid),
             )
             .expect("następny mover");
             assert_eq!(snapraid.attempts(), 2);
-            let transfer = online.transfer.clone().expect("transfer");
+            let transfer = stored.transfer.clone().expect("transfer");
             assert_eq!((transfer.phase, transfer.moved_files), (ElasticMoverPhase::Complete, 0));
             assert!(coupled_sync_success(transfer.coupled_sync_result.as_ref().expect("sync"), NEXT_OPERATION));
-            assert_eq!(online.stale_parity_bytes, None);
-            assert!(!observe(&online, None).parity_stale);
+            assert_eq!(stored.stale_parity_bytes, None);
+            assert_eq!(stored.stage, ElasticStage::Ready);
+            assert!(!observe(&stored, None).parity_stale);
+        }
+
+        /// Files changing under the coupled Sync are what a writable share does
+        /// while it is synced. The run completes, the array keeps serving, parity
+        /// stays marked out of date, and the next run's Sync picks them up.
+        #[test]
+        fn a_coupled_sync_over_changing_files_completes_the_run_and_the_next_run_syncs() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (bench, root, mut journal) = mover_bench(1);
+            write_aged(&bench.cache.join("a.bin"), b"payload", 9000);
+            let rules = move_everything_aged();
+            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+            let changing = FakeSnapraid::new(&bench.dir.0, &[1]);
+            changing.reporting(&changed_during_sync_log(), CHANGED_DURING_SYNC_STDOUT);
+            run_mover(
+                &root,
+                &mut journal,
+                &mover_request(&rules, &array_lock),
+                &bench.env(&roomy, &nothing_open),
+                &mut TestHost::new(&bench, &changing),
+            )
+            .expect("a Sync over changing files does not fail the run");
+            let stored = root.load(&bench.spec.array_id).expect("stan");
+            let transfer = stored.transfer.clone().expect("transfer");
+            assert_eq!(transfer.phase, ElasticMoverPhase::Complete);
+            assert_eq!(transfer.detail.as_deref(), Some(PARTIAL_SYNC_NOTE));
+            let sync = transfer.coupled_sync_result.clone().expect("sync");
+            assert_eq!((sync.outcome, sync.exit_code), (ElasticSnapraidOutcome::Partial, Some(1)));
+            assert!(coupled_sync_settled(&sync, MOVER_OPERATION));
+            assert_eq!(stored.stage, ElasticStage::Ready, "nothing is frozen");
+            assert!(stored.private.as_ref().unwrap().service.is_none());
+            assert!(stored.pending.is_none());
+            assert!(stored.stale_parity_bytes.is_some(), "those files wait for the next Sync");
+            assert_eq!(tree(&bench.data[0]), vec!["a.bin"]);
+            let state = observe(&stored, None);
+            assert!(state.parity_stale);
+            // The same operation restarted owes nothing more; the next one owes the Sync.
+            assert!(!transfer_sync_owed(&stored, &transfer));
+            let clean = FakeSnapraid::new(&bench.dir.0, &[0]);
+            let next = MoverRequest {
+                operation_id: NEXT_OPERATION,
+                resume_operation_id: NEXT_RESUME,
+                ..mover_request(&rules, &array_lock)
+            };
+            run_mover(&root, &mut journal, &next, &bench.env(&roomy, &nothing_open), &mut TestHost::new(&bench, &clean))
+                .expect("następny przebieg");
+            assert_eq!(clean.attempts(), 1);
+            assert_eq!(journal.stale_parity_bytes, None);
+            assert_eq!(journal.stage, ElasticStage::Ready);
         }
 
         /// Runs a two-file mover that stops right after `a.bin` is done, then
@@ -13123,20 +15920,20 @@ Nothing to do
             (root, journal)
         }
 
-        /// Every failure after files moved leaves the run releasable by its
-        /// declared Resume, with parity marked stale.
-        fn assert_released_with_stale_parity(root: &Root, journal: &mut Journal, why: &str) {
+
+        /// Every failure after files moved leaves those files outside parity,
+        /// marked so, with nothing in flight and nothing held.
+        fn assert_stale_after_moved(journal: &Journal, why: &str) {
             let transfer = journal.transfer.clone().expect("transfer");
             assert!(transfer.current.is_none(), "{why}");
             assert!(transfer.moved_files > 0, "{why}");
             assert!(journal.stale_parity_bytes.is_some(), "{why}");
-            assert!(authorize_resume(root, &mut journal.clone(), FOREIGN_RESUME).is_err(), "{why}");
-            release(root, journal, MOVER_RESUME);
-            assert!(journal.stale_parity_bytes.is_some(), "{why}");
+            assert!(journal.private.as_ref().unwrap().service.is_none(), "{why}");
         }
 
+
         #[test]
-        fn failures_before_snapraid_starts_still_release_with_stale_parity() {
+        fn failures_before_snapraid_starts_leave_stale_parity_for_the_next_run() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, mut journal) = mover_bench(1);
             write_aged(&bench.cache.join("a.bin"), b"payload", 9000);
@@ -13154,7 +15951,7 @@ Nothing to do
             assert_eq!(error, "brak pliku content parity");
             assert_eq!(snapraid.attempts(), 0);
             assert!(journal.transfer.as_ref().unwrap().coupled_sync_result.is_none(), "bez próby Sync");
-            assert_released_with_stale_parity(&root, &mut journal, "guard");
+            assert_stale_after_moved(&journal, "guard");
             // The next run owes the Sync and makes parity current.
             let next = MoverRequest {
                 operation_id: NEXT_OPERATION,
@@ -13173,6 +15970,7 @@ Nothing to do
             assert_eq!(journal.stale_parity_bytes, None);
         }
 
+
         #[test]
         fn walk_failures_after_files_moved_still_run_the_owed_sync() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -13183,8 +15981,9 @@ Nothing to do
             // Mode 0 stops a user, never root, so each says what it expects.
             let as_user = unsafe { libc::geteuid() } != 0;
             // One unreadable directory is a refused entry and the walk goes on; a
-            // failed descriptor scan or free-space probe stops the walk. Either
-            // way the Sync the moved files owe runs before the run ends.
+            // failed descriptor scan or free-space probe stops the walk, which
+            // the run reports as partial. Either way the Sync the moved files
+            // owe runs, and only a Sync that fails leaves the run unfinished.
             for case in ["unreadable_directory", "open_files", "statvfs", "walk_and_sync"] {
                 let (bench, root, journal) = mover_bench(1);
                 // Only the case that fails its Sync spends a non-zero exit.
@@ -13215,6 +16014,7 @@ Nothing to do
                 assert_eq!(data[..2], ["a.bin", "b.bin"], "{case}: plik w toku dokończony");
                 assert_eq!(snapraid.attempts(), 1, "{case}: należny Sync");
                 let transfer = journal.transfer.clone().expect("transfer");
+                assert!(journal.private.as_ref().unwrap().service.is_none(), "{case}");
                 if case == "unreadable_directory" {
                     result.expect(case);
                     assert_eq!(journal.stale_parity_bytes, None, "{case}");
@@ -13231,44 +16031,44 @@ Nothing to do
                     }
                     continue;
                 }
-                let error = result.expect_err(case);
-                assert!(error.contains(if case == "statvfs" { "statvfs" } else { "/proc/4242/fd" }), "{error}");
                 assert_eq!(data.len(), 2, "{case}");
-                assert_eq!(transfer.phase, ElasticMoverPhase::NeedsAttention, "{case}");
                 assert!(!mover_run(&transfer, &[], 0, 0).counts_known, "{case}");
                 let issue = transfer.issues.iter().find(|issue| issue.path == ".").expect("zgłoszenie przeglądu");
                 assert!(issue.reason.starts_with("przegląd cache przerwany"), "{}", issue.reason);
-                assert!(authorize_resume(&root, &mut journal.clone(), FOREIGN_RESUME).is_err(), "{case}");
                 if case == "walk_and_sync" {
                     // Both failures are reported, and the Sync that did not
                     // confirm parity is named as the one that left it stale.
+                    let error = result.expect_err(case);
                     assert!(error.contains("SnapRAID"), "{error}");
                     assert!(error.find("/proc/4242/fd") < error.find("SnapRAID"), "{error}");
+                    assert_eq!(transfer.phase, ElasticMoverPhase::NeedsAttention, "{case}");
                     let stored = root.load(&bench.spec.array_id).expect("stan");
                     assert_eq!(stored.stale_sync_operation.as_deref(), Some(MOVER_OPERATION));
                     assert!(stored.stale_parity_bytes.is_some());
                     assert!(stored.pending.is_none(), "nieudany Sync movera nie przypina pending");
-                    release(&root, &mut journal, MOVER_RESUME);
-                    assert!(journal.stale_parity_bytes.is_some(), "parity wciąż nieaktualna");
                 } else {
+                    // Nothing is in flight and nothing is inconsistent: a run
+                    // that could not walk the whole cache is partial, not stuck.
+                    result.expect(case);
+                    assert_eq!(transfer.phase, ElasticMoverPhase::Complete, "{case}");
+                    assert_eq!(journal.stage, ElasticStage::Ready, "{case}");
                     assert_eq!(journal.stale_parity_bytes, None, "{case}");
                     assert!(coupled_sync_success(transfer.coupled_sync_result.as_ref().expect("sync"), MOVER_OPERATION), "{case}");
-                    release(&root, &mut journal, MOVER_RESUME);
-                    assert_eq!(journal.stale_parity_bytes, None, "{case}: parity aktualna po Resume");
                 }
             }
         }
 
+
         #[test]
-        fn a_sync_left_running_by_a_failed_save_is_closed_by_the_declared_resume() {
+        fn a_sync_left_running_by_a_failed_save_is_closed_by_the_next_run() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, mut journal) = mover_bench(1);
             write_aged(&bench.cache.join("a.bin"), b"payload", 9000);
             let rules = move_everything_aged();
             let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+            let snapraid = FakeSnapraid::new(&bench.dir.0, &[0, 0]);
             // SnapRAID succeeds, but every later journal write fails.
-            snapraid.before(&format!("chmod 0500 '{}'\n", bench.root_path().display()));
+            snapraid.before(&format!("[ \"$n\" = 1 ] && chmod 0500 '{}'\n", bench.root_path().display()));
             run_mover(
                 &root,
                 &mut journal,
@@ -13281,12 +16081,22 @@ Nothing to do
             let mut stored = root.load(&bench.spec.array_id).expect("load");
             assert_eq!(stored.last_run.as_ref().unwrap().outcome, ElasticSnapraidOutcome::Running);
             assert!(stored.pending.is_some(), "stan trwały z uruchomionym Sync");
-            assert!(authorize_resume(&root, &mut stored.clone(), FOREIGN_RESUME).is_err());
-            release(&root, &mut stored, MOVER_RESUME);
-            let online = root.load(&bench.spec.array_id).expect("online");
+            // A foreign intent would still refuse the next run; this one is the
+            // Sync of the run it closes.
+            let next = MoverRequest {
+                operation_id: NEXT_OPERATION,
+                resume_operation_id: NEXT_RESUME,
+                ..mover_request(&rules, &array_lock)
+            };
+            run_mover(&root, &mut stored, &next, &bench.env(&roomy, &nothing_open), &mut TestHost::new(&bench, &snapraid))
+                .expect("następny przebieg zamyka przerwany Sync");
+            let online = root.load(&bench.spec.array_id).expect("stan");
             assert!(online.pending.is_none());
-            assert_eq!(online.last_run.as_ref().unwrap().outcome, ElasticSnapraidOutcome::NeedsAttention);
-            assert!(online.stale_parity_bytes.is_some());
+            assert_eq!(online.last_run.as_ref().unwrap().operation_id, NEXT_OPERATION);
+            assert_eq!(online.last_run.as_ref().unwrap().outcome, ElasticSnapraidOutcome::Succeeded);
+            assert_eq!(online.stale_parity_bytes, None);
+            assert_eq!(online.stage, ElasticStage::Ready);
+            assert_eq!(snapraid.attempts(), 2);
         }
 
         #[test]
@@ -13295,11 +16105,6 @@ Nothing to do
             let (bench, root, mut journal) = mover_bench(1);
             journal.stage = ElasticStage::SyncPending;
             journal.stale_parity_bytes = Some(5);
-            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: MOVER_OPERATION.into(),
-                pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 resume_operation_id: MOVER_RESUME.into(),
                 target: Some("d1".into()),
@@ -13509,7 +16314,6 @@ Nothing to do
             assert_eq!(transfer.issues[0].kind, ElasticMoverIssueKind::Skipped);
             assert_eq!(stored.stale_parity_bytes, None);
             // A later operation chooses its own target: d1, now the freest.
-            release(&root, &mut stored, MOVER_RESUME);
             let next = MoverRequest {
                 operation_id: NEXT_OPERATION,
                 resume_operation_id: NEXT_RESUME,
@@ -13583,7 +16387,6 @@ Nothing to do
             );
             assert_eq!(transfer.issues[0].kind, ElasticMoverIssueKind::Skipped);
             assert_eq!(journal.stale_parity_bytes, None);
-            authorize_resume(&root, &mut journal, MOVER_RESUME).expect("Resume");
         }
 
         #[test]
@@ -13679,6 +16482,96 @@ Nothing to do
             assert_eq!(tree(&bench.data[0]), vec!["d.bin", "fotoalbum/c.bin"]);
             assert_eq!(tree(&bench.cache), vec!["foto/a.bin", "foto/sub/b.bin"]);
             assert!(journal.transfer.as_ref().unwrap().issues.is_empty());
+        }
+
+        /// The age probe sees what a run would move, and nothing a run would
+        /// not: fresh files wait, pinned folders never count, eager folders
+        /// count at any age, and an open file or a stuck path is held back
+        /// rather than reported as due — a run for it alone would take the
+        /// union read-only to move nothing.
+        #[test]
+        fn cache_age_counts_what_a_run_would_move_and_holds_back_what_it_would_skip() {
+            let dir = Temp::new();
+            let cache = dir.0.join("cache");
+            write_aged(&cache.join("old.bin"), b"old-bytes", 9000);
+            write_aged(&cache.join("fresh.bin"), b"fresh", 60);
+            write_aged(&cache.join("foto/pinned.bin"), b"pinned", 90_000);
+            write_aged(&cache.join("backup/eager.bin"), b"eager", 5);
+            write_aged(&cache.join("held.bin"), b"held", 9000);
+            write_aged(&cache.join("stuck.bin"), b"stuck", 9000);
+            let rules = MoverRules {
+                min_age_secs: 7200,
+                min_free_pct: 20,
+                pinned_folders: vec!["foto".into()],
+                eager_folders: vec!["backup".into()],
+                skip_open_files: true,
+            };
+            let held = std::fs::metadata(cache.join("held.bin")).expect("held");
+            let open = BTreeSet::from([(held.dev(), held.ino())]);
+            let stuck = BTreeSet::from([path_digest("stuck.bin")]);
+            let entries = crate::elastic_transfer::scan_cache(&cache, walk_prunes(&rules)).expect("scan");
+            let age = cache_age(entries, &rules, &stuck, &open, now_ns().expect("now"));
+            assert_eq!(age.due_files, 2, "old.bin and the eager file: {age:?}");
+            assert_eq!(age.due_bytes, (b"old-bytes".len() + b"eager".len()) as u64);
+            assert_eq!(age.held_files, 2, "held.bin is open, stuck.bin is on a stuck path");
+            // The oldest file OUTSIDE the pinned folder: its 25 h never count.
+            let oldest = age.oldest_secs.expect("files are waiting");
+            assert!((9000..9100).contains(&oldest), "{oldest}");
+
+            // Nothing old enough and nothing eager: nothing is due, and the
+            // oldest file says how long the freshest backlog has waited.
+            let dir = Temp::new();
+            let cache = dir.0.join("cache");
+            write_aged(&cache.join("fresh.bin"), b"fresh", 600);
+            let entries = crate::elastic_transfer::scan_cache(&cache, walk_prunes(&rules)).expect("scan");
+            let age = cache_age(entries, &rules, &BTreeSet::new(), &BTreeSet::new(), now_ns().expect("now"));
+            assert_eq!((age.due_files, age.due_bytes, age.held_files), (0, 0, 0));
+            assert!(age.oldest_secs.is_some_and(|secs| (600..700).contains(&secs)), "{age:?}");
+
+            // An empty cache has no oldest file at all, not a zero-second one.
+            let dir = Temp::new();
+            let cache = dir.0.join("cache");
+            std::fs::create_dir_all(cache.join("lost+found")).expect("lost+found");
+            write_aged(&cache.join("foto/only.bin"), b"only", 90_000);
+            let entries = crate::elastic_transfer::scan_cache(&cache, walk_prunes(&rules)).expect("scan");
+            assert_eq!(
+                cache_age(entries, &rules, &BTreeSet::new(), &BTreeSet::new(), now_ns().expect("now")),
+                ElasticCacheAge::default()
+            );
+        }
+
+        /// M3 of the 2026-09-17 review: an original a record left under its
+        /// quarantine name is a file on the unprotected cache. The age probe
+        /// counts it — held, and as old as it is, so the stuck alert sees it —
+        /// and a walk reports it instead of moving it as a file of its own.
+        #[test]
+        fn a_quarantined_original_is_counted_by_the_probe_and_reported_by_the_walk() {
+            let dir = Temp::new();
+            let cache = dir.0.join("cache");
+            let quarantine = format!("{}{MOVER_OPERATION}-3", crate::elastic_transfer::QUARANTINE_PREFIX);
+            write_aged(&cache.join(&quarantine), b"left", 90_000);
+            write_aged(&cache.join("fresh.bin"), b"fresh", 60);
+            let rules = MoverRules { min_age_secs: 7200, ..move_everything_aged() };
+            let entries = crate::elastic_transfer::scan_cache(&cache, walk_prunes(&rules)).expect("scan");
+            let age = cache_age(entries.clone(), &rules, &BTreeSet::new(), &BTreeSet::new(), now_ns().expect("now"));
+            assert_eq!((age.due_files, age.held_files), (0, 1), "{age:?}");
+            assert!(age.oldest_secs.is_some_and(|secs| secs >= 90_000), "{age:?}");
+            let (candidates, refused) = select_candidates(entries, &rules, now_ns().expect("now"));
+            assert!(candidates.is_empty());
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].0, quarantine);
+        }
+
+        /// A file whose mtime is in the future is zero seconds old: clock skew
+        /// must neither make it due nor wrap the age into a huge number.
+        #[test]
+        fn cache_age_reads_a_future_mtime_as_zero_seconds() {
+            let rules = MoverRules { min_age_secs: 60, skip_open_files: true, ..MoverRules::default() };
+            let now = 1_000_000_000_000_000_000i128;
+            let file = ScanFile { path: "f.bin".into(), device: 1, inode: 2, size: 3, allocated: 4096, mtime_ns: now + 5_000_000_000 };
+            let age = cache_age(vec![ScanEntry::File(file)], &rules, &BTreeSet::new(), &BTreeSet::new(), now);
+            assert_eq!(age.oldest_secs, Some(0));
+            assert_eq!(age.due_files, 0);
         }
 
         #[test]
@@ -13823,7 +16716,6 @@ Nothing to do
             assert!(transfer.current.is_none());
             assert_eq!(transfer.issues[0].path, "nested/a.bin");
             assert!(transfer.issues[0].reason.starts_with("wycofano kopię"), "{}", transfer.issues[0].reason);
-            authorize_resume(&root, &mut journal, MOVER_RESUME).expect("Resume po wycofaniu");
         }
 
         #[test]
@@ -13868,7 +16760,6 @@ Nothing to do
             let issue = transfer.issues.iter().find(|issue| issue.path == "b/b.bin").expect("zgłoszenie");
             assert_eq!(issue.kind, ElasticMoverIssueKind::Attention);
             assert!(issue.reason.starts_with("źródło usunięte po tożsamości"), "{}", issue.reason);
-            authorize_resume(&root, &mut stored, MOVER_RESUME).expect("Resume");
         }
 
         #[test]
@@ -13910,14 +16801,29 @@ Nothing to do
             let root = bench.reopen();
             let mut stored = root.load(&bench.spec.array_id).expect("reopen");
             let transfer = stored.transfer.clone().expect("transfer");
-            assert_eq!(transfer.current.as_ref().expect("rekord").phase, TransferFilePhase::RenameConfirmed);
+            // Stuck on the reversal: the copy under the path is not the one
+            // the record pinned, so it is not the record's to remove.
+            assert_eq!(transfer.current.as_ref().expect("rekord").phase, TransferFilePhase::RestoreIntent);
             assert!(transfer.current_failed.as_deref().is_some_and(|reason| reason.starts_with("rekord nierozwiązany")));
             assert!(stored.stale_parity_bytes.is_some());
             assert!(transfer.issues.iter().any(|issue| issue.kind == ElasticMoverIssueKind::Attention));
             assert!(mover_run(&transfer, &[], 0, 0).detail.is_some_and(|detail| detail.contains("rekord nierozwiązany")));
-            release(&root, &mut stored, MOVER_RESUME);
-            let history = root.load(&bench.spec.array_id).expect("historia").transfer.expect("transfer");
-            assert!(history.finished_at.is_some() && history.current.is_some() && history.current_failed.is_some());
+            assert!(stored.private.as_ref().unwrap().service.is_none(), "a stuck record holds nothing");
+            // The next run closes it into the history and leaves both copies alone.
+            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+            let next = MoverRequest {
+                operation_id: NEXT_OPERATION,
+                resume_operation_id: NEXT_RESUME,
+                ..mover_request(&rules, &array_lock)
+            };
+            run_mover(&root, &mut stored, &next, &bench.env(&roomy, &nothing_open), &mut TestHost::new(&bench, &snapraid))
+                .expect("następny przebieg");
+            let history = root.load(&bench.spec.array_id).expect("historia");
+            assert_eq!(history.stuck.len(), 1);
+            assert_eq!(history.stuck[0].operation_id, MOVER_OPERATION);
+            assert!(history.stuck[0].reason.starts_with("rekord nierozwiązany"), "{}", history.stuck[0].reason);
+            assert_eq!(std::fs::read(bench.cache.join("a.bin")).expect("źródło"), b"first");
+            assert_eq!(std::fs::read(bench.data[0].join("a.bin")).expect("cel"), b"FIRST");
         }
 
         /// Drives one file to a confirmed copy, then replaces the source so the
@@ -13944,18 +16850,20 @@ Nothing to do
             let left = tree(&bench.data[0]);
             assert_eq!(left.len(), 1, "kopia tymczasowa leży na gałęzi: {left:?}");
             before_retry(&left[0]);
-            // A different inode under the same path: the withdrawal refuses it
-            // before it ever reaches the copy, so the record sticks.
-            std::fs::remove_file(bench.cache.join("a.bin")).expect("usuń źródło");
-            write_aged(&bench.cache.join("a.bin"), b"second", 9000);
-            run_mover(
+            // The cache stops answering for the file's name: neither the move
+            // nor its reversal can find the original, so the record sticks with
+            // its copy still under the temporary name.
+            crate::elastic_transfer::fail_stat_of(Some("a.bin"));
+            let error = run_mover(
                 root,
                 journal,
                 &mover_request(rules, array_lock),
                 &bench.env(&roomy, &nothing_open),
                 &mut TestHost::new(bench, &snapraid),
             )
-            .expect_err("rekord nierozwiązany")
+            .expect_err("rekord nierozwiązany");
+            crate::elastic_transfer::fail_stat_of(None);
+            error
         }
 
         #[test]
@@ -14144,11 +17052,12 @@ Nothing to do
             assert!(error.contains("wycofanie nieudane"), "{error}");
             assert_eq!(std::fs::read(bench.cache.join("a.bin")).expect("źródło"), b"first");
             assert_eq!(tree(&bench.data[0]).len(), 1, "kopia tymczasowa zostaje");
-            let mut stored = root.load(&bench.spec.array_id).expect("load");
+            let stored = root.load(&bench.spec.array_id).expect("load");
             let transfer = stored.transfer.clone().expect("transfer");
             assert!(transfer.current.is_some() && transfer.current_failed.is_some());
             assert!(stored.stale_parity_bytes.is_some());
-            release(&root, &mut stored, MOVER_RESUME);
+            assert!(stored.private.as_ref().unwrap().service.is_none());
+            assert_eq!(stored.stage, ElasticStage::Ready, "the union serves; the next run closes the stuck record into history");
         }
 
         #[test]
@@ -14175,8 +17084,9 @@ Nothing to do
             assert_eq!((transfer.phase, transfer.refused_files), (ElasticMoverPhase::Complete, 0));
         }
 
+
         #[test]
-        fn restarting_mover_refuses_a_union_that_is_not_readonly_or_unmounted_branches() {
+        fn a_mover_refuses_unmounted_branches_a_legacy_hold_and_a_new_boot_without_writing() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, journal) = mover_bench(1);
             let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
@@ -14184,17 +17094,6 @@ Nothing to do
             let rules = move_everything_aged();
             let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
             let before = bench.journal_bytes();
-            let mut rw = TestHost::new(&bench, &snapraid);
-            rw.steps.readonly = false;
-            let error = run_mover(
-                &root,
-                &mut journal,
-                &mover_request(&rules, &array_lock),
-                &bench.env(&roomy, &nothing_open),
-                &mut rw,
-            )
-            .expect_err("unia RW");
-            assert!(error.contains("unii potwierdzonej jako RO"), "{error}");
             let mut unmounted = TestHost::new(&bench, &snapraid);
             unmounted.steps.mounted.remove(&cache_branch_path("media", "c1"));
             let error = run_mover(
@@ -14206,9 +17105,106 @@ Nothing to do
             )
             .expect_err("niezamontowany cache");
             assert!(error.contains("zamontowanych branchy"), "{error}");
+            // A Hold an older helper's mover left is released only by its Resume.
+            let mut held = journal.clone();
+            held.transfer.as_mut().unwrap().current = None;
+            held.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Hold,
+                operation_id: MOVER_OPERATION.into(),
+                pending: false,
+            });
+            held.stage = ElasticStage::NeedsAttention;
+            for request in [
+                mover_request(&rules, &array_lock),
+                MoverRequest { operation_id: NEXT_OPERATION, resume_operation_id: NEXT_RESUME, ..mover_request(&rules, &array_lock) },
+            ] {
+                let error = run_mover(
+                    &root,
+                    &mut held.clone(),
+                    &request,
+                    &bench.env(&roomy, &nothing_open),
+                    &mut TestHost::new(&bench, &snapraid),
+                )
+                .expect_err("stary Hold");
+                assert!(error.contains("service Hold"), "{error}");
+            }
+            // After a boot the array is restored first; the mover never mounts.
+            let error = run_mover(
+                &root,
+                &mut journal.clone(),
+                &mover_request(&rules, &array_lock),
+                &bench.env_at(&roomy, &nothing_open, NEW_BOOT),
+                &mut TestHost::new(&bench, &snapraid),
+            )
+            .expect_err("nowy boot");
+            assert!(error.contains("wymaga Restore"), "{error}");
             assert_eq!(bench.journal_bytes(), before);
             assert_eq!(tree(&bench.data[0]), vec!["a.bin"]);
             assert_eq!(tree(&bench.cache), vec!["b.bin"]);
+        }
+
+        /// A power loss in the middle of a record: after the boot the mover
+        /// waits for Restore, Restore brings the union back around the record,
+        /// and the next run finishes it — one copy under the path.
+        #[test]
+        fn after_a_power_loss_restore_serves_the_array_and_the_next_run_finishes_the_record() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for stop in [TransferFilePhase::RenameConfirmed, TransferFilePhase::QuarantineConfirmed] {
+                let (bench, root, mut journal) = mover_bench(1);
+                write_aged(&bench.cache.join("a.bin"), b"first", 9000);
+                let rules = move_everything_aged();
+                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+                let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+                let snapshot = std::cell::RefCell::new(None);
+                let journal_path = bench.journal_path();
+                let (snapshot_ref, path_ref) = (&snapshot, journal_path.as_path());
+                run_mover(
+                    &root,
+                    &mut journal,
+                    &mover_request(&rules, &array_lock),
+                    &bench.env(&roomy, &nothing_open),
+                    &mut TestHost::new(&bench, &snapraid).with_checkpoint(move |record| {
+                        if record.phase == stop {
+                            return capture(snapshot_ref, path_ref);
+                        }
+                        Ok(())
+                    }),
+                )
+                .expect_err("utrata zasilania");
+                bench.power_loss(&snapshot.take().expect("stan w chwili awarii"));
+                drop(array_lock);
+                drop(root);
+                let root = bench.reopen();
+                let mut crashed = root.load(&bench.spec.array_id).expect("stan po awarii");
+                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+                let before = bench.journal_bytes();
+                assert!(run_mover(
+                    &root,
+                    &mut crashed.clone(),
+                    &mover_request(&rules, &array_lock),
+                    &bench.env_at(&roomy, &nothing_open, NEW_BOOT),
+                    &mut TestHost::new(&bench, &snapraid),
+                )
+                .is_err());
+                assert_eq!(bench.journal_bytes(), before, "{stop:?}");
+                restore_checkpoint_guard(&crashed).unwrap_or_else(|error| panic!("{stop:?}: {error}"));
+                // What a successful Restore in the new boot leaves in the journal.
+                crashed.boot_id = NEW_BOOT.into();
+                crashed.private.as_mut().unwrap().anchor = Some(Anchor { boot_id: NEW_BOOT.into(), ..anchor_fixture() });
+                crashed.stage = ElasticStage::Ready;
+                seed(&root, &crashed);
+                let next = MoverRequest {
+                    operation_id: NEXT_OPERATION,
+                    resume_operation_id: NEXT_RESUME,
+                    ..mover_request(&rules, &array_lock)
+                };
+                run_mover(&root, &mut crashed, &next, &bench.env_at(&roomy, &nothing_open, NEW_BOOT), &mut TestHost::new(&bench, &snapraid))
+                    .unwrap_or_else(|error| panic!("{stop:?}: {error}"));
+                assert!(tree(&bench.cache).is_empty(), "{stop:?}");
+                assert_eq!(tree(&bench.data[0]), vec!["a.bin"], "{stop:?}");
+                assert_eq!(std::fs::read(bench.data[0].join("a.bin")).expect("plik"), b"first");
+                assert_eq!(crashed.transfer.as_ref().unwrap().phase, ElasticMoverPhase::Complete);
+            }
         }
 
         #[test]
@@ -14259,8 +17255,8 @@ Nothing to do
             .expect_err("nieudany Sync");
             let stored = root.load(&bench.spec.array_id).expect("journal czytelny");
             let transfer = stored.transfer.clone().expect("transfer");
+            assert_eq!((stored.stage, stored.detail.as_deref()), (ElasticStage::Ready, None), "a failed coupled Sync is its run's");
             for (field, text) in [
-                ("detail", stored.detail.as_deref()),
                 ("last_run", stored.last_run.as_ref().and_then(|run| run.detail.as_deref())),
                 ("coupled_sync", transfer.coupled_sync_result.as_ref().and_then(|run| run.detail.as_deref())),
                 ("transfer", transfer.detail.as_deref()),
@@ -14311,8 +17307,12 @@ Nothing to do
             variant.transfer = None;
             variants.push(("usunięcie transferu", variant));
             let mut variant = stored.clone();
-            variant.transfer.as_mut().unwrap().phase = ElasticMoverPhase::Holding;
-            variants.push(("powrót do Holding", variant));
+            variant.transfer.as_mut().unwrap().phase = ElasticMoverPhase::Announced;
+            variants.push(("powrót do zapowiedzi", variant));
+            let mut variant = stored.clone();
+            variant.transfer.as_mut().unwrap().current.as_mut().unwrap().phase = TransferFilePhase::Restored;
+            variant.transfer.as_mut().unwrap().current = None;
+            variants.push(("wycofanie bez zapisanego końca", variant));
             let mut variant = stored.clone();
             variant.stale_parity_bytes = None;
             variants.push(("parity aktualna bez Sync", variant));
@@ -14381,214 +17381,6 @@ Nothing to do
             assert_eq!((transfer.moved_files, transfer.refused_files, transfer.sequence), (1, 1, 1));
             assert_eq!(transfer.issues[0].path, "over.bin");
             assert_eq!(transfer.issues[0].reason, "rekord pliku przekroczyłby limit dziennika");
-        }
-
-        /// Recovery on a fresh boot through the real `execute_steps(Recover)`:
-        /// the branches and a new mergerfs come back RO, nothing is published,
-        /// no mount intent is left behind and the declared Resume releases.
-        fn recover_and_release(bench: &MoverBench, request_coupled: bool, snapraid: &FakeSnapraid, boot_id: &'static str) {
-            let root = bench.reopen();
-            let mut crashed = root.load(&bench.spec.array_id).expect("stan po awarii czytelny");
-            let rules = move_everything_aged();
-            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let request = MoverRequest { coupled_sync: request_coupled, ..mover_request(&rules, &array_lock) };
-            let (root_ref, array_id) = (&root, bench.spec.array_id.clone());
-            let mut host = TestHost::new(bench, snapraid).after_boot(bench, boot_id).with_checkpoint(move |_| {
-                let stored = root_ref.load(&array_id).map_err(|error| error.to_string())?;
-                assert!(!stored.private.expect("private").published, "odtworzenie niczego nie publikuje");
-                assert_eq!(stored.boot_id, boot_id);
-                Ok(())
-            });
-            run_mover(&root, &mut crashed, &request, &bench.env_at(&roomy, &nothing_open, boot_id), &mut host)
-                .unwrap_or_else(|error| panic!("odtworzenie: {error}"));
-            assert_eq!(host.steps.published, 0, "tryb Recover nie publikuje");
-            assert!(host.steps.log.contains(&format!("mount {}", cache_branch_path("media", "c1"))));
-            let mergerfs = host.steps.log.iter().position(|step| step == "mergerfs").expect("nowy mergerfs");
-            assert!(host.steps.log[mergerfs..].contains(&"readonly true".to_string()), "unia wraca jako RO");
-            drop(host);
-            assert!(crashed.pending.is_none(), "żadna intencja montowania nie zostaje");
-            assert_eq!(crashed.transfer.as_ref().unwrap().phase, ElasticMoverPhase::Complete);
-            assert_eq!(crashed.boot_id, boot_id);
-            let private = crashed.private.clone().expect("private");
-            assert!(!private.published);
-            // Publication stays refused under the Hold; only the declared Resume releases it.
-            assert!(authorize_publication(&root, &crashed.spec, private.anchor.as_ref().expect("kotwica")).is_err());
-            assert!(authorize_resume(&root, &mut crashed.clone(), FOREIGN_RESUME).is_err());
-            authorize_resume(&root, &mut crashed, MOVER_RESUME)
-                .unwrap_or_else(|error| panic!("Resume po odtworzeniu: {error}"));
-        }
-
-        #[test]
-        fn mover_recovers_after_a_fresh_boot_in_every_phase() {
-            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            for stop in ["holding", "copy_confirmed", "rename_confirmed", "unlink_confirmed", "syncing"] {
-                let (bench, root, mut journal) = mover_bench(1);
-                write_aged(&bench.cache.join("a.bin"), b"first", 9000);
-                write_aged(&bench.cache.join("b/b.bin"), b"second", 8000);
-                let rules = move_everything_aged();
-                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-                // Only the syncing crash spends a SnapRAID attempt before the power loss.
-                let codes: &[i32] = if stop == "syncing" { &[1, 0] } else { &[0] };
-                let snapraid = FakeSnapraid::new(&bench.dir.0, codes);
-                // The journal as the disk holds it at the chosen moment; the run
-                // then stops, and that moment is what the power loss leaves.
-                let snapshot = std::cell::RefCell::new(None);
-                let journal_path = bench.journal_path();
-                let (snapshot_ref, path_ref) = (&snapshot, journal_path.as_path());
-                let mut host = TestHost::new(&bench, &snapraid);
-                match stop {
-                    "holding" => host = host.with_enter(move || capture(snapshot_ref, path_ref)),
-                    "syncing" => snapraid.before(&format!(
-                        "[ \"$n\" = 1 ] && cp '{}' '{}.snapshot'\n",
-                        journal_path.display(),
-                        journal_path.display()
-                    )),
-                    phase => {
-                        let wanted = match phase {
-                            "copy_confirmed" => TransferFilePhase::CopyConfirmed,
-                            "rename_confirmed" => TransferFilePhase::RenameConfirmed,
-                            _ => TransferFilePhase::UnlinkConfirmed,
-                        };
-                        host = host.with_checkpoint(move |record| {
-                            if record.source == "b/b.bin" && record.phase == wanted {
-                                return capture(snapshot_ref, path_ref);
-                            }
-                            Ok(())
-                        });
-                    }
-                }
-                run_mover(
-                    &root,
-                    &mut journal,
-                    &mover_request(&rules, &array_lock),
-                    &bench.env(&roomy, &nothing_open),
-                    &mut host,
-                )
-                .expect_err("utrata zasilania");
-                drop(host);
-                let lost = match stop {
-                    "syncing" => std::fs::read(format!("{}.snapshot", journal_path.display())).expect("migawka"),
-                    _ => snapshot.take().expect("stan w chwili awarii"),
-                };
-                bench.power_loss(&lost);
-                drop(array_lock);
-                drop(root);
-                recover_and_release(&bench, true, &snapraid, NEW_BOOT);
-                assert_eq!(tree(&bench.data[0]), vec!["a.bin", "b/b.bin"], "{stop}");
-                assert!(tree(&bench.cache).is_empty(), "{stop}");
-                let stored = bench.reopen().load(&bench.spec.array_id).expect("stan");
-                assert!(coupled_sync_success(
-                    stored.transfer.as_ref().unwrap().coupled_sync_result.as_ref().expect("sync"),
-                    MOVER_OPERATION
-                ), "{stop}");
-                assert_eq!(stored.stale_parity_bytes, None, "{stop}");
-            }
-        }
-
-        #[test]
-        fn recovery_releases_without_parity_without_coupled_sync_and_with_nothing_left() {
-            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            for case in ["no_parity", "no_coupled_sync", "nothing_left"] {
-                let (bench, root, mut journal) = mover_bench_with(1, case != "no_parity");
-                if case != "nothing_left" {
-                    write_aged(&bench.cache.join("a.bin"), b"first", 9000);
-                }
-                let rules = move_everything_aged();
-                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-                let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
-                let request = MoverRequest {
-                    coupled_sync: case != "no_coupled_sync",
-                    ..mover_request(&rules, &array_lock)
-                };
-                let snapshot = std::cell::RefCell::new(None);
-                let journal_path = bench.journal_path();
-                let (snapshot_ref, path_ref) = (&snapshot, journal_path.as_path());
-                let host = TestHost::new(&bench, &snapraid);
-                let mut host = if case == "nothing_left" {
-                    host.with_enter(move || capture(snapshot_ref, path_ref))
-                } else {
-                    host.with_checkpoint(move |record| {
-                        if record.phase == TransferFilePhase::RenameConfirmed {
-                            return capture(snapshot_ref, path_ref);
-                        }
-                        Ok(())
-                    })
-                };
-                run_mover(&root, &mut journal, &request, &bench.env(&roomy, &nothing_open), &mut host)
-                    .expect_err("utrata zasilania");
-                drop(host);
-                bench.power_loss(&snapshot.take().expect("stan w chwili awarii"));
-                drop(array_lock);
-                drop(root);
-                recover_and_release(&bench, case != "no_coupled_sync", &snapraid, NEW_BOOT);
-                assert_eq!(snapraid.attempts(), 0, "{case}: brak Sync do wykonania");
-                if case != "nothing_left" {
-                    assert_eq!(tree(&bench.data[0]), vec!["a.bin"], "{case}");
-                }
-            }
-        }
-
-        #[test]
-        fn a_recovery_that_fails_after_a_mount_intent_recovers_on_the_next_boot() {
-            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (bench, root, mut journal) = mover_bench(1);
-            write_aged(&bench.cache.join("a.bin"), b"first", 9000);
-            let rules = move_everything_aged();
-            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
-            let snapshot = std::cell::RefCell::new(None);
-            let journal_path = bench.journal_path();
-            let (snapshot_ref, path_ref) = (&snapshot, journal_path.as_path());
-            run_mover(
-                &root,
-                &mut journal,
-                &mover_request(&rules, &array_lock),
-                &bench.env(&roomy, &nothing_open),
-                &mut TestHost::new(&bench, &snapraid).with_checkpoint(move |record| {
-                    if record.phase == TransferFilePhase::CopyConfirmed {
-                        return capture(snapshot_ref, path_ref);
-                    }
-                    Ok(())
-                }),
-            )
-            .expect_err("utrata zasilania");
-            bench.power_loss(&snapshot.take().expect("stan w chwili awarii"));
-            drop(array_lock);
-            drop(root);
-            // First boot: the cache mount fails part-way through recovery.
-            let root = bench.reopen();
-            let mut crashed = root.load(&bench.spec.array_id).expect("stan po awarii");
-            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let mut failing = TestHost::new(&bench, &snapraid).after_boot(&bench, NEW_BOOT);
-            failing.steps.fail_mount = Some(cache_branch_path("media", "c1"));
-            run_mover(
-                &root,
-                &mut crashed,
-                &mover_request(&rules, &array_lock),
-                &bench.env_at(&roomy, &nothing_open, NEW_BOOT),
-                &mut failing,
-            )
-            .expect_err("montowanie cache");
-            let stored = root.load(&bench.spec.array_id).expect("stan");
-            assert_eq!(stored.pending, Some(Pending::Mount(ElasticRole::Cache)));
-            assert_eq!(stored.boot_id, NEW_BOOT);
-            // The same boot cannot retry past the unresolved mount intent.
-            let before = bench.journal_bytes();
-            assert!(run_mover(
-                &root,
-                &mut stored.clone(),
-                &mover_request(&rules, &array_lock),
-                &bench.env_at(&roomy, &nothing_open, NEW_BOOT),
-                &mut TestHost::new(&bench, &snapraid).after_boot(&bench, NEW_BOOT),
-            )
-            .is_err());
-            assert_eq!(bench.journal_bytes(), before);
-            drop(array_lock);
-            drop(root);
-            // The next boot clears the void intent and recovers.
-            recover_and_release(&bench, true, &snapraid, NEXT_BOOT);
-            assert_eq!(tree(&bench.data[0]), vec!["a.bin"]);
-            assert!(tree(&bench.cache).is_empty());
         }
 
         #[test]
@@ -14692,29 +17484,6 @@ Nothing to do
         }
 
         #[test]
-        fn recovery_steps_refuse_a_system_without_a_private_worker() {
-            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (bench, root, mut journal) = mover_bench(1);
-            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let before = bench.journal_bytes();
-            let mut steps = FakeSteps::fresh(&bench.spec, NEW_BOOT);
-            steps.worker = false;
-            let error = execute_steps(
-                &root,
-                &array_lock,
-                &mut journal,
-                &snap_spec(),
-                vec![ElasticStep::Mkdir { path: "/mnt/elastic-test".into() }],
-                StepMode::Recover,
-                &mut steps,
-            )
-            .expect_err("Recover bez wykonawcy");
-            assert_eq!(error, "odtworzenie wymaga prywatnego wykonawcy");
-            assert!(steps.log.is_empty(), "{:?}", steps.log);
-            assert_eq!(bench.journal_bytes(), before);
-        }
-
-        #[test]
         fn save_and_load_share_the_operation_record_check() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, journal) = mover_bench(1);
@@ -14754,89 +17523,6 @@ Nothing to do
             foreign.stale_sync_operation = Some(MOVER_OPERATION.into());
             root.save(&foreign).expect("własny nieudany Sync movera");
             root.load(&bench.spec.array_id).expect("czytelny po zapisie");
-        }
-
-        #[test]
-        fn inspect_after_a_failed_recovery_reports_the_restart_and_the_next_boot_recovers() {
-            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let host_boot = boot_id().expect("boot hosta");
-            assert_ne!(host_boot, boot(), "awaria w innym boot niż bieżący");
-            let (bench, root, mut journal) = mover_bench(1);
-            write_aged(&bench.cache.join("a.bin"), b"first", 9000);
-            let rules = move_everything_aged();
-            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
-            let snapshot = std::cell::RefCell::new(None);
-            let journal_path = bench.journal_path();
-            let (snapshot_ref, path_ref) = (&snapshot, journal_path.as_path());
-            run_mover(
-                &root,
-                &mut journal,
-                &mover_request(&rules, &array_lock),
-                &bench.env(&roomy, &nothing_open),
-                &mut TestHost::new(&bench, &snapraid).with_checkpoint(move |record| {
-                    if record.phase == TransferFilePhase::CopyConfirmed {
-                        return capture(snapshot_ref, path_ref);
-                    }
-                    Ok(())
-                }),
-            )
-            .expect_err("utrata zasilania");
-            bench.power_loss(&snapshot.take().expect("stan w chwili awarii"));
-            drop(array_lock);
-            drop(root);
-            // This boot: the cache mount fails part-way through recovery.
-            let root = bench.reopen();
-            let mut crashed = root.load(&bench.spec.array_id).expect("stan po awarii");
-            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let mut failing = TestHost::new(&bench, &snapraid).after_boot(&bench, &host_boot);
-            failing.steps.fail_mount = Some(cache_branch_path("media", "c1"));
-            run_mover(
-                &root,
-                &mut crashed,
-                &mover_request(&rules, &array_lock),
-                &bench.env_at(&roomy, &nothing_open, &host_boot),
-                &mut failing,
-            )
-            .expect_err("montowanie cache");
-            drop(failing);
-            let stored = root.load(&bench.spec.array_id).expect("stan");
-            assert_eq!(stored.boot_id, host_boot);
-            assert!(stored.private.as_ref().expect("private").anchor.is_none());
-            let before = bench.journal_bytes();
-            // Inspect in the same boot returns the array state with the restart it waits for.
-            let inspect = crate::HelperCommand::ElasticInspect {
-                array_id: bench.spec.array_id.clone(),
-                owner: bench.spec.owner.clone(),
-            };
-            let value = private_operation(&root, stored.clone(), &inspect).expect("Inspect zwraca stan");
-            let state: ElasticResult = serde_json::from_value(value).expect("stan macierzy");
-            assert!(state.restart_required);
-            assert_eq!(state.stage, ElasticStage::NeedsAttention);
-            // The flag carries the state; the detail keeps the cause.
-            assert!(state.detail.is_some(), "przyczyna zostaje w szczegółach");
-            assert!(
-                !state.detail.as_deref().is_some_and(|detail| detail.contains("wymagany restart")),
-                "helper nie koduje stanu w zdaniu: {:?}",
-                state.detail
-            );
-            assert_eq!(state.last_mover.expect("mover").phase, ElasticMoverPhase::NeedsAttention);
-            assert_eq!(bench.journal_bytes(), before, "Inspect niczego nie zapisuje");
-            // The same boot does not retry; the accepted exit is a reboot.
-            assert!(run_mover(
-                &root,
-                &mut stored.clone(),
-                &mover_request(&rules, &array_lock),
-                &bench.env_at(&roomy, &nothing_open, &host_boot),
-                &mut TestHost::new(&bench, &snapraid).after_boot(&bench, &host_boot),
-            )
-            .is_err());
-            assert_eq!(bench.journal_bytes(), before);
-            drop(array_lock);
-            drop(root);
-            recover_and_release(&bench, true, &snapraid, NEXT_BOOT);
-            assert_eq!(tree(&bench.data[0]), vec!["a.bin"]);
-            assert!(tree(&bench.cache).is_empty());
         }
 
         /// The longest temporary name the validators admit for `operation_id`:
@@ -14909,13 +17595,13 @@ Nothing to do
             );
             crate::elastic_transfer::fail_content_reads(None);
             assert!(result.expect_err("nierozwiązany rekord").starts_with("rekord nierozwiązany"));
-            // Visible while its operation still holds the array.
+            // Visible while its operation is still the array's open run.
             let state = observe(&journal, None);
             assert_eq!(state.stuck_records.len(), 1);
             assert_eq!(state.last_mover.expect("wynik").stuck_records, state.stuck_records);
-            release(&root, &mut journal, MOVER_RESUME);
-            assert_eq!(journal.stuck.len(), 1, "Resume przenosi rekord do historii");
-            // A new operation keeps the history, moves the rest and leaves the stuck path.
+            assert!(journal.stuck.is_empty(), "not history until its run is closed");
+            // A new operation closes that run into the history, moves the rest
+            // and leaves the stuck path.
             write_aged(&bench.cache.join("c.bin"), b"third", 9000);
             let next = MoverRequest {
                 operation_id: NEXT_OPERATION,
@@ -15092,12 +17778,6 @@ Nothing to do
             let oldest = records[0].clone();
             journal.stuck = records;
             journal.stuck_paths = paths;
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().expect("private").service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: MOVER_OPERATION.into(),
-                pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 target: Some("d1".into()),
                 sequence: 1,
@@ -15106,7 +17786,7 @@ Nothing to do
                 ..transfer_fixture(MOVER_OPERATION, ElasticMoverPhase::Moving, false)
             });
             seed(&root, &journal);
-            close_transfer(&mut journal, "77777777-7777-4777-8777-777777777777").expect("Resume zamyka transfer");
+            close_transfer(&mut journal).expect("zamknięcie transferu");
             assert_eq!(journal.stuck.len(), STUCK_LIMIT, "historia nie rośnie ponad limit");
             assert!(
                 !journal.stuck.iter().any(|record| record.path_sha256 == oldest.path_sha256),
@@ -15211,11 +17891,6 @@ Nothing to do
             let private = journal.private.as_mut().expect("private");
             private.anchor = Some(Anchor { union_source: branches, ..anchor_fixture() });
             private.published = false;
-            private.service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: MOVER_OPERATION.into(),
-                pending: false,
-            });
             let failed_sync = ElasticSnapraidRun {
                 operation_id: MOVER_OPERATION.into(),
                 kind: ElasticSnapraidKind::Sync,
@@ -15379,7 +18054,7 @@ Nothing to do
                 transfer.phase = ElasticMoverPhase::NeedsAttention;
             }
             seed(&root, &worst);
-            close_transfer(&mut worst, MOVER_RESUME).expect("Resume zamyka transfer");
+            close_transfer(&mut worst).expect("zamknięcie transferu");
             root.save(&worst).expect("zamykający zapis mieści się w limicie");
             let size = std::fs::read(root.path.join(format!("{}.json", spec.array_id))).expect("journal").len();
             assert!(size as u64 <= JOURNAL_LIMIT, "{size} B");
@@ -15531,8 +18206,8 @@ Nothing to do
             let in_flight = journal.transfer.clone().expect("transfer");
             assert!(in_flight.current.is_some() && in_flight.current_failed.is_none(), "rekord wygląda zdrowo");
             assert!(
-                transfer_blocks_resume(&journal, &in_flight, MOVER_RESUME),
-                "taki rekord blokowałby Resume"
+                close_transfer(&mut journal.clone()).is_err(),
+                "a healthy-looking record in flight cannot be closed, only finished"
             );
             // Every field is within its own bound and the journal still has no
             // room left, so the write that would carry the error is refused.
@@ -15550,7 +18225,7 @@ Nothing to do
             assert_eq!(transfer.current_failed.as_deref(), Some(SHORT_STUCK_REASON));
             assert_eq!(transfer.phase, ElasticMoverPhase::NeedsAttention);
             assert_eq!(transfer.current, in_flight.current, "rekord zostaje dokładnie taki, jaki był");
-            assert!(!transfer_blocks_resume(&released, &transfer, MOVER_RESUME), "Resume może zwolnić macierz");
+            close_transfer(&mut released.clone()).expect("the next run can close it");
             assert!(
                 released.stale_parity_bytes.is_some(),
                 "zapis awaryjny nie może skasować znacznika nieaktualnej parity"
@@ -15593,87 +18268,6 @@ Nothing to do
             }
             assert!(foreign.exists(), "obcy plik nietknięty");
             root.load(&journal.spec.array_id).expect("journal po sprzątaniu");
-        }
-
-        #[test]
-        fn inspect_flags_the_restart_when_a_recovery_failed_after_its_anchor() {
-            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let host_boot = boot_id().expect("boot hosta");
-            let (bench, root, mut journal) = mover_bench(1);
-            write_aged(&bench.cache.join("a.bin"), b"first", 9000);
-            let rules = move_everything_aged();
-            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
-            let snapshot = std::cell::RefCell::new(None);
-            let journal_path = bench.journal_path();
-            let (snapshot_ref, path_ref) = (&snapshot, journal_path.as_path());
-            run_mover(
-                &root,
-                &mut journal,
-                &mover_request(&rules, &array_lock),
-                &bench.env(&roomy, &nothing_open),
-                &mut TestHost::new(&bench, &snapraid).with_checkpoint(move |record| {
-                    if record.phase == TransferFilePhase::CopyConfirmed {
-                        return capture(snapshot_ref, path_ref);
-                    }
-                    Ok(())
-                }),
-            )
-            .expect_err("utrata zasilania");
-            bench.power_loss(&snapshot.take().expect("stan w chwili awarii"));
-            drop(array_lock);
-            drop(root);
-            // This boot: the new union comes up, its anchor is saved, and only
-            // then does the RO barrier fail.
-            let root = bench.reopen();
-            let mut crashed = root.load(&bench.spec.array_id).expect("stan po awarii");
-            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
-            let mut failing = TestHost::new(&bench, &snapraid)
-                .after_boot(&bench, &host_boot)
-                .with_enter(|| Err("prywatna unia nie przechodzi w RO".into()));
-            run_mover(
-                &root,
-                &mut crashed,
-                &mover_request(&rules, &array_lock),
-                &bench.env_at(&roomy, &nothing_open, &host_boot),
-                &mut failing,
-            )
-            .expect_err("bariera RO po odtworzeniu");
-            drop(failing);
-            let stored = root.load(&bench.spec.array_id).expect("stan");
-            assert_eq!(stored.boot_id, host_boot);
-            assert!(stored.private.as_ref().expect("private").anchor.is_some(), "kotwica zapisana przed błędem");
-            assert_eq!(stored.pending, Some(Pending::Union));
-            let before = bench.journal_bytes();
-            let inspect = crate::HelperCommand::ElasticInspect {
-                array_id: bench.spec.array_id.clone(),
-                owner: bench.spec.owner.clone(),
-            };
-            let value = private_operation(&root, stored.clone(), &inspect).expect("Inspect zwraca stan");
-            let state: ElasticResult = serde_json::from_value(value).expect("stan macierzy");
-            assert!(state.restart_required, "kotwica bez ukończonego odtworzenia też czeka na restart");
-            // The flag carries the state; the detail keeps the cause.
-            assert!(state.detail.is_some(), "przyczyna zostaje w szczegółach");
-            assert!(
-                !state.detail.as_deref().is_some_and(|detail| detail.contains("wymagany restart")),
-                "helper nie koduje stanu w zdaniu: {:?}",
-                state.detail
-            );
-            assert_eq!(bench.journal_bytes(), before, "Inspect niczego nie zapisuje");
-            // The same boot does not retry; the accepted exit is a reboot.
-            assert!(run_mover(
-                &root,
-                &mut stored.clone(),
-                &mover_request(&rules, &array_lock),
-                &bench.env_at(&roomy, &nothing_open, &host_boot),
-                &mut TestHost::new(&bench, &snapraid).after_boot(&bench, &host_boot),
-            )
-            .is_err());
-            assert_eq!(bench.journal_bytes(), before);
-            drop(array_lock);
-            drop(root);
-            recover_and_release(&bench, true, &snapraid, NEXT_BOOT);
-            assert_eq!(tree(&bench.data[0]), vec!["a.bin"]);
         }
 
         #[test]
@@ -15735,12 +18329,6 @@ Nothing to do
             let (bench, root, mut journal) = mover_bench(1);
             journal.stuck_paths = skip_seed(STUCK_PATH_LIMIT);
             let oldest = journal.stuck_paths[0].clone();
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().expect("private").service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: MOVER_OPERATION.into(),
-                pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 resume_operation_id: MOVER_RESUME.into(),
                 target: Some("d1".into()),
@@ -15750,7 +18338,7 @@ Nothing to do
                 ..transfer_fixture(MOVER_OPERATION, ElasticMoverPhase::Moving, false)
             });
             seed(&root, &journal);
-            let evicted = close_transfer(&mut journal, MOVER_RESUME).expect("Resume zamyka transfer");
+            let evicted = close_transfer(&mut journal).expect("zamknięcie transferu");
             // Nothing is said before the write is durable.
             assert!(
                 EVICTION_LOG.with(|log| log.borrow().as_ref().expect("zlew").is_empty()),
@@ -15800,7 +18388,6 @@ Nothing to do
             assert_eq!(state.stuck_evicted, 1, "macierz pamięta wyparcie");
             assert_eq!(state.last_mover.expect("wynik").stuck_evicted, 1, "ten przebieg je wykonał");
             // The next run skips the protected path and no longer skips the evicted one.
-            release(&root, &mut released, MOVER_RESUME);
             write_aged(&bench.cache.join("newest.bin"), b"newest", 9000);
             write_aged(&bench.cache.join("evicted/0.bin"), b"evicted", 9000);
             let rules = move_everything_aged();
@@ -15836,12 +18423,6 @@ Nothing to do
             let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
             let mut journal = ready_service_journal(&root);
             journal.stuck_paths = skip_seed(STUCK_PATH_LIMIT);
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().expect("private").service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: MOVER_OPERATION.into(),
-                pending: false,
-            });
             journal.transfer = Some(TransferJournal {
                 resume_operation_id: MOVER_RESUME.into(),
                 target: Some("d1".into()),
@@ -15854,7 +18435,7 @@ Nothing to do
                 ..transfer_fixture(MOVER_OPERATION, ElasticMoverPhase::Moving, false)
             });
             seed(&root, &journal);
-            close_transfer(&mut journal, MOVER_RESUME).expect("Resume zamyka transfer");
+            close_transfer(&mut journal).expect("zamknięcie transferu");
             let detail = journal.transfer.expect("transfer").detail.expect("szczegóły");
             assert!(detail.len() <= TRANSFER_DETAIL_LIMIT, "{}", detail.len());
             assert!(detail.starts_with("lista pominiętych ścieżek pełna"), "{detail}");
@@ -15887,20 +18468,15 @@ Nothing to do
             .expect_err("nieudane wycofanie");
             std::fs::set_permissions(&bench.data[0], std::fs::Permissions::from_mode(0o755)).expect("mode");
             let mut stored = root.load(&bench.spec.array_id).expect("load");
-            // Stuck before the rename, whichever side of it the machine
-            // reached: there is no destination to refuse a later run.
+            // Stuck while withdrawing a copy that never reached the path: there
+            // is no destination to refuse a later run.
             let phase = stored.transfer.as_ref().expect("transfer").current.as_ref().expect("rekord").phase;
-            assert!(
-                file_phase_rank(phase) <= file_phase_rank(TransferFilePhase::RenameIntent),
-                "rekord utknął przed zmianą nazwy: {phase:?}"
-            );
+            assert_eq!(phase, TransferFilePhase::RestoreIntent, "rekord utknął na wycofaniu");
             assert!(
                 !bench.data[0].join("a.bin").exists(),
                 "brak celu, który odmówiłby późniejszemu przebiegowi"
             );
             assert_eq!(tree(&bench.data[0]).len(), 1, "kopia tymczasowa zostaje");
-            release(&root, &mut stored, MOVER_RESUME);
-            assert_eq!(stored.stuck_paths.len(), 1, "ścieżka trafia na listę pominięć");
             write_aged(&bench.cache.join("b.bin"), b"second", 9000);
             let next = MoverRequest {
                 operation_id: NEXT_OPERATION,
@@ -15923,7 +18499,9 @@ Nothing to do
                 1,
                 "żadnej drugiej kopii tymczasowej: {after:?}"
             );
-            let transfer = root.load(&bench.spec.array_id).expect("stan").transfer.expect("transfer");
+            let after_run = root.load(&bench.spec.array_id).expect("stan");
+            assert_eq!(after_run.stuck_paths.len(), 1, "ścieżka trafia na listę pominięć");
+            let transfer = after_run.transfer.expect("transfer");
             let issue = transfer.issues.iter().find(|issue| issue.path == "a.bin").expect("pominięta ścieżka");
             assert_eq!(issue.reason, format!("rekord utknął w operacji {MOVER_OPERATION}; mover go nie rusza"));
         }
@@ -16058,10 +18636,7 @@ Nothing to do
                 Some(record.phase),
                 "rekord zostaje taki, jaki był"
             );
-            assert!(
-                !transfer_blocks_resume(&released, &transfer, MOVER_RESUME),
-                "Resume może zwolnić macierz"
-            );
+            close_transfer(&mut released.clone()).expect("the next run can close it");
         }
 
         /// A journal carrying everything validation lets it carry, with its
@@ -16114,11 +18689,6 @@ Nothing to do
             private.anchor = Some(Anchor {
                 union_source: "b".repeat(ANCHOR_SOURCE_BYTES - 2),
                 ..anchor_fixture()
-            });
-            private.service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: MOVER_OPERATION.into(),
-                pending: false,
             });
             let worst_pin = ElasticFilePin {
                 device: u64::MAX,
@@ -16200,8 +18770,7 @@ Nothing to do
             let error = mark_attention(&root, &journal.spec.array_id, MOVER_OPERATION, "x".repeat(900));
             assert!(error.starts_with('x'), "{error}");
             let stored = root.load(&journal.spec.array_id).expect("stan po awaryjnym zapisie");
-            assert_eq!(stored.detail.as_deref(), Some(SHORT_ATTENTION));
-            assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+            assert_eq!((stored.stage, &stored.detail), (journal.stage, &journal.detail), "the array state is not the run's to change");
             let transfer = stored.transfer.expect("transfer");
             assert_eq!(transfer.detail.as_deref(), Some(SHORT_ATTENTION));
             assert_eq!(transfer.phase, ElasticMoverPhase::NeedsAttention);
@@ -16298,7 +18867,7 @@ Nothing to do
             let mut foreign_target = journal.clone();
             foreign_target.transfer = Some(TransferJournal {
                 target: Some("d9".into()),
-                ..transfer_fixture("66666666-6666-4666-8666-666666666666", ElasticMoverPhase::Holding, false)
+                ..transfer_fixture("66666666-6666-4666-8666-666666666666", ElasticMoverPhase::Announced, false)
             });
             assert!(root.save(&foreign_target).is_err());
             assert_eq!(std::fs::read(&path).expect("bytes"), before);
@@ -16331,8 +18900,9 @@ Nothing to do
             .expect("zwykłe reguły");
         }
 
+
         #[test]
-        fn resume_closes_only_the_transfer_that_declared_it() {
+        fn close_transfer_closes_an_unfinished_run_into_history() {
             let dir = Temp::new();
             let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
             let mut journal = ready_service_journal(&root);
@@ -16342,25 +18912,24 @@ Nothing to do
                 false,
             ));
             seed(&root, &journal);
-            let mut foreign = journal.clone();
-            close_transfer(&mut foreign, FOREIGN_RESUME).expect("obcy Resume");
-            assert!(foreign.transfer.unwrap().finished_at.is_none());
-            assert!(restore_checkpoint_guard(&journal).is_err());
-            close_transfer(&mut journal, "77777777-7777-4777-8777-777777777777").expect("zapowiedziany Resume");
+            close_transfer(&mut journal).expect("zamknięcie");
             let closed = journal.transfer.clone().unwrap();
             assert_eq!(closed.phase, ElasticMoverPhase::NeedsAttention);
             assert!(closed.finished_at.is_some());
-            // A closed run is history: it no longer blocks Restore, Sync or Scrub.
-            restore_checkpoint_guard(&journal).expect("historia nie blokuje Restore");
             root.save(&journal).expect("zamknięty transfer");
+            // A closed run is history: closing it again changes nothing.
+            let before = journal.transfer.clone();
+            close_transfer(&mut journal).expect("ponowne zamknięcie");
+            assert_eq!(journal.transfer, before);
+            restore_checkpoint_guard(&journal).expect("historia nie blokuje Restore");
         }
 
+
         #[test]
-        fn enter_service_refuses_foreign_operation_while_the_mover_owns_the_hold() {
+        fn enter_service_waits_for_an_unfinished_mover_run_and_not_for_a_finished_one() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, mut journal) = mover_bench(1);
             write_aged(&bench.cache.join("a.bin"), b"payload", 9000);
-            let broken = |_: &Path| -> Result<(u64, u64), String> { Err("statvfs: Input/output error".into()) };
             let rules = move_everything_aged();
             let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
             let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
@@ -16368,50 +18937,41 @@ Nothing to do
                 &root,
                 &mut journal,
                 &mover_request(&rules, &array_lock),
-                &bench.env(&broken, &nothing_open),
-                &mut TestHost::new(&bench, &snapraid),
+                &bench.env(&roomy, &nothing_open),
+                &mut TestHost::new(&bench, &snapraid).with_checkpoint(stop_at("a.bin", TransferFilePhase::CopyConfirmed)),
             )
             .expect_err("przerwany mover");
-            for (moment, finished) in [("niedokończony", false), ("zakończony", true)] {
-                if finished {
-                    run_mover(
-                        &root,
-                        &mut journal,
-                        &mover_request(&rules, &array_lock),
-                        &bench.env(&roomy, &nothing_open),
-                        &mut TestHost::new(&bench, &snapraid),
-                    )
-                    .expect("wznowienie");
-                    assert_eq!(tree(&bench.data[0]), vec!["a.bin"]);
-                }
-                let before = bench.journal_bytes();
-                let mut calls = 0;
-                assert!(
-                    enter_service_with(&root, journal.clone(), FOREIGN_RESUME, &array_lock, || {
-                        calls += 1;
-                        Ok(())
-                    })
-                    .is_err(),
-                    "{moment}"
-                );
-                assert_eq!(calls, 0, "obca operacja nie może przełączyć unii: {moment}");
-                assert_eq!(bench.journal_bytes(), before, "{moment}");
-            }
-            // Only the declared Resume releases the finished run's Hold.
-            assert!(authorize_resume(&root, &mut journal.clone(), FOREIGN_RESUME).is_err());
-            authorize_resume(&root, &mut journal, MOVER_RESUME).expect("zapowiedziany Resume");
+            let before = bench.journal_bytes();
+            let mut calls = 0;
+            assert!(enter_service_with(&root, journal.clone(), FOREIGN_RESUME, &array_lock, || {
+                calls += 1;
+                Ok(())
+            })
+            .is_err());
+            assert_eq!(calls, 0, "an unfinished run is resolved by the next run, not overridden");
+            assert_eq!(bench.journal_bytes(), before);
+            run_mover(
+                &root,
+                &mut journal,
+                &mover_request(&rules, &array_lock),
+                &bench.env(&roomy, &nothing_open),
+                &mut TestHost::new(&bench, &snapraid),
+            )
+            .expect("wznowienie");
+            assert_eq!(tree(&bench.data[0]), vec!["a.bin"]);
+            let mut calls = 0;
+            enter_service_with(&root, journal.clone(), FOREIGN_RESUME, &array_lock, || {
+                calls += 1;
+                Ok(())
+            })
+            .expect("a finished run owns nothing");
+            assert_eq!(calls, 1);
         }
 
         #[test]
         fn mover_rules_are_validated_on_every_journal_load() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (bench, root, mut journal) = mover_bench(1);
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
-                mode: ElasticServiceMode::Hold,
-                operation_id: MOVER_OPERATION.into(),
-                pending: false,
-            });
             let mut transfer = transfer_fixture(MOVER_OPERATION, ElasticMoverPhase::Moving, true);
             transfer.rules.pinned_folders = vec!["../escape".into()];
             journal.transfer = Some(transfer);
@@ -16552,6 +19112,394 @@ Nothing to do
             let error = authorize_publication(&root, &spec(), &anchor).expect_err("hold publication");
             assert!(error.contains("service Hold"));
             assert_eq!(std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes"), before);
+        }
+
+        /// The refusal that took every array down after a reboot, exercised in
+        /// the helper itself: a journal from an earlier boot answers nothing but
+        /// the commands `runs_after_a_boot` names. The startup Restore must send
+        /// only those — `tentaflow-core` pins that its restore job does.
+        #[test]
+        fn after_a_boot_only_restore_and_resume_reach_a_private_array() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = ready_service_journal(&root);
+            assert_ne!(journal.boot_id, boot_id().expect("boot"), "the journal is from an earlier boot");
+            let before = std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes");
+            let (array_id, owner) = (journal.spec.array_id.clone(), journal.spec.owner.clone());
+            let refused = "prywatna macierz wymaga Restore po zmianie boot";
+            for command in [
+                crate::HelperCommand::ElasticInspect { array_id: array_id.clone(), owner: owner.clone() },
+                crate::HelperCommand::ElasticCacheAge { array_id: array_id.clone(), owner: owner.clone(), rules: MoverRules::default() },
+                crate::HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: NEXT_OPERATION.into() },
+                crate::HelperCommand::ElasticMover {
+                    array_id: array_id.clone(),
+                    owner: owner.clone(),
+                    operation_id: NEXT_OPERATION.into(),
+                    resume_operation_id: NEXT_RESUME.into(),
+                    rules: MoverRules::default(),
+                    coupled_sync: true,
+                },
+            ] {
+                assert!(!runs_after_a_boot(&command), "{command:?}");
+                assert_eq!(private_operation(&root, journal.clone(), &command).expect_err("refused"), refused, "{command:?}");
+            }
+            let restore = crate::HelperCommand::ElasticRestore { array_id, owner };
+            assert!(runs_after_a_boot(&restore));
+            let error = private_operation(&root, journal.clone(), &restore).expect_err("no disks in a test");
+            assert_ne!(error, refused, "Restore is admitted and fails only on the missing disks");
+            assert_eq!(std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes"), before);
+        }
+
+        /// A mover Hold an older helper left: finished, or with a file still in
+        /// flight. Restore no longer refuses it, and the Resume it authorizes
+        /// with the run's own UUID succeeds for both — the in-flight record
+        /// stays for the next run, which finishes it on the served union.
+        #[test]
+        fn an_older_helpers_mover_hold_is_released_even_with_a_file_in_flight() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for in_flight in [false, true] {
+                let (bench, root, mut journal) = mover_bench(1);
+                write_aged(&bench.cache.join("a.bin"), b"first", 9000);
+                let rules = move_everything_aged();
+                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+                let snapraid = FakeSnapraid::new(&bench.dir.0, &[0, 0]);
+                let stop = if in_flight { TransferFilePhase::RenameConfirmed } else { TransferFilePhase::Done };
+                let run = run_mover(
+                    &root,
+                    &mut journal,
+                    &mover_request(&rules, &array_lock),
+                    &bench.env(&roomy, &nothing_open),
+                    &mut TestHost::new(&bench, &snapraid).with_checkpoint(stop_at("a.bin", stop)),
+                );
+                assert!(run.is_err());
+                if !in_flight {
+                    run_mover(&root, &mut journal, &mover_request(&rules, &array_lock), &bench.env(&roomy, &nothing_open), &mut TestHost::new(&bench, &snapraid))
+                        .expect("finished run");
+                }
+                // What the older helper wrote on top: its Hold, the union read-only.
+                let mut held = root.load(&bench.spec.array_id).expect("stan");
+                held.stage = ElasticStage::NeedsAttention;
+                held.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                    mode: ElasticServiceMode::Hold,
+                    operation_id: MOVER_OPERATION.into(),
+                    pending: false,
+                });
+                seed(&root, &held);
+                assert_eq!(legacy_mover_hold(&held).as_deref(), Some(MOVER_RESUME));
+                restore_checkpoint_guard(&held).expect("Restore releases this Hold");
+                let mut authorized = held.clone();
+                authorize_resume(&root, &mut authorized, MOVER_RESUME).unwrap_or_else(|error| panic!("in_flight={in_flight}: {error}"));
+                let service = authorized.private.as_ref().unwrap().service.clone().unwrap();
+                assert_eq!((service.mode, service.pending), (ElasticServiceMode::Online, true));
+                // A Hold that is not a mover's is still not Restore's to take.
+                let mut foreign = held.clone();
+                foreign.private.as_mut().unwrap().service.as_mut().unwrap().operation_id = FOREIGN_RESUME.into();
+                assert_eq!(legacy_mover_hold(&foreign), None);
+                assert!(restore_checkpoint_guard(&foreign).is_err());
+                // What `finish` persists once the union is published read-write;
+                // the in-flight record is left for the next run.
+                let transfer = authorized.transfer.clone().unwrap();
+                assert_eq!(transfer.current.is_some(), in_flight, "in_flight={in_flight}");
+                authorized.private.as_mut().unwrap().service.as_mut().unwrap().pending = false;
+                authorized.stage = ElasticStage::Ready;
+                authorized.detail = None;
+                if !in_flight {
+                    close_transfer(&mut authorized).expect("zamknięcie");
+                }
+                root.save(&authorized).expect("Online");
+                let next = MoverRequest { operation_id: NEXT_OPERATION, resume_operation_id: NEXT_RESUME, ..mover_request(&rules, &array_lock) };
+                run_mover(&root, &mut authorized, &next, &bench.env(&roomy, &nothing_open), &mut TestHost::new(&bench, &snapraid))
+                    .unwrap_or_else(|error| panic!("in_flight={in_flight}: {error}"));
+                assert!(tree(&bench.cache).is_empty() && tree(&bench.data[0]) == vec!["a.bin"], "in_flight={in_flight}");
+            }
+        }
+
+        /// A reboot during a Sync — the mover's coupled one or a manual one —
+        /// left its intent Running. Restore closes it as interrupted under the
+        /// array lock instead of refusing the array; a Scrub left running still
+        /// refuses.
+        #[test]
+        fn restore_closes_a_sync_a_reboot_interrupted() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (bench, root, mut journal) = mover_bench(1);
+            write_aged(&bench.cache.join("a.bin"), b"payload", 9000);
+            let rules = move_everything_aged();
+            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+            let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+            let journal_path = bench.journal_path();
+            snapraid.before(&format!("cp '{}' '{}.snapshot'\n", journal_path.display(), journal_path.display()));
+            run_mover(&root, &mut journal, &mover_request(&rules, &array_lock), &bench.env(&roomy, &nothing_open), &mut TestHost::new(&bench, &snapraid))
+                .expect("mover");
+            bench.power_loss(&std::fs::read(format!("{}.snapshot", journal_path.display())).expect("stan w trakcie Sync"));
+            let mut crashed = root.load(&bench.spec.array_id).expect("stan po awarii");
+            assert!(matches!(crashed.pending, Some(Pending::Maintenance { kind: ElasticSnapraidKind::Sync, .. })));
+            restore_checkpoint_guard(&crashed).expect("an interrupted Sync does not refuse Restore");
+            settle_interrupted_sync(&root, &mut crashed, &array_lock).expect("zamknięcie");
+            let stored = root.load(&bench.spec.array_id).expect("stan");
+            assert!(stored.pending.is_none());
+            assert_eq!(stored.last_run.as_ref().unwrap().outcome, ElasticSnapraidOutcome::NeedsAttention);
+            assert!(stored.stale_parity_bytes.is_some(), "parity marked out of date");
+            restore_checkpoint_guard(&stored).expect("Restore");
+        }
+
+        /// A3 of the second review: a stuck record that kept both versions of
+        /// a file is reported on every observation for as long as the second
+        /// version exists — a quarantined original in the cache root, or a
+        /// copy hidden under the path on its data branch — naming the file,
+        /// where clients see it and where the other version is. Once the other
+        /// version is gone, so is the conflict.
+        #[test]
+        fn a_file_kept_in_two_versions_is_reported_until_one_is_gone() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (bench, root, mut journal) = mover_bench(1);
+            write_aged(&bench.cache.join("a.bin"), b"first", 9000);
+            let rules = move_everything_aged();
+            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+            let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+            run_mover(
+                &root,
+                &mut journal,
+                &mover_request(&rules, &array_lock),
+                &bench.env(&roomy, &nothing_open),
+                &mut TestHost::new(&bench, &snapraid).with_checkpoint(stop_at("a.bin", TransferFilePhase::QuarantineConfirmed)),
+            )
+            .expect_err("przerwany mover");
+            let mut stored = root.load(&bench.spec.array_id).expect("stan");
+            // A reversal the crash cut off, and a client that replaced the file
+            // while the original was aside: the record sticks, both versions
+            // stay.
+            stored.transfer.as_mut().and_then(|transfer| transfer.current.as_mut()).expect("record").phase =
+                TransferFilePhase::RestoreIntent;
+            root.save(&stored).expect("zapis");
+            let copy = bench.data[0].join("a.bin");
+            std::fs::remove_file(&copy).expect("usunięcie kopii");
+            std::fs::write(&copy, b"newer").expect("nowsza wersja");
+            let env = bench.env(&roomy, &nothing_open);
+            settle_before_serving(&root, &mut stored, &env.cache, &env.data, &array_lock, &mut TestHost::new(&bench, &snapraid))
+                .expect("stuck, which settles it");
+            let stored = root.load(&bench.spec.array_id).expect("stan");
+            let data = |disk: &str| {
+                assert_eq!(disk, "d1");
+                bench.data[0].clone()
+            };
+            let found = conflicts(&stored, &bench.cache, &data);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].path, "a.bin");
+            assert_eq!(found[0].visible, format!("{}/a.bin", union_path(&bench.spec.name)));
+            let kept = PathBuf::from(&found[0].kept);
+            assert_eq!(kept.parent(), Some(bench.cache.as_path()));
+            assert_eq!(std::fs::read(&kept).expect("oryginał"), b"first");
+            std::fs::remove_file(&kept).expect("admin removed it");
+            assert!(conflicts(&stored, &bench.cache, &data).is_empty());
+            // A copy hidden under the path by the cache's own file.
+            let mut hidden = stored.clone();
+            let record = hidden.transfer.as_mut().and_then(|transfer| transfer.current.clone()).expect("record");
+            let metadata = std::fs::metadata(&copy).expect("kopia");
+            std::fs::write(bench.cache.join("a.bin"), b"first").expect("oryginał pod ścieżką");
+            let transfer = hidden.transfer.as_mut().expect("transfer");
+            let mut current = record;
+            current.temporary_identity = None;
+            current.destination_identity = Some(crate::elastic_transfer::TransferPin {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.len(),
+                sha256: String::new(),
+            });
+            transfer.current = Some(current);
+            let found = conflicts(&hidden, &bench.cache, &data);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(PathBuf::from(&found[0].kept), copy);
+            std::fs::remove_file(bench.cache.join("a.bin")).expect("cache version removed");
+            assert!(conflicts(&hidden, &bench.cache, &data).is_empty());
+        }
+
+        /// W1 of the second review: a Scrub or a Fix a reboot interrupted used
+        /// to refuse Restore for good — and Destroy, and every other command
+        /// after a boot. Restore now closes either as interrupted, the journal
+        /// that results is valid to reopen, the array may be served, and the
+        /// same operation may be asked again.
+        #[test]
+        fn restore_closes_a_scrub_or_a_fix_a_reboot_interrupted() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for kind in [ElasticSnapraidKind::Scrub, ElasticSnapraidKind::Fix { disk: "d1".into() }] {
+                let (bench, root, mut journal) = mover_bench(1);
+                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+                let mut run = run_record(kind.clone());
+                run.operation_id = NEXT_OPERATION.into();
+                journal.last_run = Some(run);
+                journal.pending = Some(Pending::Maintenance { operation_id: NEXT_OPERATION.into(), kind: kind.clone() });
+                journal.stage = ElasticStage::SyncPending;
+                root.save(&journal).expect("przerwana operacja");
+                drop(array_lock);
+                drop(root);
+                let root = bench.reopen();
+                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+                let mut crashed = root.load(&bench.spec.array_id).expect("stan po awarii");
+                restore_checkpoint_guard(&crashed).unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+                settle_interrupted_sync(&root, &mut crashed, &array_lock).unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+                drop(array_lock);
+                drop(root);
+                let root = bench.reopen();
+                let stored = root.load(&bench.spec.array_id).unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+                assert!(stored.pending.is_none(), "{kind:?}");
+                let closed = stored.last_run.as_ref().expect("run");
+                assert_eq!((closed.outcome, closed.kind.clone()), (ElasticSnapraidOutcome::NeedsAttention, kind.clone()));
+                assert!(closed.finished_at.is_some(), "{kind:?}");
+                assert_eq!(stored.stage, ElasticStage::Ready, "{kind:?}");
+                assert!(stored.stale_parity_bytes.is_none(), "{kind:?}: a scrub or a fix does not stale parity");
+                restore_checkpoint_guard(&stored).unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+                serving_guard(&stored).expect("nothing in flight");
+            }
+        }
+
+        /// The array as the mount plan sees it, over the devices `FakeSteps`
+        /// hands out (data, then cache, then parity: vdb, vdc, vdd).
+        fn bench_plan(bench: &MoverBench) -> ElasticSpec {
+            ElasticSpec {
+                name: bench.spec.name.clone(),
+                filesystem: bench.spec.filesystem.as_str().into(),
+                data: vec![Branch { disk: "d1".into(), device: "/dev/vdb".into() }],
+                cache: vec![Branch { disk: "c1".into(), device: "/dev/vdc".into() }],
+                parity: vec![ParityDisk { index: 1, disk: "p1".into(), device: "/dev/vdd".into() }],
+                mergerfs: MergerfsOptions::default(),
+                snapraid: SnapraidOptions::default(),
+            }
+        }
+
+        /// W-A of the third review: the mergerfs step of the mount plan is what
+        /// PUBLISHES the union, and publishing refuses an unsettled record — so
+        /// a Restore that ran the whole plan first could never reach its own
+        /// settle and always failed, leaving the share down until a second,
+        /// manual Restore. This drives the real sequence of `restore()` over a
+        /// fake system: the plan of a fresh boot, the real `execute_steps` and
+        /// the real `publish_private` guard. ONE Restore has to be enough.
+        #[test]
+        fn a_restore_settles_between_the_branch_mounts_and_the_step_that_publishes() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (bench, root, mut journal) = mover_bench(1);
+            write_aged(&bench.cache.join("a.bin"), b"first", 9000);
+            let rules = move_everything_aged();
+            let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+            let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+            run_mover(
+                &root,
+                &mut journal,
+                &mover_request(&rules, &array_lock),
+                &bench.env(&roomy, &nothing_open),
+                &mut TestHost::new(&bench, &snapraid)
+                    .with_checkpoint(stop_at("a.bin", TransferFilePhase::QuarantineConfirmed)),
+            )
+            .expect_err("przerwany mover");
+            // The boot that follows: no branch mounted, no union, nothing published.
+            let mut crashed = root.load(&bench.spec.array_id).expect("stan po awarii");
+            assert!(unsettled_record(&crashed));
+            crashed.boot_id = NEW_BOOT.into();
+            let private = crashed.private.as_mut().expect("private");
+            private.anchor = None;
+            private.published = false;
+            crashed.stage = ElasticStage::Mounting;
+            seed(&root, &crashed);
+            let plan = bench_plan(&bench);
+            let steps = plan_mount(&plan, &Observed::nothing_mounted(), &Tools::for_preview()).expect("plan");
+            assert!(
+                steps.iter().any(|step| matches!(step, ElasticStep::MergerfsMount { .. })),
+                "a fresh boot plans the union — the step that publishes it"
+            );
+            let mut system = FakeSteps::fresh(&bench.spec, NEW_BOOT);
+            let mut settles = 0;
+            mount_then_settle(
+                &root,
+                &array_lock,
+                &mut crashed,
+                &plan,
+                steps,
+                &mut system,
+                &mut |journal, _| {
+                    settles += 1;
+                    // Every branch of the record is mounted and NOTHING has
+                    // published the union yet.
+                    let private = journal.private.as_ref().expect("private");
+                    assert!(private.anchor.is_none() && !private.published, "published before the settle");
+                    // What a real settle leaves behind at worst: the record
+                    // stuck, with both copies kept, which may be served.
+                    let transfer = journal.transfer.as_mut().expect("transfer");
+                    transfer.current_failed = Some("rekord nierozwiązany: test".into());
+                    root.save(journal)
+                },
+            )
+            .expect("one Restore mounts, settles and publishes");
+            assert_eq!(settles, 1);
+            assert_eq!(system.published, 1, "the union was published, after the settle");
+            let stored = root.load(&bench.spec.array_id).expect("stan");
+            assert!(!unsettled_record(&stored));
+            assert!(stored.private.as_ref().expect("private").published);
+            // And the same sequence over an already-mounted array is a no-op
+            // plan that still settles: the second Restore an admin used to need.
+            let mounted = plan_mount(&plan, &Observed { known: true, mounted: roles(&bench.spec)
+                .into_iter()
+                .map(|role| (mount_path(&bench.spec, role), true))
+                .chain(std::iter::once((plan.union_path(), true)))
+                .collect() }, &Tools::for_preview()).expect("plan");
+            let (branches, union) = split_before_union(mounted, &plan.union_path());
+            assert!(branches.is_empty(), "{branches:?}");
+            assert!(union.iter().all(|step| matches!(step, ElasticStep::Note(_))), "{union:?}");
+        }
+
+        /// D1 of the second review: Restore settles the record a run left in
+        /// flight BEFORE the union is published, at every phase, and the union
+        /// is never published over a record nobody settled.
+        #[test]
+        fn restore_settles_a_record_in_flight_before_the_union_is_served() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for stop in [
+                TransferFilePhase::CopyIntent,
+                TransferFilePhase::CopyConfirmed,
+                TransferFilePhase::RenameIntent,
+                TransferFilePhase::RenameConfirmed,
+                TransferFilePhase::QuarantineIntent,
+                TransferFilePhase::QuarantineConfirmed,
+                TransferFilePhase::UnlinkIntent,
+                TransferFilePhase::UnlinkConfirmed,
+                TransferFilePhase::Done,
+            ] {
+                let (bench, root, mut journal) = mover_bench(1);
+                write_aged(&bench.cache.join("a.bin"), b"first", 9000);
+                let rules = move_everything_aged();
+                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+                let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+                run_mover(
+                    &root,
+                    &mut journal,
+                    &mover_request(&rules, &array_lock),
+                    &bench.env(&roomy, &nothing_open),
+                    &mut TestHost::new(&bench, &snapraid).with_checkpoint(stop_at("a.bin", stop)),
+                )
+                .expect_err("przerwany mover");
+                let mut stored = root.load(&bench.spec.array_id).expect("stan");
+                assert!(unsettled_record(&stored), "{stop:?}");
+                let mut unpublished = stored.clone();
+                let published = std::cell::Cell::new(false);
+                let refused = publish_private(&root, &mut unpublished, |_| {
+                    published.set(true);
+                    Ok(())
+                });
+                assert!(refused.is_err() && !published.get(), "{stop:?}: published over an unsettled record");
+                assert_eq!(root.load(&bench.spec.array_id).expect("stan").transfer, stored.transfer, "{stop:?}: refused before any write");
+                let env = bench.env(&roomy, &nothing_open);
+                settle_before_serving(&root, &mut stored, &env.cache, &env.data, &array_lock, &mut TestHost::new(&bench, &snapraid))
+                    .unwrap_or_else(|error| panic!("{stop:?}: {error}"));
+                let settled = root.load(&bench.spec.array_id).expect("stan");
+                assert!(!unsettled_record(&settled), "{stop:?}");
+                let on_cache = bench.cache.join("a.bin").exists();
+                let on_data = bench.data[0].join("a.bin").exists();
+                assert!(on_cache != on_data, "{stop:?}: exactly one visible copy");
+                let visible = if on_cache { bench.cache.join("a.bin") } else { bench.data[0].join("a.bin") };
+                assert_eq!(std::fs::read(visible).expect("plik"), b"first", "{stop:?}");
+                assert!(tree(&bench.cache).len() + tree(&bench.data[0]).len() == 1, "{stop:?}: nothing left behind");
+                let mut serving = settled.clone();
+                publish_private(&root, &mut serving, |_| Ok(())).unwrap_or_else(|error| panic!("{stop:?}: {error}"));
+            }
         }
 
         #[test]
@@ -17077,6 +20025,7 @@ mod tests {
             SnapraidAction::Scrub,
             SnapraidAction::Fix {
                 disk: "sdg".to_string(),
+                scope: FixScope::MarkedBlocks,
             },
         ] {
             let error = plan_snapraid(&s, &action, &tools()).expect_err("no parity, no plan");
@@ -17091,6 +20040,7 @@ mod tests {
             &spec(),
             &SnapraidAction::Fix {
                 disk: "sdg".to_string(),
+                scope: FixScope::ReplacedDisk,
             },
             &tools(),
         )
@@ -17347,36 +20297,60 @@ mod tests {
         s.snapraid.scrub_percent = 0;
         assert_eq!(snapraid_args(&s, &SnapraidAction::Scrub).unwrap(), scrub);
 
+        // THE REPAIR'S ARGUMENTS ARE PINNED, whole. snapraid 13.0-1 measured on
+        // rig11 (`FixScope`): an unfiltered `fix` and `-d <disk> fix` revert
+        // files users rewrote since the last Sync and bring deleted files
+        // back. Only these two filtered forms are ever run.
         let s = spec();
-        let fix = snapraid_args(
-            &s,
-            &SnapraidAction::Fix {
-                disk: "sdg".to_string(),
-            },
-        )
-        .expect("args");
-        assert_eq!(fix.last().map(String::as_str), Some("fix"));
-        assert!(fix.windows(2).any(|w| w == ["-d", "sdg"]), "{fix:?}");
-        assert!(
-            snapraid_args(
-                &s,
-                &SnapraidAction::Fix {
-                    disk: "sdj".to_string()
-                }
-            )
-            .is_err(),
-            "the parity disk is not a data disk, so it cannot be fixed from parity"
+        let config = s.config_path();
+        assert_eq!(
+            snapraid_args(&s, &SnapraidAction::Fix { disk: "sdg".to_string(), scope: FixScope::MarkedBlocks }).expect("args"),
+            vec!["-c".to_string(), config.clone(), "-e".into(), "fix".into()],
+            "a disk in use: only blocks a scrub marked bad, and never with -d, which snapraid refuses beside -e"
         );
-        assert!(
-            snapraid_args(
-                &s,
-                &SnapraidAction::Fix {
-                    disk: "nvme2n1".to_string()
-                }
-            )
-            .is_err(),
-            "the cache is not in parity at all"
+        assert_eq!(
+            snapraid_args(&s, &SnapraidAction::Fix { disk: "sdg".to_string(), scope: FixScope::ReplacedDisk }).expect("args"),
+            vec!["-c".to_string(), config, "-d".into(), "sdg".into(), "fix".into()],
+            "a disk the flow has just formatted: everything parity says belongs on it, and only on it"
         );
+        for scope in [FixScope::MarkedBlocks, FixScope::ReplacedDisk] {
+            assert!(
+                snapraid_args(&s, &SnapraidAction::Fix { disk: "sdj".to_string(), scope }).is_err(),
+                "the parity disk is not a data disk, so it cannot be fixed from parity"
+            );
+            assert!(
+                snapraid_args(&s, &SnapraidAction::Fix { disk: "nvme2n1".to_string(), scope }).is_err(),
+                "the cache is not in parity at all"
+            );
+        }
+    }
+
+    /// The replacement plan is ONE mkfs of ONE disk: the slot's own device with
+    /// the slot's own label, the array's filesystem, and nothing else — no
+    /// mount, no config write, no sync. Everything else a replacement needs is
+    /// the mount plan a Restore already runs, because the new disk is mounted
+    /// at the SAME branch path the old one used.
+    #[test]
+    fn the_replacement_plan_formats_exactly_the_replaced_slot() {
+        let s = spec();
+        let replaced = s.data[1].clone();
+        let steps = plan_replace_data_disk(&s, &replaced, &tools()).expect("plan");
+        assert_eq!(steps.len(), 1, "{}", render(&steps));
+        let [ElasticStep::Mkfs { program, device, filesystem, label }] = steps.as_slice() else {
+            panic!("a replacement formats one disk: {steps:?}");
+        };
+        assert_eq!((device.as_str(), filesystem.as_str()), ("/dev/sdh", "xfs"));
+        assert_eq!(label, "tnd2-sdh", "the slot's own label, as a create would have given it");
+        assert!(program.ends_with("mkfs.xfs"), "{program}");
+        assert_eq!(wiped_devices(&steps), vec!["/dev/sdh".to_string()], "and it is the only disk touched");
+        // A branch this array does not carry, and an array with no parity to
+        // rebuild from, are refused before any step exists.
+        let foreign = Branch { disk: "sdx".into(), device: "/dev/sdx".into() };
+        assert!(plan_replace_data_disk(&s, &foreign, &tools()).is_err());
+        let mut bare = s.clone();
+        bare.parity.clear();
+        let error = plan_replace_data_disk(&bare, &replaced, &tools()).expect_err("no parity");
+        assert!(error.to_string().contains("no parity disk"), "{error}");
     }
 
     /// Every field of `MergerfsOptions` reaches the mount, and the enumeration

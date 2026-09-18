@@ -1486,7 +1486,9 @@ const TentaNasScreen = {
       })()
       : '';
     const waiting = a.protection?.cacheUnprotectedBytes;
-    const run = (a.moverHistory || [])[0] || null;
+    // The recorded runs travel inside `mover`; the array has no top-level
+    // history, and reading one here made every card say "no runs".
+    const run = (a.mover?.history || [])[0] || null;
     const runText = run
       ? `${fmtAgo(run.startedAt)} · ${fmtBytes(Number(run.movedBytes) || 0)} · ${T('tiering.files', { n: Number(run.movedFiles) || 0 })}`
       : T('tiering.no_runs');
@@ -1497,8 +1499,8 @@ const TentaNasScreen = {
       <div class="stat-rows mt-sm">
         ${sr(T('tiering.cache_tier'), `${fmtOptionalBytes(a.cacheUsedBytes)} / ${fmtOptionalBytes(a.cacheSizeBytes)}`)}
         ${sr(T('tiering.data_tier'), `${fmtOptionalBytes(a.usedBytes)} / ${fmtOptionalBytes(a.usableBytes)}`)}
-        ${sr(T('tiering.waiting'), fmtOptionalBytes(waiting), Number(waiting) > 0 ? 'num-warn' : '')}
-        ${sr(T('elastic.mover_last_run'), runText)}
+        ${sr(T('tiering.waiting'), fmtOptionalBytes(waiting))}
+        ${sr(T('tiering.last_move'), runText)}
       </div>
       <div class="muted mt-sm">${escapeHtml(T('tiering.waiting_hint'))}</div>
     </div>`;

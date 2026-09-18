@@ -8743,6 +8743,28 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * MessageBody::TentaNasBody(ElasticArrayReplaceDiskRequest).
+   *
+   * WITHDRAWN: the node refuses this request before it writes anything
+   * (`dispatch::tentanas::elastic_replace_disk`), nothing in the UI sends it,
+   * and the entry stays only so the variant keeps its encoder. Elastic Array
+   * disk replacement is its own task.
+   */
+  tentaNasElasticArrayReplaceDiskRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      disk: csText(payload.disk),
+      confirm_disk: csText(payload.confirmDisk ?? payload.confirm_disk),
+      replacement_disk_id: csText(payload.replacementDiskId ?? payload.replacement_disk_id),
+      accept_stale_parity: Boolean(payload.acceptStaleParity ?? payload.accept_stale_parity ?? false),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayReplaceDiskRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(ElasticArrayDestroyRequest). */
   tentaNasElasticArrayDestroyRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

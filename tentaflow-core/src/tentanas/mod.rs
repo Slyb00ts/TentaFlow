@@ -100,13 +100,16 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
         tracing::info!("tentanas: marked {orphaned} interrupted jobs as failed");
     }
     disks::start_sampler(ctx.db.clone(), ctx.addon_id.to_string(), pool.clone());
+    // The Elastic restore queue is registered BEFORE the scheduler starts: its
+    // Elastic passes wait for the queue, and they can only see one that
+    // already exists.
+    elastic::start_restore(ctx.db.clone(), pool.clone(), tentanas_helper::elastic::ElasticOwner {
+        org_id: ctx.org_id.to_string(), addon_id: ctx.addon_id.to_string(),
+    });
     scheduler::start(ctx.db.clone(), pool.clone());
     // configfs is empty after a reboot, so this is what puts the block targets
     // back — the only thing that does (§3.4, §5.5).
     targets::start_restore(ctx.db.clone(), pool.clone());
-    elastic::start_restore(ctx.db.clone(), pool.clone(), tentanas_helper::elastic::ElasticOwner {
-        org_id: ctx.org_id.to_string(), addon_id: ctx.addon_id.to_string(),
-    });
     fleet_mounts::start(ctx.db.clone(), ctx.addon_id.to_string(), pool);
     tracing::info!(
         "native app '{}': TentaNas initialized at {:?}",

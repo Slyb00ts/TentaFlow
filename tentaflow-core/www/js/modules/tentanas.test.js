@@ -2275,11 +2275,11 @@ test('with warnings only, the health tile stays a warning', async () => {
 const tieredArray = (overrides) => elasticArray({
   cacheSizeBytes: 1 * TIB, cacheUsedBytes: 0.25 * TIB,
   protection: { status: 'window_open', cacheUnprotectedBytes: 18 * 1024 ** 3 },
-  moverHistory: [{ startedAt: '2026-09-15 14:00:00', outcome: 'ok', movedBytes: 42 * 1024 ** 3, movedFiles: 118 }],
+  mover: { history: [{ startedAt: '2026-09-15 14:00:00', outcome: 'ok', movedBytes: 42 * 1024 ** 3, movedFiles: 118 }] },
   ...overrides,
 });
 
-test('the tiering card names both tiers, what waits for the mover, and the last run', async () => {
+test('the tiering card names both tiers, what waits on the cache unprotected, and the last move', async () => {
   stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: { arrays: [tieredArray()] } });
   const root = await mountScreen({ node: LOCAL });
   await flush();
@@ -2294,9 +2294,19 @@ test('the tiering card names both tiers, what waits for the mover, and the last 
   const text = block.textContent;
   assert.match(text, /Cache \(szybka warstwa\)/);
   assert.match(text, /Dyski danych/);
-  assert.match(text, /18(\.0)? GiB/, 'the bytes waiting for the mover are finally on a screen');
-  assert.match(text, /118 plików/, 'the last mover run carries its file count');
-  assert.match(text, /nie są chronione parzystością/, 'and it says why those bytes are at risk');
+  assert.match(text, /18(\.0)? GiB/, 'the bytes waiting on the cache are finally on a screen');
+  assert.match(text, /Na cache, jeszcze bez ochrony/);
+  assert.match(text, /Ostatnie przeniesienie/);
+  // The recorded runs live in `mover.history`; a card that looked elsewhere
+  // said "no runs" beside an array that had moved 42 GiB.
+  assert.match(text, /118 plików/, 'the last move carries its file count');
+  assert.doesNotMatch(text, /brak zapisanych przebiegów/);
+  assert.match(text, /automatycznie przenoszone/, 'it says the files move by themselves');
+  assert.match(text, /nie są chronione parzystością/, 'and why those bytes are at risk until then');
+  assert.doesNotMatch(text, /mover/i, 'no process name an admin has to know');
+  // Pending bytes are the normal state of a cache, not a warning.
+  const waitingRow = [...block.querySelectorAll('.sr')].find((r) => /jeszcze bez ochrony/.test(r.textContent));
+  assert.equal(waitingRow.querySelector('.v').classList.contains('num-warn'), false);
   assert.ok(block.querySelector('.split-bar'), 'both sides measured, so the bar is drawn');
   Screen.unmount();
 });

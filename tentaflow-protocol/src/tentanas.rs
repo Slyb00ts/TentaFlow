@@ -1442,11 +1442,13 @@ pub struct NasMoverRun {
     pub started_at: String,
     pub finished_at: Option<String>,
     /// 'running' | 'ok' | 'partial' | 'needs_attention' | 'failed' |
-    /// 'cancelled'. 'partial' is the normal outcome when files were open or
-    /// refused: the run did its job and left some behind on purpose.
-    /// 'needs_attention' is a run that stopped and still holds the array
-    /// until the same operation is resumed; 'failed' is such a run that was
-    /// closed without finishing.
+    /// 'cancelled'. 'partial' is the normal outcome when files were open,
+    /// changed while they moved or were refused, or when the coupled Sync met
+    /// files changing under it: the run did its job and left some behind on
+    /// purpose. The share stays writable during every run. 'needs_attention'
+    /// is a run that stopped with something it could not resolve, which the
+    /// next run finishes or reverses; 'failed' is such a run that was closed
+    /// without finishing.
     pub outcome: String,
     pub moved_bytes: u64,
     pub moved_files: u64,
@@ -1484,7 +1486,9 @@ pub struct NasSnapraidRun {
     pub kind: String,
     pub started_at: String,
     pub finished_at: Option<String>,
-    /// Stan próby: running, ok, failed, needs_attention, refused lub cancelled.
+    /// The attempt's state: running, ok, partial, failed, needs_attention,
+    /// refused or cancelled. `partial` is a Sync that skipped files changing
+    /// while it ran; parity stays marked out of date until the next Sync.
     pub outcome: String,
     pub detail: String,
     /// Errors this run found. `None` = the run did not get far enough to say,
@@ -1534,12 +1538,17 @@ pub struct NasSnapraidState {
 /// The mover's configuration — n15's schedule dialog, one field each.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasMoverSettings {
+    /// Whether the saved `schedule` is switched on. Moving is automatic either
+    /// way: aged files leave the cache by themselves. A switched-on schedule
+    /// RESTRICTS those moves to its slots; off (or no schedule) restricts
+    /// nothing.
     pub enabled: bool,
     pub schedule: Option<NasSchedule>,
     /// Move nothing younger than this. 0 = no age limit.
     pub min_age_secs: u64,
-    /// A trigger only: falling below this much free cache starts a run
-    /// outside the schedule. Every run moves each aged file regardless.
+    /// A trigger only: falling below this much free cache starts a run at
+    /// once, outside a restricting schedule too. Every run moves each aged
+    /// file regardless.
     pub cache_min_free_pct: u8,
     /// Run `snapraid sync` in the SAME job, immediately after the move.
     /// Default on, and §5.3 explains why in one sentence: without it the
@@ -1651,6 +1660,20 @@ pub struct NasElasticArray {
     /// would offer a button whose only possible answer is an error.
     #[serde(default)]
     pub unresolved_operation: bool,
+    /// Every unresolved operation is a mover run, and the next mover run is
+    /// what settles them: the mover is offered although
+    /// `unresolved_operation` stands. The node starts such runs itself, backs
+    /// off after each failure and stops after a few; an admin's run is then
+    /// the way on.
+    #[serde(default)]
+    pub mover_settles_unresolved: bool,
+    /// Whether a Sync or a full Scrub may start right now. It is NOT derivable
+    /// from `state` and `unresolved_operation`: a Sync is exactly what settles
+    /// a parity run that ended without success, so it is admitted on the array
+    /// such a run left behind — and a UI that read the two fields instead
+    /// disabled the one action that resolves it (W5/W6 of the fourth review).
+    #[serde(default)]
+    pub parity_run_available: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2775,8 +2798,11 @@ pub enum TentaNasPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
     },
-    /// Rebuilds ONE data disk of the array from its parity
-    /// (`snapraid fix -d <disk>`). `disk` is the array's own branch name
+    /// Repairs ONE data disk of the array from its parity. The node never runs
+    /// an unfiltered `snapraid fix`, which reverts every file changed since the
+    /// last Sync: a disk in use gets only the blocks a Scrub marked bad
+    /// (`snapraid -e fix`), a replaced, empty disk gets its missing files back
+    /// (`snapraid -d <disk> -m fix`). `disk` is the array's own branch name
     /// (`d1`, `d2`, …) as `NasElasticBranch::name` reports it, never a device:
     /// the disk being repaired is by definition the one that is failing, and a
     /// kernel name can point at a different disk after a reboot.
@@ -2804,6 +2830,34 @@ pub enum TentaNasPayload {
         name: String,
         disk_id: String,
         confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Replaces the disk of ONE data slot with a free disk and rebuilds the
+    /// array onto it — the operation an array whose disk died needs, and the
+    /// one no other request can do: every command resolves a member by the
+    /// filesystem UUID the array recorded, and a new disk does not carry it.
+    ///
+    /// `disk` is the array's own data-branch name (`d1`, `d2`, …) and is what
+    /// the admin retypes: the mistake to make impossible is rebuilding the
+    /// wrong slot. `replacement_disk_id` is the free disk that takes its
+    /// place, and it is ERASED — formatted with the array's filesystem before
+    /// the rebuild.
+    ///
+    /// WHAT A REBUILD RESTORES, which the dialog says before the button: the
+    /// disk's state at the LAST SYNC. So files deleted from it since then come
+    /// back, and anything written to it since then was never in parity and is
+    /// not recoverable. `accept_stale_parity` is the admin's explicit word for
+    /// the further case where parity itself is out of date — then some blocks
+    /// cannot be rebuilt at all and their files are left as
+    /// `<name>.unrecoverable`.
+    ElasticArrayReplaceDiskRequest {
+        name: String,
+        disk: String,
+        confirm_disk: String,
+        replacement_disk_id: String,
+        #[serde(default)]
+        accept_stale_parity: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
     },

@@ -599,6 +599,41 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         cache_policy TEXT NOT NULL CHECK(cache_policy IN ('no','only')),
         PRIMARY KEY (array_id, folder)
     ) WITHOUT ROWID;",
+), (
+    17,
+    // Replacing the disk of one data slot and rebuilding the array onto it —
+    // the operation an array whose disk died needs and the schema had no kind
+    // for. A widened CHECK needs the whole table rebuilt, so this repeats
+    // migration 15's statement with one kind added and nothing else changed.
+    //
+    // NO index of its own, for the reason 15 gives for 'add_disk': the rule
+    // that matters is "one running operation per array", which
+    // `nas_elastic_operation_running` already enforces, and a unique index
+    // over unfinished replacements would refuse the REPEAT that finishes a
+    // replacement interrupted between the journal swap and the rebuild.
+    "CREATE TABLE nas_elastic_operations_new (
+        operation_id TEXT PRIMARY KEY,
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        job_id TEXT NOT NULL UNIQUE REFERENCES nas_jobs(job_id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK(kind IN
+            ('create','import','restore','sync','scrub','mover','fix','add_disk','replace_disk','dissolve')),
+        state TEXT NOT NULL CHECK(state IN ('running','succeeded','failed','needs_attention')),
+        request_json TEXT NOT NULL,
+        result_json TEXT,
+        error TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    );
+    INSERT INTO nas_elastic_operations_new
+        SELECT operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at
+        FROM nas_elastic_operations;
+    DROP TABLE nas_elastic_operations;
+    ALTER TABLE nas_elastic_operations_new RENAME TO nas_elastic_operations;
+    CREATE INDEX nas_elastic_operation_array ON nas_elastic_operations(array_id, created_at);
+    CREATE UNIQUE INDEX nas_elastic_operation_running
+        ON nas_elastic_operations(array_id) WHERE state = 'running';
+    CREATE UNIQUE INDEX nas_elastic_operation_origin
+        ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -1131,15 +1166,210 @@ const JOB_COLUMNS: &str = "job_id, kind, subject, status, progress_pct, started_
 /// The ordering compares `(created_at, operation_id)` as a pair because
 /// `created_at` has second resolution: an operation id is a uuid v7, so the
 /// pair is total even for two rows written in the same second.
-const UNRESOLVED_ELASTIC_OPERATION: &str = "EXISTS(
+///
+/// A SUCCESSFUL SYNC OR SCRUB SUPERSEDES the parity runs that preceded it, and
+/// a successful repair supersedes ONLY those (W5, W6 and W8 of the fourth
+/// review). Three separate defects lived in the single `f.kind = 'fix'` clause
+/// this replaces:
+///
+/// * Only a `fix` cleared a parity row, and a repair cannot always succeed. A
+///   scrub marks bad blocks; `-e fix` writes back only those in files unchanged
+///   since the last Sync, so when the marked blocks belong to files the users
+///   have rewritten the repair reports `error_recovered:0` (MEASURED on rig11,
+///   `x2`: 391 marked, 0 written) and its row is `failed`. The cure it names is
+///   a Sync — and a Sync could not start, because the scrub row held the array.
+///   Nothing could ever clear it.
+/// * A Sync or Scrub the helper judged `Failed` left the same permanent state
+///   with no repair evidence at all, so the product offered the admin nothing.
+/// * And a repair cleared EVERY unresolved kind, so repairing scrub-marked
+///   blocks silently declared a failed add-disk or a half-finished disk
+///   replacement resolved.
+///
+/// A completed Sync recomputes parity for the data as it now is, and a full
+/// Scrub that ends clean is positive evidence that parity matches it, so either
+/// one supersedes an earlier parity run that ended without success. What that
+/// does NOT do is hide the fault: `unresolved_parity_run` reads the HISTORY, so
+/// a scrub that found errors goes on arming the repair until a repair succeeds.
+///
+/// A SUCCESSFUL MOVER SUPERSEDES the movers that preceded it, too. A mover run
+/// that stopped with something unresolved — a record in flight, a record it
+/// could neither finish nor reverse, a failed coupled Sync, a lost job — is
+/// what the NEXT mover run resolves: it finishes or reverses the record,
+/// closes the earlier run into the stuck history and syncs. Requiring a
+/// `fix` for it would be a wedge, because the helper refuses a fix while that
+/// run is open and an array without parity cannot run one at all.
+///
+/// AN INTERRUPTED SYNC OR SCRUB IS NOT UNRESOLVED (D2 of the second review).
+/// A `sync` or `scrub` row closed `needs_attention` with NO result is one whose
+/// process never reported: core restarted under it (`fail_orphaned_jobs`) or
+/// the helper died. The helper closes such a run as interrupted and marks
+/// parity out of date; a Scrub changed nothing. Nothing about it needs a
+/// repair, and treating it as unresolved blocked the very Sync that resolves
+/// it while the product offered `fix` instead — which reverts users' files.
+/// A row `fail_orphaned_jobs` closed is interrupted too, even when its body
+/// had recorded a result before core went away: the job never finished, and
+/// the helper's journal, not this row, knows how the run ended. An interrupted
+/// repair stays unresolved: it may have rewritten part of a disk, and the
+/// repair is what can be asked again.
+///
+/// WHICH SUCCEEDED RUN SETTLES WHICH ROW, and why it is not any-to-any inside
+/// the parity kinds (the fourth review's F2; the any-to-any version let a Sync
+/// close a Scrub that had found errors and an interrupted repair, leaving an
+/// array reading `active` with its fault still there and a Repair button that
+/// could only answer "nothing repaired" until the row aged out of the history):
+///
+/// * a `mover` row -> a succeeded `mover`. It is the next run that finishes or
+///   reverses the record in flight.
+/// * a `sync` row -> a succeeded `sync`. Only a Sync makes parity current; a
+///   repair writes data back from the OLD checkpoint and a scrub writes none.
+/// * a `fix` row -> a succeeded `fix` or a succeeded full `scrub`. A repair
+///   that was interrupted may have rewritten part of a disk, so a Sync is no
+///   evidence about it at all - while a clean FULL scrub (the only scrub this
+///   product runs, `-p full`) is positive evidence that nothing is left to
+///   repair.
+/// * a `scrub` row that counted DATA errors -> a succeeded `fix` or a later
+///   clean `scrub`, never a Sync. MEASURED on rig11 (snapraid 13.0-1, probe
+///   `scratchpad/f1probe/run3.sh` cases f1/f2/f3): a Sync leaves such a block
+///   exactly as it was - the file reads `equal`, no parity is written for it,
+///   and `-e fix` still recovers it afterwards. So a Sync settles nothing about
+///   it, and saying it did would hide a fault that is still repairable.
+/// * a `scrub` row with FILE errors only -> also a succeeded `sync`, because
+///   that is the only cure the product has for it: `-e fix` writes nothing at
+///   all for unreadable or missing files (measured, probe f4:
+///   `error:0 recovered:0`), while a Sync removes them from the content file
+///   and the next scrub then comes back clean. Without this the array would
+///   have no action left that could clear the row.
+///
+/// So every row keeps at least one reachable way out, and none is closed by a
+/// run that did not address it.
+macro_rules! orphaned_operation_error {
+    () => {
+        "Utracono nadzór core; wymagany odczyt journala roota"
+    };
+}
+const ORPHANED_OPERATION_ERROR: &str = orphaned_operation_error!();
+
+macro_rules! unresolved_elastic_operation {
+    ($kinds:literal) => {
+        concat!(
+            "EXISTS(
     SELECT 1 FROM nas_elastic_operations o
     WHERE o.array_id = ?1
-      AND o.kind IN ('sync','scrub','mover','fix','add_disk')
+      AND o.kind IN (",
+            $kinds,
+            ")
       AND o.state = 'needs_attention'
+      AND NOT (o.kind IN ('sync','scrub') AND (o.result_json IS NULL OR o.error = '",
+            orphaned_operation_error!(),
+            "'))
       AND NOT EXISTS(
         SELECT 1 FROM nas_elastic_operations f
-        WHERE f.array_id = o.array_id AND f.kind = 'fix' AND f.state = 'succeeded'
-          AND (f.created_at, f.operation_id) > (o.created_at, o.operation_id)))";
+        WHERE f.array_id = o.array_id AND f.state = 'succeeded'
+          AND ((o.kind = 'mover' AND f.kind = 'mover')
+               OR (o.kind = 'sync' AND f.kind = 'sync')
+               OR (o.kind = 'fix' AND f.kind IN ('fix','scrub'))
+               OR (o.kind = 'scrub'
+                   AND (f.kind IN ('fix','scrub')
+                        OR (f.kind = 'sync'
+                            AND COALESCE(CASE WHEN json_valid(o.result_json)
+                                              THEN json_extract(o.result_json,'$.run.errors_data')
+                                         END, 0) = 0))))
+          AND (f.created_at, f.operation_id) > (o.created_at, o.operation_id)))"
+        )
+    };
+}
+const UNRESOLVED_ELASTIC_OPERATION: &str =
+    unresolved_elastic_operation!("'sync','scrub','mover','fix','add_disk','replace_disk'");
+/// The same, for every kind but the mover's own runs.
+const UNRESOLVED_NON_MOVER_OPERATION: &str =
+    unresolved_elastic_operation!("'sync','scrub','fix','add_disk','replace_disk'");
+/// Whether the array's needs_attention came from a mover run: its newest
+/// operation of any kind is a mover closed `needs_attention`. The array's
+/// `create` never counts as newer: it precedes every mover by definition, and
+/// its id need not be a uuid v7, so within one second the pair ordering could
+/// otherwise put it after the run. Nor does a `failed` row (W3 of the second
+/// review): every Elastic command takes the node lock without waiting, so a
+/// run refused as busy — or a Sync refused before it started — is written
+/// `failed` with nothing having run, and one such collision must not turn
+/// the settling off for good.
+const ATTENTION_FROM_MOVER: &str = "EXISTS(
+    SELECT 1 FROM nas_elastic_operations l
+    WHERE l.array_id = ?1 AND l.kind = 'mover' AND l.state = 'needs_attention'
+      AND NOT EXISTS(
+        SELECT 1 FROM nas_elastic_operations n
+        WHERE n.array_id = l.array_id AND n.kind <> 'create' AND n.state <> 'failed'
+          AND (n.created_at, n.operation_id) > (l.created_at, l.operation_id)))";
+
+/// Whether a mover run may start on an array in `state`: an active array with
+/// nothing unresolved, or one whose every unresolved operation is a mover run —
+/// the run settles those — and whose needs_attention, if any, is theirs.
+/// Returns (may start, something unresolved it would settle).
+fn mover_admission(conn: &Connection, array_id: &str, state: &str) -> Result<(bool, bool)> {
+    let flag = |sql: &str| -> Result<bool> {
+        Ok(conn.query_row(&format!("SELECT {sql}"), params![array_id], |r| r.get(0))?)
+    };
+    let unresolved = flag(UNRESOLVED_ELASTIC_OPERATION)?;
+    let other = flag(UNRESOLVED_NON_MOVER_OPERATION)?;
+    let state_admits = state == "active" || (state == "needs_attention" && flag(ATTENTION_FROM_MOVER)?);
+    Ok((state_admits && !other, unresolved && !other && state_admits))
+}
+
+/// The unresolved operations a Sync cannot settle: everything that is not a
+/// parity run of its own kind. A Sync writes parity for the data as it is, so
+/// an earlier Sync, Scrub or repair that ended without success is exactly what
+/// it answers; a half-finished add or replacement, or a mover run with a file
+/// in flight, is not.
+const UNRESOLVED_OUTSIDE_PARITY: &str =
+    unresolved_elastic_operation!("'mover','add_disk','replace_disk'");
+
+/// Whether a Sync or a full Scrub may start on an array in `state`.
+///
+/// W5/W6 of the fourth review. Before this, both required `active` with
+/// nothing unresolved — and the rows they are the cure for are exactly the ones
+/// that take an array out of `active`. A repair whose own detail says "run a
+/// Sync" left the Sync refused, the mover refused with it, and the cache
+/// filling to ENOSPC with parity frozen for good.
+///
+/// So they may also start on an array whose only unresolved operations are
+/// parity runs. Nothing else is admitted: a mover record in flight, a
+/// half-finished add or a half-finished replacement are states a Sync would
+/// write parity over rather than settle.
+fn parity_admission(conn: &Connection, array_id: &str, state: &str) -> Result<bool> {
+    let flag = |sql: &str| -> Result<bool> {
+        Ok(conn.query_row(&format!("SELECT {sql}"), params![array_id], |r| r.get(0))?)
+    };
+    if !matches!(state, "active" | "needs_attention") {
+        return Ok(false);
+    }
+    Ok(!flag(UNRESOLVED_OUTSIDE_PARITY)?)
+}
+
+/// Mover runs closed `needs_attention` since the last one that succeeded,
+/// newest first. `failed` rows (refused before anything ran) and running ones
+/// are passed over; any other kind of operation is not a mover run.
+fn mover_failed_runs(conn: &Connection, array_id: &str) -> Result<u32> {
+    let mut statement = conn.prepare(
+        "SELECT state FROM nas_elastic_operations WHERE array_id=?1 AND kind='mover'
+         AND state IN ('succeeded','needs_attention')
+         ORDER BY created_at DESC, operation_id DESC LIMIT 32",
+    )?;
+    let states = statement
+        .query_map(params![array_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(states.iter().take_while(|state| *state == "needs_attention").count() as u32)
+}
+
+/// Whether an operation of this array is running right now. The scheduler asks
+/// before it pays for a cache probe: while one runs, the helper holds the
+/// array's lock, and the only possible answer would be a refusal.
+pub fn elastic_operation_running(pool: &DbPool, array_id: &str) -> Result<bool> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_elastic_operations WHERE array_id = ?1 AND state = 'running')",
+        params![array_id],
+        |r| r.get(0),
+    )?)
+}
 
 pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>) -> Result<()> {
     let mut conn = write(pool)?;
@@ -1231,11 +1461,15 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                 // state: a scrub which found errors leaves exactly this row, and
                 // refusing the repair here would make the unresolved operation
                 // permanent and the array unrepairable through the product.
+                let _ = unresolved;
                 anyhow::ensure!(
                     if super::elastic::snapraid_disk(kind).is_some() {
                         matches!(state.as_str(), "active" | "needs_attention")
                     } else {
-                        state == "active" && !unresolved
+                        // A Sync or a full Scrub is what settles a parity run
+                        // that ended without success, so it is admitted on the
+                        // array such a run left behind (`parity_admission`).
+                        parity_admission(&tx, array_id, &state)?
                     },
                     "Macierz ma niepotwierdzoną operację; brak ponowienia");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
@@ -1304,6 +1538,22 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                 let command = super::elastic::add_disk_command(owner, array_id, operation_id, disk);
                 (array_id, operation_id, "add_disk", serde_json::to_string(&command)?)
             }
+            // DISK REPLACEMENT IS WITHDRAWN (round 4, owner's decision), and
+            // this arm is the last gate: NO path may create a `replace_disk`
+            // operation row, because a failed one wedged the array (only a
+            // SUCCEEDED `fix` cleared it, and the helper could not run the
+            // command at all). The dispatch handler already refuses before it
+            // reaches a store call; this refusal exists so a future caller —
+            // the scheduler, a retry path, a restored approval — cannot open
+            // one behind the handler's back. The variant and its command
+            // builder stay, dormant, for the task that finishes the feature;
+            // `dispatch::tentanas::elastic_replace_disk` carries the list of
+            // what that task still has to solve.
+            ElasticJobIntent::ReplaceDisk { .. } => {
+                anyhow::bail!(
+                    "Wymiana dysku nie jest udostępniona w tej wersji; operacja nie została otwarta"
+                );
+            }
             ElasticJobIntent::Dissolve { owner, array_id, operation_id } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_destroy" && job.subject == spec.name,
@@ -1319,16 +1569,15 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                 // DELIBERATELY no parity guard, unlike SnapRAID: moving files
                 // off the cache is worth doing on an array with no parity at
                 // all, and the helper simply skips the coupled sync there.
-                let active: bool = tx.query_row("SELECT state='active' FROM nas_elastic_arrays WHERE array_id=?1",
+                let state: String = tx.query_row("SELECT state FROM nas_elastic_arrays WHERE array_id=?1",
                     params![array_id], |r| r.get(0))?;
-                // A stuck sync or scrub blocks a mover too, not just another
-                // mover: an unresolved parity operation means nothing knows
-                // what parity currently covers, and a run would move more
-                // bytes out of the cache and then sync on top of that unknown.
-                let unresolved: bool = tx.query_row(
-                    &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
-                    params![array_id], |r| r.get(0))?;
-                anyhow::ensure!(active && !unresolved, "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                // A stuck sync or scrub blocks a mover too: an unresolved parity
+                // operation means nothing knows what parity currently covers,
+                // and a run would move more bytes out of the cache and then
+                // sync on top of that unknown. An unresolved MOVER does not: the
+                // next run is what finishes or reverses what it left.
+                let (admitted, _) = mover_admission(&tx, array_id, &state)?;
+                anyhow::ensure!(admitted, "Macierz ma niepotwierdzoną operację; brak ponowienia");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 tentanas_helper::elastic::validate_elastic_uuid(resume_operation_id)?;
                 // The same distinctness `validate_observation` demands of the
@@ -1371,6 +1620,28 @@ pub fn set_job_progress(pool: &DbPool, job_id: &str, status: &str, pct: Option<u
     Ok(())
 }
 
+/// Whether a job failed because the helper found another Elastic command
+/// holding the lock (`tentanas_helper::elastic::ELASTIC_BUSY`). The age probe
+/// walks a whole cache under that lock, so a manual Sync or mover started
+/// meanwhile meets it; such a refusal ran nothing and must not leave an
+/// unresolved operation behind.
+/// Whether the job's error means NOTHING RAN on the array: another Elastic
+/// command held the helper's lock, or the node refused to talk to a helper of
+/// another build than this core (`broker::HELPER_VERSION_MARKER`).
+///
+/// Both close the operation row as `failed` and leave the array untouched,
+/// which is the difference between a refusal and a fault. The version refusal
+/// matters most for the unattended paths: during the window between a core
+/// upgrade and the admin re-running provisioning, every cadence tick is
+/// refused, and a refusal that parked `needs_attention` on the array would
+/// take out its Sync, its Scrub and its mover as well.
+fn nothing_ran(error: Option<&str>) -> bool {
+    error.is_some_and(|error| {
+        error.contains(tentanas_helper::elastic::ELASTIC_BUSY)
+            || error.contains(super::broker::HELPER_VERSION_MARKER)
+    })
+}
+
 pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>) -> Result<()> {
     let mut conn = write(pool)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1396,10 +1667,23 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                 Ok(result)
             });
         let (operation_state, update_array, array_state) = match validated {
+            // Refused before it started: another Elastic command held the
+            // lock, or the helper is not the build this core speaks to.
+            // Nothing ran, so nothing needs attention; the run can be asked
+            // again once the reason is gone.
+            Err(_) if nothing_ran(final_error.as_deref()) => {
+                final_status = "failed".into();
+                ("failed", false, "active")
+            }
+            // A Sync that skipped files changing under it is not a fault: the
+            // array serves on and parity waits for the next Sync.
             Ok(result)
                 if status == "succeeded"
-                    && result.run.outcome
-                        == tentanas_helper::elastic::ElasticSnapraidOutcome::Succeeded =>
+                    && matches!(
+                        result.run.outcome,
+                        tentanas_helper::elastic::ElasticSnapraidOutcome::Succeeded
+                            | tentanas_helper::elastic::ElasticSnapraidOutcome::Partial
+                    ) =>
             {
                 ("succeeded", true, "active")
             }
@@ -1409,6 +1693,37 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                         == tentanas_helper::elastic::ElasticSnapraidOutcome::Refused =>
             {
                 ("failed", false, "active")
+            }
+            // A REPAIR THAT WROTE NOTHING. It is not a success — the fault it
+            // was started for is still there, and the scrub row that reported
+            // it still holds the array — and it is not an unresolved operation
+            // of its own either: an unresolved `fix` is cleared only by a
+            // successful `fix`, and a repair cannot succeed until a scrub marks
+            // blocks for it, while that scrub needs an array nothing holds. So
+            // the row is `failed` and the ARRAY is left exactly as it was.
+            Ok(result)
+                if result.run.outcome
+                    == tentanas_helper::elastic::ElasticSnapraidOutcome::NothingRepaired =>
+            {
+                final_status = "failed".into();
+                if final_error.is_none() {
+                    final_error = result.run.detail.clone();
+                }
+                ("failed", false, "active")
+            }
+            // INTERRUPTED, not broken (W-D of the third review): a Sync or a
+            // Scrub that recorded no result had no verdict to record — the
+            // helper died, the job timed out, a precondition refused it. The
+            // operation row keeps that as `needs_attention` and reads as
+            // interrupted, which blocks nothing; the ARRAY is left exactly as
+            // it was, because a state of needs_attention would refuse the very
+            // Sync the row says will finish it.
+            Err(_) if candidate.is_none() && super::elastic::snapraid_disk(&kind).is_none() => {
+                final_status = "failed".into();
+                if final_error.is_none() {
+                    final_error = Some("Brak wyniku operacji SnapRAID".into());
+                }
+                ("needs_attention", false, "active")
             }
             other => {
                 final_status = "failed".into();
@@ -1463,16 +1778,25 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                 super::elastic::validate_mover_result(&spec, &operation_id, &result)?;
                 Ok(result)
             });
-        // Only a Complete run leaves the array serving. A run that stopped
-        // part-way still HOLDS it — both copies of every unfinished file are on
-        // disk — so it closes as needs_attention and the array says so.
+        // The union serves throughout every run; what differs is whether the
+        // helper resolved everything. Only a Complete result — validated as a
+        // `Ready` array, so without any Hold and with the union read-write —
+        // marks the array active. A run that stopped with something unresolved
+        // (a record neither finished nor reversed, a failed Sync) closes as
+        // needs_attention and the array says so until an admin looks.
         let (operation_state, array_state) = match validated {
             Ok(result)
                 if status == "succeeded"
                     && result.run.phase
                         == tentanas_helper::elastic::ElasticMoverPhase::Complete =>
             {
-                ("succeeded", "active")
+                ("succeeded", Some("active"))
+            }
+            // Refused before it started: the lock, or a helper of another
+            // build (`nothing_ran`). The array is left exactly as it was.
+            Err(_) if nothing_ran(final_error.as_deref()) => {
+                final_status = "failed".into();
+                ("failed", None)
             }
             other => {
                 final_status = "failed".into();
@@ -1481,7 +1805,7 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                 } else if final_error.is_none() {
                     final_error = Some("Niezgodny terminalny wynik movera".into());
                 }
-                ("needs_attention", "needs_attention")
+                ("needs_attention", Some("needs_attention"))
             }
         };
         anyhow::ensure!(
@@ -1498,21 +1822,23 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
             )? == 1,
             "Utracono running operację movera"
         );
-        anyhow::ensure!(
-            tx.execute(
-                "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4
-            WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
-                params![
-                    spec.array_id,
-                    array_state,
-                    final_error.as_deref().unwrap_or(""),
-                    at,
-                    spec.owner.org_id,
-                    spec.owner.addon_id
-                ]
-            )? == 1,
-            "Utracono macierz operacji movera"
-        );
+        if let Some(array_state) = array_state {
+            anyhow::ensure!(
+                tx.execute(
+                    "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4
+                WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                    params![
+                        spec.array_id,
+                        array_state,
+                        final_error.as_deref().unwrap_or(""),
+                        at,
+                        spec.owner.org_id,
+                        spec.owner.addon_id
+                    ]
+                )? == 1,
+                "Utracono macierz operacji movera"
+            );
+        }
     }
     let changed = tx.execute(
         "UPDATE nas_jobs SET status = ?2, error = ?3, finished_at = ?4,
@@ -1759,6 +2085,9 @@ pub fn list_jobs(pool: &DbPool, limit: u32) -> Result<Vec<NasJob>> {
 /// baseline log, and letting `refresh_smart` surface the verdict would make the
 /// job short-lived and restart-immune. That is a redesign of the job's
 /// contract, so it is named here and left for its own change.
+/// The history outcome of a Sync or a Scrub whose process never reported.
+pub const INTERRUPTED_OUTCOME: &str = "interrupted";
+
 pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
     let running = super::jobs::running().lock().unwrap_or_else(|p| p.into_inner());
     let mut conn = write(pool)?;
@@ -1775,8 +2104,8 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
         WHERE array_id IN (SELECT array_id FROM nas_elastic_operations WHERE state='running' AND job_id=?2)",
         params![now(),job_id])?;
         tx.execute("UPDATE nas_elastic_operations SET state='needs_attention',
-        error='Utracono nadzór core; wymagany odczyt journala roota', finished_at=?1
-        WHERE state='running' AND job_id=?2", params![now(),job_id])?;
+        error=?3, finished_at=?1
+        WHERE state='running' AND job_id=?2", params![now(),job_id,ORPHANED_OPERATION_ERROR])?;
         changed += tx.execute(
         "UPDATE nas_jobs SET status = 'failed', error = 'interrupted by core restart',
                 finished_at = ?1
@@ -1906,6 +2235,12 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             unresolved_operation: conn.query_row(
                 &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
                 params![array_id], |r| r.get(0))?,
+            mover_settles_unresolved: mover_admission(&conn, &array_id, &state)?.1,
+            // What the button on the screen may offer: a Sync or a Scrub is
+            // admitted on the array a failed parity run left behind, and the UI
+            // must not disable the one action that resolves it.
+            parity_run_available: parity_admission(&conn, &array_id, &state)?,
+            mover_failed_runs: mover_failed_runs(&conn, &array_id)?,
             create_spec: Some(spec), state, state_detail, created_at, updated_at,
             ..Default::default()
         })
@@ -1984,6 +2319,13 @@ fn elastic_runs(
             detail,
             ..Default::default()
         };
+        // A row `fail_orphaned_jobs` closed is interrupted whatever its body
+        // had recorded: the job never finished, and the SQL admission treats it
+        // as resolved on exactly that error, so the history must not show it as
+        // a fault with counters (the LOW inconsistency of the third review).
+        let interrupted = state == "needs_attention"
+            && kind != "fix"
+            && (json.is_none() || value.detail == ORPHANED_OPERATION_ERROR);
         if state != "running" {
             let decoded = json
                 .as_deref()
@@ -2009,10 +2351,13 @@ fn elastic_runs(
                 });
             match decoded {
                 Ok(result)
-                    if !(state == "needs_attention"
-                        && result.run.outcome == ElasticSnapraidOutcome::Succeeded) =>
+                    if !interrupted
+                        && !(state == "needs_attention"
+                            && result.run.outcome == ElasticSnapraidOutcome::Succeeded) =>
                 {
                     let run = result.run;
+                    // A partial Sync is listed, but it is never the array's
+                    // last COMPLETE Sync: parity was not made current by it.
                     terminal_run = matches!(
                         run.outcome,
                         ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Failed
@@ -2020,15 +2365,11 @@ fn elastic_runs(
                     value.started_at = run.started_at;
                     value.finished_at = run.finished_at;
                     value.outcome = match run.outcome {
-                        ElasticSnapraidOutcome::Succeeded => "ok",
-                        ElasticSnapraidOutcome::Refused => "refused",
-                        ElasticSnapraidOutcome::Failed => "failed",
-                        ElasticSnapraidOutcome::NeedsAttention => "needs_attention",
                         ElasticSnapraidOutcome::Running => {
                             return Err(anyhow!("Nieterminalna historia SnapRAID"));
                         }
-                    }
-                    .into();
+                        outcome => super::elastic::snapraid_outcome_to_protocol(outcome),
+                    };
                     value.detail = run.detail.unwrap_or(value.detail);
                     value.exit_code = run.exit_code;
                     value.total_blocks = run.total_blocks;
@@ -2042,6 +2383,18 @@ fn elastic_runs(
                         .zip(run.errors_io)
                         .zip(run.errors_data)
                         .and_then(|((file, io), data)| file.checked_add(io)?.checked_add(data));
+                }
+                // Refused before it started because another Elastic command
+                // held the lock: nothing ran, so no result was ever recorded.
+                Err(_) if state == "failed" && json.is_none() && nothing_ran(Some(&value.detail)) => {
+                    value.outcome = super::elastic::snapraid_outcome_to_protocol(ElasticSnapraidOutcome::Refused);
+                }
+                // A Sync or a Scrub whose process never reported, or whose job
+                // core lost: interrupted, which is neither a failure nor
+                // evidence for a repair.
+                _ if interrupted => {
+                    value.outcome = INTERRUPTED_OUTCOME.into();
+                    value.finished_at = None;
                 }
                 _ => {
                     anyhow::ensure!(
@@ -2289,6 +2642,155 @@ fn latest_add_disk(
         tentanas_helper::HelperCommand::ElasticAddDisk { disk, .. } => Ok(Some((state, disk))),
         _ => Err(anyhow!("Niezgodna intencja dodania dysku")),
     }
+}
+
+/// The newest replacement operation of this array, as (state, branch, disk).
+fn latest_replace_disk(
+    conn: &Connection,
+    array_id: &str,
+) -> Result<Option<(String, String, ElasticDiskSpec)>> {
+    let latest: Option<(String, String)> = conn
+        .query_row(
+            "SELECT state,request_json FROM nas_elastic_operations
+             WHERE array_id=?1 AND kind='replace_disk'
+             ORDER BY created_at DESC, operation_id DESC LIMIT 1",
+            params![array_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((state, json)) = latest else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<tentanas_helper::HelperCommand>(&json)? {
+        tentanas_helper::HelperCommand::ElasticReplaceDisk { branch, disk, .. } => {
+            Ok(Some((state, branch, disk)))
+        }
+        _ => Err(anyhow!("Niezgodna intencja wymiany dysku")),
+    }
+}
+
+/// The slot and the identity a repeat of an unfinished replacement must reuse.
+///
+/// The filesystem UUID is the reason, exactly as for an add: it is what the
+/// mkfs stamped on the replacement and what `filesystem_matches` checks the
+/// branch by, so a repeat that minted a new one would format a disk the
+/// journal already calls a member of the array.
+pub fn unfinished_elastic_replace_disk(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    array_id: &str,
+) -> Result<Option<(String, ElasticDiskSpec)>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mine: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays
+         WHERE array_id=?1 AND org_id=?2 AND addon_id=?3)",
+        params![array_id, owner.org_id, owner.addon_id],
+        |r| r.get(0),
+    )?;
+    if !mine {
+        return Ok(None);
+    }
+    // A RUNNING replacement is deliberately not offered: the caller asks in
+    // order to decide whether it may repeat the operation, and one still in
+    // flight may not be repeated.
+    Ok(latest_replace_disk(&conn, array_id)?
+        .filter(|(state, _, _)| !matches!(state.as_str(), "succeeded" | "running"))
+        .map(|(_, branch, disk)| (branch, disk)))
+}
+
+/// Closes a successful replacement: the member row, its aliases and the
+/// array's persisted intention all describe the NEW disk in one transaction,
+/// for the reason `finish_elastic_add_disk` gives — `elastic_spec` refuses an
+/// intention its member rows do not match, so a commit that landed one
+/// without the other would make every later read of this array fail.
+pub fn finish_elastic_replace_disk(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    operation_id: &str,
+    branch: &str,
+    disk: &ElasticDiskSpec,
+    observed: &ElasticResult,
+) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let array_id: String = tx.query_row(
+        "SELECT o.array_id FROM nas_elastic_operations o
+         JOIN nas_elastic_arrays a ON a.array_id=o.array_id
+         WHERE o.operation_id=?1 AND o.kind='replace_disk' AND o.state='running'
+         AND a.org_id=?2 AND a.addon_id=?3",
+        params![operation_id, owner.org_id, owner.addon_id],
+        |r| r.get(0),
+    )?;
+    let before = elastic_spec(&tx, owner, &array_id)?;
+    let after = super::elastic::spec_with_replaced_disk(&before, branch, disk)?;
+    super::elastic::validate_result(&after, observed)?;
+    let slot = i64::try_from(
+        after
+            .data
+            .iter()
+            .position(|member| member.disk_id == disk.disk_id)
+            .ok_or_else(|| anyhow!("Wymieniony dysk nie jest w zapisanej intencji"))?
+            + 1,
+    )?;
+    tx.execute(
+        "UPDATE nas_elastic_disks SET disk_id=?3,wwn=?4,serial=?5,bytes=?6,expected_uuid=?7
+         WHERE array_id=?1 AND role='data' AND slot=?2",
+        params![
+            array_id,
+            slot,
+            disk.disk_id,
+            disk.wwn,
+            disk.serial,
+            i64::try_from(disk.bytes)?,
+            disk.expected_uuid
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM nas_elastic_disk_aliases WHERE array_id=?1 AND role='data' AND slot=?2",
+        params![array_id, slot],
+    )?;
+    for (kind, value) in [
+        ("disk_id", Some(disk.disk_id.as_str())),
+        ("wwn", disk.wwn.as_deref()),
+        ("serial", disk.serial.as_deref()),
+    ] {
+        if let Some(value) = value {
+            tx.execute(
+                "INSERT INTO nas_elastic_disk_aliases (kind,value,array_id,role,slot)
+                 VALUES (?1,?2,?3,'data',?4)",
+                params![kind, value, array_id, slot],
+            )?;
+        }
+    }
+    let json = serde_json::to_string(&after)?;
+    anyhow::ensure!(json.len() < 16 * 1024, "Intencja Elastic przekracza limit");
+    anyhow::ensure!(
+        tx.execute(
+            "UPDATE nas_elastic_operations SET request_json=?2
+             WHERE array_id=?1 AND kind IN ('create','import')",
+            params![array_id, json]
+        )? == 1,
+        "Brak jednej operacji źródłowej macierzy"
+    );
+    // The read-back is the proof the writes agree: it is the very function
+    // every later read of this array goes through.
+    anyhow::ensure!(
+        elastic_spec(&tx, owner, &array_id)? == after,
+        "Zapis wymiany dysku nie odtworzył intencji macierzy"
+    );
+    let at = now();
+    tx.execute(
+        "UPDATE nas_elastic_operations SET state='succeeded',result_json=?2,error='',finished_at=?3
+         WHERE operation_id=?1",
+        params![operation_id, serde_json::to_string(observed)?, at],
+    )?;
+    tx.execute(
+        "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2
+         WHERE array_id=?1",
+        params![array_id, at],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// The disk spec a retry of an unfinished add must reuse, if there is one.
@@ -2560,6 +3062,16 @@ pub fn finish_elastic_operation(pool: &DbPool, owner: &ElasticOwner, operation_i
         Err(detail) => (false,None,detail.to_string()),
     };
     let at = now();
+    // A Restore refused because another Elastic command held the lock ran
+    // nothing: the array keeps its state and a later Restore is asked again.
+    let kind: String = tx.query_row("SELECT kind FROM nas_elastic_operations WHERE operation_id=?1",
+        params![operation_id], |r| r.get(0))?;
+    if kind == "restore" && result.is_err() && nothing_ran(Some(&detail)) {
+        tx.execute("UPDATE nas_elastic_operations SET state='failed',error=?2,finished_at=?3 WHERE operation_id=?1",
+            params![operation_id,detail,at])?;
+        tx.commit()?;
+        return Ok(());
+    }
     tx.execute("UPDATE nas_elastic_operations SET state=?2,result_json=?3,error=?4,finished_at=?5
         WHERE operation_id=?1",params![operation_id,if success {"succeeded"} else {"needs_attention"},json,detail,at])?;
     tx.execute("UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4 WHERE array_id=?1",
@@ -3058,10 +3570,9 @@ fn elastic_mover_config(
         .optional()?;
     let settings = mover_settings_on(conn, array_id)?;
     Ok(super::elastic::MoverConfig {
-        // No schedule row means no UNATTENDED mover: the manual run is
-        // unaffected, and the node does not start privileged jobs on an array
-        // whose admin never asked for automation.
-        enabled: schedule.as_ref().is_some_and(|s| s.enabled),
+        // No schedule row means no restriction: files move whenever they are
+        // old enough. A row switched on confines those moves to its slots.
+        schedule_enabled: schedule.as_ref().is_some_and(|s| s.enabled),
         schedule: schedule.map(|s| s.schedule),
         min_age_secs: settings.map(|s| s.0).unwrap_or(defaults.min_age_secs),
         cache_min_free_pct: settings.map(|s| s.1).unwrap_or(defaults.cache_min_free_pct),
@@ -5477,8 +5988,10 @@ mod tests {
             assert!(finish_job(&p, &row.job_id, "succeeded", None).is_err());
             assert_eq!(job(&p, &row.job_id).unwrap().unwrap().status, "failed");
             let after = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
-            assert_eq!(after.state, "needs_attention");
-            assert_eq!(after.snapraid_history[0].outcome, "needs_attention");
+            // No result at all reads as interrupted and leaves the array as it
+            // was (W-D); a foreign one is a contradiction that needs attention.
+            assert_eq!(after.state, if foreign { "needs_attention" } else { "active" });
+            assert_eq!(after.snapraid_history[0].outcome, if foreign { "needs_attention" } else { INTERRUPTED_OUTCOME });
             assert!(after.last_sync_run.is_none());
         }
     }
@@ -5696,6 +6209,110 @@ mod tests {
         assert_eq!(array.parity_window_runs.len(), ids.len() - 1);
     }
 
+    /// An array a slot can be replaced in, created and settled in the store.
+    fn replaceable_array(pool: &DbPool, name: &str) -> ElasticCreateSpec {
+        let spec = super::super::elastic::tests::replaceable_spec(name);
+        let created = elastic_job(&spec);
+        insert_job(pool, &created, Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        finish_elastic_operation(
+            pool,
+            &spec.owner,
+            &spec.operation_id,
+            Ok(&super::super::elastic::tests::ready_result(&spec)),
+        )
+        .unwrap();
+        finish_job(pool, &created.job_id, "succeeded", None).unwrap();
+        spec
+    }
+
+    fn replace_job(
+        spec: &ElasticCreateSpec,
+        branch: &str,
+        disk: &ElasticDiskSpec,
+    ) -> (NasJob, ElasticJobIntent, String) {
+        let mut row = elastic_job(spec);
+        row.kind = "elastic_replace_disk".into();
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let intent = ElasticJobIntent::ReplaceDisk {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: operation_id.clone(),
+            rebuild_operation_id: uuid::Uuid::now_v7().to_string(),
+            sync_operation_id: uuid::Uuid::now_v7().to_string(),
+            branch: branch.to_string(),
+            disk: disk.clone(),
+            accept_stale_parity: false,
+        };
+        (row, intent, operation_id)
+    }
+
+    /// THE STORE REFUSES to open a disk replacement, and this is the gate that
+    /// makes "no path may create a `replace_disk` operation" true rather than
+    /// hopeful.
+    ///
+    /// Why the store and not only the handler: a `replace_disk` row that ends
+    /// anything but `succeeded` is cleared by nothing an admin can run — only a
+    /// succeeded `fix` resolved that kind — so it costs the array every later
+    /// Sync, Scrub, mover run and disk addition. The handler refuses first, but
+    /// the scheduler, a retry or a stored approval could still reach
+    /// `insert_job`, so the intent itself has to be inadmissible. The whole
+    /// dormant machinery below (`replace_disk_command`,
+    /// `finish_elastic_replace_disk`, the helper's `replace_data_disk`) stays
+    /// for the task that finishes the feature.
+    #[test]
+    fn the_store_refuses_to_open_a_disk_replacement_and_writes_nothing() {
+        let p = pool();
+        let spec = replaceable_array(&p, "replaced");
+        let fresh = super::super::elastic::tests::fresh_disk("replaced", spec.data[0].bytes);
+        // The disk is gone: the array needs attention, which is the state the
+        // withdrawn feature was asked in.
+        p.write()
+            .unwrap()
+            .execute("UPDATE nas_elastic_arrays SET state='needs_attention'", [])
+            .unwrap();
+        let jobs_before = list_jobs(&p, 100).unwrap().len();
+        let (row, intent, _) = replace_job(&spec, "d1", &fresh);
+        let refused = insert_job(&p, &row, Some(&intent)).unwrap_err();
+        assert!(
+            refused.to_string().contains("Wymiana dysku"),
+            "{refused}"
+        );
+
+        // Nothing was written: no operation of that kind, no job row, and the
+        // array's own spec still names the disk it had.
+        let replacements: i64 = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM nas_elastic_operations WHERE kind='replace_disk'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(replacements, 0);
+        assert_eq!(list_jobs(&p, 100).unwrap().len(), jobs_before, "no job row");
+        let array = elastic_array(&p, &spec.owner, "replaced").unwrap().unwrap();
+        assert_eq!(array.persisted_spec().unwrap().data[0], spec.data[0]);
+        assert_eq!(
+            unfinished_elastic_replace_disk(&p, &spec.owner, &spec.array_id).unwrap(),
+            None,
+            "and nothing is offered as a repeat"
+        );
+
+        // AND THE ARRAY IS NOT WEDGED by having asked: a sync is still
+        // startable, which is the difference between this refusal and the one
+        // the previous version performed after it had written both rows.
+        p.write()
+            .unwrap()
+            .execute("UPDATE nas_elastic_arrays SET state='active'", [])
+            .unwrap();
+        let (sync, sync_intent, _) = maintenance(
+            &array.persisted_spec().unwrap().clone(),
+            tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+        );
+        insert_job(&p, &sync, Some(&sync_intent)).unwrap();
+    }
+
     #[test]
     fn an_unknown_scrub_attempt_does_not_replace_the_last_completed_scrub() {
         use tentanas_helper::elastic::{
@@ -5732,13 +6349,13 @@ mod tests {
             array.last_scrub_run.unwrap().operation_id.as_deref(),
             Some(id.as_str())
         );
-        assert_eq!(array.snapraid_history[0].outcome, "needs_attention");
+        assert_eq!(array.snapraid_history[0].outcome, INTERRUPTED_OUTCOME);
         assert!(array.snapraid_history[0].finished_at.is_none());
         assert!(array.snapraid_history[0].checked_blocks.is_none());
     }
 
     #[test]
-    fn failed_scrub_keeps_earlier_sync_receipt_and_blocks_new_maintenance() {
+    fn failed_scrub_keeps_earlier_sync_receipt_and_blocks_only_the_mover() {
         use tentanas_helper::elastic::{
             ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
         };
@@ -5780,9 +6397,64 @@ mod tests {
             Some(sync_id.as_str())
         );
         assert_eq!(array.last_scrub_run.unwrap().errors_data, Some(1));
-        let (other, intent, _) = maintenance(&spec, Kind::Sync);
-        assert!(insert_job(&p, &other, Some(&intent)).is_err());
-        assert!(job(&p, &other.job_id).unwrap().is_none());
+        // A SYNC IS THE WAY OUT and stays startable; a MOVER is not and does
+        // not. Nothing knows what parity currently covers after a scrub that
+        // failed, so a run that moved more bytes out of the cache and synced on
+        // top of that would be building on an unknown — but the Sync that makes
+        // parity current again is precisely what the array needs.
+        let (out, out_intent, out_id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &out, Some(&out_intent)).unwrap();
+        let blocked_mover = mover_job(&spec);
+        let blocked_intent = mover_intent(
+            &spec,
+            &uuid::Uuid::now_v7().to_string(),
+            &uuid::Uuid::now_v7().to_string(),
+        );
+        assert!(insert_job(&p, &blocked_mover, Some(&blocked_intent)).is_err());
+        assert!(job(&p, &blocked_mover.job_id).unwrap().is_none());
+        // THE SUCCEEDED SYNC DOES NOT CLEAR THE SCRUB ROW. That scrub counted
+        // DATA errors, and a Sync repairs no data: measured on rig11, it leaves
+        // a marked block exactly as it was and `-e fix` still recovers it
+        // afterwards. Saying the row was settled would put the array back to
+        // `active` with the fault still there and a Repair button that could
+        // only answer "nothing repaired" (F2 of the fourth review).
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &out_id,
+            &super::super::elastic::tests::snapraid_result(&spec, &out_id, Kind::Sync, Outcome::Succeeded),
+        )
+        .unwrap();
+        finish_job(&p, &out.job_id, "succeeded", None).unwrap();
+        let synced = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert!(
+            synced.unresolved_operation,
+            "a Sync does not settle a scrub that counted data errors"
+        );
+        // A LATER CLEAN FULL SCRUB does settle it — the product scrubs `-p
+        // full`, so a succeeded one is positive evidence over the whole array —
+        // and that is the second way out beside the repair.
+        let (clean, clean_intent, clean_id) = maintenance(&spec, Kind::Scrub);
+        insert_job(&p, &clean, Some(&clean_intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &clean_id,
+            &super::super::elastic::tests::snapraid_result(&spec, &clean_id, Kind::Scrub, Outcome::Succeeded),
+        )
+        .unwrap();
+        finish_job(&p, &clean.job_id, "succeeded", None).unwrap();
+        let settled = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(settled.state, "active");
+        assert!(!settled.unresolved_operation, "a clean full scrub settles the earlier one");
+        assert!(settled.parity_run_available);
+        let again = mover_job(&spec);
+        let again_intent = mover_intent(
+            &spec,
+            &uuid::Uuid::now_v7().to_string(),
+            &uuid::Uuid::now_v7().to_string(),
+        );
+        insert_job(&p, &again, Some(&again_intent)).unwrap();
     }
 
     fn pool() -> DbPool {
@@ -6181,19 +6853,39 @@ mod tests {
         use tentanas_helper::elastic::{ElasticSnapraidKind, ElasticSnapraidOutcome};
         let p = pool();
         let spec = completed_array(&p, "repair");
-        // A scrub that failed: the array needs attention and nothing else may
-        // start on it.
-        let (scrub, scrub_intent, _) = maintenance(&spec, ElasticSnapraidKind::Scrub);
+        // A scrub that found errors: the array needs attention and nothing else
+        // may start on it. (A scrub with no result at all is interrupted, which
+        // blocks nothing.)
+        let (scrub, scrub_intent, scrub_id) = maintenance(&spec, ElasticSnapraidKind::Scrub);
         insert_job(&p, &scrub, Some(&scrub_intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &scrub_id,
+            &super::super::elastic::tests::snapraid_result(&spec, &scrub_id, ElasticSnapraidKind::Scrub, ElasticSnapraidOutcome::Failed),
+        )
+        .unwrap();
         finish_job(&p, &scrub.job_id, "failed", Some("parity errors")).unwrap();
         let hurt = elastic_array(&p, &spec.owner, "repair").unwrap().unwrap();
         assert!(hurt.unresolved_operation);
         assert_eq!(hurt.state, "needs_attention");
-        let (blocked, blocked_intent, _) = maintenance(&spec, ElasticSnapraidKind::Sync);
-        assert!(
-            insert_job(&p, &blocked, Some(&blocked_intent)).is_err(),
-            "an unresolved parity operation blocks a sync"
-        );
+        // AND A SYNC IS STILL STARTABLE THERE. It used to be refused, which is
+        // the deadlock the fourth review found: the repair's own detail tells
+        // the admin to run a Sync, a repair that repairs nothing leaves the
+        // scrub row unresolved, and only a SUCCEEDED repair cleared it — so the
+        // array had no action left that could get it out. A Sync and a full
+        // Scrub are what settle a parity run that ended badly, so they are
+        // admitted on exactly the array such a run left behind.
+        let (escape, escape_intent, escape_id) = maintenance(&spec, ElasticSnapraidKind::Sync);
+        insert_job(&p, &escape, Some(&escape_intent)).unwrap();
+        assert!(elastic_array(&p, &spec.owner, "repair").unwrap().unwrap().parity_run_available);
+        // It did not have to succeed for the array to stay operable either: the
+        // escape is not a one-shot.
+        finish_job(&p, &escape.job_id, "failed", Some("utracono odpowiedź helpera")).unwrap();
+        let (retry, retry_intent, _) = maintenance(&spec, ElasticSnapraidKind::Scrub);
+        insert_job(&p, &retry, Some(&retry_intent)).unwrap();
+        finish_job(&p, &retry.job_id, "failed", Some("utracono odpowiedź helpera")).unwrap();
+        let _ = escape_id;
 
         // The REPAIR is admitted there, and its kind reaches the table.
         let (fix, fix_intent, fix_id) = maintenance(
@@ -6244,11 +6936,254 @@ mod tests {
         let scrub_row = healed
             .snapraid_history
             .iter()
-            .find(|run| run.kind == "scrub")
+            .find(|run| run.operation_id.as_deref() == Some(scrub_id.as_str()))
             .expect("the failed scrub stays in the history");
-        assert_eq!(scrub_row.outcome, "needs_attention");
+        assert_eq!(scrub_row.outcome, "failed");
         // And a sync is startable again.
         let (again, again_intent, _) = maintenance(&spec, ElasticSnapraidKind::Sync);
+        insert_job(&p, &again, Some(&again_intent)).unwrap();
+    }
+
+    /// A SUCCEEDED REPAIR RESOLVES PARITY RUNS AND NOTHING ELSE.
+    ///
+    /// It used to resolve every unresolved operation of the array, because the
+    /// supersede clause matched on the newer row's success alone: a repair then
+    /// cleared a mover run that stopped part-way and an add-disk that failed —
+    /// operations parity cannot repair and whose state nothing had settled. The
+    /// clause now pairs kinds: a succeeded parity run supersedes parity runs, a
+    /// succeeded mover supersedes movers, and a failed add-disk keeps holding
+    /// the array until an add finishes it.
+    #[test]
+    fn a_repair_resolves_the_parity_run_it_healed_and_not_a_stuck_mover() {
+        use tentanas_helper::elastic::{ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome};
+        let p = pool();
+        let spec = completed_array(&p, "scoped-fix");
+        // A mover that stopped part-way: its row is unresolved, and only a
+        // mover can settle it.
+        let mover = uuid::Uuid::now_v7().to_string();
+        let resume = uuid::Uuid::now_v7().to_string();
+        let mover_row = mover_job(&spec);
+        insert_job(&p, &mover_row, Some(&mover_intent(&spec, &mover, &resume))).unwrap();
+        finish_job(&p, &mover_row.job_id, "failed", Some("przerwane w trakcie przenoszenia")).unwrap();
+        // A SYNC OR A SCRUB CANNOT EVEN START over it, which is the rule that
+        // makes this the only order this state can be reached in: an unresolved
+        // mover means nothing knows what parity covers.
+        let (blocked, blocked_intent, _) = maintenance(&spec, Kind::Scrub);
+        assert!(insert_job(&p, &blocked, Some(&blocked_intent)).is_err());
+        // A REPAIR is admitted there — it writes back blocks a scrub marked and
+        // needs no mover to have finished — and it succeeds.
+        let fix_kind = Kind::Fix { disk: "d1".to_string() };
+        let (fix, fix_intent, fix_id) = maintenance(&spec, fix_kind.clone());
+        insert_job(&p, &fix, Some(&fix_intent)).unwrap();
+        let mut result =
+            super::super::elastic::tests::snapraid_result(&spec, &fix_id, fix_kind, Outcome::Succeeded);
+        result.run.errors_data = Some(3);
+        result.run.checked_blocks = None;
+        result.state.last_run = Some(result.run.clone());
+        record_snapraid_result(&p, &spec.owner, &fix_id, &result).unwrap();
+        finish_job(&p, &fix.job_id, "succeeded", None).unwrap();
+
+        // The MOVER row is untouched, and the array says so.
+        let healed = elastic_array(&p, &spec.owner, "scoped-fix").unwrap().unwrap();
+        assert!(
+            healed.unresolved_operation,
+            "a repair does not settle a mover that stopped part-way"
+        );
+        assert_eq!(
+            healed.snapraid_history.iter().filter(|run| run.kind == "fix").count(),
+            1,
+            "and the repair itself is recorded"
+        );
+        assert!(
+            !healed.parity_run_available,
+            "and an unresolved mover still holds every parity run"
+        );
+        let unresolved: Vec<String> = p
+            .read()
+            .unwrap()
+            .prepare(
+                "SELECT kind FROM nas_elastic_operations
+                 WHERE array_id=?1 AND state IN ('failed','needs_attention','running')
+                   AND NOT EXISTS(
+                     SELECT 1 FROM nas_elastic_operations f
+                     WHERE f.array_id = nas_elastic_operations.array_id AND f.state = 'succeeded'
+                       AND ((nas_elastic_operations.kind IN ('sync','scrub','fix') AND f.kind IN ('fix','sync','scrub'))
+                            OR (nas_elastic_operations.kind = 'mover' AND f.kind = 'mover'))
+                       AND (f.created_at, f.operation_id) > (nas_elastic_operations.created_at, nas_elastic_operations.operation_id))",
+            )
+            .unwrap()
+            .query_map(params![spec.array_id], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(unresolved, vec!["mover".to_string()], "only the mover is left");
+
+        // And a succeeded MOVER is what settles it — after which every action
+        // is back, the repair having settled the parity side already.
+        let second = uuid::Uuid::now_v7().to_string();
+        let second_resume = uuid::Uuid::now_v7().to_string();
+        let second_row = mover_job(&spec);
+        insert_job(&p, &second_row, Some(&mover_intent(&spec, &second, &second_resume))).unwrap();
+        let mover_result = super::super::elastic::tests::mover_result(
+            &spec,
+            &second,
+            &second_resume,
+            tentanas_helper::elastic::ElasticMoverPhase::Complete,
+            true,
+        );
+        record_mover_result(&p, &spec.owner, &second, &mover_result).unwrap();
+        finish_job(&p, &second_row.job_id, "succeeded", None).unwrap();
+        let settled = elastic_array(&p, &spec.owner, "scoped-fix").unwrap().unwrap();
+        assert!(!settled.unresolved_operation);
+        assert!(settled.parity_run_available);
+    }
+
+    /// WHICH SUCCEEDED RUN SETTLES WHICH ROW: an interrupted repair is not
+    /// settled by a Sync, and a scrub that could only report unreadable files
+    /// is — because for that one a Sync is the only cure the product has.
+    ///
+    /// The any-to-any version of the clause let a Sync close both, which put
+    /// the array back to `active` with its fault intact and left the Repair
+    /// button armed on evidence only a repair could clear — and after twenty
+    /// later runs the row aged out of the history and the arming vanished with
+    /// the fault still there (F2 of the fourth review).
+    #[test]
+    fn a_sync_settles_a_scrub_that_only_lost_files_and_never_an_interrupted_repair() {
+        use tentanas_helper::elastic::{ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome};
+        let p = pool();
+        let spec = completed_array(&p, "scoped-settle");
+        let fix_kind = Kind::Fix { disk: "d1".to_string() };
+
+        // AN INTERRUPTED REPAIR: the job never reported. It may have rewritten
+        // part of a disk, so it stays unresolved.
+        let (fix, fix_intent, _) = maintenance(&spec, fix_kind.clone());
+        insert_job(&p, &fix, Some(&fix_intent)).unwrap();
+        finish_job(&p, &fix.job_id, "failed", Some("utracono odpowiedź helpera")).unwrap();
+        assert!(elastic_array(&p, &spec.owner, "scoped-settle").unwrap().unwrap().unresolved_operation);
+
+        // A succeeded SYNC is no evidence about it.
+        let (sync, sync_intent, sync_id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &sync, Some(&sync_intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &sync_id,
+            &super::super::elastic::tests::snapraid_result(&spec, &sync_id, Kind::Sync, Outcome::Succeeded),
+        )
+        .unwrap();
+        finish_job(&p, &sync.job_id, "succeeded", None).unwrap();
+        assert!(
+            elastic_array(&p, &spec.owner, "scoped-settle").unwrap().unwrap().unresolved_operation,
+            "a Sync does not settle an interrupted repair"
+        );
+
+        // A CLEAN FULL SCRUB is, and it is reachable: a scrub is admitted on
+        // the array the interrupted repair left behind.
+        let (scrub, scrub_intent, scrub_id) = maintenance(&spec, Kind::Scrub);
+        insert_job(&p, &scrub, Some(&scrub_intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &scrub_id,
+            &super::super::elastic::tests::snapraid_result(&spec, &scrub_id, Kind::Scrub, Outcome::Succeeded),
+        )
+        .unwrap();
+        finish_job(&p, &scrub.job_id, "succeeded", None).unwrap();
+        assert!(!elastic_array(&p, &spec.owner, "scoped-settle").unwrap().unwrap().unresolved_operation);
+
+        // A SCRUB THAT ONLY LOST FILES: no data error was counted, so there is
+        // no marked block for a repair to write back — measured on rig11,
+        // `-e fix` reports `error:0 recovered:0` for unreadable files. The Sync
+        // that removes them from the content file is the cure, and it settles
+        // the row; otherwise the array would keep a fault nothing could clear.
+        let (lost, lost_intent, lost_id) = maintenance(&spec, Kind::Scrub);
+        insert_job(&p, &lost, Some(&lost_intent)).unwrap();
+        let mut only_files =
+            super::super::elastic::tests::snapraid_result(&spec, &lost_id, Kind::Scrub, Outcome::Failed);
+        only_files.run.errors_file = Some(245);
+        only_files.run.errors_data = Some(0);
+        only_files.state.last_run = Some(only_files.run.clone());
+        record_snapraid_result(&p, &spec.owner, &lost_id, &only_files).unwrap();
+        finish_job(&p, &lost.job_id, "failed", Some("file errors")).unwrap();
+        let hurt = elastic_array(&p, &spec.owner, "scoped-settle").unwrap().unwrap();
+        assert!(hurt.unresolved_operation);
+        assert_eq!(hurt.snapraid_history[0].errors, Some(245));
+
+        let (cure, cure_intent, cure_id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &cure, Some(&cure_intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &cure_id,
+            &super::super::elastic::tests::snapraid_result(&spec, &cure_id, Kind::Sync, Outcome::Succeeded),
+        )
+        .unwrap();
+        finish_job(&p, &cure.job_id, "succeeded", None).unwrap();
+        let cured = elastic_array(&p, &spec.owner, "scoped-settle").unwrap().unwrap();
+        assert!(
+            !cured.unresolved_operation,
+            "a Sync settles a scrub that counted no data errors"
+        );
+        assert_eq!(cured.state, "active");
+    }
+
+    /// A REFUSAL BY THE VERSION GATE LEAVES THE ARRAY ALONE, for a parity run
+    /// and for a mover alike.
+    ///
+    /// The gate refuses every Elastic command while the installed helper is not
+    /// the build this core speaks to (`broker::HELPER_VERSION_MARKER`), and the
+    /// window in which that happens is unattended: the helper is provisioned by
+    /// hand after a core upgrade, so the cadence keeps firing in between. If
+    /// each refused tick parked `needs_attention` on the array, the upgrade
+    /// window would cost the array its Sync, its Scrub and its mover as well —
+    /// so a refusal is `failed` with nothing touched, exactly like the helper
+    /// being busy.
+    #[test]
+    fn a_helper_version_refusal_is_recorded_as_nothing_ran() {
+        use tentanas_helper::elastic::ElasticSnapraidKind as Kind;
+        let p = pool();
+        let spec = completed_array(&p, "skew");
+        let refusal = format!(
+            "{}: zainstalowany helper ma wersję 0.12.0, a ten rdzeń wymaga 0.13.0",
+            super::super::broker::HELPER_VERSION_MARKER
+        );
+
+        // A scheduled Sync, refused before it reached the helper.
+        let (sync, sync_intent, sync_id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &sync, Some(&sync_intent)).unwrap();
+        finish_job(&p, &sync.job_id, "failed", Some(&refusal)).unwrap();
+        let after = elastic_array(&p, &spec.owner, "skew").unwrap().unwrap();
+        assert_eq!(after.state, "active", "the array is untouched");
+        assert!(!after.unresolved_operation, "a refusal is not a fault to resolve");
+        assert!(after.parity_run_available);
+        let state: String = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM nas_elastic_operations WHERE operation_id=?1",
+                params![sync_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        // The history says REFUSED, not "failed with no counters": nothing ran,
+        // so there is nothing to count.
+        assert_eq!(after.snapraid_history[0].outcome, "refused");
+        assert!(after.snapraid_history[0].errors.is_none());
+
+        // And the mover's side of the same refusal.
+        let mover = uuid::Uuid::now_v7().to_string();
+        let resume = uuid::Uuid::now_v7().to_string();
+        let row = mover_job(&spec);
+        insert_job(&p, &row, Some(&mover_intent(&spec, &mover, &resume))).unwrap();
+        finish_job(&p, &row.job_id, "failed", Some(&refusal)).unwrap();
+        let after = elastic_array(&p, &spec.owner, "skew").unwrap().unwrap();
+        assert_eq!(after.state, "active");
+        assert!(!after.unresolved_operation, "a refused mover holds nothing either");
+
+        // So the very next run — once the admin has re-provisioned — is
+        // admitted with no intervening repair, sync or acknowledgement.
+        let (again, again_intent, _) = maintenance(&spec, Kind::Sync);
         insert_job(&p, &again, Some(&again_intent)).unwrap();
     }
 
@@ -6872,7 +7807,7 @@ mod tests {
         // Nothing configured: no cadence, nothing armed, no decision claimed.
         let before = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
         assert!(!before.mover.configured);
-        assert!(!before.mover.enabled, "no row means no unattended mover");
+        assert!(!before.mover.schedule_enabled, "no row means no restriction on automatic moves");
         assert_eq!(before.mover.schedule, None);
         assert_eq!(before.snapraid.sync_schedule, None);
         assert_eq!(before.snapraid.scrub_schedule, None);
@@ -6921,7 +7856,7 @@ mod tests {
 
         // A cadence alone does NOT make the rules somebody's decision.
         let armed = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
-        assert!(armed.mover.enabled);
+        assert!(armed.mover.schedule_enabled);
         assert_eq!(armed.mover.schedule, Some(weekly()));
         assert!(
             !armed.mover.configured,
@@ -6948,7 +7883,7 @@ mod tests {
             .unwrap();
         assert_eq!(list_elastic_schedules(&p, ElasticTask::Mover).unwrap().len(), 1);
         let off = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
-        assert!(!off.mover.enabled);
+        assert!(!off.mover.schedule_enabled);
         assert_eq!(off.mover.schedule, Some(weekly()));
         assert!(off.mover.configured, "the rules survive disabling the cadence");
     }

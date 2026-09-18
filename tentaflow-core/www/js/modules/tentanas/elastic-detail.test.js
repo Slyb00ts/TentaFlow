@@ -13,7 +13,7 @@ import { fmtOptionalBytes, jobCanCancel } from './format.js';
 const GiB = 1024 ** 3;
 const disk = { diskId: 'serial-1', name: 'd1', device: '/dev/vdb', role: 'data', kind: 'hdd', filesystem: 'xfs', mountpoint: '/mnt/tentanas-branches/media/data/d1', sizeBytes: 32 * GiB, usedBytes: 0, freeBytes: 31 * GiB, mounted: true, devicePresent: true, health: 'unknown' };
 function array(overrides = {}) {
-  return { name: 'media', kind: 'elastic-array', state: 'active', stateDetail: '', enabled: true, filesystem: 'xfs', unionPath: '/mnt/media', createPolicy: 'mfs', dataDisks: [disk], parityDisks: [{ ...disk, diskId: 'serial-2', name: 'p1', mountpoint: '/mnt/tentanas-branches/media/parity/1' }], cacheDisks: [], usableBytes: 31 * GiB, usedBytes: 0, protection: { status: 'unknown', faultTolerance: null, movedUnsyncedBytes: null, protectedAsOf: '2026-09-07 12:00:00' }, snapraid: { parityErrors: null, configPath: '/etc/tentanas/snapraid-media.conf' }, updatedAt: '2026-09-07 12:01:00', ...overrides };
+  return { name: 'media', kind: 'elastic-array', state: 'active', stateDetail: '', enabled: true, parityRunAvailable: true, filesystem: 'xfs', unionPath: '/mnt/media', createPolicy: 'mfs', dataDisks: [disk], parityDisks: [{ ...disk, diskId: 'serial-2', name: 'p1', mountpoint: '/mnt/tentanas-branches/media/parity/1' }], cacheDisks: [], usableBytes: 31 * GiB, usedBytes: 0, protection: { status: 'unknown', faultTolerance: null, movedUnsyncedBytes: null, protectedAsOf: '2026-09-07 12:00:00' }, snapraid: { parityErrors: null, configPath: '/etc/tentanas/snapraid-media.conf' }, updatedAt: '2026-09-07 12:01:00', ...overrides };
 }
 
 async function mount(value, fixtures = {}, options) {
@@ -240,12 +240,17 @@ for (const action of ['sync', 'scrub']) test(`${action} wysyła dokładnie raz z
   screen.dispose();
 });
 
-test('maintenance wymaga administratora, parity i aktywnej macierzy bez running', async (t) => {
+// `parityRunAvailable` is the node's OWN admission rule for a Sync and a full
+// Scrub, and the surface repeats it rather than recomputing it from `state`:
+// the array states that refuse one are not a list this file can keep (see the
+// test below, where a state that looks unavailable admits it).
+test('maintenance wymaga administratora, parity i dopuszczenia przebiegu przez węzeł', async (t) => {
   for (const [label, value, options] of [
     ['reader', array(), { admin: false }], ['zero parity', array({ parityDisks: [] })],
-    ['disabled', array({ enabled: false })], ['pending', array({ state: 'pending' })],
-    ['creating', array({ state: 'creating' })], ['attention', array({ state: 'needs_attention' })],
-    ['unknown', array({ state: 'unknown' })], ['running', array({ snapraid: { history: [{ kind: 'sync', outcome: 'running' }] } })],
+    ['disabled', array({ enabled: false })], ['pending', array({ state: 'pending', parityRunAvailable: false })],
+    ['creating', array({ state: 'creating', parityRunAvailable: false })],
+    ['nierozwiązany mover', array({ state: 'active', parityRunAvailable: false, unresolvedOperation: true })],
+    ['unknown', array({ state: 'unknown', parityRunAvailable: false })], ['running', array({ snapraid: { history: [{ kind: 'sync', outcome: 'running' }] } })],
   ]) await t.test(label, async () => {
     const { screen, body } = await mount(value, {}, options);
     for (const action of ['sync', 'scrub']) {
@@ -274,7 +279,9 @@ test('maintenance: anulowane sudo oraz zmiana node, powierzchni i świeżego sta
     click(body.querySelector('[data-act="scrub"]'));
     if (mode === 'node') screen.currentNode = () => ({ nodeId: 'other' });
     if (mode === 'surface') body.replaceChildren();
-    if (mode === 'state') value.state = 'needs_attention';
+    // The fresh-state check is the node's admission rule, not the array's
+    // state string: a Sync is still legal on an array that needs attention.
+    if (mode === 'state') value.parityRunAvailable = false;
     if (mode === 'admin') screen.isAdmin = false;
     release();
     await flush();
@@ -382,9 +389,25 @@ test('zamknięte przyczyny odmowy i etykiety approval są tłumaczone w pięciu 
 });
 
 test('Restore nie obchodzi rozpoczętej maintenance, lecz samo Refused nie blokuje odtworzenia montowania', async () => {
-  for (const kind of ['sync', 'scrub']) for (const outcome of ['running', 'failed', 'needs_attention', 'refused']) {
+  for (const kind of ['sync', 'scrub']) for (const outcome of ['running', 'failed', 'needs_attention', 'refused', 'interrupted']) {
     const { screen, body } = await mount(array({ state: 'pending', snapraid: { history: [{ kind, outcome }] } }));
-    assert.equal(Boolean(body.querySelector('[data-act="restore"]')), outcome === 'refused', `${kind}/${outcome}`);
+    assert.equal(Boolean(body.querySelector('[data-act="restore"]')), ['refused', 'interrupted'].includes(outcome), `${kind}/${outcome}`);
+    screen.dispose();
+  }
+});
+
+// A Sync or a Scrub a reboot cut off is INTERRUPTED: the node closes it and
+// marks parity out of date, and the next Sync is what settles it. It is not a
+// failure, and it is no evidence for a repair — `snapraid fix` over a disk in
+// use reverts what users changed since the last Sync.
+test('przerwany sync nie jest błędem ani powodem naprawy', async () => {
+  for (const kind of ['sync', 'scrub']) {
+    const { screen, body } = await mount(array({ state: 'needs_attention', snapraid: { history: [{ kind, outcome: 'interrupted' }] } }));
+    const chip = body.querySelector('.nas-snapraid-history tf-chip');
+    assert.equal(chip.getAttribute('status'), 'warn', kind);
+    assert.equal(chip.getAttribute('label'), 'Przerwany: dokończy go następny Sync', kind);
+    const repair = body.querySelector('[data-act="fix"]');
+    assert.ok(!repair || repair.hasAttribute('disabled'), `${kind}: no repair offered`);
     screen.dispose();
   }
 });
@@ -423,14 +446,40 @@ test('panel movera pokazuje reguły i sprzężony sync, a niezmierzone liczniki 
   screen.dispose();
 });
 
-test('panel movera nazywa się tym, co robi, i tłumaczy regułę własnymi progami macierzy', async () => {
+// Files changing under a sync are what a writable share does while it is
+// synced: neither the mover's last run nor the SnapRAID history may read that
+// as a failure, and the admin is told the next sync covers those files.
+test('sync, który zastał zmieniające się pliki, jest częściowy, a nie nieudany', async () => {
+  const { screen, body } = await mount(moverArray({
+    snapraid: { history: [{ kind: 'sync', outcome: 'partial', errorsFile: 3, errorsIo: 0, errorsData: 0, exitCode: 1, detail: 'pliki zmieniały się podczas Sync; parity obejmie je następny Sync' }] },
+  }, {
+    lastRun: {
+      startedAt: '2026-09-08T12:00:00Z', finishedAt: '2026-09-08T12:06:00Z', outcome: 'partial',
+      movedBytes: 2 * GiB, movedFiles: 3, skippedBytes: 0, skippedFiles: 0, countsKnown: true,
+      detail: '', coupledSync: { kind: 'sync', outcome: 'partial' },
+    },
+  }));
+  const panel = body.querySelector('.nas-mover');
+  const last = moverRow(panel, 'Ostatni przebieg').textContent;
+  assert.match(last, /sync częściowy: zmienione pliki obejmie następny sync/);
+  assert.doesNotMatch(last, /nieudany/);
+  const chip = body.querySelector('.nas-snapraid-history tf-chip');
+  assert.equal(chip.getAttribute('status'), 'warn');
+  assert.equal(chip.getAttribute('label'), 'Częściowy: pliki zmieniły się w trakcie');
+  screen.dispose();
+});
+
+test('sekcja przenoszenia nazywa się tym, co robi, i tłumaczy regułę własnymi progami macierzy', async () => {
   const { screen, body } = await mount(moverArray());
   const panel = body.querySelector('.nas-mover');
-  // The name alone ("Mover") told nobody what the panel does; the heading now
-  // says it and keeps the wire name only for the job history and the logs.
-  assert.match(panel.querySelector('.section-card-head .title').textContent, /Przenoszenie z cache na dyski \(Mover\)/);
+  // The name alone ("Mover") told nobody what the section does; the summary
+  // says it, and the wire name stays inside, where the job history needs it.
+  assert.match(panel.querySelector('summary .title').textContent, /Zaawansowane: przenoszenie z cache na dyski/);
+  assert.doesNotMatch(panel.querySelector('summary').textContent, /mover/i);
+  assert.match(panel.textContent, /jako „Mover”/);
   const explain = panel.querySelector('.nas-mover-explain');
   assert.match(explain.textContent, /Nowe pliki trafiają najpierw na dysk cache/);
+  assert.match(explain.textContent, /Węzeł sam przenosi/);
   // 7200 s and cacheMinFreePct 20 — the same numbers as the rules row, and the
   // cache half is the FILL level, not the free one.
   assert.match(explain.textContent, /starszy niż 2 h/);
@@ -441,7 +490,7 @@ test('panel movera nazywa się tym, co robi, i tłumaczy regułę własnymi prog
 test('mover bez ustawionych progów wyjaśnia zasadę bez wymyślania liczb', async () => {
   const { screen, body } = await mount(moverArray({}, { minAgeSecs: null, cacheMinFreePct: null }));
   const explain = body.querySelector('.nas-mover .nas-mover-explain');
-  assert.match(explain.textContent, /progi nie są jeszcze ustawione/);
+  assert.match(explain.textContent, /progi nie są jeszcze znane/);
   assert.doesNotMatch(explain.textContent, /%/);
   screen.dispose();
 });
@@ -487,7 +536,7 @@ test('mover wysyła dokładnie jedno żądanie z nazwą macierzy i śledzi job',
     [{ name: 'media', sudoPassword: 'hunter2' }],
   );
   assert.equal(screen.jobLogs[0].jobId, 'mover-1');
-  assert.match(body.textContent, /Przyjęto zadanie movera/);
+  assert.match(body.textContent, /Przyjęto zadanie przenoszenia z cache/);
   assert.equal(jobCanCancel({ kind: 'elastic_mover' }), false);
   screen.dispose();
 });
@@ -527,15 +576,29 @@ test('nierozwiązana operacja blokuje mover i mówi dlaczego, zamiast zgłaszać
   screen.dispose();
 });
 
+// When every unresolved operation is a mover run, the next mover run is what
+// settles it — and once the node stops retrying on its own, an admin's run is
+// the only way on. The button is offered, on an array that needs attention too.
+test('mover rozstrzygający wcześniejsze przebiegi jest dostępny mimo nierozwiązanej operacji', async () => {
+  for (const state of ['active', 'needs_attention']) {
+    const { screen, body } = await mount(moverArray({ state, unresolvedOperation: true, moverSettlesUnresolved: true }));
+    assert.equal(body.querySelector('[data-act="mover"]').hasAttribute('disabled'), false, state);
+    screen.dispose();
+  }
+  const { screen, body } = await mount(moverArray({ state: 'needs_attention', unresolvedOperation: true }));
+  assert.ok(body.querySelector('[data-act="mover"]').hasAttribute('disabled'));
+  screen.dispose();
+});
+
 test('nieskonfigurowany mover nie przedstawia domyślnych liczb jako ustawień', async () => {
   const unset = await mount(moverArray());
   const panel = unset.body.querySelector('.nas-mover');
-  assert.match(moverRow(panel, 'Harmonogram').textContent, /brak harmonogramu/);
+  assert.match(moverRow(panel, 'Okno przenoszenia').textContent, /bez ograniczeń — automatycznie/);
   assert.match(moverRow(panel, 'Reguły').textContent, /domyślne:/);
   unset.screen.dispose();
   const set = await mount(moverArray({}, { configured: true, schedule: { every: '1h' } }));
   const configured = set.body.querySelector('.nas-mover');
-  assert.match(moverRow(configured, 'Harmonogram').textContent, /co 1 h/);
+  assert.match(moverRow(configured, 'Okno przenoszenia').textContent, /tylko co 1 h/);
   assert.doesNotMatch(moverRow(configured, 'Reguły').textContent, /domyślne:/);
   assert.match(moverRow(configured, 'Reguły').textContent, /LUB cache > 80%/);
   set.screen.dispose();
@@ -547,13 +610,13 @@ test('nieskonfigurowany mover nie przedstawia domyślnych liczb jako ustawień',
 test('kadencja i reguły movera to dwa osobne fakty na karcie', async () => {
   const scheduledOnly = await mount(moverArray({}, { schedule: { every: '6h' }, configured: false }));
   const panel = scheduledOnly.body.querySelector('.nas-mover');
-  assert.match(moverRow(panel, 'Harmonogram').textContent, /co 6 h/);
+  assert.match(moverRow(panel, 'Okno przenoszenia').textContent, /co 6 h/);
   assert.match(moverRow(panel, 'Reguły').textContent, /domyślne:/, 'kadencja nie czyni reguł decyzją');
   scheduledOnly.screen.dispose();
 
   const ruledOnly = await mount(moverArray({}, { schedule: null, configured: true, minAgeSecs: 1800, cacheMinFreePct: 30 }));
   const ruled = ruledOnly.body.querySelector('.nas-mover');
-  assert.match(moverRow(ruled, 'Harmonogram').textContent, /brak harmonogramu/);
+  assert.match(moverRow(ruled, 'Okno przenoszenia').textContent, /bez ograniczeń — automatycznie/);
   assert.doesNotMatch(moverRow(ruled, 'Reguły').textContent, /domyślne:/);
   assert.match(moverRow(ruled, 'Reguły').textContent, /LUB cache > 70%/);
   ruledOnly.screen.dispose();
@@ -593,12 +656,15 @@ test('okno movera zapisuje kadencję i reguły w jednym żądaniu', async () => 
   await flush();
   const win = document.querySelector('tf-window.nas-mover-schedule');
   assert.ok(win, 'okno movera otwarte');
-  // The mover is the one cadence that runs sub-daily — draining the cache
-  // between the slower parity runs is its whole job.
+  // The window may be as fine as fifteen minutes or as coarse as a night.
   assert.deepEqual(
     [...win.querySelectorAll('#nas-mover-every option')].map((o) => o.value),
     ['15m', '30m', '1h', '6h', 'daily'],
   );
+  // The switch is the RESTRICTION, and the dialog says that moving stays
+  // automatic while it is off.
+  assert.match(win.textContent, /Przenoś tylko w oknie harmonogramu/);
+  assert.match(win.textContent, /pliki są przenoszone automatycznie/);
   win.querySelector('#nas-mover-coupled').checked = false;
   confirmWindow(win);
   await flush();
@@ -628,11 +694,121 @@ test('pasek historii nie zaprzecza ostatniemu przebiegowi', async () => {
   screen.dispose();
 });
 
-test('wyłączony automatyczny mover mówi o tym, lecz ręczny przebieg pozostaje dostępny', async () => {
-  const { screen, body } = await mount(moverArray({}, { enabled: false }));
-  assert.match(body.querySelector('.nas-mover').textContent, /Automatyczny mover jest wyłączony/);
-  assert.equal(body.querySelector('[data-act="mover"]').hasAttribute('disabled'), false);
-  screen.dispose();
+test('włączone okno ogranicza przenoszenie i mówi o tym; zapisane, lecz wyłączone niczego nie ogranicza', async () => {
+  const daily = { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 };
+  const restricted = await mount(moverArray({}, { enabled: true, schedule: daily }));
+  const panel = restricted.body.querySelector('.nas-mover');
+  assert.match(panel.textContent, /ograniczone do okna harmonogramu/);
+  assert.match(moverRow(panel, 'Okno przenoszenia').textContent, /^Okno przenoszenia\s*tylko /);
+  assert.equal(restricted.body.querySelector('[data-act="mover"]').hasAttribute('disabled'), false, 'ręczny przebieg pozostaje dostępny');
+  restricted.screen.dispose();
+
+  const saved = await mount(moverArray({}, { enabled: false, schedule: daily }));
+  const off = saved.body.querySelector('.nas-mover');
+  assert.doesNotMatch(off.textContent, /ograniczone do okna harmonogramu/);
+  assert.match(moverRow(off, 'Okno przenoszenia').textContent, /bez ograniczeń \(zapisane okno .* jest wyłączone\)/);
+  saved.screen.dispose();
+});
+
+// The owner's decision (2026-09-17): moving off the cache is automatic, so the
+// main view asks the admin to operate nothing and names no process. What it
+// shows is one fact about the DATA; everything a run needs is folded away.
+const mainViewText = (body) => {
+  const copy = body.cloneNode(true);
+  copy.querySelectorAll('details[data-section="mover"]').forEach((details) => {
+    [...details.children].forEach((child) => { if (child.tagName !== 'SUMMARY') child.remove(); });
+  });
+  return copy.textContent;
+};
+
+test('widok główny nie mówi „Mover” i pokazuje jedną linię o danych czekających na cache', async () => {
+  const { screen, body } = await mount(moverArray({ protection: { status: 'window_open', cacheUnprotectedBytes: 18 * GiB, movedUnsyncedBytes: 0 } }));
+  try {
+  assert.doesNotMatch(mainViewText(body), /mover/i);
+  const details = body.querySelector('details[data-section="mover"]');
+  assert.equal(details.open, false, 'konfiguracja i ręczny przebieg są zwinięte');
+  assert.ok(details.querySelector('[data-act="mover"]'), 'ręczny przebieg jest w sekcji zaawansowanej');
+  assert.ok(details.querySelector('.mover-hist'), 'historia pozostaje osiągalna');
+  const lines = body.querySelectorAll('.nas-cache-pending .sr');
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].querySelector('.k').textContent, 'Na dysku cache, jeszcze bez ochrony');
+  assert.equal(lines[0].querySelector('.v').textContent, '18 GiB');
+  // Nothing else in the main view is a control for moving files.
+  for (const act of ['mover', 'mover-schedule']) {
+    assert.ok([...body.querySelectorAll(`[data-act="${act}"]`)].every((el) => details.contains(el)), act);
+  }
+  } finally { screen.dispose(); }
+});
+
+test('niezerowa ilość danych czekających na cache wygląda jak zwykła wartość, nie jak błąd', async () => {
+  const render = async (bytes) => {
+    const { screen, body } = await mount(moverArray({ protection: { status: 'window_open', cacheUnprotectedBytes: bytes } }));
+    try {
+      const line = body.querySelector('.nas-cache-pending');
+      return {
+        text: line.querySelector('.v').textContent,
+        valueClass: line.querySelector('.v').className,
+        rowClass: line.querySelector('.sr').className,
+        alarming: Boolean(line.querySelector('tf-alert, tf-chip, .num-err, .num-warn, .err, .warn')),
+        alerts: body.querySelectorAll('tf-alert').length,
+      };
+    } finally { screen.dispose(); }
+  };
+  const zero = await render(0);
+  const pending = await render(18 * GiB);
+  assert.equal(zero.text, '0 B');
+  assert.equal(pending.text, '18 GiB');
+  assert.equal(pending.valueClass, zero.valueClass, 'ta sama klasa co dla zera');
+  assert.equal(pending.rowClass, zero.rowClass);
+  assert.equal(pending.alarming, false);
+  assert.equal(pending.alerts, 0);
+  // Unmeasured stays unmeasured rather than becoming a confident zero.
+  assert.equal((await render(null)).text, '—');
+});
+
+test('macierz bez cache nie pokazuje linii o danych na cache', async () => {
+  const { screen, body } = await mount(array());
+  try {
+    assert.ok(body.querySelector('.nas-cache-pending') === null);
+    assert.doesNotMatch(mainViewText(body), /mover/i);
+  } finally { screen.dispose(); }
+});
+
+test('zmieniające się liczby nie przebudowują panelu, a rozwinięta sekcja przenoszenia zostaje rozwinięta', async () => {
+  let reads = 0;
+  const value = () => {
+    reads += 1;
+    return { array: moverArray({
+      usedBytes: reads * GiB,
+      cacheUsedBytes: reads * 2 * GiB,
+      updatedAt: `2026-09-07 12:0${reads}:00`,
+      protection: { status: 'window_open', cacheUnprotectedBytes: reads * 3 * GiB, movedUnsyncedBytes: reads * GiB },
+      cacheDisks: [{ ...cacheDisk, usedBytes: reads * 4 * GiB }],
+    }) };
+  };
+  const { screen, body } = await mount(null, { tentaNasElasticArrayGetRequest: value });
+  try {
+  const pending = body.querySelector('.nas-cache-pending');
+  const heading = body.querySelector('.nas-elastic-heading');
+  assert.equal(pending.querySelector('.v').textContent, fmtOptionalBytes(3 * GiB));
+  click(body.querySelector('[data-act="refresh"]'));
+  await flush(); await flush();
+  // `ok(===)`, not `equal`: a failing `equal` on two DOM nodes makes the
+  // assertion inspect the whole document for its diff and never returns.
+  assert.ok(body.querySelector('.nas-cache-pending') === pending, 'ten sam węzeł, nie przebudowa');
+  assert.ok(body.querySelector('.nas-elastic-heading') === heading, 'nagłówek nie jest przebudowany');
+  assert.equal(pending.querySelector('.v').textContent, fmtOptionalBytes(6 * GiB));
+  assert.equal(body.querySelector('tf-stat-card[data-fig="capacity"]').getAttribute('value'), fmtOptionalBytes(2 * GiB));
+  assert.equal(body.querySelector('tf-stat-card[data-fig="cache"]').getAttribute('value'), fmtOptionalBytes(4 * GiB));
+  assert.ok(body.querySelector('.disk-cell[data-disk="serial-3"] [data-fig="disk-usage"]').textContent.startsWith(`${fmtOptionalBytes(8 * GiB)} /`));
+
+  const details = body.querySelector('details[data-section="mover"]');
+  details.open = true;
+  details.dispatchEvent(new window.Event('toggle'));
+  click(body.querySelector('[data-act="refresh"]'));
+  await flush(); await flush();
+  assert.equal(body.querySelector('details[data-section="mover"]').open, true, 'rozwinięcie przeżywa odświeżenie');
+  } finally { screen.dispose(); }
 });
 
 test('wyłączony sprzężony sync ostrzega, że przeniesione pliki zostają poza parity', async () => {
@@ -714,15 +890,56 @@ test('an unchanged poll leaves the Elastic pane standing', async () => {
 const snapraidWith = (history, parityErrors = null) => ({
   parityErrors, configPath: '/etc/tentanas/snapraid-media.conf', history,
 });
-const failedScrub = { kind: 'scrub', outcome: 'needs_attention', startedAt: '2026-09-08 01:00:00', finishedAt: '2026-09-08 01:10:00' };
+// A scrub that MARKED blocks: the errors it counted are what a repair writes
+// back. Measured on rig11: `-e fix` with no such scrub behind it writes
+// nothing at all and still reports "Everything OK", so the count is part of
+// the evidence and not decoration.
+const failedScrub = { kind: 'scrub', outcome: 'needs_attention', errors: 7, startedAt: '2026-09-08 01:00:00', finishedAt: '2026-09-08 01:10:00' };
 const okFix = { kind: 'fix', outcome: 'ok', startedAt: '2026-09-08 02:00:00', finishedAt: '2026-09-08 02:30:00' };
+
+// THE WAY OUT of a parity run that ended badly, and of a repair that repaired
+// nothing: the Sync and the full Scrub stay startable on the array such a run
+// left behind. Without this the screen read `state` plus `unresolvedOperation`
+// and disabled both buttons on exactly the array that needs them — the repair
+// dialog says "run a Sync", and the Sync was the one thing refused (W5/W6 of
+// the fourth review). And no replacement is offered here either, whatever the
+// array reports, because the feature is withdrawn.
+test('nieudany scrub i naprawa bez zapisu zostawiają Sync i Scrub do uruchomienia', async () => {
+  const nothingRepaired = { kind: 'fix', outcome: 'nothing_repaired', errors: 391, startedAt: '2026-09-08 03:00:00', finishedAt: '2026-09-08 03:04:00' };
+  for (const history of [[failedScrub], [nothingRepaired, failedScrub], [{ ...failedScrub, kind: 'sync', outcome: 'failed' }]]) {
+    const { screen, body } = await mount(array({ state: 'needs_attention', snapraid: snapraidWith(history) }), {
+      tentaNasElasticArraySyncRequest: { job: { jobId: 'job-sync', status: 'running' } },
+    });
+    for (const act of ['sync', 'scrub']) {
+      assert.equal(body.querySelector(`[data-act="${act}"]`).hasAttribute('disabled'), false, `${act}: ${history[0].outcome}`);
+    }
+    assert.equal(body.querySelector('[data-act="replace-disk"]'), null, 'wymiana dysku jest wycofana');
+    click(body.querySelector('[data-act="sync"]'));
+    await flush();
+    assert.deepEqual(
+      screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest').map((c) => c.payload),
+      [{ name: 'media', sudoPassword: 'hunter2' }],
+    );
+    screen.dispose();
+  }
+  // A nothing-repaired repair is reported as itself, so the detail an admin
+  // reads matches what the array will let them do next.
+  const { screen, body } = await mount(array({ state: 'needs_attention', snapraid: snapraidWith([nothingRepaired, failedScrub]) }));
+  assert.equal(body.querySelector('.nas-snapraid-history tf-chip').getAttribute('label'), 'Nic nie naprawiono');
+  screen.dispose();
+});
 
 test('naprawa pojawia się tylko przy dowodzie awarii parity i nigdy bez parity', async () => {
   const cases = [
     [{}, false, 'zdrowa macierz nie oferuje naprawy'],
     [{ parityDisks: [] }, false, 'bez parity nie ma z czego odbudować'],
-    [{ snapraid: snapraidWith([failedScrub]) }, true, 'scrub bez sukcesu to awaria parity'],
-    [{ snapraid: snapraidWith([], 3) }, true, 'zgłoszone błędy parity'],
+    [{ snapraid: snapraidWith([failedScrub]) }, true, 'scrub, który zaznaczył błędy, to dowód'],
+    // NOT evidence: a scrub that counted nothing, a failed sync, and the
+    // parity-error figure of the reporting window — none of them marks a block
+    // in the content file, and a repair only writes marked blocks.
+    [{ snapraid: snapraidWith([{ ...failedScrub, errors: 0 }]) }, false, 'scrub bez błędów nic nie zaznaczył'],
+    [{ snapraid: snapraidWith([{ ...failedScrub, kind: 'sync' }]) }, false, 'nieudany sync nic nie zaznacza'],
+    [{ snapraid: snapraidWith([], 3) }, false, 'liczba błędów w oknie to nie zaznaczone bloki'],
     [{ state: 'needs_attention', snapraid: snapraidWith([failedScrub]) }, true, 'naprawa startuje z needs_attention'],
     // Newest first, so a repair that already succeeded settled the run below
     // it — the same rule the node applies in SQL over the same rows.
@@ -768,6 +985,16 @@ test('naprawa wymaga przepisania nazwy dysku i wysyła dokładnie jedno żądani
   await flush();
   const win = document.querySelector('tf-window');
   assert.ok(win, 'okno naprawy jest otwarte');
+  // WHAT THE DIALOG PROMISES has to be what `-e fix` does, measured on rig11:
+  // it writes back only the blocks the last Scrub marked, in files unchanged
+  // since the last Sync. It said the opposite — that it would overwrite the
+  // named disk from parity and restore files from the last sync — which is the
+  // unfiltered `fix` this app no longer runs, and an admin who believed it
+  // would expect deleted files back.
+  assert.match(win.textContent, /bloki, które ostatni Scrub oznaczył/);
+  assert.match(win.textContent, /nie przywraca brakujących plików/);
+  assert.match(win.textContent, /Nic nie naprawiono/, 'i co zrobić, gdy nic nie zaznaczono');
+  assert.doesNotMatch(win.textContent, /Odtwarza pliki z ostatniego udanego sync/);
   const confirm = win.querySelector('[data-action="confirm"]');
   assert.ok(confirm.hasAttribute('disabled'), 'przycisk startuje zablokowany');
   typeInto(win.querySelector('#nas-retype'), 'media');

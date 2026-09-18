@@ -143,11 +143,14 @@ test('the mover filter finds the cache drains and nothing else', async () => {
   await flush();
   const filters = body.querySelector('#nas-jobs-filters');
   const history = body.querySelector('#nas-jobs-table');
-  assert.equal(filters.filters.find((f) => f.id === 'mover').label, 'Przenoszenie (Mover)');
+  assert.equal(filters.filters.find((f) => f.id === 'mover').label, 'Przenoszenie z cache');
   filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'mover' } }));
   await flush();
   assert.deepEqual(history.rows.map((r) => r._job.jobId), ['j4']);
-  assert.match(history.rows[0].task, /Mover · Uruchom teraz/, 'the row keeps the job-history spelling');
+  // The row keeps the name the node logs, but no longer claims every run was
+  // started by hand: most of them are automatic now.
+  assert.match(history.rows[0].task, /Mover · przenoszenie z cache/);
+  assert.doesNotMatch(history.rows[0].task, /Uruchom teraz/);
   // The scrub family must not swallow the mover, nor the mover the scrubs.
   filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'scrub' } }));
   await flush();
@@ -328,7 +331,11 @@ test('n15 lists the Elastic cadences and the mover toggle never overwrites its r
   await drawTasks(screen, body);
   await flush();
   const rows = scheduleRows(body);
-  assert.match(rows[0].textContent, /Przenoszenie z cache: media \(Mover\)/);
+  // Moving is automatic; a mover row exists only as a saved WINDOW, and the
+  // row says what its switch does to the files.
+  assert.match(rows[0].textContent, /Okno przenoszenia z cache: media/);
+  assert.doesNotMatch(rows[0].textContent, /mover/i);
+  assert.match(rows[0].textContent, /poza oknem pliki czekają na cache/);
   assert.match(rows[1].textContent, /SnapRAID sync media/);
 
   flipToggle(rows[0], false);

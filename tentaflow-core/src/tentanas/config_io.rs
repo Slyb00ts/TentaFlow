@@ -1082,7 +1082,7 @@ pub async fn apply_with(
     }
 
     if shares_changed {
-        for line in super::shares::apply(&db, main_db, addon_id, explicit).await? {
+        for line in super::shares::apply(&db, main_db, addon_id, explicit, super::shares::ApplyTrigger::Change).await? {
             handle.log(line);
         }
     }

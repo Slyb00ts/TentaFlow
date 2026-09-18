@@ -23160,6 +23160,16 @@ pub fn encode_tentanas_elastic_array_add_disk_request(request_json: String) -> R
     encode_tentanas_json_request("ElasticArrayAddDiskRequest", &request_json)
 }
 
+/// Wymiana dysku danych macierzy Elastic i odbudowa go z parity.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayReplaceDiskRequest)]
+pub fn encode_tentanas_elastic_array_replace_disk_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayReplaceDiskRequest", &request_json)
+}
+
 /// Rozwiązanie macierzy Elastic; dyski zachowują systemy plików.
 ///
 /// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
@@ -23176,7 +23186,7 @@ mod elastic_codec_tests {
 
     #[test]
     fn elastic_encoders_roundtrip_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 20] = [
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 21] = [
             ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
             ("DiskWipePlanRequest", encode_tentanas_disk_wipe_plan_request,
                 r#"{"disk_id":"wwn-0x5000c500a1b2c3d4"}"#),
@@ -23189,6 +23199,8 @@ mod elastic_codec_tests {
                 r#"{"name":"media","disk":"d1","confirm_disk":"d1"}"#),
             ("ElasticArrayAddDiskRequest", encode_tentanas_elastic_array_add_disk_request,
                 r#"{"name":"media","disk_id":"wwn-0x5000c500a1b2c3d4","confirm_name":"media"}"#),
+            ("ElasticArrayReplaceDiskRequest", encode_tentanas_elastic_array_replace_disk_request,
+                r#"{"name":"media","disk":"d1","confirm_disk":"d1","replacement_disk_id":"wwn-0x5000c500a1b2c3d4","accept_stale_parity":false}"#),
             ("ElasticArrayDestroyRequest", encode_tentanas_elastic_array_destroy_request,
                 r#"{"name":"media","confirm_name":"media"}"#),
             ("ElasticArrayPlanRequest", encode_tentanas_elastic_array_plan_request,

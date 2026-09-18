@@ -47,6 +47,13 @@ pub enum BrokerError {
     },
     #[error("{0}")]
     Io(String),
+    /// The installed helper is not the build this core expects, or its version
+    /// could not be read at all. Elastic operations are refused on it: an
+    /// older helper accepts the command and runs an OLDER sequence, which is
+    /// how a 0.12.0 helper would still freeze a union for a mover this core
+    /// no longer knows how to release.
+    #[error("{0}")]
+    HelperVersion(String),
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +342,125 @@ async fn sudo_argv(
 /// `sudo -n`, `Some` is `sudo -S` with the password on the first line —
 /// `sudo -S` stops reading at that newline, so the command line and its
 /// payload stay in the pipe for the helper it execs.
+// ----- the version gate: an Elastic command never reaches a helper of another
+// ----- build than the one this core was compiled against ------------------------
+
+/// The marker every version refusal carries. `db::nothing_ran` matches on it to
+/// close the operation row as "refused before anything ran", so a refused
+/// cadence tick leaves the array exactly as it was instead of parking a fault
+/// on it.
+pub const HELPER_VERSION_MARKER: &str = "helper w innej wersji niż rdzeń";
+
+/// How long a version probe is trusted. The probe is one unprivileged
+/// `--version` exec; the scheduler ticks every minute and the automatic mover
+/// reads the cache too, so without this the node would exec the helper once
+/// per tick per array to learn something that changes only when an admin
+/// re-provisions (which clears the cache outright,
+/// `forget_helper_version`).
+const VERSION_PROBE_TTL: Duration = Duration::from_secs(60);
+
+struct VersionProbe {
+    path: String,
+    /// `None` = the probe could not read a version. Cached as well as a
+    /// success, because "unknown" is a verdict the gate acts on, and probing
+    /// a broken binary every tick is the same exec storm.
+    version: Option<String>,
+    at: std::time::Instant,
+}
+
+fn version_cache() -> &'static std::sync::Mutex<Option<VersionProbe>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<VersionProbe>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// The cached verdict for `path`, or `None` when there is no FRESH one. The
+/// two layers are separate so the cache can be tested without an exec: the
+/// outer `Option` is "do we know", the inner one is "what the probe read".
+fn cached_version(path: &str, now: std::time::Instant) -> Option<Option<String>> {
+    let cache = version_cache().lock().unwrap_or_else(|p| p.into_inner());
+    cache
+        .as_ref()
+        .filter(|probe| probe.path == path && now.duration_since(probe.at) < VERSION_PROBE_TTL)
+        .map(|probe| probe.version.clone())
+}
+
+fn remember_version(path: &str, version: Option<String>, now: std::time::Instant) {
+    let mut cache = version_cache().lock().unwrap_or_else(|p| p.into_inner());
+    *cache = Some(VersionProbe { path: path.to_string(), version, at: now });
+}
+
+/// Drops the cached probe. Called when provisioning installs or removes the
+/// helper, so the very next Elastic operation sees the new binary instead of
+/// waiting out the TTL.
+pub fn forget_helper_version() {
+    *version_cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// Whether this command is an Elastic Array operation, i.e. one whose whole
+/// sequence lives in the helper and whose protocol between core and helper is
+/// what a version skew breaks.
+///
+/// SCOPE, deliberately: the ZFS/zpool guards and the share writers are not
+/// gated. They are single commands with a stable argv contract, and the one
+/// thing an older helper does differently with them — reading the Elastic
+/// journals to decide a guard — already fails CLOSED there, because a journal
+/// it cannot parse makes it refuse by name. An Elastic operation is the
+/// opposite: an older helper accepts the command and performs an older
+/// sequence (0.12.0 still entered a service Hold for a mover and remounted the
+/// union read-only, and this core no longer carries the release for it), which
+/// is a freeze nobody asked for.
+fn is_elastic(command: &HelperCommand) -> bool {
+    command
+        .builtin_label()
+        .is_some_and(|label| label.starts_with("elastic_"))
+}
+
+/// The gate itself, over the version the probe read (`None` = unknown).
+///
+/// UNKNOWN REFUSES, and that is the point of the third arm: a probe that fails
+/// is not evidence that the helper is fine, and the failure modes that produce
+/// it — the file is gone, it is not executable, it hangs — are exactly the ones
+/// where running it blind is worst. An older helper is refused for the same
+/// reason as a newer one: neither speaks this core's sequence.
+fn version_gate(command: &HelperCommand, installed: Option<&str>) -> Result<(), BrokerError> {
+    if !is_elastic(command) {
+        return Ok(());
+    }
+    let expected = tentanas_helper::VERSION;
+    match installed {
+        Some(version) if version == expected => Ok(()),
+        Some(version) => Err(BrokerError::HelperVersion(format!(
+            "{HELPER_VERSION_MARKER}: zainstalowany helper ma wersję {version}, a ten rdzeń wymaga \
+             {expected}. Operacja nie została uruchomiona — powtórz nadanie uprawnień systemowych \
+             (Środowisko → kanał uprawnień), aby zainstalować pasującą wersję helpera."
+        ))),
+        None => Err(BrokerError::HelperVersion(format!(
+            "{HELPER_VERSION_MARKER}: nie udało się odczytać wersji zainstalowanego helpera (ten \
+             rdzeń wymaga {expected}). Operacja nie została uruchomiona — powtórz nadanie uprawnień \
+             systemowych (Środowisko → kanał uprawnień)."
+        ))),
+    }
+}
+
+/// The version `path` reports, cached. One unprivileged exec of `--version`,
+/// which needs no password and no channel: the same probe `helper_status`
+/// makes for the Environment tab, taken here because the tab is not what
+/// stands between a cadence and the helper.
+async fn installed_version(path: &str) -> Option<String> {
+    if let Some(hit) = cached_version(path, std::time::Instant::now()) {
+        return hit;
+    }
+    let probed = run_unprivileged(path, &["--version"], Duration::from_secs(5))
+        .await
+        .ok()
+        .filter(|out| out.success())
+        .map(|out| out.stdout.trim().to_string())
+        .filter(|version| !version.is_empty());
+    remember_version(path, probed.clone(), std::time::Instant::now());
+    probed
+}
+
 async fn through_helper(
     helper: &str,
     token: Option<&ElevationToken>,
@@ -342,6 +468,16 @@ async fn through_helper(
     key: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<CommandOutput, BrokerError> {
+    // THE VERSION GATE, here because this is the only function that execs a
+    // helper builtin and the only one that knows WHICH binary will run — the
+    // provisioned one, or the copy beside the core in mode B. Every Elastic
+    // caller passes through it: the manual handlers, the scheduled passes, the
+    // automatic mover, the startup restores and the privileged reads that are
+    // not jobs at all (the cache and age probes). A check at the job-spawn
+    // boundary would have missed the last of those.
+    if is_elastic(command) {
+        version_gate(command, installed_version(helper).await.as_deref())?;
+    }
     let mut cmd = Command::new("sudo");
     match token {
         None => cmd.args(["-n", "--", helper]),
@@ -402,5 +538,135 @@ pub async fn channel_available(db: &DbPool) -> bool {
         super::elevation::Mode::Helper => super::elevation::helper_status().await.state == "ok",
         super::elevation::Mode::Interactive => super::elevation::armed_token().is_some(),
         super::elevation::Mode::Unset => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AN ELASTIC OPERATION NEVER REACHES A HELPER OF ANOTHER BUILD, and an
+    /// unreadable version is refused exactly like a wrong one.
+    ///
+    /// The window this closes is real and not hypothetical: the helper is
+    /// installed separately, by hand, with the admin's sudo password, so a new
+    /// core necessarily runs against the previous helper until someone
+    /// re-provisions. In that window the automatic mover fires on cadence, and
+    /// a 0.12.0 helper still entered a service Hold and remounted the union
+    /// read-only for it — while this core no longer carries the release for
+    /// that Hold, because it moved into the helper. Unattended, that is the
+    /// freeze this whole series removed.
+    #[test]
+    fn the_version_gate_refuses_a_mismatch_and_an_unknown_and_admits_a_match() {
+        let elastic = HelperCommand::ElasticJournals {};
+        assert!(is_elastic(&elastic));
+
+        // The version this core was built against is admitted.
+        version_gate(&elastic, Some(tentanas_helper::VERSION)).expect("the matching helper runs");
+
+        // An OLDER helper is refused, and the refusal names both versions and
+        // the remedy — an admin who is not told cannot fix it.
+        let older = version_gate(&elastic, Some("0.12.0")).expect_err("an older helper is refused");
+        let BrokerError::HelperVersion(why) = &older else {
+            panic!("the refusal has to be its own error: {older:?}")
+        };
+        assert!(why.contains("0.12.0"), "{why}");
+        assert!(why.contains(tentanas_helper::VERSION), "{why}");
+        assert!(why.contains("uprawnień"), "{why}");
+        // And it carries the marker the store reads to close the row as
+        // "nothing ran", so a refused cadence tick parks no fault.
+        assert!(why.contains(HELPER_VERSION_MARKER), "{why}");
+
+        // A NEWER helper is refused for the same reason: neither build speaks
+        // this core's sequence.
+        assert!(matches!(
+            version_gate(&elastic, Some("0.14.0")),
+            Err(BrokerError::HelperVersion(_))
+        ));
+
+        // UNKNOWN REFUSES. A probe that failed is not evidence that the helper
+        // is fine, and it is produced by exactly the states in which running
+        // it blind is worst: the file is gone, it is not executable, it hangs.
+        let unknown = version_gate(&elastic, None).expect_err("unknown is not fine");
+        let BrokerError::HelperVersion(why) = &unknown else { panic!("{unknown:?}") };
+        assert!(why.contains("nie udało się odczytać"), "{why}");
+        assert!(why.contains(HELPER_VERSION_MARKER), "{why}");
+
+        // NOT an Elastic command: the share writers and the ZFS guards keep
+        // working on an older helper, deliberately — a single command with a
+        // stable argv, and the one thing an older helper does differently with
+        // them (reading an Elastic journal it cannot parse) already fails
+        // closed on its own side.
+        let share = HelperCommand::SmbIncludeEnsure {};
+        assert!(!is_elastic(&share));
+        for installed in [Some(tentanas_helper::VERSION), Some("0.12.0"), None] {
+            version_gate(&share, installed).expect("a share writer is not gated");
+        }
+    }
+
+    /// THE GATE IS ON THE EXEC PATH, not merely defined next to it.
+    ///
+    /// The two tests above prove what the gate decides; this one proves that
+    /// the only function which execs a helper builtin asks it, BEFORE it builds
+    /// the `sudo` command. It reads this file's own source because there is no
+    /// way to observe the wiring otherwise: reaching `through_helper` from a
+    /// test would either exec `sudo` on the machine running the suite or prove
+    /// nothing on a machine where the helper happens to match.
+    #[test]
+    fn every_helper_exec_asks_the_version_gate_first() {
+        const SOURCE: &str = include_str!("broker.rs");
+        let start = SOURCE
+            .find("async fn through_helper(")
+            .expect("through_helper moved or was renamed");
+        let body = &SOURCE[start..];
+        let gate = body.find("version_gate(command,").expect("the exec path does not ask the gate");
+        let sudo = body.find("Command::new(\"sudo\")").expect("through_helper no longer execs sudo");
+        assert!(gate < sudo, "the gate has to run BEFORE the command is built");
+        // And it is the only exec of a helper builtin: every channel arm — a
+        // one-shot password, the passwordless helper, the armed password —
+        // funnels through this one function, so one gate covers them all. The
+        // count is over PRODUCTION source only (this module's own text mentions
+        // the name too), and it is three call sites plus the definition.
+        let production = &SOURCE[..SOURCE.find("#[cfg(test)]").expect("the test module")];
+        assert_eq!(
+            production.matches("through_helper(").count(),
+            4,
+            "a new call site of through_helper has to be checked against the gate"
+        );
+    }
+
+    /// The probe is CACHED, so the gate is not an exec per tick: the scheduler
+    /// wakes every minute and the automatic mover reads the same verdict for
+    /// every array on the node.
+    #[test]
+    fn the_version_probe_is_cached_per_binary_until_its_ttl_or_a_provisioning() {
+        let now = std::time::Instant::now();
+        let path = "/probe/tentanas-helper";
+        forget_helper_version();
+        assert_eq!(cached_version(path, now), None, "nothing is known before the first probe");
+
+        remember_version(path, Some("0.13.0".into()), now);
+        assert_eq!(cached_version(path, now), Some(Some("0.13.0".into())));
+        // Still fresh just inside the TTL, gone just outside it.
+        assert_eq!(
+            cached_version(path, now + VERSION_PROBE_TTL - Duration::from_millis(1)),
+            Some(Some("0.13.0".into()))
+        );
+        assert_eq!(cached_version(path, now + VERSION_PROBE_TTL), None, "a stale entry is unknown");
+
+        // A FAILED probe is cached too — otherwise a broken binary would be
+        // re-executed every tick — and it stays "unknown", which refuses.
+        remember_version(path, None, now);
+        assert_eq!(cached_version(path, now), Some(None));
+
+        // The cache is per binary: mode B runs the copy beside the core, and a
+        // verdict about one path says nothing about the other.
+        assert_eq!(cached_version("/usr/local/libexec/tentanas-helper", now), None);
+
+        // Provisioning installs a new binary, so the verdict is dropped at
+        // once rather than waiting out the TTL.
+        remember_version(path, Some("0.13.0".into()), now);
+        forget_helper_version();
+        assert_eq!(cached_version(path, now), None);
     }
 }

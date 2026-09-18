@@ -2540,6 +2540,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElasticArrayScrubRequest { .. } => "TentaNasElasticArrayScrubRequest",
                 Tn::ElasticArrayFixRequest { .. } => "TentaNasElasticArrayFixRequest",
                 Tn::ElasticArrayAddDiskRequest { .. } => "TentaNasElasticArrayAddDiskRequest",
+                Tn::ElasticArrayReplaceDiskRequest { .. } => "TentaNasElasticArrayReplaceDiskRequest",
                 Tn::ElasticArrayDestroyRequest { .. } => "TentaNasElasticArrayDestroyRequest",
                 Tn::ElasticArrayMoverRequest { .. } => "TentaNasElasticArrayMoverRequest",
                 Tn::ElasticMoverScheduleSetRequest { .. } => {

@@ -53,8 +53,8 @@ use tentanas_helper::elastic::{
     ParityDisk as SpecParity, SnapraidOptions, Tools,
 };
 use anyhow::{anyhow, ensure, Result};
-use tentanas_helper::elastic::{ElasticCreateSpec, ElasticDiskSpec, ElasticJournalEntry, ElasticJournalsResult, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult, ElasticServiceMode};
-use tentanas_helper::elastic::{ElasticDissolveResult, ElasticMoverIssueKind, ElasticMoverPhase, ElasticMoverResult, ElasticMoverRun, ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
+use tentanas_helper::elastic::{ElasticCreateSpec, ElasticDiskSpec, ElasticJournalEntry, ElasticJournalsResult, ElasticUnreadableJournal, ElasticConflict, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult, ElasticServiceMode};
+use tentanas_helper::elastic::{ElasticCacheAge, ElasticDissolveResult, ElasticMoverIssueKind, ElasticMoverPhase, ElasticMoverResult, ElasticMoverRun, ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
 use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -70,7 +70,8 @@ pub const KIND: &str = "elastic-array";
 pub const MERGERFS_FEATURE_ID: &str = "mergerfs";
 pub const SNAPRAID_FEATURE_ID: &str = "snapraid";
 
-/// How long an out-of-schedule mover run waits before it may fire again.
+/// How long an automatic mover run waits before it may fire again, and how
+/// often the node may probe an array's cache for aged files.
 ///
 /// TWENTY MINUTES IS A JUDGEMENT, not a measurement. The trigger it guards is
 /// "the cache fell below its minimum free space", and the failure mode without
@@ -81,7 +82,21 @@ pub const SNAPRAID_FEATURE_ID: &str = "snapraid";
 /// of the guess is what makes it acceptable: too long only delays a move the
 /// scheduled run would make anyway, too short costs disk churn during exactly
 /// the period the array is under pressure.
+///
+/// The age probe (`ElasticCacheAge`) is paced by the same interval: it walks
+/// the whole cache and scans every process's descriptors, as root, and a file
+/// that became old enough a few minutes ago loses nothing by waiting for the
+/// next probe — it is on the cache either way.
 pub const MOVER_RETRIGGER_COOLDOWN: Duration = Duration::from_secs(20 * 60);
+
+/// How many age thresholds a file may wait on the cache before the node calls
+/// the cache stuck (`cache_stuck_after_secs`).
+///
+/// A healthy automatic mover takes a file at most one probe interval plus one
+/// cooldown after it becomes old enough, i.e. well inside two thresholds at the
+/// default 2 h. Four leaves room for a long run and a failed coupled sync
+/// without letting a genuinely stuck file go unreported past half a day.
+pub const CACHE_STUCK_AGE_MULTIPLE: u64 = 4;
 
 /// The window the card promises. n11 renders the row „Błędy parity (30 dni)"
 /// and the wire carries this number beside the count, so the sum below and the
@@ -294,7 +309,13 @@ pub fn folders_of(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoverConfig {
-    pub enabled: bool,
+    /// Whether the saved schedule is switched ON. Automatic moving does NOT
+    /// depend on it: every enabled array with a cache moves its aged files by
+    /// itself (`MoverTrigger::FilesAged`), like any cache. A schedule that is
+    /// on RESTRICTS those moves to its own slots, for an admin who wants the
+    /// data disks woken only at certain hours; cache pressure still overrides
+    /// it. Off, or no schedule at all, is the unrestricted default.
+    pub schedule_enabled: bool,
     pub schedule: Option<NasSchedule>,
     pub min_age_secs: u64,
     pub cache_min_free_pct: u8,
@@ -309,7 +330,7 @@ pub struct MoverConfig {
 impl Default for MoverConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            schedule_enabled: false,
             schedule: None,
             min_age_secs: 7_200,
             cache_min_free_pct: 20,
@@ -400,6 +421,18 @@ pub struct ElasticArrayRow {
     pub mover_history: Vec<NasMoverRun>,
     /// An operation of this array is closed `needs_attention` and unresolved.
     pub unresolved_operation: bool,
+    /// Every unresolved operation is a mover run that stopped with something
+    /// left, and the next mover run settles it. The scheduler starts that run
+    /// on its own; nothing waits for a `fix` that could not run.
+    pub mover_settles_unresolved: bool,
+    /// Mover runs that ended needing attention since the last one that
+    /// succeeded, newest first and counted until that success. A run refused
+    /// before it started (`failed`) is not counted: nothing ran.
+    pub mover_failed_runs: u32,
+    /// Whether a Sync or a full Scrub may start right now: an array with
+    /// nothing unresolved, or one whose only unresolved operations are parity
+    /// runs a Sync settles (W5/W6 of the fourth review).
+    pub parity_run_available: bool,
     pub snapraid: SnapraidConfig,
     /// The last state this node persisted, and why — carried the way
     /// `TargetRow::state`/`state_detail` are, so an array switched off by an
@@ -613,6 +646,12 @@ pub struct ArrayObservation {
     /// mover moved. It alone decides; a byte count never reads as protected.
     pub parity_stale: bool,
     pub last_mover: Option<ElasticMoverRun>,
+    /// What a mover run would find on the cache, when the scheduler's age
+    /// probe measured it. `None` = not measured this time, never "empty".
+    pub cache_age: Option<ElasticCacheAge>,
+    /// Files a stuck mover record left in two versions, as the helper found
+    /// them on the branches (A3 of the second review).
+    pub conflicts: Vec<ElasticConflict>,
 }
 
 impl ArrayObservation {
@@ -874,10 +913,46 @@ pub fn branch_alert_key(array: &str, disk: &str) -> String {
     format!("elastic:{array}:branch:{disk}")
 }
 
-/// The protection alert: the cache is holding unprotected bytes and the mover
-/// is not draining them.
+/// The protection alert: files have waited on the cache, outside parity, past
+/// `cache_stuck_after_secs`, and the node is not moving them. Pending files on
+/// their own never raise it — see `cache_stuck_verdict`.
 pub fn protection_alert_key(array: &str) -> String {
     format!("elastic:{array}:protection")
+}
+
+/// The alert for files a stuck mover record left in two versions.
+pub fn conflict_alert_key(array: &str) -> String {
+    format!("elastic:{array}:conflict")
+}
+
+/// What the conflict alert says, or `None` when there is nothing to say: one
+/// line per file, naming where clients see it and where the other version is.
+/// The alert stands for as long as the helper still finds a second version.
+pub fn conflict_alert(conflicts: &[ElasticConflict]) -> Option<(String, String)> {
+    if conflicts.is_empty() {
+        return None;
+    }
+    let lines = conflicts
+        .iter()
+        .map(|conflict| format!("{}: wersja widoczna {}, druga wersja zachowana w {}", conflict.path, conflict.visible, conflict.kept))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some((
+        format!("Pliki zachowane w dwóch wersjach: {}", conflicts.len()),
+        format!(
+            "Przerwane przenoszenie zostawiło dwie wersje plików i żadna nie została usunięta. \
+             Porównaj je i usuń zbędną; alert zniknie, gdy zostanie jedna. {lines}"
+        ),
+    ))
+}
+
+/// Raises or resolves the conflict alert from one observation of the array.
+pub fn record_conflict_alert(db: &DbPool, array: &str, conflicts: &[ElasticConflict]) -> Result<()> {
+    let key = conflict_alert_key(array);
+    match conflict_alert(conflicts) {
+        Some((title, detail)) => store::raise_alert(db, &key, "warning", "elastic-array", array, &title, &detail).map(|_| ()),
+        None => store::resolve_alert(db, &key),
+    }
 }
 
 /// The parity alert: a scrub found errors.
@@ -1191,11 +1266,84 @@ pub enum MoverTrigger {
     /// The cache fell below its minimum free space. §5.3: below the threshold
     /// the mover runs whether or not the schedule says so.
     CacheLow,
+    /// Files old enough to move are waiting on the cache and nothing restricts
+    /// moving them now. This is the ordinary cache behaviour the owner asked
+    /// for (2026-09-17): nobody has to configure or press anything.
+    FilesAged,
+    /// A mover run stopped with something unresolved (`mover_settles_unresolved`)
+    /// and nothing else is: the next run finishes or reverses what it left,
+    /// whatever the cache holds and whatever window a schedule sets, because
+    /// until it runs the array's Sync and Scrub stay refused.
+    Settle,
     /// Nothing to do — or nothing this node is allowed to conclude.
     None,
 }
 
-/// Whether the cache-pressure trigger should fire for this array right now.
+/// Automatic settling runs after which the node stops and asks an admin
+/// (A2 of the second review).
+pub const SETTLE_ATTEMPTS: u32 = 4;
+
+/// Whether the node may start a settling run now. Each failed run doubles the
+/// wait — one cooldown, then two, then four — and after `SETTLE_ATTEMPTS`
+/// failures in a row nothing more starts on its own: a coupled Sync failing on
+/// a dying disk would otherwise read the whole array every twenty minutes,
+/// for ever. A run that succeeds resets the count; so does an admin's run.
+pub fn settling_due(array: &ElasticArrayRow, clock: &MoverClock) -> bool {
+    if array.mover_failed_runs >= SETTLE_ATTEMPTS {
+        return false;
+    }
+    let wait = MOVER_RETRIGGER_COOLDOWN.saturating_mul(1 << array.mover_failed_runs.saturating_sub(1).min(8));
+    clock.idle_for(&array.name, wait)
+}
+
+/// The alert of an array whose automatic settling stopped.
+pub fn settle_alert_key(array: &str) -> String {
+    format!("elastic:{array}:settle")
+}
+
+/// Whether a switched-on schedule confines automatic moves to its slots.
+pub fn restricted_to_schedule(array: &ElasticArrayRow) -> bool {
+    array.mover.schedule_enabled && array.mover.schedule.is_some()
+}
+
+/// The age of a file at which the pace of automatic moving no longer explains
+/// it being on the cache. Never below one cooldown per multiple, so an array
+/// with no age rule (`min_age_secs = 0`) is not called stuck within minutes.
+fn automatic_move_budget_secs(array: &ElasticArrayRow) -> u64 {
+    CACHE_STUCK_AGE_MULTIPLE
+        .saturating_mul(array.mover.min_age_secs.max(MOVER_RETRIGGER_COOLDOWN.as_secs()))
+}
+
+/// How long the oldest file may wait on the cache before the stuck alert.
+///
+/// `CACHE_STUCK_AGE_MULTIPLE` age thresholds (each at least one cooldown), plus
+/// one full period of the schedule when a schedule restricts moving: under a
+/// daily window a file written just after the slot legitimately waits a day.
+pub fn cache_stuck_after_secs(array: &ElasticArrayRow) -> u64 {
+    let window = restricted_to_schedule(array)
+        .then(|| array.mover.schedule.as_ref().and_then(super::scheduler::cadence_minutes))
+        .flatten()
+        .map(|minutes| u64::try_from(minutes).unwrap_or(0).saturating_mul(60))
+        .unwrap_or(0);
+    automatic_move_budget_secs(array).saturating_add(window)
+}
+
+/// Whether the last recorded run finished having moved nothing.
+///
+/// Such a run is evidence that what the probe calls due cannot be moved right
+/// now — the data disks have no room above minfreespace, or a path collides
+/// with another branch — and those are facts the probe does not see. Starting
+/// the same run every cooldown would walk the cache, scan every process's
+/// descriptors and wake the data disks three times an hour to move nothing, so
+/// the age trigger backs off (`mover_trigger`).
+fn last_run_moved_nothing(array: &ElasticArrayRow) -> bool {
+    array
+        .mover_history
+        .first()
+        .is_some_and(|run| matches!(run.outcome.as_str(), "ok" | "partial") && run.moved_files == 0)
+}
+
+/// Whether a mover run should start for this array right now.
 ///
 /// The clock is a PARAMETER, not a wall-clock read, for the reason
 /// `targets::removal_is_due_with` takes one: the process-wide clock is shared
@@ -1205,13 +1353,14 @@ pub enum MoverTrigger {
 ///
 /// Returns `MoverTrigger::None` for every uncertainty. A mover run is a
 /// privileged job that moves files; starting one because a free-space figure
-/// could not be read would be acting on a measurement that does not exist.
+/// or the cache's age could not be read would be acting on a measurement that
+/// does not exist.
 pub fn mover_trigger(
     array: &ElasticArrayRow,
     observed: &ArrayObservation,
     clock: &MoverClock,
 ) -> MoverTrigger {
-    if !array.enabled || !array.mover.enabled {
+    if !array.enabled {
         return MoverTrigger::None;
     }
     if array.cache().next().is_none() {
@@ -1224,6 +1373,9 @@ pub fn mover_trigger(
     if !clock.cooled_down(&array.name) {
         return MoverTrigger::None;
     }
+    if array.mover_settles_unresolved {
+        return if settling_due(array, clock) { MoverTrigger::Settle } else { MoverTrigger::None };
+    }
     for branch in array.cache() {
         let probe = observed.probe(&cache_branch_path(&array.name, &branch.name));
         // Unknown free space is not low free space.
@@ -1234,19 +1386,94 @@ pub fn mover_trigger(
             return MoverTrigger::CacheLow;
         }
     }
+    let aged = observed.cache_age.is_some_and(|age| age.due_files > 0);
+    let backing_off = last_run_moved_nothing(array)
+        && !clock.idle_for(&array.name, Duration::from_secs(automatic_move_budget_secs(array)));
+    if aged && !restricted_to_schedule(array) && !backing_off {
+        return MoverTrigger::FilesAged;
+    }
     MoverTrigger::None
 }
 
-/// When each array last started an out-of-schedule mover run.
+/// What the stuck-cache alert should do after one age probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheStuckVerdict {
+    /// A file has waited past `cache_stuck_after_secs` and nothing was started
+    /// to move it.
+    Raise { title: String, detail: String },
+    /// Nothing on the cache has waited that long.
+    Clear,
+    /// A run was just started for these files; the next probe after it is the
+    /// answer, so the alert neither opens nor closes on this one.
+    Keep,
+}
+
+/// The stuck-cache alert, decided from one age probe.
+///
+/// It fires on AGE, never on the pending byte count: fresh files on the cache
+/// are the normal state of an array with a cache and must not look like a
+/// fault. It fires only when the oldest file outside pinned folders is older
+/// than `cache_stuck_after_secs` AND this pass did not start a run for it, and
+/// it clears on the first probe that finds no file that old — including an
+/// empty cache. The detail names the most likely reason, so the admin knows
+/// whether to free space, close a file, or resolve an operation.
+pub fn cache_stuck_verdict(
+    array: &ElasticArrayRow,
+    age: &ElasticCacheAge,
+    run_started: bool,
+) -> CacheStuckVerdict {
+    let limit = cache_stuck_after_secs(array);
+    let Some(oldest) = age.oldest_secs.filter(|secs| *secs >= limit) else {
+        return CacheStuckVerdict::Clear;
+    };
+    if run_started {
+        return CacheStuckVerdict::Keep;
+    }
+    let reason = if array.unresolved_operation {
+        "przenoszenie wstrzymuje nierozwiązana operacja tej macierzy"
+    } else if age.due_files == 0 {
+        "najstarsze pliki są otwarte albo przypisane do nieudanego przeniesienia, więc nie mogą zostać przeniesione"
+    } else if restricted_to_schedule(array) {
+        "przenoszenie jest ograniczone do okna harmonogramu"
+    } else if last_run_moved_nothing(array) {
+        "ostatnie przenoszenie nie zabrało z cache żadnego pliku (sprawdź jego wynik w historii zadań, np. brak miejsca na dyskach danych)"
+    } else {
+        "automatyczne przenoszenie nie mogło wystartować (sprawdź stan macierzy)"
+    };
+    CacheStuckVerdict::Raise {
+        title: format!("Pliki zbyt długo czekają na cache macierzy {}", array.name),
+        detail: format!(
+            "Najstarszy plik czeka na dysku cache {} (alarm po {}) i do przeniesienia na dyski danych nie chroni go parity: {reason}.",
+            wait_text(oldest),
+            wait_text(limit)
+        ),
+    }
+}
+
+/// A waiting time for the alert sentence, coarse on purpose: the sentence is
+/// rewritten on every probe, and minute precision would rewrite it every time.
+fn wait_text(secs: u64) -> String {
+    match secs {
+        s if s >= 2 * 86_400 => format!("{} dni", s / 86_400),
+        s if s >= 3_600 => format!("{} h", s / 3_600),
+        s => format!("{} min", s / 60),
+    }
+}
+
+/// When each array last started an automatic mover run, and when its cache was
+/// last probed for aged files.
 ///
 /// One instance per caller-supplied clock; `global()` is the process-wide one
 /// the tick uses, and a test makes its own.
 #[derive(Debug, Default)]
-pub struct MoverClock(std::sync::Mutex<BTreeMap<String, Instant>>);
+pub struct MoverClock {
+    started: std::sync::Mutex<BTreeMap<String, Instant>>,
+    probed: std::sync::Mutex<BTreeMap<String, Instant>>,
+}
 
 impl MoverClock {
     pub fn new() -> Self {
-        Self(std::sync::Mutex::new(BTreeMap::new()))
+        Self::default()
     }
 
     pub fn global() -> &'static Self {
@@ -1256,9 +1483,36 @@ impl MoverClock {
 
     /// Records that a run has just been started for this array.
     pub fn started(&self, array: &str) {
-        if let Ok(mut at) = self.0.lock() {
+        if let Ok(mut at) = self.started.lock() {
             at.insert(array.to_string(), Instant::now());
         }
+    }
+
+    /// Records that this array's cache has just been probed for aged files.
+    pub fn probed(&self, array: &str) {
+        if let Ok(mut at) = self.probed.lock() {
+            at.insert(array.to_string(), Instant::now());
+        }
+    }
+
+    /// Whether the age probe may run again: at most once per cooldown per
+    /// array. A poisoned mutex answers `false`, for the reason `cooled_down`
+    /// gives — an unknown clock must not turn the pacing off.
+    pub fn probe_due(&self, array: &str) -> bool {
+        let Ok(at) = self.probed.lock() else {
+            return false;
+        };
+        at.get(array)
+            .map(|t| t.elapsed() >= MOVER_RETRIGGER_COOLDOWN)
+            .unwrap_or(true)
+    }
+
+    /// Whether no run has started for this array within `quiet`.
+    pub fn idle_for(&self, array: &str, quiet: Duration) -> bool {
+        let Ok(at) = self.started.lock() else {
+            return false;
+        };
+        at.get(array).map(|t| t.elapsed() >= quiet).unwrap_or(true)
     }
 
     /// Whether the cooldown has expired. An array that has never run is
@@ -1275,12 +1529,7 @@ impl MoverClock {
     /// the log to connect it to the panic. Failing closed only ever delays a
     /// move the scheduled run makes anyway.
     pub fn cooled_down(&self, array: &str) -> bool {
-        let Ok(at) = self.0.lock() else {
-            return false;
-        };
-        at.get(array)
-            .map(|t| t.elapsed() >= MOVER_RETRIGGER_COOLDOWN)
-            .unwrap_or(true)
+        self.idle_for(array, MOVER_RETRIGGER_COOLDOWN)
     }
 
     /// Moves an existing mark back in time so a test can reach the far side of
@@ -1288,8 +1537,8 @@ impl MoverClock {
     /// — a version that silently created one would pass just as happily
     /// against a `started` that recorded nothing.
     #[cfg(test)]
-    fn rewind_for_test(&self, array: &str, by: Duration) {
-        let mut at = self.0.lock().expect("mover clock");
+    pub(crate) fn rewind_for_test(&self, array: &str, by: Duration) {
+        let mut at = self.started.lock().expect("mover clock");
         let mark = at
             .get_mut(array)
             .unwrap_or_else(|| panic!("{array} has no mark to rewind — `started` did not record"));
@@ -1987,15 +2236,19 @@ fn branch_to_protocol(
 
 pub(crate) fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
     let outcome = match run.phase {
-        ElasticMoverPhase::Holding | ElasticMoverPhase::Moving | ElasticMoverPhase::Syncing => "running",
-        // Stopped, and still holding the array until the same operation resumes.
+        ElasticMoverPhase::Announced | ElasticMoverPhase::Moving | ElasticMoverPhase::Syncing => "running",
+        // Stopped with something unresolved; the union keeps serving, and the
+        // next run finishes or reverses what it left.
         ElasticMoverPhase::NeedsAttention if run.finished_at.is_none() => "needs_attention",
-        // Closed by its Resume without ever finishing.
+        // Closed without finishing, by the run after it (or by the Resume of a
+        // Hold an older helper left).
         ElasticMoverPhase::NeedsAttention => "failed",
         ElasticMoverPhase::Complete
             if run.skipped_files > 0
                 || run.refused_files > 0
-                || run.issues.iter().any(|issue| issue.kind == ElasticMoverIssueKind::Attention) =>
+                || run.issues.iter().any(|issue| issue.kind == ElasticMoverIssueKind::Attention)
+                // Its Sync skipped files that changed while it ran.
+                || run.coupled_sync.as_ref().is_some_and(|sync| sync.outcome == ElasticSnapraidOutcome::Partial) =>
         {
             "partial"
         }
@@ -2081,13 +2334,15 @@ fn snapraid_kind_to_protocol(kind: &ElasticSnapraidKind) -> String {
     snapraid_kind(kind).to_string()
 }
 
-fn snapraid_outcome_to_protocol(outcome: ElasticSnapraidOutcome) -> String {
+pub(crate) fn snapraid_outcome_to_protocol(outcome: ElasticSnapraidOutcome) -> String {
     match outcome {
         ElasticSnapraidOutcome::Running => "running",
         ElasticSnapraidOutcome::Succeeded => "ok",
         ElasticSnapraidOutcome::Failed => "failed",
         ElasticSnapraidOutcome::NeedsAttention => "needs_attention",
         ElasticSnapraidOutcome::Refused => "refused",
+        ElasticSnapraidOutcome::Partial => "partial",
+        ElasticSnapraidOutcome::NothingRepaired => "nothing_repaired",
     }.to_string()
 }
 
@@ -2151,7 +2406,7 @@ pub fn to_protocol(
     };
 
     let protection = protection(array, observed);
-    let health = health_of(&protection, &data_disks, &cache_disks, &parity_disks, state.0);
+    let health = health_of(&protection, &data_disks, &cache_disks, &parity_disks, state.0, observed.conflicts.len());
 
     NasElasticArray {
         name: array.name.clone(),
@@ -2185,7 +2440,7 @@ pub fn to_protocol(
             .collect(),
         folders_known: array.folders_known,
         mover: NasMoverSettings {
-            enabled: array.mover.enabled,
+            enabled: array.mover.schedule_enabled,
             schedule: array.mover.schedule.clone(),
             min_age_secs: array.mover.min_age_secs,
             cache_min_free_pct: array.mover.cache_min_free_pct,
@@ -2220,6 +2475,8 @@ pub fn to_protocol(
         },
         protection,
         unresolved_operation: array.unresolved_operation,
+        mover_settles_unresolved: array.mover_settles_unresolved,
+        parity_run_available: array.parity_run_available,
         created_at: array.created_at.clone(),
         updated_at: array.updated_at.clone(),
     }
@@ -2273,7 +2530,10 @@ fn parity_errors_in_window(
         if finished.with_timezone(&chrono::Utc) < since {
             continue;
         }
-        let counted = [run.errors_file, run.errors_io, run.errors_data];
+        // A partial Sync's file errors are the files that changed while it ran,
+        // not damage: only its io and data counters say anything about parity.
+        let file_errors = if run.outcome == "partial" { Some(0) } else { run.errors_file };
+        let counted = [file_errors, run.errors_io, run.errors_data];
         if counted.iter().all(Option::is_none) {
             continue;
         }
@@ -2288,12 +2548,12 @@ fn parity_errors_in_window(
 ///
 /// SEPARATE from `repair_evidence` because the two answer opposite questions:
 /// this one is about whether the operation is POSSIBLE, that one about whether
-/// it is WARRANTED. A repair writes the named disk's blocks back from parity,
-/// so it needs that disk present and mounted — and a dead data disk, which is
-/// the very situation a repair is reached for, is therefore the one situation
-/// in which it cannot run at all. There is no replace-disk path in this
-/// product yet, so the honest answer is to say what has to happen first rather
-/// than to offer a button whose only possible outcome is
+/// it is WARRANTED. A repair writes back the blocks a scrub marked bad, and
+/// `maintenance_guard` requires every data disk present and mounted to do it —
+/// so a dead data disk, which is the very situation a repair is reached for, is
+/// the one situation in which it cannot run at all. Disk replacement is
+/// WITHDRAWN (round 4), so the honest answer is to say what has to happen first
+/// rather than to offer a button whose only possible outcome is
 /// `precondition_failed` from the helper's own guard.
 pub fn repair_blocker(array: &NasElasticArray) -> Option<String> {
     for member in &array.data_disks {
@@ -2315,36 +2575,84 @@ pub fn repair_blocker(array: &NasElasticArray) -> Option<String> {
     None
 }
 
-/// A parity run of this array that ended without success and that nothing has
-/// settled since — the state a scrub which found errors leaves behind.
+/// The SCRUB that marked blocks for a repair to write back, if one still
+/// stands: a `scrub` that ended without success AND counted errors, with no
+/// successful repair after it.
 ///
 /// It reads the SnapRAID HISTORY rather than `unresolved_operation`, and that
 /// difference is the point: `unresolved_operation` is equally true for a mover
 /// that stopped part-way and for an add-disk that failed, and neither is
-/// something parity can repair. Reading it here described a mover's problem as
-/// "nierozwiązana operacja parity" and offered to overwrite a data disk from
-/// parity over it.
+/// something parity can repair.
+///
+/// WHY ONLY A SCRUB, and only one that counted errors: a repair writes back
+/// the blocks snapraid has MARKED as bad in its content file, and a scrub (or a
+/// check) is what marks them. MEASURED (rig11, snapraid 13.0-1): `-e fix` with
+/// no scrub behind it reports `summary:error:0`, `exit:ok` and "Everything OK"
+/// while writing nothing at all; a failed Sync marks nothing either. Offering
+/// a repair on that evidence was offering an operation that could only do
+/// nothing and then report success.
 ///
 /// The history arrives newest first, so a successful repair seen BEFORE an
 /// unsuccessful run is one that came after it — the same rule
 /// `db::UNRESOLVED_ELASTIC_OPERATION` applies in SQL, over the same rows.
 fn unresolved_parity_run(array: &NasElasticArray) -> Option<&NasSnapraidRun> {
-    for run in &array.snapraid.history {
+    unresolved_parity_fault(&array.snapraid.history)
+}
+
+/// The same rule over the history alone, so the two callers that hold
+/// different shapes of the same rows — the protocol array the UI and the
+/// dispatch read, and the store row the scheduler holds — cannot drift apart.
+///
+/// The SCHEDULER needs it to keep an unattended Sync off an array whose scrub
+/// reported errors nothing has repaired. MEASURED on rig11 (snapraid 13.0-1,
+/// `scratchpad/f1probe/run3.sh`, cases f1-f3): a Sync does NOT cost the marked
+/// blocks their repairability — it sees an unchanged file as `equal`, writes no
+/// parity for it, and `-e fix` still recovers the block afterwards
+/// (`error_recovered:1`). What a Sync DOES finalise is the other half of what a
+/// scrub reports: files it could not read are removed from the content file
+/// (`summary:removed:1`), and after that parity holds nothing of them. That is
+/// why an unattended Sync is refused here while a manual one is not — an admin
+/// who is told can decide, the cadence cannot.
+pub fn unresolved_parity_fault(history: &[NasSnapraidRun]) -> Option<&NasSnapraidRun> {
+    for run in history {
         match (run.kind.as_str(), run.outcome.as_str()) {
             ("fix", "ok") => return None,
-            (_, "failed" | "needs_attention") => return Some(run),
+            ("scrub", "failed" | "needs_attention") if run.errors.is_some_and(|errors| errors > 0) => {
+                return Some(run)
+            }
             _ => (),
         }
     }
     None
 }
 
+/// Why the CADENCE must not start a Sync on this array, or `None` when it may.
+/// The sentence is what the schedule row records, so an admin reading the
+/// schedule sees why a slot did nothing instead of finding a silent gap.
+pub fn scheduled_sync_blocker(history: &[NasSnapraidRun]) -> Option<String> {
+    let run = unresolved_parity_fault(history)?;
+    Some(format!(
+        "pominięto: scrub zgłosił {} błędów, których nic jeszcze nie naprawiło — uruchom naprawę z parity \
+         (Sync usunąłby z content pliki, których scrub nie mógł odczytać)",
+        run.errors.unwrap_or_default()
+    ))
+}
+
+/// The alert key for a cadence slot skipped because parity errors await a
+/// repair. Its own key: the settle and cache alerts say something else, and an
+/// admin has to be able to clear this one by repairing.
+pub fn repair_alert_key(array: &str) -> String {
+    format!("elastic:{array}:repair")
+}
+
 /// What a repair would be working on, or `None` when the array reports nothing
 /// a repair could recover.
 ///
-/// `snapraid fix -d <disk>` WRITES the named disk's blocks back from the parity
-/// checkpoint, so on an array that reports nothing wrong it overwrites healthy
-/// data for no reason. The bar here is therefore evidence, not permission —
+/// A repair WRITES blocks back from the parity checkpoint. The helper runs only
+/// the two filtered forms measured not to revert users' data
+/// (`tentanas_helper::elastic::FixScope`): the blocks a Scrub marked bad on a
+/// disk in use, or the missing files of a replaced, empty disk. On an array
+/// that reports nothing wrong there is nothing for either to do. The bar here is therefore evidence, not permission —
 /// and the evidence has to be about PARITY, because parity is what the repair
 /// recovers from. An array with none of it has nothing a repair could recover,
 /// and the admin's next step is a scrub, which is what the refusal says.
@@ -2354,18 +2662,11 @@ fn unresolved_parity_run(array: &NasElasticArray) -> Option<&NasSnapraidRun> {
 /// one object is what keeps the button and the handler from disagreeing, and a
 /// button the node then refuses reads to an admin as a fault.
 pub fn repair_evidence(array: &NasElasticArray) -> Option<String> {
-    if let Some(run) = unresolved_parity_run(array) {
-        return Some(format!(
-            "przebieg {} macierzy zakończył się bez sukcesu i nic go nie rozwiązało",
-            run.kind
-        ));
-    }
-    match array.snapraid.parity_errors {
-        Some(errors) if errors > 0 => Some(format!(
-            "przebiegi SnapRAID zgłosiły {errors} błędów w oknie raportowania"
-        )),
-        _ => None,
-    }
+    let run = unresolved_parity_run(array)?;
+    Some(format!(
+        "scrub macierzy zaznaczył {} błędów i nic ich nie naprawiło",
+        run.errors.unwrap_or_default()
+    ))
 }
 
 /// The one status of the array card, with its reason.
@@ -2375,6 +2676,7 @@ fn health_of(
     cache: &[NasElasticBranch],
     parity: &[NasElasticParity],
     state: &str,
+    conflicts: usize,
 ) -> (&'static str, String) {
     if state == "unknown" {
         return ("unknown", "this node could not measure this array".to_string());
@@ -2420,6 +2722,16 @@ fn health_of(
                  next reconcile",
                 cold.join(", ")
             ),
+        );
+    }
+    // An array serving files a stuck mover record left in two versions is not
+    // healthy, whatever its parity says: one version is out of every share's
+    // sight and may be the only copy of a client's write. It is said before
+    // the parity state, which has its own panel.
+    if conflicts > 0 {
+        return (
+            "warning",
+            format!("{conflicts} plików zostało w dwóch wersjach po przerwanym przenoszeniu; szczegóły w alercie"),
         );
     }
     if protection.status == "unprotected" {
@@ -2511,7 +2823,8 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
         let mover_finished = run.finished_at.as_ref().map(|at| chrono::DateTime::parse_from_rfc3339(at)).transpose()?;
         ensure!(mover_finished.is_none_or(|finished| finished >= mover_started),
             "Mover ma odwrócony czas");
-        // A run ends at Complete, or as NeedsAttention once its Resume closed it.
+        // A run ends at Complete, or as NeedsAttention once the next run (or
+        // the Resume of an older helper's Hold) closed it.
         ensure!(matches!(run.phase, ElasticMoverPhase::Complete | ElasticMoverPhase::NeedsAttention)
             || run.finished_at.is_none(),
             "Nieukończony mover nie może mieć czasu końca");
@@ -2533,12 +2846,17 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
             ensure!(mover_finished.is_none_or(|finished| sync_finished.is_some_and(|sync_end| sync_end <= finished)),
                 "Sync kończy się poza moverem");
             if run.phase == ElasticMoverPhase::Complete {
-                ensure!(sync.outcome == ElasticSnapraidOutcome::Succeeded
-                    && sync_finished.is_some()
+                // A Sync that met files changing under it completes a run too:
+                // parity stays marked out of date and the next Sync covers them.
+                let clean = sync.outcome == ElasticSnapraidOutcome::Succeeded
                     && sync.exit_code == Some(0)
                     && sync.errors_file.is_none_or(|n| n == 0)
                     && sync.errors_io.is_none_or(|n| n == 0)
-                    && sync.errors_data.is_none_or(|n| n == 0),
+                    && sync.errors_data.is_none_or(|n| n == 0);
+                let changed_files = sync.outcome == ElasticSnapraidOutcome::Partial
+                    && partial_sync_counters(sync)
+                    && result.parity_stale;
+                ensure!(sync_finished.is_some() && (clean || changed_files),
                     "Mover ukończony bez udanego sync");
             }
         }
@@ -2568,6 +2886,15 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
     Ok(())
 }
 
+/// The counters snapraid reports for a Sync that skipped only files changing
+/// under it: exit 1, file errors, and no io or data error.
+fn partial_sync_counters(run: &tentanas_helper::elastic::ElasticSnapraidRun) -> bool {
+    run.exit_code == Some(1)
+        && run.errors_file.is_some_and(|n| n > 0)
+        && run.errors_io == Some(0)
+        && run.errors_data == Some(0)
+}
+
 pub fn validate_result(spec: &ElasticCreateSpec, result: &ElasticResult) -> Result<()> {
     validate_observation(spec, result)?;
     if result.stage == ElasticStage::Ready {
@@ -2591,7 +2918,15 @@ pub async fn claims(db: &DbPool, name: Option<&str>, explicit: Option<&Elevation
     let (out, _) = super::broker::run_privileged(db,
         &HelperCommand::ElasticClaims { name: name.map(str::to_string) }, explicit,
         Duration::from_secs(30)).await?;
-    ensure!(out.success() && out.stdout.len() < 64 * 1024, "Nie można odczytać rezerwacji roota");
+    // The helper's refusal names what stopped it — an unreadable journal, by
+    // its array id — and that sentence is the only way the admin learns which
+    // file to look at.
+    ensure!(
+        out.success() && out.stdout.len() < 64 * 1024,
+        "Nie można odczytać rezerwacji roota (kod {}): {}",
+        out.code,
+        helper_detail(&out.stderr)
+    );
     let result: ElasticClaimsResult = serde_json::from_str(&out.stdout)?;
     ensure!(name.is_none() || (result.name_claimed.is_some() && result.namespace_clear.is_some()),
         "Nie potwierdzono dostępności przestrzeni nazw");
@@ -2675,10 +3010,25 @@ fn same_hardware(disk: &NasDisk, member: &ElasticDiskSpec) -> bool {
 /// name is UNIQUE in the database and the adoption could not be written.
 pub fn import_candidates(
     entries: &[ElasticJournalEntry],
+    unreadable: &[ElasticUnreadableJournal],
     disks: &[NasDisk],
     known: &[(String, String)],
     owner: &ElasticOwner,
 ) -> Vec<NasElasticImportCandidate> {
+    // A journal the node cannot load is listed, never hidden (A7 of the second
+    // review): with its spec when that much could be read, by its file name
+    // otherwise, and always with the node's reason and nothing to adopt.
+    let reason = |array_id: &str| unreadable.iter().find(|journal| journal.array_id == array_id).map(|journal| journal.reason.clone());
+    let unlisted = unreadable
+        .iter()
+        .filter(|journal| !entries.iter().any(|entry| entry.spec.array_id == journal.array_id))
+        .map(|journal| NasElasticImportCandidate {
+            array_id: journal.array_id.clone(),
+            name: journal.array_id.clone(),
+            status: "unreadable".to_string(),
+            detail: journal.reason.clone(),
+            ..Default::default()
+        });
     entries
         .iter()
         .map(|entry| {
@@ -2763,10 +3113,11 @@ pub fn import_candidates(
                 // Unknown is not "not mounted": the helper answers `None` when
                 // it could not read the mount table at all.
                 union_mounted: entry.union_mounted.unwrap_or(false),
-                status: status.to_string(),
-                detail,
+                status: if reason(&spec.array_id).is_some() { "unreadable" } else { status }.to_string(),
+                detail: reason(&spec.array_id).unwrap_or(detail),
             }
         })
+        .chain(unlisted)
         .collect()
 }
 
@@ -2817,7 +3168,7 @@ fn helper_detail(stderr: &str) -> String {
 pub async fn journals(
     db: &DbPool,
     explicit: Option<&ElevationToken>,
-) -> Result<Vec<ElasticJournalEntry>> {
+) -> Result<ElasticJournalsResult> {
     let (out, _) = super::broker::run_privileged(
         db,
         &HelperCommand::ElasticJournals {},
@@ -2838,7 +3189,7 @@ pub async fn journals(
     for entry in &result.arrays {
         entry.spec.validate()?;
     }
-    Ok(result.arrays)
+    Ok(result)
 }
 
 /// One scan, as the dialog reads it: the journals, this node's live disk
@@ -2848,10 +3199,10 @@ pub async fn import_scan(
     owner: &ElasticOwner,
     explicit: Option<&ElevationToken>,
 ) -> Result<Vec<NasElasticImportCandidate>> {
-    let entries = journals(db, explicit).await?;
+    let journals = journals(db, explicit).await?;
     super::disks::refresh_inventory(db).await?;
     let known = store::elastic_array_identities(db)?;
-    Ok(import_candidates(&entries, &super::disks::snapshot().0, &known, owner))
+    Ok(import_candidates(&journals.arrays, &journals.unreadable, &super::disks::snapshot().0, &known, owner))
 }
 
 /// Adopts one scanned array. Verifies again on its own measurement, re-owns
@@ -2926,8 +3277,11 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
         Err(error) => {
             let detail = format!("{error}; utrata odpowiedzi nie dowodzi zatrzymania I/O");
             store::finish_elastic_operation(h.db(), &spec.owner, &operation_id, Err(&detail))?;
-            store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec.name,
-                "Niepotwierdzony wynik macierzy", &detail)?;
+            // Refused as busy, nothing ran: no alert, and the caller asks again.
+            if !error.to_string().contains(tentanas_helper::elastic::ELASTIC_BUSY) {
+                store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec.name,
+                    "Niepotwierdzony wynik macierzy", &detail)?;
+            }
             Err(error)
         }
     }
@@ -3118,11 +3472,38 @@ pub fn validate_snapraid_result(
                 );
             }
         }
+        // A Sync that ran with the share writable and skipped the files that
+        // changed under it. The array serves on with parity marked out of date,
+        // and the checkpoint stays where the last complete Sync put it.
+        ElasticSnapraidOutcome::Partial => {
+            ensure!(
+                *kind == ElasticSnapraidKind::Sync
+                    && result.state.stage == ElasticStage::Ready
+                    && result.state.last_run.as_ref() == Some(run)
+                    && partial_sync_counters(run)
+                    && result.state.parity_stale
+                    && result.state.sync_completed_at != run.finished_at,
+                "Niepotwierdzony częściowy sync"
+            );
+        }
         ElasticSnapraidOutcome::Failed | ElasticSnapraidOutcome::NeedsAttention => {
             ensure!(
                 result.state.stage == ElasticStage::NeedsAttention
                     && result.state.last_run.as_ref() == Some(run),
                 "Błąd SnapRAID nie zachował nieukończonej operacji"
+            );
+        }
+        // A repair that ran to its end and wrote NOTHING. It is only ever a
+        // repair, it reports what it found, and the array is exactly as it was
+        // — which is what keeps the fault it was started for in place.
+        ElasticSnapraidOutcome::NothingRepaired => {
+            ensure!(
+                repairing
+                    && result.state.last_run.as_ref() == Some(run)
+                    && run.exit_code == Some(0)
+                    && run.detail.as_ref().is_some_and(|detail| !detail.is_empty())
+                    && result.state.sync_completed_at.as_ref() != run.finished_at.as_ref(),
+                "Niepotwierdzona naprawa bez efektu"
             );
         }
         ElasticSnapraidOutcome::Running => {
@@ -3148,7 +3529,7 @@ async fn execute_snapraid_job(
     validate_snapraid_result(spec, operation_id, kind, &result)?;
     store::record_snapraid_result(h.db(), &spec.owner, operation_id, &result)?;
     ensure!(
-        result.run.outcome == ElasticSnapraidOutcome::Succeeded,
+        matches!(result.run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial),
         "{}",
         result
             .run
@@ -3192,9 +3573,14 @@ pub fn validate_mover_result(
     result: &ElasticMoverResult,
 ) -> Result<()> {
     // A completed run leaves the array serving, so it is held to the full
-    // `Ready` contract; one that stopped part-way is only an observation.
+    // `Ready` contract — which is what proves no Hold stands and the union is
+    // read-write; one that stopped part-way is only an observation.
     if result.run.phase == ElasticMoverPhase::Complete {
         validate_result(spec, &result.state)?;
+        ensure!(
+            result.state.stage == ElasticStage::Ready,
+            "Ukończony mover bez macierzy gotowej do pracy"
+        );
     } else {
         validate_observation(spec, &result.state)?;
     }
@@ -3212,8 +3598,9 @@ pub fn validate_mover_result(
         run.detail.as_ref().is_none_or(|d| d.len() < 8192),
         "Zbyt długi opis wyniku movera"
     );
-    // A terminal answer is Complete, or NeedsAttention closed by its Resume.
-    // Anything still moving is the helper failing to deliver a verdict.
+    // A terminal answer is Complete, or NeedsAttention: closed, or left for the
+    // next run with something unresolved. Anything still moving is the helper
+    // failing to deliver a verdict.
     ensure!(
         matches!(run.phase, ElasticMoverPhase::Complete | ElasticMoverPhase::NeedsAttention),
         "Helper nie dostarczył terminalnego wyniku movera"
@@ -3235,6 +3622,9 @@ async fn execute_mover_job(
     let result: ElasticMoverResult = serde_json::from_str(&output.stdout)?;
     validate_mover_result(spec, operation_id, &result)?;
     store::record_mover_result(h.db(), &spec.owner, operation_id, &result)?;
+    if let Err(error) = record_conflict_alert(h.db(), &spec.name, &result.state.conflicts) {
+        tracing::warn!("tentanas mover: conflict alert of {} not recorded: {error}", spec.name);
+    }
     ensure!(
         result.run.phase == ElasticMoverPhase::Complete,
         "{}",
@@ -3257,9 +3647,8 @@ pub fn spawn_mover(
     let operation_id = uuid::Uuid::now_v7().to_string();
     // A SECOND reservation, distinct from the run's own and from Create: the
     // helper refuses a command whose resume repeats its operation, and
-    // `validate_observation` refuses such an answer. Reserving it up front is
-    // what lets a run that stops part-way be closed later without inventing
-    // an identifier nothing agreed on.
+    // `validate_observation` refuses such an answer. The helper records it
+    // with the run; a restart of the same operation must carry it.
     let resume_operation_id = uuid::Uuid::now_v7().to_string();
     let rules = array.mover_rules();
     let coupled_sync = array.mover.coupled_sync;
@@ -3287,6 +3676,9 @@ pub fn spawn_mover(
                 &rules,
                 coupled_sync,
             );
+            // A Hold an older helper's mover left is released by the helper
+            // itself before it moves anything; the result is then held to the
+            // `Ready` contract, which proves the union serves read-write.
             let run = jobs::run_step(
                 &h,
                 &command,
@@ -3349,6 +3741,258 @@ pub fn spec_with_added_disk(
     after.data.push(disk.clone());
     after.validate()?;
     Ok(after)
+}
+
+/// The array one slot's disk replaced by another produces, validated as a
+/// whole. It is the same shape `spec_with_added_disk` has, and for the same
+/// reason: the rules that matter — identity uniqueness, the device ceiling,
+/// the sizes — are rules about the ARRAY, not about the disk.
+pub fn spec_with_replaced_disk(
+    spec: &ElasticCreateSpec,
+    branch: &str,
+    disk: &ElasticDiskSpec,
+) -> Result<ElasticCreateSpec> {
+    tentanas_helper::elastic::validate_data_branch_name(branch)?;
+    let slot = spec
+        .data
+        .iter()
+        .enumerate()
+        .position(|(index, _)| tentanas_helper::elastic::data_branch_name(index + 1) == branch)
+        .ok_or_else(|| anyhow!("Macierz nie ma dysku danych '{branch}'"))?;
+    let old = &spec.data[slot];
+    ensure!(
+        disk.bytes >= old.bytes,
+        "Dysk zamienny jest mniejszy niż slot '{branch}' ({} < {})",
+        disk.bytes,
+        old.bytes
+    );
+    if let Some(parity) = spec.parity.iter().map(|parity| parity.bytes).min() {
+        ensure!(
+            disk.bytes <= parity,
+            "Dysk zamienny jest większy niż parity macierzy; parity nie pokryłaby go w całości"
+        );
+    }
+    let mut after = spec.clone();
+    after.data[slot] = disk.clone();
+    after.validate()?;
+    Ok(after)
+}
+
+pub fn replace_disk_command(
+    owner: &ElasticOwner,
+    array_id: &str,
+    operation_id: &str,
+    rebuild_operation_id: &str,
+    sync_operation_id: &str,
+    branch: &str,
+    disk: &ElasticDiskSpec,
+    accept_stale_parity: bool,
+) -> HelperCommand {
+    HelperCommand::ElasticReplaceDisk {
+        owner: owner.clone(),
+        array_id: array_id.into(),
+        operation_id: operation_id.into(),
+        rebuild_operation_id: rebuild_operation_id.into(),
+        sync_operation_id: sync_operation_id.into(),
+        branch: branch.into(),
+        disk: disk.clone(),
+        accept_stale_parity,
+    }
+}
+
+/// What the helper must have done for a replacement to count: the array serves
+/// again with the NEW disk in that slot, the rebuild wrote blocks back, and the
+/// Sync that followed recorded them.
+pub fn validate_replace_result(
+    spec_after: &ElasticCreateSpec,
+    branch: &str,
+    disk: &ElasticDiskSpec,
+    operation_ids: (&str, &str),
+    result: &tentanas_helper::elastic::ElasticReplaceResult,
+) -> Result<()> {
+    ensure!(
+        result.branch == branch && result.disk == *disk,
+        "Wymiana dotyczy innego slotu lub dysku"
+    );
+    validate_result(spec_after, &result.state)?;
+    let (rebuild_id, sync_id) = operation_ids;
+    let rebuild_kind = ElasticSnapraidKind::Fix { disk: branch.to_string() };
+    ensure!(
+        result.rebuild.operation_id == rebuild_id && result.rebuild.kind == rebuild_kind,
+        "Obca operacja odbudowy"
+    );
+    ensure!(
+        result.sync.operation_id == sync_id && result.sync.kind == ElasticSnapraidKind::Sync,
+        "Obca operacja sync po odbudowie"
+    );
+    // The rebuild WROTE the disk back: a run that recovered nothing is not a
+    // rebuild, and the helper reports that as its own outcome.
+    ensure!(
+        result.rebuild.outcome == ElasticSnapraidOutcome::Succeeded,
+        "Odbudowa dysku nie zakończyła się sukcesem"
+    );
+    ensure!(
+        matches!(result.sync.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial),
+        "Sync po odbudowie nie zakończył się sukcesem"
+    );
+    // The array's own state has to agree that the Sync is the last one it ran.
+    ensure!(
+        result.state.last_run.as_ref() == Some(&result.sync),
+        "Stan macierzy nie potwierdza sync po odbudowie"
+    );
+    Ok(())
+}
+
+/// Why a REPLACEMENT is pointless on this slot, or `None` when it is the
+/// operation the slot needs. It reads the OBSERVED array, like
+/// `repair_blocker`, because presence is a measurement and not a database
+/// column — and it answers only when there IS a measurement: an array whose
+/// disk is gone often cannot be inspected at all after a boot, and that
+/// silence must not be read as "the disk is fine".
+pub fn replacement_blocker(array: &NasElasticArray, branch: &str) -> Option<String> {
+    let slot = array.data_disks.iter().find(|member| member.name == branch)?;
+    if slot.device_present == Some(true) && slot.health != "failing" {
+        return Some(format!(
+            "dysk '{branch}' jest obecny na tym węźle i nie zgłasza awarii: jeśli ma błędy, \
+             użyj naprawy z parity, a wymianę uruchom po jego odłączeniu"
+        ));
+    }
+    None
+}
+
+/// DORMANT: disk replacement is withdrawn (round 4, the owner's decision) and
+/// nothing calls this. `dispatch::tentanas::elastic_replace_disk` refuses the
+/// request before any write, `db::insert_job` refuses the intent so no
+/// `replace_disk` operation can be opened, and the helper's `actions::run`
+/// refuses the command. The helper-side banner on
+/// `tentanas_helper::elastic::execution::replace_data_disk` lists what the task
+/// that finishes the feature still has to solve.
+pub fn spawn_replace_disk(
+    db: &DbPool,
+    array: &ElasticArrayRow,
+    started_by: &str,
+    explicit: Option<Arc<ElevationToken>>,
+    branch: String,
+    disk: ElasticDiskSpec,
+    accept_stale_parity: bool,
+) -> Result<tentaflow_protocol::tentanas::NasJob> {
+    let spec_before = array.persisted_spec()?.clone();
+    let spec_after = spec_with_replaced_disk(&spec_before, &branch, &disk)?;
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    // The two SnapRAID runs the flow records get their reservations here, so
+    // the request row names every operation the helper will write.
+    let rebuild_operation_id = uuid::Uuid::now_v7().to_string();
+    let sync_operation_id = uuid::Uuid::now_v7().to_string();
+    let intent = jobs::ElasticJobIntent::ReplaceDisk {
+        owner: spec_after.owner.clone(),
+        array_id: spec_after.array_id.clone(),
+        operation_id: operation_id.clone(),
+        rebuild_operation_id: rebuild_operation_id.clone(),
+        sync_operation_id: sync_operation_id.clone(),
+        branch: branch.clone(),
+        disk: disk.clone(),
+        accept_stale_parity,
+    };
+    jobs::spawn(
+        db,
+        "elastic_replace_disk",
+        &array.name,
+        started_by,
+        Some(intent),
+        None,
+        move |h| async move {
+            let command = replace_disk_command(
+                &spec_after.owner,
+                &spec_after.array_id,
+                &operation_id,
+                &rebuild_operation_id,
+                &sync_operation_id,
+                &branch,
+                &disk,
+                accept_stale_parity,
+            );
+            // A rebuild reads every other disk of the array and writes a whole
+            // disk: it takes as long as the array is large, so it gets the same
+            // day-long ceiling the other Elastic operations have.
+            let run = jobs::run_step(&h, &command, explicit.as_deref(), Duration::from_secs(24 * 60 * 60));
+            execute_replace_disk_job(
+                &h,
+                &spec_before,
+                &spec_after,
+                &operation_id,
+                (&rebuild_operation_id, &sync_operation_id),
+                &branch,
+                &disk,
+                run,
+            )
+            .await
+        },
+    )
+}
+
+async fn execute_replace_disk_job(
+    h: &jobs::JobHandle,
+    spec_before: &ElasticCreateSpec,
+    spec_after: &ElasticCreateSpec,
+    operation_id: &str,
+    snapraid_ids: (&str, &str),
+    branch: &str,
+    disk: &ElasticDiskSpec,
+    run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
+) -> Result<()> {
+    let key = format!("elastic:{}:replace-disk", spec_after.array_id);
+    let result = async {
+        let out = run.await?;
+        ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
+        ensure!(out.stdout.len() < 256 * 1024, "Odpowiedź Elastic przekracza limit");
+        let result: tentanas_helper::elastic::ElasticReplaceResult = serde_json::from_str(&out.stdout)?;
+        validate_replace_result(spec_after, branch, disk, snapraid_ids, &result)?;
+        Ok::<_, anyhow::Error>(result)
+    }
+    .await;
+    let outcome = match result {
+        Ok(result) => store::finish_elastic_replace_disk(
+            h.db(),
+            &spec_after.owner,
+            operation_id,
+            branch,
+            disk,
+            &result.state,
+        )
+        .map(|()| result),
+        Err(error) => Err(error),
+    };
+    match outcome {
+        Ok(result) => {
+            store::resolve_alert(h.db(), &key)?;
+            h.log(format!(
+                "odbudowano {branch}: {}",
+                result.rebuild.detail.as_deref().unwrap_or("bez opisu")
+            ));
+            h.progress(100);
+            Ok(())
+        }
+        Err(error) => {
+            // The JOURNAL, not this row, is what a repeat resumes from: the
+            // helper swapped the slot's identity before it formatted anything,
+            // so this operation is closed as needing attention and the same
+            // command may be asked again with the SAME identity — which the
+            // request row above is what records.
+            let _ = spec_before;
+            let detail = format!("{error}; wymiana dysku nie została potwierdzona");
+            store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
+            store::raise_alert(
+                h.db(),
+                &key,
+                "warning",
+                "elastic-array",
+                &spec_after.name,
+                "Niepotwierdzona wymiana dysku",
+                &detail,
+            )?;
+            Err(error)
+        }
+    }
 }
 
 /// Members a persisted intention describes, across every role.
@@ -3559,6 +4203,16 @@ pub async fn create_job(h: jobs::JobHandle, spec: ElasticCreateSpec,
     execute_job(&h, spec.clone(), spec.operation_id.clone(), run).await
 }
 
+/// The ONE command a restore job sends. After a reboot the helper answers a
+/// private array nothing but a Restore or a Resume
+/// (`tentanas_helper::elastic::runs_after_a_boot`), so a restore job that sent
+/// anything first — an Inspect to look before it acts — would fail on every
+/// array at every startup. A Hold an older helper's mover left is released by
+/// the helper's Restore itself.
+pub fn restore_command(spec: &ElasticCreateSpec) -> HelperCommand {
+    HelperCommand::ElasticRestore { array_id: spec.array_id.clone(), owner: spec.owner.clone() }
+}
+
 pub fn spawn_restore(db: &DbPool, array: &ElasticArrayRow, started_by: &str,
     explicit: Option<Arc<ElevationToken>>,
     completion: Option<tokio::sync::oneshot::Sender<Result<()>>>) -> Result<tentaflow_protocol::tentanas::NasJob> {
@@ -3567,7 +4221,7 @@ pub fn spawn_restore(db: &DbPool, array: &ElasticArrayRow, started_by: &str,
     let intent = jobs::ElasticJobIntent::Restore { owner: spec.owner.clone(),
         array_id: spec.array_id.clone(), operation_id: operation_id.clone() };
     jobs::spawn(db,"elastic_restore",&array.name,started_by,Some(intent),completion,move |h| async move {
-        let command = HelperCommand::ElasticRestore { array_id: spec.array_id.clone(),owner:spec.owner.clone() };
+        let command = restore_command(&spec);
         let run = jobs::run_step(&h,&command,explicit.as_deref(),Duration::from_secs(24 * 60 * 60));
         execute_job(&h,spec,operation_id,run).await
     })
@@ -3581,6 +4235,29 @@ async fn observe_array(db: &DbPool, array: &ElasticArrayRow) -> Result<ElasticRe
     let result: ElasticResult = serde_json::from_str(&out.stdout)?;
     validate_observation(spec,&result)?;
     Ok(result)
+}
+
+/// What a mover run would find on this array's cache right now, measured by the
+/// helper without moving anything, under the rules a run would use.
+///
+/// Expensive by construction — a root walk of the whole cache and of every
+/// process's descriptors — which is why the scheduler calls it at most once per
+/// `MOVER_RETRIGGER_COOLDOWN` per array and never while an operation runs.
+pub async fn observe_cache_age(db: &DbPool, array: &ElasticArrayRow) -> Result<ElasticCacheAge> {
+    let spec = array.persisted_spec()?;
+    let command = HelperCommand::ElasticCacheAge {
+        array_id: spec.array_id.clone(),
+        owner: spec.owner.clone(),
+        rules: array.mover_rules(),
+    };
+    let (out, _) =
+        super::broker::run_privileged(db, &command, None, Duration::from_secs(10 * 60)).await?;
+    ensure!(
+        out.success() && out.stdout.len() < 4 * 1024,
+        "Nie można zmierzyć plików czekających na cache (kod {})",
+        out.code
+    );
+    Ok(serde_json::from_str(&out.stdout)?)
 }
 
 /// Just the branch measurements of one array, for the scheduler's
@@ -3597,6 +4274,7 @@ pub async fn observe_cache(db: &DbPool, array: &ElasticArrayRow) -> Result<Array
         mount_table_known: result.union_mounted.is_some()
             && result.disks.iter().all(|d| d.mounted.is_some()),
         union_mounted: result.union_mounted,
+        conflicts: result.conflicts,
         ..Default::default()
     };
     observed.record_disks(&array.name, result.disks);
@@ -3624,6 +4302,7 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             // wire advertises — see `parity_errors_in_window`.
             observed.parity_errors = parity_errors_in_window(array, chrono::Utc::now());
             observed.last_mover = result.last_mover.clone();
+            observed.conflicts = result.conflicts.clone();
             root_stage = Some(result.stage);
             failure = result.detail.or_else(|| {
                 if result.stage == ElasticStage::Ready
@@ -3698,7 +4377,86 @@ pub async fn get(db: &DbPool, owner: &ElasticOwner, name: &str) -> Result<Option
     Ok(list(db,owner).await?.into_iter().find(|a| a.name == name))
 }
 
-async fn restore_startup_rows<F>(rows: &[ElasticArrayRow], mut start: F) -> Result<()>
+async fn restore_startup_rows<F>(rows: &[ElasticArrayRow], start: F) -> Result<()>
+where
+    F: FnMut(
+        &ElasticArrayRow,
+        tokio::sync::oneshot::Sender<Result<()>>,
+    ) -> Result<tentaflow_protocol::tentanas::NasJob>,
+{
+    restore_startup_rows_waiting(rows, STARTUP_BUSY_WAIT, STARTUP_RESTORE_WAIT, start).await
+}
+
+/// How many times a startup Restore the helper refused as busy is asked again,
+/// and how long it waits before each. Something else held the node lock for a
+/// moment — a UI read, another owner's command — and nothing ran.
+const STARTUP_BUSY_ATTEMPTS: u32 = 6;
+const STARTUP_BUSY_WAIT: Duration = Duration::from_secs(10);
+
+/// How long the queue waits for ONE array's Restore before it gives up on it
+/// and attempts the next (W-C of the third review). A Restore mounts the
+/// branches, starts mergerfs and settles at most one file record; it does not
+/// sync. A job that has not answered in this long is not going to, and the
+/// whole node's Sync, Scrub and mover passes are waiting behind it.
+const STARTUP_RESTORE_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// The longest the scheduler's Elastic passes wait for the startup queue. Past
+/// it they run anyway: a queue this old is stuck on one array, and the cache of
+/// every other array still has to be drained.
+const STARTUP_GATE_MAX: Duration = Duration::from_secs(20 * 60);
+
+/// Startup restore queues still running in this process, and when the oldest
+/// of them began.
+static STARTUP_RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STARTUP_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Whether a startup restore queue is still running. The scheduler's Elastic
+/// passes wait for it (A1 of the second review) — but never longer than
+/// `STARTUP_GATE_MAX`, because a queue stuck on one array must not stop every
+/// other array's Sync, Scrub and mover (W-C of the third review).
+pub fn startup_restores_pending() -> bool {
+    startup_restores_pending_for(STARTUP_GATE_MAX)
+}
+
+/// The same, with the bound as a parameter: a test cannot wind the clock.
+pub fn startup_restores_pending_for(max: Duration) -> bool {
+    if STARTUP_RESTORES.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return false;
+    }
+    STARTUP_SINCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some_and(|since| since.elapsed() < max)
+}
+
+/// Held for as long as one startup restore queue runs, panic included.
+pub(crate) struct StartupRestores;
+
+impl StartupRestores {
+    pub(crate) fn begin() -> Self {
+        let mut since = STARTUP_SINCE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if STARTUP_RESTORES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            *since = Some(Instant::now());
+        }
+        StartupRestores
+    }
+}
+
+impl Drop for StartupRestores {
+    fn drop(&mut self) {
+        let mut since = STARTUP_SINCE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if STARTUP_RESTORES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            *since = None;
+        }
+    }
+}
+
+async fn restore_startup_rows_waiting<F>(
+    rows: &[ElasticArrayRow],
+    busy_wait: Duration,
+    restore_wait: Duration,
+    mut start: F,
+) -> Result<()>
 where
     F: FnMut(
         &ElasticArrayRow,
@@ -3707,14 +4465,85 @@ where
 {
     static STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _startup = STARTUP.lock().await;
+    // Every array is attempted: one array that cannot come back — refused,
+    // failed, its job not accepted — must not keep every array after it down.
+    // Each failure is already recorded on its own job and alert; this collects
+    // them. Only a completion that never arrives stops the queue: the job's end
+    // is then unknown, and its helper may still hold the node lock the next
+    // restore needs.
+    let mut failures = Vec::new();
     for row in rows {
+      let mut attempt = 1;
+      loop {
         let (completion, finished) = tokio::sync::oneshot::channel();
-        start(row, completion)?;
-        finished
-            .await
-            .map_err(|_| anyhow::anyhow!("Brak potwierdzenia zakończenia przywracania"))??;
+        if let Err(error) = start(row, completion) {
+            tracing::warn!("tentanas Elastic startup: {}: {error}", row.name);
+            failures.push(format!("{}: {error}", row.name));
+            break;
+        }
+        // BOUNDED (W-C): a job that never answers is one array's failure, not
+        // the node's. Its helper may still hold the node lock, so the arrays
+        // after it meet a busy refusal — which is retried above.
+        let answer = match tokio::time::timeout(restore_wait, finished).await {
+            Ok(answer) => answer,
+            Err(_) => {
+                let text = format!("{}: przywracanie nie odpowiedziało w czasie {restore_wait:?}", row.name);
+                tracing::warn!("tentanas Elastic startup: {text}");
+                failures.push(text);
+                break;
+            }
+        };
+        match answer {
+            Ok(Ok(())) => {}
+            // Refused as busy: nothing ran. It is asked again, a few times, so
+            // one lock collision does not leave the array unrestored.
+            Ok(Err(error))
+                if error.to_string().contains(tentanas_helper::elastic::ELASTIC_BUSY)
+                    && attempt < STARTUP_BUSY_ATTEMPTS =>
+            {
+                tracing::info!("tentanas Elastic startup: {}: helper busy, attempt {attempt}", row.name);
+                attempt += 1;
+                tokio::time::sleep(busy_wait).await;
+                continue;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("tentanas Elastic startup: {}: {error}", row.name);
+                failures.push(format!("{}: {error}", row.name));
+            }
+            Err(_) => {
+                failures.push(format!("{}: Brak potwierdzenia zakończenia przywracania", row.name));
+                return Err(anyhow::anyhow!(failures.join("; ")));
+            }
+        }
+        break;
+      }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(failures.join("; ")))
+    }
+}
+
+/// The startup queue's order. A4 of the second review: share configs are
+/// written once after the arrays are back — a share's state reads whether its
+/// union is mounted — whatever the restores ended with, and while the queue
+/// still holds the scheduler's Elastic passes, so a share an older core
+/// generated gains the veto that keeps the mover's temporary and quarantined
+/// files out of SMB clients' reach before anything moves.
+async fn restore_then_rewrite_shares<A, F>(
+    restore: impl std::future::Future<Output = Result<()>>,
+    rewrite: A,
+) -> Result<()>
+where
+    A: FnOnce() -> F,
+    F: std::future::Future<Output = Result<Vec<String>>>,
+{
+    let restored = restore.await;
+    if let Err(error) = rewrite().await {
+        tracing::warn!("tentanas Elastic startup: share configs not rewritten: {error}");
+    }
+    restored
 }
 
 pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
@@ -3723,19 +4552,26 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
     let starting = STARTING.get_or_init(|| Mutex::new(BTreeSet::new()));
     let key = (owner.org_id.clone(),owner.addon_id.clone());
     if !starting.lock().unwrap_or_else(|p| p.into_inner()).insert(key.clone()) { return; }
+    // Taken HERE, before the task is spawned: the scheduler's first tick may
+    // run on another thread the moment it is, and it must already wait.
+    let pending = StartupRestores::begin();
     runtime.spawn(async move {
+        let _pending = pending;
         let outcome = async {
             if !super::instance_should_run(&main_db,&db) { return Ok(()); }
             let rows = store::elastic_arrays(&db,&owner)?;
             let status = super::elevation::status(&db).await;
             let allowed = status.mode == "helper" && status.helper_state == "ok" && status.core_compatible;
             if allowed {
-                return restore_startup_rows(&rows, |row, completion| {
-                    if !super::instance_should_run(&main_db,&db) {
-                        anyhow::bail!("Instancja nie jest aktywna; przywracanie zatrzymane");
-                    }
-                    spawn_restore(&db,row,"startup",None,Some(completion))
-                }).await;
+                return restore_then_rewrite_shares(
+                    restore_startup_rows(&rows, |row, completion| {
+                        if !super::instance_should_run(&main_db,&db) {
+                            anyhow::bail!("Instancja nie jest aktywna; przywracanie zatrzymane");
+                        }
+                        spawn_restore(&db,row,"startup",None,Some(completion))
+                    }),
+                    || super::shares::apply(&db, &main_db, &owner.addon_id, None, super::shares::ApplyTrigger::Startup),
+                ).await;
             }
             for row in rows {
                 let spec = row.persisted_spec()?;
@@ -3781,6 +4617,9 @@ pub(crate) mod tests {
             outcome: outcome.into(),
             started_at: "2026-09-08T01:00:00Z".into(),
             finished_at: Some("2026-09-08T01:10:00Z".into()),
+            // A scrub that ended without success and counted errors is what
+            // marks blocks for a repair to write back.
+            errors: (kind == "scrub" && matches!(outcome, "failed" | "needs_attention")).then_some(7),
             ..Default::default()
         }
     }
@@ -3812,26 +4651,46 @@ pub(crate) mod tests {
             let mut hurt = observed_array();
             hurt.snapraid.history = vec![parity_run("scrub", outcome)];
             assert!(
-                repair_evidence(&hurt).is_some_and(|why| why.contains("scrub")),
+                repair_evidence(&hurt).is_some_and(|why| why.contains("scrub") && why.contains('7')),
                 "{outcome}: {:?}",
                 repair_evidence(&hurt)
             );
         }
-        // So are recorded parity errors.
+        // ONLY A SCRUB THAT COUNTED ERRORS. A repair writes back the blocks
+        // snapraid MARKED as bad, and a scrub is what marks them: measured on
+        // rig11, `-e fix` with no scrub behind it writes nothing at all and
+        // still reports "Everything OK". So neither a failed Sync, nor a
+        // scrub that counted no errors, nor a parity-error figure from the
+        // reporting window arms a repair.
+        let mut failed_sync = observed_array();
+        failed_sync.snapraid.history = vec![parity_run("sync", "failed")];
+        assert_eq!(repair_evidence(&failed_sync), None, "a failed sync marks no blocks");
+        let mut uncounted = observed_array();
+        uncounted.snapraid.history = vec![tentaflow_protocol::tentanas::NasSnapraidRun {
+            errors: Some(0),
+            ..parity_run("scrub", "failed")
+        }];
+        assert_eq!(repair_evidence(&uncounted), None, "a scrub that found nothing marks nothing");
         let mut counted = observed_array();
         counted.snapraid.parity_errors = Some(4);
-        assert!(repair_evidence(&counted).is_some_and(|why| why.contains('4')));
-        let mut clean = observed_array();
-        clean.snapraid.parity_errors = Some(0);
-        assert_eq!(repair_evidence(&clean), None);
+        assert_eq!(
+            repair_evidence(&counted),
+            None,
+            "the reporting window's figure is not a mark in the content file"
+        );
 
         // A run that was merely REFUSED is not a fault, and neither is one
         // still going.
-        for outcome in ["refused", "running", "ok"] {
+        for outcome in ["refused", "running", "ok", "nothing_repaired"] {
             let mut other = observed_array();
             other.snapraid.history = vec![parity_run("scrub", outcome)];
             assert_eq!(repair_evidence(&other), None, "{outcome}");
         }
+        // A repair that wrote NOTHING settles nothing: the scrub's marks stand
+        // and the repair is still what the array needs.
+        let mut nothing = observed_array();
+        nothing.snapraid.history = vec![parity_run("fix", "nothing_repaired"), parity_run("scrub", "failed")];
+        assert!(repair_evidence(&nothing).is_some(), "a repair that did nothing did not settle the scrub");
 
         // The history arrives NEWEST FIRST, so a successful repair above an
         // unsuccessful run is one that came after it and settled it — the rule
@@ -3846,6 +4705,243 @@ pub(crate) mod tests {
             parity_run("scrub", "failed"),
         ];
         assert!(repair_evidence(&hurt_again).is_some(), "a newer fault stands again");
+    }
+
+    /// DL1 of the third review: a repair that recovered NOTHING must not read
+    /// as a success. snapraid reports such a run "Everything OK" with exit 0
+    /// (measured on rig11: `-e fix` with no scrub behind it), so the product
+    /// has to judge it by its counters — and then leave the array, its state
+    /// and the fault that armed the repair exactly as they were, WITHOUT
+    /// turning the repair itself into an unresolved operation that only a
+    /// successful repair could clear.
+    #[tokio::test]
+    async fn a_repair_that_wrote_nothing_is_not_a_success_and_settles_nothing() {
+        let spec = mover_spec("nothing-repaired");
+        let db = settled_database(&spec);
+        // The state a scrub that found errors leaves: the array needs
+        // attention and its operation is unresolved.
+        let scrub_id = uuid::Uuid::now_v7().to_string();
+        let scrub = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_scrub".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &db,
+            &scrub,
+            Some(&jobs::ElasticJobIntent::Snapraid {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: scrub_id.clone(),
+                kind: ElasticSnapraidKind::Scrub,
+            }),
+        )
+        .unwrap();
+        store::record_snapraid_result(
+            &db,
+            &spec.owner,
+            &scrub_id,
+            &snapraid_result(&spec, &scrub_id, ElasticSnapraidKind::Scrub, ElasticSnapraidOutcome::Failed),
+        )
+        .unwrap();
+        store::finish_job(&db, &scrub.job_id, "failed", Some("data_error")).unwrap();
+        let hurt = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(hurt.state, "needs_attention");
+        assert!(hurt.unresolved_operation);
+
+        // THE REPAIR RUNS AND WRITES NOTHING.
+        let repair_id = uuid::Uuid::now_v7().to_string();
+        let kind = ElasticSnapraidKind::Fix { disk: "d1".into() };
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_fix".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &db,
+            &job,
+            Some(&jobs::ElasticJobIntent::Snapraid {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: repair_id.clone(),
+                kind: kind.clone(),
+            }),
+        )
+        .unwrap();
+        let mut result = snapraid_result(&spec, &repair_id, kind.clone(), ElasticSnapraidOutcome::Failed);
+        result.run.outcome = ElasticSnapraidOutcome::NothingRepaired;
+        result.run.exit_code = Some(0);
+        result.run.detail = Some("nic nie naprawiono: parity nie ma zaznaczonych błędów".into());
+        // The array is exactly as the scrub left it — that is the point.
+        result.state.stage = ElasticStage::NeedsAttention;
+        result.state.detail = Some("scrub zgłosił błędy danych".into());
+        result.state.last_run = Some(result.run.clone());
+        validate_snapraid_result(&spec, &repair_id, &kind, &result).expect("a recorded run with nothing done");
+        store::record_snapraid_result(&db, &spec.owner, &repair_id, &result).unwrap();
+        store::finish_job(&db, &job.job_id, "failed", None).unwrap();
+
+        let after = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        // NOT a success, and the scrub's fault still holds the array.
+        assert_eq!(after.state, "needs_attention");
+        assert!(after.unresolved_operation, "the scrub that found the errors still stands");
+        let repair_state: String = db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM nas_elastic_operations WHERE operation_id=?1",
+                [&repair_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(repair_state, "failed", "and the repair is not itself an unresolved operation");
+        assert_eq!(after.snapraid_history[0].outcome, "nothing_repaired");
+        // The repair is still the way forward: the scrub's marks are what a
+        // repair writes back, and nothing has written them.
+        let wire = to_protocol(
+            &after,
+            &BTreeMap::new(),
+            &ArrayObservation::default(),
+            true,
+            "13.0",
+            ("needs_attention", ""),
+        );
+        assert!(repair_evidence(&wire).is_some(), "the repair is still offered");
+    }
+
+    /// Two data disks, parity and a cache — an array a slot can be replaced in.
+    pub(crate) fn replaceable_spec(name: &str) -> ElasticCreateSpec {
+        let mut spec = mover_spec(name);
+        let mut second = spec.data[0].clone();
+        second.disk_id = format!("{name}-data2");
+        second.wwn = Some(format!("wwn-{name}-data2"));
+        second.serial = Some(format!("serial-{name}-data2"));
+        second.expected_uuid = uuid::Uuid::new_v4().to_string();
+        spec.data.push(second);
+        // Parity has to cover the largest data disk.
+        spec.parity[0].bytes = 64 * 1024 * 1024 * 1024;
+        spec.validate().expect("array a slot can be replaced in");
+        spec
+    }
+
+    pub(crate) fn fresh_disk(name: &str, bytes: u64) -> ElasticDiskSpec {
+        ElasticDiskSpec {
+            disk_id: format!("{name}-fresh"),
+            wwn: Some(format!("wwn-{name}-fresh")),
+            serial: Some(format!("serial-{name}-fresh")),
+            bytes,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// The array a replacement produces, and every size rule it is held to.
+    #[test]
+    fn a_replacement_produces_a_legal_array_and_nothing_else_moves() {
+        let spec = replaceable_spec("swap");
+        let fresh = fresh_disk("swap", spec.data[0].bytes);
+        let after = spec_with_replaced_disk(&spec, "d1", &fresh).expect("a legal replacement");
+        assert_eq!(after.data[0], fresh);
+        assert_eq!(after.data[1], spec.data[1]);
+        assert_eq!((&after.cache, &after.parity), (&spec.cache, &spec.parity));
+        assert_eq!(
+            (after.name.as_str(), after.array_id.as_str(), after.operation_id.as_str()),
+            (spec.name.as_str(), spec.array_id.as_str(), spec.operation_id.as_str())
+        );
+        // The second slot is a different slot.
+        let second = spec_with_replaced_disk(&spec, "d2", &fresh).expect("the other slot");
+        assert_eq!((&second.data[0], &second.data[1]), (&spec.data[0], &fresh));
+        // A slot the array does not have.
+        assert!(spec_with_replaced_disk(&spec, "d9", &fresh).is_err());
+        assert!(spec_with_replaced_disk(&spec, "c1", &fresh).is_err(), "a cache disk is not a data slot");
+        // SIZES: at least what the slot held, never more than parity covers.
+        let mut small = fresh.clone();
+        small.bytes = spec.data[0].bytes - 1;
+        assert!(spec_with_replaced_disk(&spec, "d1", &small)
+            .expect_err("too small")
+            .to_string()
+            .contains("mniejszy"));
+        let mut huge = fresh.clone();
+        huge.bytes = spec.parity[0].bytes + 1;
+        assert!(spec_with_replaced_disk(&spec, "d1", &huge)
+            .expect_err("larger than parity")
+            .to_string()
+            .contains("parity"));
+        // A disk the array already holds in another role is a repeated
+        // identity, which the produced array refuses as a whole.
+        let member = spec.data[1].clone();
+        assert!(spec_with_replaced_disk(&spec, "d1", &member).is_err());
+        let cache = spec.cache.clone().expect("cache");
+        assert!(spec_with_replaced_disk(&spec, "d1", &cache).is_err());
+    }
+
+    /// What the helper must have done for a replacement to count.
+    #[test]
+    fn a_replacement_result_is_only_accepted_with_a_rebuild_and_a_sync() {
+        let spec = replaceable_spec("rebuilt");
+        let fresh = fresh_disk("rebuilt", spec.data[0].bytes);
+        let after = spec_with_replaced_disk(&spec, "d1", &fresh).expect("after");
+        let (rebuild_id, sync_id) = (uuid::Uuid::now_v7().to_string(), uuid::Uuid::now_v7().to_string());
+        let run = |operation_id: &str, kind: ElasticSnapraidKind, outcome: ElasticSnapraidOutcome| {
+            tentanas_helper::elastic::ElasticSnapraidRun {
+                operation_id: operation_id.into(),
+                kind,
+                started_at: "2026-09-17T18:00:00Z".into(),
+                finished_at: Some("2026-09-17T19:00:00Z".into()),
+                outcome,
+                exit_code: Some(0),
+                total_blocks: Some(313),
+                checked_blocks: None,
+                accessed_mb: Some(1),
+                errors_file: None,
+                errors_io: None,
+                errors_data: None,
+                detail: Some("naprawiono 313 bloków".into()),
+            }
+        };
+        let good = |rebuild: ElasticSnapraidOutcome, sync: ElasticSnapraidOutcome| {
+            let mut state = ready_result(&after);
+            let sync_run = run(&sync_id, ElasticSnapraidKind::Sync, sync);
+            state.last_run = Some(sync_run.clone());
+            tentanas_helper::elastic::ElasticReplaceResult {
+                state,
+                branch: "d1".into(),
+                disk: fresh.clone(),
+                rebuild: run(&rebuild_id, ElasticSnapraidKind::Fix { disk: "d1".into() }, rebuild),
+                sync: sync_run,
+            }
+        };
+        let ids = (rebuild_id.as_str(), sync_id.as_str());
+        validate_replace_result(&after, "d1", &fresh, ids, &good(ElasticSnapraidOutcome::Succeeded, ElasticSnapraidOutcome::Succeeded))
+            .expect("a rebuild and a sync");
+        // A Sync that skipped files changing under it is still a Sync.
+        validate_replace_result(&after, "d1", &fresh, ids, &good(ElasticSnapraidOutcome::Succeeded, ElasticSnapraidOutcome::Partial))
+            .expect("a partial sync");
+        // A REBUILD THAT WROTE NOTHING is not a rebuild.
+        for outcome in [
+            ElasticSnapraidOutcome::NothingRepaired,
+            ElasticSnapraidOutcome::Failed,
+            ElasticSnapraidOutcome::NeedsAttention,
+            ElasticSnapraidOutcome::Refused,
+        ] {
+            assert!(
+                validate_replace_result(&after, "d1", &fresh, ids, &good(outcome, ElasticSnapraidOutcome::Succeeded)).is_err(),
+                "{outcome:?}"
+            );
+        }
+        assert!(validate_replace_result(&after, "d1", &fresh, ids, &good(ElasticSnapraidOutcome::Succeeded, ElasticSnapraidOutcome::Failed)).is_err());
+        // Another slot, another disk, another operation: all refused.
+        let accepted = good(ElasticSnapraidOutcome::Succeeded, ElasticSnapraidOutcome::Succeeded);
+        assert!(validate_replace_result(&after, "d2", &fresh, ids, &accepted).is_err());
+        assert!(validate_replace_result(&after, "d1", &spec.data[1], ids, &accepted).is_err());
+        assert!(validate_replace_result(&after, "d1", &fresh, (&sync_id, &rebuild_id), &accepted).is_err());
+        // And the array the answer describes has to be the array WITH the new
+        // disk: the spec from before the swap no longer validates it.
+        assert!(validate_replace_result(&spec, "d1", &fresh, ids, &accepted).is_err());
     }
 
     /// A repair WRITES the disk it names, so a data disk that is missing or
@@ -3883,6 +4979,39 @@ pub(crate) mod tests {
         assert_eq!(repair_blocker(&failing), None);
     }
 
+    /// A replacement is for a slot whose disk is GONE (or one the disk itself
+    /// reports as failing). A present, healthy disk is the repair's business,
+    /// and formatting a replacement over it would abandon its data.
+    #[test]
+    fn a_replacement_is_refused_while_the_slot_still_has_its_disk() {
+        let present = observed_array();
+        assert!(replacement_blocker(&present, "d1").is_some_and(|why| why.contains("obecny")
+            && why.contains("naprawy")));
+
+        // GONE: the case the operation exists for.
+        let mut absent = observed_array();
+        absent.data_disks[0].device_present = Some(false);
+        assert_eq!(replacement_blocker(&absent, "d1"), None);
+
+        // The disk itself says it is failing: a replacement is what that is
+        // for, whatever else the node can still read from it.
+        let mut failing = observed_array();
+        failing.data_disks[0].health = "failing".into();
+        assert_eq!(replacement_blocker(&failing, "d1"), None);
+
+        // UNMEASURED IS NOT PRESENT: `None` is "nothing looked", which is the
+        // state of an array whose disks have not been read — the blocker only
+        // answers on a measurement.
+        let mut unmeasured = observed_array();
+        unmeasured.data_disks[0].device_present = None;
+        assert_eq!(replacement_blocker(&unmeasured, "d1"), None);
+
+        // A slot this array does not have is not this function's refusal: the
+        // handler answers that from the array's own row, so it holds even when
+        // nothing could be measured.
+        assert_eq!(replacement_blocker(&present, "d9"), None);
+    }
+
     pub(crate) fn create_spec(name: &str) -> ElasticCreateSpec {
         let disk = |role: &str| tentanas_helper::elastic::ElasticDiskSpec {
             disk_id:format!("{name}-{role}"),wwn:Some(format!("wwn-{name}-{role}")),
@@ -3897,7 +5026,7 @@ pub(crate) mod tests {
 
     pub(crate) fn ready_result(spec: &ElasticCreateSpec) -> ElasticResult {
         ElasticResult { array_id:spec.array_id.clone(),operation_id:spec.operation_id.clone(),owner:spec.owner.clone(),
-            stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,last_mover:None,stale_parity_bytes:None,parity_stale:false,stuck_records:Vec::new(),stuck_hidden:0,stuck_evicted:0,restart_required:false,
+            stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,last_mover:None,stale_parity_bytes:None,parity_stale:false,stuck_records:Vec::new(),stuck_hidden:0,stuck_evicted:0,restart_required:false,conflicts:Vec::new(),
             disks:spec.data.iter().enumerate().map(|(i,d)| (ElasticRole::Data((i+1) as u16),d))
                 .chain(spec.cache.iter().map(|d| (ElasticRole::Cache,d)))
                 .chain(spec.parity.iter().enumerate().map(|(i,d)| (ElasticRole::Parity((i+1) as u8),d)))
@@ -4385,6 +5514,53 @@ pub(crate) mod tests {
             wire.state_detail,
             "Wymagany restart węzła: restart demona mergerfs nie powiódł się"
         );
+    }
+
+    /// A3 of the second review: a file a stuck record left in two versions
+    /// makes the array's health a warning — never "ok" — and the alert names
+    /// the file, where clients see it and where the other version is. With
+    /// the second version gone the health and the alert clear.
+    #[test]
+    fn a_file_left_in_two_versions_is_a_warning_and_an_alert_naming_both_places() {
+        let spec = mover_spec("conflicted");
+        let db = settled_database(&spec);
+        let array = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        let conflict = ElasticConflict {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            path: "docs/report.odt".into(),
+            visible: "/mnt/conflicted/docs/report.odt".into(),
+            kept: "/mnt/tentanas-branches/conflicted/cache/c1/.tentanas-quarantine-x-1".into(),
+        };
+        let _ = array;
+        let protected = NasElasticProtection { status: "protected".into(), ..Default::default() };
+        assert_eq!(health_of(&protected, &[], &[], &[], "active", 0).0, "ok");
+        let (health, reason) = health_of(&protected, &[], &[], &[], "active", 1);
+        assert_eq!(health, "warning");
+        assert!(reason.contains("dwóch wersjach"), "{reason}");
+        let mut result = ready_result(&spec);
+        result.conflicts = vec![conflict.clone()];
+        let observed = observed_protocol(&store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap(), &BTreeMap::new(), Ok(result), &[]);
+        assert!(
+            observed.health_reason.contains("dwóch wersjach"),
+            "the observation carries the conflicts to the health: {} {}",
+            observed.health,
+            observed.health_reason
+        );
+        let conflict_alerts = |db: &DbPool| {
+            store::list_alerts(db, true)
+                .unwrap()
+                .into_iter()
+                .filter(|alert| alert.subject_id == spec.name && alert.title.starts_with("Pliki zachowane w dwóch wersjach"))
+                .collect::<Vec<_>>()
+        };
+        record_conflict_alert(&db, &spec.name, &[conflict]).unwrap();
+        let alerts = conflict_alerts(&db);
+        assert_eq!(alerts.len(), 1);
+        for place in ["docs/report.odt", "/mnt/conflicted/docs/report.odt", ".tentanas-quarantine-x-1"] {
+            assert!(alerts[0].detail.contains(place), "{place}: {}", alerts[0].detail);
+        }
+        record_conflict_alert(&db, &spec.name, &[]).unwrap();
+        assert!(conflict_alerts(&db).is_empty());
     }
 
     #[test]
@@ -5038,6 +6214,204 @@ pub(crate) mod tests {
         assert!(coupled_sync);
     }
 
+    /// An array created and settled in this database, the way every job test
+    /// here starts.
+    fn settled_database(spec: &ElasticCreateSpec) -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db = Arc::new(crate::db::Db::from_connection(conn));
+        let create = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_create".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&db, &create, Some(&jobs::ElasticJobIntent::Create(spec.clone()))).unwrap();
+        store::finish_elastic_operation(&db, &spec.owner, &spec.operation_id, Ok(&ready_result(spec))).unwrap();
+        store::finish_job(&db, &create.job_id, "succeeded", None).unwrap();
+        db
+    }
+
+    fn reply(value: &impl serde::Serialize) -> Result<super::super::broker::CommandOutput> {
+        Ok(super::super::broker::CommandOutput { code: 0, stdout: serde_json::to_string(value).unwrap(), stderr: String::new() })
+    }
+
+    /// M4 of the 2026-09-17 review: the age probe walks a cache under the
+    /// helper's lock, and a manual run started meanwhile is refused "busy"
+    /// before it does anything. That refusal is a failed job, not an
+    /// unresolved operation: the array stays active and the run can be asked
+    /// again at once.
+    #[tokio::test]
+    async fn a_run_the_helper_refused_as_busy_leaves_nothing_unresolved() {
+        let busy = format!(
+            "elastic_mover exited with 69: tentanas-helper: elastic_mover: {} Resource temporarily unavailable (os error 11)",
+            tentanas_helper::elastic::ELASTIC_BUSY
+        );
+        for kind in ["mover", "sync", "restore"] {
+            let spec = mover_spec("busy-run");
+            let db = settled_database(&spec);
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let (completion, finished) = tokio::sync::oneshot::channel();
+            let (work_spec, work_id, error) = (spec.clone(), operation_id.clone(), busy.clone());
+            let intent = match kind {
+                "mover" => jobs::ElasticJobIntent::Mover {
+                    owner: spec.owner.clone(),
+                    array_id: spec.array_id.clone(),
+                    operation_id: operation_id.clone(),
+                    resume_operation_id: uuid::Uuid::now_v7().to_string(),
+                    rules: MoverRules::default(),
+                    coupled_sync: true,
+                },
+                "sync" => jobs::ElasticJobIntent::Snapraid {
+                    owner: spec.owner.clone(),
+                    array_id: spec.array_id.clone(),
+                    operation_id: operation_id.clone(),
+                    kind: ElasticSnapraidKind::Sync,
+                },
+                _ => jobs::ElasticJobIntent::Restore {
+                    owner: spec.owner.clone(),
+                    array_id: spec.array_id.clone(),
+                    operation_id: operation_id.clone(),
+                },
+            };
+            jobs::spawn(&db, &format!("elastic_{kind}"), &spec.name, "test", Some(intent), Some(completion), move |h| async move {
+                let run = async move { Err::<super::super::broker::CommandOutput, _>(anyhow!(error)) };
+                match kind {
+                    "mover" => execute_mover_job(&h, &work_spec, &work_id, run).await,
+                    "sync" => execute_snapraid_job(&h, &work_spec, &work_id, &ElasticSnapraidKind::Sync, run).await,
+                    _ => execute_job(&h, work_spec, work_id, run).await,
+                }
+            })
+            .unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(2), finished).await.unwrap().unwrap();
+            assert!(outcome.is_err(), "{kind}");
+            let array = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+            assert_eq!(array.state, "active", "{kind}");
+            assert!(!array.unresolved_operation, "{kind}");
+            let state: String = db
+                .read()
+                .unwrap()
+                .query_row("SELECT state FROM nas_elastic_operations WHERE operation_id=?1", [&operation_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(state, "failed", "{kind}");
+        }
+    }
+
+    /// Files changing under the coupled Sync complete the run: the operation
+    /// succeeds, the array stays active, nothing is left unresolved for the
+    /// stuck alert to blame, and the run reads as partial, not failed.
+    #[tokio::test]
+    async fn a_mover_whose_sync_met_changing_files_completes_and_blames_no_operation() {
+        let spec = mover_spec("partial-mover");
+        let db = settled_database(&spec);
+        let (operation_id, resume_id) = (uuid::Uuid::now_v7().to_string(), uuid::Uuid::now_v7().to_string());
+        let mut result = mover_result(&spec, &operation_id, &resume_id, ElasticMoverPhase::Complete, true);
+        {
+            let sync = result.run.coupled_sync.as_mut().unwrap();
+            sync.outcome = ElasticSnapraidOutcome::Partial;
+            sync.exit_code = Some(1);
+            sync.errors_file = Some(3);
+            sync.detail = Some("pliki zmieniały się podczas Sync; parity obejmie je następny Sync".into());
+        }
+        result.state.stale_parity_bytes = Some(42);
+        result.state.parity_stale = true;
+        result.state.last_mover = Some(result.run.clone());
+        validate_mover_result(&spec, &operation_id, &result).expect("a partial Sync completes a run");
+        let mut unmarked = result.clone();
+        unmarked.state.stale_parity_bytes = None;
+        unmarked.state.parity_stale = false;
+        assert!(validate_mover_result(&spec, &operation_id, &unmarked).is_err(), "parity must stay marked stale");
+        let (completion, finished) = tokio::sync::oneshot::channel();
+        let (work_spec, work_id, work_result) = (spec.clone(), operation_id.clone(), result.clone());
+        jobs::spawn(
+            &db,
+            "elastic_mover",
+            &spec.name,
+            "test",
+            Some(jobs::ElasticJobIntent::Mover {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: operation_id.clone(),
+                resume_operation_id: resume_id.clone(),
+                rules: MoverRules::default(),
+                coupled_sync: true,
+            }),
+            Some(completion),
+            move |h| async move { execute_mover_job(&h, &work_spec, &work_id, async { reply(&work_result) }).await },
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), finished).await.unwrap().unwrap().expect("job");
+        let array = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(array.state, "active");
+        assert!(!array.unresolved_operation, "nothing for the stuck alert to blame");
+        assert_eq!(array.mover_history[0].outcome, "partial");
+        assert_eq!(mover_to_protocol(&result.run).outcome, "partial");
+        let CacheStuckVerdict::Raise { detail, .. } = cache_stuck_verdict(
+            &array,
+            &ElasticCacheAge { due_files: 0, due_bytes: 0, held_files: 1, oldest_secs: Some(10 * 86_400) },
+            false,
+        ) else {
+            panic!("a file ten days old is past the threshold");
+        };
+        assert!(!detail.contains("nierozwiązana operacja"), "{detail}");
+    }
+
+    /// The manual Sync runs with the share writable too. One that met changing
+    /// files is recorded as partial and succeeded: the array stays active, its
+    /// file errors are not parity errors, and it is not the last complete Sync.
+    #[tokio::test]
+    async fn a_manual_sync_that_met_changing_files_is_partial_and_counts_no_parity_error() {
+        let spec = create_spec("partial-sync");
+        let db = settled_database(&spec);
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let mut result = snapraid_result(&spec, &operation_id, ElasticSnapraidKind::Sync, ElasticSnapraidOutcome::Succeeded);
+        result.run.outcome = ElasticSnapraidOutcome::Partial;
+        result.run.exit_code = Some(1);
+        result.run.errors_file = Some(9815);
+        result.run.detail = Some("pliki zmieniały się podczas Sync; parity obejmie je następny Sync".into());
+        result.state.sync_completed_at = Some("2026-09-01T00:00:00Z".into());
+        result.state.stale_parity_bytes = Some(0);
+        result.state.parity_stale = true;
+        result.state.last_run = Some(result.run.clone());
+        validate_snapraid_result(&spec, &operation_id, &ElasticSnapraidKind::Sync, &result).expect("partial");
+        let mut claimed = result.clone();
+        claimed.state.sync_completed_at = claimed.run.finished_at.clone();
+        assert!(validate_snapraid_result(&spec, &operation_id, &ElasticSnapraidKind::Sync, &claimed).is_err(),
+            "a partial Sync writes no checkpoint");
+        let mut io = result.clone();
+        io.run.errors_io = Some(1);
+        io.state.last_run = Some(io.run.clone());
+        assert!(validate_snapraid_result(&spec, &operation_id, &ElasticSnapraidKind::Sync, &io).is_err());
+        let (completion, finished) = tokio::sync::oneshot::channel();
+        let (work_spec, work_id, work_result) = (spec.clone(), operation_id.clone(), result.clone());
+        jobs::spawn(
+            &db,
+            "elastic_sync",
+            &spec.name,
+            "test",
+            Some(jobs::ElasticJobIntent::Snapraid {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: operation_id.clone(),
+                kind: ElasticSnapraidKind::Sync,
+            }),
+            Some(completion),
+            move |h| async move {
+                execute_snapraid_job(&h, &work_spec, &work_id, &ElasticSnapraidKind::Sync, async { reply(&work_result) }).await
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), finished).await.unwrap().unwrap().expect("job");
+        let array = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(array.state, "active");
+        assert!(!array.unresolved_operation);
+        assert_eq!(array.snapraid_history[0].outcome, "partial");
+        assert!(array.last_sync_run.is_none(), "a partial Sync is not the last complete one");
+        assert_eq!(parity_errors_in_window(&array, chrono::Utc::now()), Some(0), "changed files are not parity errors");
+    }
+
     #[tokio::test]
     async fn mover_job_closes_its_operation_and_stays_out_of_every_snapraid_query() {
         for case in ["complete", "attention", "malformed"] {
@@ -5629,8 +7003,11 @@ pub(crate) mod tests {
             .all(|job| !jobs::running().lock().unwrap().contains_key(&job.job_id)));
     }
 
+    /// One array that cannot come back must not keep the arrays after it down:
+    /// a body that fails, panics or cannot persist its end is recorded and the
+    /// next array is still attempted, and the queue reports every failure.
     #[tokio::test]
-    async fn startup_rows_stop_after_body_panic_or_persistence_failure() {
+    async fn startup_rows_attempt_every_array_after_a_failure_and_report_each() {
         for failure in 0..3 {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             store::migrate(&conn).unwrap();
@@ -5641,41 +7018,147 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
                 ElasticArrayRow {
-                    name: "forbidden-second".into(),
+                    name: "second".into(),
                     ..Default::default()
                 },
             ];
             let mut calls = 0;
             let result = restore_startup_rows(&rows, |row, completion| {
                     calls += 1;
+                    let first = row.name == "first";
                     jobs::spawn(&db, "startup-test", &row.name, "test", None, Some(completion), move |h| async move {
+                        if !first {
+                            return Ok(());
+                        }
                         assert_ne!(failure, 1, "kontrolowana panika");
                         if failure == 2 {
                             h.db().write().unwrap().execute_batch(
-                                "CREATE TRIGGER refuse_finish BEFORE UPDATE ON nas_jobs BEGIN SELECT RAISE(ABORT,'persist denied'); END;")?;
+                                "CREATE TRIGGER refuse_finish BEFORE UPDATE ON nas_jobs WHEN OLD.subject = 'first' BEGIN SELECT RAISE(ABORT,'persist denied'); END;")?;
                             return Ok(());
                         }
                         Err(anyhow!("kontrolowany błąd wykonawcy"))
                     })
                 }).await;
-            assert!(result.is_err());
-            assert_eq!(calls, 1);
+            let error = result.expect_err("the failure is reported").to_string();
+            assert!(error.starts_with("first: "), "{error}");
+            assert!(!error.contains("second"), "{error}");
+            assert_eq!(calls, 2, "failure={failure}: the second array is still attempted");
             let jobs = store::list_jobs(&db, 10).unwrap();
-            assert_eq!(jobs.len(), 1);
-            assert!(!jobs::running()
-                .lock()
-                .unwrap()
-                .contains_key(&jobs[0].job_id));
-            assert_eq!(
-                jobs[0].status,
-                if failure == 2 { "running" } else { "failed" }
-            );
+            assert_eq!(jobs.len(), 2);
+            let status = |subject: &str| jobs.iter().find(|job| job.subject == subject).unwrap().status.clone();
+            assert_eq!(status("first"), if failure == 2 { "running" } else { "failed" });
+            assert_eq!(status("second"), "succeeded");
+            assert!(jobs.iter().all(|job| !jobs::running().lock().unwrap().contains_key(&job.job_id)));
         }
     }
 
+    /// A1 of the second review: a startup Restore the helper refused as busy
+    /// ran nothing, and is asked again — a few times — instead of leaving the
+    /// array down until an admin notices.
     #[tokio::test]
-    async fn startup_rows_stop_on_spawn_error_or_missing_completion() {
-        let rows = vec![ElasticArrayRow::default(), ElasticArrayRow::default()];
+    async fn a_startup_restore_refused_as_busy_is_asked_again() {
+        let rows = vec![ElasticArrayRow { name: "first".into(), ..Default::default() }];
+        for busy_answers in [2u32, 99] {
+            let mut calls = 0u32;
+            let result = restore_startup_rows_waiting(&rows, Duration::ZERO, Duration::from_secs(60), |_, completion| {
+                calls += 1;
+                let answer = if calls <= busy_answers {
+                    Err(anyhow!("elastic_restore exited with 69: {} Resource temporarily unavailable", tentanas_helper::elastic::ELASTIC_BUSY))
+                } else {
+                    Ok(())
+                };
+                completion.send(answer).unwrap();
+                Ok(tentaflow_protocol::tentanas::NasJob::default())
+            })
+            .await;
+            if busy_answers == 2 {
+                result.expect("restored on the third attempt");
+                assert_eq!(calls, 3);
+            } else {
+                assert!(result.expect_err("gives up").to_string().contains("busy"));
+                assert_eq!(calls, STARTUP_BUSY_ATTEMPTS, "bounded");
+            }
+        }
+        // Any other failure is not asked again.
+        let mut calls = 0;
+        let result = restore_startup_rows_waiting(&rows, Duration::ZERO, Duration::from_secs(60), |_, completion| {
+            calls += 1;
+            completion.send(Err(anyhow!("konfiguracja niezgodna z journalem"))).unwrap();
+            Ok(tentaflow_protocol::tentanas::NasJob::default())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    /// W-C of the third review: a Restore that never answers is one array's
+    /// failure, not the node's. The queue gives up on it, attempts the next
+    /// array, and the scheduler's Elastic passes stop waiting for a queue that
+    /// has been running too long — otherwise no Sync, Scrub or mover of any
+    /// array runs for up to the 24 h job timeout and no cache is drained.
+    #[tokio::test]
+    async fn a_startup_restore_that_never_answers_is_bounded_and_so_is_the_gate() {
+        let rows = vec![
+            ElasticArrayRow { name: "hangs".into(), ..Default::default() },
+            ElasticArrayRow { name: "second".into(), ..Default::default() },
+        ];
+        // The sender is KEPT: the job neither finishes nor is dropped.
+        let mut held = Vec::new();
+        let mut calls = Vec::new();
+        let result = restore_startup_rows_waiting(&rows, Duration::ZERO, Duration::ZERO, |row, completion| {
+            calls.push(row.name.clone());
+            held.push(completion);
+            Ok(tentaflow_protocol::tentanas::NasJob::default())
+        })
+        .await;
+        let error = result.expect_err("the hanging array is reported").to_string();
+        assert!(error.contains("hangs") && error.contains("nie odpowiedziało"), "{error}");
+        assert_eq!(calls, vec!["hangs".to_string(), "second".to_string()], "the next array is still attempted");
+        assert_eq!(held.len(), 2, "no completion was ever answered");
+        // The gate: pending while the queue is young, open once it is too old.
+        let pending = StartupRestores::begin();
+        assert!(startup_restores_pending_for(Duration::from_secs(600)));
+        assert!(!startup_restores_pending_for(Duration::ZERO), "a stuck queue does not hold the passes for ever");
+        drop(pending);
+        assert!(!startup_restores_pending_for(Duration::from_secs(600)));
+    }
+
+    /// A4 of the second review: the startup queue rewrites share configs after
+    /// its restores, whatever they ended with, and while it still holds the
+    /// scheduler's Elastic passes.
+    #[tokio::test]
+    async fn the_startup_queue_rewrites_share_configs_after_its_restores_while_the_passes_wait() {
+        for restore_fails in [false, true] {
+            let order = std::sync::Mutex::new(Vec::new());
+            let pending = StartupRestores::begin();
+            let result = restore_then_rewrite_shares(
+                async {
+                    order.lock().unwrap().push("restore");
+                    if restore_fails { Err(anyhow!("restore")) } else { Ok(()) }
+                },
+                || async {
+                    assert!(startup_restores_pending(), "the passes still wait");
+                    order.lock().unwrap().push("shares");
+                    Ok(Vec::new())
+                },
+            )
+            .await;
+            drop(pending);
+            assert_eq!(result.is_err(), restore_fails);
+            assert_eq!(*order.lock().unwrap(), vec!["restore", "shares"]);
+        }
+    }
+
+    /// A job the store refuses for one array is that array's failure: the
+    /// next array is attempted. Only a completion that never arrives stops the
+    /// queue, because the job's end — and whether its helper still holds the
+    /// node lock — is then unknown.
+    #[tokio::test]
+    async fn startup_rows_go_on_after_a_refused_job_and_stop_only_without_a_completion() {
+        let rows = vec![
+            ElasticArrayRow { name: "first".into(), ..Default::default() },
+            ElasticArrayRow { name: "second".into(), ..Default::default() },
+        ];
         for missing_completion in [false, true] {
             let mut calls = 0;
             let result = restore_startup_rows(&rows, |_, completion| {
@@ -5688,9 +7171,61 @@ pub(crate) mod tests {
                 }
             })
             .await;
-            assert!(result.is_err());
-            assert_eq!(calls, 1);
+            let error = result.expect_err("reported").to_string();
+            if missing_completion {
+                assert_eq!(calls, 1);
+                assert!(error.contains("Brak potwierdzenia"), "{error}");
+            } else {
+                assert_eq!(calls, 2);
+                assert!(error.contains("first: Odmowa") && error.contains("second: Odmowa"), "{error}");
+            }
         }
+    }
+
+    /// C1 of the 2026-09-17 review, pinned against the helper's OWN admission
+    /// rule rather than a faked answer: after a reboot the helper answers a
+    /// private array only the commands `runs_after_a_boot` names, and the
+    /// restore job — the startup one and "Przywróć" alike — sends exactly one
+    /// command, which must be one of them. An Inspect sent first made every
+    /// array fail at every startup.
+    #[test]
+    fn the_restore_job_sends_only_a_command_the_helper_runs_after_a_boot() {
+        let spec = mover_spec("after-boot");
+        let command = restore_command(&spec);
+        assert!(tentanas_helper::elastic::runs_after_a_boot(&command), "{command:?}");
+        assert!(!tentanas_helper::elastic::runs_after_a_boot(&HelperCommand::ElasticInspect {
+            array_id: spec.array_id.clone(),
+            owner: spec.owner.clone(),
+        }));
+    }
+
+    /// The array becomes active after a mover only on a result that proves it
+    /// serves read-write: a Complete run whose array still reports a Hold, or
+    /// a read-only union, is not accepted.
+    #[test]
+    fn a_complete_mover_result_under_a_hold_or_a_readonly_union_is_refused() {
+        let spec = mover_spec("held-result");
+        let (operation_id, resume_id) = (uuid::Uuid::now_v7().to_string(), uuid::Uuid::now_v7().to_string());
+        let mut clean = mover_result(&spec, &operation_id, &resume_id, ElasticMoverPhase::Complete, true);
+        validate_mover_result(&spec, &operation_id, &clean).expect("serving");
+        let mut held = clean.clone();
+        held.state.stage = ElasticStage::NeedsAttention;
+        held.state.service = Some(tentanas_helper::elastic::ElasticServiceState {
+            mode: ElasticServiceMode::Hold,
+            operation_id: operation_id.clone(),
+            pending: false,
+        });
+        held.state.union_readonly = Some(true);
+        assert!(validate_mover_result(&spec, &operation_id, &held).is_err());
+        clean.state.service = Some(tentanas_helper::elastic::ElasticServiceState {
+            mode: ElasticServiceMode::Online,
+            operation_id: resume_id.clone(),
+            pending: false,
+        });
+        clean.state.union_readonly = Some(true);
+        assert!(validate_mover_result(&spec, &operation_id, &clean).is_err(), "a read-only union is no release");
+        clean.state.union_readonly = Some(false);
+        validate_mover_result(&spec, &operation_id, &clean).expect("released and serving");
     }
 
     #[tokio::test]
@@ -5819,11 +7354,10 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 array.state,
-                if matches!(case, "success" | "refused" | "persist") {
-                    "active"
-                } else {
-                    "needs_attention"
-                },
+                // Only a run the helper JUDGED and reported as failed takes the
+                // array with it. A run with no result at all is interrupted and
+                // leaves the array exactly as it was (W-D of the third review).
+                if case == "failed" { "needs_attention" } else { "active" },
                 "{case}"
             );
             let run = &array.snapraid_history[0];
@@ -5836,7 +7370,8 @@ pub(crate) mod tests {
                     "refused" => "refused",
                     "failed" => "failed",
                     "persist" => "running",
-                    _ => "needs_attention",
+                    // No confirmed result: interrupted, not a parity fault.
+                    _ => store::INTERRUPTED_OUTCOME,
                 },
                 "{case}"
             );
@@ -5869,7 +7404,10 @@ pub(crate) mod tests {
                 let reopened = store::elastic_array(&db, &spec.owner, &spec.name)
                     .unwrap()
                     .unwrap();
-                assert_eq!(reopened.snapraid_history[0].outcome, "needs_attention");
+                // Core lost the job after its result was recorded: the run is
+                // interrupted, and it holds nothing up — the next Sync settles it.
+                assert_eq!(reopened.snapraid_history[0].outcome, store::INTERRUPTED_OUTCOME);
+                assert!(!reopened.unresolved_operation);
                 assert!(reopened.last_sync_run.is_none());
             }
         }
@@ -6015,6 +7553,8 @@ pub(crate) mod tests {
             moved_unsynced_bytes: None,
             parity_stale: false,
             last_mover: None,
+            cache_age: None,
+            conflicts: Vec::new(),
         }
     }
 
@@ -6632,14 +8172,145 @@ pub(crate) mod tests {
         let fresh = MoverClock::new();
         assert_eq!(mover_trigger(&a, &blind, &fresh), MoverTrigger::None);
 
-        // A switched-off mover never fires, however full the cache is.
+        // A schedule that restricts moving does not hold back cache pressure:
+        // below the threshold the mover runs whatever the schedule says.
+        let mut restricted = array();
+        restricted.mover.schedule_enabled = true;
+        restricted.mover.schedule = Some(NasSchedule { every: "daily".into(), hour: 3, ..Default::default() });
+        assert_eq!(mover_trigger(&restricted, &pressed, &fresh), MoverTrigger::CacheLow);
+        // A switched-off array never fires, however full the cache is.
         let mut off = array();
-        off.mover.enabled = false;
+        off.enabled = false;
         assert_eq!(mover_trigger(&off, &pressed, &fresh), MoverTrigger::None);
         // Nor does one with no cache to drain.
         let mut cacheless = array();
         cacheless.branches.retain(|b| b.role != "cache");
         assert_eq!(mover_trigger(&cacheless, &pressed, &fresh), MoverTrigger::None);
+    }
+
+    fn aged(due_files: u64, oldest_secs: Option<u64>) -> ElasticCacheAge {
+        ElasticCacheAge { due_files, due_bytes: due_files * 1024, held_files: 0, oldest_secs }
+    }
+
+    fn with_age(observed: ArrayObservation, age: ElasticCacheAge) -> ArrayObservation {
+        ArrayObservation { cache_age: Some(age), ..observed }
+    }
+
+    /// The owner's rule (2026-09-17): an array with a cache moves its files to
+    /// the data disks by itself. An array with NO schedule, a roomy cache and
+    /// aged files starts a run; the same array with only fresh files, with an
+    /// unmeasured cache age, cooling down, or without a cache does not.
+    #[test]
+    fn aged_files_start_a_run_with_no_schedule_and_a_roomy_cache() {
+        let a = array();
+        assert_eq!(a.mover.schedule, None, "the fixture has no schedule at all");
+        assert!(!a.mover.schedule_enabled);
+        let roomy = all_mounted(&a, 0);
+        let clock = MoverClock::new();
+        assert_eq!(
+            mover_trigger(&a, &with_age(roomy.clone(), aged(3, Some(9_000))), &clock),
+            MoverTrigger::FilesAged
+        );
+        // Only fresh files: waiting on the cache is what they are there for.
+        assert_eq!(mover_trigger(&a, &with_age(roomy.clone(), aged(0, Some(60))), &clock), MoverTrigger::None);
+        // Not measured is not "aged".
+        assert_eq!(mover_trigger(&a, &roomy, &clock), MoverTrigger::None);
+
+        clock.started(&a.name);
+        assert_eq!(
+            mover_trigger(&a, &with_age(roomy.clone(), aged(3, Some(9_000))), &clock),
+            MoverTrigger::None,
+            "a run that just started is the answer to these files"
+        );
+        clock.rewind_for_test(&a.name, MOVER_RETRIGGER_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(
+            mover_trigger(&a, &with_age(roomy.clone(), aged(3, Some(9_000))), &clock),
+            MoverTrigger::FilesAged
+        );
+
+        let mut cacheless = array();
+        cacheless.branches.retain(|b| b.role != "cache");
+        assert_eq!(
+            mover_trigger(&cacheless, &with_age(all_mounted(&cacheless, 0), aged(3, Some(9_000))), &MoverClock::new()),
+            MoverTrigger::None
+        );
+    }
+
+    /// A switched-on schedule RESTRICTS automatic moving to its slots: aged
+    /// files wait for the scheduled run. Switched off, it restricts nothing.
+    #[test]
+    fn a_switched_on_schedule_restricts_the_age_trigger_but_not_a_switched_off_one() {
+        let mut a = array();
+        a.mover.schedule = Some(NasSchedule { every: "daily".into(), hour: 3, ..Default::default() });
+        let observed = with_age(all_mounted(&a, 0), aged(3, Some(9_000)));
+        assert_eq!(mover_trigger(&a, &observed, &MoverClock::new()), MoverTrigger::FilesAged, "saved but off");
+        a.mover.schedule_enabled = true;
+        assert!(restricted_to_schedule(&a));
+        assert_eq!(mover_trigger(&a, &observed, &MoverClock::new()), MoverTrigger::None);
+    }
+
+    /// A run that moved nothing is evidence the due files cannot move now (no
+    /// room, a colliding path). The age trigger then waits out a whole budget
+    /// instead of holding the union read-only every cooldown for nothing.
+    #[test]
+    fn after_a_run_that_moved_nothing_the_age_trigger_backs_off() {
+        let mut a = array();
+        a.mover_history = vec![NasMoverRun { outcome: "ok".into(), moved_files: 0, ..Default::default() }];
+        let observed = with_age(all_mounted(&a, 0), aged(3, Some(9_000)));
+        let clock = MoverClock::new();
+        // Nothing started in this process yet: the one retry is allowed.
+        assert_eq!(mover_trigger(&a, &observed, &clock), MoverTrigger::FilesAged);
+        clock.started(&a.name);
+        clock.rewind_for_test(&a.name, MOVER_RETRIGGER_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(mover_trigger(&a, &observed, &clock), MoverTrigger::None, "cooled down, still backing off");
+        clock.rewind_for_test(&a.name, Duration::from_secs(4 * 7_200 + 1));
+        assert_eq!(mover_trigger(&a, &observed, &clock), MoverTrigger::FilesAged);
+        // A run that moved something is no reason to wait.
+        a.mover_history[0].moved_files = 5;
+        let clock = MoverClock::new();
+        clock.started(&a.name);
+        clock.rewind_for_test(&a.name, MOVER_RETRIGGER_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(mover_trigger(&a, &observed, &clock), MoverTrigger::FilesAged);
+    }
+
+    /// The stuck alert fires on AGE past its threshold and nothing else: a
+    /// cache full of fresh files is healthy. It clears on the first probe that
+    /// finds nothing that old, and stays put while a run for the files starts.
+    #[test]
+    fn the_stuck_alert_fires_only_past_its_threshold_and_clears() {
+        let mut a = array();
+        // Defaults: 2 h age rule, four of them.
+        assert_eq!(cache_stuck_after_secs(&a), 8 * 3_600);
+        let limit = cache_stuck_after_secs(&a);
+        // Lots of pending data, all of it younger than the threshold.
+        assert_eq!(cache_stuck_verdict(&a, &aged(500, Some(limit - 1)), false), CacheStuckVerdict::Clear);
+        assert_eq!(cache_stuck_verdict(&a, &ElasticCacheAge::default(), false), CacheStuckVerdict::Clear);
+        // Past it, with a run starting for the files: neither opened nor closed.
+        assert_eq!(cache_stuck_verdict(&a, &aged(2, Some(limit)), true), CacheStuckVerdict::Keep);
+        // Past it with nothing started: raised, and the reason is named.
+        let held = ElasticCacheAge { due_files: 0, due_bytes: 0, held_files: 1, oldest_secs: Some(limit + 3_600) };
+        match cache_stuck_verdict(&a, &held, false) {
+            CacheStuckVerdict::Raise { title, detail } => {
+                assert!(title.contains("media"), "{title}");
+                assert!(detail.contains("9 h"), "{detail}");
+                assert!(detail.contains("alarm po 8 h"), "{detail}");
+                assert!(detail.contains("otwarte"), "{detail}");
+            }
+            other => panic!("expected a raise, got {other:?}"),
+        }
+        a.unresolved_operation = true;
+        let CacheStuckVerdict::Raise { detail, .. } = cache_stuck_verdict(&a, &aged(2, Some(limit)), false) else {
+            panic!("an unresolved operation past the threshold is stuck");
+        };
+        assert!(detail.contains("nierozwiązana operacja"), "{detail}");
+
+        // No age rule still leaves four cooldowns; a daily window adds a day.
+        a.mover.min_age_secs = 0;
+        assert_eq!(cache_stuck_after_secs(&a), 4 * MOVER_RETRIGGER_COOLDOWN.as_secs());
+        a.mover.min_age_secs = 7_200;
+        a.mover.schedule = Some(NasSchedule { every: "daily".into(), hour: 3, ..Default::default() });
+        a.mover.schedule_enabled = true;
+        assert_eq!(cache_stuck_after_secs(&a), 8 * 3_600 + 86_400);
     }
 
     /// The parity rule of §5.3, as a REFUSAL with the disk named — the exact
@@ -7708,7 +9379,7 @@ pub(crate) mod tests {
         let disks = member_disks(&entry);
         let owner = this_addon();
 
-        let candidates = import_candidates(&[entry.clone()], &disks, &[], &owner);
+        let candidates = import_candidates(&[entry.clone()], &[], &disks, &[], &owner);
         assert_eq!(candidates.len(), 1);
         let candidate = &candidates[0];
         assert_eq!(candidate.status, "importable");
@@ -7734,7 +9405,7 @@ pub(crate) mod tests {
         // else's filesystem. Hardware identity says "present", and that is
         // exactly the evidence an adoption may not act on.
         disks[0].fs_uuid = Some(uuid::Uuid::new_v4().to_string());
-        let candidates = import_candidates(&[entry.clone()], &disks, &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &[], &disks, &[], &this_addon());
         let candidate = &candidates[0];
 
         assert_eq!(candidate.status, "incomplete");
@@ -7756,9 +9427,31 @@ pub(crate) mod tests {
         // read as a match either.
         disks[0].fs_uuid = None;
         disks[0].fs_type = None;
-        let blank = import_candidates(&[entry], &disks, &[], &this_addon());
+        let blank = import_candidates(&[entry], &[], &disks, &[], &this_addon());
         assert_eq!(blank[0].status, "incomplete");
         assert_eq!(blank[0].disks_matched, 2);
+    }
+
+    /// A7 of the second review: the scan does not hide a journal the node
+    /// cannot load. One whose spec could still be read keeps its row and
+    /// becomes unreadable with the helper's reason; one nothing could be read
+    /// from is listed by its file name. Neither can be adopted.
+    #[test]
+    fn an_unreadable_journal_is_listed_with_its_reason_and_never_importable() {
+        let entry = lost_journal("archiwum");
+        let disks = member_disks(&entry);
+        let lost = "4b4b4b4b-4b4b-4b4b-8b4b-4b4b4b4b4b4b";
+        let unreadable = [
+            ElasticUnreadableJournal { array_id: entry.spec.array_id.clone(), reason: "journal: unknown variant `exploded`".into() },
+            ElasticUnreadableJournal { array_id: lost.into(), reason: "journal: EOF while parsing".into() },
+        ];
+        let candidates = import_candidates(&[entry.clone()], &unreadable, &disks, &[], &this_addon());
+        assert_eq!(candidates.len(), 2);
+        assert_eq!((candidates[0].status.as_str(), candidates[0].detail.as_str()), ("unreadable", "journal: unknown variant `exploded`"));
+        assert_eq!(candidates[0].name, "archiwum");
+        assert_eq!((candidates[1].array_id.as_str(), candidates[1].status.as_str()), (lost, "unreadable"));
+        assert!(candidates[1].detail.contains("EOF"));
+        assert!(import_selection(&candidates, &entry.spec.array_id, "archiwum").is_err());
     }
 
     #[test]
@@ -7766,7 +9459,7 @@ pub(crate) mod tests {
         let entry = lost_journal("archiwum");
         let mut disks = member_disks(&entry);
         let gone = disks.remove(1);
-        let candidates = import_candidates(&[entry], &disks, &[], &this_addon());
+        let candidates = import_candidates(&[entry], &[], &disks, &[], &this_addon());
         let candidate = &candidates[0];
 
         assert_eq!(candidate.status, "incomplete");
@@ -7788,7 +9481,7 @@ pub(crate) mod tests {
 
         let by_id = import_candidates(
             &[entry.clone()],
-            &disks,
+            &[], &disks,
             &[(entry.spec.array_id.clone(), "produkt".to_string())],
             &owner,
         );
@@ -7800,7 +9493,7 @@ pub(crate) mod tests {
         // has to say which of the two reasons it is.
         let by_name = import_candidates(
             &[entry.clone()],
-            &disks,
+            &[], &disks,
             &[("11111111-1111-4111-8111-111111111111".to_string(), "produkt".to_string())],
             &owner,
         );
@@ -7811,7 +9504,7 @@ pub(crate) mod tests {
     #[test]
     fn the_apply_gate_refuses_a_mistyped_name_and_an_array_the_fresh_scan_no_longer_sees() {
         let entry = lost_journal("media");
-        let candidates = import_candidates(&[entry.clone()], &member_disks(&entry), &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon());
 
         let typo = import_selection(&candidates, &entry.spec.array_id, "Media")
             .expect_err("the retyped name must match exactly")
@@ -7832,7 +9525,7 @@ pub(crate) mod tests {
         // journal owner is already ours, so there is nothing to re-own.
         let mut entry = lost_journal("media");
         entry.spec.owner = this_addon();
-        let candidates = import_candidates(&[entry.clone()], &member_disks(&entry), &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon());
 
         assert_eq!(candidates[0].status, "importable");
         assert!(!candidates[0].detail.contains("re-owns"), "{}", candidates[0].detail);
@@ -7843,7 +9536,7 @@ pub(crate) mod tests {
     fn an_unreadable_mount_table_never_reads_as_an_unmounted_union() {
         let mut entry = lost_journal("media");
         entry.union_mounted = None;
-        let candidates = import_candidates(&[entry.clone()], &member_disks(&entry), &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon());
         assert!(!candidates[0].union_mounted, "unknown is rendered as 'not claimed to be mounted'");
         assert_eq!(candidates[0].status, "importable", "and it does not block the adoption");
     }

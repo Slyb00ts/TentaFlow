@@ -1,13 +1,13 @@
 // =============================================================================
 // Plik: modules/tentanas/elastic-detail.js
-// Opis: Karta Elastic Array ze stanem, montowaniami i historią operacji SnapRAID.
+// Opis: Karta Elastic Array ze stanem, montowaniami, historią SnapRAID i zaawansowanym przenoszeniem z cache.
 // Przykład: drawElasticDetail(screen, body) korzysta z nazwy screen.array.
 // =============================================================================
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
-import { patchHtml } from '/js/modules/tentanas/dom-patch.js';
+import { patchHtml, setAttr, setText } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
 import '/js/components/tf-button.js';
@@ -33,11 +33,11 @@ const ACTION_APPROVAL = { restore: 'elastic.approval', sync: 'elastic.maintenanc
 // Why a repair CANNOT run right now, or '' when the array is in a shape
 // `snapraid fix` can work on.
 //
-// It mirrors `tentanas::elastic::repair_blocker`. A repair writes the named
-// disk's blocks back from parity, so it needs that disk present and mounted —
-// which makes a dead data disk, the very situation a repair is reached for,
-// the one situation in which it cannot run. There is no replace-disk path in
-// this product yet, so the screen says what has to happen first instead of
+// It mirrors `tentanas::elastic::repair_blocker`. A repair writes back the
+// blocks a scrub marked bad, and it needs every data disk present and mounted
+// to do it — which makes a dead data disk, the very situation a repair is
+// reached for, the one situation in which it cannot run. Disk replacement is
+// withdrawn (round 4), so the screen says what has to happen first instead of
 // offering a button whose only possible outcome is the helper's own
 // `precondition_failed`.
 //
@@ -57,7 +57,7 @@ function repairBlocker(array) {
 //
 // It MIRRORS `tentanas::elastic::repair_evidence` FIELD FOR FIELD, over the
 // same object: the node runs that rule on the very `NasElasticArray` this
-// reads. `snapraid fix` writes the named disk back from the parity checkpoint,
+// reads. A repair writes the named disk back from the parity checkpoint,
 // so a button on an array that reports nothing wrong would only overwrite
 // healthy data — and a button the node then refuses is worse still, because
 // the admin reads the refusal as a fault.
@@ -71,12 +71,16 @@ function repairBlocker(array) {
 function repairEvidence(array) {
   for (const run of array?.snapraid?.history || []) {
     if (run.kind === 'fix' && run.outcome === 'ok') break;
-    if (run.outcome === 'failed' || run.outcome === 'needs_attention') {
-      return T('elastic.repair_reason_unresolved', { kind: run.kind });
+    // ONLY A SCRUB THAT COUNTED ERRORS. A repair writes back the blocks
+    // snapraid MARKED as bad, and a scrub is what marks them: measured on
+    // rig11, `-e fix` with no scrub behind it writes nothing at all and still
+    // reports "Everything OK". A failed sync marks nothing, and the parity
+    // figure of the reporting window is not a mark in the content file.
+    if (run.kind === 'scrub' && ['failed', 'needs_attention'].includes(run.outcome)
+      && typeof run.errors === 'number' && run.errors > 0) {
+      return T('elastic.repair_reason_scrub_errors', { n: run.errors });
     }
   }
-  const errors = array?.snapraid?.parityErrors;
-  if (typeof errors === 'number' && errors > 0) return T('elastic.repair_reason_errors', { n: errors });
   return '';
 }
 
@@ -145,7 +149,7 @@ function diskHtml(disk, filesystem, repair = '') {
   return `<div class="disk-cell" data-disk="${escapeAttr(disk.diskId)}" data-branch="${escapeAttr(disk.name)}">
     <span class="health-dot ${healthClass(disk.health)}"></span>
     <div class="dc-main"><div class="dc-name"><span class="mono">${escapeHtml(disk.name)}</span></div>
-      <div class="dc-sub">${escapeHtml(fmtOptionalBytes(disk.usedBytes))} / ${escapeHtml(fmtOptionalBytes(disk.sizeBytes))} · ${escapeHtml(filesystem.toUpperCase())}</div>
+      <div class="dc-sub"><span data-fig="disk-usage"></span> · ${escapeHtml(filesystem.toUpperCase())}</div>
       <div class="dc-sub">${escapeHtml(disk.device || disk.diskId)}</div>
       <div class="dc-sub">${escapeHtml(T('elastic.mounted'))}: ${escapeHtml(triState(disk.mounted))} · ${escapeHtml(T('elastic.present'))}: ${escapeHtml(triState(disk.devicePresent))}</div>
       <div class="dc-sub mono">${escapeHtml(disk.mountpoint)}</div>
@@ -182,6 +186,14 @@ function openElasticFixDialog(screen, array, disk, evidence, onDone) {
     },
   });
 }
+
+// DISK REPLACEMENT IS WITHDRAWN (round 4, owner's decision). There is no
+// affordance for it here on purpose: the node refuses the request before it
+// writes anything, and a button whose only possible answer is a refusal is
+// worse than no button — the previous one wedged an array's whole maintenance
+// surface with a single click. What an admin can do about a data disk that is
+// gone travels with the refusal in
+// `dispatch::tentanas::elastic_replace_disk`.
 
 /// Adding one data disk. The free-disk list is fetched WHEN THE DIALOG OPENS
 /// rather than polled with the screen: it is the one moment the answer has to
@@ -294,7 +306,7 @@ function openElasticDestroyDialog(screen, array, onDone) {
 }
 
 function snapraidHistoryHtml(history, expanded) {
-  const outcomes = { running: 'run_running', ok: 'run_ok', failed: 'run_failed', needs_attention: 'error', refused: 'run_refused' };
+  const outcomes = { running: 'run_running', ok: 'run_ok', partial: 'run_partial', interrupted: 'run_interrupted', nothing_repaired: 'run_nothing_repaired', failed: 'run_failed', needs_attention: 'error', refused: 'run_refused' };
   const refusals = { no_parity: 'no_parity', precondition_failed: 'refused_precondition', unsynced_changes: 'refused_dirty', empty_parity: 'refused_empty' };
   return `<div class="nas-snapraid-history mt-md"><div class="title">${escapeHtml(T('elastic.history'))}</div>${history.length ? `<ol>${history.map((run) => {
     const label = run.kind === 'sync' ? 'Sync' : run.kind === 'scrub' ? 'Scrub' : run.kind === 'fix' ? T('elastic.run_fix') : run.kind;
@@ -316,8 +328,11 @@ const moverSkipped = (run) => !run ? '—'
   : run.countsKnown ? `${fmtOptionalBytes(run.skippedBytes)} · ${Number(run.skippedFiles) || 0}`
     : T('elastic.mover_counts_unmeasured');
 
+// A partial sync is not a failure: files changed while it ran, and the next
+// sync covers them.
 const moverSync = (run) => !run.coupledSync ? T('elastic.mover_sync_none')
-  : run.coupledSync.outcome === 'ok' ? T('elastic.mover_sync_ok') : T('elastic.mover_sync_failed');
+  : run.coupledSync.outcome === 'ok' ? T('elastic.mover_sync_ok')
+    : run.coupledSync.outcome === 'partial' ? T('elastic.mover_sync_partial') : T('elastic.mover_sync_failed');
 
 const moverLastRun = (run) => !run ? '—'
   : `${fmtDate(run.finishedAt || run.startedAt)} · ${fmtOptionalBytes(run.movedBytes)} → ${moverSync(run)}`;
@@ -351,10 +366,12 @@ const moverExplain = (m) => {
   return params ? T('elastic.mover_explain', params) : T('elastic.mover_explain_no_rules');
 };
 
-// The CADENCE is its own fact, separate from `configured`: a schedule row and
-// a rules row are saved independently, so the panel asks the schedule whether
-// there is a schedule instead of asking the rules.
-const moverScheduleValue = (m) => (m.schedule ? fmtSchedule(m.schedule) : T('elastic.mover_schedule_none'));
+// The schedule is not a cadence the mover needs — moving is automatic — but an
+// optional WINDOW that restricts it. Saved-but-off restricts nothing, and says
+// so, because reading like a live window would promise the disks rest.
+const moverScheduleValue = (m) => (!m.schedule ? T('elastic.mover_window_none')
+  : m.enabled ? T('elastic.mover_window_only', { when: fmtSchedule(m.schedule) })
+    : T('elastic.mover_window_off', { when: fmtSchedule(m.schedule) }));
 
 // A cadence and its switch are two facts. A schedule that is saved but off
 // says so, because rendering it like a live one would promise a safety net
@@ -368,21 +385,34 @@ const schedulePill = (label, value, act, admin) => (admin
   ? `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v"><button type="button" class="sched-pill" data-act="${escapeAttr(act)}" title="${escapeAttr(T('elastic.schedule_edit'))}">${sprite('clock')} ${escapeHtml(value)}</button></span></div>`
   : row(label, value));
 
-function moverPanelHtml(array, disabled, reason, admin) {
+// Moving files off the cache is automatic, so nothing here is something an
+// admin has to operate: the rules, the optional window, the manual run and the
+// history live in a collapsed section. The main view carries only the one fact
+// about the DATA (`cachePendingHtml`).
+function moverAdvancedHtml(array, disabled, reason, admin, open) {
   const m = array.mover || {};
   const last = m.lastRun || null;
   const history = m.history || [];
-  return `<div class="section-card nas-mover"><div class="section-card-head"><div class="title">${sprite('transform')} ${escapeHtml(T('elastic.mover'))}</div><div class="actions">
-    ${admin ? `<tf-button variant="ghost" size="sm" icon="edit" data-act="mover-schedule">${escapeHtml(T('elastic.schedule_edit'))}</tf-button>` : ''}
-    <tf-button variant="primary" size="sm" icon="play" data-act="mover" ${disabled ? 'disabled' : ''}>${escapeHtml(T('elastic.mover_run_now'))}</tf-button></div></div>
+  return `<details class="section-card nas-mover" data-section="mover" ${open ? 'open' : ''}><summary class="section-card-head"><div class="title">${sprite('transform')} ${escapeHtml(T('elastic.mover'))}</div></summary>
+    <div class="actions mb-sm">
+    ${admin ? `<tf-button variant="ghost" size="sm" icon="edit" data-act="mover-schedule">${escapeHtml(T('elastic.mover_settings'))}</tf-button>` : ''}
+    <tf-button variant="secondary" size="sm" icon="play" data-act="mover" ${disabled ? 'disabled' : ''}>${escapeHtml(T('elastic.mover_run_now'))}</tf-button></div>
     <div class="explain-box mb-sm nas-mover-explain">${escapeHtml(moverExplain(m))}</div>
     ${reason ? `<div class="hint mb-sm">${escapeHtml(reason)}</div>` : ''}
-    ${m.enabled === false ? `<div class="hint mb-sm">${escapeHtml(T('elastic.mover_disabled'))}</div>` : ''}
+    ${m.enabled && m.schedule ? `<div class="hint mb-sm">${escapeHtml(T('elastic.mover_restricted'))}</div>` : ''}
     <div class="stat-rows">${schedulePill(T('elastic.mover_schedule'), moverScheduleValue(m), 'mover-schedule', admin)}${row(T('elastic.mover_rules'), moverRulesValue(m))}${row(T('elastic.mover_open_files'), T('elastic.mover_open_files_skipped'))}${row(T('elastic.mover_last_run'), moverLastRun(last))}${row(T('elastic.mover_moved'), moverMoved(last))}${row(T('elastic.mover_skipped'), moverSkipped(last))}</div>
     <div class="mover-hist">${escapeHtml(T('elastic.mover_history'))}: ${history.length ? history.map((run) => `<span>${escapeHtml(fmtDate(run.finishedAt || run.startedAt))} · ${escapeHtml(fmtOptionalBytes(run.movedBytes))}</span>`).join('') : `<span>${escapeHtml(T('elastic.mover_history_empty'))}</span>`}</div>
     <div class="explain-box mt-md nas-mover-parity-note">${escapeHtml(m.coupledSync === false ? T('elastic.mover_coupled_off') : T('elastic.mover_coupled_warning'))}</div>
-  </div>`;
+    <div class="hint mt-sm">${escapeHtml(T('elastic.mover_name_note'))}</div>
+  </details>`;
 }
+
+// The one line the main view says about moving: how much data sits on the cache
+// outside parity. A figure, never a fault — a non-zero value is the normal state
+// of an array with a cache, and the stuck alert is what reports a problem. The
+// number itself is written after the patch (`paintFigures`), so a changing byte
+// count never rebuilds the pane.
+const cachePendingHtml = () => `<div class="stat-rows nas-cache-pending"><div class="sr"><span class="k">${escapeHtml(T('elastic.cache_pending'))}</span><span class="v" data-fig="cache-pending"></span></div></div>`;
 
 // §5.3's three per-folder answers, in the order the mockup lists them. `yes`
 // is the DEFAULT and is spelled by the absence of a stored row on the node, so
@@ -502,15 +532,18 @@ function foldersPanelHtml(array, admin) {
 // not an absent one — it means every file is old enough to move.
 const MOVER_AGE_OPTIONS = [0, 1800, 7200, 86400];
 const MOVER_FREE_OPTIONS = [10, 20, 30];
-// The mover is the one cadence that runs sub-daily: it is cheap and its whole
-// job is to keep the cache drained between the slower parity runs.
+// The window may be as fine as a quarter of an hour: an admin who restricts
+// moving to, say, every 6 h still wants the cache drained several times a day.
 const MOVER_EVERY = ['15m', '30m', '1h', '6h', 'daily'];
-const MOVER_SCHEDULE_DEFAULT = { every: '1h', hour: 0, minute: 0, weekday: 0, day: 1 };
+// A window is for keeping the data disks quiet in working hours, so the one an
+// admin starts from is the night.
+const MOVER_SCHEDULE_DEFAULT = { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 };
 
 /**
- * n15's mover dialog: the cadence AND the rules in one window, because the
- * mockup is one form. Sends both in one request, so an admin who changes the
- * age and the cadence together cannot end up with half of it saved.
+ * n15's mover dialog: the optional window AND the rules in one window, because
+ * the mockup is one form. Sends both in one request, so an admin who changes
+ * the age and the window together cannot end up with half of it saved. The
+ * switch turns the window's RESTRICTION on; off, moving stays automatic.
  */
 export function openMoverScheduleEditor(screen, array, onDone) {
   const m = array.mover || {};
@@ -528,7 +561,7 @@ export function openMoverScheduleEditor(screen, array, onDone) {
   win.innerHTML = `
     <div slot="body" class="stack">
       <div class="toggle-card">
-        <div class="tc-text"><span>${escapeHtml(T('schedule.enabled'))}</span><span class="tc-sub">${escapeHtml(T('schedule.enabled_sub'))}</span></div>
+        <div class="tc-text"><span>${escapeHtml(T('elastic.mover_window_label'))}</span><span class="tc-sub">${escapeHtml(T('elastic.mover_window_sub'))}</span></div>
         <tf-toggle id="nas-mover-enabled" ${m.enabled ? 'checked' : ''}></tf-toggle>
       </div>
       ${scheduleFieldsHtml('nas-mover', schedule, { allowed: MOVER_EVERY })}
@@ -636,12 +669,18 @@ export async function drawElasticDetail(screen, body) {
   let submitted = false;
   let message = '';
   let submittedJobId = null;
+  let moverOpen = false;
   const expanded = new Set();
   const canRestore = () => array && array.enabled && !['active', 'creating'].includes(array.state)
     && !(array.snapraid?.history || []).some((run) => ['sync', 'scrub'].includes(run.kind) && ['running', 'failed', 'needs_attention'].includes(run.outcome));
+  // A SYNC AND A FULL SCRUB ARE WHAT SETTLE a parity run that ended without
+  // success, so they are offered on the array such a run left behind —
+  // `parityRunAvailable` is the node's own admission rule, and reading `state`
+  // plus `unresolvedOperation` here instead disabled the one action that
+  // resolves that state (W5/W6 of the fourth review).
   const maintenanceReason = () => !screen.isAdmin ? T('elevation.admin_only')
     : !(array?.parityDisks || []).length ? T('elastic.no_parity')
-      : !array.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
+      : !array.enabled || !array.parityRunAvailable ? T('elastic.maintenance_not_ready')
         : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running') : '';
   // The mover needs no parity — the helper skips the coupled sync on an array
   // without one — but it does need something to move, so a cacheless array is
@@ -666,10 +705,13 @@ export async function drawElasticDetail(screen, body) {
       : array.unresolvedOperation ? T('elastic.add_disk_unresolved')
         : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running')
           : array.mover?.lastRun?.outcome === 'running' ? T('elastic.mover_running') : '';
+  // An array whose only unresolved operations are mover runs is offered the
+  // mover: the next run is what settles them, and after the node's own
+  // attempts stop it is the admin's way on.
   const moverReason = () => !screen.isAdmin ? T('elevation.admin_only')
     : !(array?.cacheDisks || []).length ? T('elastic.mover_no_cache')
-      : !array.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
-        : array.unresolvedOperation ? T('elastic.mover_unresolved')
+      : !array.enabled || (array.state !== 'active' && !array.moverSettlesUnresolved) ? T('elastic.maintenance_not_ready')
+        : array.unresolvedOperation && !array.moverSettlesUnresolved ? T('elastic.mover_unresolved')
           : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running')
             : array.mover?.lastRun?.outcome === 'running' ? T('elastic.mover_running') : '';
 
@@ -696,21 +738,21 @@ export async function drawElasticDetail(screen, body) {
       <tf-button variant="ghost" data-act="back">${escapeHtml(T('elastic.back'))}</tf-button><tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
       ${error ? `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(error)}"></tf-alert>` : ''}
       ${array ? `<div class="kpi">
-        <tf-stat-card icon="cylinder" label="${escapeAttr(T('elastic.capacity'))}" value="${escapeAttr(fmtOptionalBytes(array.usedBytes))}" suffix="${escapeAttr('/ ' + fmtOptionalBytes(array.usableBytes))}"></tf-stat-card>
+        <tf-stat-card icon="cylinder" data-fig="capacity" label="${escapeAttr(T('elastic.capacity'))}"></tf-stat-card>
         <tf-stat-card icon="shield" label="${escapeAttr(T('elastic.protection'))}" value="${escapeAttr(protectionLabel(array))}" delta="${escapeAttr(T('elastic.last_sync') + ': ' + fmtDate(array.protection?.protectedAsOf))}"></tf-stat-card>
         <tf-stat-card icon="database" label="${escapeAttr(T('elastic.parity'))}" value="${(array.parityDisks || []).length}" delta="${escapeAttr(T('elastic.tolerance', { n: array.protection?.faultTolerance ?? '—' }))}"></tf-stat-card>
-        <tf-stat-card icon="database" label="${escapeAttr(T('elastic.cache'))}" value="${escapeAttr(fmtOptionalBytes(array.cacheUsedBytes))}" suffix="${escapeAttr('/ ' + fmtOptionalBytes(array.cacheSizeBytes))}"></tf-stat-card>
+        <tf-stat-card icon="database" data-fig="cache" label="${escapeAttr(T('elastic.cache'))}"></tf-stat-card>
       </div>
       <div class="section-card"><div class="section-card-head"><div class="title">${sprite('cylinder')} ${escapeHtml(T('elastic.disks'))}</div><span class="hint">${escapeHtml(T('elastic.independent_fs'))}</span></div>
         <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.data'))} · MERGERFS</span><span class="mono">${escapeHtml(array.unionPath)}</span><span class="hint">${escapeHtml(T('elastic.policy'))}: ${escapeHtml(array.createPolicy)}</span>${screen.isAdmin ? `<span class="actions"><tf-button variant="secondary" size="sm" icon="plus" data-act="add-disk" ${addDiskDisabled ? 'disabled' : ''} title="${escapeAttr(addDiskBlocked || T('elastic.add_disk_online'))}">${escapeHtml(T('elastic.add_disk'))}</tf-button></span>` : ''}</div>
           <div class="disk-cells">${(array.dataDisks || []).map((d) => diskHtml(d, d.filesystem || array.filesystem, repairFor())).join('')}</div>
           ${screen.isAdmin && addDiskBlocked ? `<div class="hint">${escapeHtml(addDiskBlocked)}</div>` : ''}</div>
         <div class="vdev-group"><div class="vg-head"><span class="vg-type">PARITY · SNAPRAID</span></div><div class="disk-cells">${(array.parityDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${!(array.parityDisks || []).length ? `<div class="hint">${escapeHtml(T('elastic.no_parity'))}</div>` : ''}</div>
-        <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.cache'))}</span><span class="hint">${escapeHtml(T('elastic.cache_no_protection'))}</span></div><div class="disk-cells">${(array.cacheDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${!(array.cacheDisks || []).length ? `<div class="hint">${escapeHtml(T('elastic.cache_none'))}</div>` : ''}</div>
+        <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.cache'))}</span><span class="hint">${escapeHtml(T('elastic.cache_no_protection'))}</span></div><div class="disk-cells">${(array.cacheDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${(array.cacheDisks || []).length ? cachePendingHtml() : `<div class="hint">${escapeHtml(T('elastic.cache_none'))}</div>`}</div>
       </div>
       ${foldersPanelHtml(array, screen.isAdmin)}
       <div class="grid-2"><div class="section-card"><div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('elastic.state'))}</div><tf-chip status="${status.tone}" dot label="${escapeAttr(status.label)}"></tf-chip></div>
-        <div class="stat-rows">${row(T('elastic.mountpoint'), array.unionPath)}${row(T('elastic.state'), array.stateDetail || status.label)}${row(T('elastic.unprotected_bytes'), fmtOptionalBytes(array.protection?.movedUnsyncedBytes))}${row(T('elastic.updated'), fmtDate(array.updatedAt))}</div>
+        <div class="stat-rows">${row(T('elastic.mountpoint'), array.unionPath)}${row(T('elastic.state'), array.stateDetail || status.label)}<div class="sr"><span class="k">${escapeHtml(T('elastic.unprotected_bytes'))}</span><span class="v" data-fig="moved-unsynced"></span></div><div class="sr"><span class="k">${escapeHtml(T('elastic.updated'))}</span><span class="v" data-fig="updated"></span></div></div>
         <div class="explain-box mt-md">${escapeHtml(T('elastic.restore_hint'))}</div>
         ${screen.isAdmin && canRestore() ? `<tf-button variant="secondary" class="mt-md" data-act="restore" ${busy || submitted ? 'disabled' : ''}>${escapeHtml(T('elastic.restore'))}</tf-button>` : ''}
         ${!screen.isAdmin ? `<div class="hint mt-sm">${escapeHtml(T('elevation.admin_only'))}</div>` : ''}
@@ -719,7 +761,8 @@ export async function drawElasticDetail(screen, body) {
         <tf-button variant="secondary" size="sm" icon="refresh" data-act="sync" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.sync_now'))}</tf-button><tf-button variant="ghost" size="sm" icon="search" data-act="scrub" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.scrub_now'))}</tf-button></div></div>
         ${maintenanceReason() ? `<div class="hint mb-sm">${escapeHtml(maintenanceReason())}</div>` : ''}${repairUnavailable ? `<div class="hint mb-sm">${escapeHtml(repairUnavailable)}</div>` : ''}<div class="stat-rows">
         ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.last_scrub'), fmtDate(array.snapraid?.lastScrub?.finishedAt))}${schedulePill(T('elastic.sync_schedule'), cadenceValue(array.snapraid?.syncSchedule, array.snapraid?.syncScheduleEnabled), 'sync-schedule', screen.isAdmin)}${schedulePill(T('elastic.scrub_schedule'), cadenceValue(array.snapraid?.scrubSchedule, array.snapraid?.scrubScheduleEnabled), 'scrub-schedule', screen.isAdmin)}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
-      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div>${moverPanelHtml(array, moverDisabled, moverReason(), screen.isAdmin)}</div>
+      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div></div>
+      ${moverAdvancedHtml(array, moverDisabled, moverReason(), screen.isAdmin, moverOpen)}
       ${screen.isAdmin ? `<div class="section-card danger-zone"><h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
         ${dangerRowHtml({ title: T('elastic.dissolve', { name: array.name }), desc: T('elastic.dissolve_desc'), action: T('elastic.dissolve_action'), icon: 'trash', act: 'destroy', disabled: busy || submitted })}
       </div>` : ''}` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
@@ -727,7 +770,12 @@ export async function drawElasticDetail(screen, body) {
     // there polls to byte-identical markup, so nothing is destroyed and every
     // listener below stays bound; when it DOES differ the pane is rebuilt and
     // re-wired in the same breath, so a handler can never outlive its markup.
-    if (!patchHtml(view, html)) return;
+    // The byte figures that move on every write are NOT in that string: they
+    // are written in place after it, so a growing cache changes text nodes
+    // instead of rebuilding the pane.
+    const rebuilt = patchHtml(view, html);
+    if (array) paintFigures();
+    if (!rebuilt) return;
     view.querySelector('[data-act="back"]').addEventListener('click', () => { if (isCurrent()) screen.openArray(null); });
     view.querySelector('.nas-crumbs').addEventListener('click', (event) => {
       if (!event.target.closest('a')) return;
@@ -783,10 +831,33 @@ export async function drawElasticDetail(screen, body) {
     view.querySelectorAll('[data-act="history-job"]').forEach((button) => button.addEventListener('click', () => {
       if (isCurrent()) screen.openJobLog(button.dataset.job, finishJob);
     }));
+    view.querySelector('details[data-section="mover"]')?.addEventListener('toggle', (event) => {
+      if (isCurrent() && event.currentTarget.isConnected) moverOpen = event.currentTarget.open;
+    });
     view.querySelectorAll('details[data-run]').forEach((details) => details.addEventListener('toggle', () => {
       if (!isCurrent() || !details.isConnected) return;
       if (details.open) expanded.add(details.dataset.run); else expanded.delete(details.dataset.run);
     }));
+  };
+
+  // Every figure that changes while an array simply serves: capacity, the cache
+  // fill and what waits on it, per-disk usage, new data outside sync and the
+  // last update. setAttr/setText touch a node only when its value differs.
+  const paintFigures = () => {
+    const cap = view.querySelector('tf-stat-card[data-fig="capacity"]');
+    setAttr(cap, 'value', fmtOptionalBytes(array.usedBytes));
+    setAttr(cap, 'suffix', '/ ' + fmtOptionalBytes(array.usableBytes));
+    const cache = view.querySelector('tf-stat-card[data-fig="cache"]');
+    setAttr(cache, 'value', fmtOptionalBytes(array.cacheUsedBytes));
+    setAttr(cache, 'suffix', '/ ' + fmtOptionalBytes(array.cacheSizeBytes));
+    setText(view.querySelector('[data-fig="cache-pending"]'), fmtOptionalBytes(array.protection?.cacheUnprotectedBytes));
+    setText(view.querySelector('[data-fig="moved-unsynced"]'), fmtOptionalBytes(array.protection?.movedUnsyncedBytes));
+    setText(view.querySelector('[data-fig="updated"]'), fmtDate(array.updatedAt));
+    const disks = [...(array.dataDisks || []), ...(array.parityDisks || []), ...(array.cacheDisks || [])];
+    view.querySelectorAll('.disk-cell[data-disk]').forEach((cell) => {
+      const disk = disks.find((d) => d.diskId === cell.dataset.disk && d.name === cell.dataset.branch);
+      if (disk) setText(cell.querySelector('[data-fig="disk-usage"]'), `${fmtOptionalBytes(disk.usedBytes)} / ${fmtOptionalBytes(disk.sizeBytes)}`);
+    });
   };
 
   const finishJob = async (job) => {
