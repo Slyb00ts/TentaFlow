@@ -4289,11 +4289,15 @@ fn apply_agent_runtime_engine(
     // machine never made — the operator would then route work to a node with no
     // binary. Terminal, not deferred: no later state makes this operation legal.
     if local_node_id(tx)?.as_deref() == Some(node_id.as_str())
-        && operation.body.actor_node_id.as_deref() != Some(node_id.as_str())
+        && operation.body.actor_node_id != node_id
     {
         return Err(SyncLedgerError::Runtime(format!(
             "node {} may not assert the agent runtime of this node",
-            operation.body.actor_node_id.as_deref().unwrap_or("unknown")
+            if operation.body.actor_node_id.is_empty() {
+                "unknown"
+            } else {
+                operation.body.actor_node_id.as_str()
+            }
         )));
     }
     match operation.body.action {
