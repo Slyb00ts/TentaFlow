@@ -213,11 +213,24 @@ pub enum Decision {
 
 /// Why the user is being asked. `PatchReview` is not a normal permission
 /// prompt: it shows the diff and its answer decides what gets committed.
+/// `AccountLogin` is not a permission prompt at all — nothing is granted, the
+/// missing thing is an account — and it is the one kind whose answer arrives
+/// from outside the card (a successful sign-in).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskKind {
     Permission,
     PatchReview,
+    AccountLogin,
 }
+
+/// The slug the `approvals` row of an account ask carries (C01).
+///
+/// Deliberately NOT a `Capability`. `Capability` is the vocabulary of what a run
+/// may DO with a workspace, and `assertion.rs` derives every role's grant list
+/// from `Capability::ALL` — a pseudo-capability added there would quietly widen
+/// the RBAC matrix of the signed mesh assertion. Nothing is granted by this
+/// ask, so nothing belongs in that enum.
+pub const ACCOUNT_LOGIN_CAPABILITY: &str = "account_login";
 
 /// Everything the decision depends on, gathered by the caller so this function
 /// stays pure and testable.
@@ -566,16 +579,21 @@ pub fn validate_grant_pattern(pattern: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Stable identity of "this capability against this target". One definition,
-/// because two writers with two conventions produce grants that silently never
-/// match — or, worse, match everything.
-pub fn target_digest(cap: Capability, pattern: &str) -> String {
+/// Stable identity of "this ask against this target". One definition, because
+/// two writers with two conventions produce rows that silently never match —
+/// or, worse, match everything.
+pub fn target_digest_for(slug: &str, pattern: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(cap.slug().as_bytes());
+    hasher.update(slug.as_bytes());
     hasher.update([0u8]);
     hasher.update(pattern.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// `target_digest_for` for the capability vocabulary.
+pub fn target_digest(cap: Capability, pattern: &str) -> String {
+    target_digest_for(cap.slug(), pattern)
 }
 
 #[cfg(test)]

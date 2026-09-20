@@ -393,6 +393,7 @@ fn account_info(account: &AccountRecord, dec: &Decorations) -> ProviderAccountIn
         agent_count: dec.agents.count(account),
         updated_at: account.updated_at.clone(),
         used_on: dec.used_on(&account.account_id),
+        max_sessions: account.max_sessions,
     }
 }
 
@@ -549,6 +550,7 @@ fn account_update(
     account_id: &str,
     display_name: &Option<String>,
     status: &Option<String>,
+    max_sessions: &Option<i64>,
 ) -> Result<MessageBody, ProtocolError> {
     let caller = caller(ctx)?;
     let account = visible_account(ctx, &caller, account_id)?;
@@ -564,11 +566,19 @@ fn account_update(
     if status.is_some() {
         caller.require_admin("changing an account's status")?;
     }
+    // A limit is not about this account's credential but about how much of the
+    // node one account may occupy at once, so it is reached through the same
+    // gate as disabling: an administrator's decision, also on an account the
+    // caller owns.
+    if max_sessions.is_some() {
+        caller.require_admin("limiting an account's concurrent sessions")?;
+    }
     let update = AccountUpdate {
         display_name: display_name.clone(),
         status: status.clone(),
         plan_label: None,
         home_node_id: None,
+        max_sessions: *max_sessions,
     };
     let existed = store::update_account(&ctx.state.db, account_id, &update, Some(&caller.user_id))
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
@@ -1478,7 +1488,8 @@ pub async fn provider_account_dispatch(
             account_id,
             display_name,
             status,
-        } => account_update(ctx, account_id, display_name, status),
+            max_sessions,
+        } => account_update(ctx, account_id, display_name, status, max_sessions),
         P::AccountDeleteRequest { account_id } => account_delete(ctx, account_id).await,
         P::CredentialSetRequest {
             account_id,
@@ -2438,6 +2449,7 @@ mod tests {
                 account_id: "a".to_string(),
                 display_name: None,
                 status: None,
+                max_sessions: None,
             }),
             pa(P::AccountDeleteRequest {
                 account_id: "a".to_string(),
@@ -2615,6 +2627,7 @@ mod tests {
                 account_id: "acc-shared".to_string(),
                 display_name: Some("Taken over".to_string()),
                 status: None,
+                max_sessions: None,
             }),
             pa(P::SessionListRequest {
                 account_id: "acc-shared".to_string(),
@@ -2751,6 +2764,7 @@ mod tests {
                 account_id: "acc-alice".to_string(),
                 display_name: Some("Konto Alicji".to_string()),
                 status: None,
+                max_sessions: None,
             }),
         ] {
             let error = provider_account_dispatch(&request, &admin)
@@ -2777,6 +2791,7 @@ mod tests {
                 account_id: "acc-alice".to_string(),
                 display_name: Some("Moje Codex".to_string()),
                 status: None,
+                max_sessions: None,
             }),
             pa(P::CredentialClearRequest {
                 account_id: "acc-alice".to_string(),
@@ -2798,6 +2813,7 @@ mod tests {
                 account_id: "acc-alice".to_string(),
                 display_name: None,
                 status: Some("disabled".to_string()),
+                max_sessions: None,
             }),
             &admin,
         )

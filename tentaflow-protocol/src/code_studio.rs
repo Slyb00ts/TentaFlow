@@ -105,8 +105,6 @@ pub struct ProvisionStepInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
-    #[serde(default)]
-    pub agent_service_id: Option<i64>,
     pub workspace_id: String,
     pub title: String,
     pub branch: String,
@@ -388,6 +386,39 @@ pub struct ApprovalInfo {
     /// at once — so the approval has to name WHICH one it decides.
     #[serde(default)]
     pub patch_set_id: Option<String>,
+    /// The account this question is about, present only for a
+    /// `capability = "account_login"` row — the agent stopped because its
+    /// account is missing (C01). Carried on the row for the same reason
+    /// `patch_set_id` is: the console rebuilds the question from the poll alone,
+    /// and a card that had to cross-reference the run list would render an
+    /// amnesiac version of itself whenever the two lists were a poll apart.
+    #[serde(default)]
+    pub account: Option<AskAccountInfo>,
+}
+
+/// The account question of a paused run (C01), as the console needs it.
+///
+/// Read-only description of what was asked: which agent stopped, on which
+/// application, under which binding, and whether an account of the user's own
+/// already exists. It carries no credential and no permission — connecting is
+/// the whole answer, and the run re-resolves the account afterwards.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AskAccountInfo {
+    /// `claude-code` | `codex` | `grok-build` | `muse-code`.
+    pub engine_id: String,
+    /// The provider's product name for that id (`provider_accounts::engine`).
+    pub engine_name: String,
+    /// `global` | `user` — the agent's binding, which is WHY it was refused.
+    pub mode: String,
+    /// The agent that could not start.
+    pub agent_name: String,
+    /// The user's own account for the engine that exists but cannot be used.
+    /// Absent when they have no account for it at all — the difference between
+    /// "connect one" and "sign in again".
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub account_name: Option<String>,
 }
 
 /// A standing permission: either a session grant or a workspace allowlist row.
@@ -464,6 +495,35 @@ pub struct RunInfo {
     /// while being a guess.
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// The account this run's CLI actually ran on (§2.5, C02). Absent for an
+    /// agent that runs an LLM: there is no provider account behind it, and a
+    /// chip that named one would be a fabrication.
+    #[serde(default)]
+    pub account: Option<RunAccountInfo>,
+}
+
+/// The account one run ran on, taken from the CLI instance the run started —
+/// the durable record of WHICH account served it, not a re-resolution of the
+/// agent's binding at read time.
+///
+/// The difference matters: `agents.runtime_json` says what should resolve NOW,
+/// and an operator may rebind an agent after the run. A chip that followed the
+/// binding would silently relabel finished work with an account it never used.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAccountInfo {
+    /// The provider's own product name (`provider_accounts::AGENT_ENGINES`).
+    /// DATA, not prose: there is nothing here to translate.
+    pub engine_name: String,
+    /// `global` | `user` — the scope of the account that served the run. A
+    /// `global` binding resolves only to a global account and a `user` binding
+    /// only to that user's own, so this IS the binding that selected it.
+    pub mode: String,
+    /// The account that served the run.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// The account's own display name, for the chip. Absent with `account_id`.
+    #[serde(default)]
+    pub account_name: Option<String>,
 }
 
 /// One row of the server-side VT grid. `text` holds the row's characters and
@@ -603,28 +663,6 @@ pub struct RepoEntryInfo {
     pub blob_oid: String,
 }
 
-/// Provider credential of one CLI engine on one node (§5.2, §7.5).
-///
-/// The material is deliberately absent and there is no field it could travel
-/// in: the row is node-local key material, and the only two consumers are the
-/// git broker and the provider adapter, both inside the owner node's process.
-/// `fingerprint` is a digest that identifies WHICH key is stored without being
-/// able to reconstruct it — the same thing `WorkspaceSecretSetResponse` shows.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentCredentialInfo {
-    /// Node whose vault holds the material. A credential is meaningless on any
-    /// other node, so the UI has to show which one it belongs to.
-    pub node_id: String,
-    pub engine_id: String,
-    /// Upstream the adapter forwards to once it has injected the material.
-    pub provider_base_url: String,
-    pub fingerprint: Option<String>,
-    pub created_by: String,
-    pub created_at: String,
-    pub rotated_at: Option<String>,
-    pub last_used_at: Option<String>,
-}
-
 /// Code Studio message family (request + response). ciborium encodes variants
 /// external-tagged by variant NAME, so never rename variants or fields without
 /// updating the frontend and the golden test (`code_studio_wire_golden`).
@@ -730,8 +768,6 @@ pub enum CodeStudioPayload {
     },
     SessionOpenRequest {
         workspace_id: String,
-        #[serde(default)]
-        agent_service_id: Option<i64>,
         title: String,
         autonomy_mode: String,
     },
@@ -1614,47 +1650,6 @@ pub enum CodeStudioPayload {
         has_more: bool,
     },
 
-    // ---- Provider credentials of the CLI engines (§5.2, §7.5) ----
-    /// Lists what the vault of ONE node holds. `node_id` empty means this node;
-    /// naming another node forwards the call there, because the answer is a
-    /// fact about that node's vault and nothing else can know it.
-    AgentCredentialsListRequest {
-        #[serde(default)]
-        node_id: String,
-    },
-    AgentCredentialsListResponse {
-        node_id: String,
-        credentials: Vec<AgentCredentialInfo>,
-        /// Engines this build can put behind the adapter at all. The picker is
-        /// built from it so the browser never keeps its own copy of the list.
-        engines: Vec<String>,
-    },
-    /// Stores or ROTATES the provider credential of one engine. There is no
-    /// separate rotate variant: the row is keyed by (org, node, engine), so a
-    /// second write replaces the material in place instead of leaving two.
-    AgentCredentialSetRequest {
-        #[serde(default)]
-        node_id: String,
-        engine_id: String,
-        /// Upstream the adapter forwards to. Stored with the material because
-        /// it is part of the same decision: which provider this key pays for.
-        provider_base_url: String,
-        /// The one direction material travels. Nothing sends it back.
-        credential_material: String,
-    },
-    AgentCredentialSetResponse {
-        credential: AgentCredentialInfo,
-    },
-    AgentCredentialDeleteRequest {
-        #[serde(default)]
-        node_id: String,
-        engine_id: String,
-    },
-    AgentCredentialDeleteResponse {
-        node_id: String,
-        engine_id: String,
-        removed: bool,
-    },
 
     /// The session's PLAN — the task rows `core.task_plan` wrote and
     /// `core.task_update` moves. Read-only: the plan belongs to the agents that
@@ -1718,14 +1713,14 @@ mod tests {
         let entries = payload.entries();
         assert_eq!(
             payload.members.len(),
-            141,
+            135,
             "CodeStudioPayload variant COUNT changed. Appending is fine — update the count and \
              the digest below in the same commit. Live entries:\n{}",
             entries.join("\n")
         );
         assert_eq!(
             name_digest(&entries),
-            0x9ffe_f5aa_2734_19df,
+            0x2cf8_e9cb_5203_5ab6,
             "CodeStudioPayload variant NAMES, their FIELDS, their ORDER or a serde attribute \
              changed. ciborium tags variants by name, so a rename silently breaks every \
              deployed browser while the round-trip tests stay green. Rename back, or update \
@@ -1743,13 +1738,13 @@ mod tests {
         let names: Vec<String> = structs.iter().map(|item| item.name.clone()).collect();
         assert_eq!(
             names.len(),
-            35,
+            36,
             "wire struct COUNT changed. Live structs:\n{}",
             names.join("\n")
         );
         assert_eq!(
             name_digest(&names),
-            0x3749_e55e_d5a9_3ef5,
+            0x005e_728f_31eb_739d,
             "wire struct NAMES or their DECLARATION ORDER changed. Reordering two struct \
              blocks does not move the wire — only field and variant order does — so \
              that case is a safe digest update, not a break. Live structs:\n{}",
@@ -1763,7 +1758,7 @@ mod tests {
             ("WorkspaceMemberInput", 2, 0xf54d_b307_8d15_95b7),
             ("ProvisionStepInfo", 4, 0x68e3_5d46_c0ea_f287),
             ("SessionInfo", 11, 0x824b_2889_46d8_1e69),
-            ("WorkspaceNodeInfo", 5, 0x5e72_1429_781a_dcce),
+            ("WorkspaceNodeInfo", 7, 0x1fdd_c153_1d00_fdd1),
             ("FileEntryInfo", 4, 0x3ccf_07ec_9800_df5f),
             ("GrepHitInfo", 4, 0x1650_e8d7_e4e5_d9f2),
             ("GitStatusEntry", 4, 0x49e5_76c6_7324_6b20),
@@ -1778,11 +1773,13 @@ mod tests {
             ("PatchFileDecision", 4, 0x15bf_36bc_d81c_98e8),
             ("TimelineEventInfo", 8, 0xc583_d9de_648e_8c65),
             ("OperationInfo", 12, 0x6921_0764_102a_67ac),
-            ("ApprovalInfo", 14, 0xc27f_3563_6891_25d5),
+            ("ApprovalInfo", 15, 0xd781_163a_0619_a549),
+            ("AskAccountInfo", 6, 0xaad2_25bf_7171_2466),
             ("GrantInfo", 5, 0x1a7f_f555_54db_8b6a),
             ("AllowlistEntryInfo", 5, 0xc64d_a277_ad31_dd0f),
             ("TaskInfo", 5, 0xd6b6_43d9_787f_b53c),
-            ("RunInfo", 14, 0x33d4_3ab8_6e9e_3cca),
+            ("RunInfo", 15, 0x18be_a482_2378_23a2),
+            ("RunAccountInfo", 4, 0xc21b_f4c3_d295_80e3),
             ("TerminalCellRow", 3, 0xf95e_9a96_0477_8adc),
             ("IndexStateInfo", 6, 0xf9f3_c916_3f7d_79f3),
             ("CodeSearchHit", 7, 0x0997_eab9_7cfa_8437),
@@ -1792,7 +1789,6 @@ mod tests {
             ("WorkspaceUserCandidate", 3, 0x36ee_e757_d9b8_5892),
             ("ProjectLinkInfo", 4, 0x26dd_9e9b_d518_ac33),
             ("RepoEntryInfo", 3, 0x1b40_a301_64bc_d837),
-            ("AgentCredentialInfo", 8, 0x8739_d280_a6ae_8d9f),
         ];
         assert_eq!(pinned.len(), structs.len());
         for (name, count, digest) in pinned {
@@ -2011,6 +2007,18 @@ mod tests {
         )
         .expect("approval without patch set");
         assert_eq!(approval.patch_set_id, None);
+        assert_eq!(approval.account, None);
+
+        // The account question (C01) as a row written before the column
+        // existed reads back: no description, so the console falls back to the
+        // summary rather than failing the poll.
+        let account_ask: AskAccountInfo = serde_json::from_str(
+            r#"{"engine_id":"codex","engine_name":"Codex","mode":"user",
+                "agent_name":"code-planner"}"#,
+        )
+        .expect("account question without the account it is about");
+        assert_eq!(account_ask.account_id, None);
+        assert_eq!(account_ask.account_name, None);
 
         let run: RunInfo = serde_json::from_str(
             r#"{"run_id":"r1","ordinal":1,"kind":"root","trigger":"user","parent_run_id":null,
@@ -2022,6 +2030,7 @@ mod tests {
         assert_eq!(run.completion_tokens, 0);
         assert_eq!(run.model, None);
         assert_eq!(run.cost_usd, None);
+        assert_eq!(run.account, None);
 
         let workspace: WorkspaceInfo = serde_json::from_str(
             r#"{"workspace_id":"w1","name":"Core","slug":"core","node_id":"n1","node_name":"dev",
@@ -2091,6 +2100,7 @@ mod tests {
                 decided_at: None,
                 decided_by: None,
                 patch_set_id: None,
+                account: None,
             };
             let bytes = crate::cbor::encode(&stored).expect("encode");
             assert_eq!(
@@ -2709,57 +2719,12 @@ mod tests {
                 behind: 0,
                 error: None,
             },
-            CodeStudioPayload::AgentCredentialSetResponse {
-                credential: sample_agent_credential(),
-            },
-            CodeStudioPayload::AgentCredentialsListResponse {
-                node_id: "n1".into(),
-                credentials: vec![sample_agent_credential()],
-                engines: vec!["claude-code".into(), "codex".into()],
-            },
         ];
         for response in responses {
             let json = serde_json::to_string(&response).expect("json");
             assert!(!json.contains("secret_material"), "{json}");
             assert!(!json.contains("secret_ref"), "{json}");
-            assert!(!json.contains("credential_material"), "{json}");
         }
-    }
-
-    fn sample_agent_credential() -> AgentCredentialInfo {
-        AgentCredentialInfo {
-            node_id: "n1".into(),
-            engine_id: "claude-code".into(),
-            provider_base_url: "https://api.anthropic.com".into(),
-            fingerprint: Some("sha256:abc".into()),
-            created_by: "u-admin".into(),
-            created_at: "2026-08-14T10:00:00Z".into(),
-            rotated_at: None,
-            last_used_at: None,
-        }
-    }
-
-    /// The provider credential travels in exactly one direction. The request
-    /// names the material; the row that comes back names a digest, an upstream
-    /// and who wrote it — and a struct with nowhere to put a key is a stronger
-    /// guarantee than a handler that remembers not to fill one in.
-    #[test]
-    fn a_provider_credential_only_travels_towards_the_vault() {
-        let request = CodeStudioPayload::AgentCredentialSetRequest {
-            node_id: "n1".into(),
-            engine_id: "claude-code".into(),
-            provider_base_url: "https://api.anthropic.com".into(),
-            credential_material: "sk-ant-secret".into(),
-        };
-        let bytes = crate::cbor::encode(&request).expect("encode");
-        assert_eq!(
-            crate::cbor::decode::<CodeStudioPayload>(&bytes).expect("decode"),
-            request
-        );
-
-        let json = serde_json::to_string(&sample_agent_credential()).expect("json");
-        assert!(!json.contains("sk-ant-secret"), "{json}");
-        assert!(!json.contains("material"), "{json}");
     }
 
     /// A worktree row must not carry its on-disk location: that is a host path

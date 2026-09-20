@@ -481,17 +481,13 @@ impl AgentRunManager {
         // and that pin belongs to the SESSION, not to the agent definition — the
         // same agent serves every workspace. The caller therefore names the flow
         // when it has one; everyone else keeps the agent's own harness.
-        let flow = flow_override
-            .filter(|flow| !flow.flow_id.is_empty())
-            .unwrap_or_else(|| {
-                FlowRef::live(
-                    agent
-                        .flow_id
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(crate::flow_engine::node_adapters::AGENT_RUN_FLOW_ID),
-                )
-            });
+        let flow = match flow_override.filter(|flow| !flow.flow_id.is_empty()) {
+            Some(flow) => flow,
+            None => FlowRef::live(match agent.flow_id.as_deref().filter(|s| !s.is_empty()) {
+                Some(flow_id) => flow_id.to_string(),
+                None => crate::flow_engine::node_adapters::flow_for(&agent)?.to_string(),
+            }),
+        };
 
         // The permit is acquired INSIDE the task, not here: a saturated pool must
         // not block `spawn` (a parent dispatching a batch returns immediately, the

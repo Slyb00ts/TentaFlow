@@ -1450,6 +1450,7 @@ function renderConfigTab(body) {
 
     ${sectionCard('brain', 'section_model', `
       <div class="agents-runtime-switch">
+        <div class="agents-field-label">${escapeHtml(t('label_runtime_kind'))}</div>
         <tf-segmented data-runtime-kind size="md" value="${escapeAttr(c.runtime_kind)}">
           <option value="llm">${escapeHtml(t('runtime_kind_llm'))}</option>
           <option value="cli">${escapeHtml(t('runtime_kind_cli'))}</option>

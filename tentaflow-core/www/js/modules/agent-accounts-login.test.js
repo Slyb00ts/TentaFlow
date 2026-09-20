@@ -48,7 +48,7 @@ const { I18n } = await import('/js/i18n.js');
 await I18n.setLanguage('pl');
 const { LoginFlow, safeHttpUrl } = await import('/js/modules/agent-accounts-login.js');
 const {
-  AgentAccounts, LOGIN_START_TIMEOUT_MS, LOGIN_STEP_TIMEOUT_MS, describeError,
+  AgentAccounts, LOGIN_START_TIMEOUT_MS, LOGIN_STEP_TIMEOUT_MS, describeError, errorText,
 } = await import('/js/modules/agent-accounts.js');
 
 const pl = JSON.parse(readFileSync(join(WWW_ROOT, 'i18n', 'pl.json'), 'utf8')).agent_accounts;
@@ -270,9 +270,61 @@ test('a transport rejection without a message key falls back to the generic erro
     code: 'PolicyDenied',
     message: 'not your account',
     detail: '',
+    appendDetail: false,
   });
   assert.equal(describeError(new Error('the socket is gone')).code, '');
   assert.equal(describeError(new Error('the socket is gone')).message, 'the socket is gone');
+});
+
+test('the fleet refusal is translated and the node\'s own sentence is kept under it', () => {
+  const sentence = "node '6b09c33d' is the home of 1 agent account(s); sign those accounts in "
+    + 'on another node before taking it out of the account fleet';
+  assert.deepEqual(describeError(new Error(`protocol error BadRequest: ${sentence}`)), {
+    code: 'BadRequest',
+    message: pl.receives_home_refused,
+    detail: sentence,
+    appendDetail: true,
+  });
+  // The node's sentence names the remedy for the kinds homed there, so the same
+  // translated line has to carry it whether the store said "sign those accounts
+  // in" or "paste their API key".
+  const keyOnly = "node '6b09c33d' is the home of 1 agent account(s); paste their API key "
+    + 'on another node before taking it out of the account fleet';
+  assert.deepEqual(describeError(new Error(`protocol error BadRequest: ${keyOnly}`)), {
+    code: 'BadRequest',
+    message: pl.receives_home_refused,
+    detail: keyOnly,
+    appendDetail: true,
+  });
+  // The marker is only the fleet toggle's when the code agrees: an unrelated
+  // refusal that happens to contain the same words must not borrow the text.
+  assert.equal(
+    describeError(new Error('protocol error Conflict: a node is the home of that share')).message,
+    'a node is the home of that share',
+  );
+});
+
+// `errorText` is the toast string. Only the fleet refusal declares
+// `appendDetail`, so its generic remedy reaches the operator and every other
+// translation stays a single line — the node's English sentence is what a window
+// keeps for its `title`, not what an operator reads in their own language.
+test('only the fleet refusal carries the node\'s sentence into a toast', () => {
+  const fleet = "node '6b09c33d' is the home of 2 agent account(s); paste their API key "
+    + 'on another node before taking it out of the account fleet';
+  assert.equal(
+    errorText(new Error(`protocol error BadRequest: ${fleet}`)),
+    `${pl.receives_home_refused}\n${fleet}`,
+  );
+
+  const disabled = 'protocol error PolicyDenied: this account is disabled';
+  assert.equal(errorText(new Error(disabled)), pl.login.account_disabled);
+  assert.ok(!errorText(new Error(disabled)).includes('this account is disabled'));
+
+  // An unmapped refusal is the server's own sentence, with nothing to append.
+  assert.equal(
+    errorText(new Error('protocol error PolicyDenied: some refusal nobody mapped')),
+    'some refusal nobody mapped',
+  );
 });
 
 test('only an http(s) address from the terminal becomes a link', () => {

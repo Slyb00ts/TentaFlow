@@ -10,10 +10,12 @@
 // the HLC is minted there, and a capture committed without its row (or a row
 // committed without its capture) would replicate a state that never existed.
 //
-// The vault (`code_workspace_secrets`, `code_agent_credentials`) has no capture
-// here and never will — its material is encrypted with the per-node
-// SettingsCipher key (plan §5.2). It does not even share this database: the
-// vault and the saga state live in the instance content DB (`code_studio::db`).
+// The vault (`code_workspace_secrets`) has no capture here and never will — its
+// material is encrypted with the per-node SettingsCipher key (plan §5.2). It
+// does not even share this database: the vault and the saga state live in the
+// instance content DB (`code_studio::db`). Provider credentials are not part of
+// Code Studio's state at all any more; they belong to a `provider_accounts`
+// account and replicate through that registry's own descriptors.
 
 use std::collections::BTreeMap;
 

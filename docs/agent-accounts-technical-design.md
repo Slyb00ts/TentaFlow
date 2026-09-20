@@ -75,6 +75,20 @@ CREATE UNIQUE INDEX idx_provider_account_sessions_vendor
 CREATE INDEX idx_provider_account_sessions_user ON provider_account_sessions(account_id, user_id);
 ```
 
+Migration 161 replaces that index, which never fired: the vendor conversation is not
+among its columns (`agent_id` was NULL for every row the session recorder wrote, and
+SQLite treats NULLs as distinct). The index is now drawn on the conversation alone —
+one vendor conversation is driven by one recorded session, and `upsert_session` clears
+the row a conversation was recorded under before recording it for the session that has
+it now (`db/migrations.rs:1395-1398`):
+
+```sql
+DROP INDEX IF EXISTS idx_provider_account_sessions_vendor;
+CREATE UNIQUE INDEX idx_provider_account_sessions_vendor
+    ON provider_account_sessions(vendor_session_id)
+    WHERE vendor_session_id IS NOT NULL;
+```
+
 Node-local, **never synced** (it is per-node truth, like `provider_account_node_state.applied_revision`):
 
 ```sql
@@ -338,7 +352,7 @@ After the change:
 | Concern | Owner |
 |---|---|
 | account identity, grants, credential, status | `provider_account*` tables |
-| CLI binary present on a node, version, pinned artifact (`tentaflow-core/src/services/deploy/managed_cli.rs:14-31`) | `agent_runtime_engines`, installed by the existing `NativeManagedCli` deploy path |
+| CLI binary present on a node, version, install state (`tentaflow-core/src/services/deploy/managed_cli.rs`) | `agent_runtime_engines`, installed by the existing `NativeManagedCli` deploy path, which resolves the vendor's newest release at install time |
 | the bridge process | one `services` row **per (engine, node)**, not per account — started on demand |
 | egress allowlist per engine (`provider_config:121`) | unchanged, `tentaflow-core/src/services/coding_agent_proxy.rs` |
 | model catalogue sync (`sync_coding_agent_models:929-1002`) | unchanged, keyed by engine |
@@ -403,7 +417,7 @@ Every caller goes through this one function: `delegate_cli::execute` (`tentaflow
 
 History, sessions and caches stay private per instance — that is what makes two agents in one workspace (C02) independent.
 
-`vendor_session_id` is bound to **(account_id, user_id, agent_id, workspace_id)** by the unique index in §A.1: the same user resuming the same agent in the same workspace reattaches the vendor session; a different agent in the same directory gets a new one. `close_session_instances` (`tentaflow-core/src/code_studio/cli_bridge.rs:1515`) clears the runtime instance but leaves the binding row, so resume works after a restart.
+`vendor_session_id` is bound to the **conversation alone** by the unique index in §A.1 as migration 161 replaced it: one vendor conversation is driven by one recorded session, so the same user resuming that conversation reattaches the session that recorded it — whatever agent or workspace asks — and a second live session cannot claim a conversation one already holds, because `upsert_session` clears the previous row first. Sessions of one account in one workspace stay free to run at the same time; that concurrency is what the shared credential directory exists for (§2.5). `close_session_instances` (`tentaflow-core/src/code_studio/cli_bridge.rs:1515`) clears the runtime instance but leaves the binding row, so resume works after a restart.
 
 ### D.5 Paused turn and resume (C01)
 
@@ -639,14 +653,18 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
        directions (that state is only reached by deleting the home node, and the honest answer is
        that an administrator must name a new one);
     3. **revocation** — the revision must be above `provider_accounts.credential_revoked_revision`.
-    **The home node is the node that MINTED the current credential.** `login.rs::adopt_credential`
-    already recorded it; `write_credential` now does the same for a local mint that finds it NULL
-    (the pasted API key), and a mint NEVER takes over a home that exists — except a SIGN-IN, which
-    is the one operation that produces a credential on a chosen node and therefore moves the home to
-    it (`login.rs:605`, unchanged). That is what makes the rule stable: a rotation cannot promote its
-    node, only a deliberate sign-in can. `AccountUpdate.home_node_id` exists in the store but no wire
-    variant carries it, so there is no "move home" button and the operator moves it by signing in on
-    the target node; exposing a separate control would let an administrator name a node that never
+    **The home node is the node where the credential was DELIBERATELY PLACED.** `write_credential`
+    records it for a local mint (no expected revision), and a mint by an ADMINISTRATOR PASTING AN API
+    KEY takes over a home that already exists: that key exists only where it was pasted, so pasting
+    it on another node is the ONLY operation that can move such an account, and without this the
+    refusal below would name a remedy the account does not have. Everything else is stricter: a
+    subscription's mint only fills a NULL home (holding a copy is not placing one), a revision
+    APPLIED from the mesh never places anything (its `expected_revision` is set), and a SIGN-IN moves
+    the home explicitly (`login.rs::adopt_credential` → `update_account.home_node_id`, unchanged).
+    That is what makes the rule stable: a rotation cannot promote its node, only a placement or a
+    sign-in can. `AccountUpdate.home_node_id` exists in the store but no wire variant carries it, so
+    there is no "move home" button — the operator moves it by pasting the key or signing in on the
+    target node; exposing a separate control would let an administrator name a node that never
     minted anything, and is not part of this package.
     **Revocation is metadata, because a removal has no material to travel.** Migration 159 adds
     `provider_accounts.credential_revoked_revision` (0 = nothing revoked). `clear_credential` raises
@@ -664,8 +682,10 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
     it). Because that purge is unconditional, `set_receives_accounts` REFUSES to turn the flag off
     for a node that is some account's home: there the purge would drop the one copy every other
     node's is fanned out from, and for an account whose material exists only there, the credential
-    itself. The refusal names the count and the remedy (sign those accounts in elsewhere) and is
-    returned to the dashboard as a bad request, not swallowed as an internal error.
+    itself. The refusal names the count and the remedy for the kinds
+    actually homed there — a pasted key moves by being pasted on another node, a subscription by
+    being signed in there, and both sentences appear when both kinds are present — and is returned
+    to the dashboard as a bad request, not swallowed as an internal error.
     What this does NOT do, stated rather than hidden: the material is only re-sent on a reconnect or
     a local write, so a node that is offline through BOTH the mint and every later push stays without
     the credential until it reconnects (anti-entropy is a full rebuild per peer on connect, which is

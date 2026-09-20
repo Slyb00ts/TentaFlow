@@ -49,9 +49,15 @@ export const AgentAccounts = {
       engineId, displayName, scope, credentialKind,
     });
   },
-  /** Omitted fields stay as they are — `null` is "do not touch". */
-  update({ accountId, displayName = null, status = null }) {
-    return ApiBinary.action('providerAccountUpdateRequest', { accountId, displayName, status });
+  /**
+   * Omitted fields stay as they are — `null` is "do not touch". `maxSessions`
+   * is the exception that proves why that rule needs saying: 0 is a value (no
+   * limit) and not an absence, so it is passed through as 0 rather than dropped.
+   */
+  update({ accountId, displayName = null, status = null, maxSessions = null }) {
+    return ApiBinary.action('providerAccountUpdateRequest', {
+      accountId, displayName, status, maxSessions,
+    });
   },
   remove(accountId) {
     return ApiBinary.action('providerAccountDeleteRequest', { accountId });
@@ -142,10 +148,20 @@ export const AgentAccounts = {
 // sentence IS the contract. Every marker below is a literal from the node:
 // `services/agent_runtime.rs` (NOT_RECEIVING_ACCOUNTS, "is not installed on
 // this node"), `provider_accounts/login.rs` (the three ways a start can end
-// without an address) and `dispatch/provider_account.rs` (the two refusals
-// `require_login_authority` raises). Matched by substring, because an anyhow
+// without an address), `provider_accounts/repository.rs` (a node still homing
+// an account may not leave the fleet) and `dispatch/provider_account.rs` (the
+// two refusals `require_login_authority` raises). Matched by substring, because an anyhow
 // chain prefixes each with the operation that hit it, and the `code` narrows
 // the match so an unrelated sentence cannot borrow a translation.
+//
+// One entry carries `appendDetail`: its translation is deliberately incomplete,
+// so the node's own sentence has to travel next to it. `receives_home_refused`
+// covers a node still homing some account, and the remedy inside that sentence
+// is GENERIC — "sign those accounts in" for the provider logins, "paste their
+// API key" for the pasted keys (`repository.rs:set_receives_accounts`), joined
+// into one phrase when a node homes both kinds at once. No single translation
+// can carry that, so this is the one key whose sentence a caller must append.
+// Every other key is a complete translation; its node sentence is diagnostics.
 //
 // The last entry is the BROWSER's own deadline (`api-binary-shim.js`), which
 // arrives with no protocol prefix at all.
@@ -160,6 +176,10 @@ const REFUSALS = [
   { code: 'PolicyDenied', marker: 'this account is disabled', key: 'login.account_disabled' },
   { code: 'Conflict', marker: 'sign-in for this account is already running', key: 'login.already_running' },
   { code: 'PolicyDenied', marker: "personal account is the owner's alone", key: 'login.owner_only' },
+  // N01 — the receives-accounts toggle. The store refuses to take a node out of
+  // the fleet while it is some account's home, because that copy is the one
+  // every other node's credential is fanned out from.
+  { code: 'BadRequest', marker: 'is the home of', key: 'receives_home_refused', appendDetail: true },
   { code: '', marker: 'timed out after', key: 'error_timeout' },
 ];
 
@@ -173,6 +193,11 @@ const REFUSALS = [
  * node said. `code` is the wire enum the caller reacts to (`NotFound` while
  * polling).
  *
+ * `appendDetail` says whether that sentence is load-bearing or diagnostics. It
+ * is true only for `receives_home_refused`, whose translation cannot spell out
+ * the remedy the node names (see `REFUSALS`); every other detail is kept for a
+ * window's `title` and stays out of the line the operator reads.
+ *
  * The `protocol error <Code>: ` prefix is added by `binary-ws-client.js` when
  * it rejects a call; it names a wire enum variant and belongs in a log, not in
  * a sentence an operator reads.
@@ -185,13 +210,27 @@ export function describeError(error) {
   const known = REFUSALS.find(
     (entry) => (entry.code === '' || entry.code === code) && message.includes(entry.marker),
   );
-  if (known) return { code, message: T(known.key), detail: message };
-  return { code, message: message || T('error_unknown'), detail: '' };
+  if (known) {
+    return { code, message: T(known.key), detail: message, appendDetail: known.appendDetail === true };
+  }
+  return { code, message: message || T('error_unknown'), detail: '', appendDetail: false };
 }
 
-/** The same refusal as one string, for a toast or an error line. */
+/**
+ * The same refusal as one string, for a toast — two lines only when the entry
+ * declares `appendDetail`.
+ *
+ * The node's own words say WHICH remedy applies: `set_receives_accounts` names
+ * the one the account's kind actually has ("sign those accounts in" for a
+ * provider login, "paste their API key" for a pasted key), and no single
+ * translation can carry that for a node that homes both kinds at once. That is
+ * the ONE entry whose sentence this appends; for every other refusal the
+ * translation is complete and the node's English line would be noise in the
+ * operator's language.
+ */
 export function errorText(error) {
-  return describeError(error).message;
+  const { message, detail, appendDetail } = describeError(error);
+  return appendDetail && detail ? `${message}\n${detail}` : message;
 }
 
 // =============================================================================

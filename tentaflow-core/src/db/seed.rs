@@ -144,6 +144,10 @@ pub fn factory_flow_json(id: &str) -> Option<&'static str> {
 /// id jako domyslny flow agenta (gdy `agents.flow_id` jest NULL).
 const AGENT_RUN_FLOW_ID: &str = "00000000-0000-4000-8000-000000000012";
 
+/// Cialo harnessa agenta CLI — `agent_block::CLI_AGENT_RUN_FLOW_ID` wskazuje
+/// dokladnie to id jako domyslny flow agenta z `runtime_json.kind = "cli"`.
+const CLI_AGENT_RUN_FLOW_ID: &str = "00000000-0000-4000-8000-000000000080";
+
 /// Staly UUID systemowego agenta `general` (§3.8) — zeby harness dzialal
 /// out-of-the-box. `flow_id=NULL` => uzywa seedowanego "Agent Run".
 const GENERAL_AGENT_ID: &str = "00000000-0000-4000-8000-000000000014";
@@ -752,10 +756,10 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "delegate_cli",
             "service",
             "Deleguj do agenta CLI",
-            "Oddaje jedną turę zewnętrznemu agentowi CLI (Codex, Claude Code): wydaje ticket adaptera przez PEP (capability cli_delegate), uruchamia instancję CLI na wskazanej usłudze-moście, streamuje jej zdarzenia na oś czasu sesji jako przebieg podrzędny i odpowiada na jej prośby o zgodę tym samym PEP-em co reszta sesji. Poświadczenie organizacji nigdy nie wchodzi do procesu CLI — dostaje ticket związany z tym przebiegiem, modelem i budżetem. Silnik musi mieć zapisaną decyzję go/no-go fazy 0B, inaczej blok odmawia startu",
-            r#"{"engine":"codex","service_id":0,"model":"","budget":1000000,"timeout_secs":1800,"output_variable":"delegate_cli"}"#,
+            "Oddaje jedną turę zewnętrznemu agentowi CLI (Codex, Claude Code): wydaje ticket adaptera przez PEP (capability cli_delegate), uruchamia instancję CLI na moście agenta, streamuje jej zdarzenia na oś czasu sesji jako przebieg podrzędny i odpowiada na jej prośby o zgodę tym samym PEP-em co reszta sesji. Poświadczenie organizacji nigdy nie wchodzi do procesu CLI — dostaje ticket związany z tym przebiegiem, modelem i budżetem. Silnika, modelu ani konta nie wybiera ten blok: pochodzą z agenta, który uruchamia flow (`agents.runtime_json`), więc jeden graf obsługuje każdego agenta CLI. Silnik musi mieć zapisaną decyzję go/no-go fazy 0B, inaczej blok odmawia startu",
+            r#"{"budget":1000000,"timeout_secs":1800,"output_variable":"delegate_cli"}"#,
             "bot",
-            r#"{"properties":{"engine":{"type":"string","title":"Silnik","enum":[{"value":"codex","label":"Codex"},{"value":"claude-code","label":"Claude Code"},{"value":"grok-build","label":"Grok Build"},{"value":"muse-code","label":"Muse Code"}],"default":"codex","description":"Adapter dostawcy istnieje wyłącznie dla tych silników; inny wpis jest odrzucany przy zapisie"},"service_id":{"type":"integer","title":"Usługa (most CLI)","minimum":1,"description":"Identyfikator usługi coding-agent, na której działa most; musi mieć ten sam silnik"},"model":{"type":"string","title":"Model","description":"Jedyny model, na który opiewa ticket — bez niego ticket autoryzowałby dowolny model dostawcy"},"budget":{"type":"integer","title":"Budżet (tokeny)","minimum":1,"default":1000000,"description":"Twardy pułap mierzony w adapterze, nie raportowany przez CLI; jego przekroczenie ucina ruch w trakcie odpowiedzi i kończy przebieg błędem"},"timeout_secs":{"type":"integer","title":"Timeout (s)","minimum":1,"maximum":86400,"default":1800,"description":"Zarazem czas życia ticketu; brak zgłoszenia końca tury w tym czasie kończy delegację statusem timed_out"},"output_variable":{"type":"string","title":"Zmienna wyjściowa","default":"delegate_cli","description":"Zmienna flow z podsumowaniem: status, zużycie tokenów, identyfikator zestawu zmian"}},"required":["engine","service_id","model","budget"],"order":["engine","service_id","model","budget","timeout_secs","output_variable"]}"#,
+            r#"{"properties":{"budget":{"type":"integer","title":"Budżet (tokeny)","minimum":1,"default":1000000,"description":"Twardy pułap mierzony w adapterze, nie raportowany przez CLI; jego przekroczenie ucina ruch w trakcie odpowiedzi i kończy przebieg błędem"},"timeout_secs":{"type":"integer","title":"Timeout (s)","minimum":1,"maximum":86400,"default":1800,"description":"Zarazem czas życia ticketu; brak zgłoszenia końca tury w tym czasie kończy delegację statusem timed_out"},"output_variable":{"type":"string","title":"Zmienna wyjściowa","default":"delegate_cli","description":"Zmienna flow z podsumowaniem: status, zużycie tokenów, identyfikator zestawu zmian"}},"required":["budget"],"order":["budget","timeout_secs","output_variable"]}"#,
         ),
         (
             "document_router",
@@ -1800,8 +1804,34 @@ pub fn agent_run_flow_json() -> String {
     .to_string()
 }
 
+/// The harness of a `kind = "cli"` agent: trigger → `delegate_cli` → output.
+///
+/// Deliberately three nodes. There is no history to keep and no context to
+/// compose — the CLI process owns the conversation and the account, and the
+/// ticket's model is the agent's own. A `conversation_history` node here would
+/// hand the vendor CLI a transcript it neither reads nor updates.
+fn cli_agent_run_flow_json() -> String {
+    serde_json::json!({
+        "nodes": [
+            {"id": "t1", "type": "trigger", "position": {"x": 0, "y": 0}, "config": {}},
+            {"id": "d1", "type": "delegate_cli", "position": {"x": 360, "y": 0},
+             "config": {"budget": 1000000, "timeout_secs": 1800,
+                        "output_variable": "delegate_cli"}},
+            {"id": "o1", "type": "output", "position": {"x": 720, "y": 0},
+             "config": {"mode": "stream"}}
+        ],
+        "edges": [
+            {"from_node": "t1", "to_node": "d1", "from_port": "text", "to_port": "in"},
+            {"from_node": "d1", "to_node": "o1", "from_port": "full", "to_port": "text"}
+        ]
+    })
+    .to_string()
+}
+
 fn seed_harness_flows(conn: &Connection) -> Result<()> {
     let agent_run_json = agent_run_flow_json();
+    let cli_agent_run_json = cli_agent_run_flow_json();
+
 
     // Only the single-graph "Agent Run" is seeded now. The former legacy
     // …011 (Harness) / …013 (Agent Iteration) flows are gone: the loop is an
@@ -1813,6 +1843,12 @@ fn seed_harness_flows(conn: &Connection) -> Result<()> {
             "Agent Run",
             "Single agent graph with an inline `agent_turn` loop region: trigger -> conversation_history -> agent_context -> [region: compact_context -> llm(tools) -> tool_exec -loop_back-> compact_context] -> persist_turn -> output. Structural stop (last assistant without tool_calls). Default agent flow (agents.flow_id NULL).",
             agent_run_json.as_str(),
+        ),
+        (
+            CLI_AGENT_RUN_FLOW_ID,
+            "CLI Agent Run",
+            "Harness of an agent whose runtime is a CLI application: trigger -> delegate_cli -> output. There is nothing to choose here — the engine, the model and the account come from the agent's own runtime, and the ticketed adapter is the only way to the vendor process. Default agent flow for `kind = \"cli\"` agents (agents.flow_id NULL).",
+            cli_agent_run_json.as_str(),
         ),
     ];
 
@@ -3272,10 +3308,10 @@ mod tests {
 
     /// A fresh db has exactly one DEFAULT flow ("Default Chat", default=1) plus
     /// the remaining seeds with is_default=0: "Agent Run" (harness §3.8),
-    /// "Camera Analysis" (ADR PoC), three Code Harness variants (§16.2 A/B/C,
-    /// which `dispatch/code_studio.rs` pins its sessions to) and three RAG
-    /// flows. There is NO separate "Project Chat" any more — the project chat
-    /// runs the `core:rag-query` shell.
+    /// "CLI Agent Run" (harness of a `kind = "cli"` agent), "Camera Analysis"
+    /// (ADR PoC), the Code Harness (`dispatch/code_studio.rs` pins its sessions
+    /// to it) and three RAG flows. There is NO separate "Project Chat" any more
+    /// — the project chat runs the `core:rag-query` shell.
     #[test]
     fn fresh_db_has_expected_default_flows() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
@@ -3285,9 +3321,9 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            total, 8,
-            "oczekiwane 8 flow (Default Chat + Meeting Bot + Camera Analysis + Agent Run \
-             + Code Harness + RAG ingest/query/retrieval-round), jest {}",
+            total, 9,
+            "oczekiwane 9 flow (Default Chat + Meeting Bot + Camera Analysis + Agent Run \
+             + CLI Agent Run + Code Harness + RAG ingest/query/retrieval-round), jest {}",
             total
         );
 
@@ -3325,6 +3361,7 @@ mod tests {
             names,
             vec![
                 "Agent Run".to_string(),
+                "CLI Agent Run".to_string(),
                 "Camera Analysis".to_string(),
                 "Code Harness".to_string(),
                 "Default Chat".to_string(),
@@ -3802,7 +3839,7 @@ mod tests {
         let flow_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(flow_count, 8, "ponowny seed nie duplikuje flow");
+        assert_eq!(flow_count, 9, "ponowny seed nie duplikuje flow");
 
         let agent_count: i64 = conn
             .query_row(
@@ -3834,12 +3871,12 @@ mod tests {
         super::seed_default_flows(&conn).expect("ponowny seed po rename nie moze sie wywrocic");
 
         // Nadal 9 flow (Default Chat zmieniony + Camera Analysis + Agent Run +
-        // trzy Code Harness + trzy RAG z db::init), bez duplikatu Default
-        // Chat: kanoniczny id zachowany, nazwa nie nadpisana.
+        // CLI Agent Run + Code Harness + trzy RAG z db::init), bez duplikatu
+        // Default Chat: kanoniczny id zachowany, nazwa nie nadpisana.
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 8, "rename nie moze tworzyc drugiego flow");
+        assert_eq!(total, 9, "rename nie moze tworzyc drugiego flow");
         let name: String = conn
             .query_row(
                 "SELECT name FROM flows WHERE id = ?1",
@@ -4300,7 +4337,11 @@ mod tests {
                 .collect()
         };
         // The graphs the harness contract names by id must be among them.
-        for required in [super::AGENT_RUN_FLOW_ID, super::CODE_HARNESS_FLOW_ID] {
+        for required in [
+            super::AGENT_RUN_FLOW_ID,
+            super::CLI_AGENT_RUN_FLOW_ID,
+            super::CODE_HARNESS_FLOW_ID,
+        ] {
             assert!(
                 rows.iter().any(|(id, _)| id == required),
                 "seeded flow '{required}' is missing"
@@ -4310,6 +4351,63 @@ mod tests {
             CompiledFlow::from_json(id, json, &registry)
                 .unwrap_or_else(|e| panic!("flow '{}': kompilacja nie przechodzi: {:?}", id, e));
         }
+    }
+
+    /// The CLI harness flow AS SEEDED must carry no `service_id`: the block now
+    /// REFUSES that key (the engine, the model and the account come from the
+    /// agent's runtime), so a seeded graph still naming a service would be a
+    /// harness the platform ships and then refuses to run. Asserted on the
+    /// parsed graph, not on the source text, because a key can only do damage
+    /// once it has been decoded.
+    #[test]
+    fn seeded_cli_harness_flow_carries_no_service_id() {
+        fn find<'a>(value: &'a serde_json::Value, needle: &str) -> Option<&'a serde_json::Value> {
+            match value {
+                serde_json::Value::Object(map) => map
+                    .iter()
+                    .find_map(|(k, v)| (k == needle).then_some(v).or_else(|| find(v, needle))),
+                serde_json::Value::Array(items) => items.iter().find_map(|v| find(v, needle)),
+                _ => None,
+            }
+        }
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let json: String = {
+            let conn = pool.read().unwrap();
+            conn.query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![super::CLI_AGENT_RUN_FLOW_ID],
+                |r| r.get(0),
+            )
+            .expect("CLI harness flow is seeded")
+        };
+        let graph: serde_json::Value =
+            serde_json::from_str(&json).expect("seeded flow parses as JSON");
+
+        let delegate = graph["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .find(|n| n["type"] == "delegate_cli")
+            .expect("the seeded CLI harness has a delegate_cli node");
+        let mut keys: Vec<&str> = delegate["config"]
+            .as_object()
+            .expect("delegate_cli config is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["budget", "output_variable", "timeout_secs"],
+            "the seeded delegate_cli node carries keys the adapter does not read"
+        );
+
+        assert!(
+            find(&graph, "service_id").is_none(),
+            "the seeded CLI harness flow names a service_id: {:?}",
+            find(&graph, "service_id")
+        );
     }
 
     /// The platform ingest flow AS SEEDED. `flows.name` is the human label, not

@@ -2834,11 +2834,11 @@ fn apply_model_metrics_rollup(
                   decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, \
                   decode_tps_b5, decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
                   e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
-                  e2e_sample_count, usage_missing_count) \
+                  e2e_sample_count, usage_missing_count, account_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
                   ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, \
                   ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, \
-                  ?52, ?53, ?54, ?55) \
+                  ?52, ?53, ?54, ?55, ?56) \
                  ON CONFLICT(id) DO UPDATE SET \
                  node_id = excluded.node_id, org_id = excluded.org_id, user_id = excluded.user_id, \
                  model_id = excluded.model_id, service_key = excluded.service_key, \
@@ -2864,7 +2864,8 @@ fn apply_model_metrics_rollup(
                  e2e_b3 = excluded.e2e_b3, e2e_b4 = excluded.e2e_b4, e2e_b5 = excluded.e2e_b5, \
                  e2e_b6 = excluded.e2e_b6, e2e_b7 = excluded.e2e_b7, e2e_b8 = excluded.e2e_b8, \
                  e2e_b9 = excluded.e2e_b9, e2e_sample_count = excluded.e2e_sample_count, \
-                 usage_missing_count = excluded.usage_missing_count",
+                 usage_missing_count = excluded.usage_missing_count, \
+                 account_id = excluded.account_id",
                 rusqlite::params![
                     id,
                     field_string(operation, "node_id")?,
@@ -2921,6 +2922,13 @@ fn apply_model_metrics_rollup(
                     field_i64_or(operation, "e2e_b9", 0)?,
                     field_i64_or(operation, "e2e_sample_count", 0)?,
                     field_i64_or(operation, "usage_missing_count", 0)?,
+                    // The field map is keyed by NAME and a missing key takes the
+                    // default, so the account dimension travels without a
+                    // `SCHEMA_VERSION` bump: a peer that predates it sends no
+                    // `account_id` and its rows are the no-account bucket, which
+                    // is exactly what `''` means — a totals-correct row missing
+                    // one breakdown, never a row read as something else.
+                    field_string_or(operation, "account_id", "")?,
                 ],
             )
             .map_err(sql_error),
@@ -4163,8 +4171,9 @@ fn apply_provider_account(
                 "INSERT INTO provider_accounts \
                    (account_id, org_id, engine_id, display_name, scope, owner_user_id, \
                     credential_kind, provider_subject, plan_label, home_node_id, status, \
-                    created_by, created_at, credential_revoked_revision, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                    created_by, created_at, credential_revoked_revision, max_sessions, \
+                    updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                     strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
                  ON CONFLICT(account_id) DO UPDATE SET \
                     org_id = excluded.org_id, engine_id = excluded.engine_id, \
@@ -4177,6 +4186,7 @@ fn apply_provider_account(
                     credential_revoked_revision = MAX(\
                         provider_accounts.credential_revoked_revision, \
                         excluded.credential_revoked_revision), \
+                    max_sessions = excluded.max_sessions, \
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
                 rusqlite::params![
                     account_id,
@@ -4198,6 +4208,12 @@ fn apply_provider_account(
                     // HLC-LWW decides which EDIT is newer and a revocation must
                     // survive an older row that took the long way round.
                     field_i64_or(operation, "credential_revoked_revision", 0)?,
+                    // Absent in an operation minted before the limit existed,
+                    // which means exactly what 0 means: no limit. Unlike the
+                    // revocation mark there is no high-water rule here — raising
+                    // a limit is an ordinary edit, and HLC-LWW already says
+                    // which edit is the newer one.
+                    field_i64_or(operation, "max_sessions", 0)?,
                 ],
             )
             .map_err(sql_error)
@@ -6035,10 +6051,12 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    /// The rollup INSERT lists 55 columns by hand; a miscounted placeholder or
+    /// The rollup INSERT lists 56 columns by hand; a miscounted placeholder or
     /// param breaks EVERY replicated rollup at `prepare`. Round-trip a locally
     /// bumped row through `model_metrics_changed_fields` → `apply` on a second
-    /// DB and compare column by column.
+    /// DB and compare column by column. The field map is dropped back to what a
+    /// pre-account node sent, to prove that path lands in the no-account bucket
+    /// instead of failing the whole operation.
     #[test]
     fn model_metrics_rollup_round_trips_through_materializer() {
         let source = crate::db::init(std::path::Path::new(":memory:")).unwrap();
@@ -6053,6 +6071,7 @@ mod tests {
                 backend: "vllm",
                 modality: "chat",
                 hour_bucket: "2026-08-20T10:00:00Z",
+                account_id: "acc-alice",
                 histogram_version: 1,
             },
             &ModelMetricsCounters {
@@ -6107,6 +6126,7 @@ mod tests {
         assert_eq!(got.node_id, "peer");
         assert_eq!(got.service_key, "vllm/qwen");
         assert_eq!(got.hour_bucket, "2026-08-20T10:00:00Z");
+        assert_eq!(got.account_id, "acc-alice");
         assert_eq!(got.request_count, 3);
         assert_eq!(got.success_count, 2);
         assert_eq!(got.error_count, 1);
@@ -6122,6 +6142,27 @@ mod tests {
         assert_eq!(got.decode_tps_sample_count, 1);
         assert_eq!(got.e2e_buckets, original.e2e_buckets);
         assert_eq!(got.e2e_sample_count, 1);
+
+        // A node that predates the account dimension sends no `account_id` at
+        // all. That operation must still materialize — into the no-account
+        // bucket — because a row whose totals are right and whose account is
+        // unknown is useful, while a refused operation is a hole in the fleet.
+        let mut legacy = repository::model_metrics_changed_fields(&original);
+        legacy.remove("account_id");
+        let other = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        {
+            let mut conn = repository::acquire_for_baseline(&other).unwrap();
+            let tx = conn.transaction().unwrap();
+            let operation = rollup_operation(&original.id, legacy);
+            assert_eq!(apply_model_metrics_rollup(&tx, &operation).unwrap(), 1);
+            tx.commit().unwrap();
+        }
+        let rows =
+            repository::list_model_metrics_rollup(&other, DEFAULT_ORG_ID, &Default::default())
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].account_id, "");
+        assert_eq!(rows[0].total_tokens, 150);
     }
 
     // -------------------------------------------------------------------

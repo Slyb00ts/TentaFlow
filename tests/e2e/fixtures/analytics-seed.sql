@@ -188,6 +188,66 @@ SELECT
 FROM rows_;
 
 -- ---------------------------------------------------------------------------
+-- Provider accounts + the `account` dimension. Two coding-agent accounts,
+-- recorded the way `record_delegation_metrics` writes a CLI turn (the engine id
+-- is the service key, backend `agent-cli`, no latency samples). The rows above
+-- carry no account id, so they form the gateway bucket `(no account)`.
+-- ---------------------------------------------------------------------------
+INSERT OR REPLACE INTO provider_accounts
+  (account_id, org_id, engine_id, display_name, scope, credential_kind, status, created_by)
+VALUES
+  ('a1c4e7b2-9d63-4f18-8a25-6b0e3d9c7f41', 'org-default', 'claude-code', 'Konto zespołu', 'global', 'provider_login', 'active', 'admin'),
+  ('b8f2d5a9-3e71-4c06-9d48-2a7c1f5e8b93', 'org-default', 'codex',       'Konto Piotra',  'global', 'provider_login', 'active', 'admin');
+
+DELETE FROM model_metrics_rollup WHERE id LIKE 'seed-acct:%';
+
+WITH RECURSIVE
+bounds(h0, h1) AS (
+  SELECT CAST(strftime('%s', 'now', 'start of month', '-1 month') AS INTEGER),
+         CAST(strftime('%s', 'now') AS INTEGER)
+),
+hours(h) AS (
+  SELECT h0 FROM bounds
+  UNION ALL
+  SELECT h + 3600 FROM hours, bounds WHERE h + 3600 <= h1
+),
+combos(k, user_id, model_id, engine, account_id, weight) AS (
+  VALUES
+  (1, '8d1f02aa-4c3e-4b8a-9f21-7a5d3e9bc771', 'claude-sonnet-4-5', 'claude-code', 'a1c4e7b2-9d63-4f18-8a25-6b0e3d9c7f41', 30),
+  (2, '3b7e9c12-8a4f-4d6e-b2c1-5f8a7d3e1c42', 'claude-sonnet-4-5', 'claude-code', 'a1c4e7b2-9d63-4f18-8a25-6b0e3d9c7f41', 12),
+  (3, '3b7e9c12-8a4f-4d6e-b2c1-5f8a7d3e1c42', 'gpt-5-codex',       'codex',       'b8f2d5a9-3e71-4c06-9d48-2a7c1f5e8b93', 20)
+),
+buckets AS (
+  SELECT h, k, user_id, model_id, engine, account_id,
+    ((h / 3600) * 31 + k * 97) % 1000 AS r1,
+    ((h / 3600) * 17 + k * 53) % 100  AS r2
+  FROM hours, combos
+),
+rows_ AS (
+  SELECT *,
+    CAST(MAX(1, weight
+      * (CASE WHEN CAST(strftime('%w', h, 'unixepoch') AS INTEGER) BETWEEN 1 AND 5
+               AND CAST(strftime('%H', h, 'unixepoch') AS INTEGER) BETWEEN 8 AND 18
+              THEN 1.0 ELSE 0.3 END)
+      * (0.5 + r1 / 1000.0)) AS INTEGER) AS req
+  FROM buckets
+)
+INSERT INTO model_metrics_rollup (
+  id, node_id, org_id, user_id, model_id, service_key, backend, modality, hour_bucket,
+  account_id, histogram_version, request_count, success_count, error_count,
+  prompt_tokens, completion_tokens, total_tokens, updated_at
+)
+SELECT
+  'seed-acct:' || k || ':' || strftime('%Y%m%d%H', h, 'unixepoch'),
+  'd91a7a857611b069a19759c7ca2c5c1b83901ae4fcae86bd7dfe2f1e493f3967',
+  'org-default', user_id, model_id, engine, 'agent-cli', 'chat',
+  strftime('%Y-%m-%dT%H:00:00Z', h, 'unixepoch'),
+  account_id, 1, req, req, 0,
+  req * (900 + r2 * 3), req * (240 + r2), req * (900 + r2 * 3) + req * (240 + r2),
+  strftime('%Y-%m-%d %H:%M:%f', 'now')
+FROM rows_;
+
+-- ---------------------------------------------------------------------------
 -- Token quotas (3) + coordinator leases (2). No user-scoped quota for Marta:
 -- the spec creates that one through the UI.
 -- ---------------------------------------------------------------------------

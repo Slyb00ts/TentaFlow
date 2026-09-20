@@ -35,11 +35,9 @@ pub struct EngineDescriptor {
 /// `services/deploy/managed_cli.rs` already use; spelling one differently here
 /// would create an account nothing can run.
 ///
-/// `supports_api_key` names the same two engines as the org-key path in
-/// `dispatch/code_studio.rs` (`CREDENTIAL_ENGINES`). That constant belongs to
-/// the vault path this feature replaces and goes away with it; until the
-/// consumers switch, the two lists are read by two different code paths and
-/// must stay in step.
+/// `supports_api_key` is enforced where the credential is written
+/// (`repository.rs`), so an engine that authenticates through its own login
+/// alone cannot be given an organisation key that its CLI would ignore.
 pub const AGENT_ENGINES: &[EngineDescriptor] = &[
     EngineDescriptor {
         engine_id: "claude-code",
@@ -123,6 +121,12 @@ pub struct AccountRecord {
     /// never travels through the ledger, so the ABSENCE of a credential frame
     /// is indistinguishable from the node that cleared it being offline.
     pub credential_revoked_revision: i64,
+    /// How many sessions of this account may be open at once on one node (A03),
+    /// and `0` for "no limit" — which is what every account means until an
+    /// operator sets a number, and what this column meant before it existed.
+    /// The count it is compared against is node-local (`provider_account_sessions`
+    /// never replicates), so the limit bounds one node's concurrency.
+    pub max_sessions: i64,
 }
 
 impl AccountRecord {
@@ -157,6 +161,11 @@ pub struct AccountUpdate {
     pub status: Option<String>,
     pub plan_label: Option<String>,
     pub home_node_id: Option<String>,
+    /// Sessions of this account per node, in the range the column stores: a
+    /// positive number is a limit, `0` is "no limit". Unlike the fields above,
+    /// `0` is a VALUE a caller can write — the row's default is the same zero,
+    /// which is why turning a limit off needs no separate clearing flag.
+    pub max_sessions: Option<i64>,
 }
 
 /// One `provider_account_grants` row.
@@ -217,6 +226,11 @@ pub enum CredentialWrite {
 }
 
 /// One `provider_account_sessions` row.
+///
+/// `started_at` is a READ-side field: `list_sessions` fills it from the row and
+/// the account detail shows it, while `upsert_session` does not write the
+/// column at all — the table's own DEFAULT stamps the moment the row was first
+/// recorded, which is the answer a caller writing the row does not have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
     pub account_id: String,

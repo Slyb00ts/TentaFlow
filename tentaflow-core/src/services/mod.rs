@@ -5,6 +5,7 @@
 // =============================================================================
 
 pub mod account_move;
+pub mod agent_account;
 pub mod agent_runtime;
 pub mod cancel_registry;
 pub mod gpu_snapshot;

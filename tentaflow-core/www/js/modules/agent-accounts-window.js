@@ -289,6 +289,9 @@ export async function openAccountWindow(accountId, {
     const apiKey = account.credential_kind === 'api_key';
     const revision = Number(account.credential_revision ?? 0);
     const enabled = account.status !== 'disabled';
+    // 0 is "no limit" — the state every account starts in, and the one an
+    // administrator returns it to by saving 0.
+    const limit = Math.max(0, Number(account.max_sessions ?? 0));
     pane.innerHTML = `
       <dl class="aa-kv">
         <dt>${escapeHtml(T('kv_provider_account'))}</dt>
@@ -321,7 +324,14 @@ export async function openAccountWindow(accountId, {
               <div class="aa-toggle-name">${escapeHtml(T('field_enabled'))}</div>
               <div class="aa-hint">${escapeHtml(T('field_enabled_hint'))}</div>
             </div>
-          </div>` : ''}
+          </div>
+          <div class="aa-form aa-form-row">
+            <tf-input data-field="limit" type="number" min="0" step="1"
+              label="${escapeAttr(T('field_session_limit'))}"
+              value="${escapeAttr(String(limit))}"></tf-input>
+            <tf-button variant="secondary" data-act="limit-save">${escapeHtml(T('action_limit_save'))}</tf-button>
+          </div>
+          <p class="aa-hint">${escapeHtml(T('field_session_limit_hint'))}</p>` : ''}
         ${apiKey ? `
           <div class="aa-form aa-form-row">
             <tf-input data-field="key" type="password" label="${escapeAttr(T('field_api_key_replace'))}"
@@ -334,7 +344,9 @@ export async function openAccountWindow(accountId, {
 
       <section class="aa-section">
         <h4 class="aa-sub-h">${escapeHtml(T('sessions_title', { count: state.sessions.length }))}</h4>
-        <p class="aa-hint">${escapeHtml(T('sessions_hint'))}</p>
+        <p class="aa-hint" data-hint="sessions">${escapeHtml(limit > 0
+          ? T('sessions_hint_limited', { n: limit })
+          : T('sessions_hint'))}</p>
         <tf-table variant="flush" data-table="sessions" actions-label="${escapeAttr(I18n.t('common.actions'))}"
                   empty-message="${escapeAttr(T('sessions_empty'))}">
           <tf-column key="user" label="${escapeAttr(T('col_user'))}" renderer="html" fill></tf-column>
@@ -469,6 +481,29 @@ export async function openAccountWindow(accountId, {
       } catch (err) {
         fail(err);
         toggle.toggleAttribute('checked', !wantEnabled);
+      }
+    });
+    pane.querySelector('[data-act="limit-save"]')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      const raw = String(pane.querySelector('[data-field="limit"]').value ?? '').trim();
+      error.hidden = true;
+      const limit = Number(raw === '' ? '0' : raw);
+      if (!Number.isInteger(limit) || limit < 0) {
+        fail(new Error(T('err_limit_invalid')));
+        return;
+      }
+      button.setAttribute('disabled', '');
+      try {
+        // 0 travels as 0 and not as `null`: it is the value that removes the
+        // limit, while `null` would leave whatever is set.
+        await AgentAccounts.update({ accountId, maxSessions: limit });
+        toast(T('limit_saved'), 'success');
+        notifyChanged();
+        await reload();
+      } catch (err) {
+        fail(err);
+      } finally {
+        reenable(button);
       }
     });
     pane.querySelector('[data-act="key-save"]')?.addEventListener('click', async (event) => {

@@ -11,7 +11,9 @@ license = "Proprietary"
 icon = "claude"
 default_port = 8765
 api = "custom"
-version = "2.1.258"
+# Required by the manifest schema. A managed-cli engine installs whatever the
+# vendor's release channel reports as newest, so this is a label, not a pin.
+version = "latest"
 requires_model = false
 gpu_supported = false
 service_surfaces = ["chat"]

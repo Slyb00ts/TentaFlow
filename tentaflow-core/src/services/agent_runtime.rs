@@ -25,7 +25,6 @@
 // the account list the dashboard renders comes from `provider_accounts` alone.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -53,6 +52,18 @@ const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// this is process startup, not a compile.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a bridge is given to confirm it reaped the account's CLI processes.
+///
+/// The call answers in under a millisecond when it answers at all, so this only
+/// bounds the case where one of the account's sessions will not close: the HTTP
+/// client's own 65 s would otherwise be the only limit, and that is longer than
+/// the GUI action that asked for the stop waits.
+const SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the bridge process is given to leave once its parent pipe is closed.
+/// A bridge still here after that cannot leave and is killed.
+const SHUTDOWN_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A running bridge for one account on this node.
 #[derive(Clone, Debug)]
 pub struct BridgeHandle {
@@ -72,9 +83,9 @@ impl BridgeHandle {
     /// a vendor CLI. The token is part of the handle in production and there is
     /// no other way to construct one.
     #[cfg(test)]
-    pub(crate) fn for_test(engine_id: &str, port: u16) -> Self {
+    pub(crate) fn for_test(account_id: &str, engine_id: &str, port: u16) -> Self {
         Self {
-            account_id: "test-account".to_string(),
+            account_id: account_id.to_string(),
             engine_id: engine_id.to_string(),
             port,
             token: "t".repeat(64),
@@ -114,8 +125,9 @@ struct Running {
     /// The write end of the bridge's stdin. Nothing is ever written to it: the
     /// bridge exits when it reads EOF, so this handle IS the liveness signal —
     /// it closes when this process exits, however it exits, including a SIGKILL
-    /// that runs no shutdown code at all.
-    _parent_pipe: tokio::process::ChildStdin,
+    /// that runs no shutdown code at all, and `stop` closes it deliberately to
+    /// make a bridge that is still running leave.
+    parent_pipe: tokio::process::ChildStdin,
     last_used: Instant,
 }
 
@@ -155,14 +167,12 @@ fn start_slot(account_id: &str) -> Arc<Mutex<()>> {
 // Runtime installation (N01)
 // =============================================================================
 
-/// What the manifest says an engine is on this node.
-struct EngineBuild {
-    version: String,
-    source_hash: String,
-    source_root: PathBuf,
-}
-
-fn engine_build(engine_id: &str) -> Result<EngineBuild> {
+/// The source hash that keys one engine's bridge in this node's cache.
+///
+/// The engine's CLI version is deliberately absent. It comes from the vendor at
+/// install time (`services::deploy::managed_cli_release`), and no manifest pins
+/// it — a pin is only ever a version somebody forgot to bump.
+fn engine_source_hash(engine_id: &str) -> Result<String> {
     let manifest = crate::services::manifest::registry()
         .by_id(engine_id)
         .ok_or_else(|| anyhow!("engine '{engine_id}' is not in the service catalog"))?;
@@ -180,16 +190,7 @@ fn engine_build(engine_id: &str) -> Result<EngineBuild> {
             host_platform()
         ));
     }
-    Ok(EngineBuild {
-        version: manifest.engine.version.clone(),
-        source_hash: manifest.native_source_hash.clone(),
-        source_root: crate::paths::containers_root().join(
-            native
-                .binary_path
-                .as_deref()
-                .ok_or_else(|| anyhow!("engine '{engine_id}' has no binary_path"))?,
-        ),
-    })
+    Ok(manifest.native_source_hash.clone())
 }
 
 /// The name the manifests use for this operating system. The catalog spells
@@ -210,25 +211,22 @@ pub async fn install_engine(db: &DbPool, engine_id: &str, actor: &str) -> Result
     if crate::provider_accounts::engine(engine_id).is_none() {
         return Err(anyhow!("unknown agent engine '{engine_id}'"));
     }
+    // The refusal happens before the row says "installing": a node that cannot
+    // isolate a process has not begun an installation, and leaving a half-state
+    // behind would report a failure that never happened.
     crate::code_studio::process_sandbox::ProcessSandbox::check_available()
         .map_err(|error| anyhow!("this node cannot isolate an agent process: {error:#}"))?;
-    let build = engine_build(engine_id)?;
-    store::set_engine_state(
-        db,
-        engine_id,
-        "installing",
-        Some(&build.version),
-        None,
-        Some(actor),
-    )?;
-    let installed = async {
-        crate::services::deploy::managed_cli_install(engine_id, &build.version).await?;
-        crate::services::deploy::managed_cli_bridge(
-            engine_id,
-            &build.source_hash,
-            &build.source_root,
-        )
+    let source_hash = engine_source_hash(engine_id)?;
+    // Which release this is comes from the vendor. It is recorded before the
+    // download so that a failure names the release it failed on.
+    let release = crate::services::deploy::managed_cli_release(engine_id)
         .await
+        .map_err(|error| anyhow!("{error:#}"))?;
+    let version = release.version().to_string();
+    store::set_engine_state(db, engine_id, "installing", Some(&version), None, Some(actor))?;
+    let installed = async {
+        crate::services::deploy::managed_cli_install(engine_id, &release).await?;
+        crate::services::deploy::managed_cli_bridge(engine_id, &source_hash)
     }
     .await;
     match installed {
@@ -237,11 +235,11 @@ pub async fn install_engine(db: &DbPool, engine_id: &str, actor: &str) -> Result
                 db,
                 engine_id,
                 "installed",
-                Some(&build.version),
+                Some(&version),
                 None,
                 Some(actor),
             )?;
-            Ok(build.version)
+            Ok(version)
         }
         Err(error) => {
             let detail = format!("{error:#}");
@@ -249,7 +247,7 @@ pub async fn install_engine(db: &DbPool, engine_id: &str, actor: &str) -> Result
                 db,
                 engine_id,
                 "error",
-                Some(&build.version),
+                Some(&version),
                 Some(&detail),
                 Some(actor),
             )?;
@@ -332,6 +330,16 @@ pub async fn ensure_runtime(
             "engine '{engine_id}' is not installed on this node"
         ));
     }
+    // The bridge starts the release the matrix installed, not whatever the
+    // vendor has now: an account must run on a node that cannot reach the vendor.
+    let version = state
+        .as_ref()
+        .and_then(|row| row.version.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "engine '{engine_id}' is recorded as installed without a version; install it again"
+            )
+        })?;
     // From here on only THIS account is serialized; the registry lock is taken
     // for the two lookups and the insert, never across the start.
     let slot = start_slot(account_id);
@@ -339,7 +347,7 @@ pub async fn ensure_runtime(
     if let Some(handle) = current_bridge(account_id, Some(engine_id)).await? {
         return Ok(handle);
     }
-    let running = start_bridge(account_id, engine_id).await?;
+    let running = start_bridge(account_id, engine_id, &version).await?;
     let handle = running.handle.clone();
     bridges()
         .lock()
@@ -354,24 +362,38 @@ pub async fn ensure_runtime(
 /// rather than a second process, because one account has ONE home directory and
 /// one `account.lock`.
 async fn current_bridge(account_id: &str, engine_id: Option<&str>) -> Result<Option<BridgeHandle>> {
+    #[cfg(test)]
+    if let Some(handle) = testing::registered_bridge(account_id) {
+        return expect_engine(handle, account_id, engine_id).map(Some);
+    }
     let mut bridges = bridges().lock().await;
     let Some(running) = bridges.get_mut(account_id) else {
         return Ok(None);
     };
-    if let Some(engine_id) = engine_id {
-        if running.handle.engine_id != engine_id {
-            return Err(anyhow!(
-                "account '{account_id}' is already running as '{}' on this node",
-                running.handle.engine_id
-            ));
-        }
-    }
     if running.child.try_wait()?.is_some() {
         bridges.remove(account_id);
         return Ok(None);
     }
     running.last_used = Instant::now();
-    Ok(Some(running.handle.clone()))
+    expect_engine(running.handle.clone(), account_id, engine_id).map(Some)
+}
+
+/// One account has ONE home directory and one `account.lock`, so a second engine
+/// for the same account is a refusal, not a second process.
+fn expect_engine(
+    handle: BridgeHandle,
+    account_id: &str,
+    engine_id: Option<&str>,
+) -> Result<BridgeHandle> {
+    if let Some(engine_id) = engine_id {
+        if handle.engine_id != engine_id {
+            return Err(anyhow!(
+                "account '{account_id}' is already running as '{}' on this node",
+                handle.engine_id
+            ));
+        }
+    }
+    Ok(handle)
 }
 
 /// Starts the loop that calls `release_idle`, once per process.
@@ -402,23 +424,14 @@ fn spawn_idle_sweeper() {
 /// reason to resurrect a process in order to ask it about an event it emitted
 /// before it went away.
 pub async fn running_bridge(account_id: &str) -> Option<BridgeHandle> {
-    #[cfg(test)]
-    if let Some(handle) = testing::registered_bridge(account_id) {
-        return Some(handle);
-    }
     current_bridge(account_id, None).await.ok().flatten()
 }
 
-async fn start_bridge(account_id: &str, engine_id: &str) -> Result<Running> {
-    let build = engine_build(engine_id)?;
-    let (install_root, bin_dir) =
-        crate::services::deploy::managed_cli_install(engine_id, &build.version).await?;
-    let executable = crate::services::deploy::managed_cli_bridge(
-        engine_id,
-        &build.source_hash,
-        &build.source_root,
-    )
-    .await?;
+async fn start_bridge(account_id: &str, engine_id: &str, version: &str) -> Result<Running> {
+    let source_hash = engine_source_hash(engine_id)?;
+    let (install_root, bin_dir) = crate::services::deploy::managed_cli_installation(engine_id, version)
+        .map_err(|error| anyhow!("{error:#}"))?;
+    let executable = crate::services::deploy::managed_cli_bridge(engine_id, &source_hash)?;
     let data_dir =
         coding_agent::prepare_account_root(account_id).map_err(|error| anyhow!("{error}"))?;
     let token =
@@ -513,7 +526,7 @@ async fn start_bridge(account_id: &str, engine_id: &str) -> Result<Running> {
         handle,
         child,
         _proxy: proxy,
-        _parent_pipe: parent_pipe,
+        parent_pipe,
         last_used: Instant::now(),
     })
 }
@@ -533,19 +546,45 @@ pub async fn stop(account_id: &str) {
         return;
     };
     // The bridge owns CLI child processes and confirms their termination, so it
-    // is asked to shut down before it is killed.
-    let _ = running.handle.post("/runtime/shutdown", json!({})).await;
-    let _ = tokio::time::timeout(Duration::from_secs(10), running.child.wait()).await;
-    let _ = running.child.start_kill();
+    // is asked to shut down before it is killed. The call carries its own
+    // deadline: the handler waits for the account's sessions to close, and a CLI
+    // that will not leave its terminal would otherwise hold this call for as long
+    // as the HTTP client allows.
+    match tokio::time::timeout(
+        SHUTDOWN_CONFIRM_TIMEOUT,
+        running.handle.post("/runtime/shutdown", json!({})),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, account_id, "the agent bridge refused to shut down")
+        }
+        Err(_) => tracing::warn!(
+            account_id,
+            "the agent bridge did not confirm shutdown in time; killing it"
+        ),
+    }
+    // Closing the parent pipe is what makes a live bridge leave: it runs the same
+    // shutdown on the EOF and exits. Waiting with the pipe still open can only
+    // ever run to its full length, because nothing else ends that process.
+    drop(running.parent_pipe);
+    if tokio::time::timeout(SHUTDOWN_EXIT_TIMEOUT, running.child.wait())
+        .await
+        .is_err()
+    {
+        let _ = running.child.start_kill();
+    }
 }
 
 /// Stops every bridge this process started. Returns how many there were.
 ///
 /// Called from the shutdown path: a bridge holds the account's `account.lock`
 /// and its canonical credential directory, so one left behind blocks the next
-/// Core from ever starting that account. Each stop is bounded (the `/runtime`
-/// call, then a 10 s wait, then a kill), and they run in sequence because a
-/// shutdown that stops on a wedged bridge is worse than one that takes longer.
+/// Core from ever starting that account. Each stop is bounded (a `/runtime` call
+/// with its own deadline, then closing the parent pipe, then a bounded wait and a
+/// kill), and they run in sequence because a shutdown that stops on a wedged
+/// bridge is worse than one that takes longer.
 pub async fn stop_all() -> usize {
     let accounts: Vec<String> = bridges().lock().await.keys().cloned().collect();
     let count = accounts.len();
@@ -714,8 +753,10 @@ pub async fn read_bridge_credential(
 /// The conversations Core has with a bridge are HTTP over loopback with a
 /// bearer token, and every one of them is worth exercising without installing a
 /// vendor CLI — the alternative is that the credential-adoption paths are only
-/// ever run by hand. Registering a handle here makes `running_bridge` answer
-/// with it; nothing else in this module changes behaviour under `cfg(test)`.
+/// ever run by hand. Registering a handle here makes `current_bridge` answer
+/// with it for that account — so `ensure_runtime` and `running_bridge` both see
+/// the same bridge, exactly as they would for a started one; nothing else in
+/// this module changes behaviour under `cfg(test)`.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::BridgeHandle;
@@ -748,6 +789,7 @@ pub(crate) mod testing {
     /// Serves fixed JSON bodies by path prefix on loopback, closing every
     /// connection — which is all the client this crate uses needs.
     pub(crate) async fn fake_bridge(
+        account_id: &str,
         engine_id: &str,
         answers: Vec<(&'static str, String)>,
     ) -> BridgeHandle {
@@ -787,7 +829,7 @@ pub(crate) mod testing {
                 });
             }
         });
-        BridgeHandle::for_test(engine_id, port)
+        BridgeHandle::for_test(account_id, engine_id, port)
     }
 }
 
@@ -987,6 +1029,7 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_credential_is_read_verbatim() {
         let bridge = testing::fake_bridge(
+            "acc-1",
             "codex",
             vec![(
                 "/account/credential",
@@ -1010,6 +1053,7 @@ mod tests {
         assert_eq!(identity.as_deref(), Some("account:acct-7"));
 
         let empty = testing::fake_bridge(
+            "acc-empty",
             "codex",
             vec![(
                 "/account/credential",

@@ -422,20 +422,33 @@ fn process_gateway_config(
     };
     let mut org_approved = Vec::new();
     if policy == super::egress::EgressPolicy::OrgApproved {
-        let local = super::db::pool(registry)?;
-        for credential in
-            super::vault::list_agent_credentials(&local, &record.org_id, &record.node_id)?
-        {
-            let url = url::Url::parse(&credential.provider_base_url)?;
+        // The endpoints the organization's ACCOUNTS talk to, not the endpoints
+        // of this node's own key material: an account whose key lives on
+        // another node still belongs to this organization, and a workspace
+        // granted that account has to be able to reach its provider.
+        let accounts = crate::provider_accounts::repository::list_accounts(
+            registry,
+            &record.org_id,
+            &crate::provider_accounts::AccountFilter::default(),
+        )?;
+        let mut endpoints = std::collections::BTreeSet::new();
+        for account in accounts {
+            // An engine with no wiring has no endpoint to approve; skipping it
+            // is the answer, not an error.
+            let Ok(wiring) = super::cli_adapter::EngineWiring::for_engine(&account.engine_id) else {
+                continue;
+            };
+            let url = url::Url::parse(wiring.provider_base_url)?;
             let host = url
                 .host_str()
                 .ok_or_else(|| anyhow!("provider endpoint has no host"))?;
             let port = url
                 .port_or_known_default()
                 .ok_or_else(|| anyhow!("provider endpoint has no port"))?;
-            org_approved.push(super::egress::HostPattern::parse(&format!(
-                "{host}:{port}"
-            ))?);
+            endpoints.insert(format!("{host}:{port}"));
+        }
+        for endpoint in endpoints {
+            org_approved.push(super::egress::HostPattern::parse(&endpoint)?);
         }
     }
     Ok(super::egress::EgressGatewayConfig {

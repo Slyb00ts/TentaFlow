@@ -186,6 +186,9 @@ const USER_NAV = [
     icon: 'user',
     items: [
       { id: 'profile', labelKey: 'nav.profile', icon: 'user' },
+      // "Moje konta" (U01) is a plain user's own screen — it must be reachable
+      // from this block, not only by typing its hash.
+      { id: 'my-accounts', labelKey: 'nav.my_accounts', icon: 'key' },
     ],
   },
 ];

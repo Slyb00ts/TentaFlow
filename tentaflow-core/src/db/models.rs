@@ -843,6 +843,9 @@ pub struct DbModelMetricsRollup {
     pub backend: String,
     pub modality: String,
     pub hour_bucket: String,
+    /// Provider account the usage was spent on; empty for gateway traffic that
+    /// carries none. Dimension, so it is part of the hashed `id`.
+    pub account_id: String,
     pub histogram_version: i64,
     pub request_count: i64,
     pub success_count: i64,
@@ -885,6 +888,9 @@ pub struct DbModelPricing {
 /// Wymiary (klucz logiczny) jednego kubelka rollupu metryk modelu. `service_key`
 /// jest STABILNY (engine/deployment/nazwa), nie surowy `service_id`, zeby restart
 /// serwisu nie fragmentowal metryk. `hour_bucket` to RFC3339 przyciety do godziny.
+/// `account_id` to konto providera, na ktorym poszlo zuzycie ('' = brak konta,
+/// np. sciezka gateway); jest czescia haszowanego `id`, wiec dwa konta nigdy nie
+/// wpadna do jednego wiersza.
 #[derive(Debug, Clone)]
 pub struct ModelMetricsDims<'a> {
     pub node_id: &'a str,
@@ -895,8 +901,24 @@ pub struct ModelMetricsDims<'a> {
     pub backend: &'a str,
     pub modality: &'a str,
     pub hour_bucket: &'a str,
+    /// Provider account the usage was spent on; empty for gateway traffic that
+    /// carries none. Part of the hashed `id`, so two accounts never share a row.
+    pub account_id: &'a str,
     pub histogram_version: i64,
 }
+
+/// `backend` value of the rollup row that records a provider-CLI delegation (a
+/// coding agent). Two things travel with it:
+///
+///   * such a row is NEVER priced from `model_pricing`. The CLI is paid for by a
+///     subscription or the provider's own key, while `model_pricing` rates
+///     describe a model this node serves — pricing the same model name from them
+///     would present a guess as a measurement. The cost of such a turn is
+///     UNKNOWN, not zero (`dispatch::model_metrics`).
+///   * the `cost_usd` the provider quoted itself stays in `session_runs` in the
+///     workspace DB (node-local state, it does not travel through the Sync
+///     Ledger).
+pub const CLI_DELEGATION_BACKEND: &str = "agent-cli";
 
 /// Liczniki zadan dodawane do rollupu przy jednym `bump`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -943,6 +965,9 @@ pub struct ModelMetricsPerfSamples {
 pub struct ModelMetricsFilter<'a> {
     pub model_id: Option<&'a str>,
     pub user_id: Option<&'a str>,
+    /// Provider account id; the empty string selects traffic without any
+    /// account (gateway requests), which is a real bucket, not "no filter".
+    pub account_id: Option<&'a str>,
     pub hour_from: Option<&'a str>,
     pub hour_to: Option<&'a str>,
 }

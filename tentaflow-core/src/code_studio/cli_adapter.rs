@@ -94,6 +94,7 @@ use super::models::EgressEnforcement;
 use super::pep::{self, Capability, Decision, Target};
 use super::vault::AgentCredential;
 use crate::db::DbPool;
+use crate::services::agent_account::CredentialKind;
 
 /// Setting prefix of the Phase 0B gate. One key per engine
 /// (`…verified.claude-code`), because go/no-go is decided per CLI.
@@ -241,6 +242,17 @@ pub enum DelegationAuth {
 }
 
 impl DelegationAuth {
+    /// The mode an account's credential kind implies. Total, and a function of
+    /// the ACCOUNT rather than of a probe: which mechanism pays for a turn is
+    /// what the credential IS, so no runtime question can move a run from one
+    /// mode to the other part way through (§D.3).
+    pub fn for_credential(kind: CredentialKind) -> Self {
+        match kind {
+            CredentialKind::ApiKey => DelegationAuth::OrgCredential,
+            CredentialKind::ProviderLogin => DelegationAuth::ProviderLogin,
+        }
+    }
+
     pub fn slug(self) -> &'static str {
         match self {
             DelegationAuth::OrgCredential => "org_credential",
@@ -255,44 +267,6 @@ impl DelegationAuth {
             DelegationAuth::OrgCredential => "adapter",
             DelegationAuth::ProviderLogin => "provider_reported",
         }
-    }
-}
-
-/// Explicit account selection always spends that account. Without a selection,
-/// the configured organization API credential wins, or the configured bridge
-/// account is queried. A missing selected login never changes the billing mode.
-/// The probe is lazy so organization API mode does not start a vendor process.
-pub async fn resolve_delegation_auth(
-    local: &DbPool,
-    org_id: &str,
-    node_id: &str,
-    engine_id: &str,
-    selected_account: bool,
-    provider_login: impl std::future::Future<Output = Result<bool>>,
-) -> Result<DelegationAuth, GateRefusal> {
-    let refusal = |reason: String| GateRefusal {
-        engine_id: engine_id.to_string(),
-        reason,
-    };
-    if !selected_account {
-        let stored = super::vault::get_agent_credential_record(local, org_id, node_id, engine_id)
-            .map_err(|error| refusal(format!("the vault could not be read: {error}")))?;
-        if stored.is_some() {
-            return Ok(DelegationAuth::OrgCredential);
-        }
-    }
-    match provider_login.await {
-        Ok(true) => Ok(DelegationAuth::ProviderLogin),
-        Ok(false) => Err(refusal(format!(
-            "credential_missing: node '{node_id}' holds no organization credential for this \
-             engine, and the CLI reports no provider login of its own. Store the organization's \
-             key for the engine (it never enters the sandbox — the adapter injects it), or log \
-             the CLI in on this node"
-        ))),
-        Err(error) => Err(refusal(format!(
-            "credential_missing: node '{node_id}' holds no organization credential for this \
-             engine, and whether the CLI is logged in could not be established: {error:#}"
-        ))),
     }
 }
 
@@ -1061,6 +1035,13 @@ pub enum CredentialHeader {
 pub struct EngineWiring {
     pub engine_id: String,
     pub credential_header: CredentialHeader,
+    /// The engine's canonical upstream. It is the address the adapter forwards
+    /// to, and it is per-engine ADAPTER knowledge: which host speaks this
+    /// engine's protocol is a property of the engine, not of the account that
+    /// pays for it, so an account (or an administrator) never chooses it. A
+    /// caller that could name an upstream could point an organization's key at
+    /// a host of its choosing.
+    pub provider_base_url: &'static str,
     /// Environment variable that overrides the CLI's base URL, where the CLI
     /// honours one. `None` for codex, which does not: setting `OPENAI_BASE_URL`
     /// changed nothing and 100% of its traffic still went to the vendor, so
@@ -1105,6 +1086,7 @@ impl EngineWiring {
             "claude-code" => Ok(Self {
                 engine_id: engine_id.to_string(),
                 credential_header: CredentialHeader::XApiKey,
+                provider_base_url: "https://api.anthropic.com",
                 base_url_var: Some("ANTHROPIC_BASE_URL".to_string()),
                 api_key_var: "ANTHROPIC_API_KEY".to_string(),
                 config_dir_var: "CLAUDE_CONFIG_DIR".to_string(),
@@ -1119,6 +1101,7 @@ impl EngineWiring {
             "codex" => Ok(Self {
                 engine_id: engine_id.to_string(),
                 credential_header: CredentialHeader::AuthorizationBearer,
+                provider_base_url: "https://api.openai.com/v1",
                 base_url_var: None,
                 // Named by the provider configuration below, so the CLI reads
                 // the ticket out of a variable that means nothing to the vendor
@@ -1225,7 +1208,12 @@ impl ProviderAdapter {
         sink: Arc<dyn AdapterEventSink>,
     ) -> Result<Self> {
         let upstream = url::Url::parse(credential.provider_base_url.trim_end_matches('/'))
-            .with_context(|| "the vault row's provider_base_url is not a URL".to_string())?;
+            .with_context(|| {
+                format!(
+                    "the wiring's upstream for engine '{}' is not a URL",
+                    wiring.engine_id
+                )
+            })?;
         if !matches!(upstream.scheme(), "https" | "http") {
             return Err(anyhow!(
                 "provider_base_url must be http(s), got {}",
@@ -1299,8 +1287,12 @@ pub struct AdapterConfig {
     /// learns the address from its base URL, not from a convention.
     pub bind_addr: SocketAddr,
     pub engine_id: String,
-    pub org_id: String,
-    pub node_id: String,
+    /// The account's decrypted credential, opened by the caller from the
+    /// account registry (`provider_account_credentials`). It is a `String`
+    /// rather than a handle because the adapter has to hold the plaintext to
+    /// inject it; `AgentCredential` takes ownership of this exact allocation and
+    /// wipes it on drop, so there is never a second copy to leak.
+    pub material: String,
     /// Where the session CA is written for the sandbox to read — inside the
     /// session's tmp directory (`paths::session_tmp_dir`).
     pub ca_path: PathBuf,
@@ -1413,25 +1405,17 @@ impl AdapterHandle {
 /// Starts the adapter for one engine of one session.
 ///
 /// Only `DelegationAuth::OrgCredential` reaches this function — the mode is
-/// decided by `resolve_delegation_auth` before anything is started — so the
-/// missing vault row here is a genuine inconsistency (the row was deleted
-/// between the decision and the start), not the ordinary state of a node whose
-/// CLI carries its own login.
+/// decided from the resolved account's credential kind before anything is
+/// started — so a run that got here is one whose account holds an API key.
 ///
-/// The order of the three steps is the contract:
+/// The order of the two steps is the contract:
 ///   1. the Phase 0B gate (an unverified engine never gets this far),
-///   2. the vault row (no row → `credential_missing`, and `delegate_cli` must
-///      refuse to start rather than run the CLI unauthenticated),
-///   3. bind and serve.
+///   2. bind and serve.
 ///
-/// Step 1 reads the engine flag from the main database (`core_db`), step 2
-/// the vault row from the instance content database (`local`).
-pub async fn start_adapter(
-    core_db: &DbPool,
-    local: &DbPool,
-    cipher: &crate::crypto::SettingsCipher,
-    config: AdapterConfig,
-) -> Result<AdapterHandle> {
+/// The upstream is the engine's own, read off the wiring: the account supplies
+/// the KEY, and there is no field anywhere that lets a caller name the host the
+/// key is presented to.
+pub async fn start_adapter(core_db: &DbPool, config: AdapterConfig) -> Result<AdapterHandle> {
     ensure_engine_verified(core_db, &config.engine_id, config.egress_enforcement)?;
     let wiring = EngineWiring::for_engine(&config.engine_id)?;
     // The directory has to exist before the CLI reads it, and it has to be OURS:
@@ -1444,13 +1428,7 @@ pub async fn start_adapter(
         )
     })?;
     for name in ["home", "tmp"] { std::fs::create_dir_all(config.cli_home_dir.join(name))?; }
-    let credential = super::vault::get_agent_credential(
-        local,
-        cipher,
-        &config.org_id,
-        &config.node_id,
-        &config.engine_id,
-    )?;
+    let credential = AgentCredential::new(wiring.provider_base_url, config.material);
     let trust = SessionTrust::generate(&config.ca_path, &config.dns_names)?;
     let adapter = ProviderAdapter::bind(
         config.bind_addr,
@@ -2034,14 +2012,28 @@ mod tests {
     use super::*;
     use crate::code_studio::models::{AutonomyMode, WorkspaceRole};
 
-    #[tokio::test]
-    async fn explicitly_selected_account_does_not_spend_the_organization_api_key() {
-        let local = crate::code_studio::db::test_pool();
-        let cipher = crate::crypto::SettingsCipher::new(&[9; 32]);
-        super::super::vault::put_agent_credential(&local,&cipher,"org","node","codex","synthetic-key","https://api.openai.com/v1","admin").unwrap();
-        assert_eq!(resolve_delegation_auth(&local,"org","node","codex",false,async { panic!("vault mode must not probe a subscription") }).await.unwrap(),DelegationAuth::OrgCredential);
-        assert_eq!(resolve_delegation_auth(&local,"org","node","codex",true,async { Ok(true) }).await.unwrap(),DelegationAuth::ProviderLogin);
-        assert!(resolve_delegation_auth(&local,"org","node","codex",true,async { Ok(false) }).await.is_err());
+    #[test]
+    fn the_accounts_credential_kind_is_what_authenticates_the_turn() {
+        use crate::services::agent_account::CredentialKind;
+
+        // An API key is the organization's, so it goes through the adapter and
+        // the ticket is what meters it. A provider login IS the vendor session
+        // in the CLI's own config directory, so pointing the CLI at an adapter
+        // would take that login away — the turn authenticates itself and the
+        // vendor reports what it spent.
+        assert_eq!(
+            DelegationAuth::for_credential(CredentialKind::ApiKey),
+            DelegationAuth::OrgCredential
+        );
+        assert_eq!(
+            DelegationAuth::for_credential(CredentialKind::ProviderLogin),
+            DelegationAuth::ProviderLogin
+        );
+        assert_eq!(DelegationAuth::OrgCredential.usage_source(), "adapter");
+        assert_eq!(
+            DelegationAuth::ProviderLogin.usage_source(),
+            "provider_reported"
+        );
     }
 
     fn ctx() -> pep::SessionCtx {
@@ -2683,8 +2675,8 @@ mod tests {
     // End to end, over a real TLS socket
     // =========================================================================
 
-    /// The provider credential as the vault stores it. The test asserts this
-    /// string reaches the PROVIDER and never the client.
+    /// The provider credential an account carries. The test asserts this string
+    /// reaches the PROVIDER and never the client.
     const PROVIDER_KEY: &str = "sk-provider-org-key-not-for-the-sandbox";
 
     struct RecordedRequest {
@@ -2765,8 +2757,8 @@ mod tests {
         }
     }
 
-    /// Puts a credential in the vault and starts an adapter in front of the stub
-    /// provider. Returns everything the assertions need.
+    /// Starts an adapter in front of the stub provider with the material an
+    /// account carries. Returns everything the assertions need.
     async fn adapter_over_stub(
         upstream: SocketAddr,
     ) -> (
@@ -2777,27 +2769,8 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let local = crate::code_studio::db::test_pool();
-        let cipher = crate::crypto::SettingsCipher::new(&[9_u8; 32]);
-        crate::code_studio::vault::put_agent_credential(
-            &local,
-            &cipher,
-            "org-1",
-            "node-1",
-            "claude-code",
-            PROVIDER_KEY,
-            &format!("http://{upstream}"),
-            "u-owner",
-        )
-        .expect("store credential");
-        let credential = crate::code_studio::vault::get_agent_credential(
-            &local,
-            &cipher,
-            "org-1",
-            "node-1",
-            "claude-code",
-        )
-        .expect("read credential");
+        let credential =
+            AgentCredential::new(&format!("http://{upstream}"), PROVIDER_KEY.to_string());
 
         let trust = SessionTrust::generate(&dir.path().join("ca.pem"), &["localhost".to_string()])
             .expect("trust");

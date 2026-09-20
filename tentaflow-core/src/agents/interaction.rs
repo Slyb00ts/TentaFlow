@@ -28,16 +28,20 @@ use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
 /// Default human-wait budget when the caller omits `timeout_secs` (§3.13).
 pub const DEFAULT_INTERACTION_TIMEOUT_SECS: u64 = 600;
 
-/// The two interaction kinds. The registry is agnostic to the kind — both park
-/// on the same channel — but the kind drives what the dashboard renders (a
-/// question card vs a permission grant card) and what a timeout means (sentinel
-/// text vs deny).
+/// The interaction kinds. The registry is agnostic to the kind — all of them
+/// park on the same channel — but the kind drives what the dashboard renders (a
+/// question card vs a permission grant card vs the missing-account card) and
+/// what a timeout means (sentinel text vs deny).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InteractionKind {
     /// `core.ask_user` / `ask_user` block — a clarification or missing-data ask.
     Question,
     /// A tool permission grant requested on a NotConfigured deny.
     Permission,
+    /// A run cannot start because the provider account its agent is bound to is
+    /// not there (C01). Answered by a successful sign-in rather than by a
+    /// decision, which is why it is not a `Permission` with a fifth scope.
+    AccountLogin,
 }
 
 impl InteractionKind {
@@ -45,6 +49,7 @@ impl InteractionKind {
         match self {
             InteractionKind::Question => "question",
             InteractionKind::Permission => "permission",
+            InteractionKind::AccountLogin => "account_login",
         }
     }
 }
@@ -136,6 +141,19 @@ pub struct PendingInteraction {
     /// Epoch millis the interaction was raised (for the dashboard's "waiting
     /// for N s" display); the authoritative timeout is enforced by the awaiter.
     pub raised_at_ms: i64,
+    /// AccountLogin kind only (§D.5): which engine's account the run is missing,
+    /// the account that exists but has no usable credential (when one does), and
+    /// the accounts the person could switch to instead. Carried on the
+    /// interaction — not on the wire — because the sign-in that settles the ask
+    /// has to find it: an ask registered for `codex` must not be woken by a
+    /// successful `claude-code` sign-in, and a person's own sign-in must not
+    /// settle somebody else's run.
+    pub engine_id: Option<String>,
+    pub account_id: Option<String>,
+    pub candidate_accounts: Vec<String>,
+    /// Principal the asking run acts for. The wake-up key alongside
+    /// `engine_id`: a sign-in is a fact about ONE user + engine pair.
+    pub user_id: Option<String>,
 }
 
 /// The awaiting side of one pending interaction: the sender resolves the
@@ -289,6 +307,48 @@ impl InteractionRegistry {
             .map(|s| s.info.clone())
             .collect()
     }
+
+    /// Answers the parked account asks that ONE successful sign-in settles, and
+    /// returns how many were woken.
+    ///
+    /// The key is `(engine_id, user_id)` and not the interaction id, because a
+    /// sign-in is not an answer to a card: A02 runs in its own window, may be
+    /// opened for a different avatar of the same account, and the person never
+    /// touches the card at all. What makes the ask answerable is that the
+    /// account it named now exists and works — a fact about one engine and one
+    /// principal — so every run waiting on exactly that fact may proceed, and
+    /// a run waiting on a different engine, or for somebody else, is left alone.
+    ///
+    /// `AllowOnce` is the only decision that fits: there is no standing scope to
+    /// store (the account is already durable), and a `Deny` here would be
+    /// indistinguishable from the timeout the caller already handles.
+    pub fn resolve_account_logins(&self, engine_id: &str, user_id: &str) -> usize {
+        let Ok(mut map) = self.pending.lock() else {
+            return 0;
+        };
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, slot)| {
+                slot.info.kind == InteractionKind::AccountLogin
+                    && slot.info.engine_id.as_deref() == Some(engine_id)
+                    && slot.info.user_id.as_deref() == Some(user_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut woken = 0;
+        for id in ids {
+            if let Some(slot) = map.remove(&id) {
+                if slot
+                    .reply_tx
+                    .send(InteractionReply::Permission(PermissionDecision::AllowOnce))
+                    .is_ok()
+                {
+                    woken += 1;
+                }
+            }
+        }
+        woken
+    }
 }
 
 /// Awaits a registered interaction with a timeout, returning the human reply or
@@ -379,6 +439,11 @@ pub async fn run_ask_user(
         tool_name: None,
         permission: None,
         raised_at_ms: now_ms(),
+        // A question is answered by the model's caller, not by a sign-in.
+        engine_id: None,
+        account_id: None,
+        candidate_accounts: Vec::new(),
+        user_id: None,
     };
     let rx = registry.register(info);
 
@@ -462,6 +527,11 @@ pub async fn run_permission_request(
         tool_name: Some(tool_name.to_string()),
         permission: Some(permission.to_string()),
         raised_at_ms: now_ms(),
+        // A permission grant is a decision, not a missing account.
+        engine_id: None,
+        account_id: None,
+        candidate_accounts: Vec::new(),
+        user_id: None,
     };
     let rx = registry.register(info);
 
@@ -523,6 +593,10 @@ mod tests {
             tool_name: None,
             permission: None,
             raised_at_ms: now_ms(),
+            engine_id: None,
+            account_id: None,
+            candidate_accounts: Vec::new(),
+            user_id: None,
         }
     }
 
@@ -598,6 +672,58 @@ mod tests {
         // Admin sees both.
         let all = reg.list_for(true, &[]);
         assert_eq!(all.len(), 2);
+    }
+
+    /// An account ask parked for one engine and one person (C01).
+    fn account_ask(id: &str, run_id: &str, engine: &str, user: &str) -> PendingInteraction {
+        let mut info = pending(id, run_id, InteractionKind::AccountLogin);
+        info.engine_id = Some(engine.into());
+        info.account_id = None;
+        info.candidate_accounts = vec!["Claude Code — firma".into()];
+        info.user_id = Some(user.into());
+        info
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_wakes_only_the_run_waiting_on_that_engine_and_user() {
+        let reg = InteractionRegistry::new();
+        let mine = reg.register(account_ask("ia", "run-a", "codex", "u-1"));
+        let other_engine = reg.register(account_ask("ib", "run-b", "claude-code", "u-1"));
+        let other_user = reg.register(account_ask("ic", "run-c", "codex", "u-2"));
+
+        // A colleague's sign-in of the right engine settles nobody's run.
+        assert_eq!(reg.resolve_account_logins("codex", "u-9"), 0);
+        assert!(reg.info("ia").is_some());
+
+        assert_eq!(reg.resolve_account_logins("codex", "u-1"), 1);
+        // The woken run proceeds on the account, holding no grant — the account
+        // itself is the permission.
+        let outcome = await_reply(&reg, "ia", mine, Duration::from_secs(5)).await;
+        assert!(matches!(
+            outcome,
+            InteractionOutcome::Replied(InteractionReply::Permission(
+                PermissionDecision::AllowOnce
+            ))
+        ));
+        // The two asks that were not about that fact are still waiting.
+        assert!(reg.info("ib").is_some());
+        assert!(reg.info("ic").is_some());
+        // And the resolved ask is gone, so a second sign-in cannot wake it twice.
+        assert_eq!(reg.resolve_account_logins("codex", "u-1"), 0);
+        drop(other_engine);
+        drop(other_user);
+    }
+
+    #[tokio::test]
+    async fn an_account_ask_that_times_out_leaves_no_wedged_run() {
+        let reg = InteractionRegistry::new();
+        let rx = reg.register(account_ask("ia", "run-a", "codex", "u-1"));
+        let outcome = await_reply(&reg, "ia", rx, Duration::from_millis(20)).await;
+        assert!(matches!(outcome, InteractionOutcome::TimedOut));
+        // The slot is gone, so the sign-in that arrives afterwards finds no
+        // parked run to wake — the delegation has already refused and settled.
+        assert!(reg.info("ia").is_none());
+        assert_eq!(reg.resolve_account_logins("codex", "u-1"), 0);
     }
 
     #[test]

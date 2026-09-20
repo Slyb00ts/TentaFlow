@@ -1075,7 +1075,7 @@ mod tests {
         let leaked: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
-                 WHERE table_name IN ('code_workspace_secrets', 'code_agent_credentials', \
+                 WHERE table_name IN ('code_workspace_secrets', \
                                       'session_assertion_jti', 'code_workspace_saga_steps')",
                 [],
                 |row| row.get(0),
@@ -1088,7 +1088,7 @@ mod tests {
         let present: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN \
-                 ('code_workspace_secrets', 'code_agent_credentials', 'code_workspace_saga_steps')",
+                 ('code_workspace_secrets', 'code_workspace_saga_steps')",
                 [],
                 |row| row.get(0),
             )

@@ -2773,6 +2773,7 @@ export const encode = {
       nz(payload.filterModality ?? payload.filter_modality ?? payload.modality),
       nz(payload.filterUser ?? payload.filter_user),
       nz(payload.filterGroup ?? payload.filter_group),
+      nz(payload.filterAccount ?? payload.filter_account),
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
@@ -7582,14 +7583,13 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::CodeStudioBody(SessionOpenRequest). payload: { workspaceId, title, autonomyMode, agentServiceId? } — the branch is derived server-side, never sent from the UI. */
+  /** MessageBody::CodeStudioBody(SessionOpenRequest). payload: { workspaceId, title, autonomyMode } — the branch is derived server-side, never sent from the UI, and the account is the AGENT's, so no picker travels. */
   codeStudioSessionOpenRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeCodeStudioSessionOpenRequest(
       csText(payload.workspaceId ?? payload.workspace_id),
       csText(payload.title),
       csText(payload.autonomyMode ?? payload.autonomy_mode, 'normal'),
-      (payload.agentServiceId ?? payload.agent_service_id) == null ? undefined : BigInt(payload.agentServiceId ?? payload.agent_service_id),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -8429,7 +8429,12 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** Zmiana nazwy lub stanu konta; pominięte pole zostaje bez zmian. */
+  /**
+   * Zmiana nazwy, stanu albo limitu równoległych sesji konta; pominięte pole
+   * zostaje bez zmian. Limit to jedyne pole, w którym 0 JEST wartością („bez
+   * limitu"), więc `csOptNumber` przepuszcza je jako 0, a nie jako null —
+   * `null` znaczyłoby dla serwera „nie dotykaj".
+   */
   // wire: AccountUpdateRequest
   providerAccountUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -8437,6 +8442,7 @@ export const encode = {
       account_id: csText(payload.accountId ?? payload.account_id),
       display_name: csOptText(payload.displayName ?? payload.display_name),
       status: csOptText(payload.status),
+      max_sessions: csOptNumber(payload.maxSessions ?? payload.max_sessions),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

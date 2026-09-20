@@ -28,10 +28,10 @@ const { TfAgentActivity } = await import(
 
 const LABELS = { tokens: 'tok', runs_title: 'Runs', no_runs: 'No runs', cancel: 'Cancel' };
 
-function mount() {
+function mount(level = 'tree') {
   const el = new TfAgentActivity();
   el.labels = LABELS;
-  el.setAttribute('level', 'tree');
+  el.setAttribute('level', level);
   document.body.appendChild(el);
   return el;
 }
@@ -123,6 +123,44 @@ test('the parent link hydrated from a row nests the child under it', () => {
   el.setRunInfo('child', { status: 'running', startedAt: Date.now(), agent: 'sub #2', parentRunId: 'parent' });
   const depths = [...el.querySelectorAll('.tf-aa-run')].map((r) => r.getAttribute('style'));
   assert.deepEqual(depths, ['--depth:0', '--depth:1']);
+});
+
+// ---------------------------------------------------------------------------
+// The account a run used (C02)
+// ---------------------------------------------------------------------------
+
+// The host composes the label (engine plus the account screens' own word for
+// the mode) and hands it over per run; the widget adds no vocabulary of its own
+// and, when the host says there is no account, shows no chip rather than an
+// empty one.
+function accountChips(el, scope) {
+  return [...el.querySelectorAll(`${scope} tf-chip`)]
+    .filter((chip) => chip.getAttribute('variant') === 'outline')
+    .map((chip) => chip.textContent.trim());
+}
+
+const ACCOUNT_LABEL = 'Codex · konto globalne: Codex — firma';
+
+test('a run row carries the account the host reported for it, and only for it', () => {
+  const el = mount();
+  el.setRunInfo('a-1', {
+    agent: 'code-implementer', status: 'completed',
+    startedAt: 1000, finishedAt: 2000, accountLabel: ACCOUNT_LABEL,
+  });
+  el.setRunInfo('a-2', { agent: 'code-reviewer', status: 'completed', startedAt: 1000, finishedAt: 2000 });
+  assert.deepEqual(accountChips(el, '.tf-aa-run[data-run="a-1"]'), [ACCOUNT_LABEL]);
+  assert.deepEqual(accountChips(el, '.tf-aa-run[data-run="a-2"]'), [], 'a run with no account grew a chip');
+});
+
+test('the bar names the account of the run its line is about', () => {
+  const el = mount('bar');
+  el.setRunInfo('b-1', { agent: 'code-implementer', status: 'running', startedAt: Date.now() });
+  assert.deepEqual(accountChips(el, '.tf-aa-bar'), [], 'no account yet');
+  el.setRunInfo('b-1', { accountLabel: ACCOUNT_LABEL });
+  assert.deepEqual(accountChips(el, '.tf-aa-bar'), [ACCOUNT_LABEL]);
+  // '' is an answer, not a missing field: the host says this run has no account.
+  el.setRunInfo('b-1', { accountLabel: '' });
+  assert.deepEqual(accountChips(el, '.tf-aa-bar'), []);
 });
 
 // ---------------------------------------------------------------------------

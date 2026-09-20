@@ -468,6 +468,101 @@ impl ProxyTransport {
     }
 }
 
+/// One file of the account's credential, made visible at the path the engine
+/// inside a session's private profile reads it from.
+///
+/// It is the single thing a session's sandbox reaches outside its own profile:
+/// the instance's HOME, history, caches, tmp and engine configuration stay
+/// private, while the credential file is the ACCOUNT's one file — a refresh
+/// token that rotates on use cannot live in per-instance copies, because the
+/// copies would rotate apart and all but the last would be retired at the
+/// provider.
+///
+/// The platform decides how it becomes visible, and the difference is real:
+///
+/// * Linux mounts the file (`--bind`), so the destination is a mount point that
+///   nothing inside the sandbox can replace, rename over or write around;
+/// * macOS `sandbox-exec` has no bind mount, so the exposure is a symlink and the
+///   policy allows the SOURCE literally. An engine that rotates through a
+///   temporary file would replace that symlink with a file of its own, so a spawn
+///   that finds anything else at the destination refuses instead of running the
+///   account's engine against a credential nobody else can see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialExposure {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+impl CredentialExposure {
+    pub fn new(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+        }
+    }
+
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Puts the file where the engine will open it, or refuses a destination
+    /// that is not this exposure.
+    fn install(&self) -> Result<()> {
+        let replaced = || {
+            anyhow::anyhow!(
+                "credential exposure was replaced: {}",
+                self.destination.display()
+            )
+        };
+        #[cfg(target_os = "macos")]
+        {
+            return match std::fs::symlink_metadata(&self.destination) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    if std::fs::read_link(&self.destination)? == self.source {
+                        Ok(())
+                    } else {
+                        Err(replaced())
+                    }
+                }
+                Ok(_) => Err(replaced()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::os::unix::fs::symlink(&self.source, &self.destination)?;
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // A mount point for a file source is created by bwrap; an entry of
+            // any other kind there is not this exposure.
+            return match std::fs::symlink_metadata(&self.destination) {
+                Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+                Ok(_) => Err(replaced()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&self.destination)?;
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = replaced;
+            bail!("credential exposure is unsupported on this operating system")
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSandbox {
     workspace: PathBuf,
@@ -475,6 +570,7 @@ pub struct ProcessSandbox {
     read_only: bool,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
+    credential: Option<CredentialExposure>,
     proxy: Option<ProxyEndpoint>,
     #[cfg(target_os = "macos")]
     supervisor_root: PathBuf,
@@ -519,6 +615,7 @@ impl ProcessSandbox {
             read_only,
             read_roots: canonical_roots(read_roots)?,
             write_roots: canonical_roots(write_roots)?,
+            credential: None,
             proxy: None,
             #[cfg(target_os = "macos")]
             supervisor_root: macos_supervisor::new_root()?,
@@ -535,6 +632,47 @@ impl ProcessSandbox {
         }
         policy.validate()?;
         Ok(policy)
+    }
+
+    /// Adds the account's credential file to the policy, installing it where the
+    /// engine will open it.
+    ///
+    /// The source is checked before anything is mounted or linked: a regular file
+    /// reached without a symbolic link in any component, outside every grant this
+    /// sandbox already makes, and inside a real directory. The destination must
+    /// be inside the private profile — it is the profile that is disposable, and
+    /// a destination anywhere else would be a grant nobody asked for.
+    pub fn with_credential(mut self, exposure: CredentialExposure) -> Result<Self> {
+        let source = exposure.source();
+        let directory = source
+            .parent()
+            .context("credential source has no directory")?;
+        // `canonicalize` resolves links, so a canonical parent equal to the given
+        // one is the proof that no component of the source is a link.
+        if canonical_directory(directory)? != *directory
+            || std::fs::canonicalize(source)? != *source
+        {
+            bail!("credential source must not be reached through a symbolic link");
+        }
+        if !std::fs::symlink_metadata(source)?.file_type().is_file() {
+            bail!("credential source must be a regular file");
+        }
+        if source.starts_with(&self.private_root) || source.starts_with(&self.workspace) {
+            bail!("credential source must be outside every sandbox grant");
+        }
+        let destination = exposure.destination();
+        let parent = destination
+            .parent()
+            .context("credential destination has no directory")?;
+        if canonical_directory(parent)? != *parent || !parent.starts_with(&self.private_root) {
+            bail!("credential destination must be inside the private profile");
+        }
+        if destination.starts_with(&self.workspace) {
+            bail!("credential destination must not be inside the workspace");
+        }
+        exposure.install()?;
+        self.credential = Some(exposure);
+        Ok(self)
     }
 
     pub fn with_proxy(mut self, endpoint: ProxyEndpoint) -> Result<Self> {
@@ -665,6 +803,23 @@ impl ProcessSandbox {
             "(deny file-write* (subpath {}))\n",
             quote_path(&self.workspace.join(".git"))?
         ));
+        if let Some(credential) = &self.credential {
+            // The destination is a link, so the engine's open resolves to the
+            // source: the policy has to allow THAT path, and the ancestors are
+            // what the lookup walks through. The link itself is covered by the
+            // private root's rules, the source's siblings and the rest of the
+            // account's directory are not — they are not named here at all.
+            for ancestor in credential.source().ancestors() {
+                profile.push_str(&format!(
+                    "(allow file-read-metadata (literal {}))\n",
+                    quote_path(ancestor)?
+                ));
+            }
+            profile.push_str(&format!(
+                "(allow file-read* file-write* (literal {}))\n",
+                quote_path(credential.source())?
+            ));
+        }
         if let Some(proxy) = &self.proxy {
             profile.push_str(&format!(
                 "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
@@ -728,6 +883,17 @@ impl ProcessSandbox {
                 "--ro-bind".into(),
                 git.display().to_string(),
                 git.display().to_string(),
+            ]);
+        }
+        if let Some(credential) = &self.credential {
+            // Read-write: the engine on this account rotates the file, and the
+            // rotation is the whole reason the account has ONE file instead of a
+            // copy per instance. After the private root, so the mount point it
+            // replaces is the profile's own path and not the other way round.
+            args.extend([
+                "--bind".into(),
+                credential.source().display().to_string(),
+                credential.destination().display().to_string(),
             ]);
         }
         if let Some(proxy) = &self.proxy {
@@ -1167,14 +1333,23 @@ mod tests {
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             let daemon_file = workspace.join("daemon.pid");
-            while !daemon_file.exists() && Instant::now() < deadline {
+            // The daemon opens the file BEFORE it prints its pid into it, so the
+            // file's existence is not the pid being there yet — an existence test
+            // followed by a read races the write it is waiting for. The READ is
+            // what the deadline is for: an absent file and one that is still
+            // empty are the same answer, "not written yet".
+            let mut stamped = None;
+            while Instant::now() < deadline {
+                if let Some(pid) = std::fs::read_to_string(&daemon_file)
+                    .ok()
+                    .and_then(|contents| contents.trim().parse::<i32>().ok())
+                {
+                    stamped = Some(pid);
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(daemon_file.exists(), "daemon never started");
-            let pid: i32 = std::fs::read_to_string(daemon_file)
-                .unwrap()
-                .parse()
-                .unwrap();
+            let pid = stamped.expect("daemon never started");
             if cancel {
                 child.kill().unwrap();
             }

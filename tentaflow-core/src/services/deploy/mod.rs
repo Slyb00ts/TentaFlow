@@ -402,6 +402,17 @@ pub(crate) fn resolve_vision_bundle_api_key(
     })
 }
 
+/// Asks the vendor which release of one managed-CLI engine is current for this
+/// node's platform, without downloading anything.
+///
+/// Public for the same reason as `managed_cli_install`: the node matrix records
+/// the release it is about to install before the download starts, so a failed
+/// installation names the version it failed on. Nothing in this repository pins
+/// that version.
+pub async fn managed_cli_release(engine_id: &str) -> DeployResult<managed_cli::Release> {
+    managed_cli::resolve_latest(engine_id).await
+}
+
 /// Installs the vendor CLI of one managed-CLI engine and answers with its
 /// shared installation root and the directory holding the executable.
 ///
@@ -411,18 +422,28 @@ pub(crate) fn resolve_vision_bundle_api_key(
 /// version and shared by every account on this node.
 pub async fn managed_cli_install(
     engine_id: &str,
-    version: &str,
+    release: &managed_cli::Release,
 ) -> DeployResult<(std::path::PathBuf, std::path::PathBuf)> {
-    managed_cli::install(engine_id, version, None).await
+    managed_cli::install(engine_id, release, None).await
 }
 
-/// Builds, or reuses, the bridge executable of one managed-CLI engine.
-pub async fn managed_cli_bridge(
+/// Where an already installed engine release lives on this node.
+///
+/// Deliberately offline: a bridge is started from what the node matrix
+/// installed, on a node that may have no route to the vendor at all.
+pub fn managed_cli_installation(
     engine_id: &str,
-    source_hash: &str,
-    source_root: &std::path::Path,
-) -> DeployResult<std::path::PathBuf> {
-    managed_cli::ensure_bridge(engine_id, source_hash, source_root, None).await
+    version: &str,
+) -> DeployResult<(std::path::PathBuf, std::path::PathBuf)> {
+    managed_cli::installation(engine_id, version)
+}
+
+/// Caches the bridge executable of one managed-CLI engine on this node.
+///
+/// The executable ships with the server; nothing is compiled here, so a node
+/// needs no Rust toolchain to install an engine.
+pub fn managed_cli_bridge(engine_id: &str, source_hash: &str) -> DeployResult<std::path::PathBuf> {
+    managed_cli::ensure_bridge(engine_id, source_hash, None)
 }
 
 pub fn create_deploy_job(

@@ -72,6 +72,14 @@ pub struct ProviderAccountInfo {
     /// nothing reported", not "nowhere".
     #[serde(default)]
     pub used_on: Vec<AccountUsageNode>,
+    /// How many turns one account may run at the same time on one node. 0 —
+    /// what an account has until somebody sets it — means no limit, which is
+    /// exactly how accounts behaved before this field existed.
+    ///
+    /// It is an account-wide decision and replicates with the account; the
+    /// sessions it is compared against do not, so each node counts its own.
+    #[serde(default)]
+    pub max_sessions: i64,
 }
 
 /// One row of the Dostęp tab (A04). `subject_type` is 'user' | 'group' | 'org';
@@ -273,6 +281,11 @@ pub enum ProviderAccountPayload {
         account_id: String,
         display_name: Option<String>,
         status: Option<String>,
+        /// `None` leaves the limit as it is; 0 removes it. Unlike the other
+        /// fields, 0 is a value and not an absence, which is why turning a
+        /// limit off is expressible without a second "clear" flag.
+        #[serde(default)]
+        max_sessions: Option<i64>,
     },
     AccountDeleteRequest {
         account_id: String,
@@ -416,7 +429,7 @@ mod tests {
 
         // (enum, member count, digest of its attributes + variants)
         let pinned: &[(&str, usize, u64)] =
-            &[("ProviderAccountPayload", 30, 0x41bd_d10f_9819_cc36)];
+            &[("ProviderAccountPayload", 30, 0xc04d_9143_1f40_9d84)];
         assert_eq!(pinned.len(), enums.len());
         for (name, count, digest) in pinned {
             let item = enums
@@ -462,7 +475,7 @@ mod tests {
 
         // (struct, field count, digest of its attributes + "name: Type" fields)
         let pinned: &[(&str, usize, u64)] = &[
-            ("ProviderAccountInfo", 19, 0x6197_9160_94a4_6043),
+            ("ProviderAccountInfo", 20, 0x70cb_dd60_1c4b_7850),
             ("GrantEntry", 6, 0x6c64_44d1_5f29_be89),
             ("AccountSessionInfo", 11, 0x3227_205e_b73c_ec8d),
             ("AccountNodeInfo", 6, 0x2d0a_7b9e_3aa3_acb6),
@@ -537,6 +550,61 @@ mod tests {
             crate::cbor::encode(&runtime).expect("encode"),
             hex_bytes("a17252756e74696d654c69737452657175657374a0"),
             "RuntimeListRequest wire drift"
+        );
+    }
+
+    /// `ProviderAccountInfo::max_sessions` is an account decision that
+    /// replicates with the account, so it has to survive the wire — and it
+    /// arrived after the struct did, so a payload that predates it has to
+    /// decode to the documented "no limit" rather than fail. The field-count
+    /// digest above cannot see either: it pins the declaration, not a value.
+    #[test]
+    fn the_account_session_limit_survives_the_wire_and_defaults_to_no_limit() {
+        let account = ProviderAccountInfo {
+            account_id: "acc1".to_string(),
+            max_sessions: 4,
+            ..Default::default()
+        };
+        let frame = MessageBody::ProviderAccountBody(ProviderAccountPayload::AccountListResponse {
+            accounts: vec![account.clone()],
+            engines: Vec::new(),
+        });
+        let decoded: MessageBody =
+            crate::cbor::decode(&crate::cbor::encode(&frame).expect("encode")).expect("decode");
+        let MessageBody::ProviderAccountBody(ProviderAccountPayload::AccountListResponse {
+            accounts,
+            ..
+        }) = decoded
+        else {
+            panic!("the frame must decode as the response it was encoded from");
+        };
+        assert_eq!(
+            accounts,
+            vec![account.clone()],
+            "the limit must survive a round trip"
+        );
+        assert_eq!(accounts[0].max_sessions, 4);
+
+        // The same document with the field removed — what a peer built before
+        // this field existed sends.
+        let bytes = crate::cbor::encode(&account).expect("encode");
+        let mut value: ciborium::value::Value = crate::cbor::decode(&bytes).expect("decode");
+        let ciborium::value::Value::Map(entries) = &mut value else {
+            panic!("a struct encodes as a map");
+        };
+        entries.retain(|(key, _)| key.as_text() != Some("max_sessions"));
+        let without = crate::cbor::encode(&value).expect("encode");
+        assert!(
+            !without
+                .windows(b"max_sessions".len())
+                .any(|window| window == b"max_sessions"),
+            "the fixture must really omit the field"
+        );
+        let decoded: ProviderAccountInfo = crate::cbor::decode(&without).expect("decode");
+        assert_eq!(
+            decoded.max_sessions, 0,
+            "a payload without the field means the account has no limit, which is how accounts \
+             behaved before the field existed"
         );
     }
 }

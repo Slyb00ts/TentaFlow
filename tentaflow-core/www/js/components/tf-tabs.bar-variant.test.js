@@ -422,6 +422,38 @@ test('pinned + nudge are plain attributes the CSS keys off', () => {
   assert.ok(home.parentElement === scroller(host), 'the pinned cell is a normal tab');
 });
 
+// C02: the account a sub-agent ran on rides the tab's second line as a chip.
+// The row wrapper appears ONLY when the host names an account, so every tab
+// without one keeps the exact markup the ~30 tf-tabs consumers already render.
+test('a tab carrying an account puts it on the second line, as a chip', () => {
+  const host = mount([
+    { id: 'sa1', label: 'code-implementer', attrs: { sub: 'zakończony', account: 'Codex · konto globalne: Codex — firma' } },
+    { id: 'sa2', label: 'code-reviewer', attrs: { sub: 'zakończony' } },
+  ], { variant: 'bar' });
+
+  const withAccount = btnOf(host, 'sa1');
+  const row = withAccount.querySelector('.tf-tab-subrow');
+  assert.ok(row, 'the account row is missing');
+  assert.equal(row.querySelector('.tf-tab-sub').textContent, 'zakończony');
+  const chip = row.querySelector('tf-chip.tf-tab-account');
+  assert.ok(chip, 'the account chip is missing');
+  assert.equal(chip.getAttribute('label'), 'Codex · konto globalne: Codex — firma');
+  assert.equal(chip.getAttribute('size'), 'sm');
+  // Outline, not a filled status chip: it names an object, it reports no state.
+  assert.equal(chip.getAttribute('variant'), 'outline');
+  // The account leads the line and the state follows, the way the mockup's
+  // sub-agent tab reads it ("Codex · konto globalne: — · profil ro · zakończony").
+  assert.deepEqual(
+    [...row.children].map((el) => el.tagName.toLowerCase()),
+    ['tf-chip', 'span'],
+    'the account chip does not lead the second line',
+  );
+
+  const plain = btnOf(host, 'sa2');
+  assert.equal(plain.querySelector('.tf-tab-subrow'), null, 'a tab without an account grew a row');
+  assert.equal(plain.querySelector('.tf-tab-sub').textContent, 'zakończony');
+});
+
 // ---------------------------------------------------------------------------
 // The CSS the mockup states depend on
 // ---------------------------------------------------------------------------
@@ -441,6 +473,7 @@ test('css: every mockup state has a rule in controls.css', () => {
     ['.tf-tab .tf-tab-dot', 'status dot'],
     ['.tf-tab .tf-tab-marker', 'status letter'],
     ['.tf-tab .tf-tab-sub', 'subtitle'],
+    ['.tf-tab .tf-tab-subrow', 'second line with an account chip'],
     ['.tf-tab .tf-tab-label--mono', 'monospace label'],
     ['.tf-tab .tf-tab-count--hot', 'hot counter'],
     ['.tf-tab-close', 'close affordance'],

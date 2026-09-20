@@ -37,7 +37,7 @@ const MAX_OPEN_POOLS: usize = 16;
 const IDLE_CLOSE: Duration = Duration::from_secs(600);
 
 /// Highest runtime schema version this binary knows.
-pub const LATEST_SCHEMA_VERSION: i64 = 12;
+pub const LATEST_SCHEMA_VERSION: i64 = 15;
 
 struct Entry {
     pool: DbPool,
@@ -246,6 +246,28 @@ CREATE INDEX idx_session_tasks_session ON session_tasks(session_id, ordinal);
 CREATE INDEX idx_session_tasks_open ON session_tasks(session_id, status);
 "#;
 
+/// The account question a paused run asked (C01), kept with the question.
+///
+/// A permission question is answered by a decision and the row stores the
+/// decision; an account question is answered by a SIGN-IN happening in another
+/// window, and what the console has to draw while it waits is the question
+/// itself: which agent stopped, on which application, under which binding, and
+/// whether an account of the user's own already exists. None of that is on the
+/// row — `capability` says only that it is an account question and
+/// `target_pattern` names the engine — and none of it can be reconstructed at
+/// read time either, because the run's binding may move between the ask and the
+/// poll (that is what the ask is FOR) and the refusal knows which account was
+/// unusable while the agent does not.
+///
+/// So the description is stored as the JSON of the wire struct the console
+/// reads, written once when the question is recorded. It is a snapshot of the
+/// question as asked, which is also what an audit record should be: the card on
+/// screen and the row in the table describe the same moment, even after the
+/// user connects the account and the run goes on to succeed.
+const WORKSPACE_SCHEMA_V15: &str = r#"
+ALTER TABLE approvals ADD COLUMN account_json TEXT;
+"#;
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, WORKSPACE_SCHEMA_V1),
     (2, WORKSPACE_SCHEMA_V2),
@@ -262,7 +284,52 @@ const MIGRATIONS: &[(i64, &str)] = &[
         "ALTER TABLE sessions ADD COLUMN agent_service_id INTEGER;",
     ),
     (12, "ALTER TABLE cli_instances ADD COLUMN bridge_session_id TEXT;"),
+    (13, WORKSPACE_SCHEMA_V13),
+    (14, "ALTER TABLE sessions DROP COLUMN agent_service_id;"),
+    (15, WORKSPACE_SCHEMA_V15),
 ];
+
+/// `cli_instances` records the ACCOUNT a CLI instance ran on, not the id of a
+/// `services` row.
+///
+/// The row it used to name was local to one node and carried the account's
+/// identity only by accident; an account now lives in the provider registry and
+/// is addressed by its own id, so the column is replaced rather than
+/// reinterpreted. `cli_instances` is a LEAF — nothing references it — so the
+/// rebuild is a plain new-table/copy/drop/rename. `sessions` is deliberately NOT
+/// rebuilt: the runner enables foreign keys, and dropping a parent table there
+/// would perform an implicit cascading delete across the whole workspace.
+///
+/// Rows written before the rename keep an empty account id. They are history and
+/// are read as such: a resume is bound to an account, and no account is named
+/// `''`. The startup reaper settles any of them still claiming to be live.
+const WORKSPACE_SCHEMA_V13: &str = r#"
+CREATE TABLE cli_instances_new (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES session_runs(run_id) ON DELETE CASCADE,
+    engine_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    vendor_session_id TEXT,
+    model TEXT,
+    ticket_id TEXT,
+    status TEXT NOT NULL CHECK(status IN
+      ('starting','ready','busy','idle','ended','failed','reaped')),
+    last_seq INTEGER NOT NULL DEFAULT 0,
+    os_pid INTEGER,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    bridge_session_id TEXT
+);
+INSERT INTO cli_instances_new
+    (id, session_id, run_id, engine_id, account_id, vendor_session_id, model, ticket_id,
+     status, last_seq, os_pid, started_at, ended_at, bridge_session_id)
+    SELECT id, session_id, run_id, engine_id, '', vendor_session_id, model, ticket_id,
+           status, last_seq, os_pid, started_at, ended_at, bridge_session_id
+      FROM cli_instances;
+DROP TABLE cli_instances;
+ALTER TABLE cli_instances_new RENAME TO cli_instances;
+"#;
 
 const WORKSPACE_SCHEMA_V1: &str = r#"
 CREATE TABLE sessions (

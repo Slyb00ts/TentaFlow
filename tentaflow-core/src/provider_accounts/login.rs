@@ -553,7 +553,10 @@ async fn drive(
             match adopt_credential(&db, &cipher, &node_id, &account_id, &actor_user_id, &bridge)
                 .await
             {
-                Ok(subject) => finish(&login_id, "succeeded", None, subject),
+                Ok(subject) => {
+                    release_account_waiters(&login_id, &actor_user_id);
+                    finish(&login_id, "succeeded", None, subject)
+                }
                 Err(error) => {
                     tracing::warn!(account_id = %account_id, %error, "a finished sign-in produced no storable credential");
                     finish(
@@ -568,6 +571,32 @@ async fn drive(
             return;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Releases the runs this sign-in just made runnable (C01).
+///
+/// A finished sign-in is the ANSWER to every paused "connect your account"
+/// question about the same (engine, principal): the fact the question named —
+/// the account now exists and works — is now true, so each parked delegation can
+/// resolve its account again and continue from the step it stopped on. Parked
+/// asks about another engine, or belonging to somebody else, are left waiting.
+///
+/// Nothing is answered here when the account was only half-adopted: this is
+/// called after `adopt_credential` stored the credential, so a flow that failed
+/// to store anything never releases a run into the same refusal.
+fn release_account_waiters(login_id: &str, actor_user_id: &str) {
+    let engine_id = flows()
+        .lock()
+        .ok()
+        .and_then(|flows| flows.get(login_id).map(|flow| flow.engine_id.clone()));
+    let Some(engine_id) = engine_id else {
+        return;
+    };
+    let woken = crate::agents::interaction::global()
+        .resolve_account_logins(&engine_id, actor_user_id);
+    if woken > 0 {
+        tracing::info!(%engine_id, woken, "a finished sign-in released runs waiting on this account");
     }
 }
 
@@ -673,6 +702,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_sign_in_never_hands_back_the_url_it_could_not_reach() {
         let bridge = fake_bridge(
+            "acc-signin",
             "codex",
             vec![
                 (
@@ -705,6 +735,7 @@ mod tests {
     #[tokio::test]
     async fn a_running_sign_in_hands_back_the_address_the_cli_printed() {
         let bridge = fake_bridge(
+            "acc-signin",
             "codex",
             vec![
                 (

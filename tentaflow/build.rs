@@ -6,6 +6,10 @@
 //           `tentaflow-containers/agents/native/teams-bot/`. Binarka laduje
 //           obok `tentaflow` w target/<profile>/, deploy.native runtime=binary
 //           jej szuka tam.
+//        3. Wszystkie platformy: tentaflow-coding-agent-bridge (mostek CLI
+//           agentow) z `tentaflow-containers/agents/native/coding-agent-bridge/`.
+//           Laduje obok `tentaflow`, a services/deploy/managed_cli.rs bierze go
+//           stamtad przy instalacji silnika — wezel nie kompiluje mostka u siebie.
 // =============================================================================
 
 use std::path::PathBuf;
@@ -21,6 +25,7 @@ fn main() {
     build_mlx_bridge();
     build_kokoro_bridge();
     build_meeting_bot();
+    build_coding_agent_bridge();
 }
 
 // Kopiuje aktualny vendored libzvec_c_api (.so/.dylib) PLASKO do target/<profile>,
@@ -699,6 +704,130 @@ fn build_meeting_bot() {
 
     println!(
         "cargo:warning=tentaflow: tentaflow-meeting gotowy ({})",
+        dest_bin.display()
+    );
+}
+
+// Mostek CLI agentow (claude-code/codex/grok-build/muse-code) laduje obok
+// `tentaflow` w target/<profile>/. services/deploy/managed_cli.rs kopiuje go
+// stamtad do cache'u wezla przy instalacji silnika, wiec archiwum release jest
+// samowystarczalne: wezel nie potrzebuje ani Rust toolchaina, ani dostepu do
+// rejestru crate'ow. Wczesniej mostek byl kompilowany z zrodel, ktore kod
+// wbudowuje w binarke, co czynilo instalacje silnika zalezna od srodowiska
+// budowania na maszynie docelowej.
+//
+// Cache target-coding-agent-bridge jest wspoldzielony miedzy profilami glownej
+// binarki i ma osobna blokade Cargo — ten sam powod co przy target-meeting-bot.
+fn build_coding_agent_bridge() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bridge_dir = manifest_dir
+        .parent()
+        .expect("tentaflow/.. musi istniec")
+        .join("tentaflow-containers/agents/native/coding-agent-bridge");
+    let bridge_manifest = bridge_dir.join("Cargo.toml");
+
+    if !bridge_manifest.exists() {
+        println!(
+            "cargo:warning=tentaflow: brak {}, pomijam build coding-agent-bridge",
+            bridge_manifest.display()
+        );
+        return;
+    }
+
+    println!("cargo:rerun-if-changed={}/Cargo.toml", bridge_dir.display());
+    println!("cargo:rerun-if-changed={}/src", bridge_dir.display());
+    // Mostek kompiluje wspolny sandbox przez #[path] z `agents/native/`, wiec
+    // zmiana ktoregokolwiek z tych plikow zmienia binarke. Bez tych wpisow
+    // build.rs nie odpalilby sie (zadne z jego zrodel sie nie zmienilo) i obok
+    // `tentaflow` zostalaby poprzednia kopia.
+    let shared_dir = bridge_dir
+        .parent()
+        .expect("coding-agent-bridge/.. musi istniec");
+    for name in [
+        "process_sandbox.rs",
+        "macos_supervisor.rs",
+        "linux_sandbox_net.rs",
+    ] {
+        println!("cargo:rerun-if-changed={}", shared_dir.join(name).display());
+    }
+
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+    let bin_name = if cfg!(target_os = "windows") {
+        "tentaflow-coding-agent-bridge.exe"
+    } else {
+        "tentaflow-coding-agent-bridge"
+    };
+    let dest_bin = cargo_target_dir().join(bin_name);
+
+    // Wymus rerun gdy dest_bin zniknie (cargo clean parenta przy zachowanym
+    // dziecku target/): bez tego build.rs nie odpalilby sie na podstawie
+    // rerun-if-changed na bridge_dir/src i mostek nie trafilby obok `tentaflow`.
+    println!("cargo:rerun-if-changed={}", dest_bin.display());
+
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.arg("build")
+        .arg("--bin")
+        .arg("tentaflow-coding-agent-bridge")
+        .arg("--locked")
+        .arg("--manifest-path")
+        .arg(&bridge_manifest);
+    if profile == "release" {
+        cmd.arg("--release");
+    }
+    cmd.env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS");
+    let bridge_target = manifest_dir
+        .parent()
+        .unwrap()
+        .join("target-coding-agent-bridge");
+    cmd.env("CARGO_TARGET_DIR", &bridge_target);
+
+    let output = cmd.output();
+    match &output {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            report_command_tail("tentaflow-coding-agent-bridge", &o.stdout, &o.stderr);
+            panic!(
+                "tentaflow: cargo build tentaflow-coding-agent-bridge nieudane — patrz warningi \
+                 wyzej. Binarka jest wymagana (instalacja silnikow CLI agentow i pakowanie release)."
+            );
+        }
+        Err(e) => {
+            panic!(
+                "tentaflow: nie udalo sie uruchomic cargo dla tentaflow-coding-agent-bridge: {e}"
+            );
+        }
+    }
+
+    let src_bin = bridge_target.join(&profile).join(bin_name);
+    if !src_bin.exists() {
+        panic!(
+            "tentaflow: tentaflow-coding-agent-bridge zbudowany ale brak {} — sprawdz cargo build output",
+            src_bin.display()
+        );
+    }
+    let source_bytes = std::fs::read(&src_bin).unwrap_or_else(|error| {
+        panic!(
+            "tentaflow: nie można odczytać {}: {error}",
+            src_bin.display()
+        )
+    });
+    let unchanged = std::fs::read(&dest_bin)
+        .map(|bytes| bytes == source_bytes)
+        .unwrap_or(false);
+    if !unchanged {
+        if let Err(e) = std::fs::copy(&src_bin, &dest_bin) {
+            panic!(
+                "tentaflow: copy {} -> {} nieudane: {}",
+                src_bin.display(),
+                dest_bin.display(),
+                e
+            );
+        }
+    }
+
+    println!(
+        "cargo:warning=tentaflow: tentaflow-coding-agent-bridge gotowy ({})",
         dest_bin.display()
     );
 }

@@ -3387,9 +3387,9 @@ mod tests {
             // startup (D2), so a row still claiming `ready` describes a process
             // that no longer exists.
             conn.execute(
-                "INSERT INTO cli_instances (id, session_id, run_id, engine_id, service_id, \
+                "INSERT INTO cli_instances (id, session_id, run_id, engine_id, account_id, \
                   vendor_session_id, model, ticket_id, status, last_seq, started_at) \
-                 VALUES ('recinst', 'recsess', 'recrun', 'codex', 1, 'v-1', 'gpt-5', NULL, \
+                 VALUES ('recinst', 'recsess', 'recrun', 'codex', '', 'v-1', 'gpt-5', NULL, \
                   'ready', 0, datetime('now'))",
                 [],
             )

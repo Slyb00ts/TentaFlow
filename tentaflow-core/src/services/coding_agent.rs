@@ -228,8 +228,8 @@ fn owned_sessions(
         .map_err(|e| e.to_string())
 }
 
-/// Serializes operations that change the ACCOUNT: its name, its grants, its
-/// credential, its deployment and its relocation.
+/// Serializes operations that change the ACCOUNT: its credential, its
+/// deployment and its relocation.
 ///
 /// It is deliberately not taken for session traffic. An account serves as many
 /// sessions as it is asked to — several agents, several users with a grant,
@@ -270,83 +270,12 @@ pub async fn execute_authorized(
         None
     };
     let (can_use, can_manage) = account_permission(db, service.id, user_id)?;
-    let config: Value = serde_json::from_str(&service.config_json).map_err(|e| e.to_string())?;
-    let account_id = config.get("account_id").and_then(Value::as_str);
-    let access = |name: &str| {
-        serde_json::json!({"account_id":account_id,"service_id":service.id,"display_name":name,"can_use":can_use,"can_manage":can_manage}).to_string()
-    };
-    if operation == "account.access" {
-        return Ok(access(&service.display_name));
-    }
-    if matches!(operation,"account.rename"|"account.grants.set") {
-        let blocked:bool=db.read().map_err(|error|error.to_string())?.query_row("SELECT COALESCE((SELECT (phase<>'target_active' OR activation_complete=0) FROM coding_agent_account_moves WHERE service_id=?1 ORDER BY rowid DESC LIMIT 1),0)",[service.id],|row|row.get(0)).map_err(|error|error.to_string())?;
-        if blocked {return Err("account_moving: account settings are frozen during relocation".into());}
-    }
     let mut payload: Value = serde_json::from_str(if payload_json.trim().is_empty() {
         "{}"
     } else {
         payload_json
     })
     .map_err(|e| e.to_string())?;
-    if operation.starts_with("account.") {
-        if !can_manage {
-            return Err("administrator_required_for_account_management".into());
-        }
-        if operation == "account.rename" {
-            let name = payload
-                .get("display_name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
-                .ok_or("invalid account name")?;
-            db.write()
-                .map_err(|e| e.to_string())?
-                .execute(
-                    "UPDATE services SET display_name = ?1 WHERE id = ?2",
-                    rusqlite::params![name, service.id],
-                )
-                .map_err(|e| e.to_string())?;
-            return Ok(access(name));
-        }
-        if operation == "account.grants.set" {
-            let target = payload
-                .get("user_id")
-                .and_then(Value::as_str)
-                .ok_or("user_id is required")?;
-            let permitted = payload
-                .get("can_use")
-                .and_then(Value::as_bool)
-                .ok_or("can_use is required")?;
-            {
-                let conn = db.write().map_err(|e| e.to_string())?;
-                if permitted {
-                    conn.execute("INSERT INTO coding_agent_account_grants(service_id,user_id,granted_by) VALUES(?1,?2,?3) ON CONFLICT(service_id,user_id) DO UPDATE SET granted_by=excluded.granted_by", rusqlite::params![service.id,target,user_id]).map_err(|e| e.to_string())?;
-                } else {
-                    conn.execute("DELETE FROM coding_agent_account_grants WHERE service_id=?1 AND user_id=?2", rusqlite::params![service.id,target]).map_err(|e| e.to_string())?;
-                }
-            }
-            if !permitted {
-                for session in owned_sessions(db, service.id, target)? {
-                    execute(
-                        service,
-                        "session.close",
-                        &serde_json::json!({"session_id":session}).to_string(),
-                    )
-                    .await?;
-                }
-            }
-        } else if operation != "account.grants.list" {
-            return Err("unknown account operation".into());
-        }
-        let conn = db.read().map_err(|e| e.to_string())?;
-        let mut statement = conn.prepare("SELECT user_id FROM coding_agent_account_grants WHERE service_id=?1 ORDER BY user_id").map_err(|e| e.to_string())?;
-        let grants = statement
-            .query_map([service.id], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        return Ok(serde_json::json!({"grants":grants.into_iter().map(|id| serde_json::json!({"user_id":id,"can_use":true})).collect::<Vec<_>>()}).to_string());
-    }
     if operation.starts_with("runtime.") { return Err("private bridge lifecycle operation".into()); }
     if !can_use {
         return Err("agent_account_access_denied".into());
@@ -705,7 +634,12 @@ pub(crate) async fn call_bridge(
 
 /// Maps a protocol operation onto the bridge's HTTP surface. Pure, so the
 /// mapping is testable without a running bridge.
-fn route(
+///
+/// Shared with `code_studio::cli_bridge`, which addresses a bridge by the
+/// ACCOUNT it was started for rather than by a `services` row: one message to
+/// route operation names is what keeps the two clients from drifting into two
+/// different vocabularies for the same bridge.
+pub(crate) fn route(
     operation: &str,
     payload_json: &str,
 ) -> Result<(reqwest::Method, String, Option<Value>), String> {
@@ -1068,32 +1002,26 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
+        // Standing grants are what an account relocation carries, so the row is
+        // written the way that path writes it.
         assert_eq!(
             account_permission(&db, service.id, "account-second").unwrap(),
             (false, false)
         );
-        assert!(execute_authorized(
-            &db,
-            &service,
-            "account-second",
-            "account.grants.set",
-            r#"{"user_id":"account-second","can_use":true}"#
-        )
-        .await
-        .is_err());
-        execute_authorized(
-            &db,
-            &service,
-            "account-admin",
-            "account.grants.set",
-            r#"{"user_id":"account-second","can_use":true}"#,
-        )
-        .await
-        .unwrap();
+        db.write()
+            .unwrap()
+            .execute(
+                "INSERT INTO coding_agent_account_grants(service_id,user_id,granted_by) \
+                 VALUES(?1,'account-second','account-admin')",
+                [service.id],
+            )
+            .unwrap();
         assert_eq!(
             account_permission(&db, service.id, "account-second").unwrap(),
             (true, false)
         );
+        // Using the account is not owning one: a grant reaches the account, not
+        // the sessions somebody else opened on it.
         assert!(execute_authorized(
             &db,
             &service,
@@ -1114,20 +1042,6 @@ mod tests {
         .await
         .unwrap_err()
         .contains("resume_access_denied"));
-        execute_authorized(
-            &db,
-            &service,
-            "account-admin",
-            "account.grants.set",
-            r#"{"user_id":"account-second","can_use":false}"#,
-        )
-        .await
-        .unwrap();
-        assert!(
-            !account_permission(&db, service.id, "account-second")
-                .unwrap()
-                .0
-        );
     }
 
     /// The account lock is for CHANGING an account, never for using one.
@@ -1136,7 +1050,7 @@ mod tests {
     /// users with a grant, several workspaces — so a session operation must run
     /// while the account is locked; only another account mutation waits.
     #[tokio::test]
-    async fn the_account_lock_holds_up_a_rename_and_never_a_session() {
+    async fn the_account_lock_holds_up_a_login_and_never_a_session() {
         // A service id nobody else in this process uses: the lock is a global
         // keyed by that id, and `:memory:` hands out low rowids to everyone.
         const SERVICE_ID: i64 = 970_431;
@@ -1174,24 +1088,28 @@ mod tests {
         .expect("session traffic waited for the account lock");
         assert!(session.unwrap_err().contains("session_access_denied"));
 
-        let rename = r#"{"display_name":"Renamed"}"#;
+        // A login changes the account's credential, which is exactly what the
+        // lock is for.
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(250),
-                execute_authorized(&db, &service, "lock-admin", "account.rename", rename),
+                execute_authorized(&db, &service, "lock-admin", "auth.start", "{}"),
             )
             .await
             .is_err(),
             "an account mutation must still wait for the account lock"
         );
         drop(held);
-        tokio::time::timeout(
+        // It gets past the lock and the permission check, and stops at the
+        // missing bridge — the row here has no endpoint, and none of the
+        // assertions above depend on one.
+        let after = tokio::time::timeout(
             Duration::from_secs(5),
-            execute_authorized(&db, &service, "lock-admin", "account.rename", rename),
+            execute_authorized(&db, &service, "lock-admin", "auth.start", "{}"),
         )
         .await
-        .expect("the rename proceeds once the lock is free")
-        .unwrap();
+        .expect("the login proceeds once the lock is free");
+        assert!(after.unwrap_err().contains("no endpoint"));
     }
 
     fn path_of(operation: &str, payload: &str) -> String {

@@ -159,8 +159,8 @@ class TfAgentActivity extends HTMLElement {
   constructor() {
     super();
     // runId → { runId, agent, status, parentRunId, promptTokens,
-    //           completionTokens, model, startedAt, finishedAt, steps[],
-    //           question?, permission?, currentStep }
+    //           completionTokens, model, accountLabel, startedAt, finishedAt,
+    //           steps[], question?, permission?, currentStep }
     this._runs = new Map();
     this._labels = { ...DEFAULT_LABELS };
     this._level = 0; // 0 collapsed | 1 tree | 2 detail
@@ -271,6 +271,7 @@ class TfAgentActivity extends HTMLElement {
       promptTokens: 0,
       completionTokens: 0,
       model: '',
+      accountLabel: '',
       // Observation time, replaced by the row's own `started_at` as soon as one
       // is hydrated — a run replayed from the timeline starts "now" otherwise.
       startedAt: Date.now(),
@@ -353,9 +354,12 @@ class TfAgentActivity extends HTMLElement {
   }
 
   // Hydrate a run from a persisted row: `{ agent, status, parentRunId,
-  // startedAt, finishedAt, promptTokens, completionTokens, model }`, timestamps
-  // as epoch milliseconds (a string is parsed, which only works for a form
-  // `Date.parse` reads unambiguously — the host owns naive server timestamps).
+  // startedAt, finishedAt, promptTokens, completionTokens, model, accountLabel }`,
+  // timestamps as epoch milliseconds (a string is parsed, which only works for a
+  // form `Date.parse` reads unambiguously — the host owns naive server
+  // timestamps). `accountLabel` is the account the run's CLI ran on, ALREADY
+  // translated by the host: this widget holds no engine or scope vocabulary of
+  // its own, and an empty label is a run with no account behind it.
   //
   // A row is CREATED only when it comes with a `startedAt`: that is what tells
   // a real run apart from a bare status update about a run this widget never
@@ -372,6 +376,8 @@ class TfAgentActivity extends HTMLElement {
     if (info.status) run.status = String(info.status);
     if (info.parentRunId && info.parentRunId !== runId) run.parentRunId = String(info.parentRunId);
     if (info.model) run.model = String(info.model);
+    // Set, not merged: '' is the answer for a run the host says has no account.
+    if (info.accountLabel != null) run.accountLabel = String(info.accountLabel);
     const started = toMillis(info.startedAt);
     const finished = toMillis(info.finishedAt);
     if (started) run.startedAt = started;
@@ -430,16 +436,29 @@ class TfAgentActivity extends HTMLElement {
     return n;
   }
 
-  _currentLine() {
-    // The most recently active in-flight run drives the collapsed line.
+  // The most recently active in-flight run drives the collapsed line.
+  _driver() {
     let best = null;
     for (const run of this._runs.values()) {
       if (TERMINAL_STATUSES.has(run.status)) continue;
       if (!best || run.startedAt >= best.startedAt) best = run;
     }
+    return best;
+  }
+
+  _currentLine() {
+    const best = this._driver();
     if (!best) return this._labels.idle;
     const agent = best.agent ? `${best.agent} · ` : '';
     return `${agent}${best.currentStep || this._labels.idle}`;
+  }
+
+  // The account chip of a run. The label is the host's, already translated —
+  // this widget renders the fact and holds no engine or scope vocabulary.
+  _accountChip(run) {
+    return run && run.accountLabel
+      ? `<tf-chip size="sm" variant="outline">${esc(run.accountLabel)}</tf-chip>`
+      : '';
   }
 
   _render() {
@@ -480,10 +499,14 @@ class TfAgentActivity extends HTMLElement {
     }
     const line = waiting ? this._waitingLine() : this._currentLine();
     const waitingCard = waiting ? this._renderWaitingCards() : '';
+    // The account belongs to the run the line is about — the same run, read
+    // once, so the chip can never name one agent and the text another.
+    const account = waiting ? '' : this._accountChip(this._driver());
     return `<div class="tf-aa-bar-wrap">
       <button class="tf-aa-bar ${waiting ? 'is-waiting' : ''}" data-action="expand">
         <span class="tf-aa-dot ${waiting ? 'is-waiting' : 'is-active'}"></span>
         <span class="tf-aa-line">${esc(line)}</span>
+        ${account}
       </button>
       ${waitingCard}
     </div>`;
@@ -565,6 +588,7 @@ class TfAgentActivity extends HTMLElement {
         <button class="tf-aa-run-main" data-action="open-run" data-run-id="${esc(run.runId)}"${run.model ? ` title="${esc(run.model)}"` : ''}>
           <tf-chip status="${tone}" dot>${esc(run.status)}</tf-chip>
           <span class="tf-aa-run-agent">${esc(run.agent || run.runId.slice(0, 8))}</span>
+          ${this._accountChip(run)}
           <span class="tf-aa-run-meta">${esc(elapsed)} · ${esc(String(tokens))} ${esc(this._labels.tokens)}</span>
         </button>
         ${cancellable ? `<tf-button variant="ghost" size="sm" data-action="cancel-run" data-run-id="${esc(run.runId)}">${esc(this._labels.cancel)}</tf-button>` : ''}
@@ -584,6 +608,7 @@ class TfAgentActivity extends HTMLElement {
     const head = `<div class="tf-aa-panel-head">
       <tf-button variant="ghost" size="sm" data-action="to-tree">‹ ${esc(this._labels.back)}</tf-button>
       <span class="tf-aa-panel-title">${esc(run.agent || run.runId.slice(0, 8))}</span>
+      ${this._accountChip(run)}
       <tf-chip status="${tone}" dot>${esc(run.status)}</tf-chip>
     </div>`;
     const body = TfAgentActivity.renderTimeline(run.steps, this._labels);

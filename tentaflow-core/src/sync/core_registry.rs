@@ -628,13 +628,13 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
     // conflict.
     //
     // NEVER add here, and the omission is a security boundary, not an oversight:
-    //   * `code_workspace_secrets` / `code_agent_credentials` (§5.2) — key
-    //     material encrypted with the PER-NODE SettingsCipher key. Replicated it
-    //     would be undecryptable at the far end anyway, so shipping it would only
-    //     widen the attack surface for no gain. Same decision as `addon_config`,
-    //     which replicates `is_secret=0` rows only. Since migration 138 the vault
-    //     is not even in this database: it lives in the Code Studio instance's
-    //     content DB (`code_studio::db`), which the sync engine never opens.
+    //   * `code_workspace_secrets` (§5.2) — key material encrypted with the
+    //     PER-NODE SettingsCipher key. Replicated it would be undecryptable at
+    //     the far end anyway, so shipping it would only widen the attack surface
+    //     for no gain. Same decision as `addon_config`, which replicates
+    //     `is_secret=0` rows only. Since migration 138 the vault is not even in
+    //     this database: it lives in the Code Studio instance's content DB
+    //     (`code_studio::db`), which the sync engine never opens.
     //   * `session_assertion_jti` (§12.1) — a replay guard is meaningful only on
     //     the node that verifies the assertion.
     //   * everything in `workspace.db` (sessions, events, operations, patch sets)
@@ -1242,11 +1242,7 @@ mod tests {
         // §5.2 — key material encrypted with the per-node SettingsCipher key —
         // and the provisioning run state of one node's saga, both in the Code
         // Studio instance's content DB (`code_studio::db`).
-        for table in [
-            "code_workspace_secrets",
-            "code_agent_credentials",
-            "code_workspace_saga_steps",
-        ] {
+        for table in ["code_workspace_secrets", "code_workspace_saga_steps"] {
             assert!(
                 !is_core_sync_table(table),
                 "{table} must stay out of core sync"

@@ -2366,12 +2366,13 @@ fn spawn_quic_event_handler(
                                     }
                                 }
                             }
-                            // Not every node that may hold a credential is
-                            // connected to the one that minted it; a node that
-                            // adopted from the home node passes it on. Adoption
-                            // requires a strictly newer revision, which ends the
-                            // relay once the fleet has converged, and a node that
-                            // is not the home offers nothing to anybody but it.
+                            // What was just adopted is offered onwards. On the
+                            // HOME node that is the fan-out of a rotation a
+                            // satellite submitted, which is the only way the
+                            // other satellites hear about it; on a satellite the
+                            // offer resolves to the home node alone, which
+                            // already holds it, so it costs one comparison and
+                            // ends there.
                             qm_events
                                 .push_provider_credentials_to_trusted(Some(&node_id))
                                 .await;

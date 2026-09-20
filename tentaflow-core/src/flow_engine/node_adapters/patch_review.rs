@@ -26,9 +26,9 @@ use crate::agents::{
     InteractionKind, InteractionOutcome, InteractionRegistry, InteractionReply, PendingInteraction,
     PermissionDecision,
 };
-use crate::code_studio::pep::AskKind;
+use crate::code_studio::pep::{self, AskKind};
 use crate::code_studio::tools::{
-    self, Approval, ApprovalDecision, ApprovalGate, ReviewPrompt, ReviewTimeout,
+    self, AccountApproval, Approval, ApprovalDecision, ApprovalGate, ReviewPrompt, ReviewTimeout,
 };
 use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
@@ -116,6 +116,10 @@ impl ApprovalGate for InteractionGate<'_> {
             tool_name: Some(format!("code_studio.{}", ask.capability.slug())),
             permission: Some(ask.capability.slug().to_string()),
             raised_at_ms: interaction_now_ms(),
+            engine_id: None,
+            account_id: None,
+            candidate_accounts: Vec::new(),
+            user_id: None,
         };
         let rx = self.registry.register(info);
         self.progress.emit(
@@ -133,6 +137,10 @@ impl ApprovalGate for InteractionGate<'_> {
         let timeout = match ask.kind {
             AskKind::PatchReview => Duration::from_secs(MAX_TIMEOUT_SECS),
             AskKind::Permission => Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            // An account card never comes through here (it is `request_account`
+            // below); the budget matches that path so a future caller routing it
+            // through this method cannot silently get a shorter one.
+            AskKind::AccountLogin => Duration::from_secs(MAX_TIMEOUT_SECS),
         };
         match self.ask(&ask.interaction_id, rx, timeout).await {
             InteractionOutcome::Replied(InteractionReply::Permission(decision)) => match decision {
@@ -144,6 +152,60 @@ impl ApprovalGate for InteractionGate<'_> {
             // No answer is not consent, and neither is an answer of the wrong
             // shape for the card that was raised.
             _ => ApprovalDecision::Deny,
+        }
+    }
+
+    async fn request_account(
+        &self,
+        interaction_id: &str,
+        ask: &AccountApproval,
+    ) -> ApprovalDecision {
+        let info = PendingInteraction {
+            id: interaction_id.to_string(),
+            run_id: self.run_id.to_string(),
+            parent_run_id: self.parent_run_id.map(|s| s.to_string()),
+            kind: InteractionKind::AccountLogin,
+            prompt: ask.prompt.clone(),
+            choices: Vec::new(),
+            addon_id: Some(crate::agents::CORE_ADDON_ID.to_string()),
+            tool_name: Some(format!("code_studio.{}", pep::ACCOUNT_LOGIN_CAPABILITY)),
+            permission: Some(pep::ACCOUNT_LOGIN_CAPABILITY.to_string()),
+            raised_at_ms: interaction_now_ms(),
+            engine_id: Some(ask.engine_id.clone()),
+            account_id: ask.account_id.clone(),
+            candidate_accounts: ask.candidate_accounts.clone(),
+            user_id: Some(ask.user_id.clone()),
+        };
+        let rx = self.registry.register(info);
+        // The same progress event as a permission card: what the run stream has
+        // to say is "a person is being asked", and the card the person actually
+        // answers is the approval row, which `suspend_for_account` wrote before
+        // this was called. A second event kind would be a second thing to keep
+        // in step with the registry for no information gained.
+        self.progress.emit(
+            self.progress_scope,
+            ProgressEvent::PermissionRequest {
+                run_id: self.run_id.to_string(),
+                interaction_id: interaction_id.to_string(),
+                addon_id: crate::agents::CORE_ADDON_ID.to_string(),
+                tool_name: format!("code_studio.{}", pep::ACCOUNT_LOGIN_CAPABILITY),
+                permission: pep::ACCOUNT_LOGIN_CAPABILITY.to_string(),
+            },
+        );
+        // Human time, like a review: the sign-in window is a browser flow with a
+        // code to paste, and a person who walks to it is not stalling.
+        let timeout = Duration::from_secs(MAX_TIMEOUT_SECS);
+        match self.ask(interaction_id, rx, timeout).await {
+            // The ask is settled by a sign-in happening, so ANY allowing reply
+            // means "the account works now". Nothing is stored: the run goes back
+            // and resolves the account again, which is what makes the answer
+            // authoritative rather than a permission.
+            InteractionOutcome::Replied(InteractionReply::Permission(decision)) if decision.allows() => {
+                ApprovalDecision::AllowOnce
+            }
+            InteractionOutcome::Replied(InteractionReply::Permission(_))
+            | InteractionOutcome::Replied(InteractionReply::Question(_))
+            | InteractionOutcome::TimedOut => ApprovalDecision::Deny,
         }
     }
 
@@ -165,6 +227,10 @@ impl ApprovalGate for InteractionGate<'_> {
             tool_name: None,
             permission: None,
             raised_at_ms: interaction_now_ms(),
+            engine_id: None,
+            account_id: None,
+            candidate_accounts: Vec::new(),
+            user_id: None,
         };
         let rx = self.registry.register(info);
         self.progress.emit(

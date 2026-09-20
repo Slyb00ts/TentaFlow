@@ -1,19 +1,30 @@
-// ============ File: credentials.rs — the account's canonical provider credential ============
+// ============ File: credentials.rs — the account's shared provider credential ============
 //
-// One account, one canonical credential, and NO session may reach it.
+// One account, one credential DIRECTORY, and every instance on this node reads
+// and writes that one file — the way several windows of an ordinary CLI share
+// `~/.codex/auth.json`. A refresh token that rotates on use cannot live in
+// per-instance copies: each copy would rotate on its own and all but the last
+// would be retired at the provider.
 //
-// A session runs the vendor's own CLI over a user's code, so anything that
-// session can write is attacker-controlled: a shared credential directory in its
-// sandbox policy would let it plant a foreign provider identity for every other
-// user of the account, or redirect the bridge — which is NOT sandboxed — at an
-// arbitrary host path by swapping a directory for a symlink. So the canonical
-// credential lives here, outside every policy, a session gets a private COPY,
-// and the only way back is `publish_from_profile`, which proves the material
-// still names the same provider account and that nobody rotated it meanwhile.
+// So the credential is SHARED and the sandbox policy reaches it (main.rs
+// `credential_exposure`, validated by `process_sandbox::with_credential`), while
+// everything else about an instance — HOME, history, caches, the engine's own
+// configuration — stays in its private profile. What containment means here,
+// stated exactly:
 //
-// Every path below is resolved without following a single symlink, and every
-// file is stat'ed through the descriptor it is read from: a check on a path
-// followed by a second open is exactly the race this module exists to close.
+// * the bridge reads and writes only this directory, and every path in it is
+//   resolved without following a symlink (the readers below refuse a symlink, a
+//   FIFO, a hardlink or an oversized file), so a session that swaps a component
+//   for a link cannot aim this process at a host path of its choosing;
+// * `identity` is the gate that stops a session filing a FOREIGN provider
+//   identity under this account for every other user of it, and Core applies
+//   the revision CAS to what the bridge publishes;
+// * the shared file is not a secret from the session that runs on the account:
+//   a CLI needs the token to present it, so a session can read its own
+//   account's credential by construction. That is the boundary the plan names.
+//
+// Every file is stat'ed through the descriptor it is read from: a check on a
+// path followed by a second open is exactly the race this module exists to close.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -24,12 +35,24 @@ use crate::Provider;
 
 /// A provider credential is a small JSON document. Anything larger is either not
 /// a credential or an attempt to make the bridge read without an end.
-const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
-
-/// Where the account keeps its ONE provider credential.
 ///
-/// Nothing under this directory is ever named in a session's sandbox policy —
-/// not the directory, not the file, not read-only.
+/// `crate::main` reuses the same bound for the project settings it reads before
+/// a session starts: those files are small documents too, and one limit for
+/// both keeps a workspace from being able to make this process read without an
+/// end by any route.
+pub(crate) const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
+
+/// Where the account keeps its ONE provider credential — the directory every
+/// instance on this node shares.
+///
+/// Only the engine's own credential file inside it is exposed to a session, and
+/// every exposure that exists is read-write: the session runs the engine ON the
+/// account's shared credential, so an engine that rotates its token has to write
+/// the new value back to that one file. Claude Code receives no file exposure at
+/// all — it is handed `CLAUDE_CODE_OAUTH_TOKEN` in its child environment instead.
+/// The directory as a whole is not a mount target in either case, and the
+/// sibling engines' credential files are not reachable from a session of another
+/// engine.
 pub fn root(data_dir: &Path) -> PathBuf {
     data_dir.join("credentials")
 }
@@ -549,104 +572,102 @@ impl std::fmt::Debug for Publication {
     }
 }
 
-/// The refusal a file that cannot be read safely produces — a symlink, a FIFO,
-/// something oversized. It is also what the session carries afterwards as "the
-/// last thing I already reported", because there is no digest to carry: the
-/// state that produced it lasts as long as the session, and without something
-/// stable to remember, every poll reported it again — one audit row and one
-/// unindexed audit scan per poll, for the life of the session.
-///
-/// A reason is never 64 hex characters, so it can never collide with a digest.
-pub const UNSAFE_FILE_MARKER: &str = "unsafe_credential_file";
-
-/// What the session must carry after a refusal, given to it by the same call
-/// that produced the refusal: the digest when the material could be read,
-/// otherwise the reason. Storing the empty string a digest-less refusal carries
-/// would remember nothing, and `publish_from_profile` would refuse again on the
-/// next poll — which is exactly the loop `UNSAFE_FILE_MARKER` exists to stop.
-pub fn refusal_marker(reason: &str, sha256: &str) -> String {
-    if sha256.is_empty() {
-        reason.to_string()
-    } else {
-        sha256.to_string()
-    }
+/// What this bridge last told Core about the account's credential: the digest
+/// it announced and the provider identity of the last material it announced as
+/// THIS account's. Kept for the life of the process; a restart loses it, and the
+/// first observation after one therefore announces the credential the node
+/// holds. Core compares the digest first (`credential_events::adopt` returns
+/// early on one it already stores), so that costs one comparison and cannot move
+/// a revision — while a rotation this bridge never saw before it restarted is
+/// still announced instead of staying on one node.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Watch {
+    /// Empty until something has been announced.
+    pub sha256: String,
+    /// `None` when the engine's format names no account (`identity`), or nothing
+    /// has been announced yet.
+    pub identity: Option<String>,
+    /// The last observation could not read the file at all. The condition (a
+    /// link, a FIFO, an oversized file) lasts until somebody replaces it, and the
+    /// poll that notices it runs every second — this is what makes the refusal
+    /// once per condition instead of once per poll.
+    pub unreadable: bool,
 }
 
-/// Hands a session's private credential back to the account.
+/// What a look at the account's shared credential found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Observation {
+    /// Nothing to report: the file holds the material last announced, or there
+    /// is no file at all.
+    Unchanged,
+    /// The file moved, and the material names the same provider account as the
+    /// one it replaced (or nothing here can be compared, so nothing is claimed).
+    Moved { sha256: String, identity: Option<String> },
+    /// The file moved to material that names a DIFFERENT provider account than
+    /// the one this bridge last announced. A session runs the vendor CLI over a
+    /// user's code, so that is the shape of a foreign identity being filed
+    /// under this account for every other user of it.
+    Foreign { sha256: String },
+    /// The file moved to material that names NO provider account, while the
+    /// account was one this bridge could name. A CLI's own format always names
+    /// the account it belongs to, so this is material that cannot be tied to
+    /// this account at all.
+    Unverifiable { sha256: String },
+}
+
+/// Reads the credential as it stands now and compares it with what this bridge
+/// last announced.
 ///
-/// Three things have to hold, and all three are about a session being untrusted:
-/// the file is a bounded regular file reached without following a link, the
-/// material still names the same provider account, and the canonical credential
-/// is still the one this session started from — otherwise a session closing late
-/// would put its older token back over a newer one.
-pub fn publish_from_profile(
-    provider: Provider,
-    canonical_root: &Path,
-    profile_root: &Path,
-    baseline: Option<&str>,
-    reported: Option<&str>,
-) -> Result<Publication> {
-    if provider == Provider::ClaudeCode {
-        return Ok(Publication::Unchanged);
-    }
-    let material = match read(profile_root, provider) {
+/// This is the directory observation the plan names: with one shared file there
+/// is no per-session copy to collect, so a rotation the CLI made is visible here
+/// the first time anybody looks, and Core turns the resulting event into a
+/// revision CAS.
+///
+/// A comparison is only drawn when BOTH sides name a provider account. A format
+/// that names nobody gives us nothing to compare, and inventing a refusal from
+/// silence would disable accounts whose engine we simply cannot read.
+pub fn observe(root: &Path, provider: Provider, watch: &mut Watch) -> Result<Observation> {
+    let material = match read(root, provider) {
         Ok(Some(material)) => material,
-        // A session that deleted or replaced its own copy with something that is
-        // not a credential has only disturbed itself.
-        Ok(None) => return Ok(Publication::Unchanged),
-        // Reported once. The state that produced it (a symlink, a FIFO, an
-        // oversized file) persists until the session ends, so without the
-        // marker this refusal repeated on every single poll.
-        Err(_) if reported == Some(UNSAFE_FILE_MARKER) => return Ok(Publication::Unchanged),
-        Err(_) => {
-            return Ok(Publication::Refused {
-                reason: UNSAFE_FILE_MARKER,
-                sha256: String::new(),
-            })
+        // Nothing there: the account has no credential on this node, which is a
+        // state Core owns, not something to report twice.
+        Ok(None) => return Ok(Observation::Unchanged),
+        Err(error) => {
+            if watch.unreadable {
+                return Ok(Observation::Unchanged);
+            }
+            watch.unreadable = true;
+            return Err(error);
         }
     };
+    watch.unreadable = false;
     let sha256 = digest(&material);
-    if Some(sha256.as_str()) == baseline || Some(sha256.as_str()) == reported {
-        return Ok(Publication::Unchanged);
+    if sha256 == watch.sha256 {
+        return Ok(Observation::Unchanged);
     }
-    let canonical = read(canonical_root, provider)?;
-    let canonical_sha = canonical.as_deref().map(digest);
-    if canonical_sha.as_deref() != baseline {
-        return Ok(Publication::Refused {
-            reason: "stale_baseline",
-            sha256,
-        });
-    }
-    let Some(canonical) = canonical else {
-        return Ok(Publication::Refused {
-            reason: "identity_unverifiable",
-            sha256,
-        });
-    };
-    match (
-        identity(provider, &canonical),
-        identity(provider, &material),
-    ) {
-        (Some(current), Some(candidate)) if current == candidate => {}
-        (Some(_), Some(_)) => {
-            return Ok(Publication::Refused {
-                reason: "identity_mismatch",
-                sha256,
-            })
+    let identity = identity(provider, &material);
+    match (watch.identity.as_deref(), identity.as_deref()) {
+        (Some(announced), Some(current)) if announced != current => {
+            // Remembered by digest so this is reported once, while `identity`
+            // keeps naming the account this bridge last announced — the next
+            // change is compared against the account, not against the stranger
+            // that is sitting in the file now.
+            watch.sha256 = sha256.clone();
+            Ok(Observation::Foreign { sha256 })
         }
+        (Some(_), None) => {
+            watch.sha256 = sha256.clone();
+            Ok(Observation::Unverifiable { sha256 })
+        }
+        // Nothing to compare, or the same account: either way this is a change
+        // of material and the identity it now carries (if any) is what the next
+        // comparison is drawn against.
         _ => {
-            return Ok(Publication::Refused {
-                reason: "identity_unverifiable",
-                sha256,
-            })
+            watch.sha256 = sha256.clone();
+            watch.identity = identity.clone();
+            Ok(Observation::Moved { sha256, identity })
         }
     }
-    write(canonical_root, provider, &material)?;
-    Ok(Publication::Published {
-        sha256,
-        previous: canonical_sha,
-        material,
-    })
 }
 
 /// Why a CLI ran in the bridge's private login home. It decides what the
@@ -671,8 +692,9 @@ pub enum LoginOrigin {
 /// There is no identity gate, and that is the point of the directory being
 /// private: no session can write it, and the writer is the vendor CLI the
 /// operator is signing in with. What a probe DOES get is the same compare-and-set
-/// `publish_from_profile` applies — `baseline` is the canonical digest the login
-/// home was materialized from.
+/// the sessions used to apply — `baseline` is the canonical digest the login home
+/// was materialized from, and a canonical credential that moved while the probe
+/// ran is NEWER than the copy it started from.
 pub fn publish_from_login(
     provider: Provider,
     canonical_root: &Path,
@@ -713,9 +735,14 @@ pub fn publish_from_login(
     })
 }
 
-/// Copies the canonical credential into a root that is about to run a CLI — a
-/// session profile or the bridge's login home. The destination keeps a COPY, so
-/// the CLI can rotate it without the account's credential being at stake.
+/// Copies the canonical credential into the bridge's own login home, and answers
+/// the digest it copied. That home is the ONE place a copy still makes sense: it
+/// is where a sign-in, an authentication probe and discovery run, and their
+/// writing a copy is exactly what keeps the account's credential out of an
+/// operation that has no session to isolate it.
+///
+/// A session never calls this. Its engine reads the account's one file directly
+/// (`observe` above, and the exposure main.rs builds into the sandbox policy).
 pub fn materialize(
     provider: Provider,
     canonical_root: &Path,
@@ -726,28 +753,6 @@ pub fn materialize(
     };
     write(destination_root, provider, &material)?;
     Ok(Some(digest(&material)))
-}
-
-/// Replaces a sibling session's private copy after the account's credential
-/// moved, but only while that copy is still exactly what it was given: a session
-/// that changed its own credential is left alone rather than overwritten.
-pub fn adopt(
-    provider: Provider,
-    profile_root: &Path,
-    expected: Option<&str>,
-    material: &[u8],
-) -> Result<bool> {
-    if provider == Provider::ClaudeCode {
-        return Ok(false);
-    }
-    let Some(current) = read(profile_root, provider)? else {
-        return Ok(false);
-    };
-    if Some(digest(&current).as_str()) != expected {
-        return Ok(false);
-    }
-    write(profile_root, provider, material)?;
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -761,162 +766,160 @@ mod tests {
         .unwrap()
     }
 
-    /// The whole publication gate in one place: same account passes, another
-    /// account is refused, and a format with no stable subject is refused too.
+    /// The observation of the account's one credential: a rotation by the
+    /// engine that runs on it is announced, and material naming a DIFFERENT
+    /// provider account is announced as foreign instead — that is the case where
+    /// a session would otherwise file its own identity under a shared account.
     #[test]
-    fn only_the_same_provider_account_may_replace_the_credential() {
+    fn a_rotation_is_announced_and_a_foreign_identity_is_called_foreign() {
         let account = tempfile::tempdir().unwrap();
         let canonical = root(account.path());
-        let profile = account.path().join("profile");
         prepare(account.path()).unwrap();
-        create_private_dir(&profile.join("codex")).unwrap();
 
         write(&canonical, Provider::Codex, &codex_material("acct-1")).unwrap();
-        let baseline = digest(&codex_material("acct-1"));
+        let mut watch = Watch::default();
+        let first = observe(&canonical, Provider::Codex, &mut watch).unwrap();
+        assert_eq!(
+            first,
+            Observation::Moved {
+                sha256: digest(&codex_material("acct-1")),
+                identity: Some("account:acct-1".to_string()),
+            }
+        );
+        assert_eq!(watch.sha256, digest(&codex_material("acct-1")));
+        assert!(!watch.unreadable);
 
+        // The engine rotated the shared credential in place.
         let rotated = serde_json::to_vec(&serde_json::json!({
             "tokens": {"account_id": "acct-1", "refresh_token": "rotated"}
         }))
         .unwrap();
-        write(&profile, Provider::Codex, &rotated).unwrap();
-        let published =
-            publish_from_profile(Provider::Codex, &canonical, &profile, Some(&baseline), None)
-                .unwrap();
+        write(&canonical, Provider::Codex, &rotated).unwrap();
         assert_eq!(
-            published,
-            Publication::Published {
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Moved {
                 sha256: digest(&rotated),
-                previous: Some(baseline.clone()),
-                material: rotated.clone(),
+                identity: Some("account:acct-1".to_string()),
             }
         );
-        assert_eq!(read(&canonical, Provider::Codex).unwrap().unwrap(), rotated);
-
-        // A different provider account never becomes this account's credential.
-        write(&profile, Provider::Codex, &codex_material("acct-2")).unwrap();
+        // Observed once: the second look at the same material says nothing.
         assert_eq!(
-            publish_from_profile(
-                Provider::Codex,
-                &canonical,
-                &profile,
-                Some(&digest(&rotated)),
-                None,
-            )
-            .unwrap(),
-            Publication::Refused {
-                reason: "identity_mismatch",
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Unchanged
+        );
+
+        // Another account's credential in this file is reported, not adopted,
+        // and not reported again on the next look either.
+        write(&canonical, Provider::Codex, &codex_material("acct-2")).unwrap();
+        assert_eq!(
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Foreign {
                 sha256: digest(&codex_material("acct-2")),
             }
         );
-        assert_eq!(read(&canonical, Provider::Codex).unwrap().unwrap(), rotated);
-
-        // A credential whose format names nobody cannot be compared, so it stays
-        // in the session it came from.
-        let opaque = br#"{"session":"opaque"}"#.to_vec();
-        write(&profile, Provider::Codex, &opaque).unwrap();
         assert_eq!(
-            publish_from_profile(
-                Provider::Codex,
-                &canonical,
-                &profile,
-                Some(&digest(&rotated)),
-                None,
-            )
-            .unwrap(),
-            Publication::Refused {
-                reason: "identity_unverifiable",
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Unchanged
+        );
+        // The account it is compared against is still the one this bridge last
+        // announced, not the stranger sitting in the file.
+        assert_eq!(watch.identity.as_deref(), Some("account:acct-1"));
+        write(&canonical, Provider::Codex, &codex_material("acct-3")).unwrap();
+        assert_eq!(
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Foreign {
+                sha256: digest(&codex_material("acct-3")),
+            }
+        );
+
+        // Material that names nobody, in an account this bridge can name, is not
+        // a change of token: it cannot be tied to the account at all.
+        let opaque = br#"{"session":"opaque"}"#.to_vec();
+        write(&canonical, Provider::Codex, &opaque).unwrap();
+        assert_eq!(
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Unverifiable {
                 sha256: digest(&opaque),
             }
         );
-        assert_eq!(read(&canonical, Provider::Codex).unwrap().unwrap(), rotated);
-    }
-
-    /// A session that closes late must not put the token it started with back
-    /// over the one that replaced it meanwhile.
-    #[test]
-    fn a_session_that_missed_a_rotation_cannot_resurrect_its_token() {
-        let account = tempfile::tempdir().unwrap();
-        let canonical = root(account.path());
-        let profile = account.path().join("profile");
-        prepare(account.path()).unwrap();
-        create_private_dir(&profile.join("codex")).unwrap();
-
-        let started_from = codex_material("acct-1");
-        let newer = serde_json::to_vec(&serde_json::json!({
-            "tokens": {"account_id": "acct-1", "refresh_token": "newer"}
-        }))
-        .unwrap();
-        // The account rotated elsewhere while this session rotated its own copy.
-        let mine = serde_json::to_vec(&serde_json::json!({
-            "tokens": {"account_id": "acct-1", "refresh_token": "mine"}
-        }))
-        .unwrap();
-        write(&canonical, Provider::Codex, &newer).unwrap();
-        write(&profile, Provider::Codex, &mine).unwrap();
-
         assert_eq!(
-            publish_from_profile(
-                Provider::Codex,
-                &canonical,
-                &profile,
-                Some(&digest(&started_from)),
-                None,
-            )
-            .unwrap(),
-            Publication::Refused {
-                reason: "stale_baseline",
-                sha256: digest(&mine),
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Unchanged
+        );
+        // Still compared against the account this bridge announced: another
+        // account's material in the file is foreign, not a new identity.
+        write(&canonical, Provider::Codex, &codex_material("acct-9")).unwrap();
+        assert_eq!(
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Foreign {
+                sha256: digest(&codex_material("acct-9")),
             }
         );
-        assert_eq!(read(&canonical, Provider::Codex).unwrap().unwrap(), newer);
+
+        // Nothing to read is nothing to report.
+        remove(&canonical, Provider::Codex).unwrap();
+        assert_eq!(
+            observe(&canonical, Provider::Codex, &mut watch).unwrap(),
+            Observation::Unchanged
+        );
+
+        // An account whose format names nobody is observed as a change: there is
+        // nothing to hold it to, and inventing a refusal from silence would
+        // disable accounts whose engine this bridge simply cannot read.
+        let mut nameless = Watch::default();
+        write(&canonical, Provider::Codex, &opaque).unwrap();
+        assert_eq!(
+            observe(&canonical, Provider::Codex, &mut nameless).unwrap(),
+            Observation::Moved {
+                sha256: digest(&opaque),
+                identity: None,
+            }
+        );
     }
 
-    /// Everything a session could leave in place of its credential file to make
-    /// the bridge read, hash or publish something else — each one refused, and
-    /// the last two would hang a reader that trusted the path.
+    /// Everything that could be left in place of the account's credential to
+    /// make the bridge read, hash or hand out something else — each one refused,
+    /// and the last two would hang a reader that trusted the path. The shared
+    /// file belongs to the account, but the CLI that runs on it writes through
+    /// the same path, so the file it finds there is exactly as untrusted as a
+    /// private copy used to be.
     #[cfg(unix)]
     #[test]
     fn a_planted_path_is_refused_and_never_followed() {
         let account = tempfile::tempdir().unwrap();
         let canonical = root(account.path());
-        let profile = account.path().join("profile");
         prepare(account.path()).unwrap();
-        create_private_dir(&profile.join("codex")).unwrap();
         write(&canonical, Provider::Codex, &codex_material("acct-1")).unwrap();
-        let baseline = digest(&codex_material("acct-1"));
+        let mut watch = Watch::default();
         let elsewhere = account.path().join("elsewhere.json");
         std::fs::write(&elsewhere, codex_material("acct-2")).unwrap();
 
         // The credential file replaced by a link to another file.
-        let credential = profile.join(relative(Provider::Codex));
+        let credential = canonical.join(relative(Provider::Codex));
+        std::fs::remove_file(&credential).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &credential).unwrap();
-        assert!(read(&profile, Provider::Codex).is_err());
-        assert_eq!(
-            publish_from_profile(Provider::Codex, &canonical, &profile, Some(&baseline), None)
-                .unwrap(),
-            Publication::Refused {
-                reason: "unsafe_credential_file",
-                sha256: String::new(),
-            }
-        );
+        assert!(read(&canonical, Provider::Codex).is_err());
+        assert!(observe(&canonical, Provider::Codex, &mut watch).is_err());
+        assert!(watch.unreadable, "the refusal is remembered, not repeated");
 
         // The engine DIRECTORY replaced by a link, which is how a session would
         // aim the bridge at a host path of its choosing.
         std::fs::remove_file(&credential).unwrap();
-        std::fs::remove_dir(profile.join("codex")).unwrap();
-        std::os::unix::fs::symlink(account.path(), profile.join("codex")).unwrap();
-        assert!(read(&profile, Provider::Codex).is_err());
-        assert!(write(&profile, Provider::Codex, b"{}").is_err());
-        std::fs::remove_file(profile.join("codex")).unwrap();
-        create_private_dir(&profile.join("codex")).unwrap();
+        std::fs::remove_dir(canonical.join("codex")).unwrap();
+        std::os::unix::fs::symlink(account.path(), canonical.join("codex")).unwrap();
+        assert!(read(&canonical, Provider::Codex).is_err());
+        assert!(write(&canonical, Provider::Codex, b"{}").is_err());
+        assert!(remove(&canonical, Provider::Codex).is_err());
+        std::fs::remove_file(canonical.join("codex")).unwrap();
+        create_private_dir(&canonical.join("codex")).unwrap();
 
         // A FIFO: an open that would never return, and a read with no end.
         let path = std::ffi::CString::new(credential.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn({
-            let profile = profile.clone();
-            move || sender.send(read(&profile, Provider::Codex).is_err())
+            let canonical = canonical.clone();
+            move || sender.send(read(&canonical, Provider::Codex).is_err())
         });
         assert!(
             receiver
@@ -928,8 +931,16 @@ mod tests {
 
         // More than a megabyte is not a credential either.
         std::fs::write(&credential, vec![b'x'; (MAX_CREDENTIAL_BYTES + 1) as usize]).unwrap();
-        assert!(read(&profile, Provider::Codex).is_err());
+        assert!(read(&canonical, Provider::Codex).is_err());
 
+        // A hardlink names the same material twice, so removing the account's
+        // credential would not remove it.
+        std::fs::remove_file(&credential).unwrap();
+        std::fs::hard_link(&elsewhere, &credential).unwrap();
+        assert!(read(&canonical, Provider::Codex).is_err());
+
+        std::fs::remove_file(&credential).unwrap();
+        write(&canonical, Provider::Codex, &codex_material("acct-1")).unwrap();
         assert_eq!(
             read(&canonical, Provider::Codex).unwrap().unwrap(),
             codex_material("acct-1"),
@@ -937,51 +948,45 @@ mod tests {
         );
     }
 
-    /// A file the bridge may not read is reported ONCE. The condition lasts as
-    /// long as the session does, and the poll that notices it runs every second
-    /// — an audit row per poll is what the marker exists to stop.
+    /// A file the bridge may not read is reported ONCE. The condition lasts until
+    /// somebody replaces the file, and the poll that notices it runs every second
+    /// — an audit row per poll is what the memory exists to stop. A file that
+    /// becomes readable again is observed normally.
     #[cfg(unix)]
     #[test]
-    fn an_unreadable_session_copy_is_refused_once_and_not_on_every_poll() {
+    fn an_unreadable_credential_is_refused_once_and_not_on_every_poll() {
         let account = tempfile::tempdir().unwrap();
         let canonical = root(account.path());
-        let profile = account.path().join("profile");
         prepare(account.path()).unwrap();
-        create_private_dir(&profile.join("codex")).unwrap();
         write(&canonical, Provider::Codex, &codex_material("acct-1")).unwrap();
-        let baseline = digest(&codex_material("acct-1"));
+        let mut watch = Watch::default();
+        let mut observed = 0;
+        let report = |watch: &mut Watch, observed: &mut u32| {
+            match observe(&canonical, Provider::Codex, watch) {
+                Ok(Observation::Unchanged) => {}
+                Ok(_) => *observed += 1,
+                Err(_) => *observed += 1,
+            }
+        };
         let elsewhere = account.path().join("elsewhere.json");
         std::fs::write(&elsewhere, codex_material("acct-2")).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, profile.join(relative(Provider::Codex))).unwrap();
+        let credential = canonical.join(relative(Provider::Codex));
+        std::fs::remove_file(&credential).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &credential).unwrap();
 
-        let first =
-            publish_from_profile(Provider::Codex, &canonical, &profile, Some(&baseline), None)
-                .unwrap();
-        assert_eq!(
-            first,
-            Publication::Refused {
-                reason: UNSAFE_FILE_MARKER,
-                sha256: String::new(),
-            }
-        );
-        // What the session carries from now on comes from the refusal itself,
-        // not from the test: `refusal_marker` is the one place that decides it,
-        // and the caller stores exactly what it returns.
-        let Publication::Refused { reason, sha256 } = &first else {
-            unreachable!("the refusal was asserted above")
-        };
-        let remembered = refusal_marker(reason, sha256);
-        assert_eq!(
-            publish_from_profile(
-                Provider::Codex,
-                &canonical,
-                &profile,
-                Some(&baseline),
-                Some(&remembered),
-            )
-            .unwrap(),
-            Publication::Unchanged
-        );
+        report(&mut watch, &mut observed);
+        assert_eq!(observed, 1, "the first look reports the unreadable file");
+        assert!(watch.unreadable);
+        report(&mut watch, &mut observed);
+        report(&mut watch, &mut observed);
+        assert_eq!(observed, 1, "and every later poll stays quiet");
+
+        // Replacing it with a real credential is a change again.
+        std::fs::remove_file(&credential).unwrap();
+        write(&canonical, Provider::Codex, &codex_material("acct-3")).unwrap();
+        report(&mut watch, &mut observed);
+        assert_eq!(observed, 2);
+        assert!(!watch.unreadable);
     }
 
     /// A probe is not a decision. It may refresh the token it was handed, but a

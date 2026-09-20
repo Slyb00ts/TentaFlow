@@ -19,7 +19,6 @@ import { Router } from '/js/router.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes, formatRelative } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { agentRequest } from '/js/modules/coding-agent.js';
 import { attachSession as attachConnection, detachSession as detachConnection } from '/js/modules/code-studio-connection.js';
 import { rememberNodeName } from '/js/modules/connection-overlay.js';
 import '/js/components/tf-button.js';
@@ -1659,12 +1658,6 @@ async function openSessionDialog() {
       </tf-select>
       <div class="cs-field-hint">${escapeHtml(t('session_autonomy_hint', { ceiling: t(`autonomy.${ceiling}`) }))}</div>
     </div>
-    <div class="cs-field">
-      <tf-select id="cs-sess-account" label="${escapeAttr(t('session_account'))}" disabled>
-        <option value="">${escapeHtml(t('session_account_default'))}</option>
-      </tf-select>
-      <div class="cs-field-hint">${escapeHtml(t('session_account_hint'))}</div>
-    </div>
     <div class="cs-step-note">${escapeHtml(t((w.repoKind ?? w.repo_kind) === 'local' ? 'local_session_note' : 'session_branch_note'))}</div>
     <div class="cs-form-error" id="cs-sess-error" hidden></div>
   `;
@@ -1691,7 +1684,6 @@ async function openSessionDialog() {
         workspaceId: wsId(w),
         title,
         autonomyMode: String(body.querySelector('#cs-sess-autonomy')?.value ?? 'normal'),
-        agentServiceId: body.querySelector('#cs-sess-account')?.value ? Number(body.querySelector('#cs-sess-account').value) : null,
       });
       const session = resp.session ?? {};
       cleanup();
@@ -1704,25 +1696,6 @@ async function openSessionDialog() {
       button.removeAttribute('disabled');
     }
   });
-  try {
-    const services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
-    const nodeId = String(w.nodeId ?? w.node_id);
-    const candidates = services.filter((service) =>
-      String(service.nodeId ?? service.node_id) === nodeId
-      && ['codex', 'claude-code', 'grok-build', 'muse-code'].includes(service.engineId ?? service.engine_id)
-      && service.status === 'running');
-    const access = await Promise.allSettled(candidates.map((service) => agentRequest(service, 'account.access')));
-    const accounts = candidates.filter((_, index) => access[index].status === 'fulfilled' && access[index].value.can_use && access[index].value.account_id);
-    const picker = body.querySelector('#cs-sess-account');
-    picker.setOptions([{ value: '', label: t('session_account_default') }, ...accounts.map((service) => ({
-      value: String(service.id), label: String(service.displayName ?? service.display_name),
-    }))], '');
-    picker.removeAttribute('disabled');
-  } catch (error) {
-    const err = body.querySelector('#cs-sess-error');
-    err.textContent = describeError(error);
-    err.hidden = false;
-  }
 }
 
 // ---- Members ----------------------------------------------------------------
@@ -2174,16 +2147,6 @@ async function enterSession(workspaceId, sessionId) {
   const session = state.sessions.find(
     (s) => String(s.sessionId ?? s.session_id) === sessionId,
   ) ?? null;
-  const accountServiceId = session?.agentServiceId ?? session?.agent_service_id;
-  if (session) {
-    session.agentAccountLabel = t('session_account_default');
-    if (accountServiceId) {
-      const services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => []);
-      const service = services.find((item) => Number(item.id) === Number(accountServiceId)
-        && String(item.nodeId ?? item.node_id) === String(state.workspace.nodeId ?? state.workspace.node_id));
-      session.agentAccountLabel = String(service?.displayName ?? service?.display_name ?? `${t('session_account')} #${accountServiceId}`);
-    }
-  }
   const mtop = byId('cs-mtop');
   if (mtop) {
     mtop.querySelector('.t1').textContent = String(session?.title ?? t('session_untitled'));

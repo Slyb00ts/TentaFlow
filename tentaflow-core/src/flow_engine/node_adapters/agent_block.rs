@@ -39,6 +39,30 @@ const NODE_TYPE: &str = "agent";
 /// build without the seed cannot silently no-op.
 pub const AGENT_RUN_FLOW_ID: &str = "00000000-0000-4000-8000-000000000012";
 
+/// Stable id of the seeded "CLI Agent Run" harness flow: trigger → `delegate_cli`
+/// → output.
+///
+/// A `kind = "cli"` agent gets THIS fallback, because the graph it can run is
+/// not a choice: the engine, the model and the account come from the agent, and
+/// the prompt goes straight to the CLI. Falling back to [`AGENT_RUN_FLOW_ID`]
+/// would hand a CLI agent an LLM loop it cannot execute.
+///
+/// The id is seeded rather than referenced by name here, exactly like the LLM
+/// one: random-per-node ids would diverge across the fleet.
+pub const CLI_AGENT_RUN_FLOW_ID: &str = "00000000-0000-4000-8000-000000000080";
+
+/// The harness flow an agent runs when it names none of its own.
+///
+/// A runtime that does not parse is a refusal rather than a fallback: both
+/// candidate harnesses would fail later and elsewhere, and the operator would be
+/// reading a failure about the flow when the broken thing is the agent.
+pub fn flow_for(agent: &crate::db::models::DbAgent) -> Result<&'static str> {
+    match crate::agents::runtime::AgentRuntime::parse(&agent.runtime_json)? {
+        crate::agents::runtime::AgentRuntime::Llm => Ok(AGENT_RUN_FLOW_ID),
+        crate::agents::runtime::AgentRuntime::Cli(_) => Ok(CLI_AGENT_RUN_FLOW_ID),
+    }
+}
+
 pub struct AgentNodeAdapter {
     service: AgentServiceSlot,
     runner: SubflowRunnerSlot,
@@ -110,13 +134,12 @@ impl AgentNodeAdapter {
             return Err(anyhow!("agent: agent '{agent_id}' is disabled"));
         }
 
-        // The agent's own harness flow, falling back to the seeded "Agent Run".
-        let flow_id = agent
-            .flow_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(AGENT_RUN_FLOW_ID)
-            .to_string();
+        // The agent's own harness flow, falling back to the seeded harness for
+        // the runtime the agent declares.
+        let flow_id = match agent.flow_id.as_deref().filter(|s| !s.is_empty()) {
+            Some(flow_id) => flow_id.to_string(),
+            None => flow_for(&agent)?.to_string(),
+        };
 
         // Same recursion guards as `subflow` (§3.10): the harness flow runs at
         // depth+1, so a parent already at the cap cannot descend, and the flow
@@ -272,6 +295,94 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn seed_agent(pool: &DbPool, id: &str, name: &str, flow_id: Option<&str>, enabled: bool) {
         repository_upsert_agent(pool, id, name, flow_id, enabled);
+    }
+
+    fn seed_agent_with_runtime(pool: &DbPool, id: &str, name: &str, runtime_json: &str) {
+        crate::db::repository::upsert_agent(
+            pool,
+            &AgentParams {
+                runtime_json,
+                id,
+                name,
+                display_name: None,
+                description: "test agent",
+                system_prompt: Some("sp"),
+                model: Some("test-model"),
+                tools_json: "[]",
+                skills_json: "{}",
+                params_json: "{}",
+                max_iterations: 5,
+                timeout_secs: 600,
+                max_subagents: 0,
+                max_spawn_depth: 1,
+                flow_id: None,
+                routable: true,
+                is_enabled: true,
+                on_child_complete: "notify",
+                allowed_agents_json: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("seed agent");
+    }
+
+    /// Which harness an agent gets when it names none of its own. The runtime
+    /// decides, because the two harnesses are not interchangeable: an LLM loop
+    /// cannot drive a CLI agent, and `delegate_cli` has nothing to delegate for
+    /// an LLM agent. A runtime this node cannot interpret is a refusal here
+    /// rather than a harness chosen at random — the operator would otherwise
+    /// read a failure about the flow while the broken thing is the agent.
+    #[test]
+    fn the_fallback_harness_follows_the_agents_runtime() {
+        let pool = db();
+        seed_agent_with_runtime(
+            &pool,
+            "agent-llm",
+            "general",
+            crate::agents::LLM_RUNTIME_JSON,
+        );
+        seed_agent_with_runtime(
+            &pool,
+            "agent-cli",
+            "codex-agent",
+            r#"{"kind":"cli","engine":"codex","account":{"mode":"user"}}"#,
+        );
+        // A synced agent can name an engine this node's catalog does not carry:
+        // the row arrives from the outbox, not through this node's validated
+        // writer, so the run has to answer for it too.
+        seed_agent_with_runtime(
+            &pool,
+            "agent-unknown",
+            "unknown",
+            r#"{"kind":"cli","engine":"codex","account":{"mode":"user"}}"#,
+        );
+        pool.write()
+            .expect("write")
+            .execute(
+                "UPDATE agents SET runtime_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "agent-unknown",
+                    r#"{"kind":"cli","engine":"nano-bot","account":{"mode":"user"}}"#
+                ],
+            )
+            .expect("re-seed runtime");
+
+        let loaded = |id: &str| {
+            crate::db::repository::get_agent(&pool, id)
+                .expect("get_agent")
+                .expect("agent exists")
+        };
+        assert_eq!(flow_for(&loaded("agent-llm")).unwrap(), AGENT_RUN_FLOW_ID);
+        assert_eq!(
+            flow_for(&loaded("agent-cli")).unwrap(),
+            CLI_AGENT_RUN_FLOW_ID
+        );
+        let refused = flow_for(&loaded("agent-unknown"))
+            .expect_err("a runtime this node cannot read is not a harness choice");
+        assert!(
+            refused.to_string().contains("unknown agent engine"),
+            "{refused}"
+        );
     }
 
     fn repository_upsert_agent(

@@ -153,6 +153,8 @@
   color: var(--text); font-size: 13px;
   box-shadow: var(--shadow);
   border-left: 4px solid var(--accent-1);
+  /* A refusal toast carries the translation over the node's own sentence. */
+  white-space: pre-line;
   transition: opacity 0.2s;
 }
 .toast-success { border-left-color: var(--success); }

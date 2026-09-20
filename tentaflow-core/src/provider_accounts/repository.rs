@@ -46,7 +46,7 @@ fn write_err(e: impl std::fmt::Display) -> anyhow::Error {
 
 const ACCOUNT_COLS: &str = "account_id, org_id, engine_id, display_name, scope, owner_user_id, \
      credential_kind, provider_subject, plan_label, home_node_id, status, created_by, created_at, \
-     updated_at, credential_revoked_revision";
+     updated_at, credential_revoked_revision, max_sessions";
 
 fn read_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
     Ok(AccountRecord {
@@ -65,6 +65,7 @@ fn read_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
         credential_revoked_revision: row.get(14)?,
+        max_sessions: row.get(15)?,
     })
 }
 
@@ -94,6 +95,53 @@ fn local_node_id_tx(tx: &rusqlite::Transaction<'_>) -> Result<Option<String>> {
     .map_err(read_err)
 }
 
+/// Places the account's home on this node.
+///
+/// The home is the account's single refresher (§C.5) and the copy every other
+/// node's credential is fanned out from, so this is written only where the
+/// credential was DELIBERATELY placed on this node — an administrator pasting a
+/// key here, or a provider sign-in finishing here. A node that merely held a copy
+/// never calls this.
+fn claim_home_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    actor: Option<&str>,
+) -> Result<()> {
+    let Some(local_node) = local_node_id_tx(tx)? else {
+        return Ok(());
+    };
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT home_node_id FROM provider_accounts WHERE account_id = ?1",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .map_err(read_err)?;
+    if previous.as_deref() == Some(local_node.as_str()) {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE provider_accounts SET home_node_id = ?2, \
+           updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE account_id = ?1",
+        params![account_id, local_node],
+    )
+    .map_err(write_err)?;
+    // A FIRST placement is part of the paste or the sign-in that caused it, and
+    // those audit themselves. A MOVE takes the refresher role away from another
+    // node — it changes which node every copy is fanned out from — so it is
+    // recorded on its own even when no material changed.
+    if let Some(from) = previous.filter(|from| *from != local_node) {
+        audit_tx(
+            tx,
+            actor,
+            "provider_account.home_moved",
+            account_id,
+            serde_json::json!({ "previous_home": from, "home": local_node }),
+        )?;
+    }
+    Ok(())
+}
+
 /// One audit row, written INSIDE the mutation's transaction.
 ///
 /// The capture journal deliberately binds no actor (migration 156 carries no FK
@@ -102,6 +150,14 @@ fn local_node_id_tx(tx: &rusqlite::Transaction<'_>) -> Result<Option<String>> {
 /// Joining the write's transaction is what keeps that record honest in both
 /// directions: a rolled-back mutation leaves no entry claiming it happened, and
 /// a committed one can never be missing its entry.
+///
+/// `resource` is the id the row is about — an account id for the
+/// `provider_account.*` actions, a node id for `agent_runtime.*`. It fills
+/// `resource_type`/`resource_id` as well, so "every audit row about THIS
+/// account" is one indexed query instead of a LIKE over `resource` plus the
+/// JSON payload. The type comes from the action namespace, which is the same
+/// vocabulary every action below already uses, so a new action cannot be
+/// written with a mismatched resource type.
 fn audit_tx(
     tx: &rusqlite::Transaction<'_>,
     actor: Option<&str>,
@@ -110,13 +166,20 @@ fn audit_tx(
     details: serde_json::Value,
 ) -> Result<()> {
     let node_id = local_node_id_tx(tx)?;
-    crate::db::repository::log_audit_tx(
+    let resource_type = action
+        .split_once('.')
+        .map(|(namespace, _)| namespace)
+        .unwrap_or(action);
+    crate::db::repository::log_audit_scoped_tx(
         tx,
         actor,
-        None,
         action,
-        Some(resource),
+        resource,
+        resource_type,
+        resource,
         Some(&details.to_string()),
+        "info",
+        "unclassified",
         None,
         node_id.as_deref(),
     )
@@ -218,6 +281,69 @@ pub fn get_account(db: &DbPool, account_id: &str) -> Result<Option<AccountRecord
     .map_err(read_err)
 }
 
+/// Resolved display data of one provider account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPresentation {
+    pub display_name: String,
+    pub subtitle: String,
+}
+
+/// Display data of the accounts named by id, batched for the metrics summary.
+///
+/// The summary wire contract requires Core-resolved names, never an id, so a
+/// `group_by=account` row is decorated here. Ids that name no account are
+/// absent from the map (the caller leaves the row undecorated).
+pub fn account_presentations(
+    db: &DbPool,
+    account_ids: &[String],
+) -> Result<std::collections::HashMap<String, AccountPresentation>> {
+    let mut out = std::collections::HashMap::new();
+    if account_ids.is_empty() {
+        return Ok(out);
+    }
+    let conn = db.read().map_err(read_err)?;
+    let placeholders = (1..=account_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT account_id, engine_id, display_name FROM provider_accounts \
+             WHERE account_id IN ({placeholders})"
+        ))
+        .map_err(read_err)?;
+    let bind_refs: Vec<&dyn rusqlite::ToSql> = account_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt
+        .query_map(&bind_refs[..], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(read_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(read_err)?;
+    for (account_id, engine_id, display_name) in rows {
+        // The engine's product name is what a person recognizes; the raw id is
+        // the fallback for an engine this build does not know.
+        let subtitle = super::engine(&engine_id)
+            .map(|e| e.display_name.to_string())
+            .unwrap_or(engine_id);
+        out.insert(
+            account_id,
+            AccountPresentation {
+                display_name,
+                subtitle,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Every account of the org, filtered as A01 filters. Ordered by engine then
 /// name so two nodes render the same list.
 pub fn list_accounts(
@@ -281,6 +407,11 @@ pub fn update_account(
             return Err(anyhow!("account display_name is required"));
         }
     }
+    if update.max_sessions.is_some_and(|limit| limit < 0) {
+        return Err(anyhow!(
+            "account max_sessions must be 0 (no limit) or a positive number of sessions"
+        ));
+    }
     let mut conn = db.write().map_err(write_err)?;
     let tx = conn.transaction().map_err(write_err)?;
     let changed = tx
@@ -290,6 +421,7 @@ pub fn update_account(
                status = COALESCE(?3, status), \
                plan_label = COALESCE(?4, plan_label), \
                home_node_id = COALESCE(?5, home_node_id), \
+               max_sessions = COALESCE(?6, max_sessions), \
                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
              WHERE account_id = ?1",
             params![
@@ -298,6 +430,7 @@ pub fn update_account(
                 update.status,
                 update.plan_label,
                 update.home_node_id,
+                update.max_sessions,
             ],
         )
         .map_err(write_err)?;
@@ -313,6 +446,7 @@ pub fn update_account(
                 "status": update.status,
                 "plan_label": update.plan_label,
                 "home_node_id": update.home_node_id,
+                "max_sessions": update.max_sessions,
             }),
         )?;
     }
@@ -887,6 +1021,47 @@ pub fn user_may_use_account(
     .map_err(read_err)
 }
 
+/// The principal's OWN accounts for one engine, and nothing else: `scope='user'`,
+/// owned by them, oldest name first.
+///
+/// This is the `mode="user"` lookup, and the narrowness is the point — a granted
+/// global account is deliberately NOT part of the result, because a run that
+/// asked for the user's own account must refuse rather than be handed somebody
+/// else's subscription. `list_accounts_for_user` is the right query for a UI
+/// that shows everything the user may use; this one answers the run.
+///
+/// `org_id` narrows the search when the principal carries one. It is optional
+/// because a run started from a surface with no organisation context is still
+/// that user's own run, and the owner column alone already confines the answer
+/// to them.
+pub fn personal_accounts_for_engine(
+    db: &DbPool,
+    org_id: Option<&str>,
+    user_id: &str,
+    engine_id: &str,
+) -> Result<Vec<AccountRecord>> {
+    let conn = db.read().map_err(read_err)?;
+    let mut sql = format!(
+        "SELECT {ACCOUNT_COLS} FROM provider_accounts \
+         WHERE scope = 'user' AND owner_user_id = ?1 AND engine_id = ?2"
+    );
+    let mut binds: Vec<String> = vec![user_id.to_string(), engine_id.to_string()];
+    if let Some(org_id) = org_id {
+        binds.push(org_id.to_string());
+        sql.push_str(&format!(" AND org_id = ?{}", binds.len()));
+    }
+    sql.push_str(" ORDER BY display_name, account_id");
+    let mut stmt = conn.prepare(&sql).map_err(read_err)?;
+    let bind_refs: Vec<&dyn rusqlite::ToSql> =
+        binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+    let rows = stmt
+        .query_map(&bind_refs[..], read_account)
+        .map_err(read_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(read_err)?;
+    Ok(rows)
+}
+
 // =============================================================================
 // Credentials
 // =============================================================================
@@ -995,18 +1170,28 @@ fn write_credential(
     }
     let mut conn = db.write().map_err(write_err)?;
     let tx = conn.transaction().map_err(write_err)?;
-    let account: Option<(i64, Option<String>)> = tx
+    let account: Option<(i64, Option<String>, String)> = tx
         .query_row(
-            "SELECT credential_revoked_revision, home_node_id FROM provider_accounts \
+            "SELECT credential_revoked_revision, home_node_id, credential_kind FROM provider_accounts \
              WHERE account_id = ?1",
             params![account_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(read_err)?;
-    let Some((revoked_revision, home_node_id)) = account else {
+    let Some((revoked_revision, home_node_id, credential_kind)) = account else {
         return Err(anyhow!("provider account '{account_id}' does not exist"));
     };
+    // Whether this write is a PLACEMENT of the credential. A local mint (no
+    // expected revision) is one, and it homes the account here — even over an
+    // existing home when the material is a pasted API key, because that key
+    // exists only where an administrator put it and pasting it on another node
+    // is the only way such an account can be moved. A provider login is not
+    // moved this way: only a sign-in sets its home (`login.rs::adopt_credential`),
+    // which is what keeps two rotating nodes from swapping ownership back and
+    // forth.
+    let placed_here =
+        expected_revision.is_none() && (home_node_id.is_none() || credential_kind == "api_key");
 
     let stored: Option<(i64, String)> = tx
         .query_row(
@@ -1038,6 +1223,13 @@ fn write_credential(
     // same key would otherwise stay locked out forever — the early return that
     // skipped this was exactly that defect.
     if same_material && (expected_revision.is_none() || revision == local_revision) {
+        if placed_here {
+            claim_home_tx(&tx, account_id, meta.actor.as_deref())?;
+            // This branch writes no material and otherwise captures nothing (the
+            // status change below does its own) — but a placement can still have
+            // moved the home, and that is a row every peer has to see.
+            sync_capture::capture_account(&tx, account_id)?;
+        }
         reaffirm_credential_tx(&tx, account_id, &sha, meta)?;
         tx.commit().map_err(write_err)?;
         return Ok(CredentialWrite::Unchanged {
@@ -1107,24 +1299,10 @@ fn write_credential(
     if let Some(subject) = meta.provider_subject.as_deref() {
         apply_provider_subject_tx(&tx, account_id, subject)?;
     }
-    // An account whose credential this node MINTED and which nobody has homed
-    // yet is homed here. The home node is the account's single refresher (§C.5),
-    // and a credential with no home is one no node may publish to the others —
-    // so leaving it NULL after a mint would replicate nothing at all. A home
-    // that already exists is never taken over: moving it is an explicit
-    // administrator action, and a node that claimed it by minting would make two
-    // rotating nodes swap ownership back and forth.
-    let homed_here = expected_revision.is_none() && home_node_id.is_none();
-    if homed_here {
-        if let Some(local_node) = local_node_id_tx(&tx)? {
-            tx.execute(
-                "UPDATE provider_accounts SET home_node_id = ?2, \
-                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
-                 WHERE account_id = ?1 AND home_node_id IS NULL",
-                params![account_id, local_node],
-            )
-            .map_err(write_err)?;
-        }
+    // A credential with no home is one no node may publish to the others, so
+    // leaving it NULL after a mint would replicate nothing at all.
+    if placed_here {
+        claim_home_tx(&tx, account_id, meta.actor.as_deref())?;
     }
     // A stored credential is what makes an account usable; a disabled one stays
     // disabled, because disabling is an administrator's decision and not a
@@ -1219,12 +1397,14 @@ pub fn credential_material(
     Ok(Some(plain.value))
 }
 
-/// Reasons a bridge refuses to publish a credential a session handed back that
-/// mean the material could not be tied to THIS account's provider identity.
+/// Reasons a bridge refused a credential that mean the material could not be
+/// tied to THIS account's provider identity.
 ///
-/// The other two (`stale_baseline`, `unsafe_credential_file`) are about one
-/// session's own copy and say nothing about the account: a session that lost a
-/// race or corrupted its file leaves every other session working.
+/// The other two (`stale_baseline`, `unsafe_credential_file`) are not identity
+/// measurements at all: the first is a sign-in's login home moving under a
+/// probe, the second a node that cannot read the account's file. Neither says
+/// anything about the credential the store holds, and the account's other nodes
+/// keep working.
 const IDENTITY_REJECTIONS: &[&str] = &["identity_mismatch", "identity_unverifiable"];
 
 /// Records a credential the bridge refused, and decides whether the account has
@@ -1234,9 +1414,9 @@ const IDENTITY_REJECTIONS: &[&str] = &["identity_mismatch", "identity_unverifiab
 /// The two identity reasons are not the same measurement, so they do not carry
 /// the same weight:
 ///
-/// * `identity_mismatch` is a comparison that SUCCEEDED and disagreed — both the
-///   canonical credential and the session's copy named a provider identity, and
-///   they were different accounts. One of those is what this account's runs are
+/// * `identity_mismatch` is a comparison that SUCCEEDED and disagreed — the
+///   material the account's file now carries names a provider identity, and it
+///   is not this account's. One of those is what this account's runs are
 ///   attributed to, and nobody can tell which except by signing in, so ONE is
 ///   enough to ask for a new sign-in;
 /// * `identity_unverifiable` is a comparison that could not be made at all (the
@@ -1677,13 +1857,41 @@ pub fn last_used_by_user(db: &DbPool, user_id: &str) -> Result<HashMap<String, S
     Ok(rows.into_iter().collect())
 }
 
-/// Records or refreshes a session. `vendor_session_id` is bound to
-/// (account, user, agent, workspace) by the table's partial unique index, so
-/// the same user resuming the same agent in the same workspace reattaches the
-/// provider's own conversation instead of starting a new one.
+/// Records or refreshes a session.
+///
+/// A provider conversation is driven by ONE session, which is what the table's
+/// partial unique index on `vendor_session_id` says and what the caller's
+/// decision to resume a conversation means. The row a conversation was recorded
+/// under before is therefore cleared here: `cli_instances` deletes a session's
+/// row when its CLI closes, so a row naming another session for this
+/// conversation is a leftover of a process that is gone, and leaving it would
+/// make the index refuse the LIVE session — the account would stop listing a
+/// conversation that is running on it.
+///
+/// An EMPTY vendor id is not a conversation, so it is stored as absent and
+/// never clears another row: two sessions that have each opened no conversation
+/// carry the same empty string, and treating it as this session's binding would
+/// have the second one delete the first — a live session silently dropped from
+/// the account's list — for a conversation neither of them has.
 pub fn upsert_session(db: &DbPool, session: &SessionRecord) -> Result<()> {
-    let conn = db.write().map_err(write_err)?;
-    conn.execute(
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    let vendor_session_id = session
+        .vendor_session_id
+        .as_deref()
+        .filter(|vendor_session_id| !vendor_session_id.trim().is_empty());
+    if let Some(vendor_session_id) = vendor_session_id {
+        // Only a real vendor id reaches this DELETE, so an empty one can never
+        // clear a row — including a row another session recorded with an empty
+        // id of its own.
+        tx.execute(
+            "DELETE FROM provider_account_sessions \
+              WHERE vendor_session_id = ?1 AND NOT (account_id = ?2 AND session_id = ?3)",
+            params![vendor_session_id, session.account_id, session.session_id],
+        )
+        .map_err(write_err)?;
+    }
+    tx.execute(
         "INSERT INTO provider_account_sessions \
            (account_id, session_id, user_id, agent_id, workspace_id, node_id, vendor_session_id, \
             last_used_at) \
@@ -1698,11 +1906,12 @@ pub fn upsert_session(db: &DbPool, session: &SessionRecord) -> Result<()> {
             session.agent_id,
             session.workspace_id,
             session.node_id,
-            session.vendor_session_id,
+            vendor_session_id,
             session.last_used_at,
         ],
     )
     .map_err(write_err)?;
+    tx.commit().map_err(write_err)?;
     Ok(())
 }
 
@@ -1985,9 +2194,29 @@ pub fn set_receives_accounts(
             )
             .map_err(read_err)?;
         if homed > 0 {
+            // The remedy names the operation the kind actually has. Sending an
+            // administrator to a sign-in for a pasted key — or to a key paste for
+            // a subscription — is a dead end, and this refusal is the ONLY thing
+            // standing between them and taking the node out of the fleet.
+            let keys: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_accounts \
+                     WHERE home_node_id = ?1 AND credential_kind = 'api_key'",
+                    params![node_id],
+                    |row| row.get(0),
+                )
+                .map_err(read_err)?;
+            let mut ways = Vec::new();
+            if homed > keys {
+                ways.push("sign those accounts in");
+            }
+            if keys > 0 {
+                ways.push("paste their API key");
+            }
+            let remedy = ways.join(", or ");
             return Err(anyhow!(
-                "node '{node_id}' is the home of {homed} agent account(s); sign those accounts in \
-                 on another node before taking it out of the account fleet"
+                "node '{node_id}' is the home of {homed} agent account(s); {remedy} on another node \
+                 before taking it out of the account fleet"
             ));
         }
     }
@@ -2242,6 +2471,10 @@ mod tests {
     }
 
     fn global_account(db: &DbPool, account_id: &str) -> AccountRecord {
+        global_account_of_kind(db, account_id, "api_key")
+    }
+
+    fn global_account_of_kind(db: &DbPool, account_id: &str, kind: &str) -> AccountRecord {
         create_account(
             db,
             &NewAccount {
@@ -2251,7 +2484,7 @@ mod tests {
                 display_name: format!("Account {account_id}"),
                 scope: "global".into(),
                 owner_user_id: None,
-                credential_kind: "api_key".into(),
+                credential_kind: kind.into(),
                 created_by: "admin".into(),
             },
         )
@@ -2277,6 +2510,13 @@ mod tests {
 
     /// Gives the in-memory installation the node identity `sync::runtime::init`
     /// would have written, which is what binds an engine measurement to a node.
+    fn home_of(db: &DbPool, account_id: &str) -> Option<String> {
+        get_account(db, account_id)
+            .expect("read account")
+            .expect("account exists")
+            .home_node_id
+    }
+
     fn seed_local_node(db: &DbPool, node_id: &str) {
         let conn = db.write().expect("db");
         conn.execute(
@@ -3211,6 +3451,45 @@ mod tests {
             audit_actor(&db, "agent_runtime.engine_install", "helios").as_deref(),
             Some("admin")
         );
+
+        // Every one of those rows also names its resource in the
+        // `resource_type`/`resource_id` pair the rest of the audit uses, not only
+        // in the free-form `resource` column: "what happened to THIS account" has
+        // to be one indexed query. The node-scoped runtime decisions name their
+        // NODE under their own type instead.
+        let typed = |resource_type: &str| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT action, resource, resource_id FROM audit_log \
+                     WHERE resource_type = ?1 ORDER BY id",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(params![resource_type], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+
+        let account_rows = typed("provider_account");
+        assert_eq!(account_rows.len(), 7);
+        for (action, resource, resource_id) in account_rows {
+            assert_eq!(resource.as_deref(), Some("shared"), "{action}");
+            assert_eq!(resource_id.as_deref(), Some("shared"), "{action}");
+        }
+        let node_rows = typed("agent_runtime");
+        assert_eq!(node_rows.len(), 2);
+        for (action, resource, resource_id) in node_rows {
+            assert_eq!(resource.as_deref(), Some("helios"), "{action}");
+            assert_eq!(resource_id.as_deref(), Some("helios"), "{action}");
+        }
     }
 
     /// An account that a refusal moved to `needs_login` is working again the
@@ -3475,30 +3754,244 @@ mod tests {
         )
         .unwrap();
 
+        // The refusal names the operation THIS kind can actually perform: a
+        // pasted key has no sign-in to move it, so pointing at one would be a
+        // dead end — and the refusal is the only thing standing between the
+        // operator and taking the node out of the fleet.
         let refused = set_receives_accounts(&db, "helios", false, Some("admin"))
             .expect_err("the home of an account may not leave the fleet");
-        assert!(
-            refused.to_string().contains("sign those accounts in"),
-            "{refused}"
-        );
+        let sentence = refused.to_string();
+        assert!(sentence.contains("paste their API key"), "{sentence}");
+        assert!(!sentence.contains("sign those accounts in"), "{sentence}");
         assert!(
             receives_accounts(&db, "helios").unwrap(),
             "a refused flip changes nothing"
         );
 
-        // Once the account is homed elsewhere — which is what a sign-in on
-        // another node does — the node may leave.
-        update_account(
+        // With a subscription account also homed here, both remedies are named.
+        global_account_of_kind(&db, "subscription", "provider_login");
+        mint_credential(
             &db,
-            "shared",
-            &AccountUpdate {
-                home_node_id: Some("other-node".to_string()),
-                ..Default::default()
-            },
-            None,
+            &cipher,
+            "subscription",
+            "session-material",
+            &CredentialMeta::default(),
         )
         .unwrap();
+        let mixed = set_receives_accounts(&db, "helios", false, Some("admin"))
+            .expect_err("two accounts are homed here now");
+        let sentence = mixed.to_string();
+        assert!(sentence.contains("sign those accounts in"), "{sentence}");
+        assert!(sentence.contains("paste their API key"), "{sentence}");
+
+        // Once the accounts are homed elsewhere — which is what a sign-in or a
+        // key paste on another node does — the node may leave.
+        for account_id in ["shared", "subscription"] {
+            update_account(
+                &db,
+                account_id,
+                &AccountUpdate {
+                    home_node_id: Some("other-node".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
         set_receives_accounts(&db, "helios", false, Some("admin")).unwrap();
         assert!(!receives_accounts(&db, "helios").unwrap());
+    }
+
+    /// The paste IS the move for an API key: the key exists only where an
+    /// administrator put it, so pasting the same key on another node has to take
+    /// the home with it or the account can never be moved at all — the refusal
+    /// would name a remedy the account does not have.
+    #[test]
+    fn pasting_an_api_key_on_another_node_moves_the_home() {
+        let db = pool();
+        let cipher = cipher();
+        seed_local_node(&db, "helios");
+        global_account(&db, "shared");
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "material",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(home_of(&db, "shared").as_deref(), Some("helios"));
+        // The first placement is part of the paste that caused it, not a move.
+        assert!(!audit_actions(&db, "shared").contains(&"provider_account.home_moved".to_string()));
+
+        // A mesh apply carries the revision it is applying and must not move the
+        // home: only a local placement does.
+        seed_local_node(&db, "rig24");
+        set_credential(
+            &db,
+            &cipher,
+            "shared",
+            1,
+            "material",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            home_of(&db, "shared").as_deref(),
+            Some("helios"),
+            "an applied revision is not a placement"
+        );
+
+        // Re-pasting the identical key is: the operator asked for the credential
+        // to be HERE, and the node that used to fan it out has to be told.
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "material",
+            &CredentialMeta {
+                actor: Some("admin".into()),
+                ..CredentialMeta::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(home_of(&db, "shared").as_deref(), Some("rig24"));
+        assert!(audit_actions(&db, "shared").contains(&"provider_account.home_moved".to_string()));
+        assert_eq!(
+            audit_actor(&db, "provider_account.home_moved", "shared").as_deref(),
+            Some("admin")
+        );
+
+        // A paste that lands where the home already is changes nothing and
+        // records nothing.
+        let audits = audit_actions(&db, "shared").len();
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "material",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(audit_actions(&db, "shared").len(), audits);
+    }
+
+    /// A sign-in moves a subscription's home; an API key's copy arrives through
+    /// the same write path but must not steal a home that already exists, or two
+    /// nodes holding the same key would trade ownership on every reconcile.
+    #[test]
+    fn a_key_paste_does_not_move_a_subscription_account() {
+        let db = pool();
+        let cipher = cipher();
+        seed_local_node(&db, "helios");
+        global_account_of_kind(&db, "subscription", "provider_login");
+        mint_credential(
+            &db,
+            &cipher,
+            "subscription",
+            "session-material",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(home_of(&db, "subscription").as_deref(), Some("helios"));
+
+        seed_local_node(&db, "rig24");
+        mint_credential(
+            &db,
+            &cipher,
+            "subscription",
+            "session-material",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            home_of(&db, "subscription").as_deref(),
+            Some("helios"),
+            "only a sign-in moves a subscription's home"
+        );
+    }
+
+    /// §2.5: a provider conversation is bound to ONE session, and the index
+    /// `idx_provider_account_sessions_vendor` is what says so.
+    ///
+    /// The binding record is the vendor's own conversation id, so the row a
+    /// conversation was recorded under before is cleared rather than left for
+    /// the index to collide with: `cli_instances` deletes a session's row when
+    /// its CLI closes, which is why a row naming another session for this
+    /// conversation is a leftover of a process that is gone. Two sessions of
+    /// one account carry different conversations and both stay — that is the
+    /// concurrency this table exists to allow — and a session that has not
+    /// opened one yet binds nothing.
+    #[test]
+    fn a_vendor_conversation_is_recorded_under_one_session_at_a_time() {
+        let db = pool();
+        seed_user(&db, "alice");
+        global_account(&db, "shared");
+        let record = |session_id: &str, vendor: Option<&str>| SessionRecord {
+            account_id: "shared".into(),
+            session_id: session_id.into(),
+            user_id: "alice".into(),
+            agent_id: Some("agent-1".into()),
+            workspace_id: Some("ws-1".into()),
+            node_id: "helios".into(),
+            vendor_session_id: vendor.map(str::to_string),
+            started_at: String::new(),
+            last_used_at: None,
+        };
+
+        upsert_session(&db, &record("s1", Some("vendor-x"))).unwrap();
+        upsert_session(&db, &record("s2", Some("vendor-x"))).unwrap();
+        let sessions = list_sessions(&db, "shared").unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "one conversation, one session row: {:?}",
+            sessions.iter().map(|s| &s.session_id).collect::<Vec<_>>()
+        );
+        assert_eq!(sessions[0].session_id, "s2");
+
+        upsert_session(&db, &record("s1", Some("vendor-y"))).unwrap();
+        upsert_session(&db, &record("s3", None)).unwrap();
+        let sessions = list_sessions(&db, "shared").unwrap();
+        assert_eq!(
+            sessions.len(),
+            3,
+            "two sessions of one account hold two conversations, and a third has not opened one \
+             yet: {:?}",
+            sessions.iter().map(|s| &s.session_id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.session_id == "s1")
+                .and_then(|session| session.vendor_session_id.as_deref()),
+            Some("vendor-y")
+        );
+
+        // An empty vendor id names no conversation, so it is no session's
+        // binding: recording one must not clear the row another session
+        // recorded with an empty id of its own — that row is a live session,
+        // and deleting it would take it off the account's list while its
+        // process is still running. `None` is the same absence.
+        upsert_session(&db, &record("s4", Some(""))).unwrap();
+        upsert_session(&db, &record("s5", Some(""))).unwrap();
+        upsert_session(&db, &record("s6", None)).unwrap();
+        let sessions = list_sessions(&db, "shared").unwrap();
+        assert_eq!(
+            sessions.len(),
+            6,
+            "sessions that have opened no conversation bind nothing: {:?}",
+            sessions.iter().map(|s| &s.session_id).collect::<Vec<_>>()
+        );
+        for session_id in ["s4", "s5", "s6"] {
+            assert_eq!(
+                sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+                    .and_then(|session| session.vendor_session_id.as_deref()),
+                None,
+                "an empty vendor id is stored as no binding, never as one"
+            );
+        }
     }
 }

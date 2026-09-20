@@ -43,6 +43,7 @@ pub struct ModelMetricsDimsOwned {
     pub backend: String,
     pub modality: String,
     pub hour_bucket: String,
+    pub account_id: String,
     pub histogram_version: i64,
 }
 
@@ -57,6 +58,7 @@ impl ModelMetricsDimsOwned {
             backend: &self.backend,
             modality: &self.modality,
             hour_bucket: &self.hour_bucket,
+            account_id: &self.account_id,
             histogram_version: self.histogram_version,
         }
     }
@@ -593,6 +595,7 @@ mod tests {
                 backend: "http".to_string(),
                 modality: "chat".to_string(),
                 hour_bucket: "2026-08-23T10:00:00Z".to_string(),
+                account_id: String::new(),
                 histogram_version: crate::db::repository::MODEL_METRICS_HISTOGRAM_VERSION,
             },
             counters: ModelMetricsCounters {

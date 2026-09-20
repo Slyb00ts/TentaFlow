@@ -82,11 +82,7 @@ const BUS_LADDER_FIRST_NAME: &str = "bus_topics";
 fn reject_pre_multi_instance_bus_database(conn: &Connection, current_version: i64) -> Result<()> {
     use rusqlite::OptionalExtension;
 
-    let ladder_head = get_migrations()
-        .into_iter()
-        .map(|(version, _, _)| version)
-        .max()
-        .unwrap_or(0);
+    let ladder_head = migration_ladder_head();
     if current_version > ladder_head {
         anyhow::bail!(
             "this database has already been migrated to version {current_version}, newer than \
@@ -123,6 +119,57 @@ fn reject_pre_multi_instance_bus_database(conn: &Connection, current_version: i6
              release — reset this database (or remove it and let it be recreated) rather \
              than upgrading it."
         );
+    }
+    Ok(())
+}
+
+/// The highest version this build's ladder reaches. Derived from
+/// `get_migrations()` rather than written down, so the guard and every test
+/// that reasons about the head follow the ladder — a rung added without
+/// touching either cannot leave the guard comparing against a stale number.
+fn migration_ladder_head() -> i64 {
+    get_migrations()
+        .into_iter()
+        .map(|(version, _, _)| version)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Applies one rung exactly as `run` does — the transaction and the
+/// `_migrations` record are part of the rung, not of the loop around it, so a
+/// test that walks the ladder to a version sees the same database a real
+/// upgrade at that version would have left.
+fn apply_migration(
+    conn: &Connection,
+    version: i64,
+    name: &str,
+    step: &MigrationStep,
+) -> Result<()> {
+    match step {
+        MigrationStep::Sql(sql) => {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(sql)?;
+            tx.execute(
+                "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+                rusqlite::params![version, name],
+            )?;
+            tx.commit()?;
+        }
+        MigrationStep::Rust(f) => {
+            let tx = conn.unchecked_transaction()?;
+            f(&tx)?;
+            tx.execute(
+                "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+                rusqlite::params![version, name],
+            )?;
+            tx.commit()?;
+        }
+        MigrationStep::RustSelfManaged(f) => {
+            // Runner nie otwiera transakcji ani nie zapisuje
+            // `_migrations` — robi to sama funkcja, bo musi
+            // sterowac `PRAGMA foreign_keys` poza transakcja.
+            f(conn, version, name)?;
+        }
     }
     Ok(())
 }
@@ -185,32 +232,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     for (version, name, step) in get_migrations() {
         if version > current_version {
             info!("Migracja {}: {}", version, name);
-            match step {
-                MigrationStep::Sql(sql) => {
-                    let tx = conn.unchecked_transaction()?;
-                    tx.execute_batch(sql)?;
-                    tx.execute(
-                        "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
-                        rusqlite::params![version, name],
-                    )?;
-                    tx.commit()?;
-                }
-                MigrationStep::Rust(f) => {
-                    let tx = conn.unchecked_transaction()?;
-                    f(&tx)?;
-                    tx.execute(
-                        "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
-                        rusqlite::params![version, name],
-                    )?;
-                    tx.commit()?;
-                }
-                MigrationStep::RustSelfManaged(f) => {
-                    // Runner nie otwiera transakcji ani nie zapisuje
-                    // `_migrations` — robi to sama funkcja, bo musi
-                    // sterowac `PRAGMA foreign_keys` poza transakcja.
-                    f(conn, version, name)?;
-                }
-            }
+            apply_migration(conn, version, name, &step)?;
         }
     }
 
@@ -998,6 +1020,21 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "provider_account_credential_revocation",
             MigrationStep::Sql(PROVIDER_ACCOUNT_CREDENTIAL_REVOCATION),
         ),
+        (
+            160,
+            "adopt_coding_agent_accounts",
+            MigrationStep::Sql(ADOPT_CODING_AGENT_ACCOUNTS),
+        ),
+        (
+            161,
+            "provider_account_session_binding_and_limit",
+            MigrationStep::Sql(PROVIDER_ACCOUNT_SESSION_BINDING_AND_LIMIT),
+        ),
+        (
+            162,
+            "model_metrics_rollup_account_id",
+            MigrationStep::Rust(model_metrics_rollup_add_account_id),
+        ),
     ]
 }
 
@@ -1152,6 +1189,9 @@ CREATE TABLE provider_account_sessions (
     last_used_at      TEXT NULL,
     PRIMARY KEY (account_id, session_id)
 );
+-- Replaced by v161, which is the rung that can fire: this shape does not name
+-- the conversation it claims to bind. Left as written because a migration that
+-- has run elsewhere is immutable.
 CREATE UNIQUE INDEX idx_provider_account_sessions_vendor
     ON provider_account_sessions(account_id, user_id, agent_id, workspace_id)
     WHERE vendor_session_id IS NOT NULL;
@@ -1220,6 +1260,149 @@ CREATE TABLE coding_agent_account_moves (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX coding_agent_account_moves_service ON coding_agent_account_moves(service_id);
+"#;
+
+// v160 — the accounts this node already runs, adopted into the replicated
+// registry.
+//
+// A `services` row is node-local, so an account written into one can only ever
+// exist on the node that holds it. Every row whose configuration names an
+// `account_id` therefore becomes a `provider_accounts` row, and the node-local
+// tables that carry its grants and its sessions are copied across, so an upgrade
+// loses no access decision and no session binding.
+//
+// Purely additive. The three node-local tables and the `account_id` key in
+// `config_json` are left exactly as they are, because their readers are still
+// running: `account_permission` resolves an account through `account_directory`,
+// which is derived from that key, and an upgrade that stripped it here would
+// break delegation on every adopted account before the switch that replaces the
+// lookup lands. The strip and the table drops belong to the package that moves
+// those readers.
+//
+// Idempotent by construction: every statement is `INSERT OR IGNORE` against the
+// destination primary key, so a database handed to this rung twice — a restored
+// backup, a retried open — neither duplicates a row nor fails.
+//
+// CREDENTIALS ARE NOT MIGRATED. `code_agent_credentials` is sealed with the
+// node's own SettingsCipher key under a per-(org, node, engine) context, and the
+// account identity it was written for is not the identity the new registry
+// knows. An adopted account therefore starts at `needs_login` — the operator
+// signs in again, and the credential that comes back lives in
+// `provider_account_credentials`, where the ledger can carry it to another node.
+const ADOPT_CODING_AGENT_ACCOUNTS: &str = r#"
+-- The provider identity of every deployed coding-agent account. `account_id` is
+-- kept verbatim: it is the directory name under `keys/coding-agents/accounts/`
+-- that the account's logins and sessions already sit in, so a fresh id here
+-- would orphan every one of them.
+INSERT OR IGNORE INTO provider_accounts
+    (account_id, org_id, engine_id, display_name, scope, credential_kind,
+     home_node_id, status, created_by)
+SELECT
+    json_extract(s.config_json, '$.account_id'),
+    'org-default',
+    s.engine_id,
+    s.display_name,
+    'global',
+    'provider_login',
+    -- The node that deployed the service. `services` carries no node of its own
+    -- (a row IS local to the node that holds it) and a migration cannot read
+    -- the running process's node id, so the deployment that put the service
+    -- there is the only record of it. Empty means the row predates the deploy
+    -- bookkeeping, and NULL is the honest answer for that: `home_node_id` means
+    -- "the node responsible for refreshing the credential", and an account
+    -- without one is refreshed wherever it is first used.
+    NULLIF(COALESCE(
+        (SELECT d.node_id FROM deployments d WHERE d.deploy_id = s.active_deploy_id),
+        (SELECT d.node_id FROM deployments d WHERE d.deploy_id = s.last_deploy_id),
+        ''), ''),
+    'needs_login',
+    COALESCE(
+        (SELECT u.id FROM user_accounts u
+          WHERE u.role = 'org_admin' AND u.is_active = 1
+          ORDER BY u.created_at, u.id LIMIT 1),
+        'system')
+FROM services s
+WHERE s.engine_id IN ('claude-code', 'codex', 'grok-build', 'muse-code')
+  AND json_extract(s.config_json, '$.account_id') IS NOT NULL
+  AND trim(json_extract(s.config_json, '$.account_id')) <> '';
+
+-- Who could use the account. The old table grants one service to one user; the
+-- new one grants the ACCOUNT to the user, which is the same decision stated
+-- against the identity that survives the node.
+INSERT OR IGNORE INTO provider_account_grants
+    (account_id, subject_type, subject_id, granted_by)
+SELECT
+    json_extract(s.config_json, '$.account_id'),
+    'user',
+    g.user_id,
+    g.granted_by
+FROM coding_agent_account_grants g
+JOIN services s ON s.id = g.service_id
+WHERE json_extract(s.config_json, '$.account_id') IS NOT NULL
+  AND trim(json_extract(s.config_json, '$.account_id')) <> '';
+
+-- Sessions already opened on the account. `agent_id` and `workspace_id` stay
+-- NULL: the old row recorded neither, and inventing one would make the unique
+-- binding look like it had been checked when it had not.
+INSERT OR IGNORE INTO provider_account_sessions
+    (account_id, session_id, user_id, agent_id, workspace_id, node_id, vendor_session_id)
+SELECT
+    json_extract(s.config_json, '$.account_id'),
+    o.session_id,
+    o.user_id,
+    NULL,
+    NULL,
+    COALESCE(
+        (SELECT d.node_id FROM deployments d WHERE d.deploy_id = s.active_deploy_id),
+        (SELECT d.node_id FROM deployments d WHERE d.deploy_id = s.last_deploy_id),
+        ''),
+    o.vendor_session_id
+FROM coding_agent_session_owners o
+JOIN services s ON s.id = o.service_id
+WHERE json_extract(s.config_json, '$.account_id') IS NOT NULL
+  AND trim(json_extract(s.config_json, '$.account_id')) <> '';
+"#;
+
+// v161 — what an open agent session can promise about a provider conversation,
+// and the optional per-account session limit (A03).
+//
+// The index this replaces was written as `(account_id, user_id, agent_id,
+// workspace_id) WHERE vendor_session_id IS NOT NULL`, which binds nothing: the
+// vendor conversation is not among its columns, so two rows naming the SAME
+// conversation never collide, and `agent_id` was NULL for every row the session
+// recorder wrote — in SQLite NULLs are distinct, so the index could not fire
+// even for the tuple it does name. The obvious repair (adding the vendor id to
+// the keys) would be worse than useless: it would forbid two sessions of one
+// account in one workspace at the same time, which is the concurrency the shared
+// credential directory exists for (§2.5).
+//
+// What is true is the other direction: one vendor conversation is driven by one
+// recorded session, so the vendor id is what must be unique. `upsert_session`
+// clears the row a conversation was recorded under before recording it for the
+// session that has it now, so the index binds the live session instead of
+// refusing it over a row whose process is gone (a session's row is deleted when
+// its CLI closes).
+//
+// Rows already sharing a vendor id are collapsed to the last one written: these
+// rows are runtime state — A03 lists what is OPEN — and two rows for one
+// conversation is one conversation listed twice, not two sessions.
+//
+// `max_sessions` is 0 by default, and 0 means "no limit": every account that
+// existed before this rung runs exactly as it did, and the check only exists
+// where an operator set a number.
+const PROVIDER_ACCOUNT_SESSION_BINDING_AND_LIMIT: &str = r#"
+DELETE FROM provider_account_sessions
+ WHERE vendor_session_id IS NOT NULL
+   AND rowid NOT IN (
+       SELECT max(rowid) FROM provider_account_sessions
+        WHERE vendor_session_id IS NOT NULL
+        GROUP BY vendor_session_id);
+DROP INDEX IF EXISTS idx_provider_account_sessions_vendor;
+CREATE UNIQUE INDEX idx_provider_account_sessions_vendor
+    ON provider_account_sessions(vendor_session_id)
+    WHERE vendor_session_id IS NOT NULL;
+ALTER TABLE provider_accounts
+    ADD COLUMN max_sessions INTEGER NOT NULL DEFAULT 0 CHECK(max_sessions >= 0);
 "#;
 
 fn code_studio_process_and_local(conn: &Connection, version: i64, name: &str) -> Result<()> {
@@ -1362,6 +1545,27 @@ fn model_metrics_rollup_add_usage_missing(conn: &Connection) -> Result<()> {
             "ALTER TABLE model_metrics_rollup ADD COLUMN usage_missing_count INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    Ok(())
+}
+
+/// Which provider account a bucket was spent on, so Analytics can break usage
+/// down per account as well as per user (§2 of the global-user plan). The
+/// column is a DIMENSION and part of the hashed `id`: a row written before this
+/// migration keeps its old id and stays the no-account bucket at the `''`
+/// default, while the next bump for the same dimensions mints a new id that
+/// also hashes the (empty) account. The two are separate rows but the SAME
+/// logical bucket, and the summary SUMS rows, so no total moves — only the
+/// hour bucket fragments once, at upgrade, instead of double counting.
+fn model_metrics_rollup_add_account_id(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "model_metrics_rollup", "account_id")? {
+        conn.execute_batch(
+            "ALTER TABLE model_metrics_rollup ADD COLUMN account_id TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_model_metrics_account \
+         ON model_metrics_rollup(org_id, account_id, hour_bucket);",
+    )?;
     Ok(())
 }
 
@@ -2278,6 +2482,9 @@ CREATE TABLE IF NOT EXISTS model_metrics_rollup (
     backend                TEXT NOT NULL,
     modality               TEXT NOT NULL,
     hour_bucket            TEXT NOT NULL,
+    -- Provider account the usage was spent on, '' for gateway traffic that
+    -- carries no account (see `provider_accounts`). Part of the hashed id.
+    account_id             TEXT NOT NULL DEFAULT '',
     histogram_version      INTEGER NOT NULL DEFAULT 1,
     request_count          INTEGER NOT NULL DEFAULT 0,
     success_count          INTEGER NOT NULL DEFAULT 0,
@@ -2328,6 +2535,7 @@ CREATE TABLE IF NOT EXISTS model_metrics_rollup (
 CREATE INDEX IF NOT EXISTS idx_model_metrics_model ON model_metrics_rollup(org_id, model_id, hour_bucket);
 CREATE INDEX IF NOT EXISTS idx_model_metrics_user ON model_metrics_rollup(org_id, user_id, hour_bucket);
 CREATE INDEX IF NOT EXISTS idx_model_metrics_node ON model_metrics_rollup(node_id);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_account ON model_metrics_rollup(org_id, account_id, hour_bucket);
 CREATE INDEX IF NOT EXISTS idx_model_metrics_updated ON model_metrics_rollup(updated_at);
 "#;
 
@@ -9483,6 +9691,63 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// Walks the real ladder to `version` and stops, leaving a database a real
+    /// upgrade at that version would have produced.
+    ///
+    /// `run` applies a rung only when `version > current_version`, so a test
+    /// that needs a rung to RUN against a fixture it inserts cannot get there
+    /// by deleting that rung's `_migrations` row from an already-migrated
+    /// database: the recorded head is higher than the deleted one and the rung
+    /// is skipped in silence. It has to stop BELOW the rung and let `run` take
+    /// it from there.
+    fn run_ladder_up_to(conn: &Connection, version: i64) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        for (rung, name, step) in get_migrations() {
+            if rung > version {
+                break;
+            }
+            apply_migration(conn, rung, name, &step)
+                .unwrap_or_else(|error| panic!("the ladder must reach {version}: {error}"));
+        }
+        assert_eq!(
+            conn.query_row("SELECT MAX(version) FROM _migrations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            version,
+            "the ladder must stop exactly at {version}"
+        );
+    }
+
+    /// Applies ONE rung's registered body again, the way `run` would when the
+    /// recorded head is still below it. Once the ladder has moved past a rung
+    /// this is the only way left to replay it, and replaying is what an
+    /// upgrade over a restored backup does.
+    ///
+    /// The rung's own `_migrations` record is part of what `apply_migration`
+    /// writes, so it is cleared first: a replay starts from a database whose
+    /// head is already above the rung, and that record is exactly what would
+    /// make the write a duplicate.
+    fn replay_migration(conn: &Connection, version: i64) {
+        let (rung, name, step) = get_migrations()
+            .into_iter()
+            .find(|(rung, _, _)| *rung == version)
+            .unwrap_or_else(|| panic!("no rung {version} in the ladder"));
+        conn.execute(
+            "DELETE FROM _migrations WHERE version = ?1",
+            rusqlite::params![rung],
+        )
+        .unwrap();
+        apply_migration(conn, rung, name, &step)
+            .unwrap_or_else(|error| panic!("replaying rung {version} must succeed: {error}"));
+    }
+
     /// Regex-free heuristic: does a column name look like a core-identity FK?
     /// Matches the discovery pattern from FAZA B krok 1A.
     fn looks_like_identity_fk(table: &str, column: &str) -> bool {
@@ -11639,30 +11904,38 @@ mod tests {
     /// must be refused outright. Without this, `run()`'s own
     /// `version > current_version` loop would just never apply anything and
     /// start serving requests against a schema this build never produced.
+    ///
+    /// The fixture version is `head + 1`, computed from the ladder, and NOT a
+    /// literal: a rung added at the top moves the head, and a fixture written
+    /// against the old head would sit exactly AT the new one — where the guard
+    /// is documented to pass — leaving the refusal asserted by a test that
+    /// exercises nothing at all.
     #[test]
     fn a_database_ahead_of_this_builds_ladder_head_is_refused() {
+        let head = migration_ladder_head();
+        let ahead = head + 1;
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS _migrations (
                 version INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            INSERT INTO _migrations (version, name) VALUES (160, 'from_a_newer_build');",
-        )
+            INSERT INTO _migrations (version, name) VALUES ({ahead}, 'from_a_newer_build');",
+        ))
         .unwrap();
 
         let err =
             run(&conn).expect_err("a database ahead of this build's ladder head must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("160"), "{msg}");
-        assert!(msg.contains("head 159"), "{msg}");
+        assert!(msg.contains(&ahead.to_string()), "{msg}");
+        assert!(msg.contains(&format!("head {head}")), "{msg}");
     }
 
     /// The counterpart of the guard test above, and the reason 145/146 are
     /// `retired_migration` rather than renumbered-away: a database left at 146
     /// by a build that still carried the ORIGINAL 145/146 is NOT ahead of this
-    /// ladder (head 159), so the guard must let it through to be upgraded the
+    /// ladder (the head of `get_migrations()`), so the guard must let it through to be upgraded the
     /// rest of the way. Before the rungs were retired the head was 144 and the
     /// very same database was refused.
     #[test]
@@ -11690,13 +11963,15 @@ mod tests {
     /// `run()` from an already-at-head database stays a no-op.
     #[test]
     fn a_database_exactly_at_this_builds_ladder_head_still_passes() {
+        let expected = migration_ladder_head();
         let conn = Connection::open_in_memory().unwrap();
-        run(&conn).expect("fresh install migrates cleanly to head 159");
-        run(&conn).expect("a database already at head 159 must still pass the guard");
+        run(&conn).unwrap_or_else(|error| panic!("fresh install must migrate to head {expected}: {error}"));
+        run(&conn)
+            .unwrap_or_else(|error| panic!("a database already at head {expected} must still pass the guard: {error}"));
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 159);
+        assert_eq!(head, expected);
     }
 
     #[test]
@@ -11722,13 +11997,17 @@ mod tests {
 
     #[test]
     fn fresh_database_migrates_to_head_with_clean_foreign_keys() {
+        let expected = migration_ladder_head();
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 159, "159 must be the highest applied migration");
+        assert_eq!(
+            head, expected,
+            "{expected} must be the highest applied migration"
+        );
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -11736,7 +12015,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 159);
+        assert_eq!(head_again, expected);
     }
 
     /// v155 leaves the Flow Builder with the one harness Code Studio pins: the
@@ -12027,6 +12306,340 @@ mod tests {
         assert!(table_exists(&conn, "provider_accounts").unwrap());
     }
 
+    /// Strips what v162 adds, so the migration runs on a database that really is
+    /// at v161 — with a row of that vintage already inside it.
+    fn rewind_to_v161(conn: &Connection) {
+        conn.execute_batch(
+            "DROP INDEX idx_model_metrics_account; \
+             ALTER TABLE model_metrics_rollup DROP COLUMN account_id;",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM _migrations WHERE version = 162", [])
+            .unwrap();
+    }
+
+    /// A rollup row written before the account dimension keeps its id, its
+    /// numbers and its hour bucket: the column is added with a `''` default, so
+    /// the only thing the upgrade changes is that the dimension exists. Re-keying
+    /// or re-summing old rows here would move every historical total.
+    #[test]
+    fn migration_v162_upgrades_v161_database_without_data_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        rewind_to_v161(&conn);
+        assert!(
+            !column_exists(&conn, "model_metrics_rollup", "account_id").unwrap(),
+            "the rewind must really land on v161"
+        );
+        conn.execute(
+            "INSERT INTO model_metrics_rollup \
+               (id, node_id, org_id, user_id, model_id, service_key, backend, modality, \
+                hour_bucket, histogram_version, request_count, total_tokens) \
+             VALUES ('legacy-row', 'n1', 'org-default', 'u1', 'qwen', 'vllm:qwen', 'vllm', 'chat', \
+                     '2026-08-19T10:00:00Z', 1, 3, 150)",
+            [],
+        )
+        .unwrap();
+
+        model_metrics_rollup_add_account_id(&conn).unwrap();
+
+        let (id, account, tokens): (String, String, i64) = conn
+            .query_row(
+                "SELECT id, account_id, total_tokens FROM model_metrics_rollup",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (id.as_str(), account.as_str(), tokens),
+            ("legacy-row", "", 150)
+        );
+        // Running it again is a no-op, not a second ALTER.
+        model_metrics_rollup_add_account_id(&conn).unwrap();
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_model_metrics_account'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
+    }
+
+    /// Seed one node-local coding-agent account the way the retired model wrote
+    /// it: a `services` row whose configuration names the account, the deploy
+    /// row that records which node put it there, a grant and an open session.
+    fn seed_deployed_coding_agent_account(
+        conn: &Connection,
+        service: &str,
+        account: &str,
+        node: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO services \
+               (engine_id, category, display_name, deploy_method, transport, config_json) \
+             VALUES ('claude-code', 'agent', ?1, 'native_managed_cli', 'agent_rpc', ?2)",
+            rusqlite::params![
+                format!("Claude {service}"),
+                format!(r#"{{"account_id":"{account}","model":"sonnet"}}"#)
+            ],
+        )
+        .unwrap();
+        let service_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, status) \
+             VALUES (?1, 'claude-code', 'native_managed_cli', ?2, 'running')",
+            rusqlite::params![format!("deploy-{service}"), node],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE services SET active_deploy_id = ?2 WHERE id = ?1",
+            rusqlite::params![service_id, format!("deploy-{service}")],
+        )
+        .unwrap();
+    }
+
+    /// v160 adopts the accounts a node already runs into the replicated
+    /// registry, together with the access decisions and session bindings that
+    /// were written against their node-local service rows. The account id is
+    /// kept verbatim because it is the name of the directory the account's
+    /// logins already live in.
+    ///
+    /// The database is built UP TO v159 and the fixture is inserted there, so
+    /// `run` below applies v160 for the first time from a recorded head that is
+    /// below it — the state a node upgrading from before this rung is really
+    /// in. Deleting v160's record from an already-migrated database does not
+    /// reach that state: `run` skips every version at or below the recorded
+    /// head, so the rung would be skipped and the assertions below would be
+    /// reading rows the fixture never produced.
+    #[test]
+    fn migration_v160_adopts_deployed_coding_agents_into_the_registry() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 159);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute(
+            "INSERT INTO user_accounts (id, username, password_hash, role, is_active) \
+             VALUES ('admin-1', 'root', 'x', 'org_admin', 1)",
+            [],
+        )
+        .unwrap();
+        seed_deployed_coding_agent_account(&conn, "one", "acct-one", "node-a");
+        // A service with no account of its own, and a coding agent that predates
+        // the account model, are both left alone: neither names an identity.
+        conn.execute(
+            "INSERT INTO services \
+               (engine_id, category, display_name, deploy_method, transport, config_json) \
+             VALUES ('ollama', 'llm', 'Ollama', 'docker', 'http_direct', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services \
+               (engine_id, category, display_name, deploy_method, transport, config_json) \
+             VALUES ('codex', 'agent', 'Codex legacy', 'native_managed_cli', 'agent_rpc', '{}')",
+            [],
+        )
+        .unwrap();
+
+        let service_id: i64 = conn
+            .query_row(
+                "SELECT id FROM services WHERE display_name = 'Claude one'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO coding_agent_account_grants (service_id, user_id, granted_by) \
+             VALUES (?1, 'admin-1', 'admin-1')",
+            rusqlite::params![service_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO coding_agent_session_owners \
+               (service_id, session_id, vendor_session_id, user_id) \
+             VALUES (?1, 'sess-1', 'vendor-9', 'admin-1')",
+            rusqlite::params![service_id],
+        )
+        .unwrap();
+
+        // The rung runs where it really runs — through the ladder — rather than
+        // by calling the SQL the test happens to have in hand.
+        run(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT name FROM _migrations WHERE version = 160",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "adopt_coding_agent_accounts",
+            "the ladder must have applied v160, not skipped it"
+        );
+
+        let account: (String, String, String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT account_id, engine_id, scope, credential_kind, status, home_node_id \
+                 FROM provider_accounts",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(account.0, "acct-one", "the account id is the directory name");
+        assert_eq!(account.1, "claude-code");
+        assert_eq!(account.2, "global");
+        assert_eq!(account.3, "provider_login");
+        assert_eq!(
+            account.4, "needs_login",
+            "the node-local credential is not the identity the registry knows, so the account asks for a new sign-in"
+        );
+        assert_eq!(account.5.as_deref(), Some("node-a"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT display_name || '/' || org_id || '/' || created_by FROM provider_accounts",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "Claude one/org-default/admin-1"
+        );
+
+        let grant: (String, String, String) = conn
+            .query_row(
+                "SELECT subject_type, subject_id, granted_by FROM provider_account_grants",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            grant,
+            (
+                "user".to_string(),
+                "admin-1".to_string(),
+                "admin-1".to_string()
+            )
+        );
+
+        let session: (String, String, Option<String>, Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT session_id, user_id, agent_id, workspace_id, node_id, vendor_session_id \
+                 FROM provider_account_sessions",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(session.0, "sess-1");
+        assert_eq!(session.1, "admin-1");
+        assert_eq!(session.2, None);
+        assert_eq!(session.3, None);
+        assert_eq!(session.4, "node-a");
+        assert_eq!(session.5.as_deref(), Some("vendor-9"));
+
+        // Nothing the running code still reads may move: the old tables keep
+        // their rows and the service keeps the account id its directory is
+        // derived from.
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM coding_agent_account_grants",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM coding_agent_session_owners",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT json_extract(config_json, '$.account_id') FROM services WHERE id = ?1",
+                rusqlite::params![service_id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "acct-one"
+        );
+
+        // Handed the same database again, the rung adds nothing: an upgrade that
+        // is replayed — a restored backup, a retried open — must not double the
+        // registry or overwrite an account someone has since edited.
+        conn.execute(
+            "UPDATE provider_accounts SET status = 'active', display_name = 'renamed'",
+            [],
+        )
+        .unwrap();
+        // Replayed through the rung the ladder carries, which is the only route
+        // left once `_migrations` records a head above it: `run` skips every
+        // version at or below that head, so deleting v160's row would replay
+        // nothing and these assertions would hold vacuously.
+        replay_migration(&conn, 160);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM provider_accounts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM provider_account_grants", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM provider_account_sessions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status || '/' || display_name FROM provider_accounts",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "active/renamed",
+            "a replayed rung leaves an adopted account exactly as it found it"
+        );
+    }
+
+    /// The adoption writes `org-default` as a literal, because a ladder rung is
+    /// SQL and cannot read a Rust constant. Drift between the two would put
+    /// adopted accounts in an organization nothing else looks at.
+    #[test]
+    fn the_adoption_migration_names_the_default_organization() {
+        assert_eq!(
+            crate::services::org::DEFAULT_ORG_ID,
+            "org-default",
+            "ADOPT_CODING_AGENT_ACCOUNTS hard-codes this org id in its SELECT"
+        );
+    }
+
     /// `sync_nodes.operator` is the organization's authority list, so it is a
     /// two-valued column with a safe default: a row that arrives from an older
     /// peer, or a migration of an existing install, must read as "not an
@@ -12084,13 +12697,16 @@ mod tests {
             );
         }
         assert_eq!(*sorted.first().unwrap(), 1);
+        // A literal here would be a second place the head is written down, and
+        // the first one to go stale when a rung is added — the ladder itself is
+        // the source, and `migration_ladder_head` reads the same list.
+        assert_eq!(*sorted.last().unwrap(), migration_ladder_head());
         // plan-app-platform §7 W4 deleted the two bridge steps —
         // `bus_rbac_permissions_until_instance_matrix` (v145) and
         // `bus_groups_until_instance_db` (v146) — together with the
         // authorizer rewrite and the instance-db handle that made them dead.
         // Their NUMBERS stay occupied by `retired_migration` so the rungs
         // above them keep the versions databases already recorded.
-        assert_eq!(*sorted.last().unwrap(), 159);
 
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();

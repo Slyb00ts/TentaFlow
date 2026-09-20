@@ -32,6 +32,9 @@ import {
   renderTimelinePane,
   renderFileTreeDock, renderChangesDock, renderGitDock, renderTerminalDock,
 } from './code-studio-panes.js';
+import { AgentAccounts, credentialKindsFor, engineEntry } from '/js/modules/agent-accounts.js';
+import { openCreateAccountWindow } from '/js/modules/agent-accounts-window.js';
+import { openLoginWizard } from '/js/modules/agent-accounts-login.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -89,6 +92,12 @@ const DEGRADE_CAPABILITY = 'profile_degrade_rw';
 // Capabilities whose approval IS the review gate 5a — decided in the changes
 // pane (permission != review), never with a permission scope.
 const REVIEW_CAPABILITIES = new Set(['git_commit', 'git_merge_finalize']);
+
+// The slug of an account question (C01), minted by `suspend_for_account`. It is
+// NOT a capability: nobody is granted it, the PEP never sees it, and the only
+// answer is a sign-in happening in A02 — so the card it draws is neither a
+// permission nor a review.
+const ACCOUNT_LOGIN_CAPABILITY = 'account_login';
 
 // Tool name -> sprite id. Only ids that exist in the index.html sprite.
 const TOOL_ICONS = [
@@ -352,7 +361,24 @@ function runInfoOf(run) {
     promptTokens: run.prompt_tokens ?? run.promptTokens ?? 0,
     completionTokens: run.completion_tokens ?? run.completionTokens ?? 0,
     model: run.model || '',
+    accountLabel: accountChipLabel(run.account),
   };
+}
+
+// C02 — the account a run's CLI actually ran on, as the chip's text.
+//
+// Empty for a run with no account, and that absence is the answer for every
+// agent that runs an LLM: there is no provider account behind it, and a chip
+// that named one would be a fabrication. The scope word is the one the account
+// screens already use, so the same fact reads the same way on both.
+function accountChipLabel(account) {
+  if (!account) return '';
+  const engine = String(account.engine_name ?? account.engineName ?? '');
+  const name = String(account.account_name ?? account.accountName ?? '');
+  const mode = I18n.t(`agent_accounts.subtitle_${account.mode === 'global' ? 'global' : 'user'}`);
+  return String(name
+    ? t('session.account_chip', { engine, mode, account: name })
+    : t('session.account_chip_plain', { engine, mode })).trim();
 }
 
 function toolIcon(name) {
@@ -492,7 +518,6 @@ function buildStage() {
             <div class="cs-stage-sub" data-session-sub>${escapeHtml(t('session.orchestrator'))}</div>
           </div>
           <div class="cs-stage-chips">
-            <tf-chip title="${escapeAttr(t('session_account_hint'))}">${escapeHtml(session.agentAccountLabel || t('session_account_default'))}</tf-chip>
             <tf-chip title="${escapeAttr(session.branch || '—')}" icon="branch">${escapeHtml(session.branch || '—')}</tf-chip>
             <span class="cs-chip" data-autonomy-chip>${sprite('shield')}${escapeHtml(t(`autonomy.${state.autonomy}`))}</span>
             ${native ? `<span class="cs-chip warn" title="${escapeAttr(t('native.tooltip'))}">${sprite('alert')}${escapeHtml(t('native.chip'))}</span>` : ''}
@@ -858,6 +883,7 @@ function stageTabEl(strip, key) {
 function paintStageTab(el, tab) {
   attr(el, 'label', tab.label);
   attr(el, 'sub', tab.sub);
+  attr(el, 'account', tab.account);
   flag(el, 'mono', !!tab.mono);
   attr(el, 'close-label', I18n.t('common.close'));
   flag(el, 'closable', !tab.pinned);
@@ -1128,6 +1154,7 @@ async function runAction(el) {
       else await decideApproval('deny');
       break;
     case 'answer-review': openReviewFromAsk(); break;
+    case 'answer-login': await connectAskAccount(); break;
     case 'open-changes': openChangeTab(el.dataset.patchSet, '', ''); break;
     case 'resolve-op': await resolveOperation(el.dataset.opId, el.dataset.resolution, el); break;
     case 'revoke-grant': await revokeGrant(el.dataset.capability, el.dataset.pattern); break;
@@ -1217,6 +1244,9 @@ function openSubagentTab(runId) {
     label: run?.agent_id || shortId(runId),
     title: run?.agent_id || shortId(runId),
     sub: run ? `${run.kind} · ${run.status}` : '',
+    // C02 — the account this sub-agent's CLI ran on, next to its state. A run
+    // that resolved none carries no chip rather than an empty one.
+    account: accountChipLabel(run?.account),
     data: { runId },
   });
 }
@@ -1294,7 +1324,12 @@ function ingestEvents(list) {
     classifyRun(ev);
     feedActivity(ev);
 
-    const forConsole = !ev.runId || !state.subagentRuns.has(ev.runId);
+    // classifyRun above has already put a spawning run into the set, so the one
+    // line ANNOUNCING it needs its own exemption; only the run's later events
+    // stay out of the console.
+    const isSpawn = ev.kind === 'run_started'
+      && (String(ev.p.kind) === 'subagent' || String(ev.p.kind) === 'cli');
+    const forConsole = isSpawn || !ev.runId || !state.subagentRuns.has(ev.runId);
     if (forConsole) appendNode(streamEl('console'), buildEventNode(ev, 'console'));
     if (state.openRunId && ev.runId === state.openRunId) {
       appendNode(streamEl('subagent'), buildEventNode(ev, 'subagent'));
@@ -1569,13 +1604,22 @@ function runStartedNode(ev, scope) {
   const kind = String(ev.p.kind || 'root');
   const trigger = String(ev.p.trigger || '');
   if (scope === 'console' && (kind === 'subagent' || kind === 'cli')) {
+    const runId = ev.p.run_id || ev.runId;
+    // The event says a run began; the ACCOUNT is a fact about the run row, so it
+    // is read from the run list — replayed from it at bootstrap, polled for it
+    // afterwards. A run whose account the poll has not reported yet shows no
+    // chip on this one line, and the tab and the agents dock carry it either way.
+    const account = accountChipLabel(
+      state.runs.find((r) => r.run_id === runId)?.account,
+    );
     return node(`
-      <div class="ev ev-spawn" data-run="${escapeAttr(ev.p.run_id || ev.runId)}">
+      <div class="ev ev-spawn" data-run="${escapeAttr(runId)}">
         <span class="av">${sprite('brain')}</span>
         <span>
-          <span class="nm">${escapeHtml(ev.agentId || shortId(ev.p.run_id || ev.runId))}</span>
+          <span class="nm">${escapeHtml(ev.agentId || shortId(runId))}</span>
           <span class="ds">${escapeHtml(t(`trigger.${trigger}`))}</span>
         </span>
+        ${account ? `<tf-chip size="sm" status="accent" label="${escapeAttr(account)}"></tf-chip>` : ''}
         <span class="go">${escapeHtml(t('stage.see_run'))} ${sprite('chevron-right')}</span>
       </div>
     `);
@@ -1701,11 +1745,15 @@ function toggleToolDetail(row) {
 }
 
 function askMarkNode(ev) {
+  // An account question is not a permission: what is missing is a SIGN-IN, and
+  // the line has to say so — "wymagane uprawnienie" would send the reader
+  // looking for an operator to approve something nobody can approve (C01).
+  const account = ev.p.capability === ACCOUNT_LOGIN_CAPABILITY;
   return node(`
     <div class="ev ev-askmark" data-approval="${escapeAttr(ev.p.approval_id || '')}">
       <span class="cs-dot ask"></span>
-      <span><span class="q">${escapeHtml(t('ask.anchor'))}</span> ${escapeHtml(String(ev.p.summary || ev.p.capability || ''))}</span>
-      <span class="go">${escapeHtml(t('ask.go'))}</span>
+      <span><span class="q">${escapeHtml(t(account ? 'ask.account.anchor' : 'ask.anchor'))}</span> ${escapeHtml(String(ev.p.summary || ev.p.capability || ''))}</span>
+      <span class="go">${escapeHtml(t(account ? 'ask.account.go' : 'ask.go'))}</span>
     </div>
   `);
 }
@@ -1996,6 +2044,7 @@ function questionFromToolCall(ev) {
 function askFromApproval(approval) {
   const capability = String(approval.capability || '');
   const mandatory = !!approval.mandatory_interactive || MANDATORY_CAPABILITIES.has(capability);
+  if (capability === ACCOUNT_LOGIN_CAPABILITY) return accountAskFromApproval(approval);
   return {
     kind: REVIEW_CAPABILITIES.has(capability) ? 'review' : 'approval',
     approvalId: String(approval.approval_id || ''),
@@ -2005,6 +2054,45 @@ function askFromApproval(approval) {
     detail: String(approval.detail || ''),
     mandatory,
     options: [],
+    runId: String(approval.run_id || ''),
+  };
+}
+
+// C01 — the run is parked because the account its agent is bound to is not
+// there. The card describes the WAIT, not a decision: nothing is granted, and
+// the answer is a sign-in in A02 that the server matches by (engine, person).
+//
+// Everything the card shows comes from `approval.account`, the snapshot the
+// server took when it asked. Re-reading the agent's binding here would let the
+// card change under the person — and a card that renamed the agent it is about
+// while they read it is exactly the silent substitution the resolver forbids.
+function accountAskFromApproval(approval) {
+  const raw = approval.account ?? approval.accountInfo ?? {};
+  const account = {
+    engineId: String(raw.engine_id ?? raw.engineId ?? ''),
+    engineName: String(raw.engine_name ?? raw.engineName ?? ''),
+    mode: String(raw.mode || 'user'),
+    agentName: String(raw.agent_name ?? raw.agentName ?? ''),
+    accountId: raw.account_id ?? raw.accountId ?? null,
+    accountName: String(raw.account_name ?? raw.accountName ?? ''),
+  };
+  const engine = account.engineName || account.engineId;
+  return {
+    kind: 'account',
+    approvalId: String(approval.approval_id || ''),
+    capability: ACCOUNT_LOGIN_CAPABILITY,
+    who: [
+      account.agentName,
+      engine,
+      // The mode is named with the account screens' own words, so the card and
+      // the screen the sign-in opens say "konto użytkownika" alike.
+      I18n.t(`agent_accounts.subtitle_${account.mode === 'global' ? 'global' : 'user'}`),
+    ].filter(Boolean).join(' · '),
+    question: t(account.accountId ? 'ask.account.body_relogin' : 'ask.account.body', { engine }),
+    detail: String(approval.summary || ''),
+    mandatory: false,
+    options: [],
+    account,
     runId: String(approval.run_id || ''),
   };
 }
@@ -2057,6 +2145,9 @@ function askSignature(ask) {
   return [
     ask.kind, ask.approvalId, ask.capability, ask.who, ask.question, ask.detail,
     ask.mandatory ? '1' : '0', ask.runId,
+    // The account question carries the engine it is about: a second ask for a
+    // different application is a different question, and the card must redraw.
+    ask.account ? `${ask.account.engineId}:${ask.account.accountId ?? ''}` : '',
     askOptions(ask).map((o) => `${o.key}:${o.value}:${o.off ? 'x' : 'o'}`).join(','),
   ].join('|');
 }
@@ -2089,19 +2180,25 @@ function renderAsk() {
   }
   renderedAskSignature = signature;
   const confirm = ask.kind === 'confirm';
+  // The account card (C01) is a THIRD shape: no scope to pick, no count to
+  // show — one way out ("connect it") and one way to stop. Its two rows ARE
+  // the footer, so it has neither a counter nor a separate deny button; a
+  // second, differently-worded cancel below the first would be the same
+  // decision asked twice.
+  const account = ask.kind === 'account';
   answer.hidden = false;
   answer.innerHTML = `
     <div class="cs-answer-head" data-action="answer-expand">
-      ${sprite(confirm ? 'shield' : 'message')}
-      ${escapeHtml(t(confirm ? 'ask.confirm_head' : 'ask.head'))}
+      ${sprite(account ? 'message' : (confirm ? 'shield' : 'message'))}
+      ${escapeHtml(t(account ? 'ask.account.head' : (confirm ? 'ask.confirm_head' : 'ask.head')))}
       <span class="who">${escapeHtml(ask.who)}</span>
-      <span class="optn">${escapeHtml(t('ask.options_count', { count: askOptions(ask).length }))}</span>
+      ${account ? '' : `<span class="optn">${escapeHtml(t('ask.options_count', { count: askOptions(ask).length }))}</span>`}
       ${sprite('chevron-down')}
     </div>
-    <div class="cs-answer-q">${escapeHtml(ask.question)}${ask.detail ? ` — ${escapeHtml(ask.detail)}` : ''}</div>
+    <div class="cs-answer-q">${escapeHtml(ask.question)}${ask.detail && !account ? ` — ${escapeHtml(ask.detail)}` : ''}</div>
     ${askExplanation(ask)}
     <div class="cs-answer-opts">${askOptions(ask).map(optionHtml).join('')}</div>
-    ${ask.kind === 'question' ? '' : `
+    ${ask.kind === 'question' || account ? '' : `
       <div class="cs-answer-foot">
         <tf-button size="sm" variant="${confirm ? 'secondary' : 'danger'}" icon="ban" data-action="answer-deny">${escapeHtml(t(confirm ? 'ask.cancel' : 'ask.deny'))}</tf-button>
       </div>`}
@@ -2129,6 +2226,25 @@ function askOptions(ask) {
   }
   if (ask.kind === 'confirm') {
     return [{ key: '1', label: t('ask.confirm_run'), detail: t('ask.confirm_run_detail'), action: 'answer-confirm', value: '' }];
+  }
+  if (ask.kind === 'account') {
+    const engine = ask.account?.engineName || ask.account?.engineId || '';
+    return [
+      {
+        key: '1',
+        label: t('ask.account.connect', { engine }),
+        detail: t('ask.account.connect_detail'),
+        action: 'answer-login',
+        value: '',
+      },
+      {
+        key: '2',
+        label: t('ask.account.cancel'),
+        detail: t('ask.account.cancel_detail'),
+        action: 'answer-deny',
+        value: '',
+      },
+    ];
   }
   return APPROVAL_SCOPES.map((scope, i) => ({
     key: String(i + 1),
@@ -2166,6 +2282,67 @@ function openReviewFromAsk() {
     .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
   if (!open) { toast(t('patch.none'), 'warning'); return; }
   openChangeTab(open.patch_set_id, '', '');
+}
+
+// C01 — the answer to an account question is a SIGN-IN, not a decision, so the
+// card's first option is a door to A02 and nothing else. This function decides
+// nothing: the node matches the finished sign-in to the parked run by (engine,
+// person) and the parked delegation goes on by itself. That is why nothing is
+// sent from here — the console only opens a window and asks the session to poll
+// again when it closes, and the turn continuing on its own IS the answer.
+async function connectAskAccount() {
+  const ask = state.ask;
+  if (!ask || ask.kind !== 'account') return;
+  const account = ask.account || {};
+  const engineId = account.engineId || '';
+  // A02 names the engines it may offer and the credential kinds behind them.
+  // The card already names the one that matters, so a catalog that cannot be
+  // read still leaves the sign-in of an EXISTING account reachable; only the
+  // create path, which has nothing else to go on, needs it.
+  let engines = [];
+  try {
+    const catalog = await AgentAccounts.list({});
+    engines = catalog?.engines ?? [];
+  } catch { /* the card's engine still travels to A02 as an id */ }
+  const engine = engineEntry(engines, engineId);
+  const reload = () => { void loadApprovals(); };
+
+  if (account.accountId) {
+    // The run's binding named an account and that account cannot serve it —
+    // signing THAT one in is the whole fix. Creating another would leave the
+    // run bound to the one it already refused.
+    openLoginWizard({
+      accountId: account.accountId,
+      accountName: account.accountName || '',
+      engineId,
+      engines,
+      onFinished: reload,
+    });
+    return;
+  }
+
+  // No account of the caller's own exists for the engine. `NoAccountForUser` is
+  // the only refusal that raises a card without an account id, and the resolver
+  // mints it in `user_account()` alone — from the `mode="user"` branch — so the
+  // account this asks for is always a personal one.
+  openCreateAccountWindow({
+    engines: engine ? [engine] : engines,
+    scope: 'user',
+    onCreated: (createdId) => {
+      if (!createdId) return;
+      // An engine that signs in is connected in two steps in the person's head:
+      // the account is created here and A02 opens on top of it. An engine whose
+      // credential IS a key stored that key in the window that just closed, so
+      // there is nothing left to sign in — the poll picks the run up.
+      if (!engine || !credentialKindsFor(engine).includes('provider_login')) { reload(); return; }
+      openLoginWizard({
+        accountId: createdId,
+        engineId,
+        engines,
+        onFinished: reload,
+      });
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2453,6 +2630,8 @@ async function loadApprovals() {
     const pending = state.approvals.find((a) => a.status === 'pending');
     // A typed question and a pane confirmation are ours, not the server's: a
     // poll that finds no pending approval must not wipe them off the composer.
+    // An account card is NOT ours — it comes from the approvals list, and the
+    // poll is what makes it disappear once the sign-in settles the row.
     const local = state.ask?.kind === 'question' || state.ask?.kind === 'confirm';
     // `setAsk` brings a NEW question forward on its own, so a poll that
     // re-reports the same pending approval changes nothing on screen.

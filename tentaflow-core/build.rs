@@ -1117,6 +1117,25 @@ fn is_slim_edition() -> bool {
         .all(|f| std::env::var_os(f).is_none())
 }
 
+/// Wpis katalogu, ktory edycja slim ZACHOWUJE mimo braku lokalnego silnika
+/// inferencji: aplikacja CLI agenta (`category = "agents"`,
+/// `runtime = "managed-cli"`).
+///
+/// Taki wpis nie ma wag ani backendu GPU: install sciaga wylacznie binarke
+/// dostawcy, a mostek (`tentaflow-coding-agent-bridge`) dostarcza sama aplikacja
+/// obok `tentaflow` — wiec nie jest tym, co slim wycina.
+/// Predykat jest waski celowo: kazda inna kategoria i kazdy inny runtime
+/// podlegaja zwyklym reguom slim.
+fn is_managed_cli_agent(manifest: &services_manifest_build::ServiceManifest) -> bool {
+    use services_manifest_build::{Category, NativeRuntime};
+    manifest.engine.category == Category::Agents
+        && manifest
+            .deploy
+            .native
+            .as_ref()
+            .is_some_and(|native| native.runtime == NativeRuntime::ManagedCli)
+}
+
 // =============================================================================
 // Pakowanie kontekstu Docker (tentaflow-containers + shared Rust crates)
 // w tar.gz wbudowany w binarce. Pozwala na deploy bez zewnetrznych zrodel.
@@ -2501,17 +2520,33 @@ fn generate_services_manifest(out_dir: &Path) {
     // Filtrujemy TU, w jednym generatorze, bo z niego powstaja OBIE sciezki:
     // rejestr Rust (services_generated.rs) i katalog GUI (services-manifest.js).
     // Inaczej dashboard pokazywalby kafelki, ktorych backend odmawia uruchomic.
+    //
+    // JEDYNY wyjatek: silniki kategorii `agents` z `runtime = "managed-cli"`.
+    // Slim znaczy "bez LOKALNEGO silnika INFERENCJI", a aplikacja CLI agenta
+    // (Claude Code, Codex, Grok Build, Muse Code) nie jest silnikiem modelu —
+    // nie ma wag, nie wymaga GPU i sciaga wylacznie binarke dostawcy. Bez tego
+    // wyjatku slim nie mialby ani jednego wpisu kategorii `agents`, wiec
+    // zarzadzanie kontami agentow nie mialoby czego pokazac.
     if is_slim_edition() {
         let before = loaded.len();
+        // Bramka na samym wyjatku, w tym jednym buildzie, ktory go stosuje:
+        // kazdy wpis agents/managed-cli obecny przed filtrem musi byc obecny po
+        // nim. Cicho wyciety wpis to katalog bez zarzadzania kontami agentow,
+        // a taki blad widac dopiero na wezle.
+        let managed_cli_before = loaded.iter().filter(|m| is_managed_cli_agent(m)).count();
         loaded.retain(|m| {
-            m.engine.resource_kind == Some(ResourceKind::Infra) || m.deploy.external.is_some()
+            m.engine.resource_kind == Some(ResourceKind::Infra)
+                || m.deploy.external.is_some()
+                || is_managed_cli_agent(m)
         });
         // Silnik dostepny i zdalnie, i lokalnie (ollama) zostaje w katalogu, ale
         // wylacznie jako endpoint — lokalny deploy sciaga model, czyli dokladnie
-        // to, czego slim nie robi.
+        // to, czego slim nie robi. Wpis managed-cli zachowuje swoje `[deploy.native]`:
+        // to wlasnie ta sekcja jest runtime'em, ktory slim ma zainstalowac.
         let mut trimmed = 0usize;
         for m in loaded.iter_mut() {
-            if m.engine.resource_kind != Some(ResourceKind::Infra)
+            if !is_managed_cli_agent(m)
+                && m.engine.resource_kind != Some(ResourceKind::Infra)
                 && (m.deploy.docker.is_some() || m.deploy.native.is_some())
             {
                 m.deploy.docker = None;
@@ -2519,6 +2554,13 @@ fn generate_services_manifest(out_dir: &Path) {
                 trimmed += 1;
             }
         }
+        let managed_cli_after = loaded.iter().filter(|m| is_managed_cli_agent(m)).count();
+        assert_eq!(
+            managed_cli_after, managed_cli_before,
+            "Edycja slim: wpis agents/managed-cli nie przezyl filtra katalogu \
+             ({managed_cli_before} przed, {managed_cli_after} po) — aplikacja CLI \
+             agenta nie jest lokalnym silnikiem inferencji i slim ma ja pokazywac"
+        );
         println!(
             "cargo:warning=Edycja slim: katalog ograniczony do {} pozycji z {} \
              (ukryto silniki modelowe; {} zostawiono tylko jako zdalny endpoint)",

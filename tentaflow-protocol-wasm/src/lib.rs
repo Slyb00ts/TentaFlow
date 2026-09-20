@@ -1811,6 +1811,7 @@ pub fn encode_model_metrics_summary_request(
     filter_modality: Option<String>,
     filter_user: Option<String>,
     filter_group: Option<String>,
+    filter_account: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ModelMetricsBody(
         tentaflow_protocol::ModelMetricsPayload::SummaryRequest {
@@ -1825,6 +1826,7 @@ pub fn encode_model_metrics_summary_request(
                 modality: filter_modality,
                 user: filter_user,
                 group: filter_group,
+                account: filter_account,
             },
         },
     ))
@@ -22202,12 +22204,10 @@ pub fn encode_code_studio_session_open_request(
     workspace_id: String,
     title: String,
     autonomy_mode: String,
-    agent_service_id: Option<i64>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::CodeStudioBody(
         tentaflow_protocol::code_studio::CodeStudioPayload::SessionOpenRequest {
             workspace_id,
-            agent_service_id,
             title,
             autonomy_mode,
         },

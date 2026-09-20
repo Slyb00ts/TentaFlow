@@ -330,7 +330,7 @@ Kolejność realizacji runnera:
 
 Etap 0 rozpoczyna research wszystkich dostawców, aby ograniczenia agy/Grok/Muse wpłynęły na wspólny model przed implementacją. Etap 6 nie może być samym dodaniem kafelków.
 
-Build/release obejmuje natywne instalatory i obrazy bridge dla deklarowanych OS/architektur, kontrolowane aktualizacje z przypiętych wersji/digestów, wymagane zależności (obecnie npm dla części CLI), generację manifestów i wasm glue. Nie aktualizować binarki podczas działającej sesji; po aktualizacji ponownie sprawdzić kontrakt. Nie ręcznie edytować wygenerowanego JS manifestu.
+Build/release obejmuje natywne obrazy bridge dla deklarowanych OS/architektur, generację manifestów i wasm glue. Silniki CLI instaluje się z kanału wydawniczego dostawcy — zawsze najnowsza wersja, bez pinowania: Claude Code z `downloads.claude.ai/claude-code-releases`, Codex z GitHub Releases, Grok Build z `x.ai/cli/stable`, Muse Code z `api.meta.ai/muse-code`. Suma SHA-256 jest weryfikowana tam, gdzie dostawca ją publikuje (Claude, Codex, Muse); Grok nie publikuje żadnej i węzeł zapamiętuje digest pierwszego pobrania (TOFU). Archiwum rozpakowuje się w całości, bo np. pakiet Codeksa niesie `codex-path/rg` i `codex-resources/` obok `bin/codex`. Node/npm nie jest wymagany — instalacja potrzebuje wyłącznie shella i toolchainu Rusta na zbudowanie bridge’a. Nie aktualizować binarki podczas działającej sesji; po aktualizacji ponownie sprawdzić kontrakt. Nie ręcznie edytować wygenerowanego JS manifestu.
 
 ### Migracja istniejących danych
 

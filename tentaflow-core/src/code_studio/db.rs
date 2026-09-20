@@ -6,10 +6,12 @@
 // removes them from the sync engine's reach by construction instead of by an
 // entry it must remember not to add:
 //
-//   * `code_workspace_secrets` / `code_agent_credentials` (§5.2) — key
-//     material encrypted with the PER-NODE SettingsCipher key. Replicated it
-//     would be undecryptable at the far end anyway, so shipping it would only
-//     widen the attack surface for no gain.
+//   * `code_workspace_secrets` — key material encrypted with the PER-NODE
+//     SettingsCipher key. Replicated it would be undecryptable at the far end
+//     anyway, so shipping it would only widen the attack surface for no gain.
+//     Provider credentials are NOT here: they belong to an account in the
+//     `provider_accounts` registry, which is addressed by account id rather
+//     than by (org, node, engine).
 //   * `code_workspace_saga_steps` — the provisioning run state of ONE node's
 //     saga. No other node can resume, retry or compensate it; the durable
 //     outcome a remote UI needs (`status` + `status_detail`) travels on the
@@ -36,9 +38,10 @@ pub const PACKAGE_ID: &str = "code-studio";
 
 /// Schema steps, applied once each by `app_db::run_versioned_migrations`.
 /// Append-only: a change to the content schema is a new step, never an edit.
-const STEPS: &[(i64, &str)] = &[(
-    1,
-    "
+const STEPS: &[(i64, &str)] = &[
+    (
+        1,
+        "
 CREATE TABLE code_workspace_saga_steps (
     workspace_id TEXT NOT NULL,
     step TEXT NOT NULL,
@@ -60,21 +63,16 @@ CREATE TABLE code_workspace_secrets (
 );
 CREATE INDEX idx_code_workspace_secrets_ws
     ON code_workspace_secrets(workspace_id);
-CREATE TABLE code_agent_credentials (
-    org_id TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    engine_id TEXT NOT NULL,
-    material_enc BLOB NOT NULL,
-    provider_base_url TEXT NOT NULL,
-    fingerprint TEXT,
-    created_by TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    rotated_at TEXT,
-    last_used_at TEXT,
-    PRIMARY KEY (org_id, node_id, engine_id)
-);
 ",
-)];
+    ),
+    // Provider credentials moved to the `provider_accounts` registry, which
+    // keys them by account rather than by (org, node, engine). A node-local
+    // copy would keep a second, unrevocable answer to "which key does this
+    // engine run with" — dropping the table is what makes the registry the
+    // only one. `IF EXISTS` because only a database created by step 1 before
+    // this rung ever had it.
+    (2, "DROP TABLE IF EXISTS code_agent_credentials;"),
+];
 
 /// Brings a content database up to date. Idempotent: the versioned runner
 /// skips applied steps, so the install hook and every first open of the
@@ -120,11 +118,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM app_schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(applied, STEPS.len() as i64);
-        for table in [
-            "code_workspace_saga_steps",
-            "code_workspace_secrets",
-            "code_agent_credentials",
-        ] {
+        for table in ["code_workspace_saga_steps", "code_workspace_secrets"] {
             let present: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -134,6 +128,18 @@ mod tests {
                 .unwrap();
             assert_eq!(present, 1, "{table} must exist in the content database");
         }
+        // Step 2 drops the node-local credential table. A database that went
+        // through step 1 while it still created it is the only one that has
+        // the table; a fresh install never does.
+        let dropped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'code_agent_credentials'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dropped, 0, "provider credentials belong to the registry");
         let index: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
@@ -206,25 +212,5 @@ mod tests {
         let material = vault::get_workspace_secret(&local, &cipher, &stored.secret_ref).unwrap();
         assert_eq!(material.expose(), "ghp_example");
         assert_eq!(material.kind(), SecretKind::GitToken);
-
-        let fingerprint = vault::put_agent_credential(
-            &local,
-            &cipher,
-            "org-1",
-            "node-1",
-            "claude-code",
-            "sk-ant-example",
-            "https://api.example.test",
-            "u-admin",
-        )
-        .unwrap();
-        let record = vault::get_agent_credential_record(&local, "org-1", "node-1", "claude-code")
-            .unwrap()
-            .expect("credential record");
-        assert_eq!(record.fingerprint.as_deref(), Some(fingerprint.as_str()));
-        assert_eq!(
-            vault::delete_agent_credential(&local, "org-1", "node-1", "claude-code").unwrap(),
-            1
-        );
     }
 }

@@ -11050,7 +11050,7 @@ const MODEL_METRICS_COLS: &str = "id, node_id, org_id, user_id, model_id, servic
     decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, decode_tps_b5, \
     decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
     e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
-    e2e_sample_count, updated_at, usage_missing_count";
+    e2e_sample_count, updated_at, usage_missing_count, account_id";
 
 fn row_to_model_metrics_rollup(
     r: &rusqlite::Row<'_>,
@@ -11118,6 +11118,7 @@ fn row_to_model_metrics_rollup(
         e2e_sample_count: r.get(53)?,
         updated_at: r.get(54)?,
         usage_missing_count: r.get(55)?,
+        account_id: r.get(56)?,
     })
 }
 
@@ -11126,6 +11127,13 @@ fn row_to_model_metrics_rollup(
 /// bucket minted on different nodes therefore keeps a distinct `id` per node
 /// (single-writer-per-row), while a bucketing change re-keys rows instead of
 /// mixing incompatible histograms.
+///
+/// `account_id` is a dimension like any other: two buckets that differ ONLY in
+/// their account must not share an id, or the second account's counters would
+/// add into the first account's row and the per-account split Analytics shows
+/// would be a lie. The empty account ('' = gateway traffic) is length-prefixed
+/// like every other field, so it cannot be forged by a value ending in a field
+/// boundary either.
 pub(crate) fn model_metrics_id(dims: &crate::db::models::ModelMetricsDims<'_>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -11138,6 +11146,7 @@ pub(crate) fn model_metrics_id(dims: &crate::db::models::ModelMetricsDims<'_>) -
         dims.backend,
         dims.modality,
         dims.hour_bucket,
+        dims.account_id,
     ] {
         hasher.update((field.len() as u64).to_le_bytes());
         hasher.update(field.as_bytes());
@@ -11161,6 +11170,7 @@ pub fn model_metrics_changed_fields(
     fields.insert("backend".to_string(), field_string(&row.backend));
     fields.insert("modality".to_string(), field_string(&row.modality));
     fields.insert("hour_bucket".to_string(), field_string(&row.hour_bucket));
+    fields.insert("account_id".to_string(), field_string(&row.account_id));
     fields.insert(
         "histogram_version".to_string(),
         FieldValue::I64(row.histogram_version),
@@ -11264,11 +11274,11 @@ pub(crate) fn upsert_model_metrics_row_on_tx(
           decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, decode_tps_b5, \
           decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
           e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
-          e2e_sample_count, updated_at) \
+          e2e_sample_count, account_id, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
           ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, \
           ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, \
-          ?53, ?54, ?55, strftime('%Y-%m-%d %H:%M:%f','now')) \
+          ?53, ?54, ?55, ?56, strftime('%Y-%m-%d %H:%M:%f','now')) \
          ON CONFLICT(id) DO UPDATE SET \
          request_count = request_count + excluded.request_count, \
          success_count = success_count + excluded.success_count, \
@@ -11342,6 +11352,7 @@ pub(crate) fn upsert_model_metrics_row_on_tx(
             e2e_buckets[0], e2e_buckets[1], e2e_buckets[2], e2e_buckets[3], e2e_buckets[4],
             e2e_buckets[5], e2e_buckets[6], e2e_buckets[7], e2e_buckets[8], e2e_buckets[9],
             e2e_buckets.iter().sum::<i64>(),
+            dims.account_id,
         ],
     )?;
     Ok(())
@@ -11490,6 +11501,10 @@ pub fn list_model_metrics_rollup(
     if let Some(user_id) = filter.user_id {
         params.push(Box::new(user_id.to_string()));
         sql.push_str(&format!(" AND user_id = ?{}", params.len()));
+    }
+    if let Some(account_id) = filter.account_id {
+        params.push(Box::new(account_id.to_string()));
+        sql.push_str(&format!(" AND account_id = ?{}", params.len()));
     }
     if let Some(hour_from) = filter.hour_from {
         params.push(Box::new(hour_from.to_string()));
@@ -18041,13 +18056,85 @@ pub fn log_audit_full(
     node_id: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    log_audit_full_conn(
+        &conn,
+        user_id,
+        addon_id,
+        action,
+        None,
+        resource_type,
+        resource_id,
+        details,
+        severity,
+        risk_class,
+        result,
+        org_id,
+        ip_address,
+        node_id,
+    )
+}
+
+/// Audyt zasobu na CUDZEJ transakcji, z pelnym `resource_type`/`resource_id`
+/// ORAZ starszym `resource`. Pierwsze dwa to sposob, w jaki reszta kodu nazywa
+/// zasob (`camera`, `flow`, ...); `resource` zostaje, bo istniejące zapytania
+/// operatora filtrują po nim. Wpis commituje się razem z mutacją, którą opisuje,
+/// więc nie ma wiersza ogłaszającego zmianę, która się nie odbyła.
+#[allow(clippy::too_many_arguments)]
+pub fn log_audit_scoped_tx(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: Option<&str>,
+    action: &str,
+    resource: &str,
+    resource_type: &str,
+    resource_id: &str,
+    details: Option<&str>,
+    severity: &str,
+    risk_class: &str,
+    org_id: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<()> {
+    log_audit_full_conn(
+        tx,
+        user_id,
+        None,
+        action,
+        Some(resource),
+        Some(resource_type),
+        Some(resource_id),
+        details,
+        severity,
+        risk_class,
+        None,
+        org_id,
+        None,
+        node_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_audit_full_conn(
+    conn: &rusqlite::Connection,
+    user_id: Option<&str>,
+    addon_id: Option<&str>,
+    action: &str,
+    resource: Option<&str>,
+    resource_type: Option<&str>,
+    resource_id: Option<&str>,
+    details: Option<&str>,
+    severity: &str,
+    risk_class: &str,
+    result: Option<&str>,
+    org_id: Option<&str>,
+    ip_address: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<()> {
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let hash_input = crate::audit::chain::AuditRowHashInput {
         user_id,
         addon_id,
         instance_id: None,
         action,
-        resource: None,
+        resource,
         resource_type,
         resource_id,
         result,
@@ -18061,13 +18148,13 @@ pub fn log_audit_full(
         request_id: None,
         timestamp: &timestamp,
     };
-    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)?;
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(conn, &hash_input)?;
     conn.execute(
         "INSERT INTO audit_log \
-           (timestamp, user_id, addon_id, action, resource_type, resource_id, result, details, severity, risk_class, org_id, ip_address, node_id, prev_hash, hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+           (timestamp, user_id, addon_id, action, resource, resource_type, resource_id, result, details, severity, risk_class, org_id, ip_address, node_id, prev_hash, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
-            timestamp, user_id, addon_id, action, resource_type, resource_id, result, details, severity, risk_class, org_id, ip_address, node_id, prev_hash, hash,
+            timestamp, user_id, addon_id, action, resource, resource_type, resource_id, result, details, severity, risk_class, org_id, ip_address, node_id, prev_hash, hash,
         ],
     )?;
     Ok(())
@@ -28670,8 +28757,28 @@ mod token_metrics_tests {
             backend: "cuda",
             modality: "chat",
             hour_bucket: "2026-06-21T10:00:00Z",
+            account_id: "",
             histogram_version: 1,
         }
+    }
+
+    /// The collision guard for the account dimension: two buckets whose every
+    /// field is identical EXCEPT `account_id` must not mint one id, or the
+    /// second account's counters would land in the first account's row.
+    #[test]
+    fn model_metrics_id_separates_buckets_by_account() {
+        let with = |account_id: &'static str| crate::db::models::ModelMetricsDims {
+            account_id,
+            ..metrics_dims()
+        };
+        let gateway = model_metrics_id(&with(""));
+        let alice = model_metrics_id(&with("acc-alice"));
+        let bob = model_metrics_id(&with("acc-bob"));
+        assert_ne!(gateway, alice);
+        assert_ne!(alice, bob);
+        assert_ne!(gateway, bob);
+        // Stable: the same dimensions always mint the same id.
+        assert_eq!(alice, model_metrics_id(&with("acc-alice")));
     }
 
     #[test]

@@ -352,12 +352,20 @@ function tileClassFor(modelId) {
 }
 
 // Display helpers over wire rows.
-function rowName(r) { return r.displayName || r.display_name || String(r.key || ''); }
+// Wire key of the `account` bucket that carries gateway traffic (no provider
+// account); reserved Core-side, never an account id. A person reads a
+// localized label instead of the raw English sentinel.
+const NO_ACCOUNT_KEY = '(no account)';
+function rowName(r) {
+  if (String(r.key || '') === NO_ACCOUNT_KEY) return T('no_account');
+  return r.displayName || r.display_name || String(r.key || '');
+}
 function rowSub(r, kind) {
   if (kind === 'model') return r.displayName ? String(r.key) : '';
   if (kind === 'user') return r.subtitle || '';
   if (kind === 'group') return r.memberCount != null ? T('members_count', { count: num(r.memberCount) }) : '';
   if (kind === 'node') return shortId(r.key);
+  if (kind === 'account') return r.subtitle || '';
   return '';
 }
 function modelName(id) {
@@ -433,6 +441,7 @@ async function fetchSummary(groupBy, extra = {}) {
     filterNode: extra.filterNode ?? (f.node || undefined),
     filterUser: extra.filterUser,
     filterGroup: extra.filterGroup,
+    filterAccount: extra.filterAccount,
   };
   const resp = await cached('modelMetricsSummaryRequest', payload);
   return {
@@ -669,6 +678,7 @@ function renderToolbar() {
       parts.push(sep, group('bill_by', `<tf-segmented id="an-f-bill-by" value="${escapeAttr(state.billingBy)}" size="md">
         <option value="user">${escapeHtml(T('by_user'))}</option>
         <option value="group">${escapeHtml(T('by_group'))}</option>
+        <option value="account">${escapeHtml(T('by_account'))}</option>
       </tf-segmented>`, 'an-fg--seg'));
       parts.push('<span class="an-spacer"></span><span id="an-billing-note"></span>');
     } else {
@@ -1130,19 +1140,33 @@ async function renderOverview(panel, seq) {
 // Tab: Users & groups.
 // ---------------------------------------------------------------------------
 
+// The "list by" dimensions the users and billing tabs share; each segmented
+// control offers exactly these values, so one lookup drives every label.
+const DIM_LABELS = {
+  user: { title: 'subtab_users', col: 'col_user', count: 'users_count' },
+  group: { title: 'subtab_groups', col: 'col_group', count: 'groups_count' },
+  account: { title: 'subtab_accounts', col: 'col_account', count: 'accounts_count' },
+  model: { title: 'tab_models', col: 'col_model', count: 'models_count' },
+};
+function dimLabels(dim) { return DIM_LABELS[dim] || DIM_LABELS.user; }
+// Billing titles differ from the tab/column vocabulary above.
+const COST_TITLES = { user: 'costs_by_user', group: 'costs_by_group', account: 'costs_by_account' };
+
 async function renderUsers(panel, seq) {
   const isGroup = state.usersSub === 'group';
+  const dim = dimLabels(state.usersSub);
   panel.innerHTML = `
     <div class="an-subbar tf-toolbar">
       <tf-segmented id="an-users-sub" value="${escapeAttr(state.usersSub)}" size="md">
         <option value="user">${escapeHtml(T('subtab_users'))}</option>
         <option value="group">${escapeHtml(T('subtab_groups'))}</option>
+        <option value="account">${escapeHtml(T('subtab_accounts'))}</option>
       </tf-segmented>
       <span class="an-spacer"></span>
       <tf-searchbox id="an-users-search" placeholder="${escapeAttr(T('search_subject'))}" value="${escapeAttr(state.usersSearch)}"></tf-searchbox>
     </div>
-    ${cardHtml({ id: 'an-users-card', title: T(isGroup ? 'subtab_groups' : 'subtab_users'), hint: T('hint_click_details'), body: tableHtml('an-users-table', [
-      { key: 'name', label: T(isGroup ? 'col_group' : 'col_user'), renderer: 'html' },
+    ${cardHtml({ id: 'an-users-card', title: T(dim.title), hint: T('hint_click_details'), body: tableHtml('an-users-table', [
+      { key: 'name', label: T(dim.col), renderer: 'html' },
       { key: 'prompt', label: T('col_prompt'), renderer: 'html', num: true },
       { key: 'completion', label: T('col_completion'), renderer: 'html', num: true },
       { key: 'total', label: T('col_tokens'), renderer: 'html', num: true },
@@ -1181,7 +1205,7 @@ async function renderUsers(panel, seq) {
       cost: costCell(r.cost, r.missingPricing, false, usageMissing(r)),
       share: shareCell(total ? num(r.totalTokens) / total : 0, i),
     })), T('no_data'));
-    const left = T(isGroup ? 'groups_count' : 'users_count', { count: visible.length });
+    const left = T(dim.count, { count: visible.length });
     const right = `${T('sum_tokens', { value: compact(totals.totalTokens) })} · ${costCell(totals.cost, totals.missingPricing, false, totals.usageMissingCount)}`
       + partialHint(totals.missingPricing, totals.usageMissingCount)
       + (isGroup && data.grandTotal ? ` · ${escapeHtml(T('group_overlap_note'))}` : '');
@@ -1191,7 +1215,7 @@ async function renderUsers(panel, seq) {
   onRowClick('an-users-table', (row) => openDrill(state.usersSub, row._row.key, rowName(row._row), rowSub(row._row, state.usersSub)));
 
   state.exportCsv = () => downloadCsv(`analytics-${state.usersSub}-${effectivePeriodKey()}.csv`,
-    [T(isGroup ? 'col_group' : 'col_user'), T('col_prompt'), T('col_completion'), T('col_tokens'), T('col_requests'), T('col_audio'), T('col_cost'), T('col_usage_missing')],
+    [T(dim.col), T('col_prompt'), T('col_completion'), T('col_tokens'), T('col_requests'), T('col_audio'), T('col_cost'), T('col_usage_missing')],
     rows.map((r) => [rowName(r), r.promptTokens, r.completionTokens, r.totalTokens, r.requestCount, Math.round(num(r.audioMs) / 1000), r.missingPricing ? T('missing_pricing') : num(r.cost).toFixed(2), usageMissing(r)]));
 }
 
@@ -1379,15 +1403,18 @@ function drillFilter() {
   if (d.kind === 'user') return { filterUser: d.id };
   if (d.kind === 'group') return { filterGroup: d.id };
   if (d.kind === 'model') return { filterModel: d.id };
+  if (d.kind === 'account') return { filterAccount: d.id };
   return { filterNode: d.id };
 }
 
-// Breakdown dimensions per entity kind: [groupBy, title, hint].
+// Breakdown dimensions per entity kind: [groupBy, title, hint]. `account`
+// appears wherever the account dimension is a meaningful cross-cut.
 function drillBreakdowns() {
   const k = state.drill.kind;
-  if (k === 'user') return [['model', T('bd_model'), T('hint_click_model')], ['node', T('bd_node'), T('hint_where_computed')]];
+  if (k === 'user') return [['model', T('bd_model'), T('hint_click_model')], ['node', T('bd_node'), T('hint_where_computed')], ['account', T('bd_account'), T('hint_click_account')]];
   if (k === 'group') return [['user', T('bd_user'), T('hint_click_details')], ['model', T('bd_model'), T('hint_click_model')]];
-  if (k === 'model') return [['user', T('bd_user'), T('hint_click_details')], ['node', T('bd_node'), T('hint_where_computed')]];
+  if (k === 'model') return [['user', T('bd_user'), T('hint_click_details')], ['node', T('bd_node'), T('hint_where_computed')], ['account', T('bd_account'), T('hint_click_account')]];
+  if (k === 'account') return [['user', T('bd_user'), T('hint_click_details')], ['model', T('bd_model'), T('hint_click_model')]];
   return [['model', T('bd_model'), T('hint_click_model')], ['service', T('bd_service'), T('hint_services_on_node')]];
 }
 
@@ -1403,7 +1430,7 @@ function breakdownCols(dim) {
   }
   if (dim === 'service') return serviceCols();
   return [
-    { key: 'name', label: T(dim === 'user' ? 'col_user' : 'col_model'), renderer: 'html' },
+    { key: 'name', label: T(dimLabels(dim).col), renderer: 'html' },
     { key: 'total', label: T('col_tokens'), renderer: 'html', num: true },
     { key: 'requests', label: T('col_requests'), renderer: 'html', num: true },
     { key: 'cost', label: T('col_cost'), renderer: 'html', num: true },
@@ -1428,7 +1455,7 @@ function breakdownRows(dim, rows, total) {
       ...base,
       name: dim === 'model'
         ? modelCell(r.key, r.displayName, modelSub(r))
-        : entCell({ title: rowName(r), sub: rowSub(r, 'user') }),
+        : entCell({ title: rowName(r), sub: rowSub(r, dim) }),
       requests: compactCell(r.requestCount),
       cost: costCell(r.cost, r.missingPricing, false, usageMissing(r)),
       share: shareCell(total ? num(r.totalTokens) / total : 0, i),
@@ -1462,6 +1489,11 @@ function heroChips(d, row, services = []) {
     if (d.id === state.coordinatorId) chips.push(tfChip('accent', T('chip_coordinator')));
     const live = isLive(row?.lastSeenAt);
     chips.push(tfChip(live ? 'ok' : 'neutral', T('last_seen', { rel: live ? T('rel_now') : relTime(row?.lastSeenAt) }), true));
+  } else if (d.kind === 'account') {
+    // The summary resolves an account's engine into the row subtitle; that is
+    // the only account fact on the wire, so nothing else is shown here.
+    const engine = row?.subtitle || d.sub;
+    if (engine) chips.push(tfChip('accent', engine));
   }
   // Partial cost is flagged next to the hero KPI (the big number carries no tilde).
   if (d.kind !== 'model' && row?.missingPricing) chips.push(tfChip('warn', T('partial_cost_note')));
@@ -1560,7 +1592,7 @@ async function renderDrill(panel, seq) {
     const missing = rows.some((r) => r.missingPricing);
     const gaps = sumUsageMissing(rows);
     setRows(`an-bd-${dim}-table`, breakdownRows(dim, rows, total));
-    const countKey = { model: 'models_count', node: 'nodes_count', user: 'users_count', service: 'services_count' }[dim];
+    const countKey = { model: 'models_count', node: 'nodes_count', user: 'users_count', service: 'services_count', account: 'accounts_count' }[dim];
     const right = dim === 'node' ? escapeHtml(T('percentiles_note')) : dim === 'service' ? escapeHtml(T('percentiles_note')) : `${escapeHtml(T('sum_tokens', { value: compact(total) }))} · ${costCell(cost, missing, false, gaps)}${partialHint(missing, gaps)}`;
     setFoot(`an-bd-${dim}`, escapeHtml(T(countKey, { count: rows.length })), right);
     onRowClick(`an-bd-${dim}-table`, (row) => {
@@ -1974,10 +2006,11 @@ function closeModal(modal) {
 
 async function renderBilling(panel, seq) {
   const isGroup = state.billingBy === 'group';
+  const dim = dimLabels(state.billingBy);
   panel.innerHTML = `
     <div class="an-grid an-cols-21">
-      ${cardHtml({ id: 'an-bill-card', title: T(isGroup ? 'costs_by_group' : 'costs_by_user', { period: periodLabel() }), hint: T('exact_values'), body: tableHtml('an-bill-table', [
-        { key: 'name', label: T(isGroup ? 'col_group' : 'col_user'), renderer: 'html' },
+      ${cardHtml({ id: 'an-bill-card', title: T(COST_TITLES[state.billingBy] || COST_TITLES.user, { period: periodLabel() }), hint: T('exact_values'), body: tableHtml('an-bill-table', [
+        { key: 'name', label: T(dim.col), renderer: 'html' },
         { key: 'total', label: T('col_tokens'), num: true },
         { key: 'requests', label: T('col_requests'), num: true },
         { key: 'cost', label: T('col_cost'), renderer: 'html', num: true },
@@ -2028,7 +2061,7 @@ async function renderBilling(panel, seq) {
   const sumText = `<b>${escapeHtml(T('sum_cost', { value: money(totalCost) }))}</b>`
     + partialHint(missingModels > 0, sumUsageMissing(rows))
     + (isGroup && data.grandTotal ? ` · ${escapeHtml(T('group_overlap_note'))}` : '');
-  setFoot('an-bill-card', escapeHtml(T(isGroup ? 'groups_count' : 'users_count', { count: rows.length })), sumText);
+  setFoot('an-bill-card', escapeHtml(T(dim.count, { count: rows.length })), sumText);
   onRowClick('an-bill-table', (row) => openDrill(state.billingBy, row._row.key, rowName(row._row), rowSub(row._row, state.billingBy)));
 
   const structRows = [...byModel.rows].sort((a, b) => (a.missingPricing - b.missingPricing) || num(b.cost) - num(a.cost));
@@ -2050,7 +2083,7 @@ async function renderBilling(panel, seq) {
   renderPricing(pricing, byModel.rows);
 
   state.exportCsv = () => downloadCsv(`analytics-billing-${state.billingBy}-${effectivePeriodKey()}.csv`,
-    [T(isGroup ? 'col_group' : 'col_user'), T('col_tokens'), T('col_requests'), T('col_cost'), T('col_usage_missing')],
+    [T(dim.col), T('col_tokens'), T('col_requests'), T('col_cost'), T('col_usage_missing')],
     rows.map((r) => [rowName(r), r.totalTokens, r.requestCount, num(r.cost).toFixed(2), usageMissing(r)]));
 }
 

@@ -22,6 +22,11 @@ pub struct ModelMetricsFilterWire {
     /// Only rows of users who are members of this group (`user_groups.id`).
     #[serde(default)]
     pub group: Option<String>,
+    /// Only rows of this provider account (`provider_accounts.account_id`). The
+    /// `group_by=account` bucket for traffic without an account is keyed by the
+    /// sentinel `(no account)`; Core translates it to the empty id.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// One aggregated summary row. `key` depends on `group_by` (user/group/
@@ -121,8 +126,10 @@ pub struct ModelPricingWire {
 pub enum ModelMetricsPayload {
     /// `period` ∈ {daily, monthly, hourly} sets the `period_key` granularity
     /// (YYYY-MM-DD / YYYY-MM / YYYY-MM-DDTHH), `group_by` ∈ {user, group, model,
-    /// node, service, day, hour} the aggregation dimension. `group` rows are keyed by
-    /// group id (`user_groups.id`), `hour` by the full `hour_bucket`.
+    /// node, service, day, hour, account} the aggregation dimension. `group` rows
+    /// are keyed by group id (`user_groups.id`), `account` by
+    /// `provider_accounts.account_id` (`(no account)` for traffic without one),
+    /// `hour` by the full `hour_bucket`.
     SummaryRequest {
         period: String,
         period_key: String,
@@ -183,6 +190,7 @@ mod tests {
                 modality: Some("chat".to_string()),
                 user: Some("00000000-0000-4000-8000-000000000002".to_string()),
                 group: None,
+                account: Some("acc-claude".to_string()),
             },
         };
         let bytes = crate::cbor::encode(&payload).expect("encode");
@@ -340,6 +348,7 @@ mod tests {
         assert_eq!(filter.model.as_deref(), Some("m"));
         assert_eq!(filter.user, None);
         assert_eq!(filter.group, None);
+        assert_eq!(filter.account, None);
     }
 
     #[test]

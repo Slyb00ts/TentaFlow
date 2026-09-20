@@ -453,6 +453,17 @@ jobs:
           cd tentaflow-containers/agents/native/teams-bot
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-meeting-bot" python3 "$GITHUB_WORKSPACE/scripts/cargo-build.py" build --release --locked --bin tentaflow-meeting
 
+      - name: Coding-agent bridge (fail fast, before an hour of Rust)
+        run: |
+          # tentaflow/build.rs builds this too and reuses this target dir, so it
+          # costs nothing to do first — and a broken bridge becomes a
+          # three-minute failure instead of one found at packaging time. The
+          # archive must carry the executable: a node installs a coding agent
+          # with no Rust toolchain and no route to a crate registry, so it can
+          # not build this itself.
+          cd tentaflow-containers/agents/native/coding-agent-bridge
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-coding-agent-bridge" python3 "$GITHUB_WORKSPACE/scripts/cargo-build.py" build --release --locked
+
       - name: Reserve memory for the release link
         run: |
           # ThinLTO i biblioteki natywne mogą przekroczyć RAM runnera podczas
@@ -533,6 +544,12 @@ jobs:
           # answers with cloud providers — and the binary needs nothing beyond
           # libc, so there is no technical reason to withhold it.
           require "$OUT/tentaflow-meeting"
+          # The coding-agent bridge goes in BOTH editions for the same reason as
+          # the sidecar: a coding agent drives a vendor CLI through Core, it is
+          # not a local inference engine, so slim keeps it. Installing an agent
+          # on a node must not need a Rust toolchain, which is why the executable
+          # travels here rather than being compiled at engine-install time.
+          require "$OUT/tentaflow-coding-agent-bridge"
 
           # No silero_vad.onnx here: nothing in the build produces one, and
           # Core downloads it (with the wespeaker embedding) on first start into
@@ -571,6 +588,12 @@ jobs:
             echo "::error::$BIN links CUDA — this variant must not"
             exit 1
           fi
+          # Core starts this per account from beside its own binary, and the node
+          # installing an engine has no toolchain to rebuild it with.
+          test -x "${{ steps.stage.outputs.stage }}/tentaflow-coding-agent-bridge" || {
+            echo "::error::brak wykonywalnego tentaflow-coding-agent-bridge w archiwum"
+            exit 1
+          }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -666,6 +689,14 @@ jobs:
           cd tentaflow-containers/agents/native/teams-bot
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-meeting-bot" python3 "$GITHUB_WORKSPACE/scripts/cargo-build.py" build --release --locked --bin tentaflow-meeting
 
+      - name: Coding-agent bridge (fail fast, before three hours of Rust)
+        run: |
+          # Built by tentaflow/build.rs as well, and shipped in the archive
+          # instead of being compiled on the node — see the Linux job, which
+          # carries the same step for the same reason.
+          cd tentaflow-containers/agents/native/coding-agent-bridge
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-coding-agent-bridge" python3 "$GITHUB_WORKSPACE/scripts/cargo-build.py" build --release --locked
+
       - name: Swift bridges (fail fast, before three hours of Rust)
         run: |
           # build.rs builds these too and reuses this derived data. Doing it here
@@ -697,6 +728,7 @@ jobs:
           }
           require "$OUT/tentaflow"
           require "$OUT/tentaflow-meeting"
+          require "$OUT/tentaflow-coding-agent-bridge"
           require "$OUT/libzvec_c_api.dylib"
           require "$OUT/libpdfium.dylib"
           # MLX is the whole reason this edition exists on macOS: the bridge
@@ -738,6 +770,26 @@ jobs:
             END { exit bad }
           ' || { echo "::error::tentaflow-meeting wymaga niezapakowanej biblioteki spoza macOS"; exit 1; }
           env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$MEETING_BIN" --help
+
+          # The bridge is started by Core under one account's runtime, so the
+          # archive has to carry an executable one and nothing the target machine
+          # would lack. It takes no flag to smoke-test with: its configuration
+          # arrives in the environment Core hands it.
+          BRIDGE_BIN="$MEETING_CHECK_DIR/$STAGE/tentaflow-coding-agent-bridge"
+          test -x "$BRIDGE_BIN" || {
+            echo "::error::brak wykonywalnego tentaflow-coding-agent-bridge w archiwum Metal"
+            exit 1
+          }
+          file "$BRIDGE_BIN" | grep -q arm64 || {
+            echo "::error::tentaflow-coding-agent-bridge nie jest arm64"
+            exit 1
+          }
+          BRIDGE_DEPS=$(otool -L "$BRIDGE_BIN")
+          printf '%s\n' "$BRIDGE_DEPS"
+          printf '%s\n' "$BRIDGE_DEPS" | awk '
+            NR > 1 && $1 !~ /^\/System\/Library\// && $1 !~ /^\/usr\/lib\// { bad=1 }
+            END { exit bad }
+          ' || { echo "::error::tentaflow-coding-agent-bridge wymaga niezapakowanej biblioteki spoza macOS"; exit 1; }
 
           # zvec is linked at build time, through @rpath next to the binary.
           otool -L "$BIN" | grep -q libzvec_c_api.dylib || {

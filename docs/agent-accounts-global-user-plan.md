@@ -150,7 +150,9 @@ właściciel jest nieosiągalny dłużej niż próg, a inny node ma bieżącą r
   odmową, nie migracją rozmowy.
 - Wspólne są tylko pliki projektu (w tym `.claude/`, `.codex/`, `CLAUDE.md`) — to konfiguracja projektu, nie
   poświadczenia. Bridge odrzuca projektowe ustawienia zmieniające źródło uwierzytelnienia (apiKeyHelper,
-  auth_provider_command, env w settings).
+  auth_provider_command, env samego silnika w settings); dokument ustawień czyta przez parser, a nie
+  linia po linii, więc każdy zapis TOML znaczy to, co znaczy dla silnika, a dokument nieparsowalny jest
+  odrzucany, nie przepuszczany bez czytania.
 - Zapis do jednego worktree: jedna tura pisząca naraz (blokada tury w `delegate_cli`), recenzent/tester
   czytają równolegle.
 - Metryki i audyt: `model_metrics_rollup` i `audit_log` dostają `account_id`; zużycie konta globalnego jest
@@ -163,13 +165,25 @@ subskrypcja jest oznaczona w GUI jako „tylko dla zaufanych".
 
 ## 3. Warunki wstępne (bez nich „na każdym nodzie" nie działa)
 
-1. **Linux**: sieć w sandboxie. `bwrap` zostaje z `--unshare-net`; proxy egress wystawione jako gniazdo unix
-   zamontowane do sandboxa + forwarder `127.0.0.1:port → UDS` uruchamiany wewnątrz (ten sam plik bridge'a).
-   Usunąć bramkę `with_proxy` (`process_sandbox.rs:182`). Testy integracyjne bwrap (dziś są tylko macOS).
+1. **Linux**: sieć w sandboxie — **zrobione w HEAD** (`dd49a75c7`). Proxy egress jest gniazdem unix
+   montowanym do sandboxa (`--unshare-all`, `--bind <socket> <socket>`), a forwarder
+   `127.0.0.1:port → UDS` chodzi wewnątrz namespace jako ten sam plik bridge'a (`linux_sandbox_net.rs`).
+   Bramki `with_proxy` nie ma — `with_proxy` (`process_sandbox.rs:678`) przyjmuje Linuksa i wymaga
+   wyłącznie istniejącego gniazda. Testy bwrap nie są już tylko macOS: `linux_sandbox_carries_its_proxy_…`
+   i `real_linux_sandbox_only_reaches_its_proxy` **przechodzą na prawdziwym Linuksie** (rig26, Fedora 43,
+   `603ba4267`: 69 passed, 0 failed, 4 ignored — ignorowane wymagają binarek dostawców i jawnego env).
 2. **Sonda gotowości** sprawdza `runtime.status` z rzeczywistą próbą sandboxa, nie samo `/health`.
 3. **Bridge w archiwach release** (dziś kompilowany u użytkownika przez `cargo`). Silniki widoczne także w
    edycji slim — to nie jest lokalna inferencja.
-4. **Grok/Muse na Linuxie**: przypiąć artefakty linux x86_64/aarch64 z SHA256 w `managed_cli.rs`.
+4. **Instalatory dostawców**: nie ma pinowania — wersja jest rozwiązywana z kanału dostawcy w chwili
+   instalacji (`resolve_latest`, `managed_cli.rs:81`). Sumy weryfikuje się tam, gdzie dostawca je publikuje
+   (`verify_artifact`, `:584`): claude-code (manifest), muse-code (manifest z `checksum_algorithm == "sha256"`),
+   codex (`codex-package_SHA256SUMS`; suma dotyczy archiwum, nie binarki w środku). grok-build sumy nie
+   publikuje i idzie ścieżką trust-on-first-use (`remember_unverified_digest`, `:607`), zapisując
+   `artifact.sha256` i odmawiając artefaktu zmienionego przy niezmienionej wersji. Mapowanie platform dla
+   Linuxa istnieje (`vendor_platform`, `:53`: claude `linux-x64`/`linux-arm64`, muse `x86_linux`/`aarch64_linux`,
+   codex triple `*-unknown-linux-musl`, grok `{os}-{arch}`), ale odbiorczo sprawdzono na żywo wyłącznie
+   `darwin-arm64` — Linux pozostaje niezweryfikowany na żywo.
 5. **Windows**: bez backendu sandboxa node pozostaje „tylko zdalnie"; manifesty przestają deklarować
    `windows`, dopóki AppContainer nie przejdzie kontraktu. macOS bez sesji GUI: jawny komunikat w node pickerze.
 6. Czat `/v1`: obsługa zdarzeń `grok`/`muse` w `execute_chat`, koniec tury tylko z obserwowanego zdarzenia.
@@ -198,3 +212,57 @@ etapie, który je zastępuje.
 2. **Konto globalne — kto może używać**: rekomendacja granty (user/grupa/cała organizacja), a przypisanie
    konta do agenta nie omija grantu. Alternatywa: samo przypisanie w Agents wystarcza.
 3. **Windows**: rekomendacja — wycofać deklarację z manifestów do czasu backendu sandboxa.
+
+## 6. Znane defekty poza zakresem pakietów
+
+Znalezione przy odbiorze pakietu 2. Defekt poniżej nie należał do żadnego etapu — `stop()` i
+`uninstall_engine()` były bajtowo identyczne z HEAD, a diff pakietu nie zmieniał żadnej linii ścieżki
+`shutdown` — ale blokował obowiązkową bramkę, więc został zdiagnozowany i naprawiony w tym samym
+przyroście; naprawa nie należy do zakresu funkcjonalnego pakietu 2.
+
+- **Odinstalowanie runtime'u czekało za porzuconym startem logowania — naprawione.** Objaw:
+  `providerAccountRuntimeUninstallRequest timed out after 30000ms`
+  (`tests/e2e/agent-accounts.spec.js`, ostatnia linia bloku „A02 na żywo"), deterministycznie
+  przy pełnym przebiegu projektu `agent-accounts`.
+
+  Pierwotna hipoteza (niezgodność budżetów: `coding_agent.rs` czeka 65 s na `POST
+  /runtime/shutdown`, shim `api-binary-shim.js:19` ma `CALL_DEADLINE_MS = 30_000`) była błędna.
+  Pomiar na działającym węźle pokazał, że sam POST odpowiada w `789.833µs`, a całe `stop` to
+  10.003 s — i to wyłącznie martwe `child.wait()` (Core trzyma rurę `stdin` mostka, więc mostek
+  nigdy nie mógł wyjść przed jej zamknięciem). Obiegająca notatki liczba **50 620 ms** jako czas
+  oczekiwania klienta jest niepotwierdzona i prawdopodobnie przypisana do innego żądania: klient na
+  tej ścieżce kończy się własnym `CALL_DEADLINE_MS = 30_000` (objaw to `… timed out after 30000ms`),
+  a `Math.max(30_000, 50_000)` w shimie dotyczy wyłącznie żądania forwardowanego do innego noda. Do
+  tego pomiaru nie jest tu przypisywana.
+
+  Prawdziwa przyczyna: pętla odczytu `api/dashboard/ws_binary.rs` wołała `dispatch::dispatch(...)`
+  inline, a to **jedyne** miejsce czytające to połączenie. Handler `ProviderAccountLoginStartRequest`
+  czeka w `await_verification_url` własny `URL_TIMEOUT = 45 s` (`provider_accounts/login.rs:38`) na
+  adres od CLI; porzucony przez „Anuluj" start i tak trzyma połączenie do końca tego czekania, a
+  uninstall wysłany w tym oknie stoi w kolejce za nim — klient odrzuca go po własnych 30 s, zanim
+  kolejka się zwolni. Uninstall nie jest wolny — nigdy nie dociera do handlera.
+
+  Naprawa: (1) `ws_binary.rs` dispatchuje na osobnym tasku, tak jak już robi to dla `Forward` i dla
+  strumieni — handlery są i tak wchodzone równolegle z serwera HTTP, od peerów mesha i z innych
+  socketów, więc znika wyjątek jednego połączenia, a odpowiedź wraca z tym samym `correlation_id`;
+  (2) `agent_runtime::stop` ma własne budżety — 5 s na potwierdzenie `/runtime/shutdown` i 5 s na
+  wyjście mostka po zamknięciu rury rodzica, po czym proces jest zabijany — więc `stop` jest
+  ograniczony niezależnie od tego, kto go woła. Żadna inna ścieżka żądania się nie wydłużyła.
+
+- **Skutek uboczny tej samej zmiany w teście N01 — naprawiony po stronie testu.** Po
+  przeniesieniu dispatchu na osobny task macierz nie jest już odświeżana przypadkiem przez
+  inne ramki tego samego połączenia, więc test „installing an application runs on the node"
+  (`agent-accounts.spec.js`, dziś `:983`) padał na pojedynczej próbce DOM wziętej w chwili, gdy
+  wiersz w bazie był już `installed`, a tabela pokazywała jeszcze `Instalowanie`: ekran dogania
+  węzeł własną pętlą `watchInstall` co 2 s (`modules/services/agent-accounts-tab.js`), a pojedynczy odczyt mógł
+  wypaść do jednego interwału przed przerysowaniem. Zmiana nie dotyka zachowania produktu:
+  to samo oczekiwanie (`row.version || 'Zainstalowana'`) jest teraz odczytywane przez
+  `expect.poll` z budżetem 15 s, więc macierz, która nigdy się nie przerysuje, nadal zawodzi.
+  Zależność jest wcześniejsza niż ten pakiet: `installRuntime` w `agent-accounts.js` nie ma
+  własnego `timeoutMs` (bajtowo tak samo w HEAD), a `runtime_install`
+  (`dispatch/provider_account.rs`) czeka na pobranie od dostawcy i budowę mostka, więc żądanie
+  może przekroczyć domyślne 30 s shima — wtedy UI podąża za węzłem własnym pollem. Nie dodano
+  tu długiego terminu, bo wydłużyłby ścieżkę żądania; jeśli w danej instancji aplikacji nic
+  wcześniej nie zainstalowało claude-code, test A02 na żywo może się przez to sam pominąć
+  (`test.skip`), co zaobserwowano raz przy przebiegu z wykluczonym N01 — w wymaganej
+  kolejności pliku przechodzi.

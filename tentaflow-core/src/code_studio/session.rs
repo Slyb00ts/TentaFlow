@@ -52,7 +52,6 @@ pub fn acquire_lifecycle(workspace_id: &str) -> Result<tokio::sync::OwnedRwLockW
 /// A session as the UI and the coordinator see it.
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
-    pub agent_service_id: Option<i64>,
     pub id: String,
     pub workspace_id: String,
     pub user_id: String,
@@ -72,7 +71,6 @@ pub struct SessionRecord {
 /// request cannot aim a session at an arbitrary branch.
 #[derive(Debug, Clone)]
 pub struct NewSession {
-    pub agent_service_id: Option<i64>,
     pub id: String,
     pub user_id: String,
     /// Short human-readable slug of the user, used in the branch name.
@@ -253,8 +251,8 @@ fn insert_session_rows(
     // only a closed or failed session gives one back.
     let claimed = tx.execute(
         "INSERT INTO sessions (id, workspace_id, user_id, title, branch, autonomy_mode, \
-          flow_id, flow_version_id, status, created_at, updated_at, agent_service_id) \
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'idle', datetime('now'), datetime('now'), ?11 \
+          flow_id, flow_version_id, status, created_at, updated_at) \
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'idle', datetime('now'), datetime('now') \
          WHERE (SELECT COUNT(*) FROM sessions WHERE user_id = ?3 \
                  AND status NOT IN ('closed','failed','cancelled')) < ?9 \
            AND (?10 = 0 OR NOT EXISTS (SELECT 1 FROM sessions WHERE status != 'closed'))",
@@ -269,7 +267,6 @@ fn insert_session_rows(
             new.flow_version_id,
             quota,
             i64::from(workspace.repo_kind == "local"),
-            new.agent_service_id,
         ],
     )?;
     if claimed == 0 {
@@ -299,7 +296,7 @@ pub fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<SessionReco
     let row = conn
         .query_row(
             "SELECT id, workspace_id, user_id, title, branch, autonomy_mode, flow_id, \
-              flow_version_id, status, created_at, updated_at, closed_at, agent_service_id \
+              flow_version_id, status, created_at, updated_at, closed_at \
              FROM sessions WHERE id = ?1",
             rusqlite::params![session_id],
             read_session,
@@ -315,7 +312,7 @@ pub fn list_sessions_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<Sessio
     let conn = pool.read().map_err(|e| anyhow!("workspace db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT id, workspace_id, user_id, title, branch, autonomy_mode, flow_id, \
-          flow_version_id, status, created_at, updated_at, closed_at, agent_service_id \
+          flow_version_id, status, created_at, updated_at, closed_at \
          FROM sessions WHERE user_id = ?1 ORDER BY created_at DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![user_id], read_session)?;
@@ -324,7 +321,6 @@ pub fn list_sessions_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<Sessio
 
 fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
-        agent_service_id: row.get(12)?,
         id: row.get(0)?,
         workspace_id: row.get(1)?,
         user_id: row.get(2)?,
@@ -750,7 +746,6 @@ mod tests {
 
     fn new_session(id: &str) -> NewSession {
         NewSession {
-            agent_service_id: None,
             id: id.to_string(),
             user_id: "u-1".into(),
             user_slug: "Piotr".into(),

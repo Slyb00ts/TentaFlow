@@ -27,6 +27,7 @@ import {
   credentialKindLabel,
   engineName,
   engineTile,
+  describeError,
   errorText,
   osLabel,
   scopeChipHtml,
@@ -48,7 +49,11 @@ const state = {
   accounts: [],
   engines: [],
   nodes: [],
-  error: '',
+  // The list's own error as `{ message, detail }` — the same shape the account
+  // window renders: the translation (or the node's sentence) in `.aa-error`,
+  // the node's raw English as that element's `title`, the way
+  // `agent-accounts-window.js` keeps its inline errors.
+  error: { message: '', detail: '' },
 };
 
 /** Renders the tab into `host` and loads it. Re-entrant: Services re-mounts on every tab switch. */
@@ -117,7 +122,7 @@ export function unmount() {
   state.accounts = [];
   state.engines = [];
   state.nodes = [];
-  state.error = '';
+  state.error = { message: '', detail: '' };
 }
 
 async function load() {
@@ -130,10 +135,10 @@ async function load() {
     });
     state.accounts = list.accounts ?? [];
     state.engines = list.engines ?? [];
-    state.error = '';
+    state.error = { message: '', detail: '' };
   } catch (err) {
     state.accounts = [];
-    state.error = errorText(err);
+    state.error = describeError(err);
   }
   if (state.segment === 'runtime' || state.isAdmin) {
     try {
@@ -189,7 +194,9 @@ function paint() {
 
 function paintAccounts(body) {
   body.innerHTML = `
-    ${state.error ? `<p class="aa-error" role="alert">${escapeHtml(state.error)}</p>` : ''}
+    ${state.error.message
+      ? `<p class="aa-error" role="alert" title="${escapeAttr(state.error.detail)}">${escapeHtml(state.error.message)}</p>`
+      : ''}
     <tf-table variant="flush" id="aa-accounts-table" actions-label="${escapeAttr(I18n.t('common.actions'))}"
               empty-message="${escapeAttr(T('list_empty'))}">
       <tf-column key="account" label="${escapeAttr(T('col_account'))}" renderer="html" fill></tf-column>

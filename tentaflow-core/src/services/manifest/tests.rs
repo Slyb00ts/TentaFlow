@@ -937,10 +937,17 @@ fn loaded_manifest_engine_ids_unique() {
 /// A managed CLI runs a vendor binary inside a process sandbox, and only macOS
 /// and Linux have a backend for one. Declaring any other platform offers the
 /// engine in the catalog of a node that can only refuse it.
+///
+/// This is also the catalog test of the slim edition: these four entries are the
+/// one thing `build.rs` keeps on top of the slim rule (they are `category =
+/// "agents"` with `runtime = "managed-cli"`, and a CLI agent is not a local
+/// inference engine). A slim build that dropped them would leave the `agents`
+/// category empty and management of agent accounts with nothing to show, so the
+/// count below must hold in BOTH editions instead of only the full one.
 #[test]
 fn managed_cli_engines_declare_only_platforms_with_a_sandbox() {
     let reg = super::registry::registry();
-    let mut checked = 0;
+    let mut agents = Vec::new();
     for manifest in reg.engines() {
         let Some(native) = manifest.deploy.native.as_ref() else {
             continue;
@@ -948,7 +955,6 @@ fn managed_cli_engines_declare_only_platforms_with_a_sandbox() {
         if native.runtime != NativeRuntime::ManagedCli {
             continue;
         }
-        checked += 1;
         for platform in &native.platforms {
             assert!(
                 matches!(platform, TargetOs::Linux | TargetOs::Macos),
@@ -956,9 +962,22 @@ fn managed_cli_engines_declare_only_platforms_with_a_sandbox() {
                 manifest.engine.id
             );
         }
+        // The exception is narrow: it is the CATEGORY that survives slim, not
+        // "any managed CLI". An engine moved out of `agents` loses its place in
+        // the slim catalog silently, so name the category here.
+        assert_eq!(
+            manifest.engine.category,
+            Category::Agents,
+            "{} is a managed CLI outside the agents category, which the slim \
+             catalog filter does not keep",
+            manifest.engine.id
+        );
+        agents.push(manifest.engine.id.as_str());
     }
+    agents.sort_unstable();
     assert_eq!(
-        checked, 4,
+        agents,
+        ["claude-code", "codex", "grok-build", "muse-code"],
         "the managed CLI engines are not in the registry"
     );
 }

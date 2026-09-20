@@ -10,33 +10,39 @@
 //      membership, role, autonomy-ceiling and session-status reading a
 //      model-issued tool call gets, not a second one. It comes FIRST so a
 //      non-member learns nothing about the node's engines;
-//   2. the Phase 0B gate (`cli_adapter::ensure_engine_verified`) — an engine
+//   2. WHAT THE RUN DELEGATES TO and WHO PAYS FOR IT, in one step
+//      (`agent_account::resolve_run_account`): the agent named by `meta.agent_id`
+//      carries its runtime, and that runtime names the engine, the model and the
+//      account. Nothing here is a node parameter — one flow serves every
+//      `kind = "cli"` agent — and every way the resolution can fail is one of
+//      four refusal codes, which is what the client is told;
+//   3. the Phase 0B gate (`cli_adapter::ensure_engine_verified`) — an engine
 //      nobody verified against a pinned CLI version never starts at all;
-//   3. the egress policy (§17.3) — `local_only` has no vendor CLI, because the
+//   4. the egress policy (§17.3) — `local_only` has no vendor CLI, because the
 //      sandbox has no route and the promise would be empty;
-//   4. WHAT PAYS for the turn (`cli_adapter::resolve_delegation_auth`). Two
-//      mechanisms, chosen by the node's own state and never by a flag:
-//        * `OrgCredential` — this node's vault holds the organization's key.
-//          The adapter holds it IN THIS PROCESS, the CLI is pointed at the
-//          adapter and handed a ticket instead (§7.5), and the meter sits on
-//          our own wire, which is what makes the budget enforceable (§17.3);
-//        * `ProviderLogin` — no key in the vault, and the CLI reports a login
-//          of its own on this node. Then the CLI is started with NO base URL
+//   5. the mechanism, from the resolved account's `credential_kind` and never
+//      from a flag or a probe:
+//        * `ApiKey` — the account holds the organization's key. The adapter
+//          holds it IN THIS PROCESS, the CLI is pointed at the adapter and
+//          handed a ticket instead (§7.5), and the meter sits on our own wire,
+//          which is what makes the budget enforceable (§17.3);
+//        * `ProviderLogin` — no key: the account IS a login the CLI already
+//          carries on that node. The CLI is then started with NO base URL
 //          override, NO API key and NO private config directory, because each
 //          of those would take that login away — the config directory is where
 //          it lives. Nothing of the turn's provider traffic crosses a socket of
 //          ours, so the budget is what the VENDOR reports (`Spend`), not what
 //          we measured. That gap is §17.3's, and it is named, not hidden;
-//   5. `cli_delegate` past the PEP (`authorize_delegation`) — in BOTH modes,
+//   6. `cli_delegate` past the PEP (`authorize_delegation`) — in BOTH modes,
 //      because the capability is "may this run delegate a turn", not "may this
 //      run be handed a ticket". Holding `net_egress` is not enough;
-//   6. the CLI instance, opened with the wiring of the chosen mode and nothing
-//      else. The organization's credential is in neither of them;
-//   7. the event pump, which mirrors the vendor's stream onto the session
+//   7. the CLI instance, opened with the wiring of the chosen mode and nothing
+//      else. The account's credential is in neither of them;
+//   8. the event pump, which mirrors the vendor's stream onto the session
 //      timeline and answers its approvals through `code_studio::pep` — the
 //      same decision point, via `cli_bridge::resolve_approval`.
 //
-// Whatever happens, step 8 runs: the ticket is revoked with the run, the
+// Whatever happens, step 9 runs: the ticket is revoked with the run, the
 // adapter is stopped (which is what releases the credential from memory), the
 // CLI instance is closed and reaped, and the run row is settled with a status
 // that matches what actually happened, plus what the turn spent and who
@@ -54,7 +60,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::agents::AgentServiceSlot;
+use crate::agents::{AgentPrincipal, AgentRuntime, AgentServiceSlot};
 use crate::code_studio::cli_adapter::{
     self, AdapterConfig, AdapterEventSink, AdapterHandle, Budget, DelegateDecision, DelegationAuth,
     IssuedTicket, TicketDecision, TicketRegistry, TicketRequest,
@@ -64,25 +70,23 @@ use crate::code_studio::cli_bridge::{
     ProviderReportedUsage, TurnState,
 };
 use crate::code_studio::events::{self, EventPayload, SessionEvent};
-use crate::code_studio::models::EgressEnforcement;
+use crate::code_studio::models::{EgressEnforcement, WorkspaceRole};
 use crate::code_studio::patch::{self, PatchScope, PatchSet};
 use crate::code_studio::pep::{self, AskKind, Capability};
 use crate::code_studio::tools::{self, Bound, ToolCallCtx};
 use crate::code_studio::{paths as cs_paths, redact};
+use crate::db::models::{DbAgent, ModelMetricsCounters, ModelMetricsTokens, CLI_DELEGATION_BACKEND};
 use crate::db::DbPool;
 use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
-use crate::provider_accounts::credential_events;
+use crate::provider_accounts::{self, credential_events};
+use crate::services::agent_account::{self, AccountRefusal, ResolvedAccount};
+use crate::services::runtime::metrics_worker::{ModelMetricsDimsOwned, RollupBump};
 
 use super::patch_review::InteractionGate;
 
 const NODE_TYPE: &str = "delegate_cli";
-
-/// The engines §7.5 defines a ticket protocol for. A configuration naming
-/// anything else is refused at parse time rather than at ticket time, because
-/// that is a typo, not a missing component.
-const KNOWN_ENGINES: &[&str] = &["claude-code", "codex", "grok-build", "muse-code"];
 
 /// Default output variable of the block.
 const DEFAULT_OUTPUT_VARIABLE: &str = "delegate_cli";
@@ -96,14 +100,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(300);
 const MAX_TRANSCRIPT_CHARS: usize = tools::MAX_RESULT_CHARS;
 
 /// One validated `delegate_cli` configuration.
+///
+/// What the block delegates TO is deliberately absent. The engine, the model and
+/// the account belong to the AGENT that runs the flow (`agents.runtime_json`),
+/// and one seeded flow serves every `kind = "cli"` agent: a node parameter naming
+/// an engine would be a knob the resolved account then overrode, and two answers
+/// to "which engine" is one answer too many.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegationConfig {
-    pub engine: String,
-    pub service_id: i64,
-    /// The single model the ticket authorizes. Not optional: a ticket without a
-    /// model authorizes every model the credential can reach (§7.5), so there
-    /// is no sensible default to fall back on.
-    pub model: String,
     /// Token budget the ticket carries. A delegation with no ceiling is
     /// refused: an opaque vendor loop must not be able to spend without bound.
     pub budget: i64,
@@ -113,37 +117,20 @@ pub struct DelegationConfig {
 
 impl DelegationConfig {
     pub fn parse(node: &FlowNode) -> Result<Self> {
-        let engine = node
-            .config
-            .get("engine")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "delegate_cli node '{}': 'engine' is required ({})",
-                    node.id,
-                    KNOWN_ENGINES.join(" | ")
-                )
-            })?;
-        if !KNOWN_ENGINES.contains(&engine) {
+        // A node saved before the agent owned the target still names it here.
+        // Ignoring the key would leave an operator tuning a knob nothing reads,
+        // so it is a refusal that says where the value moved.
+        if let Some(key) = ["engine", "model", "service_id"]
+            .into_iter()
+            .find(|key| node.config.get(*key).is_some())
+        {
             return Err(anyhow!(
-                "delegate_cli node '{}': unknown engine '{engine}'; expected one of {}",
-                node.id,
-                KNOWN_ENGINES.join(", ")
+                "delegate_cli node '{}': '{key}' is not this block's to choose — the engine, the \
+                 model and the account come from the agent that runs the flow \
+                 (`runtime_json.account`), and one flow serves every CLI agent. Remove it.",
+                node.id
             ));
         }
-        let service_id = node
-            .config
-            .get("service_id")
-            .and_then(|v| v.as_i64())
-            .filter(|n| *n > 0)
-            .ok_or_else(|| {
-                anyhow!(
-                    "delegate_cli node '{}': 'service_id' must name the service running the CLI",
-                    node.id
-                )
-            })?;
         let budget = node
             .config
             .get("budget")
@@ -156,28 +143,7 @@ impl DelegationConfig {
                     node.id
                 )
             })?;
-        let model = node
-            .config
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "delegate_cli node '{}': 'model' is required; the ticket is bound to one \
-                     model and cannot be minted without it",
-                    node.id
-                )
-            })?;
-        // The same resolution `issue_ticket` performs, run at configuration
-        // time so an unbindable model is a validation error on save instead of
-        // a delegation that dies after the run row and the CLI instance exist.
-        cli_adapter::ticket_model_binding(engine, model)
-            .map_err(|reason| anyhow!("delegate_cli node '{}': {reason}", node.id))?;
         Ok(Self {
-            engine: engine.to_string(),
-            service_id,
-            model: model.to_string(),
             budget,
             timeout_secs: node
                 .config
@@ -205,13 +171,55 @@ impl DelegationConfig {
             ..Budget::default_for_run()
         }
     }
+}
 
-    /// Spellings of the configured model a ticket accepts. All of them come
-    /// from OUR catalog convention (`<engine>/<id>` and the bare id), so this
-    /// is deliberately not a guess about how a vendor aliases its own names —
-    /// that half is `cli_adapter::ticket_model_binding`, which resolves an
-    /// alias like `sonnet` to the dated ids the CLI really sends. Anything
-    /// outside both is refused with `model_not_allowed`, loudly.
+/// The engine and model an agent's runtime says this delegation runs.
+///
+/// Both come from the same `runtime_json` the account resolution starts from, so
+/// the ticket, the CLI process and the run row all describe one target. The
+/// model is required: `issue_ticket` binds the ticket to exactly one model
+/// (§7.5), and the bridge refuses to start a CLI whose model id is empty.
+struct DelegationTarget {
+    engine: String,
+    model: String,
+    /// The agent that runs this turn. Recorded on the account session the
+    /// bridge opens, so an account's open conversations name the agent behind
+    /// them — the workspace session alone cannot say which of several agents in
+    /// one workspace is running.
+    agent_id: String,
+}
+
+impl DelegationTarget {
+    fn of(agent: &DbAgent) -> Result<Self> {
+        let runtime = AgentRuntime::parse(&agent.runtime_json)
+            .map_err(|error| anyhow!("delegate_cli: agent '{}': {error}", agent.id))?;
+        let AgentRuntime::Cli(cli) = runtime else {
+            return Err(anyhow!(
+                "delegate_cli: agent '{}' runs a model prompt loop, not a CLI application, so \
+                 there is no engine to delegate to",
+                agent.id
+            ));
+        };
+        let model = cli.model.ok_or_else(|| {
+            anyhow!(
+                "delegate_cli: agent '{}' names no model, and a delegation is bound to exactly \
+                 one model — set the model on the agent",
+                agent.id
+            )
+        })?;
+        Ok(Self {
+            engine: cli.engine,
+            model,
+            agent_id: agent.id.clone(),
+        })
+    }
+
+    /// Spellings of the agent's model a ticket accepts. All of them come from
+    /// OUR catalog convention (`<engine>/<id>` and the bare id), so this is
+    /// deliberately not a guess about how a vendor aliases its own names — that
+    /// half is `cli_adapter::ticket_model_binding`, which resolves an alias like
+    /// `sonnet` to the dated ids the CLI really sends. Anything outside both is
+    /// refused with `model_not_allowed`, loudly.
     fn model_aliases(&self) -> BTreeSet<String> {
         let mut aliases = BTreeSet::new();
         aliases.insert(self.model.clone());
@@ -443,6 +451,82 @@ fn finish_run(
     }
 }
 
+/// Records one delegated turn into the mesh-replicated metrics rollup, under
+/// the provider ACCOUNT the turn was spent on.
+///
+/// The rollup carries USAGE, not money: `session_runs.cost_usd` (the amount the
+/// PROVIDER stated, or NULL) stays in the workspace DB, which never travels
+/// through the Sync Ledger. A turn with no provider-quoted cost therefore
+/// reaches Analytics as usage whose cost is not derived from `model_pricing` —
+/// see `CLI_DELEGATION_BACKEND`. `usage_missing_count` marks a FINISHED turn
+/// whose token spending nobody observed: the metered path always counts on our
+/// own wire, while the provider-reported one has numbers only when the vendor
+/// sent a usage report, and an unknown amount is not zero.
+///
+/// `node_id` is THIS node, not `account.node_id`: the row is written into this
+/// node's database and only this node's own rows are published to the mesh, so
+/// a row attributed to a remote bridge node would be one nobody ever syncs. The
+/// id comes from the same `settings` key the flusher compares against; a node
+/// that never recorded its identity writes the empty id and its rows stay local
+/// and unpublished — a gap in the fleet's numbers, never a misattribution.
+fn record_delegation_metrics(
+    main_db: &DbPool,
+    account: &ResolvedAccount,
+    user_id: &str,
+    org_id: Option<&str>,
+    model: &str,
+    run_status: &str,
+    usage: &DelegationUsage,
+) {
+    let node_id =
+        crate::db::repository::get_setting(main_db, crate::db::repository::LOCAL_NODE_ID_SETTING)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    let completed = run_status == "completed";
+    let measured = usage.source != "provider_reported" || usage.total_tokens() > 0;
+    let dims = ModelMetricsDimsOwned {
+        node_id,
+        org_id: org_id
+            .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
+            .to_string(),
+        user_id: user_id.to_string(),
+        // The engine is the stable service identity of a CLI turn: there is no
+        // service row behind one, and a deployment id would fragment metrics on
+        // every account move.
+        service_key: account.engine_id.clone(),
+        model_id: model.to_string(),
+        backend: CLI_DELEGATION_BACKEND.to_string(),
+        modality: "chat".to_string(),
+        hour_bucket: chrono::Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string(),
+        account_id: account.account_id.clone(),
+        histogram_version: crate::db::repository::MODEL_METRICS_HISTOGRAM_VERSION,
+    };
+    let counters = ModelMetricsCounters {
+        request_count: 1,
+        success_count: i64::from(completed),
+        error_count: i64::from(!completed),
+        usage_missing_count: i64::from(completed && !measured),
+    };
+    let tokens = ModelMetricsTokens {
+        prompt_tokens: usage.input_tokens as i64,
+        completion_tokens: usage.output_tokens as i64,
+        total_tokens: usage.total_tokens() as i64,
+        ..Default::default()
+    };
+    // No latency/throughput sample: the adapter times the run only on the
+    // metered path, and `api_duration_ms` is the PROVIDER's own figure, which is
+    // not a measurement of ours to put in a histogram.
+    crate::services::runtime::metrics_worker::submit_rollup_bump(RollupBump {
+        db: main_db.clone(),
+        dims,
+        counters,
+        tokens,
+        times: Default::default(),
+        perf: Default::default(),
+    });
+}
+
 // =============================================================================
 // The pump
 // =============================================================================
@@ -668,9 +752,8 @@ async fn pump(
                 BridgeEvent::CredentialChanged {
                     engine_id, sha256, ..
                 } => {
-                    if let Some(account_id) = bridge.account_id() {
-                        credential_events::observed_change(&account_id, engine_id, sha256).await;
-                    }
+                    credential_events::observed_change(bridge.account_id(), engine_id, sha256)
+                        .await;
                 }
                 // The bridge would not take what this session's copy now holds.
                 // The account keeps the credential it had and the run is not
@@ -683,14 +766,12 @@ async fn pump(
                     sha256,
                     ..
                 } => {
-                    if let Some(account_id) = bridge.account_id() {
-                        credential_events::observed_rejection(
-                            &account_id,
-                            engine_id,
-                            reason,
-                            sha256,
-                        );
-                    }
+                    credential_events::observed_rejection(
+                        bridge.account_id(),
+                        engine_id,
+                        reason,
+                        sha256,
+                    );
                 }
                 BridgeEvent::Other { kind, .. } => {
                     tracing::debug!(instance = %instance.id, %kind, "delegate_cli: unmapped event");
@@ -890,37 +971,28 @@ fn workspace_enforcement(bound: &Bound) -> Result<EgressEnforcement> {
 
 async fn start_adapter_for(
     main_db: &DbPool,
-    cipher: &crate::crypto::SettingsCipher,
     bound: &Bound,
-    engine_id: &str,
+    account: &ResolvedAccount,
+    material: String,
     sink: Arc<dyn AdapterEventSink>,
     tickets: Arc<TicketRegistry>,
 ) -> Result<AdapterHandle> {
+    let engine_id = &account.engine_id;
     let session_tmp = cs_paths::session_tmp_dir(&bound.workspace.id, &bound.session.id)?;
     let ca_path = session_tmp.join(format!("cli-{engine_id}-ca.pem"));
     // Per session rather than per run: the CLI writes its resumable transcript
     // here, so a second turn of the same session can name the first one.
     let cli_home_dir = session_tmp.join(format!("cli-{engine_id}-home"));
-    // The vault lives in Code Studio's instance content database, not in the
-    // main one; the engine gate inside `start_adapter` still needs the latter.
-    let local = crate::code_studio::db::pool(main_db)?;
     cli_adapter::start_adapter(
         main_db,
-        &local,
-        cipher,
         AdapterConfig {
             // Loopback: the bridge service is itself loopback-only
             // (`services::coding_agent`), so the CLI it spawns lives on this
             // host. On a shared loopback the TICKET is the peer check (§7.6) —
             // which is exactly why it is mandatory and scoped to one run.
             bind_addr: ([127, 0, 0, 1], 0).into(),
-            engine_id: engine_id.to_string(),
-            org_id: bound.workspace.org_id.clone(),
-            // The vault is node-local and the runtime database of this
-            // workspace only exists on its owner node, so the workspace's node
-            // IS this node; reading the credential under any other key would be
-            // reading a row that cannot decrypt here.
-            node_id: bound.workspace.node_id.clone(),
+            engine_id: engine_id.clone(),
+            material,
             ca_path,
             cli_home_dir,
             egress_enforcement: workspace_enforcement(bound)?,
@@ -959,7 +1031,7 @@ impl NodeAdapter for DelegateCliNodeAdapter {
             .ok_or_else(|| anyhow!("delegate_cli: missing input edge"))?;
         let envelope = &input.envelope;
 
-        let mut config = DelegationConfig::parse(node)?;
+        let config = DelegationConfig::parse(node)?;
         let binding = tools::binding_from_meta(&envelope.meta).ok_or_else(|| {
             anyhow!(
                 "delegate_cli: this run carries no Code Studio session binding \
@@ -969,6 +1041,24 @@ impl NodeAdapter for DelegateCliNodeAdapter {
         let user_id = ctx.user_id.clone().ok_or_else(|| {
             anyhow!("delegate_cli: delegating a turn needs a user identity to act for")
         })?;
+        // Which agent this run is: `agent_block` stamps it on every envelope it
+        // hands its subflow, and the CLI agent's own seeded flow gets it from
+        // `AgentRunManager`. Without it there is no runtime to read, and
+        // inventing one would delegate an organization's turn to an account
+        // nobody selected.
+        let agent_id = envelope
+            .meta
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow!(
+                    "delegate_cli: this run names no agent (meta.agent_id), and the engine, the \
+                     model and the account all come from the agent that runs the flow"
+                )
+            })?;
         let parent_run_id = envelope
             .meta
             .get("agent_run_id")
@@ -1010,35 +1100,29 @@ impl NodeAdapter for DelegateCliNodeAdapter {
         };
 
         let bound = tools::bind(&call_ctx).await?;
-        if let Some(service_id) = bound.session.agent_service_id {
-            let selected = {
-                let conn = main_db
-                    .read()
-                    .map_err(|e| anyhow!("account registry: {e}"))?;
-                crate::services_repo::services::get(&conn, service_id)?.ok_or_else(|| {
-                    anyhow!("selected agent account is unavailable on this workspace node")
-                })?
-            };
-            if !matches!(
-                selected.engine_id.as_str(),
-                "codex" | "claude-code" | "grok-build" | "muse-code"
-            ) {
-                return Err(anyhow!(
-                    "selected service is not a supported coding-agent account"
-                ));
-            }
-            config.service_id = service_id;
-            config.engine = selected.engine_id;
-        }
-        if !crate::services::coding_agent::account_permission(&main_db, config.service_id, &user_id)
-            .map_err(anyhow::Error::msg)?
-            .0
-        {
-            return Err(anyhow!("selected agent account access denied"));
-        }
+
+        // Step 2 — what this run delegates to, and who pays for it. One
+        // resolution, from the agent's own runtime and the run's principal: the
+        // engine, the model and the account all come out of it, and there is no
+        // fallback to another account because a silent substitution is how a run
+        // ends up reported under a subscription nobody chose.
+        let agent = service
+            .get_agent(&agent_id)?
+            .ok_or_else(|| anyhow!("delegate_cli: agent '{agent_id}' not found"))?;
+        let principal = AgentPrincipal::new(
+            Some(user_id.clone()),
+            ctx.org_id.clone(),
+            ctx.origin,
+            ctx.actor(),
+        )
+        .with_correlation_id(ctx.correlation_id.clone());
+        let account = account_with_login_ask(&call_ctx, &bound, &main_db, &agent, &principal).await?;
+        let target = DelegationTarget::of(&agent)?;
 
         // Step 3 — §17.3: under `local_only` the sandbox has no route, so a
-        // vendor CLI is not "degraded", it is absent.
+        // vendor CLI is not "degraded", it is absent. Checked BEFORE the account
+        // is asked for: a workspace that cannot reach a provider must not park a
+        // run on a sign-in that would change nothing about its outcome.
         if bound.workspace.egress_policy == "local_only" {
             return Err(anyhow!(
                 "delegate_cli: workspace '{}' runs under the 'local_only' egress policy, which \
@@ -1048,7 +1132,7 @@ impl NodeAdapter for DelegateCliNodeAdapter {
             ));
         }
 
-        let bridge = resolve_bridge(&main_db, config.service_id, &config.engine, &user_id)?;
+        let bridge = resolve_bridge(&main_db, &account, &user_id).await?;
         let worktree = tools::session_worktree(&bound.workspace.id, &bound.session.id)?;
 
         // The patch set is opened BEFORE the CLI writes anything, so its base
@@ -1069,11 +1153,12 @@ impl NodeAdapter for DelegateCliNodeAdapter {
             &bound.session.id,
             &run_id,
             (!parent_run_id.is_empty()).then_some(parent_run_id.as_str()),
-            &config.model,
+            &target.model,
         )?;
 
         let outcome = delegate(
-            &call_ctx, &bound, &bridge, &config, &cipher, &run_id, &worktree, &prompt, ctx,
+            &call_ctx, &bound, &bridge, &account, &config, &target, &cipher, &run_id, &worktree,
+            &prompt, ctx,
         )
         .await;
         settle_if_cancelled.disarm();
@@ -1098,7 +1183,20 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                     report.run_status,
                     (!completed).then_some(report.detail.as_str()),
                     Some(&report.usage),
-                    &config.model,
+                    &target.model,
+                );
+                // What the turn spent is also usage of a PROVIDER ACCOUNT, which
+                // Analytics breaks down per account — the same fact the session
+                // row holds, recorded once into the mesh-replicated rollup so a
+                // remote UI sees it. The workspace DB itself never syncs.
+                record_delegation_metrics(
+                    &main_db,
+                    &account,
+                    &user_id,
+                    ctx.org_id.as_deref(),
+                    &target.model,
+                    report.run_status,
+                    &report.usage,
                 );
                 // What the turn spent belongs to the FLOW's accounting too, not
                 // only to the session run: `flow_executions` and the agent run
@@ -1113,7 +1211,7 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                         total_tokens: report.usage.total_tokens(),
                     },
                 );
-                ctx.usage_sink.record_model(config.model.clone());
+                ctx.usage_sink.record_model(target.model.clone());
                 if !completed {
                     warn_unreviewable(&refreshed, &patch_set.id);
                     // The usage travels with the refusal: an operator reading a
@@ -1123,7 +1221,7 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                         "delegate_cli node '{}': the delegation to '{}' ended '{}': {} (spent {} \
                          of {} tokens over {} request(s), counted by '{}')",
                         node.id,
-                        config.engine,
+                        target.engine,
                         report.run_status,
                         report.detail,
                         report.usage.total_tokens(),
@@ -1140,13 +1238,13 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                         "delegate_cli node '{}': the delegation to '{}' finished, but its \
                          worktree could not be turned into a reviewable patch set: {error:#}",
                         node.id,
-                        config.engine
+                        target.engine
                     )
                 })?;
                 let mut out: FlowEnvelope = (**envelope).clone();
                 out.variables.insert(
                     config.output_variable.clone(),
-                    FlowValue::Json(report.to_json(&config, &run_id, &patch_set.id)),
+                    FlowValue::Json(report.to_json(&target, config.budget, &run_id, &patch_set.id)),
                 );
                 out.context
                     .messages
@@ -1165,7 +1263,7 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                     "failed",
                     Some(&message),
                     None,
-                    &config.model,
+                    &target.model,
                 );
                 warn_unreviewable(&refreshed, &patch_set.id);
                 Err(error)
@@ -1212,27 +1310,212 @@ fn delegation_prompt(envelope: &FlowEnvelope) -> Option<String> {
         })
 }
 
-fn resolve_bridge(
+/// The plan's refusal names travel to the caller VERBATIM inside brackets: a
+/// consumer keys on the code, an operator reads the sentence, and rewriting the
+/// account resolver's own words here would give the same state two spellings.
+fn refusal_error(refusal: AccountRefusal) -> anyhow::Error {
+    anyhow!("delegate_cli: [{}] {refusal}", refusal.code())
+}
+
+/// The run's account, asking the person to connect one when that is the only
+/// thing missing (C01, §D.5).
+///
+/// `NoAccountForUser` and `CredentialMissing` are the two refusals a sign-in
+/// fixes, and they are handled HERE, at the one place a run's account is
+/// resolved: the run is parked on the interaction registry, the question reaches
+/// the console through the approvals row `suspend_for_account` writes, and a
+/// successful sign-in for the same (engine, principal) pair wakes this future.
+/// Every other refusal is returned at once — offering a sign-in for a disabled
+/// account, a revoked grant or a node without the engine would send the person
+/// to fix something that is not broken.
+///
+/// Waking resolves the account AGAIN instead of trusting the wake-up: the only
+/// fact a sign-in proves is that the account works now, and this second resolve
+/// is what checks it, including the grant and the node. The turn itself is not
+/// re-planned — this is the same await, on the same envelope, at the same step —
+/// so nothing already spent is spent twice and no step is repeated.
+async fn account_with_login_ask(
+    call_ctx: &ToolCallCtx<'_>,
+    bound: &Bound,
     main_db: &DbPool,
-    service_id: i64,
-    engine: &str,
+    agent: &DbAgent,
+    principal: &AgentPrincipal,
+) -> Result<ResolvedAccount> {
+    // The runtime database of this workspace exists on its owner node and
+    // nowhere else, so the worktree the CLI will edit is on that node, and a
+    // bridge anywhere else would be editing a path it cannot see.
+    let preferred = Some(bound.workspace.node_id.as_str());
+    match agent_account::resolve_run_account(main_db, agent, principal, preferred) {
+        Ok(account) => Ok(account),
+        Err(refusal) => {
+            // The binding of the agent that was refused, read once: it names the
+            // engine and the mode the card has to explain.
+            let Some(label) = agent_account::describe_agent_account(main_db, agent, principal) else {
+                // No account question can be put without an engine to ask about,
+                // so the refusal stands as it is.
+                return Err(refusal_error(refusal));
+            };
+            let engine_id = match &refusal {
+                AccountRefusal::NoAccountForUser { engine_id } => engine_id.clone(),
+                AccountRefusal::CredentialMissing { .. } => label.engine_id.clone(),
+                _ => return Err(refusal_error(refusal)),
+            };
+            let ask = tools::AccountApproval {
+                prompt: prompt_for_account(&agent.name, &engine_id, &refusal),
+                engine_name: provider_accounts::engine(&engine_id)
+                    .map(|e| e.display_name.to_string())
+                    .unwrap_or_else(|| engine_id.clone()),
+                mode: label.mode.clone(),
+                agent_name: agent.name.clone(),
+                account_id: match &refusal {
+                    AccountRefusal::CredentialMissing { account_id } => Some(account_id.clone()),
+                    _ => None,
+                },
+                // The account the binding names, when it names one that exists —
+                // the difference between "connect one" and "sign in again".
+                account_name: label.account_name.clone(),
+                candidate_accounts: agent_account::candidate_accounts(main_db, principal, &engine_id),
+                user_id: call_ctx.user_id.to_string(),
+                engine_id,
+            };
+            let decision =
+                tools::suspend_for_account(&call_ctx.operator_ask(bound), ask.clone()).await?;
+            if !decision.allows() {
+                return Err(anyhow!(
+                    "delegate_cli: nobody connected a '{}' account for this run, so the turn \
+                     could not be delegated (C01)",
+                    ask.engine_name
+                ));
+            }
+            agent_account::resolve_run_account(main_db, agent, principal, preferred)
+                .map_err(refusal_error)
+        }
+    }
+}
+
+/// What the card says the run is waiting for. English, like every other
+/// server-composed summary the console shows — the client renders the frame
+/// around it (`ask.account.body`) in the reader's own language.
+fn prompt_for_account(agent_name: &str, engine_id: &str, refusal: &AccountRefusal) -> String {
+    let engine = provider_accounts::engine(engine_id)
+        .map(|e| e.display_name)
+        .unwrap_or(engine_id);
+    match refusal {
+        AccountRefusal::CredentialMissing { .. } => {
+            format!("{agent_name} uses your {engine} account, which needs signing in again")
+        }
+        _ => format!("{agent_name} uses your {engine} account"),
+    }
+}
+
+/// The provider conversation a workspace session last ended a turn on, with the
+/// account that drove it.
+struct RecordedTurn {
+    vendor_session_id: String,
+    account_id: String,
+}
+
+/// The last provider-login turn of `session_id`, as the workspace database
+/// recorded it.
+///
+/// Deliberately NOT filtered by account: a run that would continue a
+/// conversation another account opened has to be REFUSED (§2.5), and the
+/// account is the only thing that tells the two apart. The adapter path is
+/// excluded (`ticket_id IS NULL`) — a metered run presents a ticket rather than
+/// a provider login, so its conversation is not one this path resumes.
+fn recorded_provider_turn(pool: &DbPool, session_id: &str) -> Result<Option<RecordedTurn>> {
+    use rusqlite::OptionalExtension;
+    let conn = pool
+        .read()
+        .map_err(|error| anyhow!("workspace session history: {error}"))?;
+    conn.query_row(
+        "SELECT vendor_session_id, account_id FROM cli_instances \
+          WHERE session_id=?1 AND ticket_id IS NULL AND status IN ('ended','reaped') \
+            AND vendor_session_id<>'' \
+          ORDER BY started_at DESC, rowid DESC LIMIT 1",
+        rusqlite::params![session_id],
+        |row| {
+            Ok(RecordedTurn {
+                vendor_session_id: row.get(0)?,
+                account_id: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| anyhow!("workspace session history: {error}"))
+}
+
+/// The write-turn lock of one worktree (§2.5).
+///
+/// A registry of weak handles, for the reason `code_studio::session::activity_lock`
+/// keeps one: the lock has to be the SAME object for two turns of one worktree
+/// while nothing keeps a finished worktree's entry alive.
+fn write_turn_lock(worktree: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    type Locks = std::collections::HashMap<std::path::PathBuf, Weak<tokio::sync::Mutex<()>>>;
+    static LOCKS: OnceLock<Mutex<Locks>> = OnceLock::new();
+    let mut locks = match LOCKS.get_or_init(|| Mutex::new(Locks::new())).lock() {
+        Ok(locks) => locks,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let key = worktree.to_path_buf();
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+/// Takes the worktree's write turn, or refuses the run (§2.5).
+///
+/// Refused rather than queued: a vendor turn has no deadline of its own, and a
+/// caller silently parked behind one would spend its own timeout waiting for a
+/// process it cannot see.
+///
+/// Reading is not this guard's business, and a `Viewer`'s turn IS a reading
+/// turn: `pep::Capability::minimum_role` puts every writing capability at
+/// `Editor` and above, and the CLI's own tool calls are decided by that same
+/// PEP, so a viewer cannot change a byte of the worktree however the vendor
+/// asks. That is the reading half of §2.5 — a reviewer or a tester in the same
+/// worktree keeps working while a writer runs.
+fn acquire_write_turn(
+    worktree: &std::path::Path,
+    role: WorkspaceRole,
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+    if role < WorkspaceRole::Editor {
+        return Ok(None);
+    }
+    let lock = write_turn_lock(worktree);
+    match lock.try_lock_owned() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(_) => Err(anyhow!(
+            "delegate_cli: another writing turn is already running in this worktree ({}); a \
+             worktree is written by one turn at a time — wait for that turn to finish, or stop it",
+            worktree.display()
+        )),
+    }
+}
+
+/// The bridge that runs the resolved account's CLI.
+///
+/// There is no service row any more: an account's runtime is started for the
+/// ACCOUNT, on the node that holds its credential, and the handle that comes
+/// back is the only thing addressing the process.
+async fn resolve_bridge(
+    main_db: &DbPool,
+    account: &ResolvedAccount,
     user_id: &str,
 ) -> Result<CliBridge> {
-    let row = {
-        let conn = main_db
-            .read()
-            .map_err(|e| anyhow!("registry db read: {e}"))?;
-        crate::services_repo::services::get(&conn, service_id)?
-    }
-    .ok_or_else(|| anyhow!("delegate_cli: service {service_id} does not exist"))?;
-    if row.engine_id != engine {
-        return Err(anyhow!(
-            "delegate_cli: service {service_id} runs '{}', not '{engine}'",
-            row.engine_id
-        ));
-    }
-    CliBridge::new(row, main_db.clone(), user_id.to_string())
-        .map_err(|e| anyhow!("delegate_cli: {e}"))
+    let handle = crate::services::agent_runtime::ensure_runtime(
+        main_db,
+        &account.node_id,
+        &account.account_id,
+        &account.engine_id,
+    )
+    .await?;
+    Ok(CliBridge::new(handle, main_db.clone(), user_id.to_string()))
 }
 
 /// What one finished delegation reports.
@@ -1249,10 +1532,16 @@ struct Report {
 }
 
 impl Report {
-    fn to_json(&self, config: &DelegationConfig, run_id: &str, patch_set_id: &str) -> Value {
+    fn to_json(
+        &self,
+        target: &DelegationTarget,
+        budget_tokens: i64,
+        run_id: &str,
+        patch_set_id: &str,
+    ) -> Value {
         json!({
-            "engine": config.engine,
-            "model": config.model,
+            "engine": target.engine,
+            "model": target.model,
             "status": self.run_status,
             "detail": self.detail,
             "run_id": run_id,
@@ -1270,7 +1559,7 @@ impl Report {
                 "input_tokens": self.usage.input_tokens,
                 "output_tokens": self.usage.output_tokens,
                 "total_tokens": self.usage.total_tokens(),
-                "budget_tokens": config.budget,
+                "budget_tokens": budget_tokens,
                 "cost_usd": self.usage.cost_usd,
                 "api_duration_ms": self.usage.api_duration_ms,
                 "source": self.usage.source,
@@ -1286,34 +1575,25 @@ async fn delegate(
     call_ctx: &ToolCallCtx<'_>,
     bound: &Bound,
     bridge: &CliBridge,
+    account: &ResolvedAccount,
     config: &DelegationConfig,
+    target: &DelegationTarget,
     cipher: &crate::crypto::SettingsCipher,
     run_id: &str,
     worktree: &std::path::Path,
     prompt: &str,
     ctx: &ExecutionContext,
 ) -> Result<Report> {
-    // Step 4 — what pays for the turn. Read off this node: a vault row, or the
-    // engine's own login. The probe is a future, so the bridge is only asked
-    // when the vault did not already answer.
-    let local = crate::code_studio::db::pool(call_ctx.main_db)?;
-    let auth = cli_adapter::resolve_delegation_auth(
-        &local,
-        &bound.workspace.org_id,
-        // The vault is node-local and this workspace's runtime database only
-        // exists on its owner node, so the workspace's node IS this node.
-        &bound.workspace.node_id,
-        &config.engine,
-        bound.session.agent_service_id.is_some(),
-        bridge.provider_login(),
-    )
-    .await
-    .map_err(|refusal| anyhow!("delegate_cli: {refusal}"))?;
+    // Step 4 — what pays for the turn. A function of the ACCOUNT's credential
+    // kind, not of a probe: an API key means the adapter meters the run, a
+    // provider login means the vendor does. Nothing here can move a run from
+    // one mode to the other after the account was resolved.
+    let auth = DelegationAuth::for_credential(account.credential_kind);
 
     match auth {
         DelegationAuth::OrgCredential => cli_adapter::ensure_engine_verified(
             call_ctx.main_db,
-            &config.engine,
+            &target.engine,
             workspace_enforcement(bound)?,
         )
         .map_err(|refusal| anyhow!("delegate_cli: {refusal}"))?,
@@ -1328,14 +1608,14 @@ async fn delegate(
     }
 
     // Step 5 — the PEP, in both modes, before anything is started or spent.
-    let granted = authorize_delegation(call_ctx, bound, &config.engine).await?;
+    let granted = authorize_delegation(call_ctx, bound, &target.engine).await?;
     let _ = events::append(
         &bound.pool,
         &bound.session.id,
         SessionEvent::new(
             format!("cli-delegation:{run_id}"),
             EventPayload::CliDelegationAuthorized {
-                engine_id: config.engine.clone(),
+                engine_id: target.engine.clone(),
                 auth_mode: auth.slug().to_string(),
                 usage_source: auth.usage_source().to_string(),
                 budget_tokens: config.budget as u64,
@@ -1347,6 +1627,17 @@ async fn delegate(
     let tickets = Arc::new(TicketRegistry::new());
     let adapter = match auth {
         DelegationAuth::OrgCredential => {
+            let material = crate::provider_accounts::repository::credential_material(
+                call_ctx.main_db,
+                cipher,
+                &account.account_id,
+            )?
+            .ok_or_else(|| {
+                anyhow!(
+                    "delegate_cli: account '{}' has no credential to present",
+                    account.account_id
+                )
+            })?;
             let sink: Arc<dyn AdapterEventSink> = Arc::new(TimelineSink {
                 pool: bound.pool.clone(),
                 session_id: bound.session.id.clone(),
@@ -1356,9 +1647,9 @@ async fn delegate(
             Some(Arc::new(
                 start_adapter_for(
                     call_ctx.main_db,
-                    cipher,
                     bound,
-                    &config.engine,
+                    account,
+                    material,
                     sink,
                     tickets.clone(),
                 )
@@ -1392,6 +1683,7 @@ async fn delegate(
         bound,
         bridge,
         config,
+        target,
         auth,
         adapter.as_deref(),
         &granted,
@@ -1410,6 +1702,7 @@ async fn run_delegation(
     bound: &Bound,
     bridge: &CliBridge,
     config: &DelegationConfig,
+    target: &DelegationTarget,
     auth: DelegationAuth,
     adapter: Option<&AdapterHandle>,
     granted: &pep::SessionCtx,
@@ -1422,6 +1715,13 @@ async fn run_delegation(
     if ctx.cancel_token.is_cancelled() {
         return Err(anyhow!("delegate_cli: the run was cancelled"));
     }
+    // Plan §2.5: one WRITING turn per worktree. The CLI edits the worktree with
+    // its own file calls, so two turns driven at once would interleave writes
+    // that no patch set could attribute; a `Viewer`'s turn writes nothing and
+    // takes no lock, which is what keeps reading parallel. Held for the whole
+    // function, so it covers the CLI's process lifetime and is released on
+    // every path out, including a cancelled run.
+    let _turn = acquire_write_turn(worktree, bound.role)?;
     let instance_id = uuid::Uuid::new_v4().to_string();
     let delegation = match adapter {
         Some(adapter) => {
@@ -1433,9 +1733,9 @@ async fn run_delegation(
                     session_id: bound.session.id.clone(),
                     run_id: run_id.to_string(),
                     cli_instance_id: instance_id.clone(),
-                    engine_id: config.engine.clone(),
-                    model: config.model.clone(),
-                    model_aliases: config.model_aliases(),
+                    engine_id: target.engine.clone(),
+                    model: target.model.clone(),
+                    model_aliases: target.model_aliases(),
                     methods: wiring.ticket_methods.clone(),
                     path_prefixes: wiring.ticket_path_prefixes.clone(),
                     budget: config.budget(),
@@ -1465,19 +1765,29 @@ async fn run_delegation(
     // is configuration the process has to be started with (§7.5). For a
     // self-authenticated engine both halves are empty on purpose.
     let (env, args) = delegation.cli_wiring();
-    let resume_vendor_session_id: Option<String> = if matches!(
-        delegation,
-        Delegation::ProviderLogin
-    ) {
-        use rusqlite::OptionalExtension;
-        let conn = bound
-            .pool
-            .read()
-            .map_err(|error| anyhow!("workspace session history: {error}"))?;
-        conn.query_row("SELECT vendor_session_id FROM cli_instances WHERE session_id=?1 AND service_id=?2 AND ticket_id IS NULL AND status IN ('ended','reaped') AND vendor_session_id<>'' ORDER BY started_at DESC,rowid DESC LIMIT 1",rusqlite::params![bound.session.id,config.service_id],|row| row.get(0)).optional()?
-    } else {
-        None
-    };
+    let resume_vendor_session_id: Option<String> =
+        if matches!(delegation, Delegation::ProviderLogin) {
+            match recorded_provider_turn(&bound.pool, &bound.session.id)? {
+                // Plan §2.5: resuming with another account is a refusal, not a
+                // conversation migrated to a different subscription. The vendor's
+                // thread belongs to the account that opened it — continuing it here
+                // would put one account's work on another account's bill, and the
+                // account filter this lookup used to carry would have hidden the
+                // switch behind a silently fresh conversation.
+                Some(recorded) if recorded.account_id != bridge.account_id() => {
+                    return Err(refusal_error(
+                        AccountRefusal::ConversationUnderAnotherAccount {
+                            account_id: bridge.account_id().to_string(),
+                            recorded_account_id: recorded.account_id,
+                        },
+                    ));
+                }
+                Some(recorded) => Some(recorded.vendor_session_id),
+                None => None,
+            }
+        } else {
+            None
+        };
     let mut instance = tokio::select! {
         biased;
         _ = ctx.cancel_token.cancelled() => return Err(anyhow!("delegate_cli: the run was cancelled")),
@@ -1488,8 +1798,9 @@ async fn run_delegation(
                 session_id: &bound.session.id,
                 run_id,
                 worktree,
-                model: &config.model,
+                model: &target.model,
                 ticket_id: delegation.ticket_id(),
+                agent_id: &target.agent_id,
                 resume_vendor_session_id: resume_vendor_session_id.as_deref(),
                 env: &env,
                 args: &args,
@@ -1503,7 +1814,7 @@ async fn run_delegation(
         biased;
         _ = ctx.cancel_token.cancelled() => Err(anyhow!("delegate_cli: the run was cancelled")),
         result = drive_turn(
-            call_ctx, bridge, bound, config,
+            call_ctx, bridge, bound, config, target,
             &spend,
             &mut instance, prompt, ctx,
         ) => result,
@@ -1553,6 +1864,7 @@ async fn drive_turn(
     bridge: &CliBridge,
     bound: &Bound,
     config: &DelegationConfig,
+    target: &DelegationTarget,
     spend: &Spend<'_>,
     instance: &mut CliInstance,
     prompt: &str,
@@ -1596,7 +1908,7 @@ async fn drive_turn(
         main_db: call_ctx.main_db,
         workspace_id: &bound.workspace.id,
         run_id: &approval_run_id,
-        engine_id: &config.engine,
+        engine_id: &target.engine,
         worktree: &worktree,
     };
     let deadline = Instant::now() + Duration::from_secs(config.timeout_secs);
@@ -1613,18 +1925,11 @@ async fn drive_turn(
     .await
 }
 
-/// Kept so a caller can read the block's declared shape without executing it.
-pub fn known_engines() -> &'static [&'static str] {
-    KNOWN_ENGINES
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::code_studio::models::{AutonomyMode, WorkspaceRole};
     use crate::code_studio::{paths as cs_paths, workspace_db};
-    use crate::services::transport::Transport;
-    use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
     use serde_json::json;
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -1658,11 +1963,11 @@ mod tests {
         addr: SocketAddr,
         answered: Arc<Mutex<Vec<(u64, String)>>>,
         prompts: Arc<Mutex<Vec<String>>>,
+        /// Every `/sessions` body the bridge sent, in order. The vendor's own
+        /// view of the request is what pins which conversation this turn asked
+        /// to continue, and whether it asked at all.
+        creates: Arc<Mutex<Vec<Value>>>,
         closed: Arc<Mutex<bool>>,
-        /// What `/auth/status` reports — the bridge's answer to "is the CLI
-        /// logged in on this node". Settable, because the decision it feeds is
-        /// exactly what the two authentication modes turn on.
-        authenticated: Arc<std::sync::atomic::AtomicBool>,
         processes: Arc<Mutex<std::collections::HashMap<String, std::process::Child>>>,
         spawn_processes: Arc<std::sync::atomic::AtomicBool>,
         delay_create: Arc<std::sync::atomic::AtomicBool>,
@@ -1675,13 +1980,13 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let answered = Arc::new(Mutex::new(Vec::new()));
         let prompts = Arc::new(Mutex::new(Vec::new()));
+        let creates = Arc::new(Mutex::new(Vec::new()));
         let closed = Arc::new(Mutex::new(false));
-        let authenticated = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let (a, p, c, auth) = (
+        let (a, p, c, cr) = (
             answered.clone(),
             prompts.clone(),
             closed.clone(),
-            authenticated.clone(),
+            creates.clone(),
         );
         let processes = Arc::new(Mutex::new(std::collections::HashMap::<
             String,
@@ -1702,13 +2007,8 @@ mod tests {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let (processes, spawn_processes, delay_create, create_started, release_create) =
                     controls.clone();
-                let (script, a, p, c, auth) = (
-                    script.clone(),
-                    a.clone(),
-                    p.clone(),
-                    c.clone(),
-                    auth.clone(),
-                );
+                let (script, a, p, c, cr) =
+                    (script.clone(), a.clone(), p.clone(), c.clone(), cr.clone());
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0_u8; 4096];
@@ -1754,12 +2054,8 @@ mod tests {
                     let payload: Value =
                         serde_json::from_str(&body).unwrap_or(Value::Object(Default::default()));
 
-                    let response = if target == "/auth/status" {
-                        json!({
-                            "authenticated": auth.load(std::sync::atomic::Ordering::SeqCst),
-                            "status": "authenticated",
-                        })
-                    } else if method == "POST" && target == "/sessions" {
+                    let response = if method == "POST" && target == "/sessions" {
+                        cr.lock().expect("creates").push(payload.clone());
                         if spawn_processes.load(std::sync::atomic::Ordering::SeqCst) {
                             let child = std::process::Command::new("/bin/sleep")
                                 .arg("20")
@@ -1771,7 +2067,10 @@ mod tests {
                                 .insert(payload["session_id"].as_str().unwrap().into(), child);
                         }
                         create_started.notify_one();
-                        if delay_create.load(std::sync::atomic::Ordering::SeqCst) {
+                        // One-shot: a test that arms the delay is describing
+                        // the create it is about to make, so a later create from
+                        // another turn must not inherit the hold.
+                        if delay_create.swap(false, std::sync::atomic::Ordering::SeqCst) {
                             release_create.notified().await;
                         }
                         json!({"session": {"id": payload["session_id"], "vendor_session_id": "vendor-1"}})
@@ -1826,8 +2125,8 @@ mod tests {
             addr,
             answered,
             prompts,
+            creates,
             closed,
-            authenticated,
             processes,
             spawn_processes,
             delay_create,
@@ -1836,26 +2135,48 @@ mod tests {
         }
     }
 
-    /// A registry database holding one coding-agent bridge service pointed at
-    /// the stub. Inserted through the real repository, so the row is the row
-    /// `resolve_bridge` would read in production.
-    fn db_with_bridge(engine: &str, addr: SocketAddr) -> (crate::db::DbPool, i64) {
+    /// A registry database whose account resolution runs against the stub.
+    ///
+    /// The stub is registered as the RUNNING bridge of a per-call account, which
+    /// is the only owner a bridge has now — a bridge exists because an account's
+    /// runtime was started for it, and the account, not a service row, is what
+    /// `resolve_bridge` addresses. The account id is derived from the stub's own
+    /// port so two tests running in parallel can never reach each other's
+    /// bridge: the registry is process-global and the tests are not serialized.
+    ///
+    /// The credential kind is `provider_login` because that is the mode whose
+    /// whole wiring — no adapter, no ticket — is decided by the account alone,
+    /// so a test that reaches the bridge is proving the resolution, not the
+    /// adapter.
+    fn db_with_bridge(engine: &str, addr: SocketAddr) -> (crate::db::DbPool, ResolvedAccount) {
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("init db");
-        let mut new =
-            NewService::minimal(engine, DeployMethod::NativeManagedCli, Transport::AgentRpc);
-        new.category = "coding-agent".to_string();
-        new.status = ServiceStatus::Running;
-        new.endpoint_url = Some(format!("http://{addr}"));
-        let mut config = serde_json::json!({});
-        crate::services::coding_agent::ensure_account_config(&mut config).unwrap();
-        crate::services::coding_agent::prepare_account_directory(&config).unwrap();
-        new.config_json = config.to_string();
-        let id = {
-            let conn = db.write().expect("write");
-            conn.execute("INSERT INTO user_accounts(id,username,password_hash,role) VALUES('u-1','agent-fixture','synthetic','admin')",[]).unwrap();
-            crate::services_repo::services::insert(&conn, &new).expect("insert service")
+        let account_id = format!("acc-{}", addr.port());
+        crate::services::agent_runtime::testing::register(
+            &account_id,
+            crate::services::agent_runtime::BridgeHandle::for_test(&account_id, engine, addr.port()),
+        );
+        db.write()
+            .expect("write")
+            .execute("INSERT INTO user_accounts(id,username,password_hash,role) VALUES('u-1','agent-fixture','synthetic','admin')",[])
+            .unwrap();
+        let account = ResolvedAccount {
+            account_id,
+            engine_id: engine.to_string(),
+            credential_kind: crate::services::agent_account::CredentialKind::ProviderLogin,
+            node_id: "node-1".to_string(),
+            revision: 1,
         };
-        (db, id)
+        (db, account)
+    }
+
+    /// The target an agent's `runtime_json` would have named, for the tests that
+    /// drive `run_delegation` without going through the block.
+    fn target_fixture(engine: &str, model: &str) -> DelegationTarget {
+        DelegationTarget {
+            engine: engine.to_string(),
+            model: model.to_string(),
+            agent_id: "agent-fixture".to_string(),
+        }
     }
 
     fn register_workspace(db: &crate::db::DbPool, workspace_id: &str) {
@@ -1954,29 +2275,33 @@ mod tests {
     #[test]
     fn configuration_is_validated_before_anything_is_attempted() {
         assert!(DelegationConfig::parse(&node(json!({}))).is_err());
-        assert!(DelegationConfig::parse(&node(json!({"engine": "gpt-cli"}))).is_err());
         // A budget is not optional: an opaque vendor loop with no ceiling is
         // exactly the thing §7.5 refuses to authorize.
-        assert!(
-            DelegationConfig::parse(&node(json!({"engine": "codex", "service_id": 3}))).is_err()
-        );
-        // Neither is a model: the ticket is bound to one, and a ticket without
-        // it would authorize the whole account.
-        assert!(DelegationConfig::parse(&node(
-            json!({"engine": "codex", "service_id": 3, "budget": 100})
-        ))
-        .is_err());
+        assert!(DelegationConfig::parse(&node(json!({"timeout_secs": 60}))).is_err());
+        assert!(DelegationConfig::parse(&node(json!({"budget": 0}))).is_err());
         let parsed = DelegationConfig::parse(&node(json!({
-            "engine": "codex", "service_id": 3, "budget": 100000, "model": "gpt-5"
+            "budget": 100000, "timeout_secs": 90, "output_variable": "delegated"
         })))
         .expect("valid config");
-        assert_eq!(parsed.engine, "codex");
-        assert_eq!(parsed.service_id, 3);
         assert_eq!(parsed.budget, 100_000);
-        assert_eq!(parsed.model, "gpt-5");
-        assert_eq!(parsed.timeout_secs, 1800);
-        assert_eq!(parsed.output_variable, DEFAULT_OUTPUT_VARIABLE);
-        assert!(known_engines().contains(&"claude-code"));
+        assert_eq!(parsed.timeout_secs, 90);
+        assert_eq!(parsed.output_variable, "delegated");
+        let defaults = DelegationConfig::parse(&node(json!({"budget": 1}))).expect("defaults");
+        assert_eq!(defaults.timeout_secs, 1800);
+        assert_eq!(defaults.output_variable, DEFAULT_OUTPUT_VARIABLE);
+    }
+
+    /// A node saved while the block still chose the target is refused rather
+    /// than quietly obeyed: the engine, the model and the account are the
+    /// AGENT's, and a run whose ticket names one engine while the account names
+    /// another is the substitution the resolution exists to make impossible.
+    #[test]
+    fn a_retired_target_key_is_refused_instead_of_ignored() {
+        for key in ["engine", "model", "service_id"] {
+            let config = json!({"budget": 100, key: "codex"});
+            let error = DelegationConfig::parse(&node(config)).expect_err("retired key");
+            assert!(error.to_string().contains(key), "{error}");
+        }
     }
 
     /// The operator's number is the TOKEN ceiling; the request and byte floors
@@ -1984,24 +2309,488 @@ mod tests {
     /// reports no usage at all.
     #[test]
     fn the_block_sets_the_token_ceiling_and_keeps_the_adapters_floors() {
-        let config = DelegationConfig::parse(&node(json!({
-            "engine": "codex", "service_id": 1, "budget": 4242, "model": "gpt-5"
-        })))
-        .expect("config");
+        let config = DelegationConfig::parse(&node(json!({"budget": 4242}))).expect("config");
         let budget = config.budget();
         assert_eq!(budget.max_total_tokens, 4242);
         assert_eq!(budget.max_requests, Budget::default_for_run().max_requests);
         assert_eq!(budget.max_bytes, Budget::default_for_run().max_bytes);
     }
 
+    /// The account's engine and the bridge's engine have to be the same one, and
+    /// the refusal is the ACCOUNT's, not the block's: one account has one home
+    /// directory and one `account.lock`, so a second engine for it is a refusal
+    /// rather than a second process. A test that overwrote the account's engine
+    /// is exactly the state an operator would hit by editing the account while
+    /// its bridge runs.
     #[tokio::test]
-    async fn a_bridge_running_another_engine_is_refused() {
+    async fn an_account_whose_bridge_runs_another_engine_is_refused() {
         let stub = stub_bridge(Vec::new()).await;
-        let (db, service_id) = db_with_bridge("claude-code", stub.addr);
-        let error = resolve_bridge(&db, service_id, "codex", "u-1").expect_err("engine mismatch");
-        assert!(format!("{error:#}").contains("claude-code"));
-        assert!(resolve_bridge(&db, service_id + 99, "codex", "u-1").is_err());
-        assert!(resolve_bridge(&db, service_id, "claude-code", "u-1").is_ok());
+        let (db, mut account) = db_with_bridge("claude-code", stub.addr);
+        account.engine_id = "codex".to_string();
+        let error = resolve_bridge(&db, &account, "u-1")
+            .await
+            .expect_err("engine mismatch");
+        assert!(format!("{error:#}").contains("claude-code"), "{error:#}");
+    }
+
+    /// The whole `kind=cli` chain, with nothing handed to it: an agent whose
+    /// `runtime_json` names an account in the REGISTRY, resolved against the
+    /// replicated tables, into a node, and from there to the bridge that runs
+    /// THAT account — which then answers a real turn.
+    ///
+    /// Every other test here starts from a `ResolvedAccount` built by hand,
+    /// which is exactly the state that cannot catch an id that never travelled:
+    /// the registry's account id and the runtime layer's bridge key are two
+    /// different lookups, and only following the id from one into the other
+    /// proves they are the same account. A resolver reading the wrong tables,
+    /// or a bridge registered under a normalized id, would pass the hand-built
+    /// tests and delegate every run to nothing.
+    ///
+    /// §17.3's process-sandbox gate is not what this test is about, so the turn
+    /// is driven from `run_delegation`, the entry the block itself reaches once
+    /// that gate has passed; the gate's own refusals have their own tests.
+    #[tokio::test]
+    async fn a_cli_agents_runtime_json_resolves_to_the_registry_account_whose_bridge_answers() {
+        use crate::provider_accounts::repository as store;
+        use crate::provider_accounts::{CredentialMeta, GrantInput, NewAccount};
+
+        const ORG: &str = "org-default";
+        const USER: &str = "u-1";
+
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempfile::tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+
+        // --- the vendor process, on loopback ---
+        let stub = stub_bridge(vec![
+            json!({"seq": 1, "kind": "claude", "data": {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "the registry account ran this turn"}]}
+            }}),
+            json!({"seq": 2, "kind": "claude", "data": {
+                "type": "result", "subtype": "success", "result": "the registry account ran this turn"
+            }}),
+        ])
+        .await;
+
+        // --- the registry: one global account, granted to the user, signed in,
+        //     homed on a node that has the engine installed ---
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("init db");
+        let account_id = "acc-registry";
+        {
+            let conn = db.write().expect("write");
+            conn.execute(
+                "INSERT OR IGNORE INTO user_accounts \
+                   (id, username, password_hash, display_name, is_active, is_admin, role) \
+                 VALUES (?1, ?1, 'x', ?1, 1, 0, 'user')",
+                rusqlite::params![USER],
+            )
+            .expect("user");
+            conn.execute(
+                "INSERT OR IGNORE INTO org_memberships \
+                   (org_id, user_id, role_id, granted_at, granted_by) \
+                 VALUES (?1, ?2, 'role-org-viewer', datetime('now'), 'test')",
+                rusqlite::params![ORG, USER],
+            )
+            .expect("membership");
+            conn.execute(
+                "INSERT INTO agent_runtime_nodes (node_id, receives_accounts) VALUES ('node-1', 1)",
+                [],
+            )
+            .expect("runtime node");
+            conn.execute(
+                "INSERT INTO agent_runtime_engines (node_id, engine_id, install_state, version) \
+                 VALUES ('node-1', 'claude-code', 'installed', '1.0.0')",
+                [],
+            )
+            .expect("engine row");
+        }
+        store::create_account(
+            &db,
+            &NewAccount {
+                account_id: account_id.to_string(),
+                org_id: ORG.to_string(),
+                engine_id: "claude-code".to_string(),
+                display_name: "Registry".to_string(),
+                scope: "global".to_string(),
+                owner_user_id: None,
+                credential_kind: "provider_login".to_string(),
+                created_by: "admin".to_string(),
+            },
+        )
+        .expect("account row");
+        store::set_grants(
+            &db,
+            account_id,
+            &[GrantInput {
+                subject_type: "user".to_string(),
+                subject_id: USER.to_string(),
+            }],
+            "admin",
+        )
+        .expect("grants");
+        store::mint_credential(
+            &db,
+            &crate::crypto::SettingsCipher::new(&[11_u8; 32]),
+            account_id,
+            "synthetic-material",
+            &CredentialMeta {
+                provider_subject: Some("subject-registry".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("sign-in");
+
+        // --- the agent, as an operator would have saved it: the binding names
+        //     the account and nothing else about the run ---
+        let runtime_json = format!(
+            r#"{{"kind":"cli","engine":"claude-code","model":"claude-sonnet-4-6","account":{{"mode":"global","account_id":"{account_id}"}}}}"#
+        );
+        crate::db::repository::upsert_agent(
+            &db,
+            &crate::db::models::AgentParams {
+                id: "agent-registry",
+                name: "agent-registry",
+                display_name: None,
+                description: "Fixture agent",
+                system_prompt: None,
+                model: None,
+                tools_json: "[]",
+                skills_json: "{}",
+                params_json: "{}",
+                max_iterations: 1,
+                timeout_secs: 60,
+                max_subagents: 0,
+                max_spawn_depth: 1,
+                flow_id: None,
+                routable: false,
+                is_enabled: true,
+                on_child_complete: "notify",
+                allowed_agents_json: None,
+                runtime_json: &runtime_json,
+                actor_user_id: Some(USER),
+            },
+        )
+        .expect("agent row");
+        let agent = crate::db::repository::get_agent(&db, "agent-registry")
+            .expect("read agent")
+            .expect("the agent was just written");
+
+        // --- the account's runtime, keyed by the id the registry minted ---
+        crate::services::agent_runtime::testing::register(
+            account_id,
+            crate::services::agent_runtime::BridgeHandle::for_test(
+                account_id,
+                "claude-code",
+                stub.addr.port(),
+            ),
+        );
+
+        let principal = AgentPrincipal::new(
+            Some(USER.to_string()),
+            Some(ORG.to_string()),
+            crate::flow_engine::dispatcher::FlowOrigin::CodeStudio,
+            crate::flow_engine::dispatcher::FlowActor::user(USER),
+        );
+
+        // (1) The binding resolves: account, engine, node and the revision the
+        // run is required to be on.
+        let account = agent_account::resolve_run_account(&db, &agent, &principal, Some("node-1"))
+            .expect("the agent's own runtime_json resolves against the registry");
+        assert_eq!(account.account_id, account_id);
+        assert_eq!(account.engine_id, "claude-code");
+        assert_eq!(account.node_id, "node-1");
+        assert_eq!(account.credential_kind, agent_account::CredentialKind::ProviderLogin);
+        assert_eq!(account.revision, 1);
+
+        // (2) The SAME runtime names the target; one parse, one answer, so the
+        // engine the ticket would name cannot diverge from the engine the
+        // account runs.
+        let target = DelegationTarget::of(&agent).expect("the runtime names the engine and model");
+        assert_eq!(target.engine, account.engine_id);
+        assert_eq!(target.model, "claude-sonnet-4-6");
+
+        // (3) The resolved id reaches that account's bridge and no other.
+        let bridge = resolve_bridge(&db, &account, USER)
+            .await
+            .expect("the resolved account's bridge");
+        assert_eq!(
+            bridge.account_id(),
+            account_id,
+            "the bridge that answered is not the account the run resolved to"
+        );
+
+        // (4) A real turn over the real client, with the wiring the credential
+        // kind dictates: no adapter, no ticket, the vendor's own numbers.
+        let pool = workspace_fixture("wsregistry", "run-registry");
+        register_workspace(&db, "wsregistry");
+        let config = DelegationConfig::parse(&node(json!({
+            "budget": 10_000,
+            "timeout_secs": 30,
+        })))
+        .expect("config");
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let binding = tools::SessionBinding {
+            workspace_id: "wsregistry".into(),
+            session_id: "sess-1".into(),
+        };
+        let call_ctx = ToolCallCtx {
+            main_db: &db,
+            user_id: USER,
+            run_id: None,
+            tool_call_id: "call-1",
+            binding: &binding,
+            gate: &gate,
+        };
+        let bound = bound_fixture("wsregistry", pool);
+        let ctx = crate::flow_engine::node_adapter::test_support::stub_ctx();
+        let tickets = Arc::new(TicketRegistry::new());
+        let report = run_delegation(
+            &call_ctx,
+            &bound,
+            &bridge,
+            &config,
+            &target,
+            DelegationAuth::for_credential(account.credential_kind),
+            None,
+            &ticket_ctx(AutonomyMode::Normal),
+            &tickets,
+            "run-registry",
+            data.path(),
+            "what account are you running as",
+            &ctx,
+        )
+        .await
+        .expect("the turn runs on the account the registry named");
+        assert_eq!(report.run_status, "completed");
+        assert_eq!(report.transcript, "the registry account ran this turn");
+        assert_eq!(report.auth, DelegationAuth::ProviderLogin);
+        assert_eq!(
+            *stub.prompts.lock().expect("prompts"),
+            vec!["what account are you running as".to_string()],
+            "the task never reached the vendor process behind this account's bridge"
+        );
+
+        // (5) The registry is the only source of the account: an id the agent
+        // names but nobody created is refused, not invented.
+        let mut unknown = agent.clone();
+        unknown.id = "agent-unknown".to_string();
+        unknown.runtime_json = runtime_json.replace(account_id, "acc-does-not-exist");
+        let refusal = agent_account::resolve_run_account(&db, &unknown, &principal, Some("node-1"))
+            .expect_err("an id with no account behind it");
+        assert_eq!(refusal.code(), "account_grant_denied");
+        assert!(refusal.to_string().contains("acc-does-not-exist"), "{refusal}");
+
+        crate::services::agent_runtime::testing::forget(account_id);
+        workspace_db::close("wsregistry");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// The account resolver's refusal is what `execute` RETURNS, carrying the
+    /// plan's code out to the caller.
+    ///
+    /// The test above follows the chain to `resolve_run_account`, and every other
+    /// delegation test starts from a `ResolvedAccount` built by hand, so nothing
+    /// pinned the leg between them: that a refusal the resolver decides is not
+    /// caught, wrapped or dropped on its way out of the block, which is the only
+    /// place a client can read it. Everything handed to `execute` here is the
+    /// real thing — the binding comes off the envelope, the workspace and the
+    /// session out of the registry (through `code_studio::tools`, the same bind
+    /// a model-issued tool call goes through), the agent out of `agents`, and the
+    /// account out of the account tables.
+    ///
+    /// Two bindings and two codes. One refusal alone would not tell "refused for
+    /// the right reason" from "refused, and this test happens to have seeded the
+    /// reason": an id nobody created is a grant denial, while a per-user binding
+    /// with no personal account behind it is a missing account, and the second
+    /// one is exactly the fallback this design forbids.
+    ///
+    /// C01 puts those two refusals on different paths. A grant denial is still
+    /// returned where it is decided, while a missing account PARKS the run on
+    /// the interaction registry (that park is what the console's card is drawn
+    /// from) and resolves the account AGAIN once someone answers. So the second
+    /// case is driven with an answer, and the code this test reads back is the
+    /// one the SECOND resolve decides — the run had already been past
+    /// `resolve_run_account` when it parked, and nothing was re-planned to get
+    /// here.
+    #[tokio::test]
+    async fn a_binding_the_resolver_refuses_surfaces_from_execute_as_its_code() {
+        const ORG: &str = "org-1";
+        const USER: &str = "u-1";
+        const WORKSPACE: &str = "wsexec";
+
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempfile::tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("init db");
+        db.write()
+            .expect("write")
+            .execute(
+                "INSERT INTO user_accounts(id,username,password_hash,role) \
+                 VALUES(?1,?1,'synthetic','admin')",
+                [USER],
+            )
+            .expect("user");
+
+        let _pool = workspace_fixture(WORKSPACE, "run-exec");
+        register_workspace(&db, WORKSPACE);
+
+        let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0_u8; 32]));
+        let addon_manager =
+            Arc::new(crate::addon::AddonManager::new(db.clone(), cipher).expect("addon manager"));
+        let slot: AgentServiceSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+            crate::agents::AgentService::new(db.clone(), addon_manager),
+        ))));
+        let adapter = DelegateCliNodeAdapter::new(slot);
+
+        // Each agent is bound to an account the registry cannot produce: the
+        // account tables stay EMPTY, so there is nothing for either binding to
+        // resolve to and the runtime is the operator's own save and nothing more.
+        for (agent_id, binding, expected_code, parks) in [
+            (
+                "agent-unknown-account",
+                r#"{"mode":"global","account_id":"acc-does-not-exist"}"#,
+                "account_grant_denied",
+                false,
+            ),
+            (
+                "agent-own-account",
+                r#"{"mode":"user"}"#,
+                "user_account_missing",
+                true,
+            ),
+        ] {
+            let runtime_json = format!(
+                r#"{{"kind":"cli","engine":"claude-code","model":"claude-sonnet-4-6","account":{binding}}}"#
+            );
+            crate::db::repository::upsert_agent(
+                &db,
+                &crate::db::models::AgentParams {
+                    id: agent_id,
+                    name: agent_id,
+                    display_name: None,
+                    description: "Fixture agent",
+                    system_prompt: None,
+                    model: None,
+                    tools_json: "[]",
+                    skills_json: "{}",
+                    params_json: "{}",
+                    max_iterations: 1,
+                    timeout_secs: 60,
+                    max_subagents: 0,
+                    max_spawn_depth: 1,
+                    flow_id: None,
+                    routable: false,
+                    is_enabled: true,
+                    on_child_complete: "notify",
+                    allowed_agents_json: None,
+                    runtime_json: &runtime_json,
+                    actor_user_id: Some(USER),
+                },
+            )
+            .expect("agent row");
+
+            let mut envelope = FlowEnvelope::empty();
+            envelope.payload = FlowValue::Text("do the task".into());
+            envelope.meta.insert(
+                tools::SESSION_META_KEY.to_string(),
+                tools::binding_meta_value(WORKSPACE, "sess-1"),
+            );
+            envelope
+                .meta
+                .insert("agent_id".to_string(), json!(agent_id));
+
+            let mut ctx = crate::flow_engine::node_adapter::test_support::stub_ctx();
+            ctx.user_id = Some(USER.to_string());
+            ctx.org_id = Some(ORG.to_string());
+            ctx.origin = crate::flow_engine::dispatcher::FlowOrigin::CodeStudio;
+            ctx.actor_kind = crate::flow_engine::dispatcher::ActorKind::User;
+            ctx.actor_user_id = Some(USER.to_string());
+
+            // Both of these outlive the call: a parked run's future is held
+            // across the answer, so arguments built inline in the call would be
+            // dropped while the future still borrows them.
+            let node_def = node(json!({"budget": 10_000, "timeout_secs": 30}));
+            let inputs = [NodeInput {
+                from_node_id: "trigger".into(),
+                from_port: "full".into(),
+                envelope: Arc::new(envelope),
+            }];
+            let executed = adapter.execute(&node_def, &inputs, &ctx);
+            let error = if parks {
+                // The answer a sign-in gives. `execute` is polled to its park
+                // first, so the ask is on the registry before the awaited future
+                // yields and the answerer runs.
+                let answerer = tokio::spawn(allow_the_first_account_ask());
+                let error = executed
+                    .await
+                    .expect_err("an account the registry cannot produce is refused");
+                assert!(
+                    answerer.await.expect("the answerer never panicked"),
+                    "agent '{agent_id}': the parked run's account ask was never on the \
+                     registry, so nothing answered it"
+                );
+                error
+            } else {
+                executed
+                    .await
+                    .expect_err("an account the registry cannot produce is refused")
+            };
+
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(&format!("[{expected_code}]")),
+                "agent '{agent_id}': the block did not return the resolver's own code: {rendered}"
+            );
+            assert!(
+                rendered.starts_with("delegate_cli: "),
+                "agent '{agent_id}': the refusal lost the block that produced it: {rendered}"
+            );
+        }
+
+        workspace_db::close(WORKSPACE);
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// Answers the account ask a parked run is waiting on, the way a successful
+    /// sign-in does (C01): an allowing reply on the ask that names the engine.
+    /// Returns whether there was an ask to answer — a run that never asked has
+    /// nothing to wake, and the caller asserts on that.
+    ///
+    /// The filter is deliberately narrow. `execute` is the only path in the
+    /// crate that registers an `AccountLogin` ask (the registry's own tests use
+    /// their own instance), and it leaves `run_id` empty when the envelope
+    /// carries no `agent_run_id` — which is this fixture. Both conditions
+    /// together can only be the run under test, so a test running beside this
+    /// one cannot answer for it.
+    async fn allow_the_first_account_ask() -> bool {
+        let registry = crate::agents::interaction_registry_global();
+        for _ in 0..2_000 {
+            let parked = registry
+                .list_for(true, &[])
+                .into_iter()
+                .find(|p| {
+                    p.kind == crate::agents::InteractionKind::AccountLogin
+                        && p.run_id.is_empty()
+                });
+            if let Some(parked) = parked {
+                return registry.reply(
+                    &parked.id,
+                    crate::agents::InteractionReply::Permission(
+                        crate::agents::PermissionDecision::AllowOnce,
+                    ),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
     }
 
     // =========================================================================
@@ -2032,9 +2821,9 @@ mod tests {
         );
         let pool = workspace_fixture(workspace_id, run_id);
         let stub = stub_bridge(script).await;
-        let (db, service_id) = db_with_bridge("codex", stub.addr);
+        let (db, account) = db_with_bridge("codex", stub.addr);
         register_workspace(&db, workspace_id);
-        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").expect("bridge");
+        let bridge = resolve_bridge(&db, &account, "u-1").await.expect("bridge");
 
         let tickets = TicketRegistry::new();
         let decision = cli_adapter::issue_ticket(
@@ -2056,6 +2845,7 @@ mod tests {
                     worktree: data.path(),
                     model: "gpt-5-codex",
                     ticket_id: Some(&ticket.claims.ticket_id),
+                    agent_id: "agent-fixture",
                     resume_vendor_session_id: None,
                     env: &[],
                     args: &[],
@@ -2080,9 +2870,9 @@ mod tests {
         let stub = stub_bridge(vec![]).await;
         stub.spawn_processes
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let (db, service_id) = db_with_bridge("codex", stub.addr);
+        let (db, account) = db_with_bridge("codex", stub.addr);
         register_workspace(&db, "wsstoprace");
-        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").unwrap();
+        let bridge = resolve_bridge(&db, &account, "u-1").await.unwrap();
         let other = bridge
             .open(
                 &pool,
@@ -2093,6 +2883,7 @@ mod tests {
                     worktree: data.path(),
                     model: "gpt-5-codex",
                     ticket_id: None,
+                    agent_id: "agent-fixture",
                     resume_vendor_session_id: None,
                     env: &[],
                     args: &[],
@@ -2112,6 +2903,7 @@ mod tests {
                 worktree: data.path(),
                 model: "gpt-5-codex",
                 ticket_id: None,
+                agent_id: "agent-fixture",
                 resume_vendor_session_id: None,
                 env: &[],
                 args: &[],
@@ -2131,7 +2923,6 @@ mod tests {
                 )
                 .unwrap();
             crate::code_studio::cli_bridge::close_session_instances(
-                &db,
                 &pool,
                 "sess-1",
                 Some(&["run-stop".into()]),
@@ -2346,9 +3137,9 @@ mod tests {
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, Some(cwd.clone()));
         let pool = workspace_fixture("wsappr", "run-appr");
         let stub = stub_bridge(script(&cwd)).await;
-        let (db, service_id) = db_with_bridge("codex", stub.addr);
+        let (db, account) = db_with_bridge("codex", stub.addr);
         register_workspace(&db, "wsappr");
-        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").expect("bridge");
+        let bridge = resolve_bridge(&db, &account, "u-1").await.expect("bridge");
         let tickets = TicketRegistry::new();
         let TicketDecision::Issued(ticket) = cli_adapter::issue_ticket(
             &tickets,
@@ -2368,6 +3159,7 @@ mod tests {
                     worktree: data.path(),
                     model: "gpt-5-codex",
                     ticket_id: Some(&ticket.claims.ticket_id),
+                    agent_id: "agent-fixture",
                     resume_vendor_session_id: None,
                     env: &[],
                     args: &[],
@@ -2416,9 +3208,9 @@ mod tests {
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, Some(cwd.clone()));
         let pool = workspace_fixture("wsappr2", "run-appr2");
         let stub = stub_bridge(script(&cwd)).await;
-        let (db, service_id) = db_with_bridge("codex", stub.addr);
+        let (db, account) = db_with_bridge("codex", stub.addr);
         register_workspace(&db, "wsappr2");
-        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").expect("bridge");
+        let bridge = resolve_bridge(&db, &account, "u-1").await.expect("bridge");
         let tickets = TicketRegistry::new();
         let TicketDecision::Issued(ticket) = cli_adapter::issue_ticket(
             &tickets,
@@ -2438,6 +3230,7 @@ mod tests {
                     worktree: data.path(),
                     model: "gpt-5-codex",
                     ticket_id: Some(&ticket.claims.ticket_id),
+                    agent_id: "agent-fixture",
                     resume_vendor_session_id: None,
                     env: &[],
                     args: &[],
@@ -2719,17 +3512,15 @@ mod tests {
             "seq": 1, "kind": "terminal", "data": {"text": "working"}
         })])
         .await;
-        let (db, service_id) = db_with_bridge("claude-code", stub.addr);
+        let (db, account) = db_with_bridge("claude-code", stub.addr);
         register_workspace(&db, "wscancel");
-        let bridge = resolve_bridge(&db, service_id, "claude-code", "u-1").expect("bridge");
+        let bridge = resolve_bridge(&db, &account, "u-1").await.expect("bridge");
         let config = DelegationConfig::parse(&node(json!({
-            "engine": "claude-code",
-            "service_id": service_id,
-            "model": "claude-sonnet-4-6",
             "budget": 10_000,
             "timeout_secs": 120,
         })))
         .expect("config");
+        let target = target_fixture("claude-code", "claude-sonnet-4-6");
         let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
         let binding = tools::SessionBinding {
             workspace_id: "wscancel".into(),
@@ -2755,7 +3546,8 @@ mod tests {
                 &bound,
                 &bridge,
                 &config,
-                DelegationAuth::ProviderLogin,
+                &target,
+                DelegationAuth::for_credential(account.credential_kind),
                 None,
                 &granted,
                 &tickets,
@@ -2861,7 +3653,6 @@ mod tests {
                 updated_at: "now".into(),
             },
             session: crate::code_studio::session::SessionRecord {
-                agent_service_id: None,
                 id: "sess-1".into(),
                 workspace_id: workspace_id.into(),
                 user_id: "u-1".into(),
@@ -2927,9 +3718,9 @@ mod tests {
             }}),
         ])
         .await;
-        let (db, service_id) = db_with_bridge("codex", stub.addr);
+        let (db, account) = db_with_bridge("codex", stub.addr);
         register_workspace(&db, "wsclperm");
-        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").expect("bridge");
+        let bridge = resolve_bridge(&db, &account, "u-1").await.expect("bridge");
         let tickets = TicketRegistry::new();
         let TicketDecision::Issued(ticket) = cli_adapter::issue_ticket(
             &tickets,
@@ -2949,6 +3740,7 @@ mod tests {
                     worktree: data.path(),
                     model: "sonnet",
                     ticket_id: Some(&ticket.claims.ticket_id),
+                    agent_id: "agent-fixture",
                     resume_vendor_session_id: None,
                     env: &[],
                     args: &[],
@@ -3027,22 +3819,18 @@ mod tests {
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
     }
 
-    /// A delegation to an engine that authenticates ITSELF gets past the point
-    /// where it used to die, and gets there without a credential in the vault.
+    /// An account that authenticates through the provider's own login runs a
+    /// turn with no adapter, no credential and no ticket — and the workspace
+    /// still has an operator's recorded go/no-go decision behind it.
     ///
-    /// The old order was unconditional: `delegate_cli` started the provider
-    /// adapter, the adapter read `code_agent_credentials`, and a node whose CLI
-    /// carries an operator login — which is the normal state of a workstation —
-    /// was refused `credential_missing` before a CLI was ever started. Step (2)
-    /// pins that this is still exactly what the vault says, so the test cannot
-    /// pass by the row quietly appearing; step (3) is the new decision reading
-    /// the same node and answering differently.
-    ///
-    /// The Phase 0B gate is NOT waived: it is satisfied here the only way it can
-    /// be, by an administrator's recorded decision, and the delegation is shown
-    /// to pass it. What changes is only what is required after it.
+    /// The account is what decides this, and it decides it once: nothing on
+    /// this path looks for a stored key, because on this account there is none
+    /// to find. The Phase 0B gate is NOT waived for the other kind of account,
+    /// and this test proves the gate is satisfied here the only way it can be —
+    /// by an administrator's decision — so a `provider_login` account is not a
+    /// way around §17.1.
     #[tokio::test]
-    async fn a_self_authenticated_engine_delegates_without_a_vault_credential() {
+    async fn a_provider_login_account_delegates_without_an_adapter_or_a_ticket() {
         let _guard = cs_paths::test_data_dir_guard();
         let data = tempfile::tempdir().expect("data dir");
         crate::paths::set_category_override(
@@ -3051,10 +3839,9 @@ mod tests {
         );
         let pool = workspace_fixture("wslogin", "run-login");
         let stub = stub_bridge(Vec::new()).await;
-        let (db, service_id) = db_with_bridge("claude-code", stub.addr);
+        let (db, account) = db_with_bridge("claude-code", stub.addr);
         register_workspace(&db, "wslogin");
-        let bridge = resolve_bridge(&db, service_id, "claude-code", "u-1").expect("bridge");
-        let cipher = crate::crypto::SettingsCipher::new(&[7_u8; 32]);
+        let bridge = resolve_bridge(&db, &account, "u-1").await.expect("bridge");
 
         // (1) The organization's go/no-go, recorded as §17.1 requires: the flag
         // AND the note. Without both the delegation is refused whatever else is
@@ -3077,33 +3864,10 @@ mod tests {
         cli_adapter::ensure_engine_verified(&db, "claude-code", EgressEnforcement::Unrestricted)
             .expect("the gate passes once the decision is recorded");
 
-        // (2) The vault is empty for this engine — the exact fact that used to
-        // end the delegation.
-        let local = crate::code_studio::db::test_pool();
-        let missing = crate::code_studio::vault::get_agent_credential(
-            &local,
-            &cipher,
-            "org-1",
-            "node-1",
-            "claude-code",
-        )
-        .expect_err("the vault holds nothing for this engine");
-        assert!(
-            missing.to_string().contains("credential_missing"),
-            "{missing}"
-        );
-
-        // (3) The delegation is authenticated all the same, because the CLI is.
-        let auth = cli_adapter::resolve_delegation_auth(
-            &local,
-            "org-1",
-            "node-1",
-            "claude-code",
-            false,
-            bridge.provider_login(),
-        )
-        .await
-        .expect("a logged-in CLI is an authenticated delegation");
+        // (2) The delegation is authenticated all the same, because the CLI is.
+        // The ACCOUNT says how the turn authenticates; nothing here looks for a
+        // stored credential, because on this account there is none to find.
+        let auth = DelegationAuth::for_credential(account.credential_kind);
         assert_eq!(auth, DelegationAuth::ProviderLogin);
         assert_eq!(auth.usage_source(), "provider_reported");
 
@@ -3129,6 +3893,7 @@ mod tests {
                     worktree: data.path(),
                     model: "sonnet",
                     ticket_id: delegation.ticket_id(),
+                    agent_id: "agent-fixture",
                     resume_vendor_session_id: None,
                     env: &env,
                     args: &args,
@@ -3295,66 +4060,6 @@ mod tests {
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
     }
 
-    /// The other half: an engine with neither an organization credential nor a
-    /// login of its own is still refused, and the refusal names both halves.
-    ///
-    /// "Not authenticated" must not be able to read as "authenticated by the
-    /// operator" — that is the failure mode this whole mode introduces, and the
-    /// probe answering `false` (or not answering at all) has to end the
-    /// delegation rather than start a CLI that talks to a provider as nobody.
-    #[tokio::test]
-    async fn an_engine_with_no_credential_and_no_login_is_refused_by_name() {
-        let stub = stub_bridge(Vec::new()).await;
-        let (db, service_id) = db_with_bridge("claude-code", stub.addr);
-        let bridge = resolve_bridge(&db, service_id, "claude-code", "u-1").expect("bridge");
-
-        stub.authenticated
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        let local = crate::code_studio::db::test_pool();
-        let refusal = cli_adapter::resolve_delegation_auth(
-            &local,
-            "org-1",
-            "node-1",
-            "claude-code",
-            false,
-            bridge.provider_login(),
-        )
-        .await
-        .expect_err("nothing authenticates this delegation");
-        let reason = refusal.to_string();
-        assert!(reason.contains("credential_missing"), "{reason}");
-        assert!(
-            reason.contains("no provider login of its own"),
-            "the refusal has to name the second half too, or an administrator only learns about \
-             the vault: {reason}"
-        );
-
-        // A bridge that cannot answer is not a login either: an unreachable
-        // probe must never be read as a yes. The reason changes, the outcome
-        // does not.
-        let dead = {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
-            listener.local_addr().expect("addr")
-        };
-        let (dead_db, dead_service) = db_with_bridge("claude-code", dead);
-        let dead_bridge =
-            resolve_bridge(&dead_db, dead_service, "claude-code", "u-1").expect("bridge");
-        let refusal = cli_adapter::resolve_delegation_auth(
-            &local,
-            "org-1",
-            "node-1",
-            "claude-code",
-            false,
-            dead_bridge.provider_login(),
-        )
-        .await
-        .expect_err("an unanswerable probe is a refusal, not a login");
-        assert!(
-            refusal.to_string().contains("credential_missing"),
-            "{refusal}"
-        );
-    }
-
     /// The prompt reaches the CLI, and closing the instance records the state
     /// the bridge actually reported — `reaped` means the vendor process is
     /// gone, which is defect D2's promise and not a hopeful default.
@@ -3387,6 +4092,326 @@ mod tests {
         );
 
         workspace_db::close("wsturn");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// A finished provider turn, recorded exactly as `CliBridge::open`/`close`
+    /// leave it: the row `recorded_provider_turn` reads when a session resumes.
+    fn record_provider_turn(
+        pool: &DbPool,
+        instance_id: &str,
+        run_id: &str,
+        account_id: &str,
+        vendor_session_id: &str,
+    ) {
+        pool.write()
+            .expect("write")
+            .execute(
+                "INSERT INTO cli_instances \
+                   (id, session_id, run_id, engine_id, account_id, vendor_session_id, model, \
+                    ticket_id, status, started_at, ended_at) \
+                 VALUES (?1, 'sess-1', ?2, 'claude-code', ?3, ?4, 'sonnet', NULL, 'ended', \
+                         datetime('now'), datetime('now'))",
+                rusqlite::params![instance_id, run_id, account_id, vendor_session_id],
+            )
+            .expect("recorded turn");
+    }
+
+    /// §2.5: a vendor conversation belongs to the account that opened it.
+    ///
+    /// The conversation on record was opened by ANOTHER account, and the run is
+    /// refused with the plan's code instead of quietly opening a fresh
+    /// conversation on the wrong subscription — which is exactly what the
+    /// account-filtered lookup this replaced would have done, silently and with
+    /// nothing for the caller to see. The refusal comes before the vendor is
+    /// asked anything, and the same recording under the account the bridge runs
+    /// is resumed rather than refused.
+    #[tokio::test]
+    async fn a_resume_under_another_account_is_refused_and_the_same_account_resumes() {
+        const USER: &str = "u-1";
+
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempfile::tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+        let pool = workspace_fixture("wsresume", "run-resume");
+        let stub = stub_bridge(vec![json!({"seq": 1, "kind": "claude", "data": {
+            "type": "result", "subtype": "success", "result": "done"
+        }})])
+        .await;
+        let (db, account) = db_with_bridge("claude-code", stub.addr);
+        register_workspace(&db, "wsresume");
+        let bridge = resolve_bridge(&db, &account, "u-1").await.expect("bridge");
+
+        let config = DelegationConfig::parse(&node(json!({
+            "budget": 10_000,
+            "timeout_secs": 30,
+        })))
+        .expect("config");
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let binding = tools::SessionBinding {
+            workspace_id: "wsresume".into(),
+            session_id: "sess-1".into(),
+        };
+        let call_ctx = ToolCallCtx {
+            main_db: &db,
+            user_id: USER,
+            run_id: None,
+            tool_call_id: "call-1",
+            binding: &binding,
+            gate: &gate,
+        };
+        let bound = bound_fixture("wsresume", pool);
+        let ctx = crate::flow_engine::node_adapter::test_support::stub_ctx();
+        let tickets = Arc::new(TicketRegistry::new());
+        let target = target_fixture("claude-code", "sonnet");
+
+        // (1) Somebody else's conversation.
+        record_provider_turn(
+            &bound.pool,
+            "cli-foreign",
+            "run-resume",
+            "acc-somebody-else",
+            "vendor-theirs",
+        );
+        let error = match run_delegation(
+            &call_ctx,
+            &bound,
+            &bridge,
+            &config,
+            &target,
+            DelegationAuth::ProviderLogin,
+            None,
+            &ticket_ctx(AutonomyMode::Normal),
+            &tickets,
+            "run-resume",
+            data.path(),
+            "carry on",
+            &ctx,
+        )
+        .await
+        {
+            Ok(report) => panic!(
+                "another account's conversation is not this run's to continue, but the turn ran \
+                 and reported '{}'",
+                report.run_status
+            ),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("[account_conversation_mismatch]"),
+            "the refusal has to reach the caller as the plan's code: {message}"
+        );
+        assert!(
+            message.contains(&account.account_id) && message.contains("acc-somebody-else"),
+            "the refusal has to name both accounts, or an operator cannot tell which record to \
+             look at: {message}"
+        );
+        assert!(
+            stub.creates.lock().expect("creates").is_empty(),
+            "the refusal must land before the vendor is asked to continue anything"
+        );
+
+        // (2) The conversation the account behind this bridge opened.
+        record_provider_turn(
+            &bound.pool,
+            "cli-mine",
+            "run-resume",
+            bridge.account_id(),
+            "vendor-mine",
+        );
+        let report = run_delegation(
+            &call_ctx,
+            &bound,
+            &bridge,
+            &config,
+            &target,
+            DelegationAuth::ProviderLogin,
+            None,
+            &ticket_ctx(AutonomyMode::Normal),
+            &tickets,
+            "run-resume",
+            data.path(),
+            "carry on",
+            &ctx,
+        )
+        .await
+        .expect("the account's own conversation resumes");
+        assert_eq!(report.run_status, "completed");
+        let created = stub.creates.lock().expect("creates");
+        assert_eq!(
+            created.len(),
+            1,
+            "one turn asks the vendor for one session, once: {created:?}"
+        );
+        assert_eq!(
+            created[0]["resume_vendor_session_id"], "vendor-mine",
+            "the vendor is told WHICH conversation to continue, not merely that there was one"
+        );
+        drop(created);
+
+        workspace_db::close("wsresume");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// §2.5: one writing turn per worktree, and reading is not a writing turn.
+    ///
+    /// The second EDITOR turn is refused rather than queued — and refused
+    /// before it opens anything — while the first turn's process is still
+    /// starting, which is the window the lock exists for. A `Viewer` in the
+    /// same worktree is admitted throughout: every writing capability starts at
+    /// `Editor` (`pep::Capability::minimum_role`) and the CLI's tool calls are
+    /// decided by that PEP, so a viewer's turn cannot collide with either.
+    #[tokio::test]
+    async fn a_second_writing_turn_in_one_worktree_is_refused_while_a_viewer_is_not() {
+        const USER: &str = "u-1";
+
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempfile::tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+        let pool = workspace_fixture("wsturnlock", "run-turnlock");
+        let stub = stub_bridge(vec![json!({"seq": 1, "kind": "claude", "data": {
+            "type": "result", "subtype": "success", "result": "done"
+        }})])
+        .await;
+        stub.delay_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (db, account) = db_with_bridge("claude-code", stub.addr);
+        register_workspace(&db, "wsturnlock");
+        let bridge = resolve_bridge(&db, &account, "u-1").await.expect("bridge");
+
+        let config = DelegationConfig::parse(&node(json!({
+            "budget": 10_000,
+            "timeout_secs": 30,
+        })))
+        .expect("config");
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let binding = tools::SessionBinding {
+            workspace_id: "wsturnlock".into(),
+            session_id: "sess-1".into(),
+        };
+        let call_ctx = ToolCallCtx {
+            main_db: &db,
+            user_id: USER,
+            run_id: None,
+            tool_call_id: "call-1",
+            binding: &binding,
+            gate: &gate,
+        };
+        let bound = bound_fixture("wsturnlock", pool);
+        let mut reader = bound_fixture("wsturnlock", bound.pool.clone());
+        reader.role = WorkspaceRole::Viewer;
+        let ctx = crate::flow_engine::node_adapter::test_support::stub_ctx();
+        let tickets = Arc::new(TicketRegistry::new());
+        let target = target_fixture("claude-code", "sonnet");
+        let granted = ticket_ctx(AutonomyMode::Normal);
+
+        let mut first = Box::pin(run_delegation(
+            &call_ctx,
+            &bound,
+            &bridge,
+            &config,
+            &target,
+            DelegationAuth::ProviderLogin,
+            None,
+            &granted,
+            &tickets,
+            "run-turnlock",
+            data.path(),
+            "write something",
+            &ctx,
+        ));
+        // The first turn is inside the vendor's own start-up, holding the
+        // worktree, and has not returned: this is the state the guard is for.
+        tokio::select! {
+            _ = stub.create_started.notified() => {}
+            ended = &mut first => panic!(
+                "the first turn ended before the worktree was held (it failed: {})",
+                ended.is_err()
+            ),
+        }
+
+        let error = match run_delegation(
+            &call_ctx,
+            &bound,
+            &bridge,
+            &config,
+            &target,
+            DelegationAuth::ProviderLogin,
+            None,
+            &granted,
+            &tickets,
+            "run-turnlock",
+            data.path(),
+            "write something else",
+            &ctx,
+        )
+        .await
+        {
+            Ok(report) => panic!(
+                "a worktree is written by one turn at a time, but the second turn ran and \
+                 reported '{}'",
+                report.run_status
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("another writing turn is already running"),
+            "the refusal has to say what is in the way and what to do about it: {error}"
+        );
+        assert_eq!(
+            stub.creates.lock().expect("creates").len(),
+            1,
+            "the refused turn must not have started a second vendor process"
+        );
+
+        // A viewer's turn never asks for the lock, so it runs to completion
+        // while the writer is still where it was.
+        let readable = run_delegation(
+            &call_ctx,
+            &reader,
+            &bridge,
+            &config,
+            &target,
+            DelegationAuth::ProviderLogin,
+            None,
+            &granted,
+            &tickets,
+            "run-turnlock",
+            data.path(),
+            "review it",
+            &ctx,
+        )
+        .await
+        .expect("reading a worktree is not writing it");
+        assert_eq!(readable.run_status, "completed");
+        assert_eq!(
+            *stub.prompts.lock().expect("prompts"),
+            vec!["review it".to_string()],
+            "the reader's prompt is the one that reached the vendor"
+        );
+
+        // And the writer finishes normally: the refusal took nothing away from
+        // the turn it refused to run beside.
+        stub.release_create.notify_one();
+        let report = first
+            .await
+            .expect("the first turn is untouched by the refusal");
+        assert_eq!(report.run_status, "completed");
+        assert_eq!(
+            *stub.prompts.lock().expect("prompts"),
+            vec!["review it".to_string(), "write something".to_string()]
+        );
+
+        workspace_db::close("wsturnlock");
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
     }
 }

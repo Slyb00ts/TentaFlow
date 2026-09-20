@@ -14,6 +14,9 @@
 //   count (trailing pill) + count-tone (hot), disabled, dirty (unsaved-content
 //   dot after the label), dot + tone (leading status dot), marker + tone
 //   (leading status LETTER, e.g. A/M/D/!), sub (second line under the label),
+//   account (a <tf-chip> on the second line, after `sub` — the account a
+//   sub-agent run on; the text is the caller's, this component translates
+//   nothing),
 //   mono (monospace label), closable (trailing × emitting "tab-close"),
 //   pinned (sticks to the strip's left edge while the rest scrolls),
 //   nudge (amber "this is waiting for you" state), panel (id for aria-controls).
@@ -49,7 +52,7 @@ function toneClass(prefix, raw) {
 class TfTab extends HTMLElement {
   static get observedAttributes() {
     return ['count', 'icon', 'disabled', 'label', 'dirty', 'dot', 'marker',
-      'tone', 'sub', 'mono', 'count-tone', 'closable', 'panel'];
+      'tone', 'sub', 'account', 'mono', 'count-tone', 'closable', 'panel'];
   }
 
   constructor() {
@@ -116,11 +119,26 @@ class TfTab extends HTMLElement {
     }
 
     const sub = this.getAttribute('sub');
+    // The second line holds, when the host names one, the account the item ran
+    // on — a chip, because it is a labelled fact about another object rather
+    // than part of this tab's own name — ahead of the sub text (C02: the
+    // account leads, the state follows). The extra row wrapper appears only when
+    // there IS a chip, so a tab without one keeps the exact markup it had.
+    const account = this.getAttribute('account');
     const labelCls = `tf-tab-label${this.hasAttribute('mono') ? ' tf-tab-label--mono' : ''}`;
-    const labelHtml = sub
-      ? `<span class="tf-tab-text"><span class="${labelCls}">${escapeHtml(label)}</span>`
-        + `<span class="tf-tab-sub">${escapeHtml(sub)}</span></span>`
-      : `<span class="${labelCls}">${escapeHtml(label)}</span>`;
+    let labelHtml;
+    if (account) {
+      const line = `<tf-chip size="sm" variant="outline" class="tf-tab-account" `
+        + `label="${escapeHtml(account)}"></tf-chip>`
+        + (sub ? `<span class="tf-tab-sub">${escapeHtml(sub)}</span>` : '');
+      labelHtml = `<span class="tf-tab-text"><span class="${labelCls}">${escapeHtml(label)}</span>`
+        + `<span class="tf-tab-subrow">${line}</span></span>`;
+    } else if (sub) {
+      labelHtml = `<span class="tf-tab-text"><span class="${labelCls}">${escapeHtml(label)}</span>`
+        + `<span class="tf-tab-sub">${escapeHtml(sub)}</span></span>`;
+    } else {
+      labelHtml = `<span class="${labelCls}">${escapeHtml(label)}</span>`;
+    }
 
     const countHtml = count
       ? `<span class="tf-tab-count${toneClass('tf-tab-count', this.getAttribute('count-tone'))}">`

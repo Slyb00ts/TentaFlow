@@ -253,7 +253,18 @@ mod serde_array64 {
 // the first field of some other variant happens to be — silent
 // misinterpretation, not a decode error, which is exactly what a schema
 // bump exists to turn into a loud handshake refusal instead.
-pub const SCHEMA_VERSION: u16 = 29;
+//
+// v30 removes the `AgentCredential*` variants of `CodeStudioPayload` and the
+// `AgentCredentialInfo` struct they carried. Nothing is appended here. This
+// wire tags variants by NAME (ciborium external tagging), so a v29 peer still
+// sending one is not silently misread as some other variant — it fails to
+// decode as an unknown variant. It fails at REQUEST time, though, as a decode
+// error on a single message, and only once a user reaches that feature; the
+// bump is what turns a mixed fleet into a refusal at connect, before a peer
+// that cannot be served is up. An account's credential now travels as
+// `CredentialSetRequest` in the provider-account family; the node-local vault
+// the old variants addressed is gone.
+pub const SCHEMA_VERSION: u16 = 30;
 
 // =============================================================================
 // Message kind discriminants

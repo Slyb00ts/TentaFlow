@@ -68,7 +68,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
@@ -76,8 +76,7 @@ use super::events::EventPayload;
 use super::pep::{self, AskKind, Capability, Decision, Target};
 use super::tools::{self, ApprovalDecision};
 use crate::db::DbPool;
-use crate::services::transport::Transport;
-use crate::services_repo::services::ServiceRow;
+use crate::services::agent_runtime::BridgeHandle;
 
 // =============================================================================
 // Bridge client
@@ -90,7 +89,11 @@ pub struct CliInstance {
     pub session_id: String,
     pub run_id: String,
     pub engine_id: String,
-    pub service_id: i64,
+    /// The provider account the bridge of this instance belongs to. It is what
+    /// a resume is bound to: the same user resuming the same agent in the same
+    /// workspace reattaches the vendor session, a different account gets a new
+    /// one, and a session started before accounts existed carries none.
+    pub account_id: String,
     /// Identifier the BRIDGE uses; the vendor's own id is `vendor_session_id`.
     pub bridge_session_id: String,
     pub vendor_session_id: String,
@@ -766,12 +769,18 @@ impl ApprovalDialect {
     }
 }
 
-/// Talks to one coding-agent bridge through the validated Core proxy. It holds
-/// the service row rather than a URL, so the loopback and transport checks in
-/// `services::coding_agent` apply to every call made here.
+/// Talks to one coding-agent bridge of one provider account.
+///
+/// It holds the bridge's `BridgeHandle` — the loopback address and the bearer
+/// token of the process the runtime manager started — rather than a `services`
+/// row. An account is not a deployment: one account runs on the node whose
+/// runtime holds its credentials, and the handle is how that process is
+/// addressed. The endpoint and the token are still validated in one place,
+/// `services::coding_agent::call_bridge`, and the operation names still come
+/// from its `route`.
 #[derive(Debug, Clone)]
 pub struct CliBridge {
-    service: ServiceRow,
+    handle: BridgeHandle,
     db: DbPool,
     user_id: String,
 }
@@ -813,46 +822,29 @@ impl Drop for CliInstanceGuard {
 }
 
 impl CliBridge {
-    pub fn new(service: ServiceRow, db: DbPool, user_id: String) -> Result<Self> {
-        if service.transport != Transport::AgentRpc {
-            return Err(anyhow!(
-                "service {} is not a coding-agent bridge",
-                service.id
-            ));
-        }
-        Ok(Self {
-            service,
+    pub fn new(handle: BridgeHandle, db: DbPool, user_id: String) -> Self {
+        Self {
+            handle,
             db,
             user_id,
-        })
+        }
     }
 
     pub fn engine_id(&self) -> &str {
-        &self.service.engine_id
+        &self.handle.engine_id
     }
 
-    /// The provider account this bridge runs as, as the service row records it.
-    ///
-    /// `None` is a bridge whose configuration carries no account id — which a
-    /// row written before the managed-CLI deploy path existed can still be; the
-    /// callers treat it as "nothing to attribute this to" rather than as an
-    /// error, because the session itself is working.
-    pub fn account_id(&self) -> Option<String> {
-        crate::services::coding_agent::account_id_of(&self.service)
+    /// The provider account whose bridge this is. Never `None`: a bridge exists
+    /// only because an account's runtime was started for it, so there is no
+    /// unowned bridge to attribute nothing to.
+    pub fn account_id(&self) -> &str {
+        &self.handle.account_id
     }
 
     async fn call(&self, operation: &str, payload: Value) -> Result<Value> {
-        let response = crate::services::coding_agent::execute_authorized(
-            &self.db,
-            &self.service,
-            &self.user_id,
-            operation,
-            &payload.to_string(),
-        )
-        .await
-        .map_err(|error| anyhow!("coding-agent {operation}: {error}"))?;
-        serde_json::from_str(&response)
-            .with_context(|| format!("coding-agent {operation} returned invalid JSON"))
+        let (method, path, body) = crate::services::coding_agent::route(operation, &payload.to_string())
+            .map_err(|error| anyhow!("coding-agent {operation}: {error}"))?;
+        self.handle.call(method, &path, body).await
     }
 
     pub fn close_guard(&self, pool: &DbPool, instance: &CliInstance) -> CliInstanceGuard {
@@ -886,8 +878,8 @@ impl CliBridge {
             id: request.instance_id.to_string(),
             session_id: request.session_id.to_string(),
             run_id: request.run_id.to_string(),
-            engine_id: self.service.engine_id.clone(),
-            service_id: self.service.id,
+            engine_id: self.handle.engine_id.clone(),
+            account_id: self.handle.account_id.clone(),
             bridge_session_id: uuid::Uuid::new_v4().to_string(),
             vendor_session_id: String::new(),
             model: request.model.to_string(),
@@ -935,7 +927,7 @@ impl CliBridge {
                 ));
             }
         }
-        self.record_account_session(&instance, request.session_id);
+        self.record_account_session(&instance, request.session_id, request.agent_id);
         let bridge = self.clone();
         let pool = pool.clone();
         let watched = instance.clone();
@@ -987,30 +979,6 @@ impl CliBridge {
         });
         opening.disarm();
         Ok(instance)
-    }
-
-    /// Whether the ENGINE holds a provider login of its own on this node.
-    ///
-    /// The bridge answers it by running the vendor's own status command
-    /// (`claude auth status`, `codex login status`) and reporting whether it
-    /// succeeded — so the answer is the CLI's, not a setting somebody typed.
-    /// That is the whole point: `DelegationAuth::ProviderLogin` hands the CLI no
-    /// credential at all, and the only honest way to know a run will authenticate
-    /// is to ask the thing that will do the authenticating.
-    ///
-    /// A probe that cannot be run is an error, never a `true`: the caller turns
-    /// it into a refusal, because the permissive reading would start a CLI that
-    /// then talks to a provider as nobody in particular.
-    pub async fn provider_login(&self) -> Result<bool> {
-        let response = self.call("auth.status", serde_json::json!({})).await?;
-        Ok(response
-            .get("authenticated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || response
-                .get("credential_present")
-                .and_then(Value::as_bool)
-                .unwrap_or(false))
     }
 
     pub async fn turn(&self, instance: &CliInstance, prompt: &str) -> Result<()> {
@@ -1096,25 +1064,23 @@ impl CliBridge {
         instance_id: &str,
         bridge_session_id: &str,
     ) -> Result<String> {
-        // Cleanup remains authorized when the user's permission was revoked mid-launch.
-        let response = crate::services::coding_agent::execute(
-            &self.service,
-            "session.close",
-            &serde_json::json!({"session_id":bridge_session_id}).to_string(),
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
-        let response: Value = serde_json::from_str(&response)?;
+        // Cleanup remains authorized when the user's permission was revoked
+        // mid-launch: it is addressed to the account's own bridge, so nothing
+        // about who may OPEN a session can strand a running process.
+        let response = self
+            .call(
+                "session.close",
+                serde_json::json!({"session_id":bridge_session_id}),
+            )
+            .await?;
         let state = confirmed_process_state(&response)?;
         let status = if state == "reaped" { "reaped" } else { "ended" };
         set_instance_status(pool, instance_id, status)?;
-        if let Some(account_id) = self.account_id() {
-            let _ = crate::provider_accounts::repository::delete_session(
-                &self.db,
-                &account_id,
-                bridge_session_id,
-            );
-        }
+        let _ = crate::provider_accounts::repository::delete_session(
+            &self.db,
+            &self.handle.account_id,
+            bridge_session_id,
+        );
         Ok(state.to_owned())
     }
 
@@ -1124,13 +1090,16 @@ impl CliBridge {
     /// An account the registry does not know about is skipped rather than
     /// created: the only writer of `provider_accounts` is the account screen,
     /// and a session must not be able to mint the account it claims to be
-    /// using. The recording is best effort for the same reason the `services`
+    /// using. The recording is best effort for the same reason the CLI instance
     /// row is: a failure here must not take down a session that is otherwise
     /// running.
-    fn record_account_session(&self, instance: &CliInstance, workspace_session_id: &str) {
-        let Some(account_id) = self.account_id() else {
-            return;
-        };
+    fn record_account_session(
+        &self,
+        instance: &CliInstance,
+        workspace_session_id: &str,
+        agent_id: &str,
+    ) {
+        let account_id = self.handle.account_id.clone();
         use crate::provider_accounts::repository as store;
         match store::get_account(&self.db, &account_id) {
             Ok(Some(_)) => {}
@@ -1153,10 +1122,10 @@ impl CliBridge {
                 account_id: account_id.clone(),
                 session_id: instance.bridge_session_id.clone(),
                 user_id: self.user_id.clone(),
-                // The agent is a property of the RUN, which this layer is not
-                // given; the workspace is what the session screen shows and
-                // what the account detail needs to name the work.
-                agent_id: None,
+                // The agent the caller ran, and the workspace the session
+                // belongs to: together they are what the account detail shows
+                // besides the account itself.
+                agent_id: Some(agent_id.to_string()),
                 workspace_id,
                 node_id,
                 vendor_session_id: Some(instance.vendor_session_id.clone()),
@@ -1179,6 +1148,10 @@ pub struct OpenCliInstance<'a> {
     pub worktree: &'a Path,
     pub model: &'a str,
     pub ticket_id: Option<&'a str>,
+    /// The agent this turn belongs to. Recorded on the account's open session so
+    /// an account names what is running on it and why, which the workspace
+    /// session alone cannot say (§2.5).
+    pub agent_id: &'a str,
     pub resume_vendor_session_id: Option<&'a str>,
     /// Adapter wiring for the CLI process: base URL, the ticket as its API key,
     /// the session CA. Never the organization's credential.
@@ -1720,7 +1693,7 @@ fn insert_instance(pool: &DbPool, instance: &CliInstance) -> Result<()> {
     }
     conn.execute(
         "INSERT INTO cli_instances \
-           (id, session_id, run_id, engine_id, service_id, vendor_session_id, model, ticket_id, \
+           (id, session_id, run_id, engine_id, account_id, vendor_session_id, model, ticket_id, \
             status, last_seq, started_at, bridge_session_id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'starting', 0, datetime('now'), ?9)",
         rusqlite::params![
@@ -1728,7 +1701,7 @@ fn insert_instance(pool: &DbPool, instance: &CliInstance) -> Result<()> {
             instance.session_id,
             instance.run_id,
             instance.engine_id,
-            instance.service_id,
+            instance.account_id,
             instance.vendor_session_id,
             instance.model,
             instance.ticket_id,
@@ -1739,7 +1712,6 @@ fn insert_instance(pool: &DbPool, instance: &CliInstance) -> Result<()> {
 }
 
 pub async fn close_session_instances(
-    main_db: &DbPool,
     workspace_db: &DbPool,
     session_id: &str,
     run_ids: Option<&[String]>,
@@ -1748,40 +1720,34 @@ pub async fn close_session_instances(
         let conn = workspace_db
             .read()
             .map_err(|e| anyhow!("workspace db: {e}"))?;
-        let mut statement = conn.prepare("SELECT id,service_id,bridge_session_id,run_id FROM cli_instances WHERE session_id=?1 AND status NOT IN ('ended','reaped')")?;
+        let mut statement = conn.prepare("SELECT id,account_id,bridge_session_id,run_id FROM cli_instances WHERE session_id=?1 AND status NOT IN ('ended','reaped')")?;
         let rows = statement.query_map([session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (id, service_id, bridge_session_id, run_id) in instances {
+    for (id, account_id, bridge_session_id, run_id) in instances {
         if run_ids.is_some_and(|ids| !ids.contains(&run_id)) {
             continue;
         }
         let bridge_session_id = bridge_session_id.ok_or_else(|| anyhow!("CLI instance {id} has no recorded bridge session; stop its account service before closing the workspace"))?;
-        let service = {
-            let conn = main_db
-                .read()
-                .map_err(|e| anyhow!("account registry: {e}"))?;
-            crate::services_repo::services::get(&conn, service_id)?.ok_or_else(|| {
-                anyhow!(
-                    "CLI account service {service_id} is missing; termination cannot be confirmed"
-                )
-            })?
+        // No bridge on this node is no process on this node: the bridge owns
+        // the CLI children and kills them before it exits, so there is nothing
+        // left for Core to confirm and nothing to invent a status from.
+        let Some(handle) = crate::services::agent_runtime::running_bridge(&account_id).await else {
+            continue;
         };
-        let response = crate::services::coding_agent::execute(
-            &service,
+        let (method, path, body) = crate::services::coding_agent::route(
             "session.close",
             &serde_json::json!({"session_id":bridge_session_id}).to_string(),
         )
-        .await
-        .map_err(anyhow::Error::msg)?;
-        let response: Value = serde_json::from_str(&response)?;
+        .map_err(|error| anyhow!("coding-agent session.close: {error}"))?;
+        let response = handle.call(method, &path, body).await?;
         confirmed_process_state(&response)?;
         set_instance_status(workspace_db, &id, "reaped")?;
     }
@@ -2442,6 +2408,17 @@ mod tests {
                     .expect("rows");
                 *self.seen.lock().expect("seen") = rows;
                 ApprovalDecision::AllowForRun
+            }
+
+            async fn request_account(
+                &self,
+                _interaction_id: &str,
+                ask: &tools::AccountApproval,
+            ) -> ApprovalDecision {
+                panic!(
+                    "a vendor question is never an account question: {}",
+                    ask.engine_id
+                )
             }
 
             async fn present_review(&self, _prompt: &tools::ReviewPrompt) -> Option<String> {

@@ -60,6 +60,7 @@ struct AccountCaptureRow {
     created_by: String,
     created_at: String,
     credential_revoked_revision: i64,
+    max_sessions: i64,
 }
 
 /// Captures the account as it now stands: present → a full-row Insert (the
@@ -72,7 +73,7 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
         .query_row(
             "SELECT org_id, engine_id, display_name, scope, owner_user_id, credential_kind, \
                     provider_subject, plan_label, home_node_id, status, created_by, created_at, \
-                    credential_revoked_revision \
+                    credential_revoked_revision, max_sessions \
              FROM provider_accounts WHERE account_id = ?1",
             rusqlite::params![account_id],
             |row| {
@@ -90,6 +91,7 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
                     created_by: row.get(10)?,
                     created_at: row.get(11)?,
                     credential_revoked_revision: row.get(12)?,
+                    max_sessions: row.get(13)?,
                 })
             },
         )
@@ -138,6 +140,14 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
             fields.insert(
                 "credential_revoked_revision".to_string(),
                 FieldValue::I64(row.credential_revoked_revision),
+            );
+            // The limit is an administrator's decision about the ACCOUNT, taken
+            // once from any node, so it replicates with the row. What it is
+            // compared against — the open sessions — does not: those are this
+            // node's runtime state.
+            fields.insert(
+                "max_sessions".to_string(),
+                FieldValue::I64(row.max_sessions),
             );
             SqlWriteAction::Insert
         }

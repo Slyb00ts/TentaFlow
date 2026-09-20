@@ -63,9 +63,6 @@ pub enum VaultError {
     /// "the key lives on another node" instead of "authentication failed".
     #[error("secret_missing: no credential material for '{0}' on this node")]
     SecretMissing(String),
-    /// No provider credential for this (org, node, engine) triple.
-    #[error("credential_missing: no credential for engine '{engine_id}' on node '{node_id}'")]
-    CredentialMissing { node_id: String, engine_id: String },
     /// A stored row is not what this module wrote — plaintext where ciphertext
     /// belongs, or an unknown kind. Never decrypted, never used.
     #[error("vault row '{0}' is corrupt")]
@@ -201,6 +198,25 @@ pub struct Rotation {
 pub struct AgentCredential {
     pub provider_base_url: String,
     pub material: SecretMaterial,
+}
+
+impl AgentCredential {
+    /// Builds the credential the adapter injects out of material that came from
+    /// the account registry, and the engine's own upstream.
+    ///
+    /// The material is a `String` only long enough to be moved; this takes
+    /// ownership of that allocation and `SecretMaterial`'s `Drop` wipes it, so
+    /// the plaintext never exists in two places at once.
+    pub fn new(provider_base_url: &str, material: String) -> Self {
+        Self {
+            provider_base_url: provider_base_url.to_string(),
+            material: SecretMaterial {
+                kind: SecretKind::GitToken,
+                fingerprint: fingerprint_of(SecretKind::GitToken, &material),
+                material,
+            },
+        }
+    }
 }
 
 impl fmt::Debug for AgentCredential {
@@ -582,235 +598,6 @@ pub fn delete_workspace_secrets(db: &DbPool, local: &DbPool, workspace_id: &str)
 }
 
 // =============================================================================
-// Agent (provider CLI) credentials
-// =============================================================================
-
-/// Stores or replaces the provider credential of one engine on THIS node. The
-/// account is organizational, the material is node-local — the key that
-/// protects it is.
-#[allow(clippy::too_many_arguments)]
-pub fn put_agent_credential(
-    local: &DbPool,
-    cipher: &SettingsCipher,
-    org_id: &str,
-    node_id: &str,
-    engine_id: &str,
-    material: &str,
-    provider_base_url: &str,
-    created_by: &str,
-) -> Result<String> {
-    let provider_base_url = provider_base_url.trim();
-    if provider_base_url.is_empty() {
-        return Err(VaultError::Invalid(
-            "a provider credential needs the upstream base url the adapter forwards to".into(),
-        ));
-    }
-    // The adapter parses this URL when it binds. Checking it at the write means
-    // a typo is a rejected form rather than a delegation that dies after the
-    // run row, the ticket and the CLI instance have already been created.
-    match url::Url::parse(provider_base_url.trim_end_matches('/')) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") => {}
-        Ok(url) => {
-            return Err(VaultError::Invalid(format!(
-                "provider_base_url must be http(s), got '{}'",
-                url.scheme()
-            )))
-        }
-        Err(error) => {
-            return Err(VaultError::Invalid(format!(
-                "provider_base_url is not a URL: {error}"
-            )))
-        }
-    }
-    let stored = encrypt_material(
-        cipher,
-        SecretKind::GitToken,
-        material,
-        &agent_credential_context(org_id, node_id, engine_id),
-    )?;
-    let conn = local.write().map_err(db_err)?;
-    conn.execute(
-        "INSERT INTO code_agent_credentials \
-           (org_id, node_id, engine_id, material_enc, provider_base_url, fingerprint, \
-            created_by, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now')) \
-         ON CONFLICT(org_id, node_id, engine_id) DO UPDATE SET \
-            material_enc = excluded.material_enc, \
-            provider_base_url = excluded.provider_base_url, \
-            fingerprint = excluded.fingerprint, \
-            rotated_at = datetime('now')",
-        params![
-            org_id,
-            node_id,
-            engine_id,
-            stored.ciphertext,
-            provider_base_url,
-            stored.fingerprint,
-            created_by
-        ],
-    )
-    .map_err(db_err)?;
-    Ok(stored.fingerprint)
-}
-
-/// Reads the provider credential the adapter must inject. A missing row is
-/// `credential_missing`: the engine is configured for the organization but this
-/// node was never given the key, and the adapter has to say that rather than
-/// forward an unauthenticated request.
-pub fn get_agent_credential(
-    local: &DbPool,
-    cipher: &SettingsCipher,
-    org_id: &str,
-    node_id: &str,
-    engine_id: &str,
-) -> Result<AgentCredential> {
-    let row: Option<(Vec<u8>, String, Option<String>)> = {
-        let conn = local.read().map_err(db_err)?;
-        conn.query_row(
-            "SELECT material_enc, provider_base_url, fingerprint FROM code_agent_credentials \
-             WHERE org_id = ?1 AND node_id = ?2 AND engine_id = ?3",
-            params![org_id, node_id, engine_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(db_err)?
-    };
-    let (ciphertext, provider_base_url, fingerprint) =
-        row.ok_or_else(|| VaultError::CredentialMissing {
-            node_id: node_id.to_string(),
-            engine_id: engine_id.to_string(),
-        })?;
-    let label = format!("{org_id}/{node_id}/{engine_id}");
-    let context = agent_credential_context(org_id, node_id, engine_id);
-    let opened = decrypt_material(cipher, &label, &ciphertext, &context)?;
-    let material = opened.value;
-
-    let conn = local.write().map_err(db_err)?;
-    if !opened.bound {
-        let rebound = cipher
-            .encrypt_bound(&material, &context)
-            .map_err(|_| VaultError::Cipher)?;
-        conn.execute(
-            "UPDATE code_agent_credentials SET material_enc = ?4 \
-             WHERE org_id = ?1 AND node_id = ?2 AND engine_id = ?3",
-            params![org_id, node_id, engine_id, rebound.into_bytes()],
-        )
-        .map_err(db_err)?;
-    }
-    conn.execute(
-        "UPDATE code_agent_credentials SET last_used_at = datetime('now') \
-         WHERE org_id = ?1 AND node_id = ?2 AND engine_id = ?3",
-        params![org_id, node_id, engine_id],
-    )
-    .map_err(db_err)?;
-
-    Ok(AgentCredential {
-        provider_base_url,
-        material: SecretMaterial {
-            kind: SecretKind::GitToken,
-            fingerprint: fingerprint
-                .unwrap_or_else(|| fingerprint_of(SecretKind::GitToken, &material)),
-            material,
-        },
-    })
-}
-
-/// Everything a provider credential row says EXCEPT the material.
-///
-/// This is what an administrator screen is allowed to see: which engine, which
-/// upstream, which key (by digest) and when it was last used. There is no field
-/// here the material could be put in, which is what makes the "listing never
-/// returns a secret" rule a property of the type instead of a habit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentCredentialRecord {
-    pub node_id: String,
-    pub engine_id: String,
-    pub provider_base_url: String,
-    pub fingerprint: Option<String>,
-    pub created_by: String,
-    pub created_at: String,
-    pub rotated_at: Option<String>,
-    pub last_used_at: Option<String>,
-}
-
-const AGENT_CREDENTIAL_COLUMNS: &str = "node_id, engine_id, provider_base_url, fingerprint, \
-     created_by, created_at, rotated_at, last_used_at";
-
-fn agent_credential_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentCredentialRecord> {
-    Ok(AgentCredentialRecord {
-        node_id: row.get(0)?,
-        engine_id: row.get(1)?,
-        provider_base_url: row.get(2)?,
-        fingerprint: row.get(3)?,
-        created_by: row.get(4)?,
-        created_at: row.get(5)?,
-        rotated_at: row.get(6)?,
-        last_used_at: row.get(7)?,
-    })
-}
-
-/// Metadata of every provider credential one node holds for one organization.
-///
-/// Scoped by node because that is what the row means: material sealed with a
-/// node's `SettingsCipher` key exists for that node only, and listing another
-/// node's rows here would show credentials this Core could not open anyway.
-pub fn list_agent_credentials(
-    local: &DbPool,
-    org_id: &str,
-    node_id: &str,
-) -> Result<Vec<AgentCredentialRecord>> {
-    let conn = local.read().map_err(db_err)?;
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {AGENT_CREDENTIAL_COLUMNS} FROM code_agent_credentials \
-             WHERE org_id = ?1 AND node_id = ?2 ORDER BY engine_id"
-        ))
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map(params![org_id, node_id], agent_credential_record)
-        .map_err(db_err)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
-}
-
-/// The same metadata for one engine, or `None` when the node holds no key for
-/// it. Distinct from `get_agent_credential`, which decrypts: a screen that only
-/// needs to say "a key is stored" must never touch the material to find out.
-pub fn get_agent_credential_record(
-    local: &DbPool,
-    org_id: &str,
-    node_id: &str,
-    engine_id: &str,
-) -> Result<Option<AgentCredentialRecord>> {
-    let conn = local.read().map_err(db_err)?;
-    conn.query_row(
-        &format!(
-            "SELECT {AGENT_CREDENTIAL_COLUMNS} FROM code_agent_credentials \
-             WHERE org_id = ?1 AND node_id = ?2 AND engine_id = ?3"
-        ),
-        params![org_id, node_id, engine_id],
-        agent_credential_record,
-    )
-    .optional()
-    .map_err(db_err)
-}
-
-/// Removes the provider credential of one engine on this node.
-pub fn delete_agent_credential(
-    local: &DbPool,
-    org_id: &str,
-    node_id: &str,
-    engine_id: &str,
-) -> Result<usize> {
-    let conn = local.write().map_err(db_err)?;
-    conn.execute(
-        "DELETE FROM code_agent_credentials \
-         WHERE org_id = ?1 AND node_id = ?2 AND engine_id = ?3",
-        params![org_id, node_id, engine_id],
-    )
-    .map_err(db_err)
-}
-
-// =============================================================================
 // Internals
 // =============================================================================
 
@@ -824,12 +611,6 @@ struct Encrypted {
 /// workspace, or under another handle, has to break the tag.
 fn workspace_secret_context(workspace_id: &str, secret_ref: &str) -> Vec<u8> {
     format!("code-studio/workspace-secret/v1\0{workspace_id}\0{secret_ref}").into_bytes()
-}
-
-/// The same idea for a provider credential, whose identity is the triple it is
-/// keyed by.
-fn agent_credential_context(org_id: &str, node_id: &str, engine_id: &str) -> Vec<u8> {
-    format!("code-studio/agent-credential/v1\0{org_id}\0{node_id}\0{engine_id}").into_bytes()
 }
 
 fn encrypt_material(
@@ -1288,44 +1069,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 0, "the orphaned material survived the failed swap");
-    }
-
-    #[test]
-    fn an_agent_credential_is_addressed_by_org_node_and_engine() {
-        let (_db, local, cipher) = test_db();
-        let missing =
-            get_agent_credential(&local, &cipher, "org-1", "node-1", "codex").unwrap_err();
-        assert!(
-            matches!(missing, VaultError::CredentialMissing { .. }),
-            "{missing:?}"
-        );
-        assert!(missing.to_string().contains("credential_missing"));
-
-        put_agent_credential(
-            &local,
-            &cipher,
-            "org-1",
-            "node-1",
-            "codex",
-            TOKEN,
-            "https://api.example.invalid",
-            "u-admin",
-        )
-        .expect("put");
-
-        // Another node's row is a different credential, not this one.
-        assert!(get_agent_credential(&local, &cipher, "org-1", "node-2", "codex").is_err());
-
-        let credential =
-            get_agent_credential(&local, &cipher, "org-1", "node-1", "codex").expect("get");
-        assert_eq!(credential.material.expose(), TOKEN);
-        assert_eq!(credential.provider_base_url, "https://api.example.invalid");
-
-        assert_eq!(
-            delete_agent_credential(&local, "org-1", "node-1", "codex").expect("delete"),
-            1
-        );
-        assert!(get_agent_credential(&local, &cipher, "org-1", "node-1", "codex").is_err());
     }
 
     #[test]

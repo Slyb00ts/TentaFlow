@@ -932,20 +932,36 @@ pub async fn handle_ws_connection<S>(
                 }
 
                 // Zunifikowany async dispatch — sync handlery wrapowane przez makro.
-                let (resp_body, is_error) = dispatch::dispatch(&body, &ctx).await;
-                let flags = if is_error {
-                    EnvelopeFlags::IS_ERROR
-                } else {
-                    EnvelopeFlags::empty()
-                };
-                let _ = send_body(
-                    &control_tx,
-                    envelope.correlation_id,
-                    envelope.message_kind,
-                    &resp_body,
-                    flags,
-                )
-                .await;
+                //
+                // Its own task, because this loop is the ONLY reader of this
+                // connection: a handler that legitimately waits a long time —
+                // a sign-in start waits its own `URL_TIMEOUT` for the vendor
+                // CLI to print an address — would otherwise hold back every
+                // other frame the client has in flight, including ones the
+                // person is already waiting on. Handlers are entered
+                // concurrently already, from the HTTP server, from mesh peers
+                // and from other sockets; this stops making one connection the
+                // exception. The answer leaves with the same `correlation_id`,
+                // so the client cannot tell it apart from an inline reply.
+                let control_tx_dispatch = control_tx.clone();
+                let correlation_id = envelope.correlation_id;
+                let message_kind = envelope.message_kind;
+                tokio::spawn(async move {
+                    let (resp_body, is_error) = dispatch::dispatch(&body, &ctx).await;
+                    let flags = if is_error {
+                        EnvelopeFlags::IS_ERROR
+                    } else {
+                        EnvelopeFlags::empty()
+                    };
+                    let _ = send_body(
+                        &control_tx_dispatch,
+                        correlation_id,
+                        message_kind,
+                        &resp_body,
+                        flags,
+                    )
+                    .await;
+                });
             }
             Message::Text(t) => {
                 warn!(

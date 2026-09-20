@@ -128,11 +128,15 @@ impl BinaryDeploy {
         )?;
         env.retain(|name, _| name == "PORT");
         env.insert("TENTAFLOW_ENGINE_ID".into(), self.manifest.engine.id.clone());
+        // The release is the vendor's current one, not a pin: deploying this
+        // engine again is how a node moves forward.
+        let release = super::managed_cli::resolve_latest(&self.manifest.engine.id).await?;
         let (install_root, bin_dir) = super::managed_cli::install(
             &self.manifest.engine.id,
-            &self.manifest.engine.version,
+            &release,
             self.log_sink.as_ref(),
-        ).await?;
+        )
+        .await?;
         let inherited_path = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![bin_dir];
         paths.extend(std::env::split_paths(&inherited_path));
@@ -275,15 +279,11 @@ impl DeployStrategy for BinaryDeploy {
 
         let managed_cli = native.runtime == NativeRuntime::ManagedCli;
         let managed_cli_executable = if managed_cli {
-            Some(
-                super::managed_cli::ensure_bridge(
-                    &self.manifest.engine.id,
-                    &self.manifest.native_source_hash,
-                    &root,
-                    self.log_sink.as_ref(),
-                )
-                .await?,
-            )
+            Some(super::managed_cli::ensure_bridge(
+                &self.manifest.engine.id,
+                &self.manifest.native_source_hash,
+                self.log_sink.as_ref(),
+            )?)
         } else {
             None
         };

@@ -29,6 +29,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tentaflow_protocol::code_studio::AskAccountInfo;
 
 use crate::agents::CoreToolName;
 use crate::db::DbPool;
@@ -152,6 +153,37 @@ pub struct Approval {
     pub kind: AskKind,
 }
 
+/// One parked account ask put to the operator (C01, §D.5).
+///
+/// Not an `Approval`. There is no capability to grant and no scope to store —
+/// the run is refused because an account is missing, and the only thing that
+/// fixes it is a sign-in — so the answer is "the account works now" and it
+/// arrives from the sign-in window, not from a decision button. Sharing the
+/// permission card's fields would mean inventing a `Capability` for something
+/// nobody may be granted.
+#[derive(Debug, Clone)]
+pub struct AccountApproval {
+    /// Why the run stopped and what would fix it — already redacted prose.
+    pub prompt: String,
+    pub engine_id: String,
+    /// The provider's own product name (`provider_accounts::AGENT_ENGINES`).
+    /// Data, not prose.
+    pub engine_name: String,
+    /// `global` | `user`, as `agents.runtime_json` wrote it.
+    pub mode: String,
+    /// The agent that could not start, as the console names it.
+    pub agent_name: String,
+    /// The account that exists but has no usable credential; absent when the
+    /// principal has no account for this engine at all.
+    pub account_id: Option<String>,
+    pub account_name: Option<String>,
+    /// Accounts of this engine the principal could switch to instead.
+    pub candidate_accounts: Vec<String>,
+    /// Principal the asking run acts for — the second half of the wake-up key,
+    /// so a colleague's sign-in never settles this run.
+    pub user_id: String,
+}
+
 /// A change set put to the operator for review.
 #[derive(Debug, Clone)]
 pub struct ReviewPrompt {
@@ -171,6 +203,24 @@ pub trait ApprovalGate: Send + Sync {
     /// Puts one capability decision to the operator.
     async fn request(&self, ask: &Approval) -> ApprovalDecision;
 
+    /// Puts a missing-account question to the operator (C01) and returns
+    /// `AllowOnce` once the account is there, `Deny` when nobody connected one.
+    ///
+    /// A separate method rather than a fifth approval scope, because the two
+    /// questions have different answers: a scope is a permission the PEP stores
+    /// and reads back, while this one is settled by a sign-in happening in
+    /// another window — the run wakes holding no grant at all, which is exactly
+    /// what it needs, since the account itself is the permission.
+    ///
+    /// `interaction_id` is the key the sign-in will be matched against, minted
+    /// by `suspend_for_account` next to the approvals row that announces it, not
+    /// by the caller: the row and the registry have to name the same ask.
+    async fn request_account(
+        &self,
+        interaction_id: &str,
+        ask: &AccountApproval,
+    ) -> ApprovalDecision;
+
     /// Presents a change set and returns the operator's raw answer, or `None`
     /// when nobody answered inside the budget.
     async fn present_review(&self, prompt: &ReviewPrompt) -> Option<String>;
@@ -186,6 +236,9 @@ pub trait ApprovalGate: Send + Sync {
 pub struct ScriptedGate {
     answer: ApprovalDecision,
     asked: std::sync::Mutex<Vec<Capability>>,
+    /// Engines an account was asked about, in order — the same assertion as
+    /// `asked`, for the card that carries no capability.
+    accounts_asked: std::sync::Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -194,6 +247,7 @@ impl ScriptedGate {
         Self {
             answer,
             asked: std::sync::Mutex::new(Vec::new()),
+            accounts_asked: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -202,6 +256,11 @@ impl ScriptedGate {
     pub fn asked(&self) -> Vec<Capability> {
         self.asked.lock().expect("asked").clone()
     }
+
+    /// Engines an account was asked about, in order.
+    pub fn accounts_asked(&self) -> Vec<String> {
+        self.accounts_asked.lock().expect("accounts_asked").clone()
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +268,18 @@ impl ScriptedGate {
 impl ApprovalGate for ScriptedGate {
     async fn request(&self, ask: &Approval) -> ApprovalDecision {
         self.asked.lock().expect("asked").push(ask.capability);
+        self.answer
+    }
+
+    async fn request_account(
+        &self,
+        _interaction_id: &str,
+        ask: &AccountApproval,
+    ) -> ApprovalDecision {
+        self.accounts_asked
+            .lock()
+            .expect("accounts_asked")
+            .push(ask.engine_id.clone());
         self.answer
     }
 
@@ -795,9 +866,12 @@ pub async fn suspend_for_operator(
         ask.session_id,
         ask.run_id,
         &interaction_id,
-        capability,
+        capability.slug(),
         target,
         &summary,
+        // A permission question needs no description beyond the summary: its
+        // object is the target, which the row already keeps as a pattern.
+        None,
     )?;
     let _ = events::append(
         ask.pool,
@@ -836,6 +910,74 @@ pub async fn suspend_for_operator(
     Ok(decision)
 }
 
+/// Suspends a run on a MISSING ACCOUNT: writes the `approvals` row, puts the
+/// question to the operator, records the outcome on the same row.
+///
+/// Same ordering rule as `suspend_for_operator` and for the same reason — the
+/// row exists before anybody is asked, so the console can find the question
+/// while it is open and the timeline can show it afterwards. What differs is
+/// who answers: nobody grants an account, so this parks until the sign-in
+/// window reports success (or the budget runs out). On timeout the row is
+/// settled `deny` and the caller refuses the run, which is why a person who
+/// walks away leaves nothing waiting in the registry or in the table.
+pub async fn suspend_for_account(
+    ask: &OperatorAsk<'_>,
+    account: AccountApproval,
+) -> Result<ApprovalDecision> {
+    let approval_id = uuid::Uuid::new_v4().to_string();
+    let interaction_id = uuid::Uuid::new_v4().to_string();
+    let summary = redact::redact_text(&account.prompt);
+    // The sign-in that answers this happens in another window and may take
+    // minutes; the console draws the waiting card from the poll alone, so the
+    // description of what is missing travels on the row.
+    let described = serde_json::to_string(&AskAccountInfo {
+        engine_id: account.engine_id.clone(),
+        engine_name: account.engine_name.clone(),
+        mode: account.mode.clone(),
+        agent_name: account.agent_name.clone(),
+        account_id: account.account_id.clone(),
+        account_name: account.account_name.clone(),
+    })?;
+
+    record_approval_request(
+        ask.pool,
+        &approval_id,
+        ask.session_id,
+        ask.run_id,
+        &interaction_id,
+        pep::ACCOUNT_LOGIN_CAPABILITY,
+        // The engine is the target, exactly as it is for `cli_delegate`: "this
+        // run has no account for codex" is the whole question, and a row that
+        // named no target could not be read back.
+        Some(&account.engine_id),
+        &summary,
+        Some(&described),
+    )?;
+    let _ = events::append(
+        ask.pool,
+        ask.session_id,
+        SessionEvent::new(
+            events::approval_requested_key(&approval_id),
+            EventPayload::ApprovalRequested {
+                approval_id: approval_id.clone(),
+                capability: pep::ACCOUNT_LOGIN_CAPABILITY.to_string(),
+                summary: summary.clone(),
+            },
+        ),
+    );
+
+    let decision = ask.gate.request_account(&interaction_id, &account).await;
+
+    settle_approval(
+        ask.pool,
+        ask.session_id,
+        &approval_id,
+        decision.as_str(),
+        ask.user_id,
+    )?;
+    Ok(decision)
+}
+
 /// Writes the pending question. The TARGET is stored twice on purpose: as the
 /// pattern a grant would be written from (§9.1 — the object of a permission is
 /// capability + target) and as the digest that recognizes the same question
@@ -847,9 +989,10 @@ fn record_approval_request(
     session_id: &str,
     run_id: Option<&str>,
     interaction_id: &str,
-    capability: Capability,
+    capability: &str,
     target: Option<&str>,
     summary: &str,
+    account_json: Option<&str>,
 ) -> Result<()> {
     let pattern = pep::grant_pattern(target);
     pep::validate_grant_pattern(pattern).map_err(|e| anyhow!("{e}"))?;
@@ -859,18 +1002,19 @@ fn record_approval_request(
     conn.execute(
         "INSERT INTO approvals \
             (id, session_id, run_id, interaction_id, capability, target_digest, target_pattern, \
-             summary, detail_ref, status, requested_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'pending', ?9)",
+             summary, detail_ref, status, requested_at, account_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'pending', ?9, ?10)",
         rusqlite::params![
             approval_id,
             session_id,
             run_id,
             interaction_id,
-            capability.slug(),
-            pep::target_digest(capability, pattern),
+            capability,
+            pep::target_digest_for(capability, pattern),
             pattern,
             summary,
             chrono::Utc::now().to_rfc3339(),
+            account_json,
         ],
     )?;
     Ok(())
@@ -3652,7 +3796,6 @@ mod tests {
                 updated_at: "now".into(),
             },
             session: SessionRecord {
-                agent_service_id: None,
                 id: "sess-remote".into(),
                 workspace_id: "ws-remote".into(),
                 user_id: "u-owner".into(),

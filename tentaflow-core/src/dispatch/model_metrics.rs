@@ -17,6 +17,7 @@ use tentaflow_protocol::{
 use super::HandlerContext;
 use crate::db::models::{
     DbModelMetricsRollup, DbModelPricing, ModelMetricsFilter, NewModelPricing,
+    CLI_DELEGATION_BACKEND,
 };
 use crate::db::repository::{
     self, DECODE_TPS_EDGES, E2E_MS_EDGES, MODEL_METRICS_HISTOGRAM_VERSION, TTFT_MS_EDGES,
@@ -26,6 +27,10 @@ use crate::services::rbac::OrgContext;
 const PERM_READ: &str = "metrics.read";
 const PERM_WRITE: &str = "metrics.write";
 const NO_GROUP_KEY: &str = "(no group)";
+/// `group_by=account` bucket for usage that carries no provider account (the
+/// gateway path). A reserved key, never an account id — a sentinel that could
+/// collide with a real account id would misattribute the fleet's traffic.
+const NO_ACCOUNT_KEY: &str = "(no account)";
 
 fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     ctx.org_context
@@ -318,6 +323,16 @@ fn decorate_summary_rows(
                 row.display_name = models.get(&row.key).cloned();
             }
         }
+        "account" => {
+            let accounts =
+                crate::provider_accounts::repository::account_presentations(&ctx.state.db, &keys)?;
+            for row in rows.iter_mut() {
+                if let Some(p) = accounts.get(&row.key) {
+                    row.display_name = Some(p.display_name.clone());
+                    row.subtitle = Some(p.subtitle.clone());
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -386,8 +401,17 @@ fn row_matches_filter(
     true
 }
 
-/// Koszt jednego wiersza rollupu wg cennika modelu (0 gdy brak cennika).
+/// Cost of one rollup row from the model's price list (0 when there is none).
+///
+/// A provider-CLI delegation row (`CLI_DELEGATION_BACKEND`) is excluded ON
+/// PURPOSE: it is paid for by a subscription or by a key the CLI itself holds,
+/// so `model_pricing` rates (which describe a model this node serves) do not
+/// apply. Pricing it from them would present a guess as a measurement — the cost
+/// of such a turn is unknown, not zero (`row_is_unpriced`).
 fn row_cost(row: &DbModelMetricsRollup, pricing: Option<&DbModelPricing>) -> f64 {
+    if row_is_unpriced(row) {
+        return 0.0;
+    }
     let Some(p) = pricing else {
         return 0.0;
     };
@@ -398,15 +422,29 @@ fn row_cost(row: &DbModelMetricsRollup, pricing: Option<&DbModelPricing>) -> f64
         + (row.embedding_tokens as f64 / 1000.0) * p.embedding_per_1k
 }
 
-/// Czy wiersz niesie jakies rozliczalne uzycie (tokeny/audio/obrazy). Brak
-/// cennika ma znaczenie tylko dla takich wierszy — model bez uzycia nie zaklamie
-/// kosztu, wiec nie oznaczamy go jako `missing_pricing`.
+/// A row no price list can value: a provider-CLI turn. The provider may quote an
+/// amount itself (`session_runs.cost_usd` in the workspace DB), but the rollup
+/// does not carry it, so the cost stays unknown here and the UI reports it as
+/// incomplete rather than as a zero pretending to be a measurement.
+fn row_is_unpriced(row: &DbModelMetricsRollup) -> bool {
+    row.backend == CLI_DELEGATION_BACKEND
+}
+
+/// Whether the row carries any billable usage (tokens/audio/images). A missing
+/// price list only matters for such rows — a model with no usage cannot misstate
+/// cost, so it is not flagged `missing_pricing`.
 fn row_is_billable(row: &DbModelMetricsRollup) -> bool {
     row.prompt_tokens > 0
         || row.completion_tokens > 0
         || row.audio_ms > 0
         || row.images > 0
         || row.embedding_tokens > 0
+}
+
+/// This row's cost is incomplete: either the usage has no price list, or the row
+/// is not priced by `model_pricing` at all (a provider-CLI turn).
+fn row_cost_is_incomplete(row: &DbModelMetricsRollup, pricing: Option<&DbModelPricing>) -> bool {
+    row_is_billable(row) && (pricing.is_none() || row_is_unpriced(row))
 }
 
 /// Waliduje pojedyncza wartosc cennika: musi byc skonczona i nieujemna, inaczej
@@ -537,16 +575,24 @@ fn summary_v1(
     let org = require_read(ctx)?;
     if !matches!(
         group_by,
-        "user" | "group" | "model" | "node" | "service" | "day" | "hour"
+        "user" | "group" | "model" | "node" | "service" | "day" | "hour" | "account"
     ) {
         return Err(ProtocolError::bad_request(format!(
-            "unknown group_by '{group_by}' (expected user|group|model|node|service|day|hour)"
+            "unknown group_by '{group_by}' (expected user|group|model|node|service|day|hour|account)"
         )));
     }
     let (hour_from, hour_to) = period_window(period, period_key)?;
+    // A drill on the `(no account)` row asks for the account dimension's own
+    // bucket, so the sentinel becomes the empty id the gateway rows carry —
+    // the only place the wire value is translated to SQL.
+    let account_id = filter
+        .account
+        .as_deref()
+        .map(|a| if a == NO_ACCOUNT_KEY { "" } else { a });
     let db_filter = ModelMetricsFilter {
         model_id: filter.model.as_deref(),
         user_id: filter.user.as_deref(),
+        account_id,
         hour_from: Some(&hour_from),
         hour_to: Some(&hour_to),
     };
@@ -583,7 +629,7 @@ fn summary_v1(
             continue;
         }
         let pricing_row = pricing.get(&row.model_id);
-        let missing_pricing = pricing_row.is_none() && row_is_billable(row);
+        let missing_pricing = row_cost_is_incomplete(row, pricing_row);
         let cost = row_cost(row, pricing_row);
         if let Some(g) = grand.as_mut() {
             g.add_row(row, cost, missing_pricing);
@@ -593,6 +639,13 @@ fn summary_v1(
             "model" => vec![row.model_id.clone()],
             "node" => vec![row.node_id.clone()],
             "service" => vec![row.service_key.clone()],
+            // Gateway traffic carries no account (`''`); it is the one bucket
+            // that must NOT be presented as a provider account.
+            "account" => vec![if row.account_id.is_empty() {
+                NO_ACCOUNT_KEY.to_string()
+            } else {
+                row.account_id.clone()
+            }],
             "day" => vec![row.hour_bucket.chars().take(10).collect()],
             "hour" => vec![row.hour_bucket.clone()],
             // Only "group" is left after the up-front group_by validation.
@@ -651,6 +704,7 @@ fn node_service_v1(
     let db_filter = ModelMetricsFilter {
         model_id: None,
         user_id: None,
+        account_id: None,
         hour_from: Some(&hour_from),
         hour_to: Some(&hour_to),
     };
@@ -921,6 +975,23 @@ pub(crate) mod tests {
         hour: &str,
         tokens: i64,
     ) {
+        bump_row(ctx, node, user, model, hour, "vllm", "", tokens)
+    }
+
+    /// One rollup row with an explicit backend and provider account: the gateway
+    /// shape (`bump`) is only one of two producers, and a CLI delegation row
+    /// differs in both fields.
+    #[allow(clippy::too_many_arguments)]
+    fn bump_row(
+        ctx: &HandlerContext,
+        node: &str,
+        user: &str,
+        model: &str,
+        hour: &str,
+        backend: &str,
+        account_id: &str,
+        tokens: i64,
+    ) {
         repository::bump_model_metrics_rollup(
             &ctx.state.db,
             &ModelMetricsDims {
@@ -929,9 +1000,10 @@ pub(crate) mod tests {
                 user_id: user,
                 model_id: model,
                 service_key: "vllm:qwen",
-                backend: "vllm",
+                backend,
                 modality: "chat",
                 hour_bucket: hour,
+                account_id,
                 histogram_version: MODEL_METRICS_HISTOGRAM_VERSION,
             },
             &ModelMetricsCounters {
@@ -1089,6 +1161,11 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("unknown group_by"));
+        assert!(
+            err.message.contains("hour|account"),
+            "a bogus group_by is told which dimensions exist: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1163,5 +1240,200 @@ pub(crate) mod tests {
             rows[0].model_display_name.as_deref(),
             Some("Qwen 3.8 27B AWQ")
         );
+    }
+
+    /// One provider account as `provider_accounts` stores it, so the summary has
+    /// a name and an engine to resolve.
+    fn seed_provider_account(
+        ctx: &HandlerContext,
+        account_id: &str,
+        engine_id: &str,
+        display_name: &str,
+    ) {
+        let conn = ctx.state.db.write().unwrap();
+        conn.execute(
+            "INSERT INTO provider_accounts \
+               (account_id, org_id, engine_id, display_name, scope, credential_kind, status, \
+                created_by) \
+             VALUES (?1, ?2, ?3, ?4, 'global', 'api_key', 'active', 'admin')",
+            rusqlite::params![account_id, DEFAULT_ORG_ID, engine_id, display_name],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn summary_groups_usage_by_provider_account() {
+        let ctx = reader_ctx();
+        seed_directory(&ctx);
+        seed_provider_account(&ctx, "acc-claude", "claude-code", "Konto zespolu");
+        seed_provider_account(&ctx, "acc-codex", "codex", "Konto Piotra");
+        let local = ctx.state.local_node_id.to_string();
+        // Two HOURS of one account: the summary sums the buckets into one row.
+        bump_row(
+            &ctx,
+            &local,
+            "u1",
+            "sonnet",
+            "2026-08-19T10:00:00Z",
+            CLI_DELEGATION_BACKEND,
+            "acc-claude",
+            1000,
+        );
+        bump_row(
+            &ctx,
+            &local,
+            "u1",
+            "sonnet",
+            "2026-08-19T11:00:00Z",
+            CLI_DELEGATION_BACKEND,
+            "acc-claude",
+            300,
+        );
+        bump_row(
+            &ctx,
+            &local,
+            "u1",
+            "sonnet",
+            "2026-08-19T10:00:00Z",
+            CLI_DELEGATION_BACKEND,
+            "acc-codex",
+            400,
+        );
+        // Gateway traffic carries no account and must stay its own bucket.
+        bump(&ctx, &local, "u1", "qwen", "2026-08-19T10:00:00Z", 50);
+
+        let rows = summary_rows(&ctx, "account", ModelMetricsFilterWire::default());
+        assert_eq!(rows.len(), 3);
+
+        let claude = rows.iter().find(|r| r.key == "acc-claude").unwrap();
+        assert_eq!(claude.total_tokens, 1300);
+        assert_eq!(claude.display_name.as_deref(), Some("Konto zespolu"));
+        assert_eq!(claude.subtitle.as_deref(), Some("Claude Code"));
+
+        let codex = rows.iter().find(|r| r.key == "acc-codex").unwrap();
+        assert_eq!(codex.total_tokens, 400);
+        assert_eq!(codex.display_name.as_deref(), Some("Konto Piotra"));
+        assert_eq!(codex.subtitle.as_deref(), Some("Codex"));
+
+        let gateway = rows.iter().find(|r| r.key == NO_ACCOUNT_KEY).unwrap();
+        assert_eq!(gateway.total_tokens, 50);
+        assert_eq!(
+            gateway.display_name, None,
+            "traffic without an account is not presented as an account"
+        );
+    }
+
+    #[test]
+    fn summary_filters_by_provider_account() {
+        let ctx = reader_ctx();
+        seed_directory(&ctx);
+        seed_provider_account(&ctx, "acc-claude", "claude-code", "Konto zespolu");
+        seed_provider_account(&ctx, "acc-codex", "codex", "Konto Piotra");
+        let local = ctx.state.local_node_id.to_string();
+        bump_row(
+            &ctx,
+            &local,
+            "u1",
+            "sonnet",
+            "2026-08-19T10:00:00Z",
+            CLI_DELEGATION_BACKEND,
+            "acc-claude",
+            1000,
+        );
+        bump_row(
+            &ctx,
+            &local,
+            "u1",
+            "sonnet",
+            "2026-08-19T10:00:00Z",
+            CLI_DELEGATION_BACKEND,
+            "acc-codex",
+            400,
+        );
+        bump(&ctx, &local, "u1", "qwen", "2026-08-19T10:00:00Z", 50);
+
+        let claude = summary_rows(
+            &ctx,
+            "model",
+            ModelMetricsFilterWire {
+                account: Some("acc-claude".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0].key, "sonnet");
+        assert_eq!(claude[0].total_tokens, 1000);
+
+        // The sentinel names the gateway bucket, so it must select the rows with
+        // NO account — an empty id, not "no filter at all".
+        let gateway = summary_rows(
+            &ctx,
+            "model",
+            ModelMetricsFilterWire {
+                account: Some(NO_ACCOUNT_KEY.to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(gateway.len(), 1);
+        assert_eq!(gateway[0].key, "qwen");
+        assert_eq!(gateway[0].total_tokens, 50);
+
+        let missing = summary_rows(
+            &ctx,
+            "model",
+            ModelMetricsFilterWire {
+                account: Some("acc-missing".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(missing.is_empty());
+    }
+
+    /// A provider-CLI turn is never priced from `model_pricing`, even when the
+    /// same model NAME has a price list: the provider bills a subscription, the
+    /// rollup carries no quoted amount, so the cost is unknown and flagged
+    /// incomplete instead of being invented. The gateway row for that model is
+    /// priced as usual, so the assertion cannot pass with pricing broken.
+    #[test]
+    fn cli_delegation_cost_is_never_derived_from_model_pricing() {
+        let ctx = reader_ctx();
+        seed_directory(&ctx);
+        seed_provider_account(&ctx, "acc-claude", "claude-code", "Konto zespolu");
+        repository::upsert_model_pricing(
+            &ctx.state.db,
+            &NewModelPricing {
+                org_id: DEFAULT_ORG_ID,
+                model_id: "sonnet",
+                prompt_per_1k: 3.0,
+                completion_per_1k: 15.0,
+                audio_per_min: 0.0,
+                image_each: 0.0,
+                embedding_per_1k: 0.0,
+            },
+        )
+        .unwrap();
+        let local = ctx.state.local_node_id.to_string();
+        // 1000 tokens => 500 prompt + 500 completion at 3.0/15.0 per 1k = 9.0.
+        bump_row(
+            &ctx,
+            &local,
+            "u1",
+            "sonnet",
+            "2026-08-19T10:00:00Z",
+            CLI_DELEGATION_BACKEND,
+            "acc-claude",
+            1000,
+        );
+        bump(&ctx, &local, "u1", "sonnet", "2026-08-19T10:00:00Z", 1000);
+
+        let rows = summary_rows(&ctx, "account", ModelMetricsFilterWire::default());
+        let cli = rows.iter().find(|r| r.key == "acc-claude").unwrap();
+        assert_eq!(cli.total_tokens, 1000);
+        assert_eq!(cli.cost, 0.0, "a CLI turn is not priced from model_pricing");
+        assert!(cli.missing_pricing, "its cost is unknown, not zero");
+
+        let gateway = rows.iter().find(|r| r.key == NO_ACCOUNT_KEY).unwrap();
+        assert!((gateway.cost - 9.0).abs() < 1e-9);
+        assert!(!gateway.missing_pricing);
     }
 }

@@ -1,11 +1,12 @@
 // ===== File: provider_accounts/credential_events.rs — what Core does when a bridge's credential moves =====
 //
 // A bridge publishes two events about the account's canonical credential and
-// nothing else about it: `credential_changed {engine, sha256}` when a session's
-// rotated copy passed every gate and became the account's, and
-// `credential_rejected {engine, reason, sha256}` when it did not. The material
-// is never on either event — the bridge holds it, Core asks for it over the
-// authenticated loopback channel it already uses for everything else.
+// nothing else about it: `credential_changed {engine, sha256}` when the
+// account's own file moved to material that passed every gate, and
+// `credential_rejected {engine, reason, sha256}` when what it holds is not
+// usable. The material is never on either event — the bridge holds it, Core
+// asks for it over the authenticated loopback channel it already uses for
+// everything else.
 //
 // Until now both were logged and forgotten, which meant a Codex refresh token
 // rotated on one node stayed on that node's disk: the store still held the
@@ -161,15 +162,17 @@ async fn adopt(
     }
 }
 
-/// Records a credential the bridge refused to publish.
+/// Records a credential the bridge refused to use.
 ///
-/// Two of the four reasons are about one session's own copy (`stale_baseline`,
-/// `unsafe_credential_file`) and change nothing about the account. The other
-/// two mean the material could not be tied to this account's provider identity,
-/// and a repeat of one of those is the shape of an account whose stored
-/// credential no longer matches what the CLI is producing — the GUI has to say
-/// "sign in again" rather than keep showing an active account that fails every
-/// turn.
+/// Two of the four reasons say nothing about the account's stored credential.
+/// `stale_baseline` is about a sign-in's own login home moving under a probe,
+/// and `unsafe_credential_file` is one node finding the account's file
+/// unreadable — a link, a FIFO, an oversized file. Both leave the store's
+/// credential intact and other nodes working. The other two mean the material
+/// could not be tied to this account's provider identity, and a repeat of one
+/// of those is the shape of an account whose stored credential no longer
+/// matches what the CLI is producing — the GUI has to say "sign in again"
+/// rather than keep showing an active account that fails every turn.
 pub fn credential_rejected(
     db: &DbPool,
     account_id: &str,
@@ -190,7 +193,7 @@ pub fn credential_rejected(
             %reason,
             credential_sha256 = %sha256,
             needs_login = flagged,
-            "the bridge refused a credential a session handed back"
+            "the bridge refused the account's credential"
         ),
         Err(error) => tracing::warn!(
             %account_id,
@@ -210,6 +213,7 @@ mod tests {
     /// is, and registered as the running bridge of `account_id`.
     async fn bridge_holding(account_id: &str, material: &str, identity: &str) {
         let handle = agent_runtime::testing::fake_bridge(
+            account_id,
             "codex",
             vec![(
                 "/account/credential",
@@ -296,8 +300,9 @@ mod tests {
         );
     }
 
-    /// A session that lost a rotation race, or corrupted its own copy, says
-    /// nothing about the account's credential — which is still working.
+    /// A sign-in whose home moved under a probe, or a node that cannot read the
+    /// account's file, says nothing about the stored credential — which is
+    /// still working.
     #[test]
     fn a_session_local_refusal_never_disables_the_account() {
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");

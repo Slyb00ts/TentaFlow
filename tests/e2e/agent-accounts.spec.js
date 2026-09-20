@@ -49,6 +49,7 @@ const AGENT_NAME = 'Generator scenariuszy';
 const AGENT_SLUG = 'generator-scenariuszy';
 const FIRST_KEY = 'sk-ant-e2e-0000';
 const SECOND_KEY = 'sk-ant-e2e-1111';
+const THIRD_KEY = 'sk-ant-e2e-2222';
 // A fresh node forces every account off its initial password before it lets
 // anyone in, so the suite walks that screen once per account and then keeps
 // using the rotated password.
@@ -336,6 +337,18 @@ async function openRuntimeSegment(page) {
   await page.waitForSelector('#aa-runtime-table', { timeout: 15000 });
 }
 
+/**
+ * The release the vendor's own channel reports right now.
+ *
+ * A node must install this and nothing else: the version a manifest once pinned
+ * is gone, so a node that recorded a different one installed a stale artifact.
+ */
+async function vendorLatestVersion() {
+  const response = await fetch('https://downloads.claude.ai/claude-code-releases/latest');
+  expect(response.ok, `the claude-code channel answered ${response.status}`).toBe(true);
+  return (await response.text()).trim();
+}
+
 // tf-table renders its rows in a shadow root, so cell text has to be read from
 // inside it rather than through a light-DOM locator.
 function tableText(page, selector) {
@@ -414,6 +427,93 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     expect(reloaded.credential_revision).toBe(before.revision + 1);
   });
 
+  // A pasted key exists only where it was pasted, so the node it was pasted on
+  // IS the account's home. Nothing else can move such an account — there is no
+  // sign-in to run — so this gesture has to take the role with it, or the fleet
+  // switch would refuse with a remedy the account cannot perform and the node
+  // could never leave the fleet.
+  test('pasting a key places the home here, both for a new key and for the one already stored', async ({ page }) => {
+    test.setTimeout(120_000);
+    await loginAsAdmin(page);
+    const accountId = dbAccountByName(RENAMED).account_id;
+    const node = await localRuntimeNode(page);
+    const home = () => dbAccount(accountId).home_node_id;
+    const away = () => seed(`UPDATE provider_accounts SET home_node_id = 'other-node'
+                               WHERE account_id = ${quote(accountId)}`);
+
+    // The identical key again — the operator re-pasting what they already have
+    // is the ordinary way to say "this credential belongs on this node", and it
+    // is a replay of a decision, so the revision must NOT move.
+    await away();
+    await openAccountsTab(page);
+    const win = await openAccountWindow(page, RENAMED);
+    const revision = dbCredential(accountId).revision;
+    await win.locator('[data-field="key"] input').fill(SECOND_KEY);
+    await win.locator('tf-button[data-act="key-save"]').click();
+    await expect.poll(home).toBe(node.node_id);
+    expect(dbCredential(accountId).revision, 'the same material is not a rotation').toBe(revision);
+
+    // A key the fleet has not seen: a new revision AND the home.
+    await away();
+    await win.locator('[data-field="key"] input').fill(THIRD_KEY);
+    await win.locator('tf-button[data-act="key-save"]').click();
+    await expect.poll(home).toBe(node.node_id);
+    expect(dbCredential(accountId).revision).toBe(revision + 1);
+  });
+
+  // The same refusal for the other kind of home. An account that authenticates
+  // with a pasted key has no sign-in to run, so the remedy the node names has to
+  // be the paste — the one gesture this kind has. Covered separately from the
+  // provider-login case, because a node sent to a sign-in that cannot exist is
+  // exactly the dead end the remedy text exists to prevent.
+  test('a node homing a pasted-key account is refused with the remedy that kind has', async ({ page }) => {
+    test.setTimeout(120_000);
+    await loginAsAdmin(page);
+    const node = await localRuntimeNode(page);
+    const accountId = dbAccountByName(RENAMED).account_id;
+    expect(dbAccount(accountId).credential_kind, 'the key account the previous test homed here').toBe('api_key');
+    const home = () => dbAccount(accountId).home_node_id;
+    const row = () => dbRuntimeNodes().find((entry) => entry.node_id === node.node_id) ?? null;
+
+    await setReceivesAccounts(page, node.node_id, true);
+    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.node_id)}
+          WHERE account_id = ${quote(accountId)}`);
+
+    await openRuntimeSegment(page);
+    const toggleChecked = () => page.locator('#aa-runtime-table').evaluate(
+      (t) => t.shadowRoot.querySelector('tf-toggle')?.hasAttribute('checked') ?? null,
+    );
+    await expect.poll(toggleChecked).toBe(true);
+    const flip = () => page.locator('#aa-runtime-table').evaluate((t) => {
+      // tf-toggle listens on the span it builds, not on the host.
+      t.shadowRoot.querySelector('tf-toggle .tf-toggle').click();
+    });
+    await flip();
+
+    // The refusal reaches the operator as the translation plus the node's own
+    // sentence, and that sentence names the paste rather than a sign-in.
+    const refusal = page.locator('.toast.toast-error').last();
+    await expect(refusal).toContainText('domem kont agentowych');
+    await expect(refusal).toContainText('paste their API key');
+    await expect(refusal).not.toContainText('sign those accounts in');
+    await expect.poll(toggleChecked).toBe(true);
+    expect(row()?.receives_accounts, 'a refused flip changes nothing').toBe(1);
+    expect(home()).toBe(node.node_id);
+
+    // Releasing the binding is the whole of what stood in the way, and the
+    // gesture now lands.
+    seed(`UPDATE provider_accounts SET home_node_id = NULL WHERE account_id = ${quote(accountId)}`);
+    await flip();
+    await expect.poll(() => row()?.receives_accounts ?? 0).toBe(0);
+    expect(home()).toBeNull();
+
+    // Leave the binding where the previous test put it, so the rest of the
+    // suite reads the same node as this account's home.
+    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.node_id)}
+          WHERE account_id = ${quote(accountId)}`);
+    expect(home()).toBe(node.node_id);
+  });
+
   test('clearing the API key removes the credential row and writes the audit entry', async ({ page }) => {
     test.setTimeout(120_000);
     await loginAsAdmin(page);
@@ -453,6 +553,39 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
 
     const reloaded = await accountAfterReload(page, accountId);
     expect(reloaded.status).toBe('pending');
+  });
+
+  test('the session limit is saved from A03 and 0 takes it away again', async ({ page }) => {
+    test.setTimeout(120_000);
+    await loginAsAdmin(page);
+    const accountId = dbAccountByName(RENAMED).account_id;
+    expect(dbAccount(accountId).max_sessions).toBe(0);
+    await openAccountsTab(page);
+    const win = await openAccountWindow(page, RENAMED);
+
+    // The hint under the sessions table has to follow the limit: it is the one
+    // place the screen says how many sessions may run at once, and a saved
+    // limit the operator cannot see again is a setting they will re-set blind.
+    const sessionsHint = win.locator('[data-hint="sessions"]');
+    await expect(win.locator('[data-field="limit"] input')).toHaveValue('0');
+    await expect(sessionsHint).toContainText('bez limitu');
+
+    await win.locator('[data-field="limit"] input').fill('2');
+    await win.locator('tf-button[data-act="limit-save"]').click();
+    await expect.poll(() => dbAccount(accountId).max_sessions).toBe(2);
+    await expect(sessionsHint).toContainText('najwyżej 2');
+
+    const reloaded = await accountAfterReload(page, accountId);
+    expect(reloaded.max_sessions).toBe(2);
+
+    // 0 is a VALUE ("no limit"), not an absence: saving it has to reach the node
+    // as 0 rather than being dropped as an empty field.
+    await openAccountsTab(page);
+    const again = await openAccountWindow(page, RENAMED);
+    await again.locator('[data-field="limit"] input').fill('0');
+    await again.locator('tf-button[data-act="limit-save"]').click();
+    await expect.poll(() => dbAccount(accountId).max_sessions).toBe(0);
+    await page.keyboard.press('Escape');
   });
 
   test('granting a user and a group, then the whole organisation, replaces the stored grants', async ({ page }) => {
@@ -635,6 +768,12 @@ test.describe('Logowanie u dostawcy (A02)', () => {
     expect(account.status).toBe('pending');
 
     const node = await localRuntimeNode(page);
+    // A node that is some account's home may not leave the fleet (the copy it
+    // holds is the one the others are fanned out from), and the earlier tests
+    // homed their key accounts here. This scenario needs a fleet that receives
+    // nothing, so the binding is released the way an operator releases it — by
+    // signing the account in elsewhere, which for a fixture is the column.
+    seed('UPDATE provider_accounts SET home_node_id = NULL');
     await setReceivesAccounts(page, node.node_id, false);
     await openAccountsTab(page);
 
@@ -757,6 +896,50 @@ test.describe('Aplikacje na nodach (N01)', () => {
     )).toBe(!before);
   });
 
+  test('a node that is an account\'s home cannot leave the fleet, and the refusal is readable', async ({ page }) => {
+    test.setTimeout(120_000);
+    await loginAsAdmin(page);
+    const node = await localRuntimeNode(page);
+    const account = dbAccountByName(LOGIN_NAME);
+    expect(account, 'the account the A02 scenario created is what this homes').not.toBeNull();
+
+    // Every other node's copy is fanned out of the node that MINTED the
+    // credential, so a node still holding that role may not leave the fleet.
+    await setReceivesAccounts(page, node.node_id, true);
+    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.node_id)}
+          WHERE account_id = ${quote(account.account_id)}`);
+    const row = () => dbRuntimeNodes().find((entry) => entry.node_id === node.node_id) ?? null;
+
+    await openRuntimeSegment(page);
+    const toggleChecked = () => page.locator('#aa-runtime-table').evaluate(
+      (t) => t.shadowRoot.querySelector('tf-toggle')?.hasAttribute('checked') ?? null,
+    );
+    await expect.poll(toggleChecked).toBe(true);
+    await page.locator('#aa-runtime-table').evaluate((t) => {
+      // tf-toggle listens on the span it builds, not on the host.
+      t.shadowRoot.querySelector('tf-toggle .tf-toggle').click();
+    });
+
+    // The screen must not look like the flip worked: the switch goes back on,
+    // the node's own sentence stays under a translation the operator can read,
+    // and neither the flag nor the binding moved.
+    await expect(page.locator('.toast.toast-error').last()).toContainText('domem kont agentowych');
+    await expect.poll(toggleChecked).toBe(true);
+    expect(row()?.receives_accounts, 'a refused flip changes nothing').toBe(1);
+    expect(dbAccountByName(LOGIN_NAME).home_node_id).toBe(node.node_id);
+
+    // Releasing the binding — the effect of signing the account in on another
+    // node — is the whole of what stood in the way, and the gesture now lands.
+    // A node that ends up receiving nothing and holds no engine keeps no row at
+    // all, so an absent row is the flag being off, not a missing measurement.
+    seed(`UPDATE provider_accounts SET home_node_id = NULL
+          WHERE account_id = ${quote(account.account_id)}`);
+    await page.locator('#aa-runtime-table').evaluate((t) => {
+      t.shadowRoot.querySelector('tf-toggle .tf-toggle').click();
+    });
+    await expect.poll(() => row()?.receives_accounts ?? 0).toBe(0);
+  });
+
   test('the sub-line names the system the node reported and the account it holds', async ({ page }) => {
     test.setTimeout(120_000);
     await loginAsAdmin(page);
@@ -816,11 +999,21 @@ test.describe('Aplikacje na nodach (N01)', () => {
     // Whatever this machine could do (a finished install, or the failure of one
     // without the vendor's package), the matrix redraws from the node's report.
     const row = dbRuntimeEngines().find((e) => e.engine_id === 'claude-code');
-    const text = await tableText(page, '#aa-runtime-table');
-    // An installed cell leads with the version the node recorded, and falls
-    // back to the chip when it recorded none.
-    if (row.install_state === 'installed') expect(text).toContain(row.version || 'Zainstalowana');
-    else expect(text).toContain('Błąd');
+    // The row above is the node's own table, read the moment it settles; the
+    // screen follows it on its own two second loop (`watchInstall`), so it is
+    // read here until it has caught up. The assertion is the version the node
+    // recorded, not a wait: a matrix that never redraws still fails.
+    const reported = row.install_state === 'installed'
+      ? (row.version || 'Zainstalowana')
+      : 'Błąd';
+    await expect.poll(() => tableText(page, '#aa-runtime-table'), { timeout: 15_000 }).toContain(reported);
+    if (row.install_state === 'installed') {
+      // The node asked the vendor's channel and downloaded what it named. A
+      // recorded version that is not today's release means the install followed
+      // something other than the channel — the whole point of removing the pin.
+      const current = await vendorLatestVersion();
+      expect(row.version, `the node installed ${row.version}, the vendor offers ${current}`).toBe(current);
+    }
 
     // Removing it again leaves the matrix as this suite found it.
     await runtimeMenuAction(page, 'claude-code', 'uninstall');
@@ -948,7 +1141,11 @@ test.describe('Moje konta — użytkownik (U01)', () => {
     await page.waitForTimeout(3000);
     await expect(page.locator('#svc-tabs tf-tab#accounts')).toHaveCount(0);
 
-    await page.goto(`https://127.0.0.1:${PORT}/#/my-accounts`);
+    // Her own screen, reached the way the mockup points at it: the account
+    // block of the sidebar. Typing the hash would hide a missing entry point.
+    const myAccounts = page.locator('.sidebar .nav-item[data-view="my-accounts"]');
+    await expect(myAccounts).toContainText('Moje konta');
+    await myAccounts.click();
     await page.waitForSelector('#myacc-apps .myapp-card', { timeout: 20000 });
     // The org-wide grant from the access test reaches her as a company account.
     await expect(page.locator('#myacc-apps')).toContainText('konto firmowe');
@@ -989,7 +1186,7 @@ test.describe('Moje konta — użytkownik (U01)', () => {
     seedMaterialized(own.account_id, node.node_id);
     seedSession(own.account_id, 'sess-e2e-anna', node.node_id, own.owner_user_id);
 
-    await page.goto(`https://127.0.0.1:${PORT}/#/my-accounts`);
+    await page.locator('.sidebar .nav-item[data-view="my-accounts"]').click();
     await page.waitForSelector('#myacc-apps .myapp-card', { timeout: 20000 });
     const card = page.locator('#myacc-apps .myapp-card[data-engine="codex"]');
     // Every one of the three comes off the wire, and the count is inflected by
@@ -1009,7 +1206,7 @@ test.describe('Moje konta — użytkownik (U01)', () => {
   test('connecting a subscription account opens the sign-in and leaves it offered on the card', async ({ page }) => {
     test.setTimeout(150_000);
     await signIn(page, MEMBER_USERNAME, MEMBER_PASSWORD);
-    await page.goto(`https://127.0.0.1:${PORT}/#/my-accounts`);
+    await page.locator('.sidebar .nav-item[data-view="my-accounts"]').click();
     await page.waitForSelector('#myacc-apps .myapp-card', { timeout: 20000 });
 
     const card = page.locator('#myacc-apps .myapp-card[data-engine="claude-code"]');

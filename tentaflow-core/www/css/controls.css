@@ -10310,6 +10310,13 @@ tf-tabs[safe-area][layout="stacked"] .tf-tab .tf-tab-count { top: 4px; margin-ri
   letter-spacing: normal;
   color: var(--tf-text-3);
 }
+/* Second line that carries a chip beside the sub text. */
+.tf-tab .tf-tab-subrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
 .tf-tab .tf-tab-label--mono {
   font-family: var(--tf-mono);
   font-size: 11.5px;

@@ -93,13 +93,25 @@ Two invariants make this work:
   invariant is enforced.
 - **The catalog is filtered where it is generated.** `build.rs::is_slim_edition()` (no
   local-engine feature set) makes the service-manifest generator keep utility infra
-  (`resource_kind = "infra"`) and every cloud provider (anything with `[deploy.external]`)
-  — 21 entries instead of 94. An engine reachable both remotely and locally (ollama) keeps
+  (`resource_kind = "infra"`), every cloud provider (anything with `[deploy.external]`) and
+  every agent CLI engine (`category = "agents"` with `[deploy.native] runtime = "managed-cli"`)
+  — 26 entries instead of 97. A coding-agent CLI is not a model engine: it has no weights,
+  needs no GPU and downloads only the vendor binary, so the one edition whose whole point is
+  having no local inference engine still installs it — and the generator asserts those entries
+  survive the filter, because a silently trimmed catalog leaves account management with nothing
+  to show. An engine reachable both remotely and locally (ollama) keeps
   only its external section: the local deploy would pull a model, which is the one thing
   this edition does not do. It filters in the ONE generator because both
   the Rust registry (`services_generated.rs`) and the GUI catalog
   (`www/js/generated/services-manifest.js`) come out of it; filtering one path only would
   show tiles the backend then refuses to deploy.
+- **The coding-agent bridge ships with the server, it is not built on the node.**
+  `tentaflow/build.rs` compiles `tentaflow-coding-agent-bridge` beside the `tentaflow` binary
+  and both release workflows stage the pair into the archive (Linux asserts it is executable,
+  macOS also asserts arm64 and that it links no non-system dylib), so installing an engine needs
+  neither a Rust toolchain nor a route to a crate registry. The runtime copies that executable
+  to `<cache>/coding-agents/bridge/<engine>/<native_source_hash>/server` (mode 0555) — outside
+  the version directory an update replaces — and the sandbox binds that copy.
 
 Model runners (RF-DETR detector, vehicle detector, state classifier, plate OCR) live in
 `vision/runners.rs`, NOT under `services::camera_ingest`: they are shared by the camera
@@ -674,7 +686,9 @@ auto-reload; row click = drill-down in the same tab with a breadcrumb. Data come
 not a UI source. Quota/lease editing stays on `TokenUsagePayload` (`TokenQuotaWire.used_tokens` is
 computed from the rollup). Wire rows carry Core-resolved names (`display_name`, `subtitle`,
 `member_count`, node `last_seen_at`; `group_by=group` is keyed by group id, `group_by=hour` exists) —
-the UI never shows a bare UUID/64-hex as a title. Node liveness = the later of
+the UI never shows a bare UUID/64-hex as a title. `group_by=account` is a dimension of that same
+rollup (`account_id`, part of the hashed row id; the reserved key `(no account)` is gateway traffic,
+never an account) and its rows are decorated from `provider_accounts` like any other dimension. Node liveness = the later of
 `sync_nodes.last_seen_at` and `peer_persisted.last_seen_ms` (mirrored into `sync_nodes` by the peer
 registry writer); the local node is always "now". Numbers use `fmtCompact` (`12,4 tys / 121 mln`,
 exact value in `title`), billing always exact (`fmtExact`/`fmtCurrency`) — helpers in `www/js/utils.js`.
@@ -689,7 +703,10 @@ backend `usage` (streams force `stream_options.include_usage` upstream), so reas
 are billed at the completion rate — Core never estimates tokens. A successful chat/embedding call
 without backend `usage` increments `model_metrics_rollup.usage_missing_count` (never for errors) and
 the UI shows "cost incomplete: N requests without token data" next to `missing_pricing`; a backend
-returning `usage: None` must be fixed at the backend (Codex parses `response.completed`).
+returning `usage: None` must be fixed at the backend (Codex parses `response.completed`). A
+provider-CLI delegation row (`backend = CLI_DELEGATION_BACKEND`, `db/models.rs`) is NEVER priced from
+`DbModelPricing` and always reports `missing_pricing`: the CLI bills a subscription, and the one
+amount the provider did quote (`session_runs.cost_usd`) is node-local workspace state, not rollup.
 
 ## Admin Scheduler
 

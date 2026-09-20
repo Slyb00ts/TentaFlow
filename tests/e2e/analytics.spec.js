@@ -28,6 +28,14 @@ const MARTA_ID = '8d1f02aa-4c3e-4b8a-9f21-7a5d3e9bc771';
 const MARTA_NAME = 'Marta Kowalczyk';
 const QWEN_NAME = 'Qwen 3.8 27B AWQ';
 const QWEN_ID = 'cyankiwi/Qwen3.8-27B-AWQ-INT4';
+const ACCOUNT_ID = 'a1c4e7b2-9d63-4f18-8a25-6b0e3d9c7f41';
+const ACCOUNT_NAME = 'Konto zespołu';
+const ACCOUNT_MODEL = 'claude-sonnet-4-5';
+// Localized label of the account dimension's gateway bucket (pl-PL locale).
+const NO_ACCOUNT_LABEL = 'Bez konta';
+// Qwen + GLM + Whisper from the catalog, plus the two CLI models of the
+// seeded provider accounts.
+const MODEL_COUNT = 5;
 const HEX64 = /^[0-9a-f]{64}$/;
 
 let server = null;
@@ -228,7 +236,7 @@ function scenarios({ mobile }) {
     await expectCellTitlesAreNames(page, '#an-users-table');
 
     await clickTab(page, 'models');
-    expect(await page.locator('#an-models-table tbody tr').count()).toBe(3);
+    expect(await page.locator('#an-models-table tbody tr').count()).toBe(MODEL_COUNT);
     await expect(page.locator('#an-models-table tbody')).toContainText(QWEN_NAME);
     expect(await page.locator('#an-compare-table tbody tr').count()).toBeGreaterThan(0);
     await expectCellTitlesAreNames(page, '#an-models-table');
@@ -259,9 +267,9 @@ function scenarios({ mobile }) {
     expect(await page.locator('#an-bill-table tbody tr').count()).toBeGreaterThanOrEqual(4);
     await expect(page.locator('#an-bill-table tbody')).toContainText(MARTA_NAME);
     await expect(page.locator('#an-bill-table tbody')).toContainText('zł');
-    expect(await page.locator('#an-struct-table tbody tr').count()).toBe(3);
+    expect(await page.locator('#an-struct-table tbody tr').count()).toBe(MODEL_COUNT);
     await expect(page.locator('#an-struct-table tbody')).toContainText('brak cennika');
-    expect(await page.locator('#an-pricing-table tbody tr').count()).toBe(3);
+    expect(await page.locator('#an-pricing-table tbody tr').count()).toBe(MODEL_COUNT);
     await expect(page.locator('#an-billing-note')).not.toBeEmpty();
     if (mobile) await expectNoOverflow(page, 'billing');
     await expectNoRawControls(page);
@@ -300,6 +308,46 @@ function scenarios({ mobile }) {
     if (mobile) await expectNoOverflow(page, 'drill-node');
     await crumbBack(page);
     await expect(page.locator('#an-nodes-list')).toContainText('hazai');
+
+    await expectNoRawControls(page);
+    expect(errors).toEqual([]);
+  });
+
+  test('accounts: resolved names, the no-account bucket and an account drill', async ({ page }) => {
+    const errors = trackErrors(page);
+    await openAnalytics(page);
+
+    await clickTab(page, 'users');
+    await pickSegment(page, '#an-users-sub', 'account');
+    await waitPanelIdle(page);
+    await expect(page.locator('#an-users-card .an-c-head h3')).toHaveText('Konta');
+    await expect(page.locator('#an-users-table tbody')).toContainText(ACCOUNT_NAME);
+    // The bucket without a provider account is a localized label, never the
+    // raw wire sentinel.
+    await expect(page.locator('#an-users-table tbody')).toContainText(NO_ACCOUNT_LABEL);
+    await expect(page.locator('#an-users-table tbody')).not.toContainText('(no account)');
+    await expectCellTitlesAreNames(page, '#an-users-table');
+    if (mobile) await expectNoOverflow(page, 'users-account');
+
+    // A drill on an account names it and breaks it down into users + models.
+    await openDrillFromRow(page, '#an-users-table', ACCOUNT_NAME);
+    await expect(page.locator('.an-crumbs')).toContainText(ACCOUNT_NAME);
+    await expect(page.locator('#an-hero-chips')).toContainText('Claude Code');
+    await expect(page.locator('#an-bd-user-table tbody')).toContainText(MARTA_NAME);
+    await expect(page.locator('#an-bd-model-table tbody')).toContainText(ACCOUNT_MODEL);
+    if (mobile) await expectNoOverflow(page, 'drill-account');
+    await crumbBack(page);
+    await expect(page.locator('#an-users-table tbody')).toContainText(ACCOUNT_NAME);
+
+    // Billing offers the same dimension, with its own title and column.
+    await clickTab(page, 'billing');
+    await pickSegment(page, '#an-f-bill-by', 'account');
+    await waitPanelIdle(page);
+    await expect(page.locator('#an-bill-card .an-c-head h3')).toContainText('Koszty wg konta');
+    await expect(page.locator('#an-bill-table tbody')).toContainText(ACCOUNT_NAME);
+    await expect(page.locator('#an-bill-table tbody')).toContainText(NO_ACCOUNT_LABEL);
+    await expectCellTitlesAreNames(page, '#an-bill-table');
+    if (mobile) await expectNoOverflow(page, 'billing-account');
 
     await expectNoRawControls(page);
     expect(errors).toEqual([]);
@@ -364,12 +412,12 @@ function scenarios({ mobile }) {
     await expect(page.locator('#an-top-nodes-table tbody tr')).toHaveCount(3);
 
     // Model filter narrows the top models list.
-    expect(await page.locator('#an-top-models-table tbody tr').count()).toBe(3);
+    expect(await page.locator('#an-top-models-table tbody tr').count()).toBe(MODEL_COUNT);
     await selectValue(page, '#an-f-model', QWEN_ID);
     await expect(page.locator('#an-top-models-table tbody tr')).toHaveCount(1);
     await expect(page.locator('#an-top-models-table tbody')).toContainText(QWEN_NAME);
     await selectValue(page, '#an-f-model', '');
-    await expect(page.locator('#an-top-models-table tbody tr')).toHaveCount(3);
+    await expect(page.locator('#an-top-models-table tbody tr')).toHaveCount(MODEL_COUNT);
 
     // Filters persist across tabs: the users tab gets the same node filter.
     await selectValue(page, '#an-f-node', biuro.value);

@@ -2304,14 +2304,6 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Cs::ProjectLinkSetRequest { .. } => "CodeStudioProjectLinkSetRequest",
                 Cs::RepoTreeRequest { .. } => "CodeStudioRepoTreeRequest",
                 Cs::RepoTreeResponse { .. } => "CodeStudioRepoTreeResponse",
-                Cs::AgentCredentialsListRequest { .. } => "CodeStudioAgentCredentialsListRequest",
-                Cs::AgentCredentialsListResponse { .. } => "CodeStudioAgentCredentialsListResponse",
-                Cs::AgentCredentialSetRequest { .. } => "CodeStudioAgentCredentialSetRequest",
-                Cs::AgentCredentialSetResponse { .. } => "CodeStudioAgentCredentialSetResponse",
-                Cs::AgentCredentialDeleteRequest { .. } => "CodeStudioAgentCredentialDeleteRequest",
-                Cs::AgentCredentialDeleteResponse { .. } => {
-                    "CodeStudioAgentCredentialDeleteResponse"
-                }
             }
         }
         MessageBody::BusBody(env) => {
@@ -4302,6 +4294,10 @@ mod tests {
             tool_name: None,
             permission: None,
             raised_at_ms: crate::agents::interaction_now_ms(),
+            engine_id: None,
+            account_id: None,
+            candidate_accounts: Vec::new(),
+            user_id: None,
         });
 
         // A stranger may not answer it — NotFound (no existence leak).
