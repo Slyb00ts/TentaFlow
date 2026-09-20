@@ -137,6 +137,111 @@ pub fn infer_vendor(name: &str) -> crate::mesh::peer_store::GpuVendor {
 static WGPU_RESULT: std::sync::OnceLock<Mutex<Option<Vec<PeerGpuInfo>>>> =
     std::sync::OnceLock::new();
 
+/// Hidden argv flag: the process becomes a one-shot GPU probe.
+///
+/// wgpu loads Vulkan drivers from the ICD manifests found on disk. A manifest
+/// left behind by a removed card (e.g. `nvidia_icd.json` from `nvidia-utils`, when
+/// neither the card nor the kernel module is present) makes the loader dlopen a
+/// library that dies with SIGSEGV. `catch_unwind` cannot catch that, and
+/// `panic = "abort"` in the release profile does not shield against a panic
+/// either — so the enumeration runs in a re-exec'd child: a driver crash kills
+/// the probe, never the node.
+pub const GPU_PROBE_ARG: &str = "--tentaflow-gpu-probe";
+
+/// Maximum lifetime of the GPU probe.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const GPU_PROBE_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Path of the running application — `main()` registers it so the probe can
+/// re-exec. Unset (tests, embedders) means no isolation and in-process
+/// enumeration: under libtest argv belongs to the harness, so re-exec'ing the
+/// test binary with an unknown argument is pointless.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+static GPU_PROBE_EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Registers the application binary as the GPU probe target. Called once from `main()`.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn set_gpu_probe_executable(exe: std::path::PathBuf) {
+    let _ = GPU_PROBE_EXE.set(exe);
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub fn set_gpu_probe_executable(_exe: std::path::PathBuf) {}
+
+/// Probe-mode entry point: prints the GPUs as JSON on stdout and returns the exit
+/// code. `None` = not a probe, the normal startup must continue.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn maybe_run_gpu_probe_entrypoint() -> Option<i32> {
+    if std::env::args().nth(1).as_deref() == Some(GPU_PROBE_ARG) {
+        Some(run_gpu_probe())
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub fn maybe_run_gpu_probe_entrypoint() -> Option<i32> {
+    None
+}
+
+/// Probe body. Runs from `main()` before any thread exists, so `set_var` is safe
+/// here and does not touch the parent process environment.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn run_gpu_probe() -> i32 {
+    #[cfg(target_os = "linux")]
+    apply_safe_icd_filter();
+
+    // Loader layers (implicit ones included) dlopen vendor libraries too — the probe
+    // does not need them, and each one is another crash source.
+    std::env::set_var("VK_LOADER_LAYERS_DISABLE", "*");
+
+    let gpus = enumerate_gpus(probe_backends());
+    let json = match serde_json::to_string(&gpus) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!("gpu probe: serializacja wynikow nieudana: {e}");
+            return 1;
+        }
+    };
+
+    // `serde_json::to_writer(Stdout)` bypasses the LineWriter buffer, and without a
+    // flush the parent may miss the JSON before the pipe closes.
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if writeln!(out, "{json}").and_then(|_| out.flush()).is_err() {
+        return 1;
+    }
+    0
+}
+
+/// Backends for the probe. On Linux we stay on Vulkan: the GL/GLVND path is a
+/// separate dlopen (`10_nvidia.json`) the ICD filter does not cover, and every
+/// real card is visible through Vulkan anyway. Other platforms unchanged.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn probe_backends() -> wgpu::Backends {
+    #[cfg(target_os = "linux")]
+    {
+        wgpu::Backends::VULKAN
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        wgpu::Backends::all()
+    }
+}
+
+/// Minimum interval between GPU detection attempts. The probe runs as a separate
+/// process (a re-exec of the binary), so without this limit a failed attempt
+/// would repeat on every heartbeat.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const GPU_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Timestamp of the last attempt. Doubles as a lock — the probe has a 3 s
+/// deadline, so the `GPU_PROBE_RETRY_INTERVAL` window never cuts a live attempt,
+/// and a 500 ms heartbeat cannot stack parallel re-execs.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+static GPU_LAST_PROBE: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// Startuje wgpu enumeration w tle — wywolaj raz przy starcie aplikacji.
 /// Nie blokuje — wynik bedzie dostepny pozniej.
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -146,21 +251,149 @@ fn start_wgpu_enumeration() {
     if store.lock().is_some() {
         return;
     }
+    {
+        let mut last = GPU_LAST_PROBE.lock();
+        if let Some(previous) = *last {
+            if previous.elapsed() < GPU_PROBE_RETRY_INTERVAL {
+                return;
+            }
+        }
+        *last = Some(Instant::now());
+    }
 
     std::thread::spawn(|| {
-        let result = std::panic::catch_unwind(|| detect_gpus_wgpu());
-        let gpus = result.unwrap_or_else(|_| {
-            warn!("wgpu enumerate_adapters panic");
-            vec![]
-        });
-        if let Some(store) = WGPU_RESULT.get() {
-            *store.lock() = Some(gpus);
+        let gpus = match std::panic::catch_unwind(probe_gpus) {
+            Ok(gpus) => gpus,
+            Err(_) => {
+                warn!("detekcja GPU przerwana panika");
+                None
+            }
+        };
+        // Only a real result reaches the cache — a failed probe leaves `None`, so a
+        // later attempt can fill in the cards instead of freezing their absence.
+        if let Some(gpus) = gpus {
+            if let Some(store) = WGPU_RESULT.get() {
+                *store.lock() = Some(gpus);
+            }
         }
     });
 }
 
 #[cfg(any(target_os = "ios", target_os = "android"))]
 fn start_wgpu_enumeration() {}
+
+/// Prefers the out-of-process probe; when no binary is registered (tests,
+/// embedders) the in-process enumeration remains.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn probe_gpus() -> Option<Vec<PeerGpuInfo>> {
+    #[cfg(target_os = "linux")]
+    log_skipped_icds();
+
+    match GPU_PROBE_EXE.get() {
+        Some(exe) if exe.is_file() => detect_gpus_via_probe(exe, GPU_PROBE_ARG),
+        Some(exe) => {
+            // After a self-update `current_exe()` may point at a replaced file.
+            warn!(exe = %exe.display(), "gpu probe: binarka sondy niedostepna — enumeracja w procesie");
+            detect_gpus_wgpu()
+        }
+        None => detect_gpus_wgpu(),
+    }
+}
+
+/// Runs the GPU probe as a child process and reads its result.
+/// `None` = the probe gave no answer (driver crash, timeout, signal, garbage).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn detect_gpus_via_probe(exe: &std::path::Path, arg: &str) -> Option<Vec<PeerGpuInfo>> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(arg);
+    run_gpu_probe_child(cmd, GPU_PROBE_DEADLINE)
+}
+
+/// Probe core: waits for the child until `deadline`, reads stdout and parses the
+/// JSON. Split from the `Command` construction so tests can supply any process.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn run_gpu_probe_child(
+    mut cmd: std::process::Command,
+    deadline: Duration,
+) -> Option<Vec<PeerGpuInfo>> {
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| warn!("gpu probe: nie udalo sie uruchomic sondy: {e}"))
+        .ok()?;
+
+    // Read on a separate thread: a chatty child would fill the pipe buffer (64 KiB)
+    // and block before the parent reads anything.
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let limit = Instant::now() + deadline;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < limit => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                warn!("gpu probe: timeout sondy — GPU detection odroczone");
+                reap_detached(child);
+                return None;
+            }
+            Err(e) => {
+                warn!("gpu probe: try_wait nieudany: {e}");
+                reap_detached(child);
+                return None;
+            }
+        }
+    };
+
+    // A signal means a driver crash — exactly the diagnosis that motivates the
+    // separate-process probe, so we log it explicitly.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            if signal == libc::SIGSEGV {
+                warn!("gpu probe: SIGSEGV w sondzie — wyizolowany crash sterownika GPU, detekcja pominieta");
+            } else {
+                warn!(signal, "gpu probe: sonda zakonczona sygnalem");
+            }
+            return None;
+        }
+    }
+    if !status.success() {
+        warn!(code = ?status.code(), "gpu probe: sonda zwrocila blad");
+        return None;
+    }
+
+    let out = rx.recv_timeout(Duration::from_secs(1)).ok()?;
+    match serde_json::from_str::<Vec<PeerGpuInfo>>(out.trim()) {
+        Ok(gpus) => Some(gpus),
+        Err(e) => {
+            warn!("gpu probe: niepoprawny JSON od sondy: {e}");
+            None
+        }
+    }
+}
+
+/// After SIGKILL the child must be reaped so no zombie is left. A process stuck
+/// in an uninterruptible state ignores SIGKILL, so reaping goes to a detached
+/// thread instead of blocking the heartbeat.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn reap_detached(mut child: std::process::Child) {
+    let _ = child.kill();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
 
 /// Pobiera wynik wgpu enumeration (None jesli jeszcze nie gotowe)
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -173,109 +406,268 @@ fn get_wgpu_gpus() -> Option<Vec<PeerGpuInfo>> {
     Some(Vec::new())
 }
 
-/// Detekcja GPU WYLACZNIE przez wgpu — jedna metoda, zero duplikatow.
-/// Dziala na: Metal (macOS/iOS), Vulkan (Linux/Android), DX12 (Windows), GL (fallback).
-/// Deduplikacja po nazwie — wgpu moze zwrocic ten sam GPU na roznych backendach.
-/// Timeout 3s — jesli wgpu wisi (headless server, brak drivera), zwraca pusty Vec.
+/// In-process GPU detection — fallback when no binary is registered for re-exec
+/// (tests, embedders). 3 s timeout: if wgpu hangs (headless server, no driver)
+/// it returns `None` so the result is not stored as a permanent absence of
+/// cards.
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
-fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
+fn detect_gpus_wgpu() -> Option<Vec<PeerGpuInfo>> {
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let handle = std::thread::spawn(move || {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            display: None,
-        });
-
-        // Zbierz adaptery ze wszystkich backendow — wgpu 29 zwraca Future
-        let adapters: Vec<wgpu::Adapter> =
-            futures::executor::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-        let all_adapters: Vec<wgpu::AdapterInfo> = adapters
-            .into_iter()
-            .map(|a| a.get_info())
-            .filter(|info| info.device_type != wgpu::DeviceType::Cpu)
-            .collect();
-
-        // Wybierz preferowany backend (Vulkan > Metal > DX12 > GL)
-        // Kazdy fizyczny GPU jest enumerowany raz per backend,
-        // wiec bierzemy adaptery z jednego backendu — wtedy count = prawdziwa liczba GPU.
-        let preferred_backend = [
-            wgpu::Backend::Vulkan,
-            wgpu::Backend::Metal,
-            wgpu::Backend::Dx12,
-            wgpu::Backend::Gl,
-        ]
-        .iter()
-        .find(|&&b| all_adapters.iter().any(|a| a.backend == b))
-        .copied();
-
-        #[allow(unused_mut)]
-        let mut gpus: Vec<PeerGpuInfo> = if let Some(backend) = preferred_backend {
-            all_adapters
-                .iter()
-                .filter(|a| a.backend == backend)
-                .map(|info| {
-                    let clean_name = info
-                        .name
-                        .split('/')
-                        .next()
-                        .unwrap_or(&info.name)
-                        .trim()
-                        .to_string();
-                    let vendor = infer_vendor(&clean_name);
-                    PeerGpuInfo {
-                        name: clean_name,
-                        vram_total_mb: 0,
-                        vram_used_mb: 0,
-                        usage_percent: 0.0,
-                        temperature_c: 0,
-                        power_draw_w: None,
-                        power_limit_w: None,
-                        vendor,
-                        pci_bus_id: None,
-                        uuid: None,
-                        fan_speed_percent: None,
-                        pcie_link_gen: None,
-                        pcie_link_width: None,
-                        pcie_link_gen_current: None,
-                        pcie_link_width_current: None,
-                    }
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
-        // Apple Silicon — VRAM = RAM (unified memory)
-        #[cfg(target_os = "macos")]
-        {
-            let total_ram_mb = {
-                let sys = sys().lock();
-                sys.total_memory() / (1024 * 1024)
-            };
-            for gpu in &mut gpus {
-                if gpu.vram_total_mb == 0 {
-                    gpu.vram_total_mb = total_ram_mb;
-                }
-            }
-        }
-
-        let _ = tx.send(gpus);
+    std::thread::spawn(move || {
+        let _ = tx.send(enumerate_gpus(wgpu::Backends::all()));
     });
 
-    // Czekaj max 3s — jesli wgpu wisi (headless server, brak drivera), odpuszczamy
     match rx.recv_timeout(Duration::from_secs(3)) {
-        Ok(gpus) => {
-            let _ = handle.join();
-            gpus
-        }
+        Ok(gpus) => Some(gpus),
         Err(_) => {
             warn!("wgpu enumerate_adapters timeout (3s) — GPU detection niedostepne");
-            vec![]
+            None
         }
+    }
+}
+
+/// The actual wgpu enumeration — the single place mapping adapters to
+/// `PeerGpuInfo`, shared by the process and the probe.
+///
+/// Deduplication by name — wgpu may return the same GPU on several backends.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn enumerate_gpus(backends: wgpu::Backends) -> Vec<PeerGpuInfo> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        display: None,
+    });
+
+    // Collect adapters from every backend — wgpu 29 returns a Future
+    let adapters: Vec<wgpu::Adapter> =
+        futures::executor::block_on(instance.enumerate_adapters(backends));
+    let all_adapters: Vec<wgpu::AdapterInfo> = adapters
+        .into_iter()
+        .map(|a| a.get_info())
+        .filter(|info| info.device_type != wgpu::DeviceType::Cpu)
+        .collect();
+
+    // Pick the preferred backend (Vulkan > Metal > DX12 > GL)
+    // Every physical GPU is enumerated once per backend,
+    // so we take the adapters of one backend — then count = the real GPU count.
+    let preferred_backend = [
+        wgpu::Backend::Vulkan,
+        wgpu::Backend::Metal,
+        wgpu::Backend::Dx12,
+        wgpu::Backend::Gl,
+    ]
+    .iter()
+    .find(|&&b| all_adapters.iter().any(|a| a.backend == b))
+    .copied();
+
+    #[allow(unused_mut)]
+    let mut gpus: Vec<PeerGpuInfo> = if let Some(backend) = preferred_backend {
+        all_adapters
+            .iter()
+            .filter(|a| a.backend == backend)
+            .map(|info| {
+                let clean_name = info
+                    .name
+                    .split('/')
+                    .next()
+                    .unwrap_or(&info.name)
+                    .trim()
+                    .to_string();
+                let vendor = infer_vendor(&clean_name);
+                PeerGpuInfo {
+                    name: clean_name,
+                    vram_total_mb: 0,
+                    vram_used_mb: 0,
+                    usage_percent: 0.0,
+                    temperature_c: 0,
+                    power_draw_w: None,
+                    power_limit_w: None,
+                    vendor,
+                    pci_bus_id: None,
+                    uuid: None,
+                    fan_speed_percent: None,
+                    pcie_link_gen: None,
+                    pcie_link_width: None,
+                    pcie_link_gen_current: None,
+                    pcie_link_width_current: None,
+                }
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Apple Silicon — VRAM = RAM (unified memory)
+    #[cfg(target_os = "macos")]
+    {
+        let total_ram_mb = {
+            let sys = sys().lock();
+            sys.total_memory() / (1024 * 1024)
+        };
+        for gpu in &mut gpus {
+            if gpu.vram_total_mb == 0 {
+                gpu.vram_total_mb = total_ram_mb;
+            }
+        }
+    }
+
+    gpus
+}
+
+// ===== ICD manifest filter (Linux) =====
+// Narrow, aimed at the proven case: an NVIDIA manifest without the kernel
+// module. Everything else is caught by the process isolation.
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IcdManifest {
+    path: std::path::PathBuf,
+    library_path: String,
+}
+
+#[cfg(target_os = "linux")]
+fn is_nvidia_manifest(manifest: &IcdManifest) -> bool {
+    manifest.library_path.to_ascii_lowercase().contains("nvidia")
+}
+
+/// Pure: when the NVIDIA kernel driver is loaded we touch nothing; otherwise we
+/// drop manifests pointing at an NVIDIA library.
+/// Manifests we do not understand are NOT hidden — we have no better source of
+/// truth about which cards physically exist.
+#[cfg(target_os = "linux")]
+fn filter_icd_manifests(
+    manifests: &[IcdManifest],
+    nvidia_driver_present: bool,
+) -> Vec<IcdManifest> {
+    if nvidia_driver_present {
+        return manifests.to_vec();
+    }
+    manifests
+        .iter()
+        .filter(|m| !is_nvidia_manifest(m))
+        .cloned()
+        .collect()
+}
+
+/// `/proc/driver/nvidia/version` exists only when the NVIDIA kernel module is
+/// loaded — precisely its absence is what leaves a dead ICD manifest behind.
+#[cfg(target_os = "linux")]
+fn nvidia_kernel_driver_loaded() -> bool {
+    std::path::Path::new("/proc/driver/nvidia/version").exists()
+}
+
+#[cfg(target_os = "linux")]
+fn load_icd_manifests() -> Vec<IcdManifest> {
+    let mut dirs: Vec<std::path::PathBuf> = [
+        "/usr/share/vulkan/icd.d",
+        "/etc/vulkan/icd.d",
+        "/usr/local/share/vulkan/icd.d",
+        "/etc/xdg/vulkan/icd.d",
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .collect();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".local/share/vulkan/icd.d"));
+        dirs.push(home.join(".config/vulkan/icd.d"));
+    }
+
+    let mut manifests = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            let library_path = match &json["ICD"]["library_path"] {
+                serde_json::Value::String(s) => s.clone(),
+                // The loader accepts a list of paths; the first one suffices for the filter.
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .find_map(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                _ => continue,
+            };
+            manifests.push(IcdManifest { path, library_path });
+        }
+    }
+    manifests
+}
+
+/// Filter plan: `None` when we do not filter (environment set by the user, or
+/// nothing to drop), otherwise `(kept, skipped)`.
+#[cfg(target_os = "linux")]
+fn safe_icd_plan() -> Option<(Vec<IcdManifest>, Vec<IcdManifest>)> {
+    // We would overwrite a working user configuration.
+    if std::env::var_os("VK_DRIVER_FILES").is_some()
+        || std::env::var_os("VK_ICD_FILENAMES").is_some()
+    {
+        return None;
+    }
+
+    let manifests = load_icd_manifests();
+    if manifests.is_empty() {
+        return None;
+    }
+
+    let nvidia_present = nvidia_kernel_driver_loaded();
+    let kept = filter_icd_manifests(&manifests, nvidia_present);
+    if kept.len() == manifests.len() {
+        return None;
+    }
+    // Since something was dropped, a missing NVIDIA driver was not the reason.
+    let skipped = manifests
+        .iter()
+        .filter(|m| is_nvidia_manifest(m))
+        .cloned()
+        .collect();
+    Some((kept, skipped))
+}
+
+/// Sets `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` to the filtered manifest list.
+/// Called in the probe before the Vulkan instance is created. When the filter
+/// removes everything we set an empty list: the loader then finds no driver at
+/// all, which is the correct result ("no usable card") instead of a crash.
+#[cfg(target_os = "linux")]
+fn apply_safe_icd_filter() {
+    let Some((kept, _)) = safe_icd_plan() else {
+        return;
+    };
+    let joined = std::env::join_paths(kept.iter().map(|m| &m.path))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Older loaders read only VK_ICD_FILENAMES; we set both.
+    std::env::set_var("VK_DRIVER_FILES", &joined);
+    std::env::set_var("VK_ICD_FILENAMES", &joined);
+}
+
+/// Logs the skipped manifests from the parent process, where tracing works — the
+/// probe starts without a subscriber, so its own `warn!` would be lost. Without
+/// this line a missing NVIDIA card has no explanation in the logs.
+#[cfg(target_os = "linux")]
+fn log_skipped_icds() {
+    let Some((_, skipped)) = safe_icd_plan() else {
+        return;
+    };
+    for manifest in skipped {
+        warn!(
+            manifest = %manifest.path.display(),
+            library = %manifest.library_path,
+            "pomijam manifest ICD — sterownik NVIDIA niezaladowany"
+        );
     }
 }
 
@@ -1926,5 +2318,118 @@ NVIDIA H100 PCIe, 81920, 40960, 95, 70, 320.0, 400.0\n";
         let entries = parse_nvidia_smi_output(out);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "NVIDIA RTX A6000");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod gpu_probe_tests {
+    use super::run_gpu_probe_child;
+    use crate::mesh::peer_store::{GpuVendor, PeerGpuInfo};
+    use std::time::Duration;
+
+    fn sample_gpu(name: &str) -> PeerGpuInfo {
+        PeerGpuInfo {
+            name: name.to_string(),
+            vram_total_mb: 32768,
+            vram_used_mb: 0,
+            usage_percent: 0.0,
+            temperature_c: 45,
+            power_draw_w: None,
+            power_limit_w: None,
+            vendor: GpuVendor::Amd,
+            pci_bus_id: None,
+            uuid: None,
+            fan_speed_percent: None,
+            pcie_link_gen: None,
+            pcie_link_width: None,
+            pcie_link_gen_current: None,
+            pcie_link_width_current: None,
+        }
+    }
+
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    }
+
+    #[test]
+    fn segfaulting_child_is_isolated_and_yields_no_result() {
+        // The probe dies by signal, but the parent survives and returns no result —
+        // this scenario (a driver crash) is why the isolation exists.
+        let result = run_gpu_probe_child(sh("kill -SEGV $$"), Duration::from_secs(5));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn hung_child_is_killed_after_the_deadline() {
+        let result = run_gpu_probe_child(sh("exec sleep 60"), Duration::from_millis(200));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn valid_json_from_child_is_parsed() {
+        let gpus = vec![sample_gpu("AMD Radeon AI PRO R9700")];
+        let json = serde_json::to_string(&gpus).unwrap();
+        let result = run_gpu_probe_child(sh(&format!("echo '{json}'")), Duration::from_secs(5))
+            .expect("poprawny JSON powinien sie sparsowac");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "AMD Radeon AI PRO R9700");
+        assert_eq!(result[0].vendor, GpuVendor::Amd);
+    }
+
+    #[test]
+    fn garbage_output_is_rejected() {
+        let result = run_gpu_probe_child(sh("echo not-json"), Duration::from_secs(5));
+        assert!(result.is_none());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod icd_filter_tests {
+    use super::{filter_icd_manifests, IcdManifest};
+
+    fn manifest(file: &str, library: &str) -> IcdManifest {
+        IcdManifest {
+            path: std::path::PathBuf::from(file),
+            library_path: library.to_string(),
+        }
+    }
+
+    #[test]
+    fn keeps_everything_when_nvidia_driver_is_loaded() {
+        let all = vec![
+            manifest("nvidia_icd.json", "libGLX_nvidia.so.0"),
+            manifest("radeon_icd.json", "libvulkan_radeon.so"),
+        ];
+        assert_eq!(filter_icd_manifests(&all, true).len(), 2);
+    }
+
+    #[test]
+    fn drops_nvidia_manifest_without_driver() {
+        let all = vec![
+            manifest("nvidia_icd.json", "libGLX_nvidia.so.0"),
+            manifest("radeon_icd.json", "libvulkan_radeon.so"),
+        ];
+        let kept = filter_icd_manifests(&all, false);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, std::path::PathBuf::from("radeon_icd.json"));
+    }
+
+    #[test]
+    fn never_hides_unrecognised_manifests() {
+        let all = vec![
+            manifest("intel_icd.json", "libvulkan_intel.so"),
+            manifest("lvp_icd.json", "libvulkan_lvp.so"),
+        ];
+        assert_eq!(filter_icd_manifests(&all, false).len(), 2);
+    }
+
+    #[test]
+    fn stale_nvidia_only_machine_yields_empty_list() {
+        // The NVIDIA card is gone, the manifest stayed: no driver = no card, so the
+        // probe must enumerate nothing (and must not crash).
+        let all = vec![manifest("nvidia_icd.json", "libGLX_nvidia.so.0")];
+        assert!(filter_icd_manifests(&all, false).is_empty());
     }
 }

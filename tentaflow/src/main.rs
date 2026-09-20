@@ -141,6 +141,17 @@ use tentaflow_core::mesh::pipeline::{start_mesh_pipeline, MeshPipelineConfig};
 // srodku tokio runtime). Dla normalnego startu serwera tworzymy tokio runtime
 // recznie pod `run_server`.
 fn main() -> Result<()> {
+    // GPU probe child: enumerate and print, then exit. Must run before any thread
+    // exists — the Vulkan ICD filter it applies sets environment variables.
+    if let Some(code) = tentaflow_core::mesh::node_info_collector::maybe_run_gpu_probe_entrypoint()
+    {
+        std::process::exit(code);
+    }
+    // Register our own binary so the GPU probe can re-exec it. Skipped by test
+    // binaries, which keep the in-process enumeration.
+    if let Ok(exe) = std::env::current_exe() {
+        tentaflow_core::mesh::node_info_collector::set_gpu_probe_executable(exe);
+    }
     if let Some(code) = tentaflow_core::code_studio::process_sandbox::maybe_run_sandbox_entrypoint()
     {
         std::process::exit(code);
