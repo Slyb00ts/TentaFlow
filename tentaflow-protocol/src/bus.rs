@@ -624,9 +624,9 @@ pub struct BusCapabilitiesWire {
 // =============================================================================
 // M2 replication wire types (SUM/tentabus/PLAN-M2.md §1f) — node cards, the
 // per-partition role matrix, and failover history for the M06 "Partycje i
-// repliki"/replication view. `SCHEMA_VERSION` stays 27 (§1f: `MessageBody`
-// tags by variant name, so appending to `BusPayload` alone never forces a
-// bump).
+// repliki"/replication view. Adding to `BusPayload` alone never forces a
+// `SCHEMA_VERSION` bump: `MessageBody` tags by variant name, not by index
+// (§1f). Check `envelope::SCHEMA_VERSION` for the value in force.
 // =============================================================================
 
 /// One node's replication-relevant state (mirrors `bus::ReplicaNodeInfo`

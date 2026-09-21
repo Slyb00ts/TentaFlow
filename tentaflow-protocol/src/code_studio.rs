@@ -123,20 +123,56 @@ pub struct SessionInfo {
     pub flow_version_id: String,
 }
 
+/// Why a node cannot run a `process_sandbox` workspace, as a closed set.
+///
+/// A reason sentence cannot be translated — "process isolation requires the
+/// current user's GUI launchd domain" is not something a Polish picker can
+/// render — so the CAUSE crosses the wire and each locale says it in its own
+/// words. `gui_session_required` is the one that has to name the missing GUI
+/// session: it is the only cause an operator can still fix on that machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessSandboxCause {
+    NoSandboxBinary,
+    SupervisorNotInitialized,
+    MissingCoalition,
+    GuiSessionRequired,
+}
+
 /// Node that can host a workspace, for the wizard's node picker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceNodeInfo {
     pub node_id: String,
     pub name: String,
     pub is_local: bool,
-    /// Whether this node can run a container-isolated workspace at all.
-    pub supports_container: bool,
+    /// Whether this node can run a container-isolated workspace.
+    ///
+    /// A tri-state, for the same reason the sandbox flag is one: this node's own
+    /// row is measured here, a peer's row carries what THAT node advertised, and
+    /// a peer that advertised nothing stays `None`. `false` and `None` both keep
+    /// the mode unchoosable, but only `false` lets the picker say the node has no
+    /// runtime — an unknown must not be reported as a missing one.
+    #[serde(default)]
+    pub supports_container: Option<bool>,
     #[serde(default)]
     pub supports_process_sandbox: Option<bool>,
+    /// The probe's own sentence. It is a DIAGNOSTIC, never the picker's
+    /// primary text: that one is chosen from `process_sandbox_cause` and
+    /// rendered in the reader's language.
     #[serde(default)]
     pub process_sandbox_reason: Option<String>,
     /// How this node would enforce egress policy.
     pub egress_enforcement: String,
+    /// The cause behind a refusal, on every row that has one — this node's own
+    /// probe here, a peer's ADVERTISED value there.
+    ///
+    /// A peer's availability is the peer's to report: this node cannot probe
+    /// another one's launchd domain, so it renders the cause that peer sent
+    /// over the mesh (`NodeInfo`) instead of guessing one. A peer that
+    /// advertises nothing leaves `supports_process_sandbox` `None` and this
+    /// `None` with it — the picker then says the owner has to answer.
+    #[serde(default)]
+    pub process_sandbox_cause: Option<ProcessSandboxCause>,
 }
 
 /// One entry of a worktree directory listing.
@@ -1691,10 +1727,9 @@ mod tests {
         wire_pin::assert_parseable(SOURCE);
     }
 
-    /// Every `pub enum` of the module. `CodeStudioPayload` is the only one
-    /// today; reading the whole set rather than that one name means a domain
-    /// enum added later cannot reach the wire unpinned. Each entry is the
-    /// enum's own serde attributes followed by every variant with ITS
+    /// Every `pub enum` of the module, read as a whole set rather than by name,
+    /// so a domain enum added later cannot reach the wire unpinned. Each entry
+    /// is the enum's own serde attributes followed by every variant with ITS
     /// attributes and fields, so `#[serde(rename_all)]` above the enum, a
     /// renamed variant, a reordered field inside one and an inserted variant
     /// all fail here — none of which a round-trip test can see, because it
@@ -1707,26 +1742,50 @@ mod tests {
     fn code_studio_variant_names_are_pinned() {
         let enums = wire_pin::wire_enums(SOURCE);
         let names: Vec<String> = enums.iter().map(|item| item.name.clone()).collect();
-        assert_eq!(names, vec!["CodeStudioPayload".to_string()]);
+        assert_eq!(
+            names.len(),
+            2,
+            "wire enum COUNT changed. Live enums:\n{}",
+            names.join("\n")
+        );
+        assert_eq!(
+            name_digest(&names),
+            0xf41f_8e1a_8d5e_0eb9,
+            "wire enum NAMES or their DECLARATION ORDER changed. The dashboard keys a cause by \
+             its name, so a rename is a wire break even though a round trip stays green. Live \
+             enums:\n{}",
+            names.join("\n")
+        );
 
-        let payload = &enums[0];
-        let entries = payload.entries();
-        assert_eq!(
-            payload.members.len(),
-            135,
-            "CodeStudioPayload variant COUNT changed. Appending is fine — update the count and \
-             the digest below in the same commit. Live entries:\n{}",
-            entries.join("\n")
-        );
-        assert_eq!(
-            name_digest(&entries),
-            0x2cf8_e9cb_5203_5ab6,
-            "CodeStudioPayload variant NAMES, their FIELDS, their ORDER or a serde attribute \
-             changed. ciborium tags variants by name, so a rename silently breaks every \
-             deployed browser while the round-trip tests stay green. Rename back, or update \
-             this digest deliberately. Live entries:\n{}",
-            entries.join("\n")
-        );
+        // (enum, variant count, digest of the variants in declaration order)
+        let pinned: &[(&str, usize, u64)] = &[
+            ("ProcessSandboxCause", 4, 0xbda1_1274_7a3b_16de),
+            ("CodeStudioPayload", 135, 0x2cf8_e9cb_5203_5ab6),
+        ];
+        assert_eq!(pinned.len(), enums.len());
+        for (name, count, digest) in pinned {
+            let item = enums
+                .iter()
+                .find(|item| &item.name == name)
+                .unwrap_or_else(|| panic!("enum '{name}' is gone from the wire module"));
+            let entries = item.entries();
+            assert_eq!(
+                item.members.len(),
+                *count,
+                "'{name}' variant COUNT changed. Appending is fine — update the count and the \
+                 digest here in the same commit. Live entries:\n{}",
+                entries.join("\n")
+            );
+            assert_eq!(
+                name_digest(&entries),
+                *digest,
+                "'{name}' variant NAMES, their FIELDS, their ORDER or a serde attribute changed. \
+                 ciborium tags variants by name, so a rename silently breaks every deployed \
+                 browser while the round-trip tests stay green. Rename back, or update this \
+                 digest deliberately. Live entries:\n{}",
+                entries.join("\n")
+            );
+        }
     }
 
     /// The response STRUCTS, pinned the same way — the half the byte goldens
@@ -1758,7 +1817,7 @@ mod tests {
             ("WorkspaceMemberInput", 2, 0xf54d_b307_8d15_95b7),
             ("ProvisionStepInfo", 4, 0x68e3_5d46_c0ea_f287),
             ("SessionInfo", 11, 0x824b_2889_46d8_1e69),
-            ("WorkspaceNodeInfo", 7, 0x1fdd_c153_1d00_fdd1),
+            ("WorkspaceNodeInfo", 8, 0x67e7_c8c7_c4c1_a45f),
             ("FileEntryInfo", 4, 0x3ccf_07ec_9800_df5f),
             ("GrepHitInfo", 4, 0x1650_e8d7_e4e5_d9f2),
             ("GitStatusEntry", 4, 0x49e5_76c6_7324_6b20),

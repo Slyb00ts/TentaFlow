@@ -41,9 +41,33 @@ export function activityLabels() {
     step_compaction: t('agent_activity.step_compaction', 'kompakcja kontekstu'),
     step_router: t('agent_activity.step_router', 'router'),
     step_child: t('agent_activity.step_child', 'subagent'),
+    // The word a multi-child spawn is stated with. `{count}` is kept as a
+    // placeholder here and filled by `activityStatusText` — `I18n.t` is asked
+    // WITHOUT vars, so its `interpolate` returns the template untouched.
+    step_child_many: t('agent_activity.status_spawn_many', 'Odpalam {count} agentów'),
     step_question: t('agent_activity.step_question', 'pytanie'),
     step_permission: t('agent_activity.step_permission', 'uprawnienie'),
     step_resolved: t('agent_activity.step_resolved', 'rozwiązano'),
+    // The widget holds no vocabulary of its own, so the run-status words travel
+    // in the same dict. TEN states from TWO translated sources, because the
+    // widget is pointed at two run families: a session run (`session_runs`,
+    // whose states `code-studio-session.js` already words) and an agent run
+    // (`agent_runs`, whose CHECK set is the one that carries `interrupted`, and
+    // which `agents.js` words through `agents.run_status_*`). Neither set
+    // subsumes the other, and no state may reach the screen as a wire id on a
+    // screen whose locale can already name it.
+    run_status: {
+      queued: t('code_studio.run_status.queued', 'w kolejce'),
+      running: t('code_studio.run_status.running', 'w toku'),
+      waiting: t('code_studio.run_status.waiting', 'oczekuje'),
+      waiting_user: t('code_studio.run_status.waiting_user', 'czeka na użytkownika'),
+      completed: t('code_studio.run_status.completed', 'ukończony'),
+      failed: t('code_studio.run_status.failed', 'błąd'),
+      cancelled: t('code_studio.run_status.cancelled', 'anulowany'),
+      cancelling: t('code_studio.run_status.cancelling', 'anulowanie…'),
+      timed_out: t('code_studio.run_status.timed_out', 'przekroczył czas'),
+      interrupted: t('agents.run_status_interrupted', 'przerwany'),
+    },
   };
 }
 
@@ -68,9 +92,21 @@ export function activityStatusText(event, labels = activityLabels()) {
       return `${l.step_tool} · ${event.name ?? ''}`.trim();
     case 'child_spawned': {
       const count = Number(event.count ?? 0);
-      return count > 1
-        ? t('agent_activity.status_spawn_many', 'Odpalam {count} agentów').replace('{count}', String(count))
-        : `${l.step_child} · ${event.agent ?? ''}`.trim();
+      if (count > 1) {
+        // The wording travels in the dict like every other word here; only the
+        // number is supplied in this function. A dict without the word still
+        // states the count, in the shape the single-child line already uses —
+        // the number is never the part that goes missing.
+        const word = l.step_child_many;
+        if (typeof word === 'string' && word) {
+          return word.replaceAll('{count}', String(count));
+        }
+        const child = typeof l.step_child === 'string' && l.step_child
+          ? l.step_child
+          : 'sub-agent';
+        return `${child} · ${count}`;
+      }
+      return `${l.step_child} · ${event.agent ?? ''}`.trim();
     }
     case 'user_question':
       return l.step_question;

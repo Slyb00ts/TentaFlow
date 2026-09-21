@@ -138,6 +138,30 @@ Data moved (all inside one transaction, in this order):
 
 Dropped in the same step: `coding_agent_account_grants`, `coding_agent_session_owners`, `coding_agent_account_moves` (`migrations.rs:973`). The FK map at `migrations.rs:3806-3808` loses its three entries.
 
+> **Corrected (2026-09-20).** Only ONE of the three was ever dropped, and not in
+> this step. The ladder is append-only: rung **149** (`migrations.rs:972`,
+> DDL const `CODING_AGENT_ACCOUNT_MOVES` at `:1254`) still CREATES
+> `coding_agent_account_moves` exactly as it did, because a database that already
+> ran it has it recorded as applied and editing that rung would desynchronise the
+> ladder instead of removing anything.
+> The table is dropped by the separate rung **163**
+> (`drop_coding_agent_account_moves`, `migrations.rs:1040`, const
+> `DROP_CODING_AGENT_ACCOUNT_MOVES` at `:1287-1290`) — a fresh database creates
+> it at 149 and drops it at 163.
+>
+> `coding_agent_account_grants` and `coding_agent_session_owners` were NOT
+> dropped and are not dead: rung 160 (`adopt_coding_agent_accounts`,
+> `migrations.rs:1025`) adopts their rows into `provider_account_grants` /
+> `provider_account_sessions` and deliberately keeps the old tables and their
+> rows — "nothing the running code still reads may move" — and
+> `services/coding_agent.rs` still reads both (`:211`, `:221`, `:316`, `:342`).
+> They are created at `migrations.rs:1477` and `:1483`. The FK map at
+> `migrations.rs:4278-4280` therefore KEEPS its three entries, one line per
+> `(table, column)` pair (`coding_agent_account_grants.user_id`,
+> `coding_agent_account_grants.granted_by`,
+> `coding_agent_session_owners.user_id`). The line numbers this paragraph
+> originally carried (`:973`, `:3806-3808`) no longer point at any of it.
+
 **Credentials are NOT migrated.** `code_agent_credentials` lives in the Code Studio *content* DB (`tentaflow-core/src/code_studio/db.rs:63-75`), is keyed `(org_id,node_id,engine_id)` and is encrypted with the **per-node** `SettingsCipher` key — a platform migration has neither the pool nor the cipher, and a cross-DB adoption hook would be exactly the parallel path the rules forbid. The bridge-held provider logins (`accounts/<uuid>/` on disk) are likewise unreachable from SQL. Therefore:
 
 - content-DB `STEPS` gains step `(2, "DROP TABLE code_agent_credentials;")` in `tentaflow-core/src/code_studio/db.rs:39`, and the idempotence test's table list (`:123-127`) loses the entry;
@@ -145,6 +169,21 @@ Dropped in the same step: `coding_agent_account_grants`, `coding_agent_session_o
 - the operator re-runs A02 once per account, and re-enters one API key per `api_key` account. Flagged in §H-1.
 
 ### A.3 Deleted in the same increment
+
+> **Removed / did not land (2026-09-20).** This table is a PLAN inventory, not a
+> description of the tree: every line number in it points at the code as it stood
+> when the design was written. The manual "move an agent account between nodes"
+> mechanism is the part that was removed, by WP8 — `services/account_move.rs`
+> (and its `Manifest`, phases, `operate`/`start`/`receive`/`recover`), the
+> bridge's `transfer.rs`, `MeshCommandType::AgentAccountMove` with its executor
+> branch, `services::mod`'s `mod account_move;`, the `account.move` dispatch
+> branch, the frontend's `mountAccountMove` and every `agent_accounts.move_*`
+> key. `SCHEMA_VERSION` is now **31** (`tentaflow-protocol/src/envelope.rs`),
+> which refuses a peer that still sends the variant at connect. The three rows
+> naming `account_move` itself, plus the last row (the frontend window and its
+> `move_*` keys), are WP8's; the rows between them belong to WP1–WP6 and are read
+> the same way — as the plan, against line numbers that have since moved. Nothing
+> here is a navigation aid today.
 
 | Artifact | Path |
 |---|---|
@@ -476,7 +515,23 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
 | **WP5** | Resolver + consumers + agents `runtime_json` + G01 | `services/agent_account.rs` (new), `flow_engine/node_adapters/delegate_cli.rs` (`:114`, `:1001`, `:1063`, `:1083`, `:1265`, `:1335`), `code_studio/cli_adapter.rs:265`, `dispatch/code_studio.rs:2864,2994`, `db/seed.rs:752-759,2111`, `agents/mod.rs`, `dispatch/handlers.rs:8292`, `www/js/modules/agents.js` | one table-driven test per `AccountRefusal`; seed/flow test that `delegate_cli` blocks carry no `service_id`; agent validation rejects a foreign-engine account | a flow runs end to end with an account chosen by `runtime_json` |
 | **WP6** | Bridge multi-session: shared credential dir, remove `account_busy`/`lease`/`reconcile_session_credential`, per-engine refresh hooks, `vendor_session_id` binding | `tentaflow-containers/agents/native/coding-agent-bridge/src/{main.rs,transfer.rs}`, `services/agent_runtime.rs`, `code_studio/cli_bridge.rs:1515` | two concurrent sessions on one account with isolated histories; codex rotation submits CAS and a stale satellite refuses; resume reattaches `vendor_session_id` | **needs a real codex/muse account** to prove rotation |
 | **WP7** | C01 paused turn + C02 chips + U01 | `agents/interaction.rs:36`, delegation refusal path, `www/js/modules/{code-studio-session.js,code-studio.js,my-accounts.js}`, i18n ×5 | interaction registers, times out, and resumes after a successful login | C01 flow demonstrated live |
-| **WP8** | Removal sweep: `services/account_move.rs`, `MeshCommandType::AgentAccountMove` + executor branch, `mountAccountMove`, `agent_accounts.move_*` keys, dead i18n/CSS, `cargo check` unused warnings to zero | as listed in §A.3 | key-parity check across the five locales; `cargo check` clean | no reference to "move"/`account_move` remains |
+| **WP8** | Removal sweep: `services/account_move.rs`, `MeshCommandType::AgentAccountMove` + executor branch, `mountAccountMove`, `agent_accounts.move_*` keys, dead i18n/CSS, `cargo check` unused warnings to zero | as listed in §A.3 | key-parity check across the five locales; `cargo check` clean | no reference to "move"/`account_move` remains outside the migration ladder |
+
+> **Removed (2026-09-20).** WP8 ran. The sweep is complete on every code path it
+> owned: `services/account_move.rs` and the bridge's `transfer.rs` are deleted,
+> no `mod account_move;`, no `account.move` dispatch branch, no
+> `MeshCommandType::AgentAccountMove` and no executor branch for it, no
+> `mountAccountMove` in `www/js/modules/coding-agent.js`, and no
+> `agent_accounts.move_*` key in any of the five locales. `SCHEMA_VERSION` is
+> **31**.
+>
+> What a `grep` still finds is deliberate, and the original acceptance sentence
+> ("no reference to … remains") was false against it: the migration ladder keeps
+> rung 149 and its DDL const plus the rung-163 `DROP` (§A.3), and
+> `tentaflow-protocol/src/envelope.rs` carries the comment that documents the v31
+> variant removal. Those are the record of a removal, not a live path — the
+> ladder must not be rewritten, and the envelope comment is what tells a mixed
+> fleet why its handshake fails.
 
 ---
 

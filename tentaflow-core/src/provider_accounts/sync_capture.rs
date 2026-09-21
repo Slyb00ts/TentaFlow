@@ -56,6 +56,7 @@ struct AccountCaptureRow {
     provider_subject: Option<String>,
     plan_label: Option<String>,
     home_node_id: Option<String>,
+    home_lost_node_id: Option<String>,
     status: String,
     created_by: String,
     created_at: String,
@@ -72,8 +73,8 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
     let row = tx
         .query_row(
             "SELECT org_id, engine_id, display_name, scope, owner_user_id, credential_kind, \
-                    provider_subject, plan_label, home_node_id, status, created_by, created_at, \
-                    credential_revoked_revision, max_sessions \
+                    provider_subject, plan_label, home_node_id, home_lost_node_id, status, \
+                    created_by, created_at, credential_revoked_revision, max_sessions \
              FROM provider_accounts WHERE account_id = ?1",
             rusqlite::params![account_id],
             |row| {
@@ -87,11 +88,12 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
                     provider_subject: row.get(6)?,
                     plan_label: row.get(7)?,
                     home_node_id: row.get(8)?,
-                    status: row.get(9)?,
-                    created_by: row.get(10)?,
-                    created_at: row.get(11)?,
-                    credential_revoked_revision: row.get(12)?,
-                    max_sessions: row.get(13)?,
+                    home_lost_node_id: row.get(9)?,
+                    status: row.get(10)?,
+                    created_by: row.get(11)?,
+                    created_at: row.get(12)?,
+                    credential_revoked_revision: row.get(13)?,
+                    max_sessions: row.get(14)?,
                 })
             },
         )
@@ -129,6 +131,15 @@ pub fn capture_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> Resu
             fields.insert(
                 "home_node_id".to_string(),
                 opt_text(row.home_node_id.as_deref()),
+            );
+            // WHICH node's deletion took the home away, when the home is gone.
+            // It travels for the reason the marker exists at all: a peer that
+            // only learns "this account has no home" cannot tell an account
+            // that was never homed from one that is still running its sessions
+            // on a machine no longer in the registry.
+            fields.insert(
+                "home_lost_node_id".to_string(),
+                opt_text(row.home_lost_node_id.as_deref()),
             );
             fields.insert("status".to_string(), text(&row.status));
             fields.insert("created_by".to_string(), text(&row.created_by));

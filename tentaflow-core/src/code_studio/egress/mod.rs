@@ -101,6 +101,18 @@ impl NodeCapabilities {
     }
 }
 
+/// The node's capabilities, probed once per process.
+///
+/// `NodeCapabilities::probe` reads the container socket and the firewall
+/// ruleset, so it is not something a list request may do per workspace. The
+/// cache is process-wide, which also means an answer cannot change without a
+/// restart: the create gate and the mesh advertisement read the same value, so
+/// neither can promise something the other would refuse.
+pub fn node_capabilities() -> NodeCapabilities {
+    static CAPS: std::sync::OnceLock<NodeCapabilities> = std::sync::OnceLock::new();
+    *CAPS.get_or_init(NodeCapabilities::probe)
+}
+
 /// Resolves `egress_enforcement` when a workspace is created (§7.6). The value
 /// is a statement about the node, so it is computed once and stored — the UI
 /// then says what the workspace really is instead of implying a guarantee.

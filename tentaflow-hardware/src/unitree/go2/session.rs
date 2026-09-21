@@ -35,7 +35,7 @@ pub struct Go2Session {
 impl Go2Session {
     /// Connect over the LAN: build the channel, run con_notify/con_ing signaling,
     /// apply the answer, then complete the data-channel validation handshake.
-    pub async fn connect(ip: String) -> Result<Go2Session> {
+    pub async fn connect(ip: String, aes_128_key: Option<String>) -> Result<Go2Session> {
         let (channel, offer_sdp) = WebRtcChannel::create(WebRtcConfig {
             data_channel_label: "data".to_string(),
             want_video: true,
@@ -52,8 +52,9 @@ impl Go2Session {
         .await?;
 
         let ip_sig = ip.clone();
+        let key_sig = aes_128_key.clone();
         let answer_sdp = tokio::task::spawn_blocking(move || -> Result<String> {
-            let notify = handshake::con_notify(&ip_sig)?;
+            let notify = handshake::con_notify(&ip_sig, key_sig.as_deref())?;
             let key = handshake::gen_session_key();
             handshake::send_offer(&ip_sig, &notify, &key, &offer_sdp)
         })

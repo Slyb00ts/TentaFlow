@@ -42,7 +42,14 @@ function esc(value) {
     .replace(/'/g, '&#39;');
 }
 
-// Run status → tf-chip status tone. Mirrors the agent_runs CHECK set.
+// Run status → tf-chip status tone. Spans both vocabularies the widget receives:
+// `agent_runs`'s CHECK set plus the `session_runs` states it alone has
+// (`cancelling`, `timed_out`).
+// `cancelling` is still in flight — the request has been made, the CLI has not
+// acknowledged it — so it reads as active (`accent`), not as `info` beside
+// `queued`/`cancelled` and not as `warn`, which would ask the operator for
+// something that is already handled. `timed_out` is a terminal end that no
+// error describes, which is `warn` — the same tone `interrupted` takes.
 const STATUS_TONE = {
   queued: 'info',
   running: 'accent',
@@ -51,11 +58,46 @@ const STATUS_TONE = {
   completed: 'ok',
   failed: 'err',
   cancelled: 'info',
+  cancelling: 'accent',
   interrupted: 'warn',
+  timed_out: 'warn',
 };
 
 // child_finished status → run status (the run row updates from lifecycle events).
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+// A timed-out run has ENDED: it must not be counted as activity, kept in a badge
+// or offered a Cancel button. `cancelling` is deliberately absent — a requested
+// cancellation is not a finished one.
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'timed_out']);
+
+// Run status → the word the chip states. English, like every other default here:
+// the widget carries no locale of its own. It is the FLOOR under a host's map,
+// not a replacement for it — a host that words one run family's states must not
+// blank the widget's word for the other's. A status in NEITHER map is printed
+// exactly as it arrived: a wire id is a fact the operator can look up, a
+// `run_status.*` key is a translation nobody asked for.
+const DEFAULT_RUN_STATUS = {
+  queued: 'queued',
+  running: 'running',
+  waiting: 'waiting',
+  waiting_user: 'waiting for user',
+  completed: 'completed',
+  failed: 'failed',
+  cancelled: 'cancelled',
+  cancelling: 'cancelling',
+  interrupted: 'interrupted',
+  timed_out: 'timed out',
+};
+
+// The status word for a run, resolved through the host's dictionary, over the
+// widget's own. Merged rather than replaced: `labels` arrives spread over
+// DEFAULT_LABELS, so a host that supplies a `run_status` map hands over ONE key
+// of a nested dict and would otherwise take the whole default with it.
+function runStatusText(status, labels) {
+  const id = String(status ?? '');
+  const map = { ...DEFAULT_RUN_STATUS, ...((labels && labels.run_status) || {}) };
+  const text = map[id];
+  return typeof text === 'string' && text ? text : id;
+}
 
 // Default English-ish fallbacks so the component is usable without a host that
 // wires labels (tests, isolated usage). A host MUST override these via `labels`.
@@ -87,9 +129,11 @@ const DEFAULT_LABELS = {
   step_compaction: 'context compaction',
   step_router: 'router',
   step_child: 'sub-agent',
+  step_child_many: '{count} sub-agents',
   step_question: 'question',
   step_permission: 'permission',
   step_resolved: 'resolved',
+  run_status: DEFAULT_RUN_STATUS,
 };
 
 // A flat AgentRunEvent → a per-run step the timeline renders. Pure: shared by
@@ -114,7 +158,7 @@ function eventToStep(ev, labels) {
     case 'child_spawned':
       return { tone: 'accent', kind: l.step_child, detail: ev.agent };
     case 'child_finished':
-      return { tone: TERMINAL_STATUSES.has(ev.status) && ev.status !== 'completed' ? 'warn' : 'ok', kind: l.step_child, detail: ev.status };
+      return { tone: TERMINAL_STATUSES.has(ev.status) && ev.status !== 'completed' ? 'warn' : 'ok', kind: l.step_child, detail: runStatusText(ev.status, l) };
     case 'user_question':
       return { tone: 'warn', kind: l.step_question, detail: ev.question };
     case 'permission_request':
@@ -586,7 +630,7 @@ class TfAgentActivity extends HTMLElement {
       const cancellable = !TERMINAL_STATUSES.has(run.status);
       const row = `<div class="tf-aa-run" data-run="${esc(run.runId)}" style="--depth:${depth}">
         <button class="tf-aa-run-main" data-action="open-run" data-run-id="${esc(run.runId)}"${run.model ? ` title="${esc(run.model)}"` : ''}>
-          <tf-chip status="${tone}" dot>${esc(run.status)}</tf-chip>
+          <tf-chip status="${tone}" dot>${esc(runStatusText(run.status, this._labels))}</tf-chip>
           <span class="tf-aa-run-agent">${esc(run.agent || run.runId.slice(0, 8))}</span>
           ${this._accountChip(run)}
           <span class="tf-aa-run-meta">${esc(elapsed)} · ${esc(String(tokens))} ${esc(this._labels.tokens)}</span>
@@ -609,7 +653,7 @@ class TfAgentActivity extends HTMLElement {
       <tf-button variant="ghost" size="sm" data-action="to-tree">‹ ${esc(this._labels.back)}</tf-button>
       <span class="tf-aa-panel-title">${esc(run.agent || run.runId.slice(0, 8))}</span>
       ${this._accountChip(run)}
-      <tf-chip status="${tone}" dot>${esc(run.status)}</tf-chip>
+      <tf-chip status="${tone}" dot>${esc(runStatusText(run.status, this._labels))}</tf-chip>
     </div>`;
     const body = TfAgentActivity.renderTimeline(run.steps, this._labels);
     return `${head}<div class="tf-aa-detail">${body}</div>`;

@@ -173,6 +173,37 @@ pub fn remove(root: &Path, provider: Provider) -> Result<bool> {
     remove_within(root, &relative(provider))
 }
 
+/// Writes a JSON document that must not be readable by anyone but its owner,
+/// atomically and durably.
+///
+/// The bridge's session state file is the caller: it names the private profiles
+/// that exist on this node and the sessions bound to them, so it is created
+/// `0600` and replaced by rename — a reader either sees the previous document or
+/// the new one, never a half-written file, and the fsync of the directory makes
+/// the rename survive a power cut. The temporary name is random and created with
+/// `create_new`, so a concurrent writer cannot be steered into an existing file.
+pub fn write_private(path: &Path, value: &Value) -> Result<()> {
+    use std::io::Write;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&temporary)?;
+    output.write_all(&serde_json::to_vec(value)?)?;
+    output.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    std::fs::File::open(
+        path.parent()
+            .context("state directory missing")?,
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn open_directory(root: &Path, relative: &Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::{

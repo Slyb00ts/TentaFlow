@@ -56,6 +56,20 @@ pub struct ProviderAccountInfo {
     pub status: String,
     pub home_node_id: Option<String>,
     pub home_node_name: Option<String>,
+    /// The node that WAS this account's home and has since been deleted from the
+    /// registry, which is why `home_node_id` is `None` (migration 164).
+    ///
+    /// It is what tells A03's two no-home states apart. An account that was never
+    /// homed has a complete session list on the answering node; one whose home
+    /// was deleted may still be running its sessions on that machine — it left
+    /// the registry over expired trust, not because it stopped — so the empty
+    /// session cell must say "no data" instead of "Brak aktywnych sesji.".
+    ///
+    /// There is deliberately no `home_lost_node_name`: no node can resolve a
+    /// display name for a node that is gone, and the client shortens the id the
+    /// same way it shortens every other id Core cannot name.
+    #[serde(default)]
+    pub home_lost_node_id: Option<String>,
     pub credential_revision: i64,
     pub expires_at: Option<String>,
     pub grant_count: u32,
@@ -201,6 +215,15 @@ pub struct RuntimeNodeInfo {
     /// that peer.
     #[serde(default)]
     pub os: Option<String>,
+    /// True on the row of the node that ANSWERED, false on every peer row.
+    ///
+    /// Nothing but the answering node can make this claim: a node id the
+    /// dashboard would otherwise compare against its own is not in the payload,
+    /// so the window cannot tell which row is itself. Same contract as
+    /// `WorkspaceNodeInfo::is_local`, and the same reason the Code Studio node
+    /// picker already carries one.
+    #[serde(default)]
+    pub is_local: bool,
 }
 
 /// One cell of the node matrix: the state of one engine on one node.
@@ -475,13 +498,13 @@ mod tests {
 
         // (struct, field count, digest of its attributes + "name: Type" fields)
         let pinned: &[(&str, usize, u64)] = &[
-            ("ProviderAccountInfo", 20, 0x70cb_dd60_1c4b_7850),
+            ("ProviderAccountInfo", 21, 0x8c7a_396f_e84b_d8d3),
             ("GrantEntry", 6, 0x6c64_44d1_5f29_be89),
             ("AccountSessionInfo", 11, 0x3227_205e_b73c_ec8d),
             ("AccountNodeInfo", 6, 0x2d0a_7b9e_3aa3_acb6),
             ("AccountAgentInfo", 3, 0xf485_7274_2ec5_4bef),
             ("MyAccountInfo", 13, 0x8f3a_1ca1_fb6b_a66b),
-            ("RuntimeNodeInfo", 8, 0xda92_e650_eba7_469e),
+            ("RuntimeNodeInfo", 9, 0x2d27_8aee_18b0_391a),
             ("RuntimeEngineInfo", 4, 0x3b72_3d70_7ebd_2541),
             ("EngineSummary", 4, 0x9d7c_c109_f7dd_c510),
             ("AccountUsageNode", 2, 0xa9b4_a56e_70f7_26dd),
@@ -605,6 +628,113 @@ mod tests {
             decoded.max_sessions, 0,
             "a payload without the field means the account has no limit, which is how accounts \
              behaved before the field existed"
+        );
+    }
+
+    /// `home_lost_node_id` arrived after the struct did, so a payload from a peer
+    /// that predates it has to decode — and decode to `None`, which is exactly
+    /// what it means: a peer that never had the column has no account whose home
+    /// it recorded as lost. If the default flipped, every account of an older
+    /// peer would arrive claiming its home had been deleted.
+    #[test]
+    fn a_payload_without_the_lost_home_marker_defaults_to_no_loss() {
+        let account = ProviderAccountInfo {
+            account_id: "acc1".to_string(),
+            home_lost_node_id: Some("gone-node".to_string()),
+            ..Default::default()
+        };
+        let frame = MessageBody::ProviderAccountBody(ProviderAccountPayload::AccountListResponse {
+            accounts: vec![account.clone()],
+            engines: Vec::new(),
+        });
+        let decoded: MessageBody =
+            crate::cbor::decode(&crate::cbor::encode(&frame).expect("encode")).expect("decode");
+        let MessageBody::ProviderAccountBody(ProviderAccountPayload::AccountListResponse {
+            accounts,
+            ..
+        }) = decoded
+        else {
+            panic!("the frame must decode as the response it was encoded from");
+        };
+        assert_eq!(
+            accounts,
+            vec![account.clone()],
+            "the marker must survive a round trip"
+        );
+        assert_eq!(accounts[0].home_lost_node_id.as_deref(), Some("gone-node"));
+
+        // The same struct with the field removed — what a peer built before the
+        // marker existed sends.
+        let bytes = crate::cbor::encode(&account).expect("encode");
+        let mut value: ciborium::value::Value = crate::cbor::decode(&bytes).expect("decode");
+        let ciborium::value::Value::Map(entries) = &mut value else {
+            panic!("a struct encodes as a map");
+        };
+        entries.retain(|(key, _)| key.as_text() != Some("home_lost_node_id"));
+        let without = crate::cbor::encode(&value).expect("encode");
+        assert!(
+            !without
+                .windows(b"home_lost_node_id".len())
+                .any(|window| window == b"home_lost_node_id"),
+            "the fixture must really omit the field"
+        );
+        let decoded: ProviderAccountInfo = crate::cbor::decode(&without).expect("decode");
+        assert_eq!(
+            decoded.home_lost_node_id, None,
+            "an account from a peer that does not carry the marker has not lost a home as far as \
+             that peer can say"
+        );
+    }
+
+    /// `RuntimeNodeInfo::is_local` arrived after the struct did, so a matrix
+    /// encoded by a peer that predates it has to decode — and decode to FALSE.
+    /// That default is what the UI reads as "not this machine": if it flipped,
+    /// every remote row of an older peer's matrix would claim to be the node
+    /// the operator is looking at, and A03 would label the wrong row.
+    #[test]
+    fn a_node_matrix_without_the_local_marker_defaults_every_row_to_remote() {
+        let node = RuntimeNodeInfo {
+            node_id: "peer".to_string(),
+            is_local: true,
+            ..Default::default()
+        };
+        let frame = MessageBody::ProviderAccountBody(ProviderAccountPayload::RuntimeListResponse {
+            nodes: vec![node.clone()],
+        });
+        let decoded: MessageBody =
+            crate::cbor::decode(&crate::cbor::encode(&frame).expect("encode")).expect("decode");
+        let MessageBody::ProviderAccountBody(ProviderAccountPayload::RuntimeListResponse { nodes }) =
+            decoded
+        else {
+            panic!("the frame must decode as the response it was encoded from");
+        };
+        assert_eq!(
+            nodes,
+            vec![node.clone()],
+            "the marker must survive a round trip"
+        );
+        assert!(nodes[0].is_local);
+
+        // The same struct with the field removed — what a peer built before the
+        // marker existed sends.
+        let bytes = crate::cbor::encode(&node).expect("encode");
+        let mut value: ciborium::value::Value = crate::cbor::decode(&bytes).expect("decode");
+        let ciborium::value::Value::Map(entries) = &mut value else {
+            panic!("a struct encodes as a map");
+        };
+        entries.retain(|(key, _)| key.as_text() != Some("is_local"));
+        let without = crate::cbor::encode(&value).expect("encode");
+        assert!(
+            !without
+                .windows(b"is_local".len())
+                .any(|window| window == b"is_local"),
+            "the fixture must really omit the field"
+        );
+        let decoded: RuntimeNodeInfo = crate::cbor::decode(&without).expect("decode");
+        assert!(
+            !decoded.is_local,
+            "a node matrix without the marker says nothing about which row is local, so no row \
+             may claim it"
         );
     }
 }

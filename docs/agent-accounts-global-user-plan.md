@@ -130,9 +130,13 @@ Rotacja tokenów (najtrudniejsza część, różna per silnik):
 | grok-build | `auth.json` + hak `auth_provider_command` | broker: CLI pyta Core o token, refresh token nie opuszcza vaultu |
 | muse-code | `config/muse/auth.json` | jak codex, po teście kontraktowym |
 
-`home_node_id` przenosi się automatycznie (istniejący protokół `account_move`, bez kasowania replik), gdy
-właściciel jest nieosiągalny dłużej niż próg, a inny node ma bieżącą rewizję. Dzisiejsza kwarantanna
-(`credential-review-required`) zostaje wyłącznie dla zmiany tożsamości albo przegranego CAS.
+`home_node_id` **nie przenosi się sam.** Rolę noda macierzystego wyznacza umieszczenie na nim poświadczenia:
+konto subskrypcyjne loguje się na tym nodzie, a konto z wklejonym kluczem API wkleja tam klucz. Node macierzysty
+rozsyła kolejne rewizje do nodów z włączonym przyjmowaniem kont, a satelita, który zaobserwuje w sesji zmianę
+poświadczenia, zgłasza nową rewizję **wyłącznie macierzystemu** — ten rozstrzyga CAS i rozsyła wynik. Gdy
+macierzysty jest nieosiągalny, satelita pracuje dalej na dostarczonej kopii, ale nowych rewizji nie ma kto
+rozesłać. Dzisiejsza kwarantanna (`credential-review-required`) zostaje wyłącznie dla zmiany tożsamości albo
+przegranego CAS.
 
 ### 2.5 Współbieżność i izolacja w jednym katalogu
 

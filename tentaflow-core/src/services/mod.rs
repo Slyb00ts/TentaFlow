@@ -4,7 +4,6 @@
 //       Eksportuje klientow QUIC/HTTP do komunikacji z silnikami AI.
 // =============================================================================
 
-pub mod account_move;
 pub mod agent_account;
 pub mod agent_runtime;
 pub mod cancel_registry;

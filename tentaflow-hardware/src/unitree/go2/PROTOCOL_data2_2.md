@@ -11,8 +11,9 @@ Target robot: firmware 1.1.12, LAN signaling port `:9991` (con_notify). Port 808
 2. Decrypt `data1` with the STATIC AES-128-GCM key (no per-device key on <1.1.15):
    - key = `[232,86,130,189,22,84,155,0,142,4,166,104,43,179,235,227]` (16 bytes)
    - raw = base64decode(data1); `ct = raw[..len-28]`, `nonce = raw[len-28..len-16]` (12B),
-     `tag = raw[len-16..]`. AES-128-GCM decrypt(nonce, ct||tag) → UTF-8 string.
-   - `data2 == 1` (or absent) → data1 is already plaintext. `data2 == 3` → per-device key (NOT us).
+   - `data2 == 1` (or absent) → data1 is already plaintext.
+   - `data2 == 2` → static AES-128-GCM key (firmware < 1.1.15).
+   - `data2 == 3` → per-device AES-128 key (firmware >= 1.1.15), 16 bytes passed as 32 hex chars. Same AES-128-GCM layout (nonce=12B at len-28..len-16, tag=16B at len-16..).
 3. From decrypted `data1` (ASCII):
    - robot RSA public key (base64 DER, SPKI) = `data1[10 .. len-10]`
    - `path_ending` = take last 10 chars, split into 5 pairs, map each pair's SECOND char

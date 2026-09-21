@@ -145,8 +145,11 @@ async function load() {
       const runtime = await AgentAccounts.runtimeNodes();
       state.nodes = runtime.nodes ?? [];
     } catch {
-      // The matrix is administration-only; a refusal here must not blank the
-      // account list a non-administrator is allowed to see.
+      // A transport, decode or reconnect failure leaves the matrix unread. An
+      // unread matrix must not render as "this account is homed here": with no
+      // row marked as this machine the window cannot place the home node, so it
+      // is handed an empty matrix and reports the scope as unknown instead of
+      // claiming the account's list is the one this node holds.
       state.nodes = [];
     }
   }

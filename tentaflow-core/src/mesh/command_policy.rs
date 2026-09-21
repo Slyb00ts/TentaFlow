@@ -51,7 +51,6 @@ pub fn required_privilege(command: &MeshCommandType) -> CommandPrivilege {
         | C::PushModelToPeer { .. }
         | C::OauthStart { .. }
         | C::OauthPoll { .. }
-        | C::AgentAccountMove { .. }
         | C::ConfigBundleExport
         | C::MlTrainStart { .. }
         | C::MlTrainCancel { .. }

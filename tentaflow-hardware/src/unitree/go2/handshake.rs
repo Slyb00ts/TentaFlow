@@ -61,10 +61,10 @@ fn http_post(ip: &str, port: u16, path: &str, content_type: Option<&str>, body: 
     Ok(String::from_utf8_lossy(body_bytes).trim().to_string())
 }
 
-/// POST con_notify and parse the robot identity (legacy data2=2 path).
-pub fn con_notify(ip: &str) -> Result<RobotIdentity> {
+/// POST con_notify and parse the robot identity (supports data2=2 and data2=3).
+pub fn con_notify(ip: &str, aes_128_key: Option<&str>) -> Result<RobotIdentity> {
     let body = http_post(ip, 9991, "/con_notify", None, b"").context("con_notify failed")?;
-    protocol::parse_con_notify(&body)
+    protocol::parse_con_notify(&body, aes_128_key)
 }
 
 /// Send the SDP offer via con_ing_<path>, return the decrypted SDP answer.

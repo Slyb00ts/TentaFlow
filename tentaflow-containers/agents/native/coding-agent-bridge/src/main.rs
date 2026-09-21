@@ -5,7 +5,6 @@ mod process;
 #[path = "../../process_sandbox.rs"]
 mod process_sandbox;
 mod rpc;
-mod transfer;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -111,8 +110,8 @@ struct AppState {
     probe_file: PathBuf,
     models_file: PathBuf,
     /// The last real sandbox launch and when it ran. A deploy asks once, but the
-    /// dashboard and `account_move` ask repeatedly, and a spawn per poll is a
-    /// cost nobody asked for.
+    /// dashboard polls repeatedly, and a spawn per poll is a cost nobody asked
+    /// for.
     sandbox: SandboxProbeCache,
     probe: Arc<Mutex<ProbeCache>>,
     /// Serializes every probe. Held across the whole CLI interaction, so
@@ -498,9 +497,6 @@ async fn run() -> Result<()> {
                 .put(write_account_credential)
                 .delete(delete_account_credential),
         )
-        .route("/account/transfer/freeze", post(transfer::freeze))
-        .route("/account/transfer/retire", post(transfer::retire))
-        .route("/account/transfer/activate", post(transfer::activate))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", delete(close_session))
         .route("/sessions/{id}/turn", post(start_turn))
@@ -1159,7 +1155,7 @@ async fn persist_probe_cache(state: &AppState) -> Result<()> {
 async fn persist(state: &AppState) -> Result<()> {
     let sessions = state.sessions.lock().await;
     let metas: Vec<_> = sessions.values().map(|s| s.meta.clone()).collect();
-    transfer::write_private(&state.state_file, &serde_json::to_value(metas)?)
+    credentials::write_private(&state.state_file, &serde_json::to_value(metas)?)
 }
 
 async fn shutdown_runtime(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -1348,14 +1344,6 @@ async fn auth_status_snapshot(State(state): State<AppState>) -> (StatusCode, Jso
         );
     }
     drop(login);
-    if let Err(error) = transfer::available(&state) {
-        return (
-            StatusCode::OK,
-            Json(
-                json!({"authenticated":false,"status":"account_moving","output":error.to_string()}),
-            ),
-        );
-    }
     if let Err(error) = ensure_idle_runtime(&state) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1510,7 +1498,6 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
         ));
     }
     ensure_idle_runtime(&state)?;
-    transfer::available(&state)?;
     let workspace = env::var("HOME").context("account HOME missing")?;
     let id = format!("auth-{}", uuid::Uuid::new_v4());
     let events = Arc::new(SyncMutex::new(Vec::new()));
@@ -1574,7 +1561,6 @@ async fn list_models(
     State(state): State<AppState>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    transfer::available(&state)?;
     if state.provider == Provider::ClaudeCode {
         let (models, source) = configured_claude_models(&state.models_file)?;
         return Ok(Json(
@@ -1738,7 +1724,6 @@ async fn usage(
     State(state): State<AppState>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    transfer::available(&state)?;
     if !query.refresh {
         let cache = state.probe.lock().await;
         if cache.usage_is_fresh(now_ms()) {
@@ -1973,7 +1958,6 @@ async fn start_session(
     events: Arc<SyncMutex<Vec<Event>>>,
 ) -> Result<(SessionMeta, Runtime), ApiError> {
     let id = id.to_string();
-    transfer::available(state)?;
     ensure_idle_runtime(state)?;
     // Which private profile this session runs in, resolved before anything is
     // spent on it: a resume names an existing profile, a fresh session gets its
@@ -3900,7 +3884,6 @@ mod tests {
         let proof = shutdown_runtime(State(state.clone())).await.unwrap().0;
         assert_eq!(proof["process_state"], "reaped");
         assert_eq!(proof["bridge_pid"], std::process::id());
-        assert!(transfer::available(&state).is_err());
         assert!(ensure_idle_runtime(&state).is_err());
         let _ = shutdown_runtime(State(state)).await.unwrap();
     }
@@ -3926,51 +3909,6 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&state.state_file).unwrap()).unwrap();
         assert!(persisted.to_string().contains(&id));
         assert_eq!(state.sessions.lock().await[&id].meta.status, "closed");
-    }
-
-    #[tokio::test]
-    async fn relocation_barriers_are_idempotent_and_never_activate_the_source() {
-        let temporary = tempfile::tempdir().unwrap();
-        let state = account_fixture(temporary.path());
-        let id = uuid::Uuid::new_v4().to_string();
-        let request = json!({"transfer_id":id,"manifest":{"account_id":"test-account"}});
-        let first = transfer::freeze(State(state.clone()), Json(request.clone()))
-            .await
-            .unwrap()
-            .0;
-        let second = transfer::freeze(State(state.clone()), Json(request.clone()))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(first, second);
-        assert!(transfer::available(&state).is_err());
-        let _ = transfer::retire(State(state.clone()), Json(json!({"transfer_id":id})))
-            .await
-            .unwrap();
-        let _ = transfer::retire(State(state.clone()), Json(json!({"transfer_id":id})))
-            .await
-            .unwrap();
-        assert!(transfer::freeze(State(state.clone()), Json(request))
-            .await
-            .is_err());
-        assert!(
-            transfer::activate(State(state.clone()), Json(json!({"transfer_id":id})))
-                .await
-                .is_err()
-        );
-        assert!(transfer::available(&state).is_err());
-        transfer::write_private(
-            &temporary.path().join("transfer.json"),
-            &json!({"transfer_id":id,"phase":"target_staged"}),
-        )
-        .unwrap();
-        let _ = transfer::activate(State(state.clone()), Json(json!({"transfer_id":id})))
-            .await
-            .unwrap();
-        let _ = transfer::activate(State(state.clone()), Json(json!({"transfer_id":id})))
-            .await
-            .unwrap();
-        assert!(transfer::available(&state).is_ok());
     }
 
     fn env_value(env: &[(String, String)], name: &str) -> String {
@@ -5159,8 +5097,7 @@ mod tests {
     }
 
     /// Sessions do not gate each other, and they do not gate a sign-in: only
-    /// another sign-in does. A relocation still needs an idle account, so it
-    /// asks the sessions rather than a lease.
+    /// another sign-in does.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_session_blocks_no_other_session_and_no_login() {
@@ -5187,7 +5124,10 @@ mod tests {
         );
 
         // Both of these fail on this host — it has no managed execution policy —
-        // but neither may fail because the account is already in use.
+        // but neither may fail because the account is already in use: a second
+        // session takes its own private profile and a sign-in takes the login
+        // home, so the only refusals left here are one sign-in at a time and a
+        // resume of a profile a live CLI still holds.
         let refusal = |error: ApiError| error.1;
         let request: CreateSession = serde_json::from_value(
             json!({"session_id": uuid::Uuid::new_v4().to_string(), "workspace_authorized": true, "workspace": temporary.path()}),
@@ -5198,15 +5138,15 @@ mod tests {
             .map(|_| String::new())
             .unwrap_or_else(refusal);
         assert!(
-            !second.contains("account_busy"),
-            "a second session was refused: {second}"
+            !second.contains("login_in_progress") && !second.contains("profile_in_use"),
+            "a second session was refused for sharing the account: {second}"
         );
         let login = auth_start(State(state.clone()))
             .await
             .map(|_| String::new())
             .unwrap_or_else(refusal);
         assert!(
-            !login.contains("account_busy") && !login.contains("login_in_progress"),
+            !login.contains("login_in_progress"),
             "a session blocked a sign-in: {login}"
         );
 
@@ -5218,18 +5158,6 @@ mod tests {
             .1
             .contains("login_in_progress"));
         *state.login_flow.lock().await = None;
-
-        let moving = transfer::freeze(
-            State(state.clone()),
-            Json(json!({"transfer_id": uuid::Uuid::new_v4().to_string(), "manifest": {}})),
-        )
-        .await
-        .map(|_| String::new())
-        .unwrap_or_else(refusal);
-        assert!(
-            moving.contains("account_busy"),
-            "a move must still require an idle account: {moving}"
-        );
     }
 
     /// Two live sessions may share an account; they may not share one vendor

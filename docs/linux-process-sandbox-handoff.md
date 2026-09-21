@@ -15,8 +15,8 @@ Przed pracą przeczytaj `AGENTS.md` oraz:
 
 - Osobne UUID kont, prywatne profile i historie, uprawnienia użytkowników, jedna aktywna sesja na konto, blokady OS i wspólne instalacje według wersji.
 - Administracyjne przypisanie istniejącego katalogu Git do workspace'u, kontrola tożsamości katalogu i członkostwa, osobne ścieżki exec, PTY i CLI. Czat jest domyślnym widokiem.
-- Gateway z uwierzytelnieniem i polityką dostawcy, odebranie dostępu zatrzymujące sesje, odzyskiwanie gatewaya po awarii Core oraz trwałe przenoszenie bezczynnych kont Codex/Claude.
-- Na macOS działa Seatbelt i supervisor launchd. Testy obejmowały odłączone procesy potomne, SIGKILL, dwa konta, dwa nody, przerwanie transferu, powrót konta i ponowny start obu kont naraz.
+- Gateway z uwierzytelnieniem i polityką dostawcy, odebranie dostępu zatrzymujące sesje, odzyskiwanie gatewaya po awarii Core oraz rozsyłanie poświadczeń Codex/Claude z noda macierzystego do nodów przyjmujących konta.
+- Na macOS działa Seatbelt i supervisor launchd. Testy obejmowały odłączone procesy potomne, SIGKILL, dwa konta i ponowny start obu kont naraz.
 - Linux ma ścieżkę bubblewrap bez sieci. Samo istnienie `/usr/bin/bwrap` nie jest wystarczającą kontrolą możliwości. Transport gatewaya i pełny nadzór cyklu życia procesów wymagają dokończenia oraz testów.
 
 ## Miejsca w kodzie
@@ -26,7 +26,7 @@ Przed pracą przeczytaj `AGENTS.md` oraz:
 | Wspólna polityka i wrapper OS | `tentaflow-containers/agents/native/process_sandbox.rs` |
 | Wzorzec gwarancji supervisora macOS | `tentaflow-containers/agents/native/macos_supervisor.rs` |
 | Core: exec, PTY, katalogi, cleanup | `tentaflow-core/src/code_studio/{sandbox.rs,location.rs,exec/,terminal.rs,git_broker.rs,cli_bridge.rs}` |
-| Gateway, dostęp i transfer kont | `tentaflow-core/src/services/{coding_agent_proxy.rs,coding_agent.rs,account_move.rs,supervisor.rs}` |
+| Gateway i dostęp do kont | `tentaflow-core/src/services/{coding_agent_proxy.rs,coding_agent.rs,supervisor.rs}` |
 | Instalacja i start kont | `tentaflow-core/src/services/deploy/{managed_cli.rs,binary.rs,mod.rs}` |
 | Procesy i adaptery CLI | `tentaflow-containers/agents/native/coding-agent-bridge/src/` |
 | Dostępność silników w GUI | `tentaflow-containers/agents/_services/{codex,claude-code,grok-build,muse-code}.toml` |
@@ -40,7 +40,7 @@ W `process_sandbox.rs` sprawdź szczególnie `Policy::check_available`, `Policy:
 3. Zapewnij kontrolowany transport do istniejącego gatewaya. Dobierz i sprawdź na tym hoście sposób przekazania połączenia przez granicę namespace'u. Nie otwieraj całej sieci hosta przez `--share-net`; nie wystawiaj gatewaya bez uwierzytelnienia. Zachowaj politykę egress, ochronę innych usług lokalnych i odcięcie aktywnych połączeń po odebraniu dostępu.
 4. Zapewnij zakończenie całego drzewa procesów, także po podwójnym fork, `setsid`, zamknięciu PTY, Stop, anulowaniu i SIGKILL Core/bridge. Samo zabicie grupy procesów nie jest dowodem cleanupu. Wykorzystaj sprawdzony na tym Linuxie mechanizm namespace/supervisora lub delegowanej cgroup. Zajętość konta i katalogu wolno zwolnić dopiero po potwierdzonym sprzątaniu. Zachowaj trwały zamiar startu i ochronę przed ponownym użyciem PID.
 5. Uruchom rzeczywiste CLI w prywatnej instalacji. Dla Grok/Muse zweryfikuj oficjalne linuksowe artefakty, rozmiary i SHA-256. Włącz Linux w manifestach oraz kontrolach backendu dopiero dla faktycznie działających silników i architektur. GUI ma pokazywać rzeczywistą dostępność; używaj istniejących komponentów `tf-*`.
-6. Sprawdź dwa konta tego samego dostawcy i dwa nody na jednym hoście. Zachowaj oczekiwanie na współdzieloną instalację, rozpoznawanie nodów po identyfikatorze oraz trwałe adresy po restarcie. Nie twórz równoległej implementacji zarządzania kontami ani osobnego protokołu transferu.
+6. Sprawdź dwa konta tego samego dostawcy i dwa nody na jednym hoście. Zachowaj oczekiwanie na współdzieloną instalację, rozpoznawanie nodów po identyfikatorze oraz trwałe adresy po restarcie. Nie twórz równoległej implementacji zarządzania kontami obok noda macierzystego i rozsyłania poświadczeń.
 
 ## Testy akceptacyjne
 
@@ -50,7 +50,7 @@ W `process_sandbox.rs` sprawdź szczególnie `Policy::check_available`, `Policy:
 - Rzeczywisty terminal: odczyt, zapis, resize, zamknięcie. Potomkowie po fork/setsid mają zniknąć po Stop i awarii; procesy drugiego konta mają pozostać żywe.
 - Anulowanie podczas tworzenia sesji/instalacji nie może uruchomić jej z opóźnieniem. Po awarii Core nowy bridge musi mieć działający gateway nowego Core.
 - Dwa przypięte konta startują razem, zachowując UUID, granty i prywatne profile. Użytkownik bez grantu nie widzi cudzej historii ani nie używa konta.
-- Dwa prawdziwe nody: transfer Codex/Claude, przerwanie i wznowienie, powrót konta, brak dwóch aktywnych kopii. Sprawdź automatyczne ponowne połączenie po restarcie bez ponownego parowania.
+- Dwa prawdziwe nody: poświadczenie umieszczone na nodzie macierzystym dociera do noda przyjmującego konta, a na jedno konto przypada jedna aktywna sesja. Sprawdź automatyczne ponowne połączenie po restarcie bez ponownego parowania.
 - Zamknięcie/usunięcie workspace'u zachowuje oryginalne repozytorium, zmienione pliki śledzone i pliki nieśledzone.
 - Zmierz koszt startu i pamięć na testowanym hoście. Oddziel koszt instalacji CLI od kosztu uruchomienia gotowego sandboxa.
 

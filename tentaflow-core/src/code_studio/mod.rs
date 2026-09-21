@@ -55,3 +55,37 @@ pub mod terminal;
 pub mod tools;
 pub mod vault;
 pub mod workspace_db;
+
+/// The wire spelling of a process-sandbox refusal.
+///
+/// The picker switches on the variant, never on the English prose a probe
+/// produces — a localized message cannot be recovered from a sentence, and
+/// substring-matching one in the dashboard is how the wrong message ends up
+/// under the wrong node. ONE mapping, because two of them (the node picker and
+/// the mesh advertisement) would eventually disagree on a new cause.
+pub fn sandbox_cause(
+    unavailable: &process_sandbox::SandboxUnavailable,
+) -> tentaflow_protocol::code_studio::ProcessSandboxCause {
+    use process_sandbox::SandboxUnavailable as Unavailable;
+    use tentaflow_protocol::code_studio::ProcessSandboxCause as Cause;
+    match unavailable {
+        Unavailable::NoSandboxBinary => Cause::NoSandboxBinary,
+        Unavailable::SupervisorNotInitialized => Cause::SupervisorNotInitialized,
+        Unavailable::MissingCoalition => Cause::MissingCoalition,
+        Unavailable::GuiSessionRequired => Cause::GuiSessionRequired,
+    }
+}
+
+/// Whether THIS node can host a container-isolated workspace. Both halves
+/// matter: a build without the `docker` feature has no sandbox backend at all,
+/// and a node whose runtime socket does not answer cannot keep the promise
+/// either.
+///
+/// One statement, two callers: the create gate and the `NodeInfo` this node
+/// advertises to peers. Reading the same predicate is what stops an
+/// advertisement from promising a mode the gate then refuses; a false negative
+/// (a runtime reached over `DOCKER_HOST=tcp://…`, which the socket probe cannot
+/// confirm) only hides the mode, it never over-promises.
+pub fn container_runtime_available() -> bool {
+    cfg!(feature = "docker") && egress::node_capabilities().container_runtime
+}

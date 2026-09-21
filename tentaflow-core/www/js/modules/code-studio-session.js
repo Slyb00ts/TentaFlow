@@ -409,6 +409,30 @@ function dotClassFor(status) {
   }
 }
 
+// The states a `session_runs` row is written with. Two families reach the
+// column, both from session-run code. The literals: the insert's `running`
+// (`dispatch/code_studio.rs:6607`, `code_studio/session.rs:525`,
+// `flow_engine/node_adapters/delegate_cli.rs:351`), the cancel path's
+// `cancelling`/`cancelled` (`dispatch/code_studio.rs:6987`, `:7019`) and what a
+// settled run reports — `completed`/`failed` from the run manager
+// (`dispatch/code_studio.rs:6698`, `code_studio/session.rs:629`) plus the CLI
+// delegation's own `timed_out` (`flow_engine/node_adapters/delegate_cli.rs:421`,
+// settled from the report at `:1841`). And `queued`/`waiting`/`waiting_user`,
+// which arrive only through `read_terminal_row` (`agents/run_manager.rs:945-962`):
+// its bounded retry hands back the freshest row even when it is not terminal, and
+// `watch_session_run` (`dispatch/code_studio.rs:6630`) copies it into the row.
+// A state this build does not know is shown exactly as it arrived, never as a
+// `code_studio.run_status.*` key an operator would have to read as a translation.
+const RUN_STATUSES = new Set([
+  'queued', 'running', 'waiting', 'waiting_user', 'completed', 'failed',
+  'cancelled', 'cancelling', 'timed_out',
+]);
+
+function runStatusLabel(status) {
+  const id = String(status || '');
+  return RUN_STATUSES.has(id) ? t(`run_status.${id}`) : id;
+}
+
 function profileLabel(mount, network) {
   if (!mount && !network) return '';
   return `${mount || '—'} × ${network || '—'}`;
@@ -728,6 +752,12 @@ function activityLabels() {
     step_node: t('activity.step_node'),
     step_compaction: t('activity.step_compaction'),
     step_router: t('activity.step_router'),
+    // The widget holds no vocabulary of its own, so the run-status words travel
+    // in the same dict. Built from `RUN_STATUSES` rather than listed again: a
+    // state added to the set cannot reach the screen as an untranslated id.
+    run_status: Object.fromEntries(
+      [...RUN_STATUSES].map((status) => [status, runStatusLabel(status)]),
+    ),
   };
 }
 
@@ -1243,7 +1273,7 @@ function openSubagentTab(runId) {
     mono: false,
     label: run?.agent_id || shortId(runId),
     title: run?.agent_id || shortId(runId),
-    sub: run ? `${run.kind} · ${run.status}` : '',
+    sub: run ? `${t(`run_kind.${run.kind}`)} · ${runStatusLabel(run.status)}` : '',
     // C02 — the account this sub-agent's CLI ran on, next to its state. A run
     // that resolved none carries no chip rather than an empty one.
     account: accountChipLabel(run?.account),
@@ -2361,7 +2391,7 @@ function renderRunChain() {
       <span class="gnode"><span class="gdot"></span>${index < state.runs.length - 1 ? '<span class="gline"></span>' : ''}</span>
       <span>
         <span class="gmsg">${escapeHtml(t(`run_kind.${run.kind}`))} #${escapeHtml(String(run.ordinal))} — ${escapeHtml(t(`trigger.${run.trigger}`))}</span>
-        <span class="gmeta">${escapeHtml(run.agent_id || shortId(run.run_id))} · ${escapeHtml(run.status)} · ${escapeHtml(durationOf(run.started_at, run.finished_at))}</span>
+        <span class="gmeta">${escapeHtml(run.agent_id || shortId(run.run_id))} · ${escapeHtml(runStatusLabel(run.status))} · ${escapeHtml(durationOf(run.started_at, run.finished_at))}</span>
         ${run.note ? `<span class="gmeta">${escapeHtml(run.note)}</span>` : ''}
       </span>
     </div>

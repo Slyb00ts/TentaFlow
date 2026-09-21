@@ -264,7 +264,17 @@ mod serde_array64 {
 // that cannot be served is up. An account's credential now travels as
 // `CredentialSetRequest` in the provider-account family; the node-local vault
 // the old variants addressed is gone.
-pub const SCHEMA_VERSION: u16 = 30;
+//
+// v31 removes `MeshCommandType::AgentAccountMove`. Like v30 this is a variant
+// removal, not a shape change, and the mesh command enum is serde externally
+// tagged too — so the variant NAME travels on the wire and a v30 peer still
+// sending it fails to decode rather than being misread. That failure would
+// otherwise arrive mid-mesh-command, on the one path that carried a credential
+// payload; the bump turns it into a handshake refusal at connect. Every mesh
+// node is rebuilt together on a bump. The relocation this command drove is gone
+// — an account's credential is refreshed by its `home_node_id` and reaches
+// other nodes as fanned-out revisions — so nothing replaces the variant.
+pub const SCHEMA_VERSION: u16 = 31;
 
 // =============================================================================
 // Message kind discriminants

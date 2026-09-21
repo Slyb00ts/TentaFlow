@@ -40,6 +40,19 @@ function cutFn(name) {
   return cutBalanced(source, start, '{', '}');
 }
 
+// `escapeHtml` is imported by the module under test rather than defined in it, so
+// it is cut from the file that ships it (minus the `export` keyword, which is
+// illegal inside `new Function`).
+const utilsSource = readFileSync(join(here, '..', 'utils.js'), 'utf8');
+function cutUtilsFn(name) {
+  const prefix = `export function ${name}(`;
+  const start = utilsSource.indexOf(prefix);
+  if (start < 0) throw new Error(`no definition in utils.js: ${name}`);
+  const body = start + 'export '.length;
+  return cutBalanced(utilsSource, body, '{', '}');
+}
+const escapeHtml = new Function(`${cutUtilsFn('escapeHtml')} return escapeHtml;`)();
+
 function cutConst(name) {
   const start = source.indexOf(`const ${name} = `);
   if (start < 0) throw new Error(`no constant: ${name}`);
@@ -305,6 +318,143 @@ test('the line counter carries a plural form per language, three of them in Poli
     assert.ok(forms, `${lang} counts lines by concatenation instead of a plural form`);
     const expected = lang === 'pl' ? 3 : 2;
     assert.equal(forms[1].split('|').length, expected, `${lang} plural forms`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The state a run tab states on its sub-line
+// ---------------------------------------------------------------------------
+
+// `RUN_STATUSES` is a two-line `new Set([...])`, which the single-line
+// `cutConst` above cannot cut, so it is taken by bracket balance instead.
+function cutSet(name) {
+  const start = source.indexOf(`const ${name} = `);
+  if (start < 0) throw new Error(`no constant: ${name}`);
+  const eq = start + `const ${name} = `.length;
+  return `${source.slice(start, eq)}${cutBalanced(source, eq, '(', ')')};`;
+}
+
+/// The shipped `runStatusLabel` and the set it dispatches on, bound to one
+/// locale's `code_studio` dictionary. A key the module asks for and the locale
+/// does not have is a failure here, not a raw key on the screen.
+function statusLabels(dict) {
+  const T = (key) => {
+    const text = lookup(dict, key);
+    assert.equal(typeof text, 'string', `missing translation: code_studio.${key}`);
+    return text;
+  };
+  return new Function('T', `
+    const t = (key) => T(key);
+    ${cutSet('RUN_STATUSES')}
+    ${cutFn('runStatusLabel')}
+    return { runStatusLabel, RUN_STATUSES };
+  `)(T);
+}
+
+// The states the module is willing to translate. Taken from the shipped set so
+// that a state added there without a translation fails below instead of
+// printing as a raw id.
+const RUN_STATUS_KEYS = [...new Function(`${cutSet('RUN_STATUSES')}
+  return RUN_STATUSES;
+`)()];
+
+test('the run_status family has the same sub-keys in all five locales', () => {
+  assert.ok(RUN_STATUS_KEYS.length, 'the module translates no run state at all');
+  const plKeys = Object.keys(lookup(LOCALES.find(([lang]) => lang === 'pl')[1], 'run_status') || {}).sort();
+  assert.deepEqual(plKeys, [...RUN_STATUS_KEYS].sort(), 'pl lists a different family than RUN_STATUSES');
+  for (const [lang, dict] of LOCALES) {
+    assert.deepEqual(
+      Object.keys(lookup(dict, 'run_status') || {}).sort(),
+      plKeys,
+      `code_studio.run_status sub-keys in ${lang}`,
+    );
+  }
+});
+
+// The dictionary is the only source of the wording: a state the set carries must
+// read as its `code_studio.run_status.*` string, and every language but English
+// must spell it differently from the wire id — that difference is the proof no raw
+// id reaches the screen.
+test('every state the module translates is stated in the operator’s language', () => {
+  for (const [lang, dict] of LOCALES) {
+    const { runStatusLabel } = statusLabels(dict);
+    const labels = RUN_STATUS_KEYS.map((status) => runStatusLabel(status));
+    for (const [index, label] of labels.entries()) {
+      const status = RUN_STATUS_KEYS[index];
+      assert.equal(label, lookup(dict, `run_status.${status}`), `${lang} ${status}`);
+      assert.ok(label.trim().length > 0, `${lang} ${status} is blank`);
+      if (lang !== 'en') {
+        assert.notEqual(label, status, `${lang} ${status} is shown as the raw wire id`);
+      }
+    }
+    assert.equal(new Set(labels).size, labels.length, `${lang}: two states read alike: ${labels}`);
+  }
+});
+
+// The run chain in the inspector is the second place a run's state is put on
+// screen, and it printed the wire value verbatim. `renderRunChain` reads
+// module-level `host`/`state` and the locale-bound `t`, so it is driven the way
+// the browser drives it: a host carrying the one node it queries, the shipped
+// `state.runs` shape, and `t` bound to a locale dictionary.
+function runChainHtml(dict, runs) {
+  const box = { innerHTML: '' };
+  const host = { querySelector: (sel) => (sel === '[data-runs-chain]' ? box : null) };
+  const t = (key) => {
+    const text = lookup(dict, key);
+    return typeof text === 'string' ? text : key;
+  };
+  new Function('host', 'state', 't', 'escapeHtml', 'durationOf', `
+    ${cutFn('shortId')}
+    ${cutSet('RUN_STATUSES')}
+    ${cutFn('runStatusLabel')}
+    ${cutFn('renderRunChain')}
+    renderRunChain();
+  `)(host, { runs }, t, escapeHtml, durationOf);
+  return box.innerHTML;
+}
+
+test('the run chain states every run state in the operator’s language', () => {
+  for (const [lang, dict] of LOCALES) {
+    for (const status of RUN_STATUS_KEYS) {
+      const html = runChainHtml(dict, [{
+        run_id: 'abcdef0123456789abcd',
+        kind: 'root',
+        trigger: 'user',
+        ordinal: 3,
+        status,
+        started_at: '2026-01-01T00:00:00Z',
+        finished_at: '2026-01-01T00:00:05Z',
+      }]);
+      const label = lookup(dict, `run_status.${status}`);
+      // The row still carries its kind, ordinal and duration — the label change
+      // is not allowed to eat the rest of the line.
+      assert.ok(html.includes(`#3`), `${lang} ${status}: the ordinal is gone`);
+      assert.ok(html.includes(`5s`), `${lang} ${status}: the duration is gone`);
+      assert.ok(
+        html.includes(`· ${escapeHtml(label)} ·`),
+        `${lang} ${status}: '${label}' is not on the row (${html})`,
+      );
+      if (label !== status) {
+        assert.ok(
+          !html.includes(`· ${status} ·`),
+          `${lang} ${status}: the wire id is still on the row (${html})`,
+        );
+      }
+    }
+  }
+});
+
+// A state this build does not know is shown exactly as it arrived — never as a
+// `code_studio.run_status.*` key an operator would have to read as a
+// translation. This is the documented fall-through, pinned as it behaves.
+test('a state the module does not know is shown as it arrived, not as a key', () => {
+  for (const [lang, dict] of LOCALES) {
+    const { runStatusLabel } = statusLabels(dict);
+    for (const unknown of ['projection_pending', 'reaped', 'orphaned']) {
+      assert.equal(runStatusLabel(unknown), unknown, `${lang} ${unknown}`);
+    }
+    assert.equal(runStatusLabel(''), '', `${lang} no status at all`);
+    assert.equal(runStatusLabel(null), '', `${lang} a null status`);
   }
 });
 

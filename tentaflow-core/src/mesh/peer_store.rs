@@ -64,8 +64,16 @@ pub struct MeshPeerInfo {
     pub cpu_temperature_c: Option<f32>,
     pub swap_total_mb: u64,
     pub swap_used_mb: u64,
-    /// Czy Docker jest dostepny na tym nodzie
-    pub docker_available: bool,
+    /// Whether a container runtime answers on this node. A peer row holds what
+    /// that peer ADVERTISED in its `NodeInfo`, copied as received; the local row
+    /// keeps the CLI-driven `docker info` signal (`seed_local` /
+    /// `update_local_extras`) it has always carried, which is display data
+    /// nothing gates on — this node's own answer reaches its picker from the
+    /// live predicate, exactly as the process-sandbox fields do. `None` means
+    /// "nothing reported" — a peer built before the field, or one that has not
+    /// probed — and nothing reported is never read as support.
+    #[serde(default)]
+    pub docker_available: Option<bool>,
     /// Wersja Docker serwera (np. "27.5.1")
     pub docker_version: String,
     /// Modele zaladowane / dostepne na nodzie (propagowane przez ModelsSync).
@@ -89,6 +97,17 @@ pub struct MeshPeerInfo {
     /// wyswietlania checkbox'ow per zrodlo na ekranie Profile.
     #[serde(default)]
     pub profiling_collectors_available: Vec<String>,
+    /// Whether the peer can run a workspace in `process_sandbox` — ITS OWN
+    /// probe, carried over the mesh in `NodeInfo`. `None` means "nothing
+    /// reported": either it does not know the field (an older build) or it has
+    /// not probed yet. Nothing reported is never read as consent.
+    #[serde(default)]
+    pub supports_process_sandbox: Option<bool>,
+    /// Why not, when `supports_process_sandbox == Some(false)`. A probe's
+    /// sentence does not translate, so the mesh carries the CAUSE from the
+    /// closed `ProcessSandboxCause` set and each language says it its own way.
+    #[serde(default)]
+    pub process_sandbox_cause: Option<tentaflow_protocol::code_studio::ProcessSandboxCause>,
 }
 
 /// Producent GPU — wykrywany po nazwie / PCI; uzywany do gating profilowania
@@ -166,6 +185,28 @@ pub struct NodeInfo {
     /// un-upgraded peer's info as `Prod`.
     #[serde(default)]
     pub environment: tentaflow_protocol::environment::NodeEnvironment,
+    /// Whether the SENDING node can run a `process_sandbox` workspace, by its
+    /// own probe — the sandbox counterpart of what a container runtime tells
+    /// the mesh about that node. `None` means "nothing reported": a peer built
+    /// before the field, or one that has not probed. Nothing reported is never
+    /// read as support (a picker would offer a mode that node then refuses).
+    ///
+    /// Appended after `environment`, like every other field additions here: the
+    /// frame is a CBOR map keyed by field name, so an older peer just omits it.
+    #[serde(default)]
+    pub supports_process_sandbox: Option<bool>,
+    /// Why not, when the sender reported `false`: the CAUSE from the closed
+    /// set, because a probe's English sentence cannot be translated and the
+    /// picker renders the cause in the reader's language.
+    #[serde(default)]
+    pub process_sandbox_cause: Option<tentaflow_protocol::code_studio::ProcessSandboxCause>,
+    /// Whether the SENDING node can run a `container` workspace, by the same
+    /// predicate its create gate uses (`container_runtime_available`). `None`
+    /// means "nothing reported" — a peer built before the field — and nothing
+    /// reported is never read as support: the wire default of a plain `bool`
+    /// cannot express that third state, which is why this one is an `Option`.
+    #[serde(default)]
+    pub docker_available: Option<bool>,
 }
 
 /// Informacje o kontenerze Docker peera
@@ -942,6 +983,11 @@ impl MeshPeerStore {
             entry.ram_total_mb = info.ram_total_mb;
             entry.gpu_info = info.gpu_info.clone();
             entry.gpu_links = info.gpu_links.clone();
+            // The peer's own report, stored as received — including the `None`
+            // of a peer that advertises nothing.
+            entry.supports_process_sandbox = info.supports_process_sandbox;
+            entry.process_sandbox_cause = info.process_sandbox_cause;
+            entry.docker_available = info.docker_available;
             (entry.hostname.clone(), entry.port, entry.ram_total_mb)
         };
         Self::remove_stale_by_hostname_port(
@@ -1081,7 +1127,7 @@ impl MeshPeerStore {
             entry.ram_total_mb = ram_total_mb;
             entry.gpu_info = gpu_info;
             entry.addresses = addresses;
-            entry.docker_available = docker_available;
+            entry.docker_available = Some(docker_available);
             entry.docker_version = docker_version;
             if entry.role.is_empty() {
                 entry.role = "router".to_string();
@@ -1183,7 +1229,7 @@ impl MeshPeerStore {
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
             entry.addresses = addresses;
-            entry.docker_available = docker_available;
+            entry.docker_available = Some(docker_available);
             entry.docker_version = docker_version;
             if !os_info.is_empty() {
                 entry.os_info = os_info;
@@ -1386,7 +1432,7 @@ impl MeshPeerStore {
             cpu_temperature_c: None,
             swap_total_mb: 0,
             swap_used_mb: 0,
-            docker_available: false,
+            docker_available: None,
             docker_version: String::new(),
             models: vec![],
             active_requests: 0,
@@ -1394,6 +1440,8 @@ impl MeshPeerStore {
             nsys_available: false,
             nsys_version: String::new(),
             profiling_collectors_available: Vec::new(),
+            supports_process_sandbox: None,
+            process_sandbox_cause: None,
         }
     }
 }
@@ -1533,6 +1581,136 @@ mod tests {
         assert!(decoded
             .profiling_collectors_available
             .contains(&"nvidia.nsys.gpu".to_string()));
+    }
+
+    /// One `NodeInfo` with every isolation field filled, for the tests that move
+    /// it across the wire.
+    fn node_info_with_isolation(
+        node_id: &str,
+        sandbox: (Option<bool>, Option<tentaflow_protocol::code_studio::ProcessSandboxCause>),
+        docker_available: Option<bool>,
+    ) -> NodeInfo {
+        NodeInfo {
+            node_id: node_id.to_string(),
+            hostname: "gpu-01".to_string(),
+            os_info: "Darwin 27.0 (arm64)".to_string(),
+            cpu_count: 12,
+            ram_total_mb: 32768,
+            gpu_info: Vec::new(),
+            gpu_links: Vec::new(),
+            environment: Default::default(),
+            supports_process_sandbox: sandbox.0,
+            process_sandbox_cause: sandbox.1,
+            docker_available,
+        }
+    }
+
+    /// A peer's own sandbox answer has to reach this node's peer row: the node
+    /// picker on THIS node decides whether a remote node may host a
+    /// `process_sandbox` workspace from exactly this value, and before the
+    /// field existed every remote row was `None` — read as a refusal.
+    #[test]
+    fn the_sandbox_advertisement_of_a_peer_survives_the_wire() {
+        use tentaflow_protocol::code_studio::ProcessSandboxCause;
+
+        let node = hex::encode([31; 32]);
+        let store = MeshPeerStore::new();
+        for (sent, expected) in [
+            (Some(true), Some(true)),
+            (Some(false), Some(false)),
+            (None, None),
+        ] {
+            let info = node_info_with_isolation(&node, (sent, None), Some(true));
+            let bytes = crate::mesh::cbor::encode(&info).expect("encode");
+            let decoded = crate::mesh::cbor::decode::<NodeInfo>(&bytes).expect("decode");
+            assert_eq!(decoded.supports_process_sandbox, expected);
+
+            store.update_node_info(&node, &decoded);
+            assert_eq!(
+                store.get(&node).expect("the peer row").supports_process_sandbox,
+                expected,
+                "the row the picker reads must carry what the peer advertised",
+            );
+        }
+
+        // The cause is what the picker renders, so it has to survive too — and
+        // two refusals must stay apart on the far side.
+        for cause in [
+            ProcessSandboxCause::GuiSessionRequired,
+            ProcessSandboxCause::NoSandboxBinary,
+        ] {
+            let info = node_info_with_isolation(&node, (Some(false), Some(cause)), Some(true));
+            let bytes = crate::mesh::cbor::encode(&info).expect("encode");
+            let decoded = crate::mesh::cbor::decode::<NodeInfo>(&bytes).expect("decode");
+            assert_eq!(decoded.process_sandbox_cause, Some(cause));
+            store.update_node_info(&node, &decoded);
+            assert_eq!(
+                store.get(&node).expect("the peer row").process_sandbox_cause,
+                Some(cause)
+            );
+        }
+    }
+
+    /// The container half of the same advertisement. The picker offers
+    /// `container` on a remote node from this one value, and `None` has to stay
+    /// `None` on the far side: copying it as `false` would turn "the peer said
+    /// nothing" into "the peer has no runtime".
+    #[test]
+    fn the_container_advertisement_of_a_peer_survives_the_wire() {
+        let node = hex::encode([33; 32]);
+        let store = MeshPeerStore::new();
+        for (sent, expected) in [
+            (Some(true), Some(true)),
+            (Some(false), Some(false)),
+            (None, None),
+        ] {
+            let info = node_info_with_isolation(&node, (Some(true), None), sent);
+            let bytes = crate::mesh::cbor::encode(&info).expect("encode");
+            let decoded = crate::mesh::cbor::decode::<NodeInfo>(&bytes).expect("decode");
+            assert_eq!(decoded.docker_available, expected);
+
+            store.update_node_info(&node, &decoded);
+            assert_eq!(
+                store.get(&node).expect("the peer row").docker_available,
+                expected,
+                "the row the picker reads must carry what the peer advertised",
+            );
+        }
+    }
+
+    /// A peer built before the fields existed sends a frame without them, and
+    /// it has to decode as UNKNOWN — not as a refusal, and above all not as
+    /// support: the picker would offer a mode that node then refuses.
+    #[test]
+    fn a_node_info_without_the_isolation_fields_reads_as_unknown() {
+        let node = hex::encode([32; 32]);
+        let info = node_info_with_isolation(&node, (Some(true), None), Some(true));
+        let bytes = crate::mesh::cbor::encode(&info).expect("encode");
+        let mut value: ciborium::value::Value = crate::mesh::cbor::decode(&bytes).expect("decode");
+        let ciborium::value::Value::Map(entries) = &mut value else {
+            panic!("a struct encodes as a map");
+        };
+        entries.retain(|(key, _)| {
+            !matches!(
+                key.as_text(),
+                Some("supports_process_sandbox")
+                    | Some("process_sandbox_cause")
+                    | Some("docker_available")
+            )
+        });
+        let mut old_bytes = Vec::new();
+        ciborium::ser::into_writer(&value, &mut old_bytes).expect("encode");
+        let decoded = crate::mesh::cbor::decode::<NodeInfo>(&old_bytes).expect("decode");
+        assert_eq!(decoded.supports_process_sandbox, None);
+        assert_eq!(decoded.process_sandbox_cause, None);
+        assert_eq!(decoded.docker_available, None);
+
+        let store = MeshPeerStore::new();
+        store.update_node_info(&node, &decoded);
+        let row = store.get(&node).expect("the peer row");
+        assert_eq!(row.supports_process_sandbox, None);
+        assert_eq!(row.process_sandbox_cause, None);
+        assert_eq!(row.docker_available, None);
     }
 
     /// Heartbeat trigger for an Offline/Disconnected peer in the shadow

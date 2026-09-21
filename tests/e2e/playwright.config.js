@@ -29,6 +29,7 @@ module.exports = defineConfig({
     },
     { name: 'code-studio-pipeline', testMatch: 'code-studio-pipeline.spec.js' },
     { name: 'code-studio-projects', testMatch: 'code-studio-projects.spec.js' },
+    { name: 'code-studio-remote-sandbox', testMatch: 'code-studio-remote-sandbox.spec.js' },
     { name: 'code-studio-delegation', testMatch: 'code-studio-delegation.spec.js' },
     { name: 'code-studio-harness', testMatch: 'code-studio-harness.spec.js' },
     { name: 'frontend-cache-version', testMatch: 'frontend-cache-version.spec.js' },

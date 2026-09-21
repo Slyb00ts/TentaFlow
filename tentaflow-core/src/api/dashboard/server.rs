@@ -277,56 +277,9 @@ impl DashboardServer {
             );
         }
 
-        // Code Studio owner side. A forwarded mesh request is executed here
-        // through the ordinary dispatch handlers, so the receive path needs the
-        // same shared resources a WebSocket connection assembles — but it has no
-        // connection to assemble them from, and a per-connection AppState would
-        // die with its socket. Register a server-lifetime one instead; without
-        // it the owner answers every forwarded call with "code studio mesh
-        // context is not initialized on this node". Registered outside the mesh
-        // `if let` above because the non-mesh readers of `node_state()` must see
-        // it on a node that never paired, and unconditionally on the runtime
-        // because the call also starts assertion-key rotation.
-        let ui_sessions = match crate::addon::ui_session::global_registry() {
-            Some(registry) => registry.clone(),
-            None => {
-                crate::addon::ui_session::init_global_registry(Arc::new(
-                    crate::addon::ui_session::SessionRegistry::new(),
-                ));
-                crate::addon::ui_session::global_registry()
-                    .expect("global_registry must be set after init")
-                    .clone()
-            }
-        };
-        crate::code_studio::remote_proxy::install_owner_context(Arc::new(
-            crate::dispatch::AppState {
-                db: db.clone(),
-                router: router.clone(),
-                mesh_peer_store: mesh_peer_store.clone(),
-                service_manager: service_manager.clone(),
-                metrics: metrics.clone(),
-                settings_cipher: settings_cipher.clone(),
-                cipher: cipher.clone(),
-                quic_mesh: quic_mesh.clone(),
-                local_node_id: local_node_id.clone(),
-                mesh_security: mesh_security.clone(),
-                permission_checker: permission_checker.clone(),
-                addon_manager: addon_manager.clone(),
-                license: license.clone(),
-                meeting_manager: crate::meeting::MeetingManager::new(
-                    db.clone(),
-                    Some(service_manager.clone()),
-                ),
-                vnc_tunnels: super::vnc_tunnel::shared_registry(),
-                mesh_relay_health: mesh_relay_health.clone(),
-                port_allocator: port_allocator.clone(),
-                mesh_services_registry: mesh_services_registry.clone(),
-                live_handles: service_manager.live_handles.clone(),
-                ui_sessions,
-                progress_broker: crate::flow_engine::progress_broker::global_broker(),
-                agent_run_manager: crate::agents::agent_run_manager_global(),
-            },
-        ));
+        // AppState for the owners of a forwarded request is built by
+        // `build_app_state` and registered at boot by `unified_server`, which is
+        // the server that actually runs; nothing registers it from here.
 
         // §13 — the durability promise. Everything the previous process left
         // half-done is settled HERE, before the first connection is accepted:
@@ -1010,6 +963,75 @@ fn extract_bearer_token(req: &Request<Incoming>) -> Option<&str> {
 }
 
 /// Glowny handler routingu
+/// Assemble the bundle of shared server resources the dispatch handlers run on.
+///
+/// Two callers need the same bundle for different lifetimes: a WebSocket
+/// connection builds one per socket, and the mesh receive path needs a
+/// server-lifetime one — a forwarded request arrives with no socket to assemble
+/// it from, and a per-connection bundle would die with its socket. One
+/// constructor keeps the two from drifting into offering the handlers different
+/// resources.
+pub fn build_app_state(
+    db: DbPool,
+    router: Arc<Router>,
+    mesh_peer_store: MeshPeerStore,
+    service_manager: Arc<ServiceManager>,
+    metrics: Arc<RouterMetrics>,
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
+    cipher: Arc<crate::crypto::SecretsCipher>,
+    quic_mesh: Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
+    local_node_id: Arc<str>,
+    mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
+    permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    addon_manager: Option<Arc<crate::addon::AddonManager>>,
+    license: Arc<dyn LicenseChecker>,
+    mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
+    port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
+) -> Arc<crate::dispatch::AppState> {
+    // Ensure a single shared SessionRegistry. If already initialized (e.g. by
+    // another code path), reuse the existing one. Both dispatch and host functions
+    // must see the same instance.
+    let ui_sessions = match crate::addon::ui_session::global_registry() {
+        Some(registry) => registry.clone(),
+        None => {
+            crate::addon::ui_session::init_global_registry(Arc::new(
+                crate::addon::ui_session::SessionRegistry::new(),
+            ));
+            crate::addon::ui_session::global_registry()
+                .expect("global_registry must be set after init")
+                .clone()
+        }
+    };
+    let meeting_manager =
+        crate::meeting::MeetingManager::new(db.clone(), Some(service_manager.clone()));
+    let live_handles = service_manager.live_handles.clone();
+    Arc::new(crate::dispatch::AppState {
+        db,
+        router,
+        mesh_peer_store,
+        service_manager,
+        metrics,
+        settings_cipher,
+        cipher,
+        quic_mesh,
+        local_node_id,
+        mesh_security,
+        permission_checker,
+        addon_manager,
+        license,
+        meeting_manager,
+        vnc_tunnels: super::vnc_tunnel::shared_registry(),
+        mesh_relay_health,
+        port_allocator,
+        mesh_services_registry,
+        live_handles,
+        ui_sessions,
+        progress_broker: crate::flow_engine::progress_broker::global_broker(),
+        agent_run_manager: crate::agents::agent_run_manager_global(),
+    })
+}
+
 pub async fn handle_request(
     mut req: Request<Incoming>,
     db: DbPool,
@@ -1188,46 +1210,25 @@ pub async fn handle_request(
                 .unwrap_or_default(),
         );
 
-        // Ensure a single shared SessionRegistry. If already initialized (e.g. by
-        // another code path), reuse the existing one. Both dispatch and host functions
-        // must see the same instance.
-        let shared_sessions = if let Some(registry) = crate::addon::ui_session::global_registry() {
-            registry.clone()
-        } else {
-            let fresh = Arc::new(crate::addon::ui_session::SessionRegistry::new());
-            crate::addon::ui_session::init_global_registry(fresh);
-            crate::addon::ui_session::global_registry()
-                .expect("global_registry must be set after init")
-                .clone()
-        };
-
         // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
-        let meeting_manager =
-            crate::meeting::MeetingManager::new(db.clone(), Some(service_manager.clone()));
-        let app_state = std::sync::Arc::new(crate::dispatch::AppState {
-            db: db.clone(),
-            router: router.clone(),
-            mesh_peer_store: mesh_peer_store.clone(),
-            service_manager: service_manager.clone(),
-            metrics: metrics.clone(),
-            settings_cipher: settings_cipher.clone(),
-            cipher: cipher.clone(),
-            quic_mesh: quic_mesh.clone(),
-            local_node_id: local_node_id.clone(),
-            mesh_security: mesh_security.clone(),
-            permission_checker: permission_checker.clone(),
-            addon_manager: addon_manager.clone(),
-            license: license.clone(),
-            meeting_manager,
-            vnc_tunnels: super::vnc_tunnel::shared_registry(),
-            mesh_relay_health: mesh_relay_health.clone(),
-            port_allocator: port_allocator.clone(),
-            mesh_services_registry: mesh_services_registry.clone(),
-            live_handles: service_manager.live_handles.clone(),
-            ui_sessions: shared_sessions.clone(),
-            progress_broker: crate::flow_engine::progress_broker::global_broker(),
-            agent_run_manager: crate::agents::agent_run_manager_global(),
-        });
+        let app_state = build_app_state(
+            db.clone(),
+            router.clone(),
+            mesh_peer_store.clone(),
+            service_manager.clone(),
+            metrics.clone(),
+            settings_cipher.clone(),
+            cipher.clone(),
+            quic_mesh.clone(),
+            local_node_id.clone(),
+            mesh_security.clone(),
+            permission_checker.clone(),
+            addon_manager.clone(),
+            license.clone(),
+            mesh_relay_health.clone(),
+            port_allocator.clone(),
+            mesh_services_registry.clone(),
+        );
 
         let upgrade = hyper::upgrade::on(&mut req);
 

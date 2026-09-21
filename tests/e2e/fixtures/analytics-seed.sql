@@ -218,7 +218,7 @@ combos(k, user_id, model_id, engine, account_id, weight) AS (
   (3, '3b7e9c12-8a4f-4d6e-b2c1-5f8a7d3e1c42', 'gpt-5-codex',       'codex',       'b8f2d5a9-3e71-4c06-9d48-2a7c1f5e8b93', 20)
 ),
 buckets AS (
-  SELECT h, k, user_id, model_id, engine, account_id,
+  SELECT h, k, user_id, model_id, engine, account_id, weight,
     ((h / 3600) * 31 + k * 97) % 1000 AS r1,
     ((h / 3600) * 17 + k * 53) % 100  AS r2
   FROM hours, combos

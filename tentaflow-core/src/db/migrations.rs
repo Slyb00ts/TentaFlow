@@ -1035,6 +1035,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "model_metrics_rollup_account_id",
             MigrationStep::Rust(model_metrics_rollup_add_account_id),
         ),
+        (
+            163,
+            "drop_coding_agent_account_moves",
+            MigrationStep::Sql(DROP_CODING_AGENT_ACCOUNT_MOVES),
+        ),
+        (
+            164,
+            "provider_account_home_lost",
+            MigrationStep::Sql(PROVIDER_ACCOUNT_HOME_LOST),
+        ),
     ]
 }
 
@@ -1260,6 +1270,75 @@ CREATE TABLE coding_agent_account_moves (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX coding_agent_account_moves_service ON coding_agent_account_moves(service_id);
+"#;
+
+// v163 — the relocation state machine's table goes.
+//
+// `coding_agent_account_moves` recorded a persistent, exclusive relocation of a
+// coding agent's credential between services, and every service mutation read
+// its newest row to refuse work while a move was in flight. That mechanism is
+// gone: an account's credential is refreshed by the `home_node_id` that minted
+// it and reaches other nodes as fanned-out revisions, so nothing reads or
+// writes this table any more. Its index goes with it.
+//
+// Rung 149 and its DDL const stay exactly as they are. A database that already
+// ran 149 has it recorded as applied, so editing that history would desynchronise
+// the ladder instead of removing anything; a fresh database creates the table at
+// 149 and drops it here. Retiring a table in a rung of its own is how this file
+// does it.
+//
+// Dropped and NOT re-created: `DROP TABLE IF EXISTS` also tolerates a database
+// where an operator removed the table by hand.
+const DROP_CODING_AGENT_ACCOUNT_MOVES: &str = "
+DROP INDEX IF EXISTS coding_agent_account_moves_service;
+DROP TABLE IF EXISTS coding_agent_account_moves;
+";
+
+// v164 — why an account has no home, told apart from an account that never had
+// one.
+//
+// `forget_node_tx` NULLs the `home_node_id` of every account homed on a node
+// deleted from the registry, and that NULL is right: the node is gone. But it
+// also erases the only evidence that a home ever existed, and the node was
+// pruned for expired TRUST, not because the machine stopped — the account's
+// sessions may still be running on it. The dashboard then renders "Brak
+// aktywnych sesji." over a list it cannot see, which is the exact claim the A03
+// window exists to refuse (§H.4 of `docs/agent-accounts-technical-design.md`
+// requires "no data" wherever the empty cell would state something about a
+// machine this node cannot read).
+//
+// `home_node_id IS NULL` cannot carry this: it is the answer for an account that
+// was never homed (created, adopted at 160) and for one whose home was lost, and
+// those two need opposite wording. Neither can `status`: its CHECK is the
+// credential lifecycle ('pending', 'active', 'needs_login', 'disabled'), and a
+// lost home is not a state of the credential. `audit_log` is not an option
+// either — it does not replicate, and the card has to say the same thing on
+// every node.
+//
+// So the marker is account METADATA and it travels with the row:
+// `sync_capture::capture_account` reads it, the core materializer writes it. It
+// is written in the SAME UPDATE that NULLs the home, before that capture, so the
+// record of the loss cannot be a second write that gets lost.
+//
+// INVARIANT: non-NULL only while `home_node_id` IS NULL. `forget_node_tx` sets
+// both halves together and `claim_home_tx` clears the marker when it (re)claims
+// a home, so a re-homed account stops reading as lost. Nothing ever sets it at
+// creation.
+//
+// `update_account` can also write a `home_node_id` and does NOT clear the marker
+// — deliberately, and it cannot break the invariant: a marker only exists while
+// the home is NULL, and the one production caller that writes a home this way
+// (`login.rs::adopt_credential`) runs after `mint_credential`, which claims the
+// home itself whenever the home is NULL. By the time that write happens the
+// marker is already gone.
+//
+// WHICH node was the home, never its name: the node is gone from the registry,
+// so no node can resolve a display name for it, and a name column would be NULL
+// everywhere the marker matters. Each screen shortens the id the way it shortens
+// every other id it cannot name.
+const PROVIDER_ACCOUNT_HOME_LOST: &str = r#"
+ALTER TABLE provider_accounts
+    ADD COLUMN home_lost_node_id TEXT NULL;
 "#;
 
 // v160 — the accounts this node already runs, adopted into the replicated
@@ -12365,6 +12444,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(indexes, 1);
+    }
+
+    /// v164 adds the marker that tells "this account's home was deleted" apart
+    /// from "this account never had one". The upgrade is an ordinary `ADD COLUMN`
+    /// and does NOT rewrite any row: a node upgrading into it cannot know which
+    /// of its NULL homes were once real, and inventing an answer would print a
+    /// deleted node's id on accounts that were never homed. The marker only ever
+    /// describes a deletion this ladder witnessed.
+    #[test]
+    fn migration_v164_adds_the_lost_home_marker_without_rewriting_any_account() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 163);
+        assert!(
+            !column_exists(&conn, "provider_accounts", "home_lost_node_id").unwrap(),
+            "the column must not exist before the rung runs"
+        );
+        for (account_id, home) in [("acc-homed", Some("node-a")), ("acc-never-homed", None)] {
+            conn.execute(
+                "INSERT INTO provider_accounts \
+                   (account_id, org_id, engine_id, display_name, scope, credential_kind, \
+                    home_node_id, status, created_by) \
+                 VALUES (?1, 'default', 'codex', 'Shared codex', 'global', 'provider_login', \
+                         ?2, 'active', 'admin')",
+                rusqlite::params![account_id, home],
+            )
+            .unwrap();
+        }
+
+        apply_migration(
+            &conn,
+            164,
+            "provider_account_home_lost",
+            &MigrationStep::Sql(PROVIDER_ACCOUNT_HOME_LOST),
+        )
+        .unwrap();
+
+        let rows: Vec<(String, Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT account_id, home_node_id, home_lost_node_id FROM provider_accounts \
+                 ORDER BY account_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("acc-homed".to_string(), Some("node-a".to_string()), None),
+                ("acc-never-homed".to_string(), None, None),
+            ],
+            "the home survives the upgrade and no row is marked as having lost one"
+        );
     }
 
     /// Seed one node-local coding-agent account the way the retired model wrote

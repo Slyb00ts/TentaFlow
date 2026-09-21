@@ -204,8 +204,6 @@ pub fn account_permission(
     {
         return Err("service is not an agent account".into());
     }
-    let blocked:bool=conn.query_row("SELECT COALESCE((SELECT (phase<>'target_active' OR activation_complete=0) FROM coding_agent_account_moves WHERE service_id=?1 ORDER BY rowid DESC LIMIT 1),0)",[service_id],|row|row.get(0)).map_err(|error|error.to_string())?;
-    if blocked { return Ok((false,admin)); }
     let config: Value = serde_json::from_str(&service.config_json).map_err(|e| e.to_string())?;
     if account_directory(&config).is_err() {
         return Ok((false, admin));
@@ -228,8 +226,37 @@ fn owned_sessions(
         .map_err(|e| e.to_string())
 }
 
-/// Serializes operations that change the ACCOUNT: its credential, its
-/// deployment and its relocation.
+/// Refuses a mutation of an agent service whose runtime is still being
+/// installed or started.
+///
+/// The installer owns the row between `begin_redeploy` and the terminal status:
+/// it owns `active_deploy_id` and drives `Deploying`/`Starting`. A pause, start,
+/// update or delete that ran in that window would race the installer for the
+/// same process, so the row is fenced until the deployment settles — including
+/// on failure, which is why the barrier is released by the install reaching a
+/// non-deploying status rather than by success.
+pub fn ensure_mutation_allowed(db: &crate::db::DbPool, service_id: i64) -> Result<(), String> {
+    let conn = db.read().map_err(|error| error.to_string())?;
+    let Some(row) =
+        crate::services_repo::services::get(&conn, service_id).map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    if row.transport == Transport::AgentRpc
+        && (!row.active_deploy_id.is_empty()
+            || matches!(
+                row.status,
+                crate::services_repo::services::ServiceStatus::Deploying
+                    | crate::services_repo::services::ServiceStatus::Starting
+            ))
+    {
+        return Err("agent installation or startup is in progress; wait for it to finish".into());
+    }
+    Ok(())
+}
+
+/// Serializes operations that change the ACCOUNT: its credential and its
+/// deployment.
 ///
 /// It is deliberately not taken for session traffic. An account serves as many
 /// sessions as it is asked to — several agents, several users with a grant,
@@ -677,9 +704,6 @@ pub(crate) fn route(
         "auth.status" => (reqwest::Method::GET, "/auth/status".to_string(), None),
         "runtime.status" => (reqwest::Method::GET,"/runtime/status".into(),None),
         "runtime.shutdown" => (reqwest::Method::POST,"/runtime/shutdown".into(),Some(payload)),
-        "account.transfer.freeze" => (reqwest::Method::POST,"/account/transfer/freeze".into(),Some(payload)),
-        "account.transfer.retire" => (reqwest::Method::POST,"/account/transfer/retire".into(),Some(payload)),
-        "account.transfer.activate" => (reqwest::Method::POST,"/account/transfer/activate".into(),Some(payload)),
         "auth.start" => (
             reqwest::Method::POST,
             "/auth/start".to_string(),
@@ -1558,5 +1582,55 @@ mod tests {
         assert_eq!(decision["decision"], "denied");
         assert_eq!(decision["request_id"], 7);
         std::fs::remove_dir_all(profile).unwrap();
+    }
+
+    /// An agent runtime that is being installed owns its row: the installer
+    /// drives `active_deploy_id` and the deploying statuses, so any other
+    /// mutation has to wait until the deployment settles — success or failure.
+    /// Only agent services are fenced; every other transport keeps its own
+    /// lifecycle rules.
+    #[test]
+    fn installation_fences_mutations_before_a_runtime_exists() {
+        use crate::services_repo::services::{self, DeployMethod, NewService, ServiceStatus};
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut new = NewService::minimal(
+            "codex",
+            DeployMethod::NativeManagedCli,
+            Transport::AgentRpc,
+        );
+        new.status = ServiceStatus::Deploying;
+        new.active_deploy_id = uuid::Uuid::new_v4().to_string();
+        let id = services::insert(&db.write().unwrap(), &new).unwrap();
+        assert!(ensure_mutation_allowed(&db, id).is_err());
+        services::mark_deploy_failed(
+            &db.write().unwrap(),
+            id,
+            &new.active_deploy_id,
+            ServiceStatus::Failed,
+            Some("installation failed"),
+        )
+        .unwrap();
+        assert!(ensure_mutation_allowed(&db, id).is_ok());
+        services::set_status(&db.write().unwrap(), id, ServiceStatus::Starting).unwrap();
+        assert!(ensure_mutation_allowed(&db, id).is_err());
+        services::set_status(&db.write().unwrap(), id, ServiceStatus::Stopped).unwrap();
+        assert!(ensure_mutation_allowed(&db, id).is_ok());
+        {
+            let conn = db.write().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            services::begin_redeploy_in_tx(&tx, id, "failed-redeploy", &new.config_json).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(ensure_mutation_allowed(&db, id).is_err());
+        services::mark_failed_clear_runtime(&db.write().unwrap(), id, "installation failed")
+            .unwrap();
+        assert!(ensure_mutation_allowed(&db, id).is_ok());
+
+        let mut plain = NewService::minimal("vllm", DeployMethod::Docker, Transport::Embedded);
+        plain.status = ServiceStatus::Deploying;
+        plain.active_deploy_id = uuid::Uuid::new_v4().to_string();
+        let plain_id = services::insert(&db.write().unwrap(), &plain).unwrap();
+        assert!(ensure_mutation_allowed(&db, plain_id).is_ok());
     }
 }

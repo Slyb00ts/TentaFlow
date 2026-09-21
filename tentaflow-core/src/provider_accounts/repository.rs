@@ -45,8 +45,8 @@ fn write_err(e: impl std::fmt::Display) -> anyhow::Error {
 }
 
 const ACCOUNT_COLS: &str = "account_id, org_id, engine_id, display_name, scope, owner_user_id, \
-     credential_kind, provider_subject, plan_label, home_node_id, status, created_by, created_at, \
-     updated_at, credential_revoked_revision, max_sessions";
+     credential_kind, provider_subject, plan_label, home_node_id, home_lost_node_id, status, \
+     created_by, created_at, updated_at, credential_revoked_revision, max_sessions";
 
 fn read_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
     Ok(AccountRecord {
@@ -60,12 +60,13 @@ fn read_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
         provider_subject: row.get(7)?,
         plan_label: row.get(8)?,
         home_node_id: row.get(9)?,
-        status: row.get(10)?,
-        created_by: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
-        credential_revoked_revision: row.get(14)?,
-        max_sessions: row.get(15)?,
+        home_lost_node_id: row.get(10)?,
+        status: row.get(11)?,
+        created_by: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        credential_revoked_revision: row.get(15)?,
+        max_sessions: row.get(16)?,
     })
 }
 
@@ -102,6 +103,13 @@ fn local_node_id_tx(tx: &rusqlite::Transaction<'_>) -> Result<Option<String>> {
 /// credential was DELIBERATELY placed on this node — an administrator pasting a
 /// key here, or a provider sign-in finishing here. A node that merely held a copy
 /// never calls this.
+///
+/// Claiming also CLEARS `home_lost_node_id`: the account has a home again, so the
+/// record of the one it lost stops being true. The only writer that SETS the
+/// marker on this node is `forget_node_tx`, which NULLs the home in the same
+/// UPDATE — a peer's copy receives it with the row through the materializer — so
+/// a non-NULL marker here always means this node recorded a loss and never means
+/// a home exists.
 fn claim_home_tx(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
@@ -615,6 +623,15 @@ pub fn forget_grant_subject_tx(
 /// tombstone first), its per-account materialization state, and the `home_node_id`
 /// of every account that pointed at it — an account whose home node is gone is
 /// an account with no home, not an account homed on a node that does not exist.
+///
+/// That NULL is also the loss of the only evidence a home ever existed, and the
+/// two states need opposite wording: an account that was never homed has a
+/// complete session list on this node, while one whose home was deleted may
+/// still be running its sessions on a machine that left the registry over
+/// expired TRUST rather than because it stopped. `home_lost_node_id` records
+/// which node that was — in the same UPDATE, before the capture that carries it,
+/// because a capture reads the row back and a second write could be lost while
+/// the peer still travelled the loss as an ordinary absent home.
 pub fn forget_node_tx(tx: &rusqlite::Transaction<'_>, node_id: &str) -> Result<()> {
     let engines: Vec<String> = {
         let mut stmt = tx
@@ -660,9 +677,9 @@ pub fn forget_node_tx(tx: &rusqlite::Transaction<'_>, node_id: &str) -> Result<(
     };
     for account_id in &homed {
         tx.execute(
-            "UPDATE provider_accounts SET home_node_id = NULL, \
+            "UPDATE provider_accounts SET home_node_id = NULL, home_lost_node_id = ?2, \
                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE account_id = ?1",
-            params![account_id],
+            params![account_id, node_id],
         )
         .map_err(write_err)?;
         sync_capture::capture_account(tx, account_id)?;
@@ -2508,8 +2525,6 @@ mod tests {
         .expect("create account")
     }
 
-    /// Gives the in-memory installation the node identity `sync::runtime::init`
-    /// would have written, which is what binds an engine measurement to a node.
     fn home_of(db: &DbPool, account_id: &str) -> Option<String> {
         get_account(db, account_id)
             .expect("read account")
@@ -2517,6 +2532,19 @@ mod tests {
             .home_node_id
     }
 
+    /// The node whose deletion took this account's home away, as the store
+    /// records it. `None` is the answer for an account that has a home AND for
+    /// one that never had any; the tests that need the distinction assert the
+    /// home beside it.
+    fn home_lost_of(db: &DbPool, account_id: &str) -> Option<String> {
+        get_account(db, account_id)
+            .expect("read account")
+            .expect("account exists")
+            .home_lost_node_id
+    }
+
+    /// Gives the in-memory installation the node identity `sync::runtime::init`
+    /// would have written, which is what binds an engine measurement to a node.
     fn seed_local_node(db: &DbPool, node_id: &str) {
         let conn = db.write().expect("db");
         conn.execute(
@@ -2524,12 +2552,56 @@ mod tests {
             params![crate::db::repository::LOCAL_NODE_ID_SETTING, node_id],
         )
         .expect("seed node id");
-        conn.execute(
-            "INSERT OR IGNORE INTO sync_nodes (node_id, public_key, display_name) \
-             VALUES (?1, 'test-key', ?1)",
-            params![node_id],
+        drop(conn);
+        seed_node_row(db, node_id);
+    }
+
+    /// A registry row for a node that need not be this installation. A peer's
+    /// row is what an account can be homed on without being homed here.
+    fn seed_node_row(db: &DbPool, node_id: &str) {
+        db.write()
+            .expect("db")
+            .execute(
+                "INSERT OR IGNORE INTO sync_nodes (node_id, public_key, display_name) \
+                 VALUES (?1, 'test-key', ?1)",
+                params![node_id],
+            )
+            .expect("seed node row");
+    }
+
+    /// Latest core capture for an account, as (action, fields). Empty means the
+    /// write never reached the outbox.
+    fn latest_account_capture(
+        db: &DbPool,
+        account_id: &str,
+    ) -> (
+        String,
+        std::collections::BTreeMap<String, crate::sync::ledger::FieldValue>,
+    ) {
+        let conn = db.read().expect("db");
+        conn.query_row(
+            "SELECT action, changed_fields_blob FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = 'core.provider_account' AND resource_id = ?1 \
+             ORDER BY hlc_wall DESC, hlc_logical DESC LIMIT 1",
+            params![account_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
-        .expect("seed node row");
+        .optional()
+        .expect("capture query")
+        .map(|(action, blob)| (action, crate::sync::ledger::decode(&blob).expect("decode")))
+        .expect("the account was captured at all")
+    }
+
+    /// The captured text of one field, or `None` when the capture carries the
+    /// field as a NULL — which is a value here, not an absence.
+    fn captured_text(
+        fields: &std::collections::BTreeMap<String, crate::sync::ledger::FieldValue>,
+        key: &str,
+    ) -> Option<String> {
+        match fields.get(key) {
+            Some(crate::sync::ledger::FieldValue::String(value)) => Some(value.clone()),
+            _ => None,
+        }
     }
 
     fn audit_actions(db: &DbPool, resource: &str) -> Vec<String> {
@@ -2553,6 +2625,20 @@ mod tests {
             |row| row.get::<_, Option<String>>(0),
         )
         .expect("audit row")
+    }
+
+    /// How many rows the whole log holds under `action`, whatever they are
+    /// about: an audit write that should not have happened cannot hide under a
+    /// resource the reader did not think to look under.
+    fn audit_count(db: &DbPool, action: &str) -> i64 {
+        db.read()
+            .expect("db")
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = ?1",
+                params![action],
+                |row| row.get(0),
+            )
+            .expect("audit count")
     }
 
     fn grant(subject_type: &str, subject_id: &str) -> GrantInput {
@@ -2954,6 +3040,82 @@ mod tests {
         );
     }
 
+    /// A purge is a node-local decision, and the audit row is the only record of
+    /// WHICH node made it and why — the removal itself is never captured, since
+    /// replicating it would purge everybody's copy. The delete is scoped to this
+    /// node's `(account_id, node_id)`: another node's state is a different claim
+    /// about the same account and survives.
+    #[test]
+    fn a_local_purge_audits_the_removal_and_only_this_nodes_copy() {
+        let db = pool();
+        let cipher = cipher();
+        global_account(&db, "shared");
+        mint_credential(&db, &cipher, "shared", "key", &CredentialMeta::default()).unwrap();
+        set_node_state(&db, "shared", "helios", 1, "ready", None).unwrap();
+        set_node_state(&db, "shared", "selene", 1, "ready", None).unwrap();
+
+        assert!(purge_local_credential(&db, "shared", "helios", "revoked").unwrap());
+        assert_eq!(credential_material(&db, &cipher, "shared").unwrap(), None);
+        assert!(
+            node_state(&db, "shared", "helios").unwrap().is_none(),
+            "the purged node's own row goes with the copy it names"
+        );
+        assert_eq!(
+            node_state(&db, "shared", "selene")
+                .expect("node state")
+                .expect("another node's row")
+                .applied_revision,
+            1,
+            "another node's state is not this node's to remove"
+        );
+
+        assert_eq!(
+            audit_actions(&db, "shared"),
+            vec![
+                "provider_account.create",
+                "provider_account.credential_set",
+                "provider_account.credential_purged",
+            ]
+        );
+        assert_eq!(audit_count(&db, "provider_account.credential_purged"), 1);
+        assert_eq!(
+            audit_actor(&db, "provider_account.credential_purged", "shared"),
+            None,
+            "nobody asked: the node found itself holding a revoked revision"
+        );
+        let details: String = db
+            .read()
+            .expect("db")
+            .query_row(
+                "SELECT details FROM audit_log \
+                 WHERE action = 'provider_account.credential_purged' AND resource = 'shared'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("audit row");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&details).unwrap(),
+            serde_json::json!({ "node_id": "helios", "reason": "revoked" })
+        );
+    }
+
+    /// A purge that removed nothing still purges the NODE STATE — that row names
+    /// a copy the node claims to hold, and it is gone either way — but it
+    /// recorded no removal, so it does not claim one in the audit log.
+    #[test]
+    fn a_purge_that_removed_nothing_writes_no_audit_row() {
+        let db = pool();
+        global_account(&db, "shared");
+        set_node_state(&db, "shared", "helios", 1, "ready", None).unwrap();
+
+        assert!(!purge_local_credential(&db, "shared", "helios", "revoked").unwrap());
+        assert!(
+            node_state(&db, "shared", "helios").unwrap().is_none(),
+            "the state names a copy this node does not hold"
+        );
+        assert_eq!(audit_count(&db, "provider_account.credential_purged"), 0);
+    }
+
     /// The node that MINTS a credential nobody has homed yet becomes the
     /// account's home — the single refresher every other node's copy comes
     /// from. A home that already exists is never taken over by a mint: moving it
@@ -3340,11 +3502,126 @@ mod tests {
 
         assert!(list_runtime_nodes(&db).unwrap().is_empty());
         assert!(list_node_states(&db, "shared").unwrap().is_empty());
-        assert!(get_account(&db, "shared")
-            .unwrap()
-            .unwrap()
-            .home_node_id
-            .is_none());
+        let account = get_account(&db, "shared").unwrap().unwrap();
+        assert!(account.home_node_id.is_none());
+        // The home is gone and the account is still running its sessions on a
+        // machine that may only have been pruned for expired trust, so WHICH
+        // node that was travels with the row instead of being erased with it.
+        assert_eq!(account.home_lost_node_id.as_deref(), Some("helios"));
+        let (action, fields) = latest_account_capture(&db, "shared");
+        assert_eq!(
+            action, "insert",
+            "the loss must be captured, not only stored"
+        );
+        assert_eq!(
+            captured_text(&fields, "home_node_id"),
+            None,
+            "and the home travels as NULL with it"
+        );
+        assert_eq!(
+            captured_text(&fields, "home_lost_node_id").as_deref(),
+            Some("helios"),
+            "a peer that only learns 'no home' cannot tell a loss from an account that never had one"
+        );
+    }
+
+    /// The marker is cleared by the same claim that gives the account a home
+    /// again: an account that has a home does not read as one that lost it.
+    ///
+    /// The record would otherwise outlive the state it describes — the card
+    /// would keep saying "the sessions may still be running on the node that
+    /// left" about an account another node now refreshes.
+    #[test]
+    fn claiming_a_home_clears_the_record_of_the_one_that_was_lost() {
+        let db = pool();
+        let cipher = cipher();
+        seed_local_node(&db, "helios");
+        seed_node_row(&db, "rig26");
+        global_account(&db, "shared");
+        // Homed on the peer, then the peer's row goes.
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                home_node_id: Some("rig26".into()),
+                ..AccountUpdate::default()
+            },
+            Some("admin"),
+        )
+        .unwrap();
+        crate::db::repository::delete_sync_node(&db, "rig26").unwrap();
+        assert_eq!(
+            home_lost_of(&db, "shared").as_deref(),
+            Some("rig26"),
+            "the loss has to be recorded before it can be cleared"
+        );
+
+        // Pasting a key here is a placement, so it homes the account here.
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "key-one",
+            &CredentialMeta {
+                actor: Some("admin".into()),
+                ..CredentialMeta::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(home_of(&db, "shared").as_deref(), Some("helios"));
+        assert_eq!(
+            home_lost_of(&db, "shared"),
+            None,
+            "a re-homed account must stop reading as lost"
+        );
+        let (_, fields) = latest_account_capture(&db, "shared");
+        assert_eq!(captured_text(&fields, "home_lost_node_id"), None);
+        assert_eq!(
+            captured_text(&fields, "home_node_id").as_deref(),
+            Some("helios")
+        );
+    }
+
+    /// The distinction the marker exists for: an account with no recorded home
+    /// never lost one, so NO bookkeeping about a deletion may appear on it — and
+    /// a deletion may only mark the accounts actually homed on the node that
+    /// went.
+    #[test]
+    fn a_node_deletion_marks_only_the_accounts_that_were_homed_on_it() {
+        let db = pool();
+        seed_local_node(&db, "helios");
+        seed_node_row(&db, "rig26");
+        global_account(&db, "never-homed");
+        global_account(&db, "homed-elsewhere");
+        update_account(
+            &db,
+            "homed-elsewhere",
+            &AccountUpdate {
+                home_node_id: Some("helios".into()),
+                ..AccountUpdate::default()
+            },
+            Some("admin"),
+        )
+        .unwrap();
+
+        crate::db::repository::delete_sync_node(&db, "rig26").unwrap();
+
+        assert_eq!(
+            home_lost_of(&db, "never-homed"),
+            None,
+            "an account that was never homed did not lose a home"
+        );
+        assert_eq!(
+            home_lost_of(&db, "homed-elsewhere"),
+            None,
+            "only the accounts homed on the deleted node lose theirs"
+        );
+        // And an account created from now on starts with no such record either:
+        // the column is written by one path (a deletion), never at creation.
+        global_account(&db, "fresh");
+        assert_eq!(home_lost_of(&db, "fresh"), None);
+        assert_eq!(home_of(&db, "fresh"), None);
     }
 
     /// Every mutation leaves one audit row naming the actor, and a credential

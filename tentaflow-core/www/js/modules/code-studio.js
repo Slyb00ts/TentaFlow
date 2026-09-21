@@ -892,6 +892,47 @@ function nodeById(nodeId) {
   return state.nodes.find((n) => String(n.nodeId ?? n.node_id) === String(nodeId)) ?? null;
 }
 
+// Why the process-sandbox card is blocked, in the reader's language. The chosen
+// node reports a CAUSE — measured on this one, advertised over the mesh by a
+// peer — and the picker turns that cause into a sentence. The probe's own
+// English text is a tooltip, never the primary line, which is how a Polish
+// screen used to show "process isolation requires the current user's GUI
+// launchd domain" as if it were the message.
+//
+// The macOS-without-a-GUI-session case gets its own sentence because it is the
+// only one an operator can still act on: start the node from a desktop session
+// rather than over SSH.
+function processSandboxNote(node) {
+  const cause = String(node?.processSandboxCause ?? node?.process_sandbox_cause ?? '');
+  if (cause === 'gui_session_required') return t('mode_process_gui_session');
+  // Any other cause names what the chosen node is missing, and it travels from
+  // THAT node over the mesh — a remote refusal is as readable as a local one,
+  // because the sentence is chosen here, from the cause.
+  if (cause) return t('mode_process_unavailable');
+  // No cause at all: the node reported nothing. Its availability is its OWN to
+  // report — this Core cannot probe another node's launchd domain — so the
+  // message names the owner instead of inventing a cause for it.
+  if ((node?.isLocal ?? node?.is_local) !== true) return t('mode_process_remote');
+  return t('mode_process_unavailable');
+}
+
+// The container fact is a tri-state for the same reason: `false` is the node's
+// word for "I have no runtime" and may be printed as such, while its absence
+// means the owner has not reported one. Both keep the mode unchoosable; only the
+// sentence differs, because a picker that told the operator to go install Docker
+// on a node that never spoke would be inventing a fact.
+function containerFactKey(supports) {
+  if (supports === true) return 'node_container_yes';
+  if (supports === false) return 'node_container_no';
+  return 'node_container_unknown';
+}
+
+function containerNote(node, supports) {
+  if (supports === true) return '';
+  if (supports === false) return t('mode_container_unavailable', { node: String(node?.name ?? '') });
+  return t('mode_container_remote');
+}
+
 function openWizard() {
   const firstNode = state.nodes[0];
   const wz = {
@@ -1034,10 +1075,11 @@ function openWizard() {
     <tf-button variant="primary" data-action="next"></tf-button>
   `;
 
-  const showError = (message) => {
+  const showError = (message, detail = '') => {
     const el = byId('cs-wz-error');
     el.hidden = !message;
     el.textContent = message || '';
+    el.title = message ? detail : '';
     // The error sits at the end of a step that can be taller than the window,
     // so on a phone it would otherwise land under the footer, unseen.
     if (message) el.scrollIntoView({ block: 'nearest' });
@@ -1064,14 +1106,17 @@ function openWizard() {
   // catalog has about it: whether it is this Core, whether it can isolate a
   // workspace in a container, and how it would enforce egress. `WorkspaceNodeInfo`
   // carries nothing else — operating system and memory are not on the wire.
+  // The container fact is a tri-state: a peer that has not reported its runtime
+  // is neither a yes nor a no, and the label says so instead of turning its
+  // silence into a missing runtime.
   const renderNodes = () => {
     byId('cs-wz-node').setOptions(state.nodes.map((n) => {
       const id = String(n.nodeId ?? n.node_id ?? '');
-      const supports = !!(n.supportsContainer ?? n.supports_container);
+      const supports = n.supportsContainer ?? n.supports_container ?? null;
       const enforcement = String(n.egressEnforcement ?? n.egress_enforcement ?? 'unrestricted');
       const facts = [
         (n.isLocal ?? n.is_local) ? t('node_local') : t('node_remote'),
-        t(supports ? 'node_container_yes' : 'node_container_no'),
+        t(containerFactKey(supports)),
         t(`enforcement_${enforcement}`),
       ];
       return { value: id, label: `${n.name ?? id} — ${facts.join(' · ')}` };
@@ -1104,18 +1149,26 @@ function openWizard() {
   };
 
   // A node without a container runtime blocks the choice — and the card says
-  // what to install, which is the one thing a blocked option must not hide.
+  // what to install, which is the one thing a blocked option must not hide. A
+  // node that has not reported one is blocked too, with the sentence that names
+  // the owner rather than the runtime.
   const renderModes = () => {
     const node = nodeById(wz.nodeId);
-    const supports = !!(node?.supportsContainer ?? node?.supports_container);
+    const supports = node?.supportsContainer ?? node?.supports_container ?? null;
     const group = byId('cs-wz-modes');
     const container = group.querySelector('tf-choice-card[value="container"]');
     const process = group.querySelector('[value=process_sandbox]');
     process.disabled = (node?.supportsProcessSandbox ?? node?.supports_process_sandbox) !== true;
-    process.note = process.disabled ? String(node?.processSandboxReason ?? node?.process_sandbox_reason ?? t('mode_process_unavailable')) : '';
-    container.disabled = !supports || wz.repoKind === 'local';
+    process.note = process.disabled ? processSandboxNote(node) : '';
+    // The native `title` is this module's tooltip channel on a rendered card
+    // (the choice card owns its own markup): the probe's sentence stays
+    // reachable for a diagnosis without standing in for the message.
+    process.title = process.disabled
+      ? String(node?.processSandboxReason ?? node?.process_sandbox_reason ?? '')
+      : '';
+    container.disabled = supports !== true || wz.repoKind === 'local';
     group.querySelector('[value=trusted_native]').disabled = wz.repoKind === 'local';
-    container.note = supports ? '' : t('mode_container_unavailable', { node: String(node?.name ?? '') });
+    container.note = containerNote(node, supports);
     group.value = wz.execMode;
   };
 
@@ -1180,8 +1233,8 @@ function openWizard() {
   byId('cs-wz-node').addEventListener('change', (e) => {
     wz.nodeId = String(e.detail?.value ?? '');
     const node = nodeById(wz.nodeId);
-    const supports = !!(node?.supportsContainer ?? node?.supports_container);
-    if (!supports && wz.execMode === 'container') wz.execMode = 'process_sandbox';
+    const supports = node?.supportsContainer ?? node?.supports_container ?? null;
+    if (supports !== true && wz.execMode === 'container') wz.execMode = 'process_sandbox';
     renderModes();
     renderPolicySelects();
   });
@@ -1227,7 +1280,7 @@ function openWizard() {
     if (wz.step === 2) {
       const node = nodeById(wz.nodeId);
       if (wz.execMode === 'process_sandbox' && (node?.supportsProcessSandbox ?? node?.supports_process_sandbox) !== true) {
-        showError(String(node?.processSandboxReason ?? node?.process_sandbox_reason ?? t('mode_process_unavailable')));
+        showError(processSandboxNote(node), String(node?.processSandboxReason ?? node?.process_sandbox_reason ?? ''));
         return;
       }
       if (wz.execMode === 'container' && !wz.containerImage.trim()) {
@@ -1236,7 +1289,7 @@ function openWizard() {
       }
       wz.step = 3; paintStep(); return;
     }
-    if (wz.repoKind === 'local' && (nodeById(wz.nodeId)?.supportsProcessSandbox ?? nodeById(wz.nodeId)?.supports_process_sandbox) !== true) { showError(t('mode_process_unavailable')); return; }
+    if (wz.repoKind === 'local' && (nodeById(wz.nodeId)?.supportsProcessSandbox ?? nodeById(wz.nodeId)?.supports_process_sandbox) !== true) { showError(processSandboxNote(nodeById(wz.nodeId))); return; }
     if (wz.repoKind === 'local' && !wz.localPath.trim()) { showError(t('local_path_required')); return; }
     if (wz.repoKind === 'local' && wz.execMode !== 'process_sandbox') { showError(t('local_process_required')); return; }
     if (wz.repoKind === 'git' && !wz.repoUrl.trim()) { showError(t('err_repo_url_required')); return; }

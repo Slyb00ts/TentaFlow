@@ -204,9 +204,9 @@ function scenarios({ mobile }) {
     for (const id of ['an-kpi-tokens', 'an-kpi-requests', 'an-kpi-ttft', 'an-kpi-decode', 'an-kpi-errors', 'an-kpi-cost']) {
       await expect(page.locator(`#${id}`)).not.toHaveAttribute('value', '—');
     }
-    expect(await page.locator('#an-chart tf-bar-chart svg .tf-chart__bar').count()).toBeGreaterThan(1);
+    await expect.poll(() => page.locator('#an-chart tf-bar-chart svg .tf-chart__bar').count()).toBeGreaterThan(1);
     for (const t of ['an-top-models-table', 'an-top-users-table', 'an-top-nodes-table']) {
-      expect(await page.locator(`#${t} tbody tr`).count()).toBeGreaterThan(0);
+      await expect.poll(() => page.locator(`#${t} tbody tr`).count()).toBeGreaterThan(0);
       await expectCellTitlesAreNames(page, `#${t}`);
     }
     await expect(page.locator('#an-top-users-table tbody')).toContainText(MARTA_NAME);
@@ -222,7 +222,7 @@ function scenarios({ mobile }) {
     await openAnalytics(page);
 
     await clickTab(page, 'users');
-    expect(await page.locator('#an-users-table tbody tr').count()).toBeGreaterThanOrEqual(4);
+    await expect.poll(() => page.locator('#an-users-table tbody tr').count()).toBeGreaterThanOrEqual(4);
     await expect(page.locator('#an-users-table tbody')).toContainText(MARTA_NAME);
     await expectCellTitlesAreNames(page, '#an-users-table');
     await expect(page.locator('#an-users-card-foot')).not.toBeEmpty();
@@ -236,40 +236,40 @@ function scenarios({ mobile }) {
     await expectCellTitlesAreNames(page, '#an-users-table');
 
     await clickTab(page, 'models');
-    expect(await page.locator('#an-models-table tbody tr').count()).toBe(MODEL_COUNT);
+    await expect(page.locator('#an-models-table tbody tr')).toHaveCount(MODEL_COUNT);
     await expect(page.locator('#an-models-table tbody')).toContainText(QWEN_NAME);
-    expect(await page.locator('#an-compare-table tbody tr').count()).toBeGreaterThan(0);
+    await expect.poll(() => page.locator('#an-compare-table tbody tr').count()).toBeGreaterThan(0);
     await expectCellTitlesAreNames(page, '#an-models-table');
     if (mobile) await expectNoOverflow(page, 'models');
     await expectNoRawControls(page);
 
     await clickTab(page, 'nodes');
-    expect(await page.locator('.an-node-card').count()).toBe(3);
+    await expect(page.locator('.an-node-card')).toHaveCount(3);
     await expect(page.locator('#an-nodes-list')).toContainText('hazai');
     await expect(page.locator('#an-nodes-list')).toContainText('laptop-pw');
-    expect(await page.locator('.an-node-card tbody tr').count()).toBeGreaterThan(0);
+    await expect.poll(() => page.locator('.an-node-card tbody tr').count()).toBeGreaterThan(0);
     for (const name of await page.locator('.an-node-name').allInnerTexts()) expect(name.trim()).not.toMatch(HEX64);
     if (mobile) await expectNoOverflow(page, 'nodes');
     await expectNoRawControls(page);
 
     await clickTab(page, 'limits');
-    expect(await page.locator('#an-quotas-table tbody tr').count()).toBe(3);
+    await expect(page.locator('#an-quotas-table tbody tr')).toHaveCount(3);
     await expect(page.locator('#an-quotas-table tbody')).toContainText('Marketing');
     await expect(page.locator('#an-quotas-table tbody')).toContainText('Cała organizacja');
     await expect(page.locator('#an-quotas-table tbody')).toContainText('wyłączony');
-    expect(await page.locator('#an-leases-table tbody tr').count()).toBe(2);
+    await expect(page.locator('#an-leases-table tbody tr')).toHaveCount(2);
     await expect(page.locator('#an-leases-table tbody')).toContainText('biuro-mini');
     await expect(page.locator('#an-new-quota')).toBeVisible();
     if (mobile) await expectNoOverflow(page, 'limits');
     await expectNoRawControls(page);
 
     await clickTab(page, 'billing');
-    expect(await page.locator('#an-bill-table tbody tr').count()).toBeGreaterThanOrEqual(4);
+    await expect.poll(() => page.locator('#an-bill-table tbody tr').count()).toBeGreaterThanOrEqual(4);
     await expect(page.locator('#an-bill-table tbody')).toContainText(MARTA_NAME);
     await expect(page.locator('#an-bill-table tbody')).toContainText('zł');
-    expect(await page.locator('#an-struct-table tbody tr').count()).toBe(MODEL_COUNT);
+    await expect(page.locator('#an-struct-table tbody tr')).toHaveCount(MODEL_COUNT);
     await expect(page.locator('#an-struct-table tbody')).toContainText('brak cennika');
-    expect(await page.locator('#an-pricing-table tbody tr').count()).toBe(MODEL_COUNT);
+    await expect(page.locator('#an-pricing-table tbody tr')).toHaveCount(MODEL_COUNT);
     await expect(page.locator('#an-billing-note')).not.toBeEmpty();
     if (mobile) await expectNoOverflow(page, 'billing');
     await expectNoRawControls(page);
@@ -285,9 +285,9 @@ function scenarios({ mobile }) {
     await openDrillFromRow(page, '#an-users-table', MARTA_NAME);
     await expect(page.locator('.an-crumbs')).toContainText(MARTA_NAME);
     await expect(page.locator('#an-hero-chips')).toContainText('Marketing');
-    expect(await page.locator('#an-drill-chart tf-bar-chart svg .tf-chart__bar').count()).toBeGreaterThan(0);
-    expect(await page.locator('#an-bd-model-table tbody tr').count()).toBeGreaterThan(0);
-    expect(await page.locator('#an-periods-table tbody tr').count()).toBe(3);
+    await expect.poll(() => page.locator('#an-drill-chart tf-bar-chart svg .tf-chart__bar').count()).toBeGreaterThan(0);
+    await expect.poll(() => page.locator('#an-bd-model-table tbody tr').count()).toBeGreaterThan(0);
+    await expect(page.locator('#an-periods-table tbody tr')).toHaveCount(3);
     if (mobile) await expectNoOverflow(page, 'drill-user');
     await crumbBack(page);
     await expect(page.locator('#an-users-table tbody')).toContainText(MARTA_NAME);
@@ -356,7 +356,7 @@ function scenarios({ mobile }) {
   test('filters reload automatically without a refresh button', async ({ page }) => {
     const errors = trackErrors(page);
     await openAnalytics(page);
-    expect(await page.locator('#an-root tf-button[icon="refresh"]').count()).toBe(0);
+    await expect(page.locator('#an-root tf-button[icon="refresh"]')).toHaveCount(0);
     await expect(page.locator('#an-toolbar')).not.toContainText(/odśwież/i);
 
     const monthly = await kpiTokensExact(page);
@@ -400,7 +400,7 @@ function scenarios({ mobile }) {
     await expect.poll(() => kpiTokensExact(page)).toBe(monthly);
 
     // Node filter narrows the top nodes list to exactly that node.
-    expect(await page.locator('#an-top-nodes-table tbody tr').count()).toBe(3);
+    await expect(page.locator('#an-top-nodes-table tbody tr')).toHaveCount(3);
     const nodeOptions = await page.locator('#an-f-node select option').evaluateAll((o) => o.map((x) => ({ value: x.value, label: x.textContent })));
     const biuro = nodeOptions.find((o) => o.label.includes('biuro-mini'));
     expect(biuro).toBeTruthy();
@@ -412,7 +412,7 @@ function scenarios({ mobile }) {
     await expect(page.locator('#an-top-nodes-table tbody tr')).toHaveCount(3);
 
     // Model filter narrows the top models list.
-    expect(await page.locator('#an-top-models-table tbody tr').count()).toBe(MODEL_COUNT);
+    await expect(page.locator('#an-top-models-table tbody tr')).toHaveCount(MODEL_COUNT);
     await selectValue(page, '#an-f-model', QWEN_ID);
     await expect(page.locator('#an-top-models-table tbody tr')).toHaveCount(1);
     await expect(page.locator('#an-top-models-table tbody')).toContainText(QWEN_NAME);
@@ -425,7 +425,7 @@ function scenarios({ mobile }) {
     await clickTab(page, 'users');
     await expect(page.locator('#an-f-node select')).toHaveValue(biuro.value);
     await expect(page.locator('#an-users-table tbody tr').first()).toBeVisible();
-    expect(await page.locator('#an-users-table tbody tr').count()).toBeLessThan(5);
+    await expect.poll(() => page.locator('#an-users-table tbody tr').count()).toBeLessThan(5);
 
     expect(errors).toEqual([]);
   });
@@ -434,6 +434,10 @@ function scenarios({ mobile }) {
     const errors = trackErrors(page);
     await openAnalytics(page);
     await clickTab(page, 'limits');
+    // The limits panel assigns its tables BEFORE it awaits the quotas, so a
+    // count taken right here reads the empty shell — and `waitPanelIdle` sees
+    // no spinner to wait for. Wait for the seeded rows, then sample.
+    await expect(page.locator('#an-quotas-table tbody tr').first()).toBeVisible();
     const rowsBefore = await page.locator('#an-quotas-table tbody tr').count();
     const martaRow = page.locator('#an-quotas-table tbody tr').filter({ hasText: MARTA_NAME });
     await expect(martaRow).toHaveCount(0);

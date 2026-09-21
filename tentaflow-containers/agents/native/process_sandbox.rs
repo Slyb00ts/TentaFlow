@@ -12,6 +12,78 @@ mod macos_supervisor;
 #[path = "linux_sandbox_net.rs"]
 mod linux_sandbox_net;
 
+/// Why this machine cannot confine an agent process, as a CLOSED set of causes.
+///
+/// "Unavailable" is not an answer a node picker can give: on macOS the gap
+/// between a missing GUI launchd domain and a sandbox front end that is not
+/// installed at all is the gap between "start the node from a desktop session"
+/// and "this machine will never do it". The cause therefore travels as a
+/// variant, while `Display` keeps the exact sentences the probes used to bail
+/// with — every log line and every `to_string()` still reads as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxUnavailable {
+    /// No `/usr/bin/sandbox-exec` (macOS) and no `/usr/bin/bwrap` (Linux).
+    NoSandboxBinary,
+    /// The macOS supervisor entry point never ran in this process, so nothing
+    /// can own the resource coalition of its descendants.
+    SupervisorNotInitialized,
+    /// launchd assigned this process no resource coalition to hand down.
+    MissingCoalition,
+    /// This process has no GUI launchd domain: an SSH login, a LaunchDaemon or
+    /// any other session without a window server cannot host the supervisor.
+    GuiSessionRequired,
+}
+
+impl std::fmt::Display for SandboxUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoSandboxBinary => {
+                "process sandbox unavailable: requires macOS sandbox-exec or Linux /usr/bin/bwrap"
+            }
+            Self::SupervisorNotInitialized => {
+                "this executable has not initialized the process supervisor entry point"
+            }
+            Self::MissingCoalition => "missing resource coalition",
+            Self::GuiSessionRequired => {
+                "process isolation requires the current user's GUI launchd domain"
+            }
+        })
+    }
+}
+
+impl std::error::Error for SandboxUnavailable {}
+
+/// The DECISION, with every probe already taken.
+///
+/// Split from the probes so each cause can be exercised in a table: none of the
+/// three macOS absences can be produced on demand on a machine that has a GUI
+/// session, a launchd domain and a working supervisor.
+///
+/// The three macOS facts are `Option` because a Linux node has none of that
+/// machinery. It cannot fail on launchd, and a sentinel "fine" would be exactly
+/// the conflation of "not applicable" with "verified" these causes exist to
+/// undo.
+fn classify(
+    sandbox_binary: bool,
+    supervisor_initialized: Option<bool>,
+    coalition: Option<u64>,
+    launchd_domain: Option<bool>,
+) -> Result<(), SandboxUnavailable> {
+    if !sandbox_binary {
+        return Err(SandboxUnavailable::NoSandboxBinary);
+    }
+    if supervisor_initialized == Some(false) {
+        return Err(SandboxUnavailable::SupervisorNotInitialized);
+    }
+    if coalition == Some(0) {
+        return Err(SandboxUnavailable::MissingCoalition);
+    }
+    if launchd_domain == Some(false) {
+        return Err(SandboxUnavailable::GuiSessionRequired);
+    }
+    Ok(())
+}
+
 /// A private temporary directory whose owner is PROVABLE.
 ///
 /// Something that keeps per-run state under `TMPDIR` has to clean up after a
@@ -690,16 +762,17 @@ impl ProcessSandbox {
         Ok(self)
     }
 
-    pub fn check_available() -> Result<()> {
+    pub fn check_available() -> Result<(), SandboxUnavailable> {
         #[cfg(target_os = "macos")]
-        if Path::new("/usr/bin/sandbox-exec").is_file() {
-            return macos_supervisor::check_available();
-        }
+        return macos_supervisor::check_available();
         #[cfg(target_os = "linux")]
-        if Path::new("/usr/bin/bwrap").is_file() {
-            return Ok(());
-        }
-        bail!("process sandbox unavailable: requires macOS sandbox-exec or Linux /usr/bin/bwrap")
+        // Linux confines by pid namespace and bind mounts, so `bwrap` is the
+        // whole requirement and there is no supervisor, coalition or window
+        // server to probe — those `None`s carry that absence, they are not a
+        // check passed.
+        return classify(Path::new("/usr/bin/bwrap").is_file(), None, None, None);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        return Err(SandboxUnavailable::NoSandboxBinary);
     }
 
     fn validate(&self) -> Result<()> {
@@ -1109,6 +1182,93 @@ mod tests {
         );
     }
     use super::*;
+
+    /// One machine state per row, and the ONE cause it must produce.
+    ///
+    /// The classifier, not the prose, is what the node picker keys on: an
+    /// assertion over `Display` alone would pass while every refusal produced
+    /// the same cause.
+    #[test]
+    fn classify_names_the_cause_behind_every_unavailable_sandbox() {
+        type Decision = Result<(), SandboxUnavailable>;
+        let table: &[(bool, Option<bool>, Option<u64>, Option<bool>, Decision)] = &[
+            // A Linux node: the sandbox binary is the whole requirement, and it
+            // satisfies the classifier on its own.
+            (true, None, None, None, Ok(())),
+            (
+                false,
+                None,
+                None,
+                None,
+                Err(SandboxUnavailable::NoSandboxBinary),
+            ),
+            // A macOS node with every mechanism in place.
+            (true, Some(true), Some(7), Some(true), Ok(())),
+            (
+                true,
+                Some(false),
+                Some(7),
+                Some(true),
+                Err(SandboxUnavailable::SupervisorNotInitialized),
+            ),
+            (
+                true,
+                Some(true),
+                Some(0),
+                Some(true),
+                Err(SandboxUnavailable::MissingCoalition),
+            ),
+            // The GUI cause the plan names — a node started over SSH, with a
+            // working supervisor and a coalition of its own.
+            (
+                true,
+                Some(true),
+                Some(7),
+                Some(false),
+                Err(SandboxUnavailable::GuiSessionRequired),
+            ),
+            // A missing front end outranks every macOS fact, because there is
+            // nothing to probe it against.
+            (
+                false,
+                Some(false),
+                Some(0),
+                Some(false),
+                Err(SandboxUnavailable::NoSandboxBinary),
+            ),
+        ];
+        for (binary, initialized, coalition, domain, expected) in table {
+            assert_eq!(
+                classify(*binary, *initialized, *coalition, *domain),
+                *expected,
+                "binary={binary} initialized={initialized:?} coalition={coalition:?} \
+                 domain={domain:?}"
+            );
+        }
+    }
+
+    /// Every `.to_string()` consumer — the node picker's diagnostic, the deploy
+    /// refusal, the installer log — reads these sentences, so the cause split
+    /// must not have reworded any of them.
+    #[test]
+    fn every_cause_keeps_the_sentence_its_callers_already_print() {
+        assert_eq!(
+            SandboxUnavailable::NoSandboxBinary.to_string(),
+            "process sandbox unavailable: requires macOS sandbox-exec or Linux /usr/bin/bwrap"
+        );
+        assert_eq!(
+            SandboxUnavailable::SupervisorNotInitialized.to_string(),
+            "this executable has not initialized the process supervisor entry point"
+        );
+        assert_eq!(
+            SandboxUnavailable::MissingCoalition.to_string(),
+            "missing resource coalition"
+        );
+        assert_eq!(
+            SandboxUnavailable::GuiSessionRequired.to_string(),
+            "process isolation requires the current user's GUI launchd domain"
+        );
+    }
 
     #[test]
     #[cfg(target_os = "macos")]

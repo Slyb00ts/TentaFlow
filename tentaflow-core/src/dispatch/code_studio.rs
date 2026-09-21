@@ -21,7 +21,8 @@ use tentaflow_protocol::code_studio::{
     AllowlistEntryInfo, ApprovalInfo, AskAccountInfo, CodeSearchHit, CodeStudioPayload,
     DiffHunkInfo, FileEntryInfo, GitBranchInfo, GitCommitInfo, GitStatusEntry, GrantInfo,
     GrepHitInfo, IndexStateInfo, OperationInfo, PatchFileDecision, PatchFileInfo, PatchHunkInfo,
-    PatchSetInfo, ProjectLinkInfo, ProvisionStepInfo, RepoEntryInfo, RunAccountInfo, RunInfo, SessionInfo,
+    PatchSetInfo, ProcessSandboxCause, ProjectLinkInfo, ProvisionStepInfo, RepoEntryInfo,
+    RunAccountInfo, RunInfo, SessionInfo,
     TaskInfo, TerminalCellRow, TimelineEventInfo, WorkspaceInfo, WorkspaceMemberInfo,
     WorkspaceMemberInput, WorkspaceNodeInfo, WorkspaceUserCandidate, WorktreeInfo,
 };
@@ -288,27 +289,18 @@ fn audit(ctx: &HandlerContext, action: &str, resource: &str, details: &serde_jso
 // Node capabilities and server-side policy resolution (§9.5)
 // =============================================================================
 
-/// Node capabilities, probed once. `NodeCapabilities::probe` reads the
-/// container socket and the firewall ruleset, so it is not something a list
-/// request may do per workspace; neither answer can change without a restart.
-fn node_capabilities() -> egress::NodeCapabilities {
-    static CAPS: OnceLock<egress::NodeCapabilities> = OnceLock::new();
-    *CAPS.get_or_init(egress::NodeCapabilities::probe)
-}
-
-/// Whether this node can actually run a container-isolated workspace. Both
-/// halves matter: a build without the `docker` feature has no sandbox backend
-/// at all, and a node whose runtime socket does not answer cannot keep the
-/// promise either.
+/// Whether this node can actually run a container-isolated workspace, read
+/// from the shared predicate so the picker row, the mesh advertisement and the
+/// create gate can never disagree.
 fn node_supports_container(_ctx: &HandlerContext) -> bool {
-    cfg!(feature = "docker") && node_capabilities().container_runtime
+    crate::code_studio::container_runtime_available()
 }
 
 /// How network policy is REALLY enforced here (§7.6). Computed from the node,
 /// never accepted from the wire — a client that could name its own enforcement
 /// could promise filtering the node cannot perform.
 fn resolve_egress_enforcement(exec_mode: ExecMode) -> EgressEnforcement {
-    egress::detect_enforcement(exec_mode, &node_capabilities())
+    egress::detect_enforcement(exec_mode, &egress::node_capabilities())
 }
 
 /// The combinations §9.5 refuses, enforced here rather than in the wizard: the
@@ -399,7 +391,42 @@ fn node_name(ctx: &HandlerContext, node_id: &str) -> String {
 
 fn local_node_info(ctx: &HandlerContext) -> WorkspaceNodeInfo {
     let node_id = ctx.state.local_node_id.to_string();
-    node_info(ctx, node_id, node_supports_container(ctx))
+    node_info(
+        ctx,
+        node_id,
+        AdvertisedIsolation {
+            supports_container: Some(node_supports_container(ctx)),
+            ..AdvertisedIsolation::default()
+        },
+    )
+}
+
+/// What a node told the mesh about its own isolation, straight off its
+/// `NodeInfo`.
+///
+/// Every value here is the NODE'S OWN report, which is why the picker can show
+/// a peer's answer instead of the Core's guess: only the node itself can probe
+/// its launchd domain or its container runtime. `None` means it reported
+/// nothing — an older build, or one that has not probed yet — and nothing is
+/// never turned into support, because that offers a mode the node then refuses.
+#[derive(Debug, Clone, Copy, Default)]
+struct AdvertisedIsolation {
+    supports_container: Option<bool>,
+    supports_process_sandbox: Option<bool>,
+    process_sandbox_cause: Option<ProcessSandboxCause>,
+}
+
+impl AdvertisedIsolation {
+    /// What a peer row reports. The local row never comes through here — this
+    /// node's own answer is measured (see `node_info`), so a stale local entry
+    /// cannot stand in for a probe.
+    fn from_peer(peer: &crate::mesh::peer_store::MeshPeerInfo) -> Self {
+        Self {
+            supports_container: peer.docker_available,
+            supports_process_sandbox: peer.supports_process_sandbox,
+            process_sandbox_cause: peer.process_sandbox_cause,
+        }
+    }
 }
 
 /// One entry of the node picker.
@@ -410,22 +437,69 @@ fn local_node_info(ctx: &HandlerContext) -> WorkspaceNodeInfo {
 /// the OWNER node compute the authoritative value while it provisions. The
 /// picker therefore shows an expectation, and `WorkspaceInfo` returned after
 /// creation carries the measured one.
-fn node_info(ctx: &HandlerContext, node_id: String, supports_container: bool) -> WorkspaceNodeInfo {
+///
+/// The process-sandbox answer follows the same rule, one step further: the
+/// OWNER's own probe is what the user sees (measured here for this node, read
+/// off `advertised` for a peer), and the create path re-runs that probe before
+/// it provisions — a stale `true` therefore costs a refused create, never a
+/// workspace that cannot be isolated.
+fn node_info(
+    ctx: &HandlerContext,
+    node_id: String,
+    advertised: AdvertisedIsolation,
+) -> WorkspaceNodeInfo {
+    let is_local = node_id.as_str() == &*ctx.state.local_node_id;
+    // Probed once: on macOS this spawns `launchctl`, and asking twice for one
+    // row would fork twice for the same answer.
+    let refusal = is_local
+        .then(|| crate::code_studio::process_sandbox::ProcessSandbox::check_available().err())
+        .flatten();
+    let (supports_process_sandbox, process_sandbox_reason, process_sandbox_cause) = if is_local {
+        // Measured here and now, not read from the local peer row: this is the
+        // same probe the create path runs, so the row cannot disagree with the
+        // decision it feeds.
+        (
+            Some(refusal.is_none()),
+            refusal.as_ref().map(|refusal| refusal.to_string()),
+            refusal.as_ref().map(crate::code_studio::sandbox_cause),
+        )
+    } else {
+        match advertised.supports_process_sandbox {
+            // A refusal travels with its cause; the probe's own sentence stays
+            // on the node that produced it, so there is nothing to translate.
+            Some(false) => (Some(false), None, advertised.process_sandbox_cause),
+            // A cause justifies a refusal, so one sent next to an advertisement
+            // of support is self-contradictory and is dropped rather than shown
+            // as the reason for an enabled mode.
+            Some(true) => (Some(true), None, None),
+            None => (None, None, None),
+        }
+    };
+    // Measured here, or the owner's own report for a peer. A peer that
+    // reported nothing stays `None`: a container mode offered on a guess is
+    // refused at provisioning, which is a worse answer than an honest "not
+    // reported".
+    let supports_container = if is_local {
+        Some(node_supports_container(ctx))
+    } else {
+        advertised.supports_container
+    };
     WorkspaceNodeInfo {
         name: node_name(ctx, &node_id),
-        is_local: node_id.as_str() == &*ctx.state.local_node_id,
-        node_id: node_id.clone(),
+        is_local,
+        node_id,
         supports_container,
-        supports_process_sandbox: (node_id.as_str() == &*ctx.state.local_node_id)
-            .then(|| crate::code_studio::process_sandbox::ProcessSandbox::check_available().is_ok()),
-        process_sandbox_reason: if node_id.as_str() == &*ctx.state.local_node_id {
-            crate::code_studio::process_sandbox::ProcessSandbox::check_available().err().map(|e| e.to_string())
-        } else { Some("Availability must be checked on the owner node".into()) },
-        egress_enforcement: if supports_container {
+        supports_process_sandbox,
+        process_sandbox_reason,
+        // Namespace isolation is what a container sandbox buys; without a
+        // confirmed runtime there is no mechanism to claim, so the expectation
+        // stays `unrestricted` — the same conservative direction as the flag.
+        egress_enforcement: if supports_container == Some(true) {
             EgressEnforcement::Namespace.slug().to_string()
         } else {
             EgressEnforcement::Unrestricted.slug().to_string()
         },
+        process_sandbox_cause,
     }
 }
 
@@ -446,10 +520,15 @@ fn node_catalog(ctx: &HandlerContext) -> Vec<WorkspaceNodeInfo> {
         if peer.node_id.as_str() == &*ctx.state.local_node_id || !iroh.is_trusted(&peer.node_id) {
             continue;
         }
-        // The peer's own report of whether it can isolate a workspace. Taking
-        // the local answer here would offer container mode on a node that
-        // cannot deliver it.
-        nodes.push(node_info(ctx, peer.node_id.clone(), peer.docker_available));
+        // The peer's own report of whether it can isolate a workspace, in
+        // either mode. Taking the local answer here would offer a mode on a
+        // node that cannot deliver it; refusing a peer that supports one is the
+        // opposite mistake and just as wrong.
+        nodes.push(node_info(
+            ctx,
+            peer.node_id.clone(),
+            AdvertisedIsolation::from_peer(&peer),
+        ));
     }
     nodes
 }
@@ -11416,6 +11495,20 @@ mod tests {
     // Node catalog (§3)
     // =========================================================================
 
+    /// One advertised fact, named so the tests below read as the answers a peer
+    /// can send.
+    fn advertised(
+        supports_container: Option<bool>,
+        supports_process_sandbox: Option<bool>,
+        cause: Option<ProcessSandboxCause>,
+    ) -> AdvertisedIsolation {
+        AdvertisedIsolation {
+            supports_container,
+            supports_process_sandbox,
+            process_sandbox_cause: cause,
+        }
+    }
+
     #[test]
     fn a_node_entry_reports_locality_and_isolation_from_the_node_itself() {
         let _guard = paths::test_data_dir_guard();
@@ -11426,15 +11519,276 @@ mod tests {
 
         // A peer's answer, not this node's: offering container mode on a node
         // that cannot deliver it is exactly the promise §3 forbids.
-        let peer = node_info(&fx.ctx, "node-b".to_string(), true);
+        let peer = node_info(
+            &fx.ctx,
+            "node-b".to_string(),
+            advertised(Some(true), None, None),
+        );
         assert!(!peer.is_local);
-        assert!(peer.supports_container);
+        assert_eq!(peer.supports_container, Some(true));
         assert_eq!(peer.egress_enforcement, EgressEnforcement::Namespace.slug());
-        let bare = node_info(&fx.ctx, "node-c".to_string(), false);
+        let bare = node_info(
+            &fx.ctx,
+            "node-c".to_string(),
+            AdvertisedIsolation::default(),
+        );
+        assert_eq!(
+            bare.supports_container, None,
+            "a peer that reported nothing is unknown, not a refusal"
+        );
         assert_eq!(
             bare.egress_enforcement,
             EgressEnforcement::Unrestricted.slug()
         );
+        release();
+    }
+
+    /// The container half of the same advertisement: a peer that reports a
+    /// runtime socket is selectable for `container` and would enforce egress in
+    /// a network namespace. Before the flag travelled, `from_peer` read the
+    /// local row's default and every remote row arrived as a refusal.
+    #[test]
+    fn a_peer_that_advertises_a_container_runtime_is_offered_it() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-owner", &[PERM_READ]);
+        let offered = node_info(
+            &fx.ctx,
+            "node-b".to_string(),
+            advertised(Some(true), None, None),
+        );
+        assert_eq!(
+            offered.supports_container,
+            Some(true),
+            "a peer that advertises a runtime must be selectable for container"
+        );
+        assert_eq!(
+            offered.egress_enforcement,
+            EgressEnforcement::Namespace.slug(),
+            "namespace isolation is the mechanism that runtime buys"
+        );
+        release();
+    }
+
+    /// A peer that reported it has no runtime is a REFUSAL: unchoosable, and
+    /// with nothing to claim about egress.
+    #[test]
+    fn a_peer_that_advertises_no_container_runtime_is_not_offered_it() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-owner", &[PERM_READ]);
+        let denied = node_info(
+            &fx.ctx,
+            "node-b".to_string(),
+            advertised(Some(false), None, None),
+        );
+        assert_eq!(denied.supports_container, Some(false));
+        assert_eq!(
+            denied.egress_enforcement,
+            EgressEnforcement::Unrestricted.slug()
+        );
+        release();
+    }
+
+    /// A peer built before the container flag, or one that has not probed, is
+    /// UNKNOWN — `None`, never `false`. Both keep the mode unchoosable, but only
+    /// `false` is the node's word for "I have no runtime", and a picker that
+    /// printed that for a node which never spoke would be inventing a fact.
+    #[test]
+    fn a_peer_that_advertises_nothing_for_containers_stays_unknown() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-owner", &[PERM_READ]);
+        let silent = node_info(
+            &fx.ctx,
+            "node-b".to_string(),
+            advertised(None, None, None),
+        );
+        assert_eq!(
+            silent.supports_container, None,
+            "nothing reported is not the same fact as no runtime"
+        );
+        assert_eq!(
+            silent.egress_enforcement,
+            EgressEnforcement::Unrestricted.slug()
+        );
+        release();
+    }
+
+    /// A peer that reports it CAN isolate a process is selectable for
+    /// `process_sandbox`. Before the advertisement existed every remote row was
+    /// `None`, which the picker reads as a refusal — so a node that fully
+    /// supported the mode could never be chosen for it.
+    #[test]
+    fn a_remote_node_is_offered_the_sandbox_it_advertises() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-owner", &[PERM_READ]);
+        let offered = node_info(
+            &fx.ctx,
+            "node-b".to_string(),
+            advertised(Some(false), Some(true), None),
+        );
+        assert!(!offered.is_local);
+        assert_eq!(
+            offered.supports_process_sandbox,
+            Some(true),
+            "a peer that advertises support must be selectable"
+        );
+        assert_eq!(offered.process_sandbox_cause, None);
+        assert_eq!(
+            offered.process_sandbox_reason, None,
+            "the probe's sentence stays on the node that produced it"
+        );
+
+        // A cause next to an advertisement of support contradicts itself, and
+        // an enabled mode must never print a reason for being unavailable.
+        let contradictory = node_info(
+            &fx.ctx,
+            "node-b".to_string(),
+            advertised(Some(false), Some(true), Some(ProcessSandboxCause::GuiSessionRequired)),
+        );
+        assert_eq!(contradictory.supports_process_sandbox, Some(true));
+        assert_eq!(contradictory.process_sandbox_cause, None);
+        release();
+    }
+
+    /// A refusal travels WITH its cause: "start the node from a desktop
+    /// session" and "this machine will never do it" are the same boolean and
+    /// two different messages, and only the cause tells them apart.
+    #[test]
+    fn a_peer_refusal_arrives_with_its_cause() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-owner", &[PERM_READ]);
+        let mut causes = Vec::new();
+        for cause in [
+            ProcessSandboxCause::GuiSessionRequired,
+            ProcessSandboxCause::NoSandboxBinary,
+        ] {
+            let row = node_info(
+                &fx.ctx,
+                "node-b".to_string(),
+                advertised(Some(false), Some(false), Some(cause)),
+            );
+            assert_eq!(row.supports_process_sandbox, Some(false));
+            assert_eq!(
+                row.process_sandbox_cause,
+                Some(cause),
+                "the picker switches on the cause, never on a sentence"
+            );
+            assert_eq!(row.process_sandbox_reason, None);
+            causes.push(row.process_sandbox_cause);
+        }
+        assert_ne!(
+            causes[0], causes[1],
+            "two refusals the operator must tell apart"
+        );
+        release();
+    }
+
+    /// A peer built before the advertisement, or one that has not probed, is
+    /// UNKNOWN — never `true` (the mode would be offered and then refused) and
+    /// never a fabricated cause.
+    #[test]
+    fn a_peer_that_advertises_nothing_stays_unknown() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-owner", &[PERM_READ]);
+        let silent = node_info(
+            &fx.ctx,
+            "node-b".to_string(),
+            advertised(None, None, None),
+        );
+        assert_eq!(silent.supports_process_sandbox, None);
+        assert_eq!(silent.process_sandbox_cause, None);
+        assert_eq!(silent.process_sandbox_reason, None);
+        release();
+    }
+
+    /// This node answers from its own probe, not from any advertisement: it is
+    /// the same check the create path re-runs before it provisions. The
+    /// container half is measured the same way, from the predicate the create
+    /// gate itself calls.
+    #[test]
+    fn the_local_row_keeps_the_value_measured_here() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-owner", &[PERM_READ]);
+        let measured = crate::code_studio::process_sandbox::ProcessSandbox::check_available();
+        let local = local_node_info(&fx.ctx);
+        assert_eq!(local.supports_process_sandbox, Some(measured.is_ok()));
+        assert_eq!(
+            local.supports_container,
+            Some(crate::code_studio::container_runtime_available())
+        );
+        assert_eq!(
+            local.egress_enforcement,
+            if crate::code_studio::container_runtime_available() {
+                EgressEnforcement::Namespace.slug()
+            } else {
+                EgressEnforcement::Unrestricted.slug()
+            }
+        );
+        match measured.as_ref().err() {
+            Some(refusal) => {
+                assert_eq!(
+                    local.process_sandbox_reason.as_deref(),
+                    Some(refusal.to_string().as_str())
+                );
+                assert_eq!(
+                    local.process_sandbox_cause,
+                    Some(crate::code_studio::sandbox_cause(refusal))
+                );
+            }
+            None => {
+                assert_eq!(local.process_sandbox_reason, None);
+                assert_eq!(local.process_sandbox_cause, None);
+            }
+        }
+        release();
+    }
+
+    /// The whole path a peer's report takes: taken off the wire into the peer
+    /// row, read back out of it into the picker row. Both halves travel here,
+    /// so one `NodeInfo` fills every fact the picker shows about that node.
+    #[test]
+    fn a_node_infos_sandbox_report_reaches_the_picker_row() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-owner", &[PERM_READ]);
+        let node_id = hex::encode([9u8; 32]);
+        fx.ctx.state.mesh_peer_store.update_node_info(
+            &node_id,
+            &crate::mesh::peer_store::NodeInfo {
+                node_id: node_id.clone(),
+                hostname: "gpu-01".to_string(),
+                os_info: "Darwin 27.0 (arm64)".to_string(),
+                cpu_count: 12,
+                ram_total_mb: 32768,
+                gpu_info: Vec::new(),
+                gpu_links: Vec::new(),
+                environment: Default::default(),
+                supports_process_sandbox: Some(false),
+                process_sandbox_cause: Some(ProcessSandboxCause::GuiSessionRequired),
+                docker_available: Some(true),
+            },
+        );
+        let peer = fx
+            .ctx
+            .state
+            .mesh_peer_store
+            .get(&node_id)
+            .expect("the advertised peer row");
+        let row = node_info(
+            &fx.ctx,
+            node_id.clone(),
+            AdvertisedIsolation::from_peer(&peer),
+        );
+        assert_eq!(
+            row.supports_container,
+            Some(true),
+            "the container flag must survive the peer row, not default to a refusal"
+        );
+        assert_eq!(row.egress_enforcement, EgressEnforcement::Namespace.slug());
+        assert_eq!(row.supports_process_sandbox, Some(false));
+        assert_eq!(
+            row.process_sandbox_cause,
+            Some(ProcessSandboxCause::GuiSessionRequired)
+        );
+        assert_eq!(row.name, "gpu-01");
         release();
     }
 

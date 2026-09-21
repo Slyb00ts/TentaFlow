@@ -152,24 +152,35 @@ fn main() {{
     Ok(path)
 }
 
-pub fn check_available() -> Result<()> {
-    if !cfg!(test) && !HOST_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) {
-        bail!("this executable has not initialized the process supervisor entry point");
-    }
-    if coalition(std::process::id() as i32)? == 0 {
-        bail!("missing resource coalition");
-    }
-    let status = Command::new("/bin/launchctl")
+pub fn check_available() -> Result<(), super::SandboxUnavailable> {
+    // A coalition the SPI will not report is no coalition this process can
+    // prove it owns, so the refusal is the same one — and the probe's own error
+    // text is not a cause a node picker could translate.
+    super::classify(
+        Path::new("/usr/bin/sandbox-exec").is_file(),
+        Some(cfg!(test) || HOST_INITIALIZED.load(std::sync::atomic::Ordering::Acquire)),
+        Some(coalition(std::process::id() as i32).unwrap_or(0)),
+        Some(launchd_domain()),
+    )
+}
+
+/// Whether this process belongs to the current user's GUI launchd domain — the
+/// one condition separating a desktop session from an SSH login or a
+/// LaunchDaemon-backed server, which is what a `process_sandbox` workspace
+/// needs the supervisor for.
+///
+/// A `launchctl` that cannot be run cannot answer for the domain either, and an
+/// unanswerable domain is not one the supervisor may rely on.
+fn launchd_domain() -> bool {
+    Command::new("/bin/launchctl")
         .args(["print", &domain()])
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()?;
-    if !status.success() {
-        bail!("process isolation requires the current user's GUI launchd domain");
-    }
-    Ok(())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 pub fn ensure_quiescent(root: &Path) -> Result<()> {

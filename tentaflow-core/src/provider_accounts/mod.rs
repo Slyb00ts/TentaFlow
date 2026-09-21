@@ -110,6 +110,17 @@ pub struct AccountRecord {
     pub provider_subject: Option<String>,
     pub plan_label: Option<String>,
     pub home_node_id: Option<String>,
+    /// The node that WAS this account's home and is gone from the registry, so
+    /// `home_node_id` is NULL (migration 164). It is set by `forget_node_tx` and
+    /// cleared by `claim_home_tx`, never at creation, so a non-NULL value is the
+    /// difference between "no home has ever been recorded" — where this node's
+    /// session list is the account's whole list — and "the home was deleted from
+    /// the registry", where the account's sessions may still be running on a
+    /// machine nobody can see from here. The value travels on the ledger with the
+    /// rest of the row because the card must read the same on every node, and it
+    /// names the node only: a deleted node has no resolvable display name
+    /// anywhere.
+    pub home_lost_node_id: Option<String>,
     pub status: String,
     pub created_by: String,
     pub created_at: String,

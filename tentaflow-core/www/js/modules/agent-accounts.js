@@ -312,6 +312,22 @@ export function shortId(id) {
 }
 
 /**
+ * The name of a node as a cell TITLE.
+ *
+ * Core has no name to send for a node it does not know: `node_entries` in
+ * `dispatch/provider_account.rs` substitutes the node id, deliberately, because
+ * this layer is the one that decides what a missing name looks like
+ * (`node_names`). A 64-hex id in a title is the thing this project forbids, so
+ * a name that IS the id is treated as no name at all and says so; the id itself
+ * stays in the cell's mono sub-line, where `shortId` belongs.
+ */
+export function nodeTitle(node) {
+  const name = String(node?.node_name ?? node?.nodeName ?? '').trim();
+  const id = String(node?.node_id ?? node?.nodeId ?? '');
+  return name && name !== id ? name : T('node_unnamed');
+}
+
+/**
  * The sub-line of an account's name cell: the provider identity and the plan
  * when the account has been signed in, the owner for a personal account, and
  * nothing invented when neither is known.
@@ -381,8 +397,7 @@ export function whenLabel(isoTimestamp) {
  */
 export function usedOnLabel(account) {
   const nodes = account.used_on ?? account.usedOn ?? [];
-  const names = nodes.map((node) => node.node_name ?? node.nodeName ?? '').filter(Boolean);
-  return names.length ? names.join(', ') : T('value_none');
+  return nodes.length ? nodes.map(nodeTitle).join(', ') : T('value_none');
 }
 
 /** `linux` / `macos` / `windows` as the operator's language spells it. */

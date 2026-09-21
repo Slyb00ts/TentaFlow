@@ -29,6 +29,7 @@ import {
   errorText,
   grantedByLabel,
   nodeCredentialLabel,
+  nodeTitle,
   shortId,
   sinceLabel,
   statusChipHtml,
@@ -170,6 +171,129 @@ export function openCreateAccountWindow({ engines = [], scope = 'global', onCrea
 // =============================================================================
 
 /**
+ * Which row of the node matrix is THIS machine, or `''` when the matrix is not
+ * at hand.
+ *
+ * Nothing else on the wire names the answering node: `RuntimeNodeInfo` carries
+ * no id a window could compare against its own, so the server marks its own row
+ * and this reads that mark — the same shape the Code Studio node picker and the
+ * Benchmark Studio screen already use.
+ */
+export function localNodeIdOf(runtimeNodes) {
+  const local = (runtimeNodes ?? []).find((node) => node.is_local ?? node.isLocal);
+  return String(local?.node_id ?? local?.nodeId ?? '');
+}
+
+/**
+ * How the Przegląd tab presents the session list (A03).
+ *
+ * `provider_account_sessions` is runtime state and does NOT replicate, so the
+ * server can only answer with the sessions THIS node holds. For an account
+ * homed on another node that subset is not the account's session list: rendering
+ * it under the account's own heading, with an empty table reading "no active
+ * sessions", states something false about a machine this node cannot see. The
+ * wording therefore follows the scope this window can actually prove, which is
+ * what `scope` names — one value per state:
+ *
+ * - `home`    — homed here, or a home that was never recorded at all. Homed here
+ *               is a claim this node can back: the rows it read ARE the list, and
+ *               a NULL home with no loss marker says the same thing, because an
+ *               account that was never homed to any node runs wherever it is
+ *               first used and has no other list to be missing.
+ * - `lost`    — a home was recorded and then LOST. Deleting a node from the
+ *               registry clears the home of every account homed on it
+ *               (`delete_sync_node` → `provider_accounts::repository::forget_node_tx`)
+ *               and records WHICH node that was in `home_lost_node_id`, which is
+ *               the field this state reads. The node was pruned for expired
+ *               TRUST, not because the machine stopped, so those sessions may
+ *               still be running on it — the cell therefore says "no data", names
+ *               the node, and says what restores a home. Unpairing is NOT that
+ *               cause: the admin revoke (`mesh/admin_ops.rs`) and the
+ *               TrustRevoked handling (`mesh/pipeline.rs`) call `sec.unpair` and
+ *               never `delete_sync_node`, so a home survives them. The one
+ *               production caller of the registry deletion is the trust-expiry
+ *               prune in `mesh/pipeline.rs`, which does both.
+ * - `remote`  — homed on another node that answers the matrix: this node shows
+ *               its own subset and names the node holding the rest.
+ * - `offline` — homed on another node that does not answer: design §H.4's "no
+ *               data". That node's sessions are unreadable from here, so the
+ *               empty cell must not be read as "there are none".
+ * - `unknown` — no matrix at hand, so the window cannot even name its own row:
+ *               neither the account's list nor the account living here may be
+ *               claimed.
+ *
+ * `sessions_empty` is a positive claim about the account's sessions, so it is
+ * the right wording in exactly the states where this node can see them all —
+ * and nowhere else.
+ */
+export function sessionScopePresentation({
+  account, sessionCount, localNodeId, runtimeNodes = [],
+}) {
+  const homeNodeId = String(account?.home_node_id ?? account?.homeNodeId ?? '');
+  const homedHere = Boolean(localNodeId) && homeNodeId === String(localNodeId);
+  // Which node's deletion took the home away, when the home is gone. The two
+  // fields are written and cleared together (`forget_node_tx` NULLs the home and
+  // sets the marker in one UPDATE; `claim_home_tx` clears the marker with the
+  // home it claims), so the marker is read only while there is no home — a value
+  // left behind by a re-home must not outrank a home this node can see.
+  const lostHomeId = String(account?.home_lost_node_id ?? account?.homeLostNodeId ?? '');
+  if (!homeNodeId && lostHomeId) {
+    // The node is gone from the registry, so Core has no display name to send for
+    // it and this is the only form of it a sentence can carry.
+    return {
+      scope: 'lost',
+      title: T('sessions_title_scope', { count: sessionCount }),
+      empty: T('sessions_no_data'),
+      note: T('sessions_home_lost', { node: shortId(lostHomeId) }),
+    };
+  }
+  if (!homeNodeId || homedHere) {
+    return {
+      scope: 'home',
+      title: T('sessions_title', { count: sessionCount }),
+      empty: T('sessions_empty'),
+      note: '',
+    };
+  }
+  // A node with no name yet resolves to its own id, and a sentence carrying 64
+  // hex characters names nothing — the short id is the readable form of the
+  // very same node, not a different one.
+  const homeName = String(account?.home_node_name ?? account?.homeNodeName ?? '').trim();
+  const node = !homeName || homeName === homeNodeId ? shortId(homeNodeId) : homeName;
+  const title = T('sessions_title_scope', { count: sessionCount });
+  if (!localNodeId) {
+    return {
+      scope: 'unknown',
+      title,
+      empty: T('sessions_scope_unknown'),
+      note: T('sessions_scope_unknown_note', { node }),
+    };
+  }
+  // A home node with no row in the matrix has not reported itself, so it counts
+  // as not answering: only a row that says `online` lets this window call the
+  // node reachable. The two shapes share one rendering on purpose: a missing row
+  // is not a measurement of the other node, so the caveat states the scope the
+  // cell is missing rather than a cause this node never observed.
+  const home = runtimeNodes.find(
+    (row) => String(row?.node_id ?? row?.nodeId ?? '') === homeNodeId,
+  );
+  if (!home?.online) {
+    return {
+      scope: 'offline',
+      title,
+      empty: T('sessions_no_data'),
+      note: T('sessions_remote_offline', { node }),
+    };
+  }
+  return {
+    scope: 'remote',
+    title,
+    empty: T('sessions_remote_empty'),
+    note: T('sessions_remote_home', { node }),
+  };
+}
+
+/**
  * Opens the account window. `isAdmin` decides whether the Dostęp tab and the
  * status switch exist at all: granting access and disabling an account are
  * administrator decisions, and the server refuses them anyway — hiding them is
@@ -179,6 +303,9 @@ export async function openAccountWindow(accountId, {
   engines = [], runtimeNodes = [], isAdmin = false, onChanged = null,
 } = {}) {
   const loaded = await AgentAccounts.get(accountId);
+  // Read once: the matrix does not change while this window is open, and both
+  // the session scope and the "Na nodach" marker need the same answer.
+  const localNodeId = localNodeIdOf(runtimeNodes);
   const state = {
     account: loaded.account ?? {},
     grants: loaded.grants ?? [],
@@ -292,6 +419,12 @@ export async function openAccountWindow(accountId, {
     // 0 is "no limit" — the state every account starts in, and the one an
     // administrator returns it to by saving 0.
     const limit = Math.max(0, Number(account.max_sessions ?? 0));
+    const sessions = sessionScopePresentation({
+      account,
+      sessionCount: state.sessions.length,
+      localNodeId,
+      runtimeNodes,
+    });
     pane.innerHTML = `
       <dl class="aa-kv">
         <dt>${escapeHtml(T('kv_provider_account'))}</dt>
@@ -343,12 +476,13 @@ export async function openAccountWindow(accountId, {
       </section>
 
       <section class="aa-section">
-        <h4 class="aa-sub-h">${escapeHtml(T('sessions_title', { count: state.sessions.length }))}</h4>
+        <h4 class="aa-sub-h">${escapeHtml(sessions.title)}</h4>
         <p class="aa-hint" data-hint="sessions">${escapeHtml(limit > 0
           ? T('sessions_hint_limited', { n: limit })
           : T('sessions_hint'))}</p>
+        ${sessions.note ? `<p class="aa-note" data-hint="sessions-scope">${escapeHtml(sessions.note)}</p>` : ''}
         <tf-table variant="flush" data-table="sessions" actions-label="${escapeAttr(I18n.t('common.actions'))}"
-                  empty-message="${escapeAttr(T('sessions_empty'))}">
+                  empty-message="${escapeAttr(sessions.empty)}">
           <tf-column key="user" label="${escapeAttr(T('col_user'))}" renderer="html" fill></tf-column>
           <tf-column key="agent" label="${escapeAttr(T('col_agent'))}"></tf-column>
           <tf-column key="workspace" label="${escapeAttr(T('col_workspace'))}"></tf-column>
@@ -377,7 +511,7 @@ export async function openAccountWindow(accountId, {
         + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(session.session_id))}</div>`,
       agent: session.agent_name ?? T('value_none'),
       workspace: session.workspace_name ?? T('value_none'),
-      node: session.node_name ?? '',
+      node: nodeTitle(session),
       since: sinceLabel(session.started_at),
       _sessionId: session.session_id,
     }));
@@ -415,9 +549,14 @@ export async function openAccountWindow(accountId, {
     };
     pane.querySelector('[data-table="nodes"]').rows = state.nodes.map((node) => {
       const credential = nodeCredentialLabel(node, state.account.credential_revision);
+      const nodeId = String(node.node_id ?? node.nodeId ?? '');
+      // Which row is the machine the operator is looking at: the per-account
+      // node state says nothing about that, so it comes from the matrix mark.
+      const isLocal = Boolean(localNodeId) && nodeId === localNodeId;
       return {
-        node: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(node.node_name ?? '')}</div>`
-          + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(node.node_id))}</div>`,
+        node: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(nodeTitle(node))}</div>`
+          + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(nodeId))}</div>`
+          + (isLocal ? `<div class="tf-table__cell-sub">${escapeHtml(T('node_local'))}</div>` : ''),
         credential: `<tf-chip size="sm" status="${credential.tone}" dot label="${escapeAttr(credential.label)}"></tf-chip>`
           + (node.last_error ? `<div class="tf-table__cell-sub">${escapeHtml(node.last_error)}</div>` : ''),
         sessions: String(sessionsByNode.get(node.node_id ?? '') ?? 0),

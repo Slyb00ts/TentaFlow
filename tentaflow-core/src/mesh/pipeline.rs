@@ -426,6 +426,8 @@ pub async fn start_mesh_pipeline(
                 mesh_peer_store.clone(),
                 local_node_id.clone(),
                 db_pool.clone(),
+                quic_mesh.clone(),
+                local_node_info.clone(),
             );
             spawn_pairing_cleanup(mesh_security.clone());
             spawn_sync_repair_scheduler(quic_mesh.clone(), mesh_security.clone());
@@ -557,7 +559,7 @@ fn upsert_local_peer(
         cpu_temperature_c: None,
         swap_total_mb: 0,
         swap_used_mb: 0,
-        docker_available,
+        docker_available: Some(docker_available),
         docker_version,
         models: vec![],
         active_requests: 0,
@@ -565,6 +567,11 @@ fn upsert_local_peer(
         nsys_available: false,
         nsys_version: String::new(),
         profiling_collectors_available: Vec::new(),
+        // The local row is read by THIS node's picker straight from the live
+        // probe (`local_node_info` in the Code Studio dispatch), never from
+        // here, so the local entry stays "nothing reported".
+        supports_process_sandbox: None,
+        process_sandbox_cause: None,
     });
 }
 
@@ -3650,14 +3657,33 @@ fn collect_local_models(
         .collect()
 }
 
-/// Slow refresh — co 60s odswiezaj wolno-zmienne dane lokalnego noda:
-/// adresy IP, Docker availability/version, OS distro.
+/// Slow refresh — every 60 s, refresh the slowly changing data of the local
+/// node: IP addresses, Docker availability/version, OS distro and the
+/// process-sandbox capability.
+///
+/// A `NodeInfo` carrying a ready sandbox report goes to every trusted peer on
+/// connect, so a node that gains or loses the capability without a restart (a
+/// GUI session appears after login, the supervisor gets installed) would have to
+/// wait for a reconnect. Here it reaches the peers at most 60 s later — but ONLY
+/// on a value change: an unconditional broadcast every minute would be gossip
+/// with no content.
+///
+/// The container flag is deliberately NOT re-advertised here: its probe is
+/// cached for the process lifetime, so it cannot change without a restart.
 fn spawn_slow_refresh(
     peer_store: MeshPeerStore,
     local_node_id: String,
     db_pool: Option<crate::db::DbPool>,
+    quic_mesh: Arc<IrohMeshManager>,
+    local_node_info: NodeInfo,
 ) {
     tokio::spawn(async move {
+        let mut local_node_info = local_node_info;
+        // What the peers already have — see `collect_sandbox_info`.
+        let mut advertised = (
+            local_node_info.supports_process_sandbox,
+            local_node_info.process_sandbox_cause,
+        );
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
@@ -3680,11 +3706,12 @@ fn spawn_slow_refresh(
                 };
                 let (docker_available, docker_version) = node_info_collector::collect_docker_info();
                 let os_info = node_info_collector::collect_os_distro();
-                (addresses, docker_available, docker_version, os_info)
+                let sandbox = node_info_collector::collect_sandbox_info();
+                (addresses, docker_available, docker_version, os_info, sandbox)
             })
             .await;
 
-            if let Ok((addresses, docker_available, docker_version, os_info)) = result {
+            if let Ok((addresses, docker_available, docker_version, os_info, sandbox)) = result {
                 peer_store.update_local_extras(
                     &local_node_id,
                     addresses,
@@ -3692,6 +3719,18 @@ fn spawn_slow_refresh(
                     docker_version,
                     os_info,
                 );
+                // The same shape the peers hold, so the comparison below
+                // compares two reports rather than two different types.
+                let sandbox = (Some(sandbox.0), sandbox.1);
+                if advertised != sandbox {
+                    advertised = sandbox;
+                    local_node_info.supports_process_sandbox = sandbox.0;
+                    local_node_info.process_sandbox_cause = sandbox.1;
+                    match crate::mesh::cbor::encode(&local_node_info) {
+                        Ok(bytes) => quic_mesh.broadcast_node_info(&bytes).await,
+                        Err(e) => warn!("NodeInfo encode failed on sandbox re-advertise: {}", e),
+                    }
+                }
             }
         }
     });

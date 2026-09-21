@@ -88,17 +88,13 @@ Zmodyfikowane poświadczenie z katalogu sesji **nie zastępuje automatycznie cen
 
 Claude używa udokumentowanego `claude setup-token` i `CLAUDE_CODE_OAUTH_TOKEN`, z prywatnym plikiem `setup-token.json`. Token drukowany przez CLI jest przechwytywany do pliku 0600; surowe wyjście tej procedury nie trafia do zdarzeń GUI. Nie kopiujemy systemowego Keychain. Ten tryb subskrypcyjny nie obsługuje Remote Control ani konektorów claude.ai; nie deklaruje również API odczytu limitów. Prawdziwe logowanie, zakres konta i wywołanie modelu czekają na konta przekazane przez użytkownika.
 
-Bez kont i bez płatnych wywołań wykonano prawdziwe Codex 0.153.4 (`--version`, app-server initialize oraz cleanup), Claude Code 2.1.258 (`--version`) i Muse 1.0.3-R2198.1 (MSP initialize, sesja, jawny błąd braku logowania i cleanup). Skrypt `scripts/test-agent-bridge.py` sprawdza rzeczywisty serwer HTTP bridge: health, brak/błędny token IPC, pusty profil i blokadę drugiego bridge na tym samym koncie. Testy syntetyczne sprawdzają oddzielenie historii, niedopuszczenie niezweryfikowanego refresh do centralnego konta, blokadę hardlinków, prywatne przechwycenie tokenu Claude oraz rollback nieudanego startu. To nie zastępuje testów abonamentu, OAuth ani wielonodowego transferu.
+Bez kont i bez płatnych wywołań wykonano prawdziwe Codex 0.153.4 (`--version`, app-server initialize oraz cleanup), Claude Code 2.1.258 (`--version`) i Muse 1.0.3-R2198.1 (MSP initialize, sesja, jawny błąd braku logowania i cleanup). Skrypt `scripts/test-agent-bridge.py` sprawdza rzeczywisty serwer HTTP bridge: health, brak/błędny token IPC, pusty profil i blokadę drugiego bridge na tym samym koncie. Testy syntetyczne sprawdzają oddzielenie historii, niedopuszczenie niezweryfikowanego refresh do centralnego konta, blokadę hardlinków, prywatne przechwycenie tokenu Claude oraz rollback nieudanego startu. To nie zastępuje testów abonamentu, OAuth ani wielonodowego rozesłania poświadczeń.
 
 Skan dopuszczenia wykonuje pełny spis `(dev, ino)` i liczy nazwy każdego pliku. Hardlinki wewnątrz projektu są dopuszczone tylko wtedy, gdy liczba znalezionych nazw równa się `st_nlink` i wszystkie należą do tej samej klasy dostępu. Nazwy pod `.git` są liczone oddzielnie, więc alias metadanych w zapisywalnym projekcie jest odrzucany. Symlinki nie zwiększają licznika. Przed dopuszczeniem ponownie sprawdzane są tożsamość, liczba linków, rozmiar, tryb i znaczniki czasu plików/katalogów. Przejście kontroli nie dopuszcza dalszych zmian przez zewnętrzny proces hosta. Testy obejmują dwa prawidłowe aliasy wewnętrzne, trzeci link poza projektem, alias `.git` i symlink do linku zewnętrznego.
 
 Osobna próba wykonała `/bin/ln` już po dopuszczeniu i uruchomieniu sandboxa: z obcego pliku do projektu oraz z `.git/config` do zapisywalnego aliasu w projekcie. Obie operacje zostały odrzucone przez OS (`EPERM`), aliasy nie powstały, zawartość źródeł pozostała niezmieniona, a cleanup obu supervisorów został potwierdzony. Nie zmienia to ograniczenia dotyczącego wrogiego procesu poza sandboxem.
 
-Przenoszenie bezczynnego konta Codex/Claude jest realizowane jako trwała operacja administracyjna między zaufanymi nodami. API `account.move` przyjmuje wyłącznie docelowy `node_id`; `account.move.status` zwraca etap i błąd ostatniej próby. Profil projektu, historia, środowisko i pliki robocze nie wchodzą do transferu. Kopiowane są wyłącznie kanoniczne poświadczenie oraz identyfikator konta, nazwa i przydziały użytkowników; użytkownicy muszą już istnieć na nodzie docelowym. Materiał jest przesyłany prywatną komendą mesh, której `Debug` nie ujawnia treści, i nie trafia do bazy sagi ani odpowiedzi GUI.
-
-Źródło najpierw zapisuje barierę blokującą sesje, cel przygotowuje zamrożony runtime, następnie źródło trwale rezygnuje z wykonania. Dopiero wtedy cel aktywuje konto. Po potwierdzeniu źródło usuwa poświadczenie i zatrzymuje runtime. Zerwane połączenie nie przywraca automatycznie źródła: zapisany etap jest ponawiany co pięć sekund oraz po restarcie. Powtórzona aktywacja starszego transferu jest odrzucana, a zakończona aktywacja nie cofa późniejszej ręcznej pauzy administratora. Zmiana nazwy, uprawnień i cyklu życia podczas trwającej operacji jest blokowana. Odwołanie zaufania albo uprawnień administratora zatrzymuje dalszą aktywację.
-
-Testy bez kont dostawców obejmują bariery bridge oraz opóźnione rozpoczęcie anulowanej sesji. Testy sagi wstrzykują awarię stagingu, utratę potwierdzenia wyłączenia źródła, utratę potwierdzenia aktywacji celu i przerwane sprzątanie. Test integracyjny dwóch sparowanych procesów mesh opisano niżej; ponowne użycie ważnej subskrypcji na celu nadal wymaga rzeczywistego konta dostawcy. Nie jest to przezroczyste przenoszenie aktywnej sesji; odświeżone przez nieufny proces poświadczenie nadal wymaga weryfikacji opisanej wyżej. Grok/Muse nie mają włączonego transferu, dopóki przenośność ich poświadczeń nie zostanie potwierdzona.
+Testy bez kont dostawców obejmują opóźnione rozpoczęcie anulowanej sesji. Test integracyjny dwóch sparowanych procesów mesh opisano niżej; rozesłanie poświadczenia na drugi node nadal wymaga rzeczywistego konta dostawcy. Odświeżone przez nieufny proces poświadczenie nadal wymaga weryfikacji opisanej wyżej.
 
 ## Końcowe testy kodu
 
@@ -109,7 +105,6 @@ Wyniki na macOS ARM64 z 2026-09-06:
 | Core `code_studio` — katalogi, granty, sesje, sandbox, PTY, cleanup | 565 testów przeszło, 0 pominiętych |
 | Core `delegate_cli` — również Stop podczas tworzenia sesji i odrzucenie spóźnionego startu | 19 testów przeszło, 0 pominiętych |
 | Core `coding_agent` — autoryzacja i profile kont | 9 testów przeszło |
-| Core `account_move` — wznowienie aktywacji, odrzucenie starego transferu i blokada podczas instalacji | 4 testy przeszły |
 | Wdrożenie konta — trwały UUID, blokada OS i ponowienie po nieudanym przygotowaniu | 1 test przeszedł |
 | Repozytorium usług — również zwolnienie zakończonej blokady wdrożenia | 9 testów przeszło |
 | Migracje Core — świeża baza, klucze obce, mapowanie identyfikatorów | 35 testów przeszło |
@@ -119,7 +114,9 @@ Wyniki na macOS ARM64 z 2026-09-06:
 | Rejestr nodów — trwałe adresy, scalanie, unieważnianie i granice partii | 32 testy przeszły |
 | Parowanie i porządkowanie kontaktów | 10 testów przeszło |
 | Odkrycie odrębnego noda na tym samym IP | 1 test przeszedł |
-| Bridge — profile, transfer, protokoły, procesy | 40 testów przeszło; 4 próby wymagające jawnych ścieżek do CLI uruchamiano oddzielnie |
+| Bridge — profile, protokoły, procesy, sandbox | 68 testów przeszło; 4 próby wymagające jawnych ścieżek do CLI uruchamiano oddzielnie |
+
+Wiersz bridge’a zmierzono ponownie na macOS ARM64 2026-09-20. Pozostałe wiersze tabeli są wynikami z 2026-09-06.
 
 Końcowy `cargo build` głównej aplikacji przeszedł po poprawkach migracji i interfejsu. Nie uruchamiano całego zestawu testów wszystkich niezależnych crate’ów. W buildzie pozostają wcześniejsze ostrzeżenia repozytorium oraz ostrzeżenie linkera o rozmiarze sekcji unwind. Wyniki nie zastępują testu zalogowanej subskrypcji ani testów Linux/Windows.
 
@@ -128,6 +125,8 @@ Rzeczywista instalacja z GUI wykryła osobny błąd kompilacji produkcyjnego bri
 Kolejna próba instalacji ujawniła konflikt npm: prywatna konfiguracja użytkownika i globalna wskazywały ten sam plik. Po rozdzieleniu plików rzeczywiste `npm install @openai/codex@0.153.4` z pustym prywatnym HOME i jawnym środowiskiem zakończyło się powodzeniem w 5 s; plik wykonywalny został zainstalowany. Nie uruchamiano logowania ani zapytania do modelu.
 
 ## Integracja dwóch nodów i rzeczywisty interfejs
+
+> **Uwaga (2026-09-20).** Opisany niżej przebieg dotyczy ręcznego przenoszenia konta między nodami, usuniętego w pakiecie WP8 (`MeshCommandType::AgentAccountMove`, `SCHEMA_VERSION` 31). Dziś konto trafia na nody automatycznie: poświadczenie odświeża jego `home_node_id`, a pozostałe nody otrzymują rozesłane rewizje. W GUI nie ma już zakładki „Przenieś" ani powrotnego przenoszenia, więc ten tekst jest zapisem wykonanego wtedy pomiaru, nie instrukcją.
 
 Na dwóch oddzielnych testowych profilach TentaFlow uruchomiono z GUI/API dwa serwisy Codexa z odrębnymi UUID i profilami. Instalator zbudował produkcyjny bridge oraz zainstalował przypięty Codex. Nie inicjowano logowania; okno postępu zamknięto istniejącą akcją pracy w tle przed automatycznym otwarciem loginu.
 

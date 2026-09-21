@@ -802,6 +802,13 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
     // GPU — uzyj cache jesli dostepny, jesli nie — puste (wgpu w tle)
     let gpu_info = get_wgpu_gpus().unwrap_or_default();
 
+    // One probe per payload composition, not per gossip turn: the details and
+    // the staleness window are in `collect_sandbox_info`. A change during the
+    // process lifetime is caught by `spawn_slow_refresh` (at most 60 s).
+    // The local answer is always definite; the `None` of the field type is for
+    // a peer that stays silent.
+    let sandbox = collect_sandbox_info();
+
     NodeInfo {
         node_id: node_id.to_string(),
         hostname,
@@ -816,6 +823,13 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
         // after calling `collect_node_info` (`mesh::pipeline`,
         // `mesh::admin_ops::send_pairing_bootstrap`).
         environment: tentaflow_protocol::environment::NodeEnvironment::default(),
+        supports_process_sandbox: Some(sandbox.0),
+        process_sandbox_cause: sandbox.1,
+        // The gate's own predicate, not `docker info`: the capabilities probe
+        // is cached for the process lifetime, so this value cannot go stale
+        // behind the create gate — and a peer must never be offered a mode
+        // this node's gate would then refuse.
+        docker_available: Some(crate::code_studio::container_runtime_available()),
     }
 }
 
@@ -924,6 +938,29 @@ pub fn collect_docker_info() -> (bool, String) {
     };
 
     (available, version)
+}
+
+/// Whether THIS node can isolate a workspace in `process_sandbox`, and why not
+/// when it cannot. The answer travels to peers in `NodeInfo` as this node's own
+/// report, so a picker on another node does not have to guess.
+///
+/// Probed rarely, never per request: on macOS the probe spawns `launchctl`, and
+/// `NodeInfo` goes to every trusted peer. The value is therefore tied to the
+/// moment the payload is composed (mesh start, pairing bootstrap), and a change
+/// during the process lifetime — a GUI session appearing — is broadcast by
+/// `spawn_slow_refresh` at most 60 s later.
+///
+/// The container half of the same question needs no such refresh: its probe is
+/// cached for the process lifetime (`egress::node_capabilities`), so
+/// `container_runtime_available` cannot drift behind the create gate.
+pub fn collect_sandbox_info() -> (
+    bool,
+    Option<tentaflow_protocol::code_studio::ProcessSandboxCause>,
+) {
+    match crate::code_studio::process_sandbox::ProcessSandbox::check_available() {
+        Ok(()) => (true, None),
+        Err(unavailable) => (false, Some(crate::code_studio::sandbox_cause(&unavailable))),
+    }
 }
 
 // =============================================================================

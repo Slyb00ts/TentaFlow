@@ -113,9 +113,14 @@ function dbGrants(accountId) {
   );
 }
 
+// The audit contract for an account is carried by the TYPED columns, not by the
+// legacy `resource` string: `resource_type='provider_account'` alongside
+// `resource_id=<account id>` is what an operator's own query filters on
+// (docs/agent-accounts-operations.md, "Zużycie i audyt per konto"). Both are
+// selected here so a row that stopped filling them cannot pass this suite.
 function dbAudit(action, resource) {
   return sql(
-    `SELECT action, resource, details FROM audit_log
+    `SELECT action, resource, resource_type, resource_id, details FROM audit_log
      WHERE action = ${quote(action)} AND resource = ${quote(resource)} ORDER BY id`,
   );
 }
@@ -530,6 +535,8 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     await expect.poll(() => dbCredential(accountId)).toBeNull();
     const audit = dbAudit('provider_account.credential_clear', accountId);
     expect(audit.length, 'one audit entry for the clear').toBe(1);
+    expect(audit[0].resource_type, 'the typed column says what kind of row this is').toBe('provider_account');
+    expect(audit[0].resource_id, 'the typed column names the account under test').toBe(accountId);
     expect(dbAccount(accountId).status).toBe('needs_login');
 
     const reloaded = await accountAfterReload(page, accountId);
@@ -825,8 +832,14 @@ test.describe('Logowanie u dostawcy (A02)', () => {
     expect(message).toContain('Ta aplikacja agentowa nie jest zainstalowana');
     await expect(win.locator('[data-error-detail]')).toContainText('is not installed on this node');
     expect(await win.locator('[data-link]').evaluate((el) => el.hidden)).toBe(true);
-    // The step 4 line repeats the outcome instead of leaving "waiting" behind.
-    await expect(win.locator('[data-result]')).toHaveText(message);
+    // Step 4 states the outcome instead of leaving "waiting" behind, but it no
+    // longer repeats the refusal: the reason is stated once, in the band above.
+    // Assert the outcome with a retrying matcher — the line renders a frame
+    // after the band, and a single read here fails on that frame rather than on
+    // a defect.
+    const result = win.locator('[data-result]');
+    await expect(result).toHaveText('Logowanie się nie powiodło.');
+    expect((await result.textContent()).trim()).not.toBe(message);
     // Nothing was written: no credential, no status change, no session.
     expect(dbCredential(account.account_id)).toBeNull();
     expect(dbAccount(account.account_id).status).toBe('pending');

@@ -1092,8 +1092,8 @@ pub async fn model_delete(
 
     let _account = crate::services::coding_agent::lock_account(service_id).await
         .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, service_id, true)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, service_id)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     // Stop the runtime BEFORE dropping the row — same contract as service_delete.
     // Without this the process/container is orphaned with no DB trace (the model
@@ -4959,12 +4959,8 @@ pub async fn service_redeploy(
     let _account = crate::services::coding_agent::lock_account(payload.service_id)
         .await
         .map_err(ProtocolError::internal)?;
-    crate::services::account_move::ensure_service_mutation_allowed(
-        &ctx.state.db,
-        payload.service_id,
-        false,
-    )
-    .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     // v1: redeploy local-only; cross-node forward TODO. Brak wiersza lokalnie =
     // "not_found" zamiast forwardu do innego noda.
@@ -10565,9 +10561,8 @@ pub async fn service_delete(
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
     let _account = crate::services::coding_agent::lock_account(payload.service_id).await
         .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, true)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
-
+    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     // Czlonek AKTYWNEGO klastra TP: usuniecie workera/heada z listy serwisow
@@ -10753,9 +10748,8 @@ pub async fn service_pause(
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
     let _account = crate::services::coding_agent::lock_account(payload.service_id).await
         .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
-
+    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     // When transitioning into paused, actively stop the runtime so the user's
     // intent ("frozen, do not consume resources") is enforced. Unpause does
@@ -10864,9 +10858,8 @@ pub async fn service_start(
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
     let _account = crate::services::coding_agent::lock_account(payload.service_id).await
         .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
-
+    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
@@ -11041,9 +11034,8 @@ pub async fn service_update(
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
     let _account = crate::services::coding_agent::lock_account(payload.service_id).await
         .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
-
+    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
 
@@ -11705,17 +11697,6 @@ pub async fn service_agent(
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
     let service = fetch_service_row(ctx, payload.service_id)?;
-    if matches!(payload.operation.as_str(),"account.move"|"account.move.status") {
-        let context=crate::services::account_move::MoveContext{
-            db:ctx.state.db.clone(),
-            ports:ctx.state.port_allocator.clone().ok_or_else(||ProtocolError::internal("service supervisor unavailable"))?,
-            mesh:ctx.state.quic_mesh.clone().ok_or_else(||ProtocolError::internal("mesh transport unavailable"))?,
-            security:ctx.state.mesh_security.clone().ok_or_else(||ProtocolError::internal("mesh security unavailable"))?,
-        };
-        return match crate::services::account_move::operate(context,service.id,&uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),&payload.operation,&payload.payload_json).await {
-            Ok(result)=>response(result,None),Err(error)=>response(String::new(),Some(error.to_string())),
-        };
-    }
     match crate::services::coding_agent::execute_public(
         &ctx.state.db,
         &service,

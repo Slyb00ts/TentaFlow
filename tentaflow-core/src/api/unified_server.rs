@@ -260,6 +260,40 @@ pub fn start_unified_server_with_permissions(
     let port_allocator = port_allocator.clone();
     let mesh_services_registry = mesh_services_registry.clone();
 
+    // Code Studio owner side. A forwarded mesh request is executed on THIS node
+    // through the ordinary dispatch handlers, so the receive path needs the same
+    // bundle of shared resources a WebSocket connection assembles — but it has no
+    // connection to assemble them from, and a per-connection bundle would die
+    // with its socket. Register a server-lifetime one instead; without it the
+    // owner refuses every forwarded call with "mesh execution context is not
+    // initialized on this node". Registered here, with the server itself, because
+    // this is the server that actually runs (the legacy `DashboardServer` is not
+    // constructed anywhere), and unconditionally on the runtime because the call
+    // also starts assertion-key rotation — a node that never paired needs that.
+    let owner_license: Arc<dyn crate::license::LicenseChecker> =
+        Arc::new(crate::license::StaticLicenseChecker::free());
+    let installed = crate::code_studio::remote_proxy::install_owner_context(
+        crate::api::dashboard::server::build_app_state(
+            db.clone(),
+            router.clone(),
+            mesh_peer_store.clone(),
+            service_manager.clone(),
+            metrics.clone(),
+            settings_cipher.clone(),
+            cipher.clone(),
+            quic_mesh.clone(),
+            local_node_id.clone(),
+            mesh_security.clone(),
+            permission_checker.clone(),
+            addon_manager.clone(),
+            owner_license,
+            mesh_relay_health.clone(),
+            port_allocator.clone(),
+            mesh_services_registry.clone(),
+        ),
+    );
+    info!("Code Studio owner context installed: {installed}");
+
     // Initialise the process-wide pickup mTLS profile from the loaded config.
     // The verifier wired into rustls below offers client auth iff this profile
     // says pickup is required; the HTTP layer enforces fingerprint pinning.

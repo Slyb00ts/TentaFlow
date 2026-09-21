@@ -4170,10 +4170,10 @@ fn apply_provider_account(
             tx.execute(
                 "INSERT INTO provider_accounts \
                    (account_id, org_id, engine_id, display_name, scope, owner_user_id, \
-                    credential_kind, provider_subject, plan_label, home_node_id, status, \
-                    created_by, created_at, credential_revoked_revision, max_sessions, \
-                    updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                    credential_kind, provider_subject, plan_label, home_node_id, \
+                    home_lost_node_id, status, created_by, created_at, \
+                    credential_revoked_revision, max_sessions, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                     strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
                  ON CONFLICT(account_id) DO UPDATE SET \
                     org_id = excluded.org_id, engine_id = excluded.engine_id, \
@@ -4182,6 +4182,7 @@ fn apply_provider_account(
                     credential_kind = excluded.credential_kind, \
                     provider_subject = excluded.provider_subject, \
                     plan_label = excluded.plan_label, home_node_id = excluded.home_node_id, \
+                    home_lost_node_id = excluded.home_lost_node_id, \
                     status = excluded.status, \
                     credential_revoked_revision = MAX(\
                         provider_accounts.credential_revoked_revision, \
@@ -4199,6 +4200,13 @@ fn apply_provider_account(
                     subject,
                     field_optional_string(operation, "plan_label")?,
                     field_optional_string(operation, "home_node_id")?,
+                    // The node whose deletion left the account homed nowhere,
+                    // restated with the home it belongs to: the two only ever
+                    // travel together, because one transaction writes both. An
+                    // operation minted before the column existed says nothing
+                    // about it, which is the same thing as the NULL home it
+                    // necessarily carries.
+                    field_optional_string(operation, "home_lost_node_id")?,
                     field_string(operation, "status")?,
                     field_string(operation, "created_by")?,
                     field_string(operation, "created_at")?,
@@ -7018,6 +7026,89 @@ mod tests {
             .remove("credential_revoked_revision");
         assert_eq!(apply_provider_account(&tx, &without_mark).unwrap(), 1);
         assert_eq!(stored_mark(&tx), 3);
+    }
+
+    /// A lost home is account metadata and travels with the row, so the
+    /// materializer has to carry it: the column is written by hand here, and one
+    /// missing from this INSERT would be dropped silently — every peer would keep
+    /// rendering a deleted home as an account that was never homed, which is the
+    /// defect the marker exists to remove.
+    #[test]
+    fn the_record_of_a_lost_home_reaches_a_receiving_node() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+
+        let row = |lost: FieldValue, home: FieldValue| {
+            field_map(&[
+                ("org_id", FieldValue::String("default".into())),
+                ("engine_id", FieldValue::String("codex".into())),
+                ("display_name", FieldValue::String("Shared codex".into())),
+                ("scope", FieldValue::String("global".into())),
+                ("owner_user_id", FieldValue::Null),
+                (
+                    "credential_kind",
+                    FieldValue::String("provider_login".into()),
+                ),
+                ("provider_subject", FieldValue::Null),
+                ("plan_label", FieldValue::Null),
+                ("home_node_id", home),
+                ("home_lost_node_id", lost),
+                ("status", FieldValue::String("active".into())),
+                ("created_by", FieldValue::String("admin".into())),
+                (
+                    "created_at",
+                    FieldValue::String("2026-09-18T00:00:00Z".into()),
+                ),
+            ])
+        };
+        let operation = |lost: FieldValue, home: FieldValue| {
+            matrix_operation(
+                "core.provider_account",
+                "provider_accounts",
+                "account_id",
+                &["acc-1"],
+                ActionType::Insert,
+                row(lost, home),
+            )
+        };
+        let account_id = operation(FieldValue::Null, FieldValue::String("node-home".into()))
+            .body
+            .resource_id
+            .clone();
+        let stored = |tx: &rusqlite::Transaction<'_>| -> (Option<String>, Option<String>) {
+            tx.query_row(
+                "SELECT home_node_id, home_lost_node_id FROM provider_accounts WHERE account_id = ?1",
+                rusqlite::params![account_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        let deleted_home = operation(FieldValue::String("gone-node".into()), FieldValue::Null);
+        assert_eq!(apply_provider_account(&tx, &deleted_home).unwrap(), 1);
+        assert_eq!(
+            stored(&tx),
+            (None, Some("gone-node".to_string())),
+            "the receiving node has to know WHICH node's deletion left the account homed nowhere"
+        );
+
+        // A later re-home on the peer clears the record through the same row,
+        // which is why the field is written from `excluded` like the home is.
+        let rehomed = operation(FieldValue::Null, FieldValue::String("node-home".into()));
+        assert_eq!(apply_provider_account(&tx, &rehomed).unwrap(), 1);
+        assert_eq!(
+            stored(&tx),
+            (Some("node-home".to_string()), None),
+            "a claimed home must not travel next to the record of a lost one"
+        );
+
+        // An operation minted before the column existed carries neither, which is
+        // exactly the state a row of that vintage was in.
+        let mut without = rehomed;
+        without.body.changed_fields.remove("home_lost_node_id");
+        assert_eq!(apply_provider_account(&tx, &without).unwrap(), 1);
+        assert_eq!(stored(&tx).1, None);
     }
 
     /// An engine row is what ONE node measured on its own filesystem. A peer

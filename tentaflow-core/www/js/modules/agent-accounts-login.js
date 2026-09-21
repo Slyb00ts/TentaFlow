@@ -410,7 +410,11 @@ export function openLoginWizard({
       const identity = [flow.providerSubject, flow.planLabel].filter(Boolean).join(' · ');
       result.textContent = identity ? T('login.result_ok_as', { who: identity }) : T('login.result_ok');
     } else if (flow.state === 'failed') {
-      result.textContent = flow.message || T('login.result_failed');
+      // The step states the outcome and nothing more: WHAT went wrong is the
+      // error band's line below, which is the only place the node's own
+      // sentence can sit under it. Repeating `flow.message` here printed the
+      // same refusal twice on one pane.
+      result.textContent = T('login.result_failed');
     } else if (flow.state === 'cancelled') {
       result.textContent = T('login.result_cancelled');
     } else if (flow.state === 'verifying') {

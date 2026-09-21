@@ -6,6 +6,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+### Aplikacje, TentaBus i konta agentów
+
+- Konta agentów CLI przechodzą w całości do rejestru kont dostawców. Po aktualizacji
+  każde przeniesione konto zaczyna jako „wymaga zalogowania", a poświadczenia
+  zapisane w starym miejscu (tabela w bazie treści Code Studio i logowania
+  przechowywane na dysku przez bridge) **nie są** przenoszone — nie da się ich
+  odszyfrować kluczem innego węzła, więc operator loguje się do każdego konta
+  jednokrotnie. Przy starcie węzeł wypisuje w logu, ile wierszy poświadczeń
+  usunięto, osobno dla każdego węzła i silnika — łącznie z sumą — żeby utrata
+  starych wpisów nie wyglądała na cichy zanik danych.
+- Karta konta (A03) nie twierdzi już, że konto nie ma sesji, gdy widzi tylko
+  sesje tego węzła. Ekran rozdziela cztery stany: konto z domem na tym węźle (lub
+  bez domu) zachowuje dotychczasowe brzmienie; konto z domem na innym, dostępnym
+  węźle nazywa ten węzeł i pokazuje własny podzbiór; konto z domem na węźle,
+  który nie odpowiada, pokazuje „brak danych" zamiast pustej listy (wymóg §H.4
+  projektu technicznego); braku macierzy węzłów nie da się już pomylić z domem
+  na tym węźle i ekran mówi wprost, że zakres jest nieznany.
+
 ## [0.2.0-beta] — 2026-09-08
 
 Najważniejsze zmiany względem ostatniego opublikowanego wydania `0.1.0-beta`.

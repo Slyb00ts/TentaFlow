@@ -57,6 +57,26 @@ fn decrypt_data1_legacy(data1_b64: &str) -> Result<String> {
     String::from_utf8(pt).context("decrypted data1 is not UTF-8")
 }
 
+fn decrypt_data1_v3(data1_b64: &str, aes_128_hex: &str) -> Result<String> {
+    let raw = B64.decode(data1_b64.trim()).context("data1 is not valid base64")?;
+    if raw.len() < 28 {
+        bail!("data1 too short for V3 GCM decrypt ({} bytes)", raw.len());
+    }
+    let key_bytes = hex::decode(aes_128_hex.trim()).context("AES key is not valid hex")?;
+    if key_bytes.len() != 16 {
+        bail!("AES key must be 16 bytes (32 hex characters), got {} bytes", key_bytes.len());
+    }
+    let n = raw.len();
+    let nonce = &raw[n - 28..n - 16];
+    let mut ct_with_tag = raw[..n - 28].to_vec();
+    ct_with_tag.extend_from_slice(&raw[n - 16..]); // aes-gcm wants ciphertext||tag
+    let cipher = Aes128Gcm::new_from_slice(&key_bytes).map_err(|e| anyhow!("invalid AES key: {e}"))?;
+    let pt = cipher
+        .decrypt(Nonce::from_slice(nonce), ct_with_tag.as_ref())
+        .map_err(|_| anyhow!("V3 GCM decrypt failed (wrong aes_key or corrupt data1)"))?;
+    String::from_utf8(pt).context("decrypted data1 is not UTF-8")
+}
+
 /// last 10 chars of data1, pairs, each pair's second char (A..J) → 0..9 index.
 fn calc_path_ending(data1: &str) -> String {
     const MAP: [char; 10] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
@@ -118,7 +138,9 @@ pub fn validation_response(challenge: &str) -> String {
 
 /// Parse the con_notify HTTP response body (base64(JSON{data1,data2})) into the
 /// robot identity. Pure — the caller fetches the body over its own transport.
-pub fn parse_con_notify(body_text: &str) -> Result<RobotIdentity> {
+/// When the robot responds with `data2=3` (firmware >= 1.1.15), `aes_128_key`
+/// (32-character hex string) is required.
+pub fn parse_con_notify(body_text: &str, aes_128_key: Option<&str>) -> Result<RobotIdentity> {
     let decoded = B64.decode(body_text.trim()).context("con_notify body is not base64")?;
     let json: serde_json::Value =
         serde_json::from_slice(&decoded).context("con_notify payload is not JSON")?;
@@ -130,7 +152,12 @@ pub fn parse_con_notify(body_text: &str) -> Result<RobotIdentity> {
     let data1 = match data2 {
         2 => decrypt_data1_legacy(data1_field)?,
         1 => data1_field.to_string(),
-        3 => bail!("robot speaks data2=3 (firmware >= 1.1.15) — per-device AES key required"),
+        3 => {
+            let key = aes_128_key.ok_or_else(|| {
+                anyhow!("robot speaks data2=3 (firmware >= 1.1.15) — per-device AES-128 key is required (32 hex chars)")
+            })?;
+            decrypt_data1_v3(data1_field, key)?
+        }
         other => bail!("unexpected data2={other} in con_notify"),
     };
     let robot_pubkey = parse_robot_pubkey(&data1)?;
@@ -218,5 +245,25 @@ mod tests {
         let k = gen_session_key();
         assert_eq!(k.len(), 32);
         assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn v3_decrypt_roundtrip() {
+        let key_bytes: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let key_hex = hex::encode(key_bytes);
+        let nonce = [42u8; 12];
+        let pt = b"test payload for v3 aes-128-gcm";
+        let cipher = Aes128Gcm::new_from_slice(&key_bytes).unwrap();
+        let ct_tag = cipher.encrypt(Nonce::from_slice(&nonce), pt.as_ref()).unwrap();
+        // Pack: ct + nonce (12B) + tag (16B)
+        let ct = &ct_tag[..ct_tag.len() - 16];
+        let tag = &ct_tag[ct_tag.len() - 16..];
+        let mut raw = ct.to_vec();
+        raw.extend_from_slice(&nonce);
+        raw.extend_from_slice(tag);
+        let b64 = B64.encode(&raw);
+
+        let decrypted = decrypt_data1_v3(&b64, &key_hex).unwrap();
+        assert_eq!(decrypted.as_bytes(), pt);
     }
 }

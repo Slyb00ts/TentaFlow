@@ -327,6 +327,44 @@ mod tests {
         );
     }
 
+    /// The refusal is filed under the exact action string every reader of the
+    /// account's history queries. `record_credential_rejection` holds that
+    /// literal twice — once in the write, once in the query that counts this
+    /// account's earlier identity refusals — so a rename applied to both keeps
+    /// the identity rule armed and every round-trip test green, while the row an
+    /// operator (or any SQL that was not renamed with it) looks for silently
+    /// changes name. The row is therefore pinned, not only the behaviour hanging
+    /// off it.
+    ///
+    /// The detail is pinned down to the fingerprint label, because the digest is
+    /// the one thing about the material an operator is allowed to see.
+    #[test]
+    fn a_refusal_is_filed_under_the_action_its_readers_query() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let cipher = SettingsCipher::new(&[9u8; 32]);
+        account(&db, "acc-audit");
+        store::mint_credential(
+            &db,
+            &cipher,
+            "acc-audit",
+            "material",
+            &CredentialMeta::default(),
+        )
+        .expect("credential");
+
+        credential_rejected(&db, "acc-audit", "muse-code", "identity_unverifiable", "aa");
+
+        let details = audit_details(&db, "provider_account.credential_rejected", "acc-audit")
+            .expect("the refusal is filed under the action its readers query");
+        assert_eq!(details["engine_id"], serde_json::json!("muse-code"));
+        assert_eq!(
+            details["reason"],
+            serde_json::json!("identity_unverifiable")
+        );
+        assert_eq!(details["identity"], serde_json::json!(true));
+        assert_eq!(details["fingerprint"], serde_json::json!("sha256:aa"));
+    }
+
     /// The whole adoption, end to end against a bridge: the rotation becomes
     /// the next revision, the material the bridge holds is what the store
     /// keeps, the audit row names no actor (nobody asked — the provider did

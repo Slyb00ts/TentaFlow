@@ -249,6 +249,10 @@ tentaflow-infer/kernels/mojo/build/.kernel-build-*/
 # Trafialy tu tez klucze API wklejane do testow, wiec ta reguła jest zabezpieczeniem, nie porzadkami.
 .pw-tmp/
 
+# Playwright MCP zostawia zrzuty stron (page-*.yml) w korzeniu repo przy kazdym
+# wywolaniu narzedzia. To scratch narzedzia, nie zrodlo.
+.playwright-mcp/
+
 # =============================================================================
 # Fikstury testowe
 # =============================================================================

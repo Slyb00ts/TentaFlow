@@ -696,8 +696,6 @@ pub enum MeshCommandType {
         assertion: SessionAssertion,
         payload_cbor: Vec<u8>,
     },
-    /// Credential-only account relocation between trusted nodes; payload is secret.
-    AgentAccountMove { operation: String, payload_json: String },
 }
 
 // =============================================================================
@@ -1315,7 +1313,6 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("MlTrainCancel")
                 .field("run_id", run_id)
                 .finish(),
-            Self::AgentAccountMove { operation, .. } => f.debug_struct("AgentAccountMove").field("operation",operation).finish_non_exhaustive(),
             Self::MlDatasetChunk {
                 dataset_hash,
                 seq,

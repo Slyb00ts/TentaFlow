@@ -42,6 +42,8 @@ const ADDON_ID: &str = "go2";
 // The robot IP is provided per-install via the `ip` connection_param and read
 // from addon_config at runtime — there is intentionally NO hardcoded default.
 const IP_CONFIG_KEY: &str = "ip";
+// Per-device AES-128 key (32 hex characters) required for Go2 firmware >= 1.1.15 (data2=3).
+const AES_KEY_CONFIG_KEY: &str = "aes_key";
 const LATENCY_ALERT_MS: i64 = 500;
 const BATTERY_ALERT_PCT: i64 = 20;
 // Watchdogs (seconds). Validation must complete promptly; an online connection
@@ -1902,7 +1904,8 @@ fn do_connect() -> JsonValue {
             return json!({ "error": "no IP configured" });
         }
     };
-    log::info(&alloc::format!("go2: do_connect ip={ip} status={}", robot.status));
+    let aes_key = config_get(AES_KEY_CONFIG_KEY).filter(|k| !k.is_empty());
+    log::info(&alloc::format!("go2: do_connect ip={ip} status={} has_aes_key={}", robot.status, aes_key.is_some()));
     if db::ensure_robot(&ip).is_err() {
         log::warn("go2: ensure_robot failed");
         return json!({ "error": "db init failed" });
@@ -1953,7 +1956,7 @@ fn do_connect() -> JsonValue {
         if st != 200 {
             return Err(alloc::format!("con_notify http {st}"));
         }
-        let identity = protocol::parse_con_notify(&body).map_err(|e| alloc::format!("con_notify: {e}"))?;
+        let identity = protocol::parse_con_notify(&body, aes_key.as_deref()).map_err(|e| alloc::format!("con_notify: {e}"))?;
         let key = protocol::gen_session_key();
         let (path, ci_body) =
             protocol::build_con_ing(&identity, &key, &out.offer_sdp).map_err(|e| alloc::format!("build con_ing: {e}"))?;

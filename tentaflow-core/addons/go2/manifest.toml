@@ -8,7 +8,7 @@
 [addon]
 id = "go2"
 name = "Unitree Go2"
-version = "0.0.1"
+version = "0.1.0"
 description = "Sterowanie robotem czworonożnym Unitree Go2 (Air) — ruch, pozy, akcje, telemetria, kamera, lidar przez WebRTC LAN."
 category = "robotics"
 keywords = ["robot", "quadruped", "unitree", "go2", "webrtc"]
@@ -80,6 +80,18 @@ key = "serial"
 label = "Numer seryjny (do wykrywania w sieci, opcjonalnie)"
 type = "string"
 required = false
+
+[[robot.connection_param]]
+key = "aes_key"
+label = "Klucz AES-128 (dla firmware >= 1.1.15 / data2=3)"
+type = "string"
+required = false
+placeholder = "32 znaki hex (z chmury Unitree)"
+
+[config.schema]
+ip = { type = "string", label = "Adres IP robota", required = true }
+serial = { type = "string", label = "Numer seryjny (opcjonalnie)", required = false }
+aes_key = { type = "string", label = "Klucz AES-128 robota (dla firmware >= 1.1.15)", required = false }
 
 # What the robot can do — lets the Robots app / Flow Builder expose controls,
 # status tiles and sensor previews uniformly across robot types.

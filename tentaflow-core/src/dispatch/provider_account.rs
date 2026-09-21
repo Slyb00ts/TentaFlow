@@ -386,6 +386,10 @@ fn account_info(account: &AccountRecord, dec: &Decorations) -> ProviderAccountIn
             .as_deref()
             .and_then(|id| dec.nodes.get(id).cloned().flatten()),
         home_node_id: account.home_node_id.clone(),
+        // Sent raw, with no name beside it: the node named here is gone from the
+        // registry, so `node_names` has nothing to resolve and a name field would
+        // be NULL in every answer that matters. The client shortens the id.
+        home_lost_node_id: account.home_lost_node_id.clone(),
         credential_revision,
         expires_at,
         grant_count: dec.grants.get(&account.account_id).copied().unwrap_or(0),
@@ -1077,6 +1081,10 @@ fn runtime_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
                     })
                     .unwrap_or_default(),
                 account_count: counts.get(node_id).copied().unwrap_or(0),
+                // Nothing else on the wire names this machine, so a window that
+                // wants to say "this row is the node you are looking at" has
+                // only the answering node's own answer to go on.
+                is_local: node_id == &local_id,
                 node_id: node_id.clone(),
             }
         })
@@ -2018,6 +2026,47 @@ mod tests {
             "only the local node can answer this, and it must"
         );
         assert_eq!(this.account_count, 0);
+    }
+
+    /// The matrix marks the answering node's own row and nothing else. A window
+    /// has no other way to name this machine — `RuntimeNodeInfo` carries no id
+    /// the dashboard could compare against — so a marker that reached a peer row
+    /// would make A03 label the wrong node as "this one", and a marker missing
+    /// from the local row would leave it unlabelled.
+    #[tokio::test]
+    async fn the_node_matrix_marks_the_answering_node_and_no_peer() {
+        let admin = ctx_for(Some("admin"), BOB);
+        let local = admin.state.local_node_id.to_string();
+        for node_id in [local.as_str(), "node-far"] {
+            store::set_receives_accounts(&admin.state.db, node_id, true, None)
+                .expect("runtime node");
+        }
+        let MessageBody::ProviderAccountBody(P::RuntimeListResponse { nodes }) =
+            provider_account_dispatch(&pa(P::RuntimeListRequest {}), &admin)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a runtime list");
+        };
+        assert!(
+            nodes.iter().any(|node| node.node_id == "node-far"),
+            "the fixture needs a peer in the matrix for this to say anything: {nodes:?}"
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| node.is_local)
+                .map(|node| node.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![local.as_str()],
+            "exactly the answering node is local: {nodes:?}"
+        );
+        for peer in nodes.iter().filter(|node| node.node_id != local) {
+            assert!(
+                !peer.is_local,
+                "a peer row claiming to be this machine is what the marker cannot do: {peer:?}"
+            );
+        }
     }
 
     /// Signing in decides which provider identity the runs are billed to, so a
