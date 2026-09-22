@@ -794,7 +794,7 @@ async fn drain_stream_batch(
         out.error = Some("stream aborted".to_string());
     };
 
-    let mut apply = |out: &mut LlmStreamNextOutput, ev: LlmStreamEvent| -> bool {
+    let apply = |out: &mut LlmStreamNextOutput, ev: LlmStreamEvent| -> bool {
         match ev {
             LlmStreamEvent::Chunk(text) => {
                 out.chunks.push(text);

@@ -222,8 +222,7 @@ fn two_tentabus_instances_never_see_each_others_data() {
     let mesh_security = Arc::new(
         MeshSecurity::new(db.clone(), state.settings_cipher.clone()).expect("mesh security"),
     );
-    runtime::init(db.clone(), mesh_security, state.settings_cipher.clone())
-        .expect("sync runtime init");
+    runtime::init(db.clone(), mesh_security).expect("sync runtime init");
 
     bundled::install_native_packages(&db).expect("native package reconcile");
 

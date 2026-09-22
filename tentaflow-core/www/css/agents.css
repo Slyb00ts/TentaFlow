@@ -1430,6 +1430,16 @@
   grid-template-columns: repeat(3, 1fr);
 }
 
+/* Declared after the three-up rule, so it has to restate the phone layout: the
+   earlier 720px block loses to it and three fields at a third of a phone each
+   cut their values mid-word. */
+@media (max-width: 720px) {
+  .agents-model-grid,
+  .agents-limits {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* A02 keeps the identity line and the action row on the header's first rows;
    centring pushed the buttons down against the badge rows. */
 #agents-detail-view .tf-detail-header {

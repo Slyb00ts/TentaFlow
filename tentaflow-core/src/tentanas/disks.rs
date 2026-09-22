@@ -317,7 +317,7 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         "system" => refusals.push(refuse(
             "system",
             format!(
-                "{name}: to dysk systemowy tego węzła ({}) — nie ma operacji, która go zwalnia; \
+                "{name}: to dysk systemowy tego noda ({}) — nie ma operacji, która go zwalnia; \
                  przenieś system na inny nośnik, jeśli ten dysk ma być wolny",
                 mounts()
             ),
@@ -382,7 +382,7 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
             refusals.push(refuse(
                 JOURNAL_OTHER_ORG,
                 format!(
-                    "{name}: dysk należy do macierzy Elastic innej organizacji na tym węźle — \
+                    "{name}: dysk należy do macierzy Elastic innej organizacji na tym nodzie — \
                      ta organizacja nie może go wyczyścić ani przejąć"
                 ),
             ));
@@ -393,7 +393,7 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
                 "journal_serving",
                 format!(
                     "{name}: dysk należy do macierzy Elastic {}, która nadal udostępnia unię na \
-                     tym węźle — rozwiąż macierz, a potem wyczyść jej dyski",
+                     tym nodzie — rozwiąż macierz, a potem wyczyść jej dyski",
                     journal.claim.name
                 ),
             ));
@@ -405,7 +405,7 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
                 format!(
                     "{name}: nie udało się odczytać, czy macierz Elastic {} jest jeszcze \
                      udostępniana — nieznany stan nie jest stanem wolnym; powtórz plan, gdy \
-                     węzeł odpowie",
+                     node odpowie",
                     journal.claim.name
                 ),
             ));
@@ -468,7 +468,7 @@ pub fn wipe_command(
     }
     if plan.disk_id != disk.disk_id || plan.path != disk.path {
         return Err(WipeRefusal::BadRequest(
-            "Plan dotyczy innego dysku niż ten, który węzeł ma teraz w inwentarzu".to_string(),
+            "Plan dotyczy innego dysku niż ten, który node ma teraz w inwentarzu".to_string(),
         ));
     }
     if !plan.refusals.is_empty() {
@@ -2227,7 +2227,7 @@ mod tests {
             assert!(!plan.allowed, "{serving:?}");
             assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
             assert_eq!(plan.refusals[0].code, JOURNAL_OTHER_ORG);
-            assert!(plan.refusals[0].detail.contains("innej organizacji na tym węźle"), "{:?}", plan.refusals[0]);
+            assert!(plan.refusals[0].detail.contains("innej organizacji na tym nodzie"), "{:?}", plan.refusals[0]);
             assert!(plan.journal_claim.is_none(), "no claim to acknowledge, and none to read a name from");
             // What the plan says about the claim, as it would be serialised:
             // the array's name and id appear nowhere in it. (Only these two

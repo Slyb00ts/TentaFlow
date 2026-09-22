@@ -68,7 +68,7 @@ fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
             ProtocolErrorCode::NotAvailable,
             format!(
                 "Kanał uprawnień systemowych nie jest dostępny ({why}) — \
-                 otwórz TentaNas na tym węźle i dokończ krok konfiguracji \
+                 otwórz TentaNas na tym nodzie i dokończ krok konfiguracji \
                  kanału, który pojawi się zamiast zakładek."
             ),
         ),
@@ -3986,7 +3986,7 @@ async fn elastic_add_disk(
                 .is_empty()
             {
                 return Err(ProtocolError::bad_request(
-                    "Dysk jest już zarezerwowany przez macierz Elastic na tym węźle",
+                    "Dysk jest już zarezerwowany przez macierz Elastic na tym nodzie",
                 ));
             }
             if let Some(conflict) = tentanas::elastic::conflicting_owner(&picked) {
@@ -4084,7 +4084,7 @@ async fn elastic_replace_disk(
         ProtocolErrorCode::NotAvailable,
         format!(
             "Wymiana dysku macierzy '{name}' nie jest udostępniona w tej wersji. Macierz serwuje \
-             dalej z dysków, które ma; naprawa z parity działa dla dysków obecnych na węźle, a \
+             dalej z dysków, które ma; naprawa z parity działa dla dysków obecnych na nodzie, a \
              macierz z brakującym dyskiem można rozwiązać i przejąć ponownie po jego podłączeniu."
         ),
     ))
@@ -5564,7 +5564,7 @@ mod registration_tests {
             panic!("oczekiwano NodesListResponse, otrzymano: {answer:?}");
         };
         assert_eq!(local_node_id, "test-node");
-        assert_eq!(nodes.len(), 1, "lista musi zawierać lokalny węzeł");
+        assert_eq!(nodes.len(), 1, "lista musi zawierać lokalny node");
         assert_eq!(nodes[0].node_id, local_node_id);
         assert!(nodes[0].is_local);
         assert!(nodes[0].online);

@@ -536,6 +536,11 @@ pub struct RunInfo {
     /// chip that named one would be a fabrication.
     #[serde(default)]
     pub account: Option<RunAccountInfo>,
+    /// The agent's name as the Agenci screen shows it, resolved by the server
+    /// from `agent_id`, so the console never has to print a uuid for a run.
+    /// Absent for a run with no agent or one whose agent was deleted since.
+    #[serde(default)]
+    pub agent_name: Option<String>,
 }
 
 /// The account one run ran on, taken from the CLI instance the run started —
@@ -1735,7 +1740,7 @@ mod tests {
     /// all fail here — none of which a round-trip test can see, because it
     /// re-encodes with the new declaration.
     ///
-    /// The byte goldens cover 16 of 141 variants — and of the server's own
+    /// The byte goldens cover 16 of 135 variants — and of the server's own
     /// frames only two stream pushes, no `*Response` at all — which is why the
     /// declaration digest carries the rest.
     #[test]
@@ -1837,7 +1842,7 @@ mod tests {
             ("GrantInfo", 5, 0x1a7f_f555_54db_8b6a),
             ("AllowlistEntryInfo", 5, 0xc64d_a277_ad31_dd0f),
             ("TaskInfo", 5, 0xd6b6_43d9_787f_b53c),
-            ("RunInfo", 15, 0x18be_a482_2378_23a2),
+            ("RunInfo", 16, 0x5b40_4a4b_71dc_7bdb),
             ("RunAccountInfo", 4, 0xc21b_f4c3_d295_80e3),
             ("TerminalCellRow", 3, 0xf95e_9a96_0477_8adc),
             ("IndexStateInfo", 6, 0xf9f3_c916_3f7d_79f3),

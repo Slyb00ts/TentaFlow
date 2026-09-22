@@ -1131,7 +1131,7 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
         // it no longer selects a sentence that asserts a quantity.
         let waiting = "na cache bez parity (czeka na mover): ochronę domyka najbliższy sync, \
              który mover uruchamia zaraz po przenosinach";
-        let unmeasured = "ten węzeł nie zmierzył, ile czeka na cache";
+        let unmeasured = "ten node nie zmierzył, ile czeka na cache";
         let moved = "pliki już przeniesione przez mover także są poza parity: ich sprzężony sync \
              nie potwierdził ochrony, domknie ją dopiero kolejny udany sync";
         let unconfirmed = "sprzężony sync nie potwierdził ochrony; domknie ją dopiero kolejny udany sync";
@@ -1216,7 +1216,7 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
     } else if cache_bytes.is_none() {
         (
             "unknown",
-            "ten węzeł nie zmierzył, ile czeka na cache".to_string(),
+            "ten node nie zmierzył, ile czeka na cache".to_string(),
         )
     } else if observed.moved_unsynced_bytes.is_some_and(|bytes| bytes > 0) {
         (
@@ -2624,14 +2624,14 @@ pub fn repair_blocker(array: &NasElasticArray) -> Option<String> {
         let shown = member_label(&member.name, &member.disk_name);
         if member.device_present == Some(false) {
             return Some(format!(
-                "dysk '{shown}' nie jest widoczny na tym węźle: podłącz go ponownie, \
+                "dysk '{shown}' nie jest widoczny na tym nodzie: podłącz go ponownie, \
                  bo naprawa z parity zapisuje właśnie ten dysk"
             ));
         }
         if member.mounted == Some(false) {
             return Some(format!(
                 "dysk '{shown}' nie jest zamontowany: odtwórz montowania macierzy, \
-                 bo naprawa zapisałaby katalog brancha na systemie plików węzła"
+                 bo naprawa zapisałaby katalog brancha na systemie plików noda"
             ));
         }
     }
@@ -3323,7 +3323,7 @@ pub fn import_selection<'a>(
     let candidate = candidates
         .iter()
         .find(|candidate| candidate.array_id == array_id)
-        .ok_or_else(|| anyhow!("Węzeł nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
+        .ok_or_else(|| anyhow!("Node nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
     // The same sentence every other retype-to-confirm path in this module
     // answers with, so one typo reads the same wherever it happens.
     ensure!(
@@ -3454,7 +3454,7 @@ pub async fn import_apply(
         .iter()
         .find(|entry| entry.spec.array_id == array_id)
         .map(|entry| entry.spec.owner.clone())
-        .ok_or_else(|| anyhow!("Węzeł nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
+        .ok_or_else(|| anyhow!("Node nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
     let name = candidate.name.clone();
     let (out, _) = super::broker::run_privileged(
         db,
@@ -4098,7 +4098,7 @@ pub fn replacement_blocker(array: &NasElasticArray, branch: &str) -> Option<Stri
     let slot = array.data_disks.iter().find(|member| member.name == branch)?;
     if slot.device_present == Some(true) && slot.health != "failing" {
         return Some(format!(
-            "dysk '{branch}' jest obecny na tym węźle i nie zgłasza awarii: jeśli ma błędy, \
+            "dysk '{branch}' jest obecny na tym nodzie i nie zgłasza awarii: jeśli ma błędy, \
              użyj naprawy z parity, a wymianę uruchom po jego odłączeniu"
         ));
     }
@@ -4565,8 +4565,8 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             // A recovery after a boot stopped part-way: only a reboot retries it.
             if result.restart_required {
                 failure = Some(match failure {
-                    Some(detail) => format!("Wymagany restart węzła: {detail}"),
-                    None => "Wymagany restart węzła".to_string(),
+                    Some(detail) => format!("Wymagany restart noda: {detail}"),
+                    None => "Wymagany restart noda".to_string(),
                 });
             }
             let service_safe = result.service.as_ref().is_none_or(|service| {
@@ -5753,7 +5753,7 @@ pub(crate) mod tests {
         row.create_spec = Some(spec);
         let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result.clone()), &[]);
         assert_eq!(wire.state, "needs_attention");
-        assert_eq!(wire.state_detail, "Wymagany restart węzła: mount: Input/output error");
+        assert_eq!(wire.state_detail, "Wymagany restart noda: mount: Input/output error");
         // The prefix comes from the flag, never from recognising a word in the
         // helper's own sentence: a cause that happens to mention a restart is
         // still prefixed exactly once.
@@ -5762,7 +5762,7 @@ pub(crate) mod tests {
         let wire = observed_protocol(&row, &BTreeMap::new(), Ok(mentions), &[]);
         assert_eq!(
             wire.state_detail,
-            "Wymagany restart węzła: restart demona mergerfs nie powiódł się"
+            "Wymagany restart noda: restart demona mergerfs nie powiódł się"
         );
     }
 
@@ -8305,7 +8305,7 @@ pub(crate) mod tests {
             // The drift guard: falling through to the unmeasured-cache arm
             // below would drop the confirmed half entirely.
             assert_ne!(
-                p.detail, "ten węzeł nie zmierzył, ile czeka na cache",
+                p.detail, "ten node nie zmierzył, ile czeka na cache",
                 "{case}: potwierdzona nieaktualna parity nie może zniknąć"
             );
         }

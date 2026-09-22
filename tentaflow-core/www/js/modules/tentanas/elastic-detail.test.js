@@ -189,7 +189,7 @@ test('anulowanie sudo nie wysyła restore; nieadministrator nie ma tej akcji', a
   reader.screen.dispose();
 });
 
-test('zmiana węzła podczas sudo nie wysyła starej mutacji; spóźniony Get nie odmalowuje powierzchni', async () => {
+test('zmiana noda podczas sudo nie wysyła starej mutacji; spóźniony Get nie odmalowuje powierzchni', async () => {
   const { screen, body } = await mount(array({ state: 'needs_attention' }));
   let release;
   screen.withSudo = async (fn, title, isCurrent) => { await new Promise((r) => { release = r; }); return isCurrent() ? fn(undefined) : null; };
@@ -254,7 +254,7 @@ for (const action of ['sync', 'scrub']) test(`${action} wysyła dokładnie raz z
 // Scrub, and the surface repeats it rather than recomputing it from `state`:
 // the array states that refuse one are not a list this file can keep (see the
 // test below, where a state that looks unavailable admits it).
-test('maintenance wymaga administratora, parity i dopuszczenia przebiegu przez węzeł', async (t) => {
+test('maintenance wymaga administratora, parity i dopuszczenia przebiegu przez node', async (t) => {
   for (const [label, value, options] of [
     ['reader', array(), { admin: false }], ['zero parity', array({ parityDisks: [] })],
     ['disabled', array({ enabled: false })], ['pending', array({ state: 'pending', parityRunAvailable: false })],
@@ -489,7 +489,7 @@ test('sekcja przenoszenia nazywa się tym, co robi, i tłumaczy regułę własny
   assert.match(panel.textContent, /jako „Mover”/);
   const explain = panel.querySelector('.nas-mover-explain');
   assert.match(explain.textContent, /Nowe pliki trafiają najpierw na dysk cache/);
-  assert.match(explain.textContent, /Węzeł sam przenosi/);
+  assert.match(explain.textContent, /Node sam przenosi/);
   // 7200 s and cacheMinFreePct 20 — the same numbers as the rules row, and the
   // cache half is the FILL level, not the free one.
   assert.match(explain.textContent, /starszy niż 2 h/);
@@ -805,7 +805,7 @@ test('zmieniające się liczby nie przebudowują panelu, a rozwinięta sekcja pr
   await flush(); await flush();
   // `ok(===)`, not `equal`: a failing `equal` on two DOM nodes makes the
   // assertion inspect the whole document for its diff and never returns.
-  assert.ok(body.querySelector('.nas-cache-pending') === pending, 'ten sam węzeł, nie przebudowa');
+  assert.ok(body.querySelector('.nas-cache-pending') === pending, 'ten sam node, nie przebudowa');
   assert.ok(body.querySelector('.nas-elastic-heading') === heading, 'nagłówek nie jest przebudowany');
   assert.equal(pending.querySelector('.v').textContent, fmtOptionalBytes(6 * GiB));
   assert.equal(body.querySelector('tf-stat-card[data-fig="capacity"]').getAttribute('value'), fmtOptionalBytes(2 * GiB));
@@ -973,7 +973,7 @@ test('naprawa pojawia się tylko przy dowodzie awarii parity i nigdy bez parity'
   // And when it is blocked the reason is the disk, in the admin's words —
   // never the helper's `precondition_failed` after a job has been started.
   const blocked = await mount(array({ dataDisks: [{ ...disk, devicePresent: false }], snapraid: snapraidWith([failedScrub]) }));
-  assert.match(blocked.body.querySelector('.nas-snapraid').textContent, /nie widać na tym węźle/);
+  assert.match(blocked.body.querySelector('.nas-snapraid').textContent, /nie widać na tym nodzie/);
   blocked.screen.dispose();
 
   // And a reader never sees any of the three, whatever the array reports.

@@ -68,6 +68,18 @@ pub mod channels {
     /// Inclusive valid kind range for a known channel. Returns `None` for
     /// unallocated channels (0x0A..=0xFF) — validator (4c1g) treats `None`
     /// as `UnknownChannel` per §11 error code 0x0003.
+    ///
+    /// This table is the SINGLE SOURCE OF TRUTH for which kinds may arrive as a
+    /// UFP/2 envelope, and `validate_channel_kind` runs before any dispatch: a
+    /// kind outside its channel's range is dropped as `UnknownKind` and no
+    /// handler ever sees the frame. So a new mesh message that travels as a
+    /// UFP/2 unicast envelope MUST be allocated INSIDE `0x04`'s bound, in a free
+    /// slot (the band is dense but has gaps — e.g. `0x28` and `0x29`). Do not
+    /// widen the bound to fit a new value: the Mesh bound is also what keeps the
+    /// raw bi-stream discriminators (`tentaflow_protocol::mesh::
+    /// MESH_MSG_CAMERA_STREAM_SUBSCRIBE` 0x52, `MESH_MSG_LIDAR_STREAM_SUBSCRIBE`
+    /// 0x53) out, since those open their own QUIC bi-stream and are deliberately
+    /// not envelope kinds.
     pub fn valid_kind_range(c: Channel) -> Option<RangeInclusive<u16>> {
         match c.0 {
             0x01 => Some(0x0001..=0x07FF),
@@ -121,6 +133,7 @@ mod tests {
     fn kind_range_mesh_matches_legacy_discriminators() {
         let r = channels::valid_kind_range(channels::MESH).unwrap();
         assert!(r.contains(&0x0010)); // HEARTBEAT
+        assert!(r.contains(&0x0029)); // PROVIDER_CREDENTIALS_SYNC
         assert!(r.contains(&0x004C)); // SYNC_SNAPSHOT_RESPONSE
         assert!(r.contains(&0x004D)); // ROUTING_SYNC
         assert!(r.contains(&0x004E)); // ROBOTS_ANNOUNCE
@@ -128,7 +141,14 @@ mod tests {
         assert!(r.contains(&0x0050)); // ROBOTS_GET_RESPONSE
         assert!(r.contains(&0x0051)); // ROBOTS_UPDATE
         assert!(!r.contains(&0x000F));
-        assert!(!r.contains(&0x0052));
+        // The two raw bi-stream discriminators sit one past the bound ON PURPOSE:
+        // they open their own QUIC bi-stream and are never envelope kinds, so a
+        // sender claiming them on the UFP/2 path is refused here. Widening this
+        // bound is what would bless them, which is why a new UFP/2 mesh kind
+        // takes a free slot inside it instead.
+        assert!(!r.contains(&0x0052)); // CAMERA_STREAM_SUBSCRIBE (bi-stream only)
+        assert!(!r.contains(&0x0053)); // LIDAR_STREAM_SUBSCRIBE (bi-stream only)
+        assert!(!r.contains(&0x0054));
     }
 
     #[test]

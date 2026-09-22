@@ -48,9 +48,6 @@ pub enum BackendHandle {
         node_id: String,
         engine_id: String,
     },
-    /// Local Codex/Claude Code bridge. Requests are translated into managed
-    /// CLI sessions by the runtime executor instead of OpenAI-compatible HTTP.
-    AgentRpc,
 }
 
 impl BackendHandle {
@@ -61,7 +58,6 @@ impl BackendHandle {
         match self {
             BackendHandle::Http(_) => true,
             BackendHandle::Embedded { .. } => true,
-            BackendHandle::AgentRpc => true,
             BackendHandle::Quic(handle) => {
                 // `client` siedzi pod async RwLock; tu tylko fast-path. Kiedy
                 // reconnect loop jeszcze nie ustawil clienta, traktujemy jako
@@ -103,7 +99,6 @@ impl BackendHandle {
             } => {
                 format!("embedded:{engine_id}:{model_name}")
             }
-            BackendHandle::AgentRpc => "agent-rpc".to_string(),
         }
     }
 }
@@ -142,10 +137,6 @@ impl LiveHandlesCache {
         svc: &ServiceInfo,
         creds: Option<ExternalProviderCreds>,
     ) -> Result<()> {
-        if svc.transport == Transport::AgentRpc.as_db_tag() {
-            self.insert(svc.node_id.clone(), svc.id, BackendHandle::AgentRpc);
-            return Ok(());
-        }
         // Snapshot-driven inserts (mesh sync) pass `creds = None` — the
         // broadcast `ServiceInfo` carries no secrets. The owning node's deploy
         // handler resolves the decrypted external-provider creds itself;
@@ -316,9 +307,6 @@ pub fn build_handle(
                 quic_config,
             ))))
         }
-        Transport::AgentRpc => Err(anyhow!(
-            "coding-agent RPC services are managed through ServiceAgentRequest, not inference routing"
-        )),
     }
 }
 
@@ -500,21 +488,6 @@ mod tests {
 
         let removed = cache.remove("nodeA", 42).expect("removed");
         assert!(matches!(removed, BackendHandle::Embedded { .. }));
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn agent_rpc_service_does_not_create_inference_handle() {
-        let cache = LiveHandlesCache::new();
-        let mut service = embedded_svc(7, "nodeA", "codex/default");
-        service.engine_id = "codex".to_string();
-        service.category = "agents".to_string();
-        service.transport = Transport::AgentRpc.as_db_tag().to_string();
-
-        cache
-            .upsert_service_info(&service, None)
-            .expect("agent RPC service should be accepted without an inference handle");
-
         assert!(cache.is_empty());
     }
 

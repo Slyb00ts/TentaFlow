@@ -531,7 +531,7 @@ fn upsert_local_peer(
             .collect(),
     };
     let local_os_distro = node_info_collector::collect_os_distro();
-    let (docker_available, docker_version) = node_info_collector::collect_docker_info();
+    let docker_version = node_info_collector::docker_server_version();
 
     mesh_peer_store.add_or_update(MeshPeerInfo {
         node_id: local_node_id.to_string(),
@@ -559,7 +559,8 @@ fn upsert_local_peer(
         cpu_temperature_c: None,
         swap_total_mb: 0,
         swap_used_mb: 0,
-        docker_available: Some(docker_available),
+        // Nothing reported, on the same grounds as the sandbox fields below.
+        docker_available: None,
         docker_version,
         models: vec![],
         active_requests: 0,
@@ -3658,7 +3659,7 @@ fn collect_local_models(
 }
 
 /// Slow refresh — every 60 s, refresh the slowly changing data of the local
-/// node: IP addresses, Docker availability/version, OS distro and the
+/// node: IP addresses, the Docker server version, OS distro and the
 /// process-sandbox capability.
 ///
 /// A `NodeInfo` carrying a ready sandbox report goes to every trusted peer on
@@ -3704,21 +3705,15 @@ fn spawn_slow_refresh(
                     }
                     None => raw.into_iter().filter(|ip| ip.is_ipv4()).collect(),
                 };
-                let (docker_available, docker_version) = node_info_collector::collect_docker_info();
+                let docker_version = node_info_collector::docker_server_version();
                 let os_info = node_info_collector::collect_os_distro();
                 let sandbox = node_info_collector::collect_sandbox_info();
-                (addresses, docker_available, docker_version, os_info, sandbox)
+                (addresses, docker_version, os_info, sandbox)
             })
             .await;
 
-            if let Ok((addresses, docker_available, docker_version, os_info, sandbox)) = result {
-                peer_store.update_local_extras(
-                    &local_node_id,
-                    addresses,
-                    docker_available,
-                    docker_version,
-                    os_info,
-                );
+            if let Ok((addresses, docker_version, os_info, sandbox)) = result {
+                peer_store.update_local_extras(&local_node_id, addresses, docker_version, os_info);
                 // The same shape the peers hold, so the comparison below
                 // compares two reports rather than two different types.
                 let sandbox = (Some(sandbox.0), sandbox.1);

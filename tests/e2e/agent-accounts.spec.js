@@ -141,7 +141,7 @@ function dbSessions(accountId) {
 }
 
 function dbRuntimeEngines() {
-  return sql('SELECT node_id, engine_id, install_state, version FROM agent_runtime_engines ORDER BY engine_id');
+  return sql('SELECT node_id, engine_id, install_state, version, last_error FROM agent_runtime_engines ORDER BY engine_id');
 }
 
 // Two rows nothing in the dashboard can create: a CLI session is opened by the
@@ -319,8 +319,22 @@ async function clickRowAction(page, rowText, label) {
   }, [rowText, label]);
 }
 
-/** Opens the matrix cell's menu and picks one of its two actions. */
+/**
+ * Runs one action on a matrix cell the way a person does: an app that is not on
+ * the node has its own "Zainstaluj" button, an installed one opens the "…" menu.
+ */
 async function runtimeMenuAction(page, engineId, action) {
+  const direct = await page.locator('#aa-runtime-table').evaluate((table, engine) => {
+    const button = table.shadowRoot.querySelector(`tf-button[data-runtime-install][data-engine="${engine}"]`);
+    if (!button) return false;
+    if (button.hasAttribute('disabled')) throw new Error(`the ${engine} cell is disabled on this node`);
+    button.click();
+    return true;
+  }, engineId);
+  if (direct) {
+    expect(action, `${engineId} is not installed, so the only action is install`).toBe('install');
+    return;
+  }
   await page.locator('#aa-runtime-table').evaluate((table, engine) => {
     const trigger = table.shadowRoot.querySelector(`tf-button[data-engine="${engine}"]`);
     if (!trigger) throw new Error(`no menu trigger for ${engine}`);
@@ -376,6 +390,15 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     test.setTimeout(120_000);
     await loginAsAdmin(page);
     await openAccountsTab(page);
+    // The node's own decision about holding agent accounts comes first, and the
+    // row starts absent — which reads as NO, because a missing decision must not
+    // be a way past the gate. A pasted key is stored on THIS node, so the paste
+    // passes the same gate the sign-in does; the refusal names exactly this
+    // remedy. The operator's step is taken here through the same call the
+    // switch on the N01 tab sends.
+    const local = await localRuntimeNode(page);
+    expect(local, 'the node does not report its own row').toBeTruthy();
+    await setReceivesAccounts(page, local.node_id, true);
     await createAccountThroughUi(page, { engine: 'claude-code', name: ACCOUNT_NAME, key: FIRST_KEY });
 
     await expect.poll(() => tableText(page, '#aa-accounts-table')).toContain(ACCOUNT_NAME);
@@ -495,12 +518,14 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     });
     await flip();
 
-    // The refusal reaches the operator as the translation plus the node's own
-    // sentence, and that sentence names the paste rather than a sign-in.
+    // The refusal reaches the operator in their language, naming both remedies
+    // (sign in elsewhere, or paste the key there) — never the node's English
+    // sentence with its 64-hex node id.
     const refusal = page.locator('.toast.toast-error').last();
-    await expect(refusal).toContainText('domem kont agentowych');
-    await expect(refusal).toContainText('paste their API key');
-    await expect(refusal).not.toContainText('sign those accounts in');
+    await expect(refusal).toContainText('Na tym nodzie zalogowano konta agentów');
+    await expect(refusal).toContainText('klucz API');
+    await expect(refusal).not.toContainText('paste their API key');
+    await expect(refusal).not.toContainText("node '");
     await expect.poll(toggleChecked).toBe(true);
     expect(row()?.receives_accounts, 'a refused flip changes nothing').toBe(1);
     expect(home()).toBe(node.node_id);
@@ -513,10 +538,17 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     expect(home()).toBeNull();
 
     // Leave the binding where the previous test put it, so the rest of the
-    // suite reads the same node as this account's home.
+    // suite reads the same node as this account's home. The switch has to come
+    // back with it: a node outside the fleet refuses a pasted key (the paste is
+    // the other road to a home), and the toolbar test below pastes one. Turning
+    // the switch OFF was only ever possible here because the home was cleared
+    // first — the store refuses to take a home node out of the fleet (the test
+    // above that), so this fixture pair is not a state the API can produce.
     seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.node_id)}
           WHERE account_id = ${quote(accountId)}`);
+    await setReceivesAccounts(page, node.node_id, true);
     expect(home()).toBe(node.node_id);
+    expect(row()?.receives_accounts).toBe(1);
   });
 
   test('clearing the API key removes the credential row and writes the audit entry', async ({ page }) => {
@@ -734,7 +766,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     const win = await openAccountWindow(page, RENAMED);
     await expect(win.locator('.aa-kv')).toContainText(wireAccount.used_on[0].node_name);
     await expect(win.locator('.aa-kv dd[title]')).toHaveAttribute(
-      'title', 'Zgodnie z pomiarem węzła, który odpowiedział.',
+      'title', 'Zgodnie z pomiarem noda, który odpowiedział.',
     );
 
     // A04: the org grant the access test left carries who granted it and when.
@@ -792,7 +824,7 @@ test.describe('Logowanie u dostawcy (A02)', () => {
     await win.locator('tf-button[data-act="start"]').click();
 
     await expect(win.locator('[data-error]')).toBeVisible();
-    await expect(win.locator('[data-error-text]')).toContainText('Ten węzeł nie przyjmuje kont agentowych');
+    await expect(win.locator('[data-error-text]')).toContainText('Ten node nie przyjmuje kont agentowych');
     // The node's own English sentence stays under the translation.
     await expect(win.locator('[data-error-detail]'))
       .toHaveText('this node is not configured to receive agent accounts');
@@ -934,9 +966,9 @@ test.describe('Aplikacje na nodach (N01)', () => {
     });
 
     // The screen must not look like the flip worked: the switch goes back on,
-    // the node's own sentence stays under a translation the operator can read,
-    // and neither the flag nor the binding moved.
-    await expect(page.locator('.toast.toast-error').last()).toContainText('domem kont agentowych');
+    // the refusal is in the operator's language, and neither the flag nor the
+    // binding moved.
+    await expect(page.locator('.toast.toast-error').last()).toContainText('Na tym nodzie zalogowano konta agentów');
     await expect.poll(toggleChecked).toBe(true);
     expect(row()?.receives_accounts, 'a refused flip changes nothing').toBe(1);
     expect(dbAccountByName(LOGIN_NAME).home_node_id).toBe(node.node_id);
@@ -1012,10 +1044,22 @@ test.describe('Aplikacje na nodach (N01)', () => {
     // Whatever this machine could do (a finished install, or the failure of one
     // without the vendor's package), the matrix redraws from the node's report.
     const row = dbRuntimeEngines().find((e) => e.engine_id === 'claude-code');
+    // The node's own vocabulary for a cell is `absent | installing | installed |
+    // error` (`provider_accounts::INSTALL_STATES`) and the row above settles no
+    // longer `installing`, so only the two terminal states can be read here. A
+    // cell holding anything else did not come from the node, and accepting it
+    // would let this test pass on a report the node never makes.
+    expect(['installed', 'error'], `the node settled claude-code as '${row.install_state}'`)
+      .toContain(row.install_state);
     // The row above is the node's own table, read the moment it settles; the
     // screen follows it on its own two second loop (`watchInstall`), so it is
     // read here until it has caught up. The assertion is the version the node
     // recorded, not a wait: a matrix that never redraws still fails.
+    //
+    // The failure branch asserts the failure's OWN text (`Błąd`), never a string
+    // a passing install also prints: a red chip is what a broken install shows
+    // AND what a fabricated one would, so the branch below adds the node's own
+    // reason before the failure is accepted as the outcome.
     const reported = row.install_state === 'installed'
       ? (row.version || 'Zainstalowana')
       : 'Błąd';
@@ -1026,6 +1070,22 @@ test.describe('Aplikacje na nodach (N01)', () => {
       // something other than the channel — the whole point of removing the pin.
       const current = await vendorLatestVersion();
       expect(row.version, `the node installed ${row.version}, the vendor offers ${current}`).toBe(current);
+    } else {
+      // A failure this suite accepts has to be a MEASURED one. `error` is only
+      // ever written by `agent_runtime::install_engine` AFTER the release was
+      // resolved and the download or the bridge build failed, and it records
+      // both the release and the sentence the failure carried. An `error` cell
+      // with neither is indistinguishable from an install that never ran — the
+      // silent breakage this test exists to catch — so it fails here instead of
+      // being read as "the node said no".
+      expect(row.version, `the failed install names the release it failed on: ${JSON.stringify(row)}`)
+        .toBeTruthy();
+      const reason = String(row.last_error ?? '').trim();
+      expect(reason, `the node reported why the install failed: ${JSON.stringify(row)}`).not.toBe('');
+      // And the reason is what the screen shows: the cell also carries the
+      // node's sentence, so a matrix that painted a bare red chip over a real
+      // error would fail here.
+      await expect.poll(() => tableText(page, '#aa-runtime-table'), { timeout: 15_000 }).toContain(reason);
     }
 
     // Removing it again leaves the matrix as this suite found it.
@@ -1043,6 +1103,25 @@ test.describe('Aplikacje na nodach (N01)', () => {
 // exactly that window, so a person who gave up left `claude setup-token`
 // holding a PTY. This needs the vendor CLI installed on the node; where it
 // cannot be installed (no egress), the test says so instead of pretending.
+//
+// WHAT THE TEST BELOW DOES NOT COVER, and why the green count must not be read
+// as "sign-in works". The wizard has two outcomes and this machine always takes
+// the SAME one: with no route to the vendor's sign-in and no vendor account to
+// sign into, the CLI answers with an error, so `outcome.error` is what fills in
+// and the SUCCESS branch — the "Otwórz link logowania" band, its copy/open
+// buttons, the verification-code field and step 4 — never renders in a browser
+// against a real node. The assertions below cover the start that outlives the
+// old 30 s deadline, the live "Anuluj", and that closing the wizard leaves no
+// vendor CLI behind; they say nothing about whether a COMPLETED sign-in adopts
+// a credential, and nothing here would notice if that path broke.
+//
+// There IS source-cut coverage of the success path's flow and templates
+// (`tentaflow-core/www/js/modules/agent-accounts-login.test.js`: the address, the
+// instruction, the code submitted once, polling following the node to the
+// outcome), but it drives a fake transport against the module, not the running
+// app — a broken wire contract between them would keep it green. Closing the gap
+// in e2e needs a real vendor sign-in on the node, which cannot be stubbed or
+// automated away: a stub would prove the stub.
 // =============================================================================
 
 /** Sign-in processes this run started, ignoring anything that was already there. */
@@ -1062,7 +1141,10 @@ function signInProcesses() {
 }
 
 test.describe('Logowanie u dostawcy na żywo (A02)', () => {
-  test('a start outlives the old 30 s deadline, and cancelling one closes the terminal', async ({ page }) => {
+  // Named for what it actually exercises: on this machine the CLI answers with
+  // an error, so the wizard's success branch (link band, copy/open, code field)
+  // is NOT covered here — see the block comment above.
+  test('a start outlives the old 30 s deadline, and cancelling one closes the terminal (offline: the CLI refuses, a COMPLETED sign-in is not covered)', async ({ page }) => {
     test.setTimeout(600_000);
     await loginAsAdmin(page);
     const node = await localRuntimeNode(page);
@@ -1089,7 +1171,7 @@ test.describe('Logowanie u dostawcy na żywo (A02)', () => {
 
     // While the node opens the terminal the wizard says so, and "Anuluj" is
     // live — that window is precisely when a person changes their mind.
-    await expect(win.locator('[data-result]')).toContainText('Węzeł uruchamia terminal', { timeout: 10000 });
+    await expect(win.locator('[data-result]')).toContainText('Node uruchamia terminal', { timeout: 10000 });
     expect(await win.locator('tf-button[data-act="cancel"]').getAttribute('disabled')).toBeNull();
 
     // Past the shim's old 30 s: the browser must still be waiting on the node.
@@ -1109,6 +1191,12 @@ test.describe('Logowanie u dostawcy na żywo (A02)', () => {
       await page.waitForTimeout(1000);
       outcome = await read();
     }
+    // This accepts EITHER outcome on purpose, and on a machine without the
+    // vendor's sign-in the branch taken is always the error one, so it is not
+    // an assertion that a sign-in succeeds: it asserts only that the node
+    // answered the start itself instead of the transport dying under it. The
+    // `link` half is what a machine WITH a working sign-in would exercise —
+    // see the block comment above for what that leaves uncovered.
     expect(outcome.link || outcome.error, 'the node answered the start one way or the other').toBeTruthy();
     if (outcome.error) {
       expect(outcome.error).not.toContain('timed out');
@@ -1127,7 +1215,7 @@ test.describe('Logowanie u dostawcy na żywo (A02)', () => {
     const second = page.locator('tf-window').filter({ has: page.locator('.aa-login') }).last();
     await second.locator('.aa-login').waitFor({ state: 'visible', timeout: 10000 });
     await second.locator('tf-button[data-act="start"]').click();
-    await expect(second.locator('[data-result]')).toContainText('Węzeł uruchamia terminal', { timeout: 10000 });
+    await expect(second.locator('[data-result]')).toContainText('Node uruchamia terminal', { timeout: 10000 });
     await second.locator('tf-button[data-act="cancel"]').click();
     await expect(second.locator('.aa-login')).toHaveCount(0, { timeout: 15000 });
 
@@ -1490,5 +1578,71 @@ test.describe('Agent na aplikacji CLI (G01)', () => {
     await page.waitForSelector('#agent-detail-tabs tf-tab', { timeout: 15000 });
     await expect(page.locator('#ag-detail-header-host .d-badges')).toContainText('Konto użytkownika');
     await expect(page.locator('#ag-detail-body [data-account-mode]')).toHaveAttribute('value', 'user');
+
+    // ---------------------------------------------------------------------
+    // `cli_model` — the model select of the CLI pane.
+    //
+    // Only the half a node with no vendor sign-in can have is covered here. The
+    // option list is built from `modelListRequest` rows named
+    // `<engine_id>/<model>`, whose only writer is
+    // `services::coding_agent::sync_models`; the supervisor reaches it only
+    // after the bridge has answered `auth.status` with `authenticated = true`
+    // (supervisor.rs, the `if !authenticated { continue; }` guard). Nothing
+    // signs in here, so the catalogue offers nothing for the engine — and the
+    // ONE option the select must still carry is the model the agent was STORED
+    // with, because opening the pane must not silently erase what it runs on.
+    // The model is written by the same upsert the agent builder uses, so what
+    // is asserted is a real backend value read back through the real select.
+    //
+    // NOT covered: a signed-in engine's models appearing as options. See
+    // docs/agent-accounts-technical-design.md, "E2E coverage of C01, C02 and
+    // cli_model".
+    // ---------------------------------------------------------------------
+    const roster = await api(page, 'agentsListRequest', {});
+    const seeded = JSON.parse(roster?.agentsJson ?? roster?.agents_json ?? '[]')
+      .find((a) => a.name === AGENT_SLUG);
+    expect(seeded?.id, 'the seeded agent is not on the node').toBeTruthy();
+    await api(page, 'agentsUpsertRequest', {
+      agentJson: JSON.stringify({
+        id: seeded.id,
+        name: AGENT_SLUG,
+        display_name: AGENT_NAME,
+        description: 'e2e',
+        system_prompt: null,
+        model: null,
+        tools: [],
+        skills: { names: [], tags: [] },
+        params: {},
+        max_iterations: 25,
+        timeout_secs: 600,
+        max_subagents: 0,
+        max_spawn_depth: 1,
+        on_child_complete: 'notify',
+        flow_id: null,
+        routable: true,
+        is_enabled: true,
+        runtime: {
+          kind: 'cli',
+          engine: 'claude-code',
+          reasoning: 'standard',
+          model: 'sonnet',
+          account: { mode: 'user' },
+        },
+      }),
+    });
+    await expect.poll(() => JSON.parse(dbAgentRuntime(AGENT_SLUG)).model).toBe('sonnet');
+
+    await page.reload();
+    await page.waitForSelector('aside', { timeout: 30000 });
+    await page.locator('.sidebar .nav-item[data-view="agents"]').first().click();
+    await page.locator('.agent-card').filter({ hasText: AGENT_NAME }).first().click();
+    await page.waitForSelector('#agent-detail-tabs tf-tab', { timeout: 15000 });
+    const modelSelect = page.locator('#ag-detail-body [data-cfg="cli_model"] select');
+    await expect(modelSelect).toBeVisible();
+    await expect(modelSelect).toHaveValue('sonnet');
+    const modelOptions = await modelSelect.evaluate(
+      (sel) => [...sel.options].map((o) => o.value),
+    );
+    expect(modelOptions, 'the stored model is not offered as an option').toContain('sonnet');
   });
 });

@@ -433,11 +433,7 @@ async fn run_server(args: Args) -> Result<()> {
         "Mesh identity: {}",
         &local_node_id_str[..16.min(local_node_id_str.len())]
     );
-    match tentaflow_core::sync::runtime::init(
-        db.clone(),
-        mesh_security.clone(),
-        settings_cipher.clone(),
-    ) {
+    match tentaflow_core::sync::runtime::init(db.clone(), mesh_security.clone()) {
         Ok(_) => {
             info!("Sync Ledger runtime initialized");
             match tentaflow_core::sync::runtime::run_pending_baseline_cutover() {
@@ -554,7 +550,7 @@ async fn run_server(args: Args) -> Result<()> {
         let hostname = info.hostname.clone();
         let platform = node_info_collector::detect_platform();
         let os_info = node_info_collector::collect_os_distro();
-        let (docker_available, docker_version) = node_info_collector::collect_docker_info();
+        let docker_version = node_info_collector::docker_server_version();
         let addresses = node_info_collector::collect_local_addresses();
         mesh_peer_store.seed_local(
             &local_node_id_str,
@@ -569,7 +565,6 @@ async fn run_server(args: Args) -> Result<()> {
             info.ram_total_mb,
             info.gpu_info.clone(),
             addresses,
-            docker_available,
             docker_version,
         );
         info!(node_id = %local_node_id_str, "Local node seeded in peer_store");

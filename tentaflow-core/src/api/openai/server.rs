@@ -2013,31 +2013,6 @@ async fn handle_passthrough(
     }
 }
 
-/// Rozwiązuje lokalny `<base>/v1` endpoint serwisu dla danego modelu przez ten
-/// sam resolver/ACL co reszta `/v1` (autoryzacja MUSI być już sprawdzona przez
-/// `v1_authorize` przed wywołaniem). Zwraca bazowy URL zakończony na `/v1`
-/// (bez trailing slash) gotowy do doklejenia gołej ścieżki (`/rerank`), albo
-/// gotowy error-response gdy serwis jest zdalny / nie jest serwisem HTTP /
-/// nie ma endpointu. Współdzielony przez passthrough i tłumaczące handlery.
-fn resolve_local_v1_base(
-    router: &Router,
-    model: &str,
-    surface: crate::services::catalog::ServiceSurface,
-    input_modalities: &[crate::services::catalog::InputModality],
-    user_ctx: Option<crate::auth::acl::UserContext>,
-    context_label: &str,
-) -> std::result::Result<String, Response<OpenAIBody>> {
-    resolve_local_v1_base_url(
-        router,
-        model,
-        surface,
-        input_modalities,
-        user_ctx,
-        context_label,
-    )
-    .map_err(|msg| error_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg))
-}
-
 /// Rozwiązuje `ResolvedExecutionTarget` przez ten sam resolver/ACL co reszta
 /// `/v1` (autoryzacja MUSI być sprawdzona wcześniej przez `v1_authorize`).
 /// Współdzielone przez passthrough, który dla `/v1/infer` musi rozróżnić
@@ -2113,7 +2088,7 @@ fn resolve_http_base_from_target(
             StatusCode::SERVICE_UNAVAILABLE,
             "service_unavailable",
             format!(
-                "model '{}' żyje tylko na zdalnym węźle '{}' — {} obsługuje wyłącznie lokalne serwisy",
+                "model '{}' żyje tylko na zdalnym nodzie '{}' — {} obsługuje wyłącznie lokalne serwisy",
                 model, node_id, context_label
             ),
         )),
@@ -2341,10 +2316,11 @@ fn vision_infer_to_json(out: crate::vision::InferOutput, w: f32, h: f32) -> serd
 }
 
 /// Rdzeń rozwiązywania lokalnego `<base>/v1` — bez warstwy HTTP. Zwraca czysty
-/// `Err(String)` z gotowym komunikatem, żeby mógł go użyć zarówno HTTP handler
-/// (`resolve_local_v1_base` owija to w `error_response`) jak i handler
-/// protokołu binarnego (`ProtocolError`). Współdzielona, jedyna implementacja
-/// resolve dla obu tierów — bez duplikacji logiki katalogu/ACL.
+/// `Err(String)` z gotowym komunikatem, żeby mógł go użyć zarówno `rerank_forward`
+/// (propaguje `String` dalej do wywołującego handlera protokołu binarnego jako
+/// `ProtocolError`) jak i inni callerzy, którzy sami decydują jak opakować błąd.
+/// Współdzielona, jedyna implementacja resolve dla obu tierów — bez duplikacji
+/// logiki katalogu/ACL.
 pub fn resolve_local_v1_base_url(
     router: &Router,
     model: &str,
@@ -2395,7 +2371,7 @@ pub fn resolve_local_v1_base_url(
         crate::services::runtime::target::ResolvedExecutionTarget::MeshForward {
             node_id, ..
         } => Err(format!(
-            "model '{}' żyje tylko na zdalnym węźle '{}' — {} obsługuje wyłącznie lokalne serwisy",
+            "model '{}' żyje tylko na zdalnym nodzie '{}' — {} obsługuje wyłącznie lokalne serwisy",
             model, node_id, context_label
         )),
         crate::services::runtime::target::ResolvedExecutionTarget::Flow { .. } => Err(format!(

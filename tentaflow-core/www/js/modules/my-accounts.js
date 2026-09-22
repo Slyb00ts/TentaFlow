@@ -21,6 +21,7 @@ import {
   engineName,
   engineTile,
   errorText,
+  reportWriteOutcome,
   statusChipHtml,
   usedOnLabel,
   whenLabel,
@@ -187,10 +188,17 @@ function patchCard(entry) {
   if (!fresh) return;
   card.replaceWith(fresh);
   wireCardActions(grid);
-  // Keep the header subtitle count in sync.
+  paintSubtitle();
+}
+
+// The header counts every working connection on the screen: the add-on
+// accounts and the person's own agent-app accounts shown below them.
+function paintSubtitle() {
   const sub = byId('myacc-sub');
-  const active = entries.filter((e) => e.status === 'active').length;
-  if (sub) sub.textContent = I18n.t('my_accounts.subtitle', { n: active });
+  if (!sub) return;
+  const addons = entries.filter((e) => e.status === 'active').length;
+  const apps = agentAccounts.filter((a) => a.scope === 'user' && a.status === 'active').length;
+  sub.textContent = I18n.t('my_accounts.subtitle', { n: addons + apps });
 }
 
 function normalize(a) {
@@ -215,10 +223,8 @@ function normalize(a) {
 
 function renderGrid() {
   const grid = byId('myacc-grid');
-  const sub = byId('myacc-sub');
   if (!grid) return;
-  const active = entries.filter((e) => e.status === 'active').length;
-  if (sub) sub.textContent = I18n.t('my_accounts.subtitle', { n: active });
+  paintSubtitle();
   if (entries.length === 0) {
     grid.innerHTML = `<div class="addons-empty">${escapeHtml(I18n.t('my_accounts.empty_state'))}</div>`;
     return;
@@ -419,6 +425,7 @@ async function loadAgentApps() {
     toast(errorText(err), 'error');
   }
   renderAgentApps();
+  paintSubtitle();
 }
 
 function renderAgentApps() {
@@ -573,8 +580,12 @@ function wireAgentCards(grid) {
       });
       if (!ok) return;
       try {
-        await AgentAccounts.remove(account.account_id ?? account.accountId);
-        toast(T('apps_disconnected'), 'success');
+        // "Odłącz" is the same delete the account window sends, so it reports
+        // the same partial outcome the same way.
+        reportWriteOutcome(
+          await AgentAccounts.remove(account.account_id ?? account.accountId),
+          T('apps_disconnected'),
+        );
         await loadAgentApps();
       } catch (err) {
         toast(errorText(err), 'error');

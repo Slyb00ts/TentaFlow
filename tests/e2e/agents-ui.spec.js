@@ -73,15 +73,16 @@ test.afterAll(async () => {
 //     is newer than the page; it would swallow every click in this suite.
 //   - a fresh instance defaults to English, while every string this suite
 //     asserts is the Polish copy the mockups are written in.
-async function prepare(page) {
-  await page.addInitScript(() => {
+async function prepare(page, jwt = null) {
+  await page.addInitScript((token) => {
     localStorage.setItem('tentaflow_lang', 'pl');
+    if (token) localStorage.setItem('tentaflow_jwt', token);
     const kill = () => document.querySelectorAll('.update-overlay').forEach((el) => el.remove());
     document.addEventListener('DOMContentLoaded', () => {
       kill();
       new MutationObserver(kill).observe(document.documentElement, { childList: true, subtree: true });
     });
-  });
+  }, jwt);
 }
 
 // A fresh node refuses to let the seeded admin in until the initial password is
@@ -89,8 +90,26 @@ async function prepare(page) {
 // run keeps using the password it set.
 const ROTATED_PASSWORD = 'admin-e2e-2026';
 let adminPassword = 'admin';
+// The node refuses more than ten logins a minute for one username, and this
+// suite has more tests than that, so every test after the first carries the
+// JWT the first login produced, as a returning operator's browser does.
+let adminJwt = null;
 
 async function openAgentsScreen(page) {
+  if (adminJwt) {
+    await prepare(page, adminJwt);
+    await page.goto(`https://127.0.0.1:${PORT}/`);
+    await page.waitForSelector('aside', { timeout: 30000 });
+  } else {
+    await signInAsAdmin(page);
+    adminJwt = await page.evaluate(() => localStorage.getItem('tentaflow_jwt'));
+  }
+  // `data-view` is the stable handle; the nav label is translated.
+  await page.locator('.sidebar .nav-item[data-view="agents"]').first().click();
+  await page.waitForSelector('#agents-grid-host .agent-card', { timeout: 20000 });
+}
+
+async function signInAsAdmin(page) {
   await prepare(page);
   await page.goto(`https://127.0.0.1:${PORT}/`);
   await page.locator('#login-username input').first().waitFor({ state: 'visible', timeout: 20000 });
@@ -109,9 +128,6 @@ async function openAgentsScreen(page) {
     adminPassword = ROTATED_PASSWORD;
     await page.waitForSelector('aside', { timeout: 30000 });
   }
-  // `data-view` is the stable handle; the nav label is translated.
-  await page.locator('.sidebar .nav-item[data-view="agents"]').first().click();
-  await page.waitForSelector('#agents-grid-host .agent-card', { timeout: 20000 });
 }
 
 async function openAgentDetail(page, name = AGENT_NAME) {
@@ -214,7 +230,9 @@ test.describe('Agenci — szczegóły agenta (A02-A05)', () => {
 
     await page.locator('.ag-breadcrumb .crumb').first().click();
     const dialog = page.locator('tf-window').filter({ hasText: 'Niezapisane zmiany' });
-    await expect(dialog).toBeVisible();
+    // The host element has no box of its own (the window inside it is fixed-
+    // positioned), so what the operator sees is asserted on the window's content.
+    await expect(dialog.getByText('Masz niezapisane zmiany konfiguracji tego agenta')).toBeVisible();
     // Cancelling keeps the operator where they were, draft intact.
     await dialog.locator('tf-button[data-action="cancel"]').click();
     await expect(page.locator('#agents-page-header')).toBeHidden();

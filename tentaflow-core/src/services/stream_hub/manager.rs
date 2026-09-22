@@ -188,9 +188,9 @@ impl StreamHub {
         // owner closed before init, init timed out) reports no broadcaster. Do
         // not cache it — surface a clean failure so the subscriber resubscribes
         // instead of hanging on an empty registered stream.
-        let Some(broadcaster) = source.chunk_broadcaster() else {
+        if source.chunk_broadcaster().is_none() {
             return Err(StreamHubError::NotRegistered(stream_id.to_string()));
-        };
+        }
 
         let entry = {
             let mut active = self.active.write();

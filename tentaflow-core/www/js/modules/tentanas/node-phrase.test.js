@@ -25,11 +25,11 @@ const CASES = [
 ];
 
 test('a named node goes into the template, a nameless one gets its own sentence', () => {
-  assert.equal(nodeT('pools.title', { nodeName: 'orion' }), 'Pule na węźle orion');
-  assert.equal(nodeT('pools.title', { nodeName: '  ' }), 'Pule na węźle bez nazwy');
-  assert.equal(nodeT('pools.title', null), 'Pule na węźle bez nazwy', 'no node at all reads the same');
+  assert.equal(nodeT('pools.title', { nodeName: 'orion' }), 'Pule na nodzie orion');
+  assert.equal(nodeT('pools.title', { nodeName: '  ' }), 'Pule na nodzie bez nazwy');
+  assert.equal(nodeT('pools.title', null), 'Pule na nodzie bez nazwy', 'no node at all reads the same');
   assert.equal(nodeT('sudo.password_label', { nodeName: 'orion' }, { user: 'tentaflow' }), 'Hasło sudo użytkownika tentaflow@orion');
-  assert.equal(nodeT('sudo.password_label', {}, { user: 'tentaflow' }), 'Hasło sudo użytkownika tentaflow na węźle bez nazwy');
+  assert.equal(nodeT('sudo.password_label', {}, { user: 'tentaflow' }), 'Hasło sudo użytkownika tentaflow na nodzie bez nazwy');
 });
 
 // The header subline used to be its own copy of this same chooser, in
@@ -39,9 +39,9 @@ test('a named node goes into the template, a nameless one gets its own sentence'
 // key must fall back to that phrase, never leak the raw
 // "tentanas.node.head_sub_node_unnamed" string onto the screen.
 test('nodeHeadSub reads naturally for a named and a nameless node, through nodeT', () => {
-  assert.equal(nodeHeadSub({ nodeName: 'orion' }), 'węzeł orion');
-  assert.equal(nodeHeadSub({ nodeName: '' }), 'Węzeł bez nazwy');
-  assert.equal(nodeHeadSub(null), 'Węzeł bez nazwy', 'no node at all reads the same');
+  assert.equal(nodeHeadSub({ nodeName: 'orion' }), 'node orion');
+  assert.equal(nodeHeadSub({ nodeName: '' }), 'Node bez nazwy');
+  assert.equal(nodeHeadSub(null), 'Node bez nazwy', 'no node at all reads the same');
   assert.doesNotMatch(nodeHeadSub({ nodeName: '' }), /tentanas\./, 'no missing-key leak when there is no dedicated _unnamed sibling');
 });
 
@@ -79,8 +79,8 @@ test('the Pools heading of a nameless node reads naturally', async () => {
     await drawPools(screen, body);
     await flush();
     const title = body.querySelector('.nas-pools-heading .title').textContent;
-    assert.match(title, /Pule na węźle bez nazwy/);
-    assert.doesNotMatch(title, /Węzeł bez nazwy/);
+    assert.match(title, /Pule na nodzie bez nazwy/);
+    assert.doesNotMatch(title, /Node bez nazwy/);
   } finally {
     // Stops the tab's poll even when an assertion fails, so a failure never
     // keeps the test process alive.

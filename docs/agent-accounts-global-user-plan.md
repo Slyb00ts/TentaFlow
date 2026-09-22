@@ -201,7 +201,7 @@ subskrypcja jest oznaczona w GUI jako „tylko dla zaufanych".
 | 2 | `provider_accounts` + granty + poświadczenia; migracja istniejących kont i `code_agent_credentials`; bridge na żądanie; self-service logowania użytkownika; GUI „Konta agentów" i „Moje konta agentów" | Użytkownik bez roli admina łączy własne konto; admin nie może go użyć; dwa konta tego samego silnika nie widzą się nawzajem |
 | 3 | Synchronizacja kont i poświadczeń, `ensure_account_on_node`, single-refresher/CAS/broker, automatyczna zmiana `home_node_id` | Login na A, sesja na B bez żadnej akcji; refresh na B widoczny na A; A offline nie blokuje B; dwa nody naraz nie unieważniają tokenu |
 | 4 | `agents.runtime_json`, `resolve_run_account`, UI Agents, usunięcie `agent_service_id` i syntetycznego flow, limity współbieżności | Dwóch użytkowników w tym samym workspace z agentem `mode=user` działa na własnych kontach; agent `mode=global` obok, w tym samym katalogu; test negatywny: brak konta użytkownika nie używa globalnego |
-| 5 | Metryki/audyt per konto, dokumentacja operacyjna, e2e Playwright ścieżki kont (dziś brak) | Analytics pokazuje zużycie per konto i użytkownik |
+| 5 | Metryki/audyt per konto, dokumentacja operacyjna; e2e Playwright ścieżki kont już istnieje i nie jest tu robotą (`tests/e2e/agent-accounts.spec.js`, 29 testów: A01, A02 w tym blok na żywo, A03/A04, N01, U01, G01) | Analytics pokazuje zużycie per konto i użytkownik |
 
 Kontrakty do zachowania: warianty protokołu tylko dopisywane (`SCHEMA_VERSION` rośnie — wszystkie nody
 przebudować razem), `agents` i nowe tabele z migracją i wpisem w `core_registry`, brak shimów: stare

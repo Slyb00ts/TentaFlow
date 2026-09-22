@@ -60,7 +60,6 @@ pub struct SyncRuntime {
     ledger: Arc<FjallSyncLedgerStore>,
     signer: RuntimeSigner,
     local_node_id: String,
-    settings_cipher: Arc<crate::crypto::SettingsCipher>,
     hlc: HlcClock,
     /// Set once at startup; runs after a synced addon-instance op commits.
     addon_reconciler: parking_lot::RwLock<Option<Arc<dyn AddonSyncReconciler>>>,
@@ -230,11 +229,7 @@ pub struct EpochReconcileRequest {
     pub donor_epoch_counter: u64,
 }
 
-pub fn init(
-    db: DbPool,
-    signer: Arc<MeshSecurity>,
-    settings_cipher: Arc<crate::crypto::SettingsCipher>,
-) -> LedgerResult<Arc<SyncRuntime>> {
+pub fn init(db: DbPool, signer: Arc<MeshSecurity>) -> LedgerResult<Arc<SyncRuntime>> {
     // The runtime is process-global: a second init in the same process (tests,
     // defensive restart paths) must not re-open the Fjall ledger, which is
     // exclusively locked by the first instance, so return the existing runtime.
@@ -267,7 +262,6 @@ pub fn init(
             security: signer,
         },
         local_node_id,
-        settings_cipher,
         hlc,
         addon_reconciler: parking_lot::RwLock::new(None),
         max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
@@ -4242,6 +4236,12 @@ mod tests {
 
     struct RuntimeHarness {
         runtime: SyncRuntime,
+        /// `SyncRuntime` itself no longer holds a cipher (shared-secret settings
+        /// are excluded from ledger replication entirely — `carries_shared_secret`
+        /// — rather than re-encrypted through the runtime); tests that exercise
+        /// `repository::*_shared_secret_setting_secure` still need one keyed the
+        /// same as the harness's `MeshSecurity`.
+        settings_cipher: Arc<crate::crypto::SettingsCipher>,
         _ledger_dir: tempfile::TempDir,
     }
 
@@ -4282,7 +4282,6 @@ mod tests {
                     security,
                 },
                 local_node_id,
-                settings_cipher: make_settings_cipher(key_seed),
                 hlc,
                 addon_reconciler: parking_lot::RwLock::new(None),
                 max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
@@ -4292,6 +4291,7 @@ mod tests {
                 env_mismatch_warned: parking_lot::Mutex::new(HashSet::new()),
                 push_state: PushState::default(),
             },
+            settings_cipher: make_settings_cipher(key_seed),
             _ledger_dir: ledger_dir,
         }
     }
@@ -4310,7 +4310,6 @@ mod tests {
                 security,
             },
             local_node_id,
-            settings_cipher: make_settings_cipher(key_seed),
             hlc,
             addon_reconciler: parking_lot::RwLock::new(None),
             max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
@@ -5627,7 +5626,7 @@ mod tests {
                 &source.runtime.db,
                 "hf_token",
                 "hf_test_secret",
-                &source.runtime.settings_cipher,
+                &source.settings_cipher,
             )
             .expect("set shared secret");
 
@@ -5644,7 +5643,7 @@ mod tests {
             assert_eq!(captures, 0);
             let versions = repository::list_shared_secret_versions(
                 &source.runtime.db,
-                &source.runtime.settings_cipher,
+                &source.settings_cipher,
             )
             .expect("versions");
             assert_eq!(versions.len(), 1);
@@ -11466,7 +11465,7 @@ mod tests {
                 &node.runtime.db,
                 "hf_token",
                 "hf_baseline_secret",
-                &node.runtime.settings_cipher,
+                &node.settings_cipher,
             )
             .expect("store shared secret");
             repository::set_setting(&node.runtime.db, "jwt_expiry_hours", "12")
@@ -11505,7 +11504,7 @@ mod tests {
                 repository::get_setting_secure(
                     &node.runtime.db,
                     "hf_token",
-                    &node.runtime.settings_cipher
+                    &node.settings_cipher
                 )
                 .expect("get secret")
                 .as_deref(),
@@ -12502,7 +12501,6 @@ mod tests {
                     security,
                 },
                 local_node_id,
-                settings_cipher: make_settings_cipher(key_seed),
                 hlc,
                 addon_reconciler: parking_lot::RwLock::new(None),
                 max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,
@@ -13301,7 +13299,6 @@ mod tests {
                         security: honest.runtime.signer.security.clone(),
                     },
                     local_node_id: author_id.clone(),
-                    settings_cipher: make_settings_cipher(90),
                     hlc: HlcClock::new(author_id.clone(), None),
                     addon_reconciler: parking_lot::RwLock::new(None),
                     max_inbox_defer_attempts: MAX_INBOX_DEFER_ATTEMPTS,

@@ -783,7 +783,7 @@ function renderList() {
     const empty = document.createElement('tf-empty-state');
     empty.setAttribute('icon', 'cpu');
     empty.setAttribute('title', 'Brak robotów w sieci mesh');
-    empty.setAttribute('message', 'Sparuj robota lub dołącz węzeł, który nim steruje — pojawi się tu po wykryciu przez mesh.');
+    empty.setAttribute('message', 'Sparuj robota lub dołącz node, który nim steruje — pojawi się tu po wykryciu przez mesh.');
     host.appendChild(empty);
     return;
   }

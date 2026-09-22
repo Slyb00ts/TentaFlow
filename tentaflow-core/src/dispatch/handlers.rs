@@ -1090,11 +1090,6 @@ pub async fn model_delete(
         (row.service_id, row.engine_id)
     };
 
-    let _account = crate::services::coding_agent::lock_account(service_id).await
-        .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, service_id)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
-
     // Stop the runtime BEFORE dropping the row — same contract as service_delete.
     // Without this the process/container is orphaned with no DB trace (the model
     // list's delete must clean up exactly like the service list's).
@@ -1102,11 +1097,7 @@ pub async fn model_delete(
         fetch_service_row(ctx, service_id),
         ctx.state.port_allocator.clone(),
     ) {
-        if let Err(error) = crate::services::deploy::stop(&svc, port_allocator).await {
-            if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
-                return Err(ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()));
-            }
-        }
+        let _ = crate::services::deploy::stop(&svc, port_allocator).await;
     }
 
     // Delete the row and read sibling ports under the SAME guard, in a sync block
@@ -4590,6 +4581,24 @@ pub async fn service_manifest_deploy(
             ))
         })?;
 
+    // A managed-CLI coding agent (codex/claude-code/grok-build/muse-code) is
+    // never a `services` row: it runs as an on-demand bridge tied to a
+    // provider account, not a long-lived deployment. Refuse it here, BEFORE
+    // resolving a `DeployMethod`, so the wizard can never create a services
+    // row for it even if `resolve_deploy_method`'s own refusal is bypassed.
+    if manifest.engine.category == crate::services::manifest::Category::Agents
+        && manifest
+            .deploy
+            .native
+            .as_ref()
+            .is_some_and(|native| native.runtime == crate::services::manifest::NativeRuntime::ManagedCli)
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "Silnik '{}' to zarządzany agent CLI — zainstaluj go z ekranu \"Konta agentów\", nie jako usługę",
+            payload.engine_id
+        )));
+    }
+
     let deploy_method = resolve_deploy_method(&manifest, &payload.deploy_method)
         .map_err(ProtocolError::bad_request)?;
 
@@ -4956,12 +4965,6 @@ pub async fn service_redeploy(
         ))
     };
 
-    let _account = crate::services::coding_agent::lock_account(payload.service_id)
-        .await
-        .map_err(ProtocolError::internal)?;
-    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
-
     // v1: redeploy local-only; cross-node forward TODO. Brak wiersza lokalnie =
     // "not_found" zamiast forwardu do innego noda.
     let row = {
@@ -5187,12 +5190,21 @@ fn resolve_deploy_method(
                 manifest.deploy.native.as_ref().ok_or_else(|| {
                     format!("engine '{}' has no [deploy.native]", manifest.engine.id)
                 })?;
-            Ok(match native.runtime {
-                NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
-                NativeRuntime::Binary => DeployMethod::NativeBinary,
-                NativeRuntime::PythonBundle => DeployMethod::NativePythonBundle,
-                NativeRuntime::ManagedCli => DeployMethod::NativeManagedCli,
-            })
+            match native.runtime {
+                NativeRuntime::Embedded => Ok(DeployMethod::NativeEmbedded),
+                NativeRuntime::Binary => Ok(DeployMethod::NativeBinary),
+                NativeRuntime::PythonBundle => Ok(DeployMethod::NativePythonBundle),
+                // A managed-CLI coding agent (codex/claude-code/grok-build/muse-code) is
+                // never deployed as a `services` row — the caller must have already
+                // refused it earlier (`service_manifest_deploy`), so reaching this arm
+                // means that guard was bypassed. Refuse here too rather than invent a
+                // `DeployMethod` variant for a path that no longer exists.
+                NativeRuntime::ManagedCli => Err(format!(
+                    "engine '{}' is a managed coding-agent CLI; install it from the \
+                     Konta agentów screen, not as a service",
+                    manifest.engine.id
+                )),
+            }
         }
         other => Err(format!(
             "unknown deploy method '{}': expected docker/native/external",
@@ -8152,7 +8164,7 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
     // what stops the same addon appearing twice (once live, once as an
     // "uninstalled" catalog package, which is how a real selection ended up
     // rendered as read-only).
-    let mut group_of = |instance_id: String, tools: Vec<CatalogTool>, installed: bool| {
+    let group_of = |instance_id: String, tools: Vec<CatalogTool>, installed: bool| {
         let m = meta.get(&instance_id);
         let package_id = m
             .map(|m| m.package_id.trim().to_string())
@@ -10559,10 +10571,6 @@ pub async fn service_delete(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
-    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
-        .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     // Czlonek AKTYWNEGO klastra TP: usuniecie workera/heada z listy serwisow
@@ -10591,12 +10599,6 @@ pub async fn service_delete(
         .await
         .err()
         .map(|e| e.to_string());
-
-    if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
-        if let Some(error) = &stop_err {
-            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, error.clone()));
-        }
-    }
 
     // Delete the row and, under the SAME guard, read the ports still owned by
     // sibling rows of this engine. Confined to a sync block so the DB guard is
@@ -10746,10 +10748,6 @@ pub async fn service_pause(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
-    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
-        .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     // When transitioning into paused, actively stop the runtime so the user's
     // intent ("frozen, do not consume resources") is enforced. Unpause does
@@ -10856,10 +10854,6 @@ pub async fn service_start(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
-    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
-        .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
@@ -11032,10 +11026,6 @@ pub async fn service_update(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
-    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
-        .map_err(|error| ProtocolError::internal(error))?;
-    crate::services::coding_agent::ensure_mutation_allowed(&ctx.state.db, payload.service_id)
-        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error))?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
 
@@ -11112,9 +11102,6 @@ pub async fn service_update(
         // Stop running runtime — terminate(pid) + release ports.
         if let Some(ports) = ctx.state.port_allocator.clone() {
             if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
-                if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
-                    return Err(ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()));
-                }
                 tracing::warn!(
                     service_id = payload.service_id,
                     "service_update: stop failed before respawn: {}",
@@ -11142,7 +11129,6 @@ pub async fn service_update(
             let cfg_json = new_config_json.clone();
             let preserved_port = svc.runtime_port;
             tokio::spawn(async move {
-                let _account = _account;
                 match crate::services::deploy::respawn(
                     &engine_id,
                     deploy_method,
@@ -11629,99 +11615,6 @@ pub async fn service_oauth_poll(
     poll_resp(status, account_label, error)
 }
 
-#[handler(variant = "ServiceAgentRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub async fn service_agent(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = match req {
-        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqAgent(p)) => p.clone(),
-        _ => {
-            return Err(ProtocolError::bad_request(
-                "expected ServicePayload::ReqAgent",
-            ))
-        }
-    };
-    let response = |result_json: String, error: Option<String>| {
-        Ok(MessageBody::ServiceBody(
-            tentaflow_protocol::ServicePayload::ResAgent(
-                tentaflow_protocol::ServiceAgentResponse {
-                    success: error.is_none(),
-                    result_json,
-                    error,
-                },
-            ),
-        ))
-    };
-    let is_admin = matches!(
-        &ctx.session,
-        SessionAuth::UserSession { role: Some(role), .. } if role == "admin"
-    );
-    if payload.operation == "session.create" {
-        let value: serde_json::Value = serde_json::from_str(&payload.payload_json).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-        if value.get("env").and_then(serde_json::Value::as_object).is_some_and(|env| !env.is_empty())
-            || value.get("args").and_then(serde_json::Value::as_array).is_some_and(|args| !args.is_empty()) {
-            return response(String::new(), Some("agent runtime wiring is reserved for Code Studio".into()));
-        }
-    }
-    // Driving or tearing down a login flow is an admin act: those sessions carry
-    // the operator's device code and vendor credentials.
-    let touches_auth_flow = matches!(
-        payload.operation.as_str(),
-        "session.input" | "session.close"
-    ) && serde_json::from_str::<serde_json::Value>(&payload.payload_json)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("session_id")
-                .and_then(|id| id.as_str())
-                .map(|id| id.starts_with("auth-"))
-        })
-        .unwrap_or(false);
-    if (payload.operation == "auth.start" || touches_auth_flow) && !is_admin {
-        return response(
-            String::new(),
-            Some("administrator_required_for_login".to_string()),
-        );
-    }
-    // The owner node runs this same handler for the forwarded request. It
-    // verifies a signed assertion of who is acting and takes that person's role
-    // from its own database, so the checks above hold there too and a peer
-    // cannot simply name the user it wants to act as.
-    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
-        let body_cbor = tentaflow_protocol::cbor::encode(req)
-            .map_err(|e| ProtocolError::internal(format!("request encode failed: {e}")))?;
-        return super::app_route::forward_to_node(ctx, target, body_cbor).await;
-    }
-    reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
-    let service = fetch_service_row(ctx, payload.service_id)?;
-    match crate::services::coding_agent::execute_public(
-        &ctx.state.db,
-        &service,
-        &uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),
-        &payload.operation,
-        &payload.payload_json,
-    )
-    .await
-    {
-        Ok(result_json) => {
-            if payload.operation == "models.list" {
-                if let Err(error) = crate::services::coding_agent::sync_models(
-                    &ctx.state.db,
-                    &service,
-                    &result_json,
-                ) {
-                    return response(String::new(), Some(error));
-                }
-            }
-            response(result_json, None)
-        }
-        Err(error) => response(String::new(), Some(error)),
-    }
-}
-
 #[handler(variant = "ServiceVramHintRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
@@ -12091,7 +11984,7 @@ mod mesh_node_list_visibility_tests {
                         },
                         None,
                     )
-                    .expect("zaufany węzeł w bazie");
+                    .expect("zaufany node w bazie");
                 }
                 repository::remove_trusted_node(&app.db, &revoked).expect("cofnięcie zaufania");
                 for node_id in [&revoked, &offline, &incoming] {
@@ -12123,7 +12016,7 @@ mod mesh_node_list_visibility_tests {
                 };
                 let response = mesh_node_list(&MessageBody::MeshNodeListRequest, &ctx)
                     .await
-                    .expect("lista węzłów");
+                    .expect("lista nodów");
                 let MessageBody::MeshNodeListResponseBody(response) = response else {
                     panic!("nieoczekiwany typ odpowiedzi");
                 };

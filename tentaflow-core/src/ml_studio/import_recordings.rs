@@ -473,8 +473,18 @@ fn parse_schema(schema_json: &str) -> HashMap<String, ClassAttrs> {
 }
 
 /// Trims a `snap_adr` result (`"33/1203 opis materiału"`) down to the bare
-/// `kemler/UN` code the dataset stores in the `kod` attribute.
-#[cfg(any(feature = "inference-vision-gpu", test))]
+/// `kemler/UN` code the dataset stores in the `kod` attribute. Only called by
+/// `AdrReader::read_code`, which itself exists solely on non-Apple platforms
+/// (the Apple ADR OCR stack is Apple Vision, wired separately) — mirror that
+/// gate here so an Apple `inference-vision-gpu` build does not carry a
+/// production-unreachable helper.
+#[cfg(any(
+    all(
+        feature = "inference-vision-gpu",
+        not(any(target_os = "macos", target_os = "ios"))
+    ),
+    test
+))]
 fn adr_code_only(snapped: &str) -> String {
     snapped
         .split_once(' ')
@@ -578,13 +588,13 @@ fn run_import(
         .filter(|s| !s.trim().is_empty())
     {
         Some(node) => {
-            update_progress(job_id, |p| p.phase = format!("pobieranie z węzła {node}"));
+            update_progress(job_id, |p| p.phase = format!("pobieranie z noda {node}"));
             let pulled = handle
                 .block_on(crate::mesh::recordings_pull::pull_remote(
                     node,
                     &spec.recording_refs,
                 ))
-                .with_context(|| format!("pobieranie nagrań z węzła {node}"))?;
+                .with_context(|| format!("pobieranie nagrań z noda {node}"))?;
             let mut map = HashMap::with_capacity(pulled.len());
             let mut temps = Vec::with_capacity(pulled.len());
             for (rec_ref, path, item) in pulled {
@@ -707,7 +717,7 @@ fn extract_recording(
         Some(map) => {
             let pulled = map
                 .get(recording_ref)
-                .ok_or_else(|| anyhow::anyhow!("węzeł nie udostępnił tego nagrania do pobrania"))?;
+                .ok_or_else(|| anyhow::anyhow!("node nie udostępnił tego nagrania do pobrania"))?;
             (pulled.path.clone(), pulled.kind.clone())
         }
         None => {

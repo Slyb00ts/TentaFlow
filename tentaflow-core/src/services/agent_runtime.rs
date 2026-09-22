@@ -541,7 +541,13 @@ fn free_loopback_port() -> Result<u16> {
 }
 
 /// Stops one account's bridge, if it is running here.
-pub async fn stop(account_id: &str) {
+///
+/// A purge depends on where this leaves the account: it removes the credential
+/// trees itself once the bridge is gone, and that removal is only sound when no
+/// writer the bridge started is left. What a bridge left behind is not visible
+/// from here, so "the bridge did not confirm it reaped its CLI children" is logged
+/// at the one place every caller passes through.
+async fn stop(account_id: &str) {
     let Some(mut running) = bridges().lock().await.remove(account_id) else {
         return;
     };
@@ -550,30 +556,63 @@ pub async fn stop(account_id: &str) {
     // deadline: the handler waits for the account's sessions to close, and a CLI
     // that will not leave its terminal would otherwise hold this call for as long
     // as the HTTP client allows.
-    match tokio::time::timeout(
+    let reaped = match tokio::time::timeout(
         SHUTDOWN_CONFIRM_TIMEOUT,
         running.handle.post("/runtime/shutdown", json!({})),
     )
     .await
     {
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => true,
         Ok(Err(error)) => {
-            tracing::warn!(%error, account_id, "the agent bridge refused to shut down")
+            tracing::warn!(%error, account_id, "the agent bridge refused to shut down");
+            false
         }
-        Err(_) => tracing::warn!(
-            account_id,
-            "the agent bridge did not confirm shutdown in time; killing it"
-        ),
-    }
+        Err(_) => {
+            tracing::warn!(
+                account_id,
+                "the agent bridge did not confirm shutdown in time; killing it"
+            );
+            false
+        }
+    };
     // Closing the parent pipe is what makes a live bridge leave: it runs the same
     // shutdown on the EOF and exits. Waiting with the pipe still open can only
     // ever run to its full length, because nothing else ends that process.
     drop(running.parent_pipe);
-    if tokio::time::timeout(SHUTDOWN_EXIT_TIMEOUT, running.child.wait())
-        .await
-        .is_err()
-    {
-        let _ = running.child.start_kill();
+    let exited = match tokio::time::timeout(SHUTDOWN_EXIT_TIMEOUT, running.child.wait()).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, account_id, "the agent bridge process could not be waited for");
+            false
+        }
+        Err(_) => {
+            let _ = running.child.start_kill();
+            // A kill is a signal, not a state. Without this wait `stop` returns
+            // while the process it was asked to end may still be running — and a
+            // purge that removed the files next would be racing a live writer.
+            match tokio::time::timeout(SHUTDOWN_EXIT_TIMEOUT, running.child.wait()).await {
+                Ok(Ok(_)) => false,
+                _ => {
+                    tracing::warn!(
+                        account_id,
+                        "the agent bridge survived a kill and may still be running"
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    if !reaped || !exited {
+        // Not a failure of whatever comes next, and not silent either: a CLI this
+        // bridge started may still be alive, and it is the one thing that could
+        // write the account's trees back after they are removed. Everything the
+        // node itself can see said the process was ended; this says the bridge did
+        // not confirm it. The node log is where an operator can tell the two apart,
+        // and the orphan is reaped at the bridge's next start.
+        tracing::warn!(
+            account_id,
+            "the agent bridge was stopped without confirming it reaped the account's CLI processes"
+        );
     }
 }
 
@@ -694,23 +733,58 @@ pub async fn ensure_account_materialized(
 /// Takes this node's copy of an account's credential out of service.
 ///
 /// Both halves matter and neither is enough on its own: the store row goes (that
-/// is the caller's `purge_local_credential`), and the bridge — the only writer of
-/// the canonical file — is told to drop the file and then stopped. A node that
-/// kept the file would hand a retired token to the next session; a node that
-/// kept the bridge would keep serving the sessions already on it.
+/// is the caller's `purge_local_credential`), and the files go from this node. A
+/// node that kept them would hand a retired token to the next session.
 ///
-/// A bridge that is not running is not started for this: with the store row gone
-/// there is nothing it could be given, and the file it holds cannot be
-/// materialized back.
+/// WHICH half does the files depends on whether the bridge is up. A running
+/// bridge is the only writer of the canonical file, so it is told to drop what
+/// it holds and then stopped. With no bridge there is nothing to tell and the
+/// files are removed from here instead — the bridge's own route cannot run in a
+/// process that is not there, and `IDLE_GRACE` releases a bridge long before an
+/// operator normally purges, so "no bridge" is the ordinary case and not an
+/// edge one.
+///
+/// The running bridge REFUSES the call while a sign-in is in flight (`400`
+/// `login_in_progress`, the same guard `PUT /account/credential` carries): the
+/// sign-in would write the file back the moment it finished, so the bridge will
+/// not promise a removal it cannot keep. That refusal is not an answer about this
+/// node's disk — it is the bridge saying it did nothing — and the account row is
+/// already gone by the time Core gets here, so a purge that stopped at it left a
+/// plaintext credential on the disk with nothing left in the store to name it.
+/// The files are therefore removed HERE once the bridge is out of the way, which
+/// is the same arm the no-bridge case uses. The bridge's own message is kept in
+/// the error rather than swallowed: when the disk refuses as well, the operator is
+/// told both why the bridge did not do it and which paths could not be removed.
+///
+/// WHAT THIS DOES NOT GUARANTEE, stated where the guarantee would otherwise be
+/// assumed: the removal below is only as final as the stop that precedes it. The
+/// node closes the bridge's parent pipe and waits for its process, and the bridge
+/// reaps the CLI children it tracked and refuses `/runtime/shutdown` while one of
+/// them is still running — so the ordinary case leaves no writer behind. What
+/// Core cannot see is a bridge that reports a shutdown it could not confirm (a
+/// session that will not close): the stop logs that, and the orphan it left is
+/// reaped at the bridge's next start, not here. The alternative on the table was
+/// to refuse the purge instead, which would have kept the plaintext credential on
+/// the disk in exchange for a guarantee this function cannot make either.
 pub async fn drop_account_credential(account_id: &str) -> Result<()> {
     let Some(bridge) = running_bridge(account_id).await else {
-        return Ok(());
+        return coding_agent::purge_account_credentials(account_id)
+            .map_err(|error| anyhow!("{error}"));
     };
     let dropped = bridge
         .call(reqwest::Method::DELETE, "/account/credential", None)
         .await;
     stop(account_id).await;
-    dropped.map(|_| ())
+    match dropped {
+        Ok(_) => Ok(()),
+        Err(error) => match coding_agent::purge_account_credentials(account_id) {
+            Ok(()) => Ok(()),
+            Err(files) => Err(anyhow!(
+                "the agent bridge refused to drop the credential ({error:#}); it could not be \
+                 removed from this node either: {files}"
+            )),
+        },
+    }
 }
 
 /// Reads the account's canonical credential back out of its bridge.
@@ -788,10 +862,15 @@ pub(crate) mod testing {
 
     /// Serves fixed JSON bodies by path prefix on loopback, closing every
     /// connection — which is all the client this crate uses needs.
+    ///
+    /// The status is per answer rather than fixed at 200 because a bridge says
+    /// no in the same currency it says yes: a route that is up and refuses (a
+    /// sign-in holding the credential, an unknown operation) answers 4xx with a
+    /// body, and `call_bridge` turns that into the only error the caller sees.
     pub(crate) async fn fake_bridge(
         account_id: &str,
         engine_id: &str,
-        answers: Vec<(&'static str, String)>,
+        answers: Vec<(&'static str, u16, String)>,
     ) -> BridgeHandle {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -815,13 +894,13 @@ pub(crate) mod testing {
                     }
                     let text = String::from_utf8_lossy(&request).to_string();
                     let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
-                    let body = answers
+                    let (status, body) = answers
                         .iter()
-                        .find(|(prefix, _)| path.starts_with(prefix))
-                        .map(|(_, body)| body.clone())
-                        .unwrap_or_else(|| "{}".to_string());
+                        .find(|(prefix, _, _)| path.starts_with(prefix))
+                        .map(|(_, status, body)| (*status, body.clone()))
+                        .unwrap_or((200, "{}".to_string()));
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
@@ -1033,6 +1112,7 @@ mod tests {
             "codex",
             vec![(
                 "/account/credential",
+                200,
                 serde_json::json!({
                     "present": true,
                     "engine": "codex",
@@ -1057,6 +1137,7 @@ mod tests {
             "codex",
             vec![(
                 "/account/credential",
+                200,
                 serde_json::json!({"present": false, "engine": "codex"}).to_string(),
             )],
         )
@@ -1065,5 +1146,274 @@ mod tests {
             .await
             .expect("read")
             .is_none());
+    }
+
+    /// An account's key store redirected to a tempdir for one test.
+    ///
+    /// `account_root` is addressed through `paths::keys_dir`, so the whole
+    /// filesystem half of a purge is only reachable by moving that root. The lock
+    /// is global for the same reason the redirect is.
+    struct KeysRoot {
+        _dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl KeysRoot {
+        fn redirect() -> Self {
+            let guard = crate::paths::lock_category_overrides();
+            let dir = tempfile::tempdir().expect("key store");
+            crate::paths::set_category_override(
+                crate::paths::StorageCategory::Keys,
+                Some(dir.path().to_string_lossy().into_owned()),
+            );
+            Self {
+                _dir: dir,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for KeysRoot {
+        fn drop(&mut self) {
+            crate::paths::set_category_override(crate::paths::StorageCategory::Keys, None);
+        }
+    }
+
+    /// Writes one file, creating its directory.
+    fn seed_file(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().expect("a file has a parent")).expect("create");
+        std::fs::write(path, b"{\"tokens\":{\"access_token\":\"secret\"}}").expect("write");
+    }
+
+    /// A purge removes the FILES, not just the row, and it does so with no bridge
+    /// running — which is the ordinary case rather than an edge one: `IDLE_GRACE`
+    /// releases a bridge fifteen minutes after its last turn, and a node restart
+    /// leaves none at all, so every purge an operator performs later than that has
+    /// no bridge to tell. Answering `ok` while the plaintext provider credential
+    /// stays on this node's disk is what this test exists to prevent.
+    #[tokio::test]
+    async fn a_purge_without_a_bridge_removes_the_accounts_credential_files() {
+        let _keys = KeysRoot::redirect();
+        let account = "9f1c2f6e-6f4a-4a1f-9f1d-2c3b4a5d6e7f";
+        let neighbour = "0b7a1c2d-3e4f-4a5b-8c9d-0e1f2a3b4c5d";
+        let root = coding_agent::account_root(account).expect("account root");
+        let neighbour_root = coding_agent::account_root(neighbour).expect("account root");
+        // Outside every account root, and inside the key store the roots are
+        // addressed through: a purge that walks up instead of down reaches it.
+        let outside = crate::paths::keys_dir().join("outside-the-accounts.json");
+        let survivor = neighbour_root.join("credentials/codex/auth.json");
+        for file in [
+            // The two trees the bridge holds for its own engine, and a second
+            // engine's file so the removal cannot be one hard-coded name.
+            root.join("credentials/codex/auth.json"),
+            root.join("login/codex/auth.json"),
+            root.join("credentials/config/muse/auth.json"),
+            survivor.clone(),
+            outside.clone(),
+        ] {
+            seed_file(&file);
+        }
+
+        assert!(
+            running_bridge(account).await.is_none(),
+            "no bridge is started in order to purge one"
+        );
+        drop_account_credential(account).await.expect("purge");
+
+        assert!(
+            !root.join("credentials").exists(),
+            "the canonical credential survived a purge with no bridge running"
+        );
+        assert!(
+            !root.join("login").exists(),
+            "the login home kept its plaintext copy of the purged credential"
+        );
+        assert!(
+            survivor.exists(),
+            "the purge reached the neighbouring account's credential"
+        );
+        assert!(outside.exists(), "the purge left the account root");
+
+        // A second purge is what a reconcile after a delete does, and it has
+        // nothing left to remove rather than an error.
+        drop_account_credential(account)
+            .await
+            .expect("a purge with nothing to remove");
+    }
+
+    /// A running bridge is the only writer of the canonical file, so it is the
+    /// one that removes it: Core stops after telling it, and a second writer
+    /// would race the atomic replacement the bridge's sessions read through.
+    ///
+    /// What this pins is the RESPONSIBILITY SPLIT, not the removal: the file
+    /// surviving here is the assertion, and it says Core left the delete to the
+    /// arm that owns it. That the bridge's route really empties both trees is
+    /// the other half, and it is measured end to end against a real bridge in
+    /// `tests/e2e/agent-accounts-code-studio.spec.js` (the purge with a running
+    /// bridge), where the files are read back from the filesystem.
+    #[tokio::test]
+    async fn a_purge_with_a_running_bridge_leaves_the_removal_to_it() {
+        let _keys = KeysRoot::redirect();
+        let account = "1d4e7a2b-8c5f-4d3e-9a1b-6f2c8e4d7a30";
+        let root = coding_agent::account_root(account).expect("account root");
+        let canonical = root.join("credentials/codex/auth.json");
+        seed_file(&canonical);
+
+        let bridge = testing::fake_bridge(
+            account,
+            "codex",
+            vec![(
+                "/account/credential",
+                200,
+                serde_json::json!({"removed": true}).to_string(),
+            )],
+        )
+        .await;
+        testing::register(account, bridge);
+
+        drop_account_credential(account).await.expect("purge");
+
+        assert!(
+            canonical.exists(),
+            "Core removed what a running bridge owns; the bridge is the writer"
+        );
+        testing::forget(account);
+    }
+
+    /// A bridge refuses this call while a sign-in is in flight — it would write
+    /// the file back the moment the sign-in finished — and that refusal is not an
+    /// answer about this node's disk.
+    ///
+    /// It is Core that owns the account root, and the account row is already gone
+    /// by the time the purge runs, so returning the refusal as the outcome left a
+    /// plaintext provider credential on the node with nothing left in the store
+    /// to name it: no reconcile reaches an account no row points at. The files
+    /// are removed HERE once the bridge is out of the way, which is why the test
+    /// asserts the RESULT and not the route.
+    #[tokio::test]
+    async fn a_bridge_that_refuses_the_removal_does_not_leave_the_credential() {
+        let _keys = KeysRoot::redirect();
+        let account = "7c1d4a8e-2b6f-4c9a-8e3d-5f7b1a2c6d48";
+        let root = coding_agent::account_root(account).expect("account root");
+        let canonical = root.join("credentials/codex/auth.json");
+        seed_file(&canonical);
+        seed_file(&root.join("login/codex/auth.json"));
+
+        let bridge = testing::fake_bridge(
+            account,
+            "codex",
+            vec![(
+                "/account/credential",
+                400,
+                serde_json::json!({"error": "login_in_progress: this account is signing in"})
+                    .to_string(),
+            )],
+        )
+        .await;
+        testing::register(account, bridge);
+
+        drop_account_credential(account)
+            .await
+            .expect("a refusal is the cue to remove the files from here, not an outcome");
+
+        assert!(
+            !canonical.exists(),
+            "the credential a signing-in bridge refused to drop is still on the node"
+        );
+        assert!(
+            !root.join("login").exists(),
+            "the login home kept the plaintext copy the bridge would have written back"
+        );
+        testing::forget(account);
+    }
+
+    /// When the disk refuses as well, the operator is told both why the bridge
+    /// did not do it and which path could not be removed.
+    ///
+    /// Swallowing the bridge's message here would have replaced one impossible
+    /// instruction ("remove it by hand") with another: the residual path is the
+    /// only thing that makes the warning actionable, and the refusal is the only
+    /// thing that explains why the ordinary route did not run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_removal_that_also_fails_names_the_bridge_and_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "the fixture needs an unlink the kernel refuses; root overrides the mode bits"
+        );
+        let _keys = KeysRoot::redirect();
+        let account = "5a9e3c7b-1d4f-4a8c-9b2e-6f3d8a1c5e70";
+        let root = coding_agent::account_root(account).expect("account root");
+        let canonical = root.join("credentials/codex/auth.json");
+        seed_file(&canonical);
+        seed_file(&root.join("login/codex/auth.json"));
+        let locked = canonical.parent().expect("an engine directory");
+        std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o500)).expect("mode");
+
+        let bridge = testing::fake_bridge(
+            account,
+            "codex",
+            vec![(
+                "/account/credential",
+                400,
+                serde_json::json!({"error": "login_in_progress: this account is signing in"})
+                    .to_string(),
+            )],
+        )
+        .await;
+        testing::register(account, bridge);
+
+        let error = drop_account_credential(account)
+            .await
+            .expect_err("neither arm could remove the canonical credential");
+
+        std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("login_in_progress"),
+            "the bridge's own refusal was swallowed: {message}"
+        );
+        assert!(
+            message.contains(&root.join("credentials").display().to_string()),
+            "the warning names no path, so nothing an operator can act on: {message}"
+        );
+        assert!(
+            !root.join("login").exists(),
+            "the second tree survived a failure in the first one, and it holds the same credential"
+        );
+        assert!(
+            canonical.exists(),
+            "the fixture did not actually refuse the removal"
+        );
+        testing::forget(account);
+    }
+
+    /// A link where a credential directory should be is removed as the link it
+    /// is: following it would turn a purge into a way to unlink somebody else's
+    /// files, chosen by whoever planted the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_purge_does_not_follow_a_link_out_of_the_account_root() {
+        let _keys = KeysRoot::redirect();
+        let account = "3b8f5c1d-9e2a-4f7b-8d4c-1a6e3b9f5c28";
+        let root = coding_agent::account_root(account).expect("account root");
+        std::fs::create_dir_all(&root).expect("account root");
+        let target = crate::paths::keys_dir().join("somewhere-else");
+        let pointed_at = target.join("auth.json");
+        seed_file(&pointed_at);
+        std::os::unix::fs::symlink(&target, root.join("credentials")).expect("link");
+
+        drop_account_credential(account).await.expect("purge");
+
+        assert!(
+            pointed_at.exists(),
+            "the purge followed a link out of the account root"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("credentials")).is_err(),
+            "the link itself is what had to go"
+        );
     }
 }

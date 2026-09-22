@@ -12,7 +12,6 @@ pub enum DeployMethod {
     NativeEmbedded,
     NativeBinary,
     NativePythonBundle,
-    NativeManagedCli,
     External,
 }
 
@@ -23,7 +22,6 @@ impl DeployMethod {
             DeployMethod::NativeEmbedded => "native_embedded",
             DeployMethod::NativeBinary => "native_binary",
             DeployMethod::NativePythonBundle => "native_python_bundle",
-            DeployMethod::NativeManagedCli => "native_managed_cli",
             DeployMethod::External => "external",
         }
     }
@@ -35,7 +33,6 @@ pub fn parse_deploy_method(tag: &str) -> Result<DeployMethod> {
         "native_embedded" => DeployMethod::NativeEmbedded,
         "native_binary" => DeployMethod::NativeBinary,
         "native_python_bundle" => DeployMethod::NativePythonBundle,
-        "native_managed_cli" => DeployMethod::NativeManagedCli,
         "external" => DeployMethod::External,
         other => return Err(anyhow!("unknown deploy_method tag: {}", other)),
     })

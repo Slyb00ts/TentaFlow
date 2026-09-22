@@ -41,7 +41,7 @@ const CAT_DESC = {
   data_dir: 'Główna baza platformy, paczki addonów, dokumenty prawne',
   cache_dir: 'Środowiska Python usług natywnych, cache vLLM, artefakty ML',
   containers_dir: 'Konteksty budowania obrazów Docker, definicje usług',
-  sync_dir: 'Dziennik operacji synchronizacji między węzłami (Fjall)',
+  sync_dir: 'Dziennik operacji synchronizacji między nodami (Fjall)',
   blobs_dir: 'Audio z flow, nagrania rozmów, migawki',
   recordings_dir: 'Nagrania kamer (migawki i segmenty)',
   addons_data_dir: 'Bazy addonów, indeksy wektorowe, grafy wiedzy, dokumenty',
@@ -87,7 +87,7 @@ export function renderStorageTab(overview) {
         <p class="form-hint" style="margin:0 0 16px;">
           Gdzie TentaFlow przechowuje poszczególne rodzaje danych. Zmiana katalogu może obejmować
           migrację istniejących danych — usługi zależne zostaną na chwilę wstrzymane i wznowione
-          automatycznie, bez restartu aplikacji. Ustawienia są per-węzeł (nie synchronizują się w meshu).
+          automatycznie, bez restartu aplikacji. Ustawienia są per-node (nie synchronizują się w meshu).
         </p>
 
         <div class="tf-disk-summary">

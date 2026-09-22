@@ -232,11 +232,11 @@ test('a claim on a plan the node already refused is never offered for acknowledg
 // dialog words that refusal itself, in the admin's language, from the code —
 // not from the node's Polish sentence — and says no array name.
 test('another organisation’s disk on this node is refused in the admin’s language and names no array', async () => {
-  const refusal = { code: 'journal_other_org', detail: 'sdc: dysk należy do macierzy Elastic innej organizacji na tym węźle — ta organizacja nie może go wyczyścić ani przejąć' };
+  const refusal = { code: 'journal_other_org', detail: 'sdc: dysk należy do macierzy Elastic innej organizacji na tym nodzie — ta organizacja nie może go wyczyścić ani przejąć' };
   const screen = fakeScreen({ tentaNasDiskWipePlanRequest: plan({ allowed: false, refusals: [refusal] }) });
   const win = await openDiskWipeDialog(screen, DISK, () => {});
   await flush();
-  assert.match(win.textContent, /sdc: dysk należy do macierzy Elastic innej organizacji na tym węźle\. Ta organizacja nie może go wyczyścić ani przejąć tej macierzy\./);
+  assert.match(win.textContent, /sdc: dysk należy do macierzy Elastic innej organizacji na tym nodzie\. Ta organizacja nie może go wyczyścić ani przejąć tej macierzy\./);
   assert.ok(!win.querySelector('#nas-wipe-ack'), 'nothing to acknowledge');
   typeInto(win.querySelector('#nas-retype'), 'sdc');
   assert.ok(!armed(win), 'refused, however carefully the name is typed');

@@ -420,7 +420,7 @@ pub async fn mesh_train_start_llm(run_id: &str, spec_json: &str) -> anyhow::Resu
     let blob_path = cache.join("dataset.bin");
     if !blob_path.is_file() {
         anyhow::bail!(
-            "dataset LLM nie zmaterializowany na tym węźle (hash {})",
+            "dataset LLM nie zmaterializowany na tym nodzie (hash {})",
             hash
         );
     }

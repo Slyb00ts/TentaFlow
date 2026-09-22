@@ -1963,7 +1963,7 @@ async fn start_session(
     // spent on it: a resume names an existing profile, a fresh session gets its
     // own. `None` is a caller-supplied environment, which brings its own.
     let profile_id = if req.env.is_empty() {
-        let sessions = state.sessions.lock().await;
+        let mut sessions = state.sessions.lock().await;
         let profile_id = match &req.resume_vendor_session_id {
             Some(resume) => sessions
                 .values()
@@ -1985,6 +1985,13 @@ async fn start_session(
             return Err(ApiError::bad_request(
                 "profile_in_use: this vendor session is already open",
             ));
+        }
+        // The claim goes on the reservation under the same lock as the check.
+        // A start takes seconds (workspace, sandbox, CLI spawn), and a sibling
+        // that resolved the same profile in that window would otherwise see a
+        // reservation with no profile and spawn a second CLI on it.
+        if let Some(reservation) = sessions.get_mut(&id) {
+            reservation.meta.profile_id = Some(profile_id.clone());
         }
         Some(profile_id)
     } else {
@@ -2571,20 +2578,30 @@ async fn write_account_credential(
     Ok(Json(json!({"applied": true, "sha256": sha256})))
 }
 
-/// Drops the account's canonical credential.
+/// Drops every copy of the account's credential the bridge holds.
 ///
 /// Core calls this when the credential was revoked — cleared by its owner, or
 /// covered by a revocation that reached this node through the account row. The
-/// bridge owns the file, so nothing else may unlink it, and a node that kept it
-/// would keep handing a retired token to the next session that starts.
+/// bridge owns these files, so nothing else may unlink them, and a node that
+/// kept one would keep handing a retired token to the next session that starts.
+///
+/// The login home goes with the canonical one, and that half is not optional:
+/// it is a copy the bridge itself made for a probe or a sign-in, so leaving it
+/// behind is what a removed credential would come back from — the next probe
+/// reads it, the CLI answers that the account is signed in, and the publication
+/// after it writes the retired material to the canonical path again.
+///
+/// Both trees go whole rather than one engine's file each, and both are
+/// attempted even when one of them refuses; `credentials::remove_account_credentials`
+/// states why, and the failure it returns names every tree it could not empty.
 ///
 /// A sign-in in flight wins here for the same reason it wins over the write: it
 /// is about to settle a credential onto this path, and removing the file
 /// underneath it would make the sign-in publish against a baseline that
 /// disappeared. A live session is NOT chased and cannot be: its engine holds the
-/// account's file open, and every instance on this node reads the same file —
-/// which is exactly why removing it here reaches all of them at once, as far as
-/// each engine re-reads its credential.
+/// account's file open, and every session on this node reads that one file, so
+/// removing it reaches all of them at once, as far as each engine re-reads its
+/// credential.
 async fn delete_account_credential(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let login = state.login_flow.lock().await;
     if login.is_some() {
@@ -2592,7 +2609,7 @@ async fn delete_account_credential(State(state): State<AppState>) -> Result<Json
             "login_in_progress: this account is signing in",
         ));
     }
-    let removed = credentials::remove(&credentials::root(&state.data_dir), state.provider)?;
+    let removed = credentials::remove_account_credentials(&state.data_dir)?;
     // Nothing is there any more, and the next file to appear is a new
     // credential: forgetting the announcement is what makes it one.
     *state.credential.lock().await = credentials::Watch::default();
@@ -2684,6 +2701,21 @@ async fn start_turn(
     }
     if req.prompt.len() > 1024 * 1024 {
         return Err(ApiError::bad_request("prompt exceeds 1 MiB"));
+    }
+    // The session start refused project settings that name a credential source,
+    // but the workspace stays writable by the CLI's own tool calls, and a CLI that
+    // reloads its project settings between turns would pick up whatever an
+    // earlier turn wrote there. So every turn repeats the check, outside the
+    // sessions lock because it reads files.
+    let workspace = state
+        .sessions
+        .lock()
+        .await
+        .get(&id)
+        .map(|session| session.meta.workspace.clone())
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
+    if let Err(error) = refuse_project_auth_settings(Path::new(&workspace)).await {
+        return Err(ApiError::bad_request(&format!("{error}")));
     }
     let mut sessions = state.sessions.lock().await;
     let session = sessions
@@ -4401,6 +4433,196 @@ mod tests {
         );
     }
 
+    /// The FIRST sign-in of an account is the case that materializes nothing:
+    /// the home starts empty and the CLI writes the credential the account is
+    /// about to have. Whatever a previous run left there must be gone before
+    /// that CLI starts — a copy of a credential that was removed would be read
+    /// back as a healthy sign-in — and the publication after it is what creates
+    /// the account's credential in the first place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_first_sign_in_publishes_what_its_cli_wrote() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let login = credentials::login_root(&state.data_dir);
+        // No credential on the account, and a copy of one in the home.
+        credentials::remove(&credentials::root(&state.data_dir), state.provider).unwrap();
+        credentials::write(&login, state.provider, FOREIGN).unwrap();
+
+        let home = lease_login_home(&state, credentials::LoginOrigin::SignIn)
+            .await
+            .unwrap();
+        assert_eq!(
+            credentials::read(&login, state.provider).unwrap(),
+            None,
+            "a sign-in must start from an empty home, not from a removed credential's copy"
+        );
+
+        // The vendor CLI writes the account's new credential into the home it
+        // was given, and the bridge extracts it onto the account's file.
+        let signed_in = br#"{"tokens":{"account_id":"first-login","refresh_token":"new"}}"#;
+        credentials::write(&login, state.provider, signed_in).unwrap();
+        settle_login_credential(&state, &home).await.unwrap();
+
+        assert_eq!(canonical_credential(&state), signed_in);
+        assert!(
+            state
+                .credential_events
+                .lock()
+                .await
+                .iter()
+                .any(|(kind, _)| kind == "credential_changed"),
+            "Core is told the account has a credential now"
+        );
+    }
+
+    /// The purge is BOTH halves. The canonical file is the one every session on
+    /// this node shares; the login home is the bridge's own copy of it, made for
+    /// a probe or a sign-in. A purge that removed only the first would leave a
+    /// plaintext provider credential on disk for good, with the next probe
+    /// reading it and publishing it back as the account's credential.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_purge_removes_the_login_home_with_the_accounts_credential() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let login = credentials::login_root(&state.data_dir);
+        // What a probe leaves behind: the account's credential in both places.
+        credentials::write(&login, state.provider, FIRST).unwrap();
+
+        let Json(removed) = delete_account_credential(State(state.clone()))
+            .await
+            .unwrap();
+        assert_eq!(removed["removed"], json!(true));
+        assert!(
+            !canonical_path(&state).exists(),
+            "the account's own file survived the purge"
+        );
+        assert_eq!(
+            credentials::read(&login, state.provider).unwrap(),
+            None,
+            "the bridge's copy of the purged credential survived it"
+        );
+        // Both trees go whole, exactly as Core's own arm removes them: the
+        // login home of an engine the account has moved away from is a copy of
+        // the SAME retired token, so a purge that named one path would leave it.
+        assert!(
+            !credentials::root(&state.data_dir).exists(),
+            "the canonical tree was left behind as a directory"
+        );
+        assert!(
+            !login.exists(),
+            "the login home was left behind as a directory"
+        );
+    }
+
+    /// A failure in ONE tree may not decide what the second one keeps.
+    ///
+    /// The two trees hold the same plaintext credential one directory apart, and
+    /// Core drops the store row in the same operation, so a purge that stopped at
+    /// the first error left a retired token on this disk with nothing left to name
+    /// the account it belonged to: no reconcile and no screen can ask for it
+    /// again. The fixture is a `0500` engine directory — unlinking an entry needs
+    /// write permission on its PARENT, so the walk still reads it and is refused
+    /// at `unlink` (EACCES, measured on this machine), which is the shape the
+    /// macOS `uchg` case has. A file held open by a running process is NOT that
+    /// shape: POSIX unlinks it and the data leaves with the last descriptor, and
+    /// the one held-open refusal that exists is a busy DIRECTORY's final `rmdir`
+    /// (macOS `EBUSY`). The leftover planted in the second tree is another
+    /// engine's file, which is what a named-path removal leaves behind even when
+    /// it succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_purge_still_empties_the_login_home() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "the fixture needs an unlink the kernel refuses; root overrides the mode bits"
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let login = credentials::login_root(&state.data_dir);
+        credentials::write(&login, Provider::GrokBuild, FOREIGN).unwrap();
+        let locked = canonical_path(&state).parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = delete_account_credential(State(state.clone()))
+            .await
+            .expect_err("the tree cannot be emptied");
+
+        // Restore before asserting, so a failure here leaves no directory the
+        // tempdir's own cleanup cannot remove.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(
+                &credentials::root(&state.data_dir).display().to_string()
+            ),
+            "the failure does not name the tree it came from: {message}"
+        );
+        assert!(
+            !login.exists(),
+            "the second tree survived a failure in the first one, and it holds the same credential"
+        );
+        assert!(
+            canonical_path(&state).exists(),
+            "the fixture did not actually refuse the removal, so it pinned nothing"
+        );
+    }
+
+    /// With BOTH trees refusing, every one of them is named.
+    ///
+    /// This is the property an early return hides, and it is the only shape that
+    /// pins it whichever tree a caller walks first: a `?` after the first failure
+    /// would name exactly one tree here, and the operator (who reads the paths in
+    /// Core's warning, and nothing else) would have no way to tell which of the
+    /// two trees the unremoved token is in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_purge_that_cannot_empty_either_tree_names_both() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "the fixture needs an unlink the kernel refuses; root overrides the mode bits"
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let login = credentials::login_root(&state.data_dir);
+        credentials::write(&login, state.provider, FOREIGN).unwrap();
+        let mut locked = vec![
+            credentials::root(&state.data_dir).join("codex"),
+            login.join("codex"),
+        ];
+        for directory in &locked {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+
+        let error = delete_account_credential(State(state.clone()))
+            .await
+            .expect_err("neither tree can be emptied");
+
+        for directory in locked.drain(..) {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let message = format!("{error:?}");
+        for tree in [
+            credentials::root(&state.data_dir),
+            credentials::login_root(&state.data_dir),
+        ] {
+            assert!(
+                message.contains(&tree.display().to_string()),
+                "the failure does not name {}: {message}",
+                tree.display()
+            );
+        }
+        assert!(
+            canonical_path(&state).exists() && login.join("codex/auth.json").exists(),
+            "the fixture did not refuse both removals, so it pinned nothing"
+        );
+    }
+
     /// Materialization from Core's side: Core hands over the account's stored
     /// credential, the bridge writes it as the account's own, and reading it back
     /// returns the same bytes with the identity the material names. Core is the
@@ -5187,6 +5409,114 @@ mod tests {
         assert!(
             refused.contains("profile_in_use"),
             "a second CLI was allowed onto one vendor profile: {refused}"
+        );
+    }
+
+    /// A turn repeats the start's settings check: the workspace is writable by
+    /// the session itself, so an earlier turn can plant a credential source that
+    /// was not there when the session started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_refuses_an_auth_source_planted_after_the_start() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let profile_id = uuid::Uuid::new_v4().to_string();
+        insert_open_session(&state, &profile_id).await;
+        std::fs::create_dir_all(state.data_dir.join(".claude")).unwrap();
+        std::fs::write(
+            state.data_dir.join(".claude/settings.local.json"),
+            r#"{"apiKeyHelper":"/bin/true"}"#,
+        )
+        .unwrap();
+        let refused = start_turn(
+            State(state.clone()),
+            AxumPath(profile_id),
+            Json(TurnRequest {
+                prompt: "hello".into(),
+            }),
+        )
+        .await
+        .map(|_| String::new())
+        .unwrap_or_else(|error| error.1);
+        assert!(
+            refused.contains("apiKeyHelper"),
+            "a turn ran under a planted credential source: {refused}"
+        );
+    }
+
+    /// The same rule while the first start is still in flight: a start spends
+    /// seconds between resolving the profile and publishing its session, and
+    /// two resumes of one closed conversation racing through that window must
+    /// not both reach a CLI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_in_flight_claims_its_vendor_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let profile_id = uuid::Uuid::new_v4().to_string();
+        prepare_session_profile(&state, &profile_id).unwrap();
+        insert_open_session(&state, &profile_id).await;
+        state
+            .sessions
+            .lock()
+            .await
+            .get_mut(&profile_id)
+            .unwrap()
+            .meta
+            .status = "closed".into();
+
+        let resume = |session_id: &str| -> CreateSession {
+            serde_json::from_value(json!({
+                "session_id": session_id,
+                "workspace_authorized": true,
+                "workspace": temporary.path(),
+                "resume_vendor_session_id": "vendor",
+            }))
+            .unwrap()
+        };
+        let first = uuid::Uuid::new_v4().to_string();
+        let events = Arc::new(SyncMutex::new(Vec::new()));
+        state.sessions.lock().await.insert(
+            first.clone(),
+            Session {
+                meta: SessionMeta {
+                    id: first.clone(),
+                    vendor_session_id: String::new(),
+                    workspace: temporary.path().to_string_lossy().into_owned(),
+                    status: "starting".into(),
+                    model: None,
+                    profile_id: None,
+                    login_completed: None,
+                    request_hash: Some("first".into()),
+                    created_at_ms: now_ms(),
+                },
+                runtime: None,
+                events: events.clone(),
+            },
+        );
+        // Whatever the fixture does past the claim, the reservation stays in the
+        // map exactly as a start that has not finished yet would leave it.
+        if let Ok((_, mut runtime)) =
+            start_session(&state, &resume(&first), &first, "first", events).await
+        {
+            terminate_runtime(&mut runtime).await;
+        }
+        assert_eq!(
+            state.sessions.lock().await[&first].meta.profile_id.as_deref(),
+            Some(profile_id.as_str()),
+            "the start did not claim its profile"
+        );
+
+        let refused = create_session(
+            State(state.clone()),
+            Json(resume(&uuid::Uuid::new_v4().to_string())),
+        )
+        .await
+        .map(|_| String::new())
+        .unwrap_or_else(|error| error.1);
+        assert!(
+            refused.contains("profile_in_use"),
+            "a second resume reached a CLI while the first was starting: {refused}"
         );
     }
 

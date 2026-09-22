@@ -2244,7 +2244,6 @@ async fn run_cluster_deploy_phases(
     );
     info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P2: wait head container build");
     if let Err(e) = poll_node_readiness(
-        ctx,
         &qm,
         &head_node_id,
         &local_id,
@@ -2292,7 +2291,6 @@ async fn run_cluster_deploy_phases(
         );
         info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P3: wait head Ray GCS");
         if let Err(e) = poll_node_readiness(
-            ctx,
             &qm,
             &head_node_id,
             &local_id,
@@ -2368,7 +2366,6 @@ async fn run_cluster_deploy_phases(
             return;
         }
         if let Err(e) = poll_node_readiness(
-            ctx,
             &qm,
             &node_id,
             &local_id,
@@ -2410,7 +2407,6 @@ async fn run_cluster_deploy_phases(
             "P4: klaster Ray gotowy",
         );
         if let Err(e) = poll_node_readiness(
-            ctx,
             &qm,
             &head_node_id,
             &local_id,
@@ -2485,7 +2481,6 @@ async fn run_cluster_deploy_phases(
         }
     };
     if let Err(e) = start_serve_on_head(
-        ctx,
         &qm,
         &head_node_id,
         &local_id,
@@ -2523,7 +2518,6 @@ async fn run_cluster_deploy_phases(
     );
     info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P6: wait serve ready (/v1/models)");
     if let Err(e) = poll_node_readiness(
-        ctx,
         &qm,
         &head_node_id,
         &local_id,
@@ -2709,7 +2703,6 @@ enum ReadyPhase {
 /// from the spec it was deployed with, `serve_cmd` is used only locally). Detached — vLLM laduje model w tle, a
 /// gotowosc potwierdza pozniejszy `ServeReady`.
 async fn start_serve_on_head(
-    ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
     head_node_id: &str,
     local_id: &str,
@@ -2743,7 +2736,6 @@ async fn start_serve_on_head(
 /// `ServeReady` tylko dla head-a.
 #[allow(clippy::too_many_arguments)]
 async fn poll_node_readiness(
-    ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
     target_node: &str,
     local_id: &str,
@@ -2758,7 +2750,6 @@ async fn poll_node_readiness(
     let mut last = String::from("brak odpowiedzi");
     while start.elapsed() < timeout {
         let (container_running, gcs_up, ray_nodes, serve_ready, engine_error) = probe_node_once(
-            ctx,
             qm,
             target_node,
             local_id,
@@ -2799,7 +2790,6 @@ async fn poll_node_readiness(
 /// Transient blad mesh → traktowany jak "jeszcze niegotowy" (polling kontynuuje).
 #[allow(clippy::too_many_arguments)]
 async fn probe_node_once(
-    ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
     target_node: &str,
     local_id: &str,

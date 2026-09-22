@@ -558,7 +558,7 @@ impl ReplicationManager {
     /// own startup is behind". The environment gate deliberately stays
     /// BEFORE that wait: a peer from another environment gets no DB reads
     /// and no hold at all (PLAN §4.4 Z12).
-    pub async fn accept_stream(&self, _remote_hex: String, mut recv: BusRecv, mut send: BusSend) {
+    pub async fn accept_stream(&self, _remote_hex: String, mut recv: BusRecv, send: BusSend) {
         let first = frames::read_frame(&mut recv).await;
         match first {
             Ok(ReplFrame::Hello(hello)) => {
@@ -659,7 +659,7 @@ impl ReplicationManager {
     pub(crate) async fn accept_hello(
         &self,
         hello: ReplHello,
-        mut recv: BusRecv,
+        recv: BusRecv,
         mut send: BusSend,
     ) {
         if hello.instance_id != self.instance_id {

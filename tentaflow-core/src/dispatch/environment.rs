@@ -836,7 +836,7 @@ mod tests {
             // in the test binary (`resolver.rs`, `dispatch/mod.rs`).
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                match crate::sync::runtime::init(db.clone(), security.clone(), cipher.clone()) {
+                match crate::sync::runtime::init(db.clone(), security.clone()) {
                     Ok(_) => break,
                     Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
                         if std::time::Instant::now() < deadline =>

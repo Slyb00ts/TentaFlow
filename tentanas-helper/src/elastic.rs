@@ -8952,7 +8952,7 @@ pub(crate) mod execution {
         let private = journal.private.as_ref().ok_or("wymiana dysku wymaga prywatnej topologii")?;
         // The union must not be serving in this boot (see the note above).
         if private.anchor.is_some() {
-            return Err("macierz publikuje unię w tym uruchomieniu; zrestartuj węzeł przed wymianą dysku".into());
+            return Err("macierz publikuje unię w tym uruchomieniu; zrestartuj node przed wymianą dysku".into());
         }
         if journal.spec.parity.is_empty() {
             return Err("macierz bez parity nie ma z czego odbudować dysku".into());
@@ -13489,7 +13489,7 @@ Nothing to do
             let mut serving = journal.clone();
             serving.private = Some(PrivateTopology { anchor: Some(anchor_fixture()), published: true, service: None });
             let error = replaceable_slot(&serving, &replace_request("d1", &fresh, false)).expect_err("serving");
-            assert!(error.contains("zrestartuj węzeł"), "{error}");
+            assert!(error.contains("zrestartuj node"), "{error}");
 
             // No parity, or no confirmed first sync: nothing to rebuild from.
             let mut bare = journal.clone();

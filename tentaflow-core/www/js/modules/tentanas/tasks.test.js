@@ -130,7 +130,7 @@ test('a viewer sees the toggles disabled and no run/edit actions', async () => {
 // id); the "node" column of the job history must fall back to the Polish
 // "Węzeł bez nazwy" label — through `nodeLabel` — and keep the id available
 // only as a `title=` tooltip, never as visible text.
-test('the job history node column falls back to "Węzeł bez nazwy" for an unnamed node, with the id in a tooltip', async () => {
+test('the job history node column falls back to "Node bez nazwy" for an unnamed node, with the id in a tooltip', async () => {
   const screen = fakeScreen(fixtures());
   screen.currentNode = () => ({ nodeId: 'node-64hex-abcdef', nodeName: '', isLocal: true });
   const body = mount();
@@ -141,7 +141,7 @@ test('the job history node column falls back to "Węzeł bez nazwy" for an unnam
   const wrap = document.createElement('div');
   wrap.innerHTML = history.rows[0].node;
   assert.doesNotMatch(wrap.textContent, /node-64hex-abcdef/, 'the id is not visible text');
-  assert.match(wrap.textContent, /Węzeł bez nazwy/);
+  assert.match(wrap.textContent, /Node bez nazwy/);
   assert.equal(wrap.querySelector('span').getAttribute('title'), 'node-64hex-abcdef');
   screen.dispose();
 });

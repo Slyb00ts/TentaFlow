@@ -1833,7 +1833,7 @@ impl IrohMeshManager {
         read_reply_stall(&mut recv, &mut len_buf, unzip_budget).await?;
         let n = u32::from_be_bytes(len_buf) as usize;
         if n == 0 {
-            anyhow::bail!("węzeł docelowy nie zapisał artefaktu");
+            anyhow::bail!("node docelowy nie zapisał artefaktu");
         }
         let mut pbuf = vec![0u8; n];
         read_reply_stall(&mut recv, &mut pbuf, stall).await?;

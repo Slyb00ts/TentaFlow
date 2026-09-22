@@ -257,8 +257,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
             .into_iter()
             .filter(|ip| ip.is_ipv4())
             .collect();
-        let (docker_available, docker_version) =
-            tentaflow_core::mesh::node_info_collector::collect_docker_info();
+        let docker_version = tentaflow_core::mesh::node_info_collector::docker_server_version();
         let local_heartbeat = tentaflow_core::mesh::peer_store::HeartbeatMetrics {
             cpu_usage_percent: local_metrics.cpu_usage_percent,
             ram_used_mb: local_metrics.ram_used_mb,
@@ -290,7 +289,6 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
             local_node_info.ram_total_mb,
             local_node_info.gpu_info,
             local_addresses,
-            docker_available,
             docker_version,
         );
         mesh_peer_store.update_metrics(&node_id, &local_heartbeat);

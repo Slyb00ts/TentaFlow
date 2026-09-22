@@ -1045,6 +1045,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "provider_account_home_lost",
             MigrationStep::Sql(PROVIDER_ACCOUNT_HOME_LOST),
         ),
+        (
+            165,
+            "drop_coding_agent_account_grants",
+            MigrationStep::Sql(DROP_CODING_AGENT_ACCOUNT_GRANTS),
+        ),
+        (
+            166,
+            "drop_coding_agent_legacy_service_path",
+            MigrationStep::Sql(DROP_CODING_AGENT_LEGACY_SERVICE_PATH),
+        ),
     ]
 }
 
@@ -1325,12 +1335,15 @@ DROP TABLE IF EXISTS coding_agent_account_moves;
 // a home, so a re-homed account stops reading as lost. Nothing ever sets it at
 // creation.
 //
-// `update_account` can also write a `home_node_id` and does NOT clear the marker
-// — deliberately, and it cannot break the invariant: a marker only exists while
-// the home is NULL, and the one production caller that writes a home this way
-// (`login.rs::adopt_credential`) runs after `mint_credential`, which claims the
-// home itself whenever the home is NULL. By the time that write happens the
-// marker is already gone.
+// `update_account` can also write a `home_node_id`, and it clears the marker in
+// the same statement when it does (`CASE WHEN ?5 IS NOT NULL THEN NULL`), so the
+// invariant belongs to the store rather than to the order its callers happen to
+// follow. Only one production caller names a home — the sign-in path
+// (`provider_accounts/login.rs::adopt_credential`), which reaches this after
+// `mint_credential` already claimed it; the wire edit handler hard-codes
+// `home_node_id: None` (`dispatch/provider_account.rs`), in the account update
+// it builds. An edit that names NO home leaves the record alone: it is the
+// account's history and a rename or a new session limit must not erase it.
 //
 // WHICH node was the home, never its name: the node is gone from the registry,
 // so no node can resolve a display name for it, and a name column would be NULL
@@ -1340,6 +1353,55 @@ const PROVIDER_ACCOUNT_HOME_LOST: &str = r#"
 ALTER TABLE provider_accounts
     ADD COLUMN home_lost_node_id TEXT NULL;
 "#;
+
+// v165 — the per-service grant table retires.
+//
+// v160 copied every row into `provider_account_grants`, and since then the
+// account screen has written only there, so the two tables drifted apart: a
+// grant revoked on the screen stayed live here, and a grant given on the screen
+// never reached here. `coding_agent::account_permission` now asks the account
+// registry, which leaves nothing that reads this table. Keeping it would only
+// keep a second answer to "who may use this account" on disk.
+//
+// Rungs that create and adopt it stay as they are (the ladder is append-only);
+// `child_remaps` keeps its entries because the remap skips a table that does
+// not exist.
+const DROP_CODING_AGENT_ACCOUNT_GRANTS: &str = "
+DROP TABLE IF EXISTS coding_agent_account_grants;
+";
+
+// v166 — the old "agent account = services row" path is gone; the node-local
+// session table and the services rows it bound retire with it.
+//
+// `coding_agent_session_owners` bound an open agent session to a service row
+// so `execute_authorized` could ask "does this user own the session on this
+// service". Nothing calls it any more: a session lives in
+// `provider_account_sessions` (v160 already adopted every row this table
+// held; v161 replaced the binding this table never actually enforced), so
+// keeping it would only keep a second, stale answer to the same question.
+//
+// A `services` row with `deploy_method = 'native_managed_cli'` WAS the agent
+// itself — `codex`/`claude-code`/`grok-build`/`muse-code` deployed as a
+// service and driven over `Transport::AgentRpc`. The new model never writes
+// one: every coding agent runs through a provider account and an on-demand
+// bridge instead. A surviving row is either something v160 already adopted
+// into `provider_accounts` (its credential and sessions are safe there) or a
+// row that predates the account model and adopted nothing either way. Either
+// way nothing may read it past this rung: `DeployMethod::NativeManagedCli`
+// and `Transport::AgentRpc` lose their variants in the same change that adds
+// this rung, so an undeleted row would fail to deserialize instead of
+// running — this DELETE is what keeps that removal safe.
+//
+// `model_registry` and `service_aliases` cascade on `service_id`, so their
+// rows for a deleted service go with it. `deployments` carries no FK to
+// `services` — `deploy_id` has always been its own key, never a foreign one —
+// so its rows for a removed deploy stay as dead history, exactly the way a
+// normal redeploy or service delete has always left them.
+const DROP_CODING_AGENT_LEGACY_SERVICE_PATH: &str = "
+DROP INDEX IF EXISTS coding_agent_sessions_user;
+DROP TABLE IF EXISTS coding_agent_session_owners;
+DELETE FROM services WHERE deploy_method = 'native_managed_cli';
+";
 
 // v160 — the accounts this node already runs, adopted into the replicated
 // registry.
@@ -12598,8 +12660,14 @@ mod tests {
         .unwrap();
 
         // The rung runs where it really runs — through the ladder — rather than
-        // by calling the SQL the test happens to have in hand.
-        run(&conn).unwrap();
+        // by calling the SQL the test happens to have in hand. The ladder stops
+        // before v165, which retires the grant table this rung reads; the end
+        // of the test takes it to the head.
+        for (rung, name, step) in get_migrations() {
+            if (160..=164).contains(&rung) {
+                apply_migration(&conn, rung, name, &step).unwrap();
+            }
+        }
         assert_eq!(
             conn.query_row(
                 "SELECT name FROM _migrations WHERE version = 160",
@@ -12758,6 +12826,100 @@ mod tests {
             .unwrap(),
             "active/renamed",
             "a replayed rung leaves an adopted account exactly as it found it"
+        );
+
+        // v165 retires the per-service grant table; the grant it held lives on
+        // in the registry, which is the only thing asked from now on.
+        run(&conn).unwrap();
+        assert!(!table_exists(&conn, "coding_agent_account_grants").unwrap());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM provider_account_grants", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    /// v166 removes the entire old "agent account = services row" path: the
+    /// service row an agent deployed as, and the node-local session table that
+    /// bound a session to it. The fixture also carries a `model_registry` row
+    /// and an unrelated `ollama` service, so the test proves the cascade
+    /// clears exactly the legacy row's children and leaves everything else.
+    #[test]
+    fn migration_v166_drops_the_legacy_agent_service_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 165);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute(
+            "INSERT INTO user_accounts (id, username, password_hash, role, is_active) \
+             VALUES ('admin-1', 'root', 'x', 'org_admin', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services \
+               (engine_id, category, display_name, deploy_method, transport, config_json) \
+             VALUES ('codex', 'agent', 'Codex legacy', 'native_managed_cli', 'agent_rpc', '{}')",
+            [],
+        )
+        .unwrap();
+        let legacy_service_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO model_registry (service_id, model_name) VALUES (?1, 'codex-default')",
+            rusqlite::params![legacy_service_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO coding_agent_session_owners (service_id, session_id, user_id) \
+             VALUES (?1, 'sess-1', 'admin-1')",
+            rusqlite::params![legacy_service_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services \
+               (engine_id, category, display_name, deploy_method, transport, config_json) \
+             VALUES ('ollama', 'llm', 'Ollama', 'docker', 'http_direct', '{}')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        assert!(
+            !table_exists(&conn, "coding_agent_session_owners").unwrap(),
+            "the node-local session table must be gone"
+        );
+        assert!(
+            !index_exists(&conn, "coding_agent_sessions_user"),
+            "its index must be gone with it"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM services WHERE deploy_method = 'native_managed_cli'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "every legacy agent-deployed-as-a-service row must be gone"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_registry WHERE service_id = ?1",
+                rusqlite::params![legacy_service_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "model_registry cascades on service_id"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM services WHERE engine_id = 'ollama'", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a service that never was a coding agent must survive"
         );
     }
 

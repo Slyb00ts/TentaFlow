@@ -1566,7 +1566,26 @@ fn apply_peer_node_row(
                 "DELETE FROM sync_nodes WHERE node_id = ?1",
                 rusqlite::params![operation.body.resource_id],
             )
-            .map_err(sql_error),
+            .map_err(sql_error)
+            .and_then(|removed| {
+                // The same cleanup the LOCAL removal runs
+                // (`db::repository::delete_sync_node`), in the same transaction
+                // and for the same reason: `agent_runtime_nodes` and the accounts
+                // homed on this node have no FK to `sync_nodes` (migration 156),
+                // so a bare DELETE leaves a row in the fleet view and — worse —
+                // leaves `home_node_id` pointing at a node that is gone from the
+                // registry, with no lost-home state on the account card. The
+                // invariant has to hold no matter WHICH node applied the removal,
+                // so this is the store's own call rather than a second copy of it.
+                if removed > 0 {
+                    crate::provider_accounts::repository::forget_node_tx(
+                        tx,
+                        operation.body.resource_id.as_str(),
+                    )
+                    .map_err(|error| SyncLedgerError::Runtime(format!("{error:#}")))?;
+                }
+                Ok(removed)
+            }),
     }
 }
 
@@ -7109,6 +7128,79 @@ mod tests {
         without.body.changed_fields.remove("home_lost_node_id");
         assert_eq!(apply_provider_account(&tx, &without).unwrap(), 1);
         assert_eq!(stored(&tx).1, None);
+    }
+
+    /// The LEDGER path that removes a peer's registry row has to clean up what
+    /// the local removal cleans up. `sync_nodes` has no FK from
+    /// `agent_runtime_nodes` or `provider_accounts` (migration 156), so a bare
+    /// DELETE left an account whose `home_node_id` named a node that is gone
+    /// from the registry — the card then rendered a home nobody could resolve
+    /// and, because the lost-home marker is what the card words it from, no
+    /// record that a home had been there at all. Which node applied the removal
+    /// is not part of the state, so this is the store's own call and not a
+    /// second implementation of it.
+    ///
+    /// Removing the REGISTRY row is not removing the secret: the credential the
+    /// account still holds stays where it is, and this test pins that too.
+    #[test]
+    fn a_deleted_peer_registry_row_clears_its_homes_like_the_local_removal() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-op", true);
+        seed_node(&tx, "node-gone", false);
+        tx.execute(
+            "INSERT INTO provider_accounts (account_id, org_id, engine_id, display_name, scope, \
+             credential_kind, home_node_id, status, created_by) \
+             VALUES ('acc-1', 'default', 'codex', 'Shared codex', 'global', 'api_key', \
+                     'node-gone', 'active', 'admin')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO provider_account_credentials (account_id, revision, material_enc, \
+             material_sha256, refreshed_at, refreshed_by_node) \
+             VALUES ('acc-1', 1, 'sealed', 'sha', '2026-09-18T00:00:00Z', 'node-gone')",
+            [],
+        )
+        .unwrap();
+
+        let delete = node_operation(
+            "node-gone",
+            "node-op",
+            ActionType::Delete,
+            field_map(&[]),
+        );
+        assert_eq!(apply_sync_node(&tx, &delete).unwrap(), 1);
+        assert!(!node_exists(&tx, "node-gone"));
+
+        let (home, lost): (Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT home_node_id, home_lost_node_id FROM provider_accounts WHERE account_id = 'acc-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            home, None,
+            "the account still names a home the registry no longer has"
+        );
+        assert_eq!(
+            lost.as_deref(),
+            Some("node-gone"),
+            "the loss of the home was not recorded, so nothing can word it"
+        );
+        let material: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM provider_account_credentials WHERE account_id = 'acc-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            material, 1,
+            "the registry row was removed, not the credential the account still holds"
+        );
     }
 
     /// An engine row is what ONE node measured on its own filesystem. A peer

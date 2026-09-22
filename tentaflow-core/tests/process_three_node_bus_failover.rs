@@ -1293,8 +1293,7 @@ async fn child_main() {
         .expect("set node environment");
 
     let _runtime =
-        tentaflow_core::sync::runtime::init(db.clone(), security.clone(), cipher.clone())
-            .expect("runtime");
+        tentaflow_core::sync::runtime::init(db.clone(), security.clone()).expect("runtime");
     let local_node_id = security.ed25519_public_key_hex();
 
     let mesh = IrohMeshManager::new(

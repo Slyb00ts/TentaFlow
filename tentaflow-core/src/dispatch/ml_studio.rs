@@ -2357,7 +2357,7 @@ pub async fn ml_studio_ft_train_start(
                     .ok_or_else(|| {
                         let _ = repository::update_training_run_status(&run_id, "failed");
                         ProtocolError::bad_request(format!(
-                            "multi-rig: brak adresu LAN węzła {} w rejestrze mesh",
+                            "multi-rig: brak adresu LAN noda {} w rejestrze mesh",
                             target
                         ))
                     })?;
@@ -2664,7 +2664,7 @@ pub async fn ml_studio_ft_train_status(
                 {
                     let _ = repository::set_training_run_error(
                         &payload.run_id,
-                        "węzeł treningowy nieosiągalny — trening przerwany",
+                        "node treningowy nieosiągalny — trening przerwany",
                     );
                     let _ = repository::update_training_run_status(&payload.run_id, "failed");
                     if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
@@ -2912,7 +2912,7 @@ pub async fn ml_studio_recog_train_start(
             if dataset.kind != "coco_path" {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request(
-                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
+                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na nodzie B",
                 ));
             }
             let raw =
@@ -3137,7 +3137,7 @@ pub async fn ml_studio_recog_train_status(
                 {
                     let _ = repository::set_training_run_error(
                         &payload.run_id,
-                        "węzeł treningowy nieosiągalny — trening przerwany",
+                        "node treningowy nieosiągalny — trening przerwany",
                     );
                     let _ = repository::update_training_run_status(&payload.run_id, "failed");
                     if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
@@ -3324,7 +3324,7 @@ pub async fn ml_studio_classifier_train_start(
             if dataset.kind != "coco_path" {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request(
-                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
+                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na nodzie B",
                 ));
             }
             let raw =
@@ -3555,7 +3555,7 @@ pub async fn ml_studio_ocr_train_start(
             if dataset.kind != "coco_path" {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request(
-                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
+                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na nodzie B",
                 ));
             }
             let raw =
@@ -3672,7 +3672,7 @@ pub async fn ml_studio_train_cancel(
                     // Węzeł B nieosiągalny: flaga na A domknie run przy najbliższym
                     // obiegu, więc logujemy i idziemy dalej zamiast zwracać błąd.
                     tracing::warn!(run_id = %payload.run_id, node = %node, error = %e,
-                        "mesh train cancel nie dotarł do węzła treningowego");
+                        "mesh train cancel nie dotarł do noda treningowego");
                 }
             }
         }
@@ -3811,7 +3811,7 @@ pub async fn ml_studio_generic_train_status(
                 {
                     let _ = repository::set_training_run_error(
                         &payload.run_id,
-                        "węzeł treningowy nieosiągalny — trening przerwany",
+                        "node treningowy nieosiągalny — trening przerwany",
                     );
                     let _ = repository::update_training_run_status(&payload.run_id, "failed");
                     if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
@@ -4743,11 +4743,11 @@ pub async fn ml_studio_ft_deploy(
         } else {
             if !is_mlx {
                 return Err(ProtocolError::bad_request(
-                    "transfer artefaktu między węzłami wspierany tylko dla modeli MLX (katalog)",
+                    "transfer artefaktu między nodami wspierany tylko dla modeli MLX (katalog)",
                 ));
             }
             let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
-                ProtocolError::internal("mesh transport niedostępny na tym węźle")
+                ProtocolError::internal("mesh transport niedostępny na tym nodzie")
             })?;
             let cmd = tentaflow_protocol::mesh::MeshCommandType::MlArtifactPushTo {
                 src_path: gguf_path.clone(),
@@ -4850,14 +4850,14 @@ pub async fn ml_studio_ft_deploy(
     // na „Zapytaj", po błędzie cofa do „Wdróż".
     if !is_mlx && artifact_node != local_node {
         return Err(ProtocolError::bad_request(
-            "transfer artefaktu między węzłami wspierany tylko dla modeli MLX (katalog)",
+            "transfer artefaktu między nodami wspierany tylko dla modeli MLX (katalog)",
         ));
     }
     let iroh = ctx
         .state
         .quic_mesh
         .clone()
-        .ok_or_else(|| ProtocolError::internal("mesh transport niedostępny na tym węźle"))?;
+        .ok_or_else(|| ProtocolError::internal("mesh transport niedostępny na tym nodzie"))?;
 
     // Optymistyczny zapis stanu — model NATYCHMIAST pokazuje się jako wdrażany pod
     // tą nazwą (UI flip na „Zapytaj"); węzeł inferencji = węzeł docelowy. Ten stan
@@ -5085,7 +5085,7 @@ async fn run_remote_deploy(
             let msg = resp
                 .error
                 .unwrap_or_else(|| "zdalny deploy zgłosił błąd".into());
-            tracing::warn!(model_id = %model_id, err = %msg, "remote deploy: węzeł docelowy zgłosił błąd");
+            tracing::warn!(model_id = %model_id, err = %msg, "remote deploy: node docelowy zgłosił błąd");
             set_inference_status(&model_id, "failed", Some(&msg));
         }
         Err(e) => {
@@ -5519,7 +5519,7 @@ pub async fn ml_studio_vision_model_publish(
         return respond(
             false,
             Some(format!(
-                "artefakty modelu żyją na węźle '{node}' — uruchom publikację na tym węźle"
+                "artefakty modelu żyją na nodzie '{node}' — uruchom publikację na tym nodzie"
             )),
         );
     }
@@ -5539,7 +5539,7 @@ pub async fn ml_studio_vision_model_publish(
                 false,
                 Some(
                     "czytnik ADR nie jest dostępny na macOS/iOS (OCR idzie przez apple_ocr) \
-                     — opublikuj go na węźle z tą ścieżką wizji"
+                     — opublikuj go na nodzie z tą ścieżką wizji"
                         .to_string(),
                 ),
             );
@@ -6546,7 +6546,7 @@ pub async fn ml_studio_recordings_list(
                 .await
                 .map_err(|e| {
                     ProtocolError::internal(format!(
-                        "nie udało się pobrać listy nagrań z węzła {node}: {e:#}"
+                        "nie udało się pobrać listy nagrań z noda {node}: {e:#}"
                     ))
                 })?
                 .into_iter()

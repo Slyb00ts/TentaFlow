@@ -1116,9 +1116,6 @@ impl NodeAdapter for DelegateCliNodeAdapter {
             ctx.actor(),
         )
         .with_correlation_id(ctx.correlation_id.clone());
-        let account = account_with_login_ask(&call_ctx, &bound, &main_db, &agent, &principal).await?;
-        let target = DelegationTarget::of(&agent)?;
-
         // Step 3 — §17.3: under `local_only` the sandbox has no route, so a
         // vendor CLI is not "degraded", it is absent. Checked BEFORE the account
         // is asked for: a workspace that cannot reach a provider must not park a
@@ -1131,6 +1128,9 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                 bound.workspace.name
             ));
         }
+
+        let account = account_with_login_ask(&call_ctx, &bound, &main_db, &agent, &principal).await?;
+        let target = DelegationTarget::of(&agent)?;
 
         let bridge = resolve_bridge(&main_db, &account, &user_id).await?;
         let worktree = tools::session_worktree(&bound.workspace.id, &bound.session.id)?;
@@ -1374,7 +1374,6 @@ async fn account_with_login_ask(
                 // The account the binding names, when it names one that exists —
                 // the difference between "connect one" and "sign in again".
                 account_name: label.account_name.clone(),
-                candidate_accounts: agent_account::candidate_accounts(main_db, principal, &engine_id),
                 user_id: call_ctx.user_id.to_string(),
                 engine_id,
             };
@@ -4413,5 +4412,99 @@ mod tests {
 
         workspace_db::close("wsturnlock");
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// A delegated CLI turn is recorded against the PROVIDER ACCOUNT that paid
+    /// for it, and Core resolves that dimension to the account's name.
+    ///
+    /// This is the one write the whole per-account settlement rests on:
+    /// `record_delegation_metrics` is the only producer of an `agent-cli` rollup
+    /// row, and a row that lost its `account_id` fails nowhere — it quietly
+    /// joins the gateway bucket and is read as traffic belonging to nobody.
+    /// The Analytics e2e suite proves the SCREEN over seeded rows, so what is
+    /// asserted here is the link the seed stands in for, end to end.
+    #[test]
+    fn a_delegated_turn_is_recorded_under_the_provider_account_it_spent() {
+        const ACCOUNT: &str = "acc-metrics-e2e";
+        const NODE: &str = "node-metrics-e2e";
+        const USER: &str = "u-anna";
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("metrics db");
+        // The node's own identity — the `settings` key the rollup flusher
+        // compares against. Without it the row stays local and is never
+        // published, so the fleet's Analytics would not see this turn at all.
+        crate::db::repository::set_setting(&db, crate::db::repository::LOCAL_NODE_ID_SETTING, NODE)
+            .expect("node identity");
+        db.write()
+            .expect("write")
+            .execute(
+                "INSERT INTO provider_accounts \
+                   (account_id, org_id, engine_id, display_name, scope, credential_kind, \
+                    status, created_by) \
+                 VALUES (?1, ?2, 'claude-code', 'Konto zespolu', 'global', 'provider_login', \
+                         'active', 'admin')",
+                rusqlite::params![ACCOUNT, crate::services::org::DEFAULT_ORG_ID],
+            )
+            .expect("account row");
+
+        let account = ResolvedAccount {
+            account_id: ACCOUNT.to_string(),
+            engine_id: "claude-code".to_string(),
+            credential_kind: crate::services::agent_account::CredentialKind::ProviderLogin,
+            node_id: NODE.to_string(),
+            revision: 7,
+        };
+        let usage = DelegationUsage {
+            input_tokens: 1_200,
+            output_tokens: 300,
+            requests: 3,
+            cost_usd: None,
+            api_duration_ms: None,
+            source: "adapter",
+        };
+
+        record_delegation_metrics(
+            &db,
+            &account,
+            USER,
+            Some(crate::services::org::DEFAULT_ORG_ID),
+            "claude-sonnet-4-6",
+            "completed",
+            &usage,
+        );
+
+        let rows = crate::db::repository::list_model_metrics_rollup(
+            &db,
+            crate::services::org::DEFAULT_ORG_ID,
+            &crate::db::models::ModelMetricsFilter::default(),
+        )
+        .expect("rollup rows");
+        assert_eq!(rows.len(), 1, "one delegated turn is exactly one rollup row");
+        let row = &rows[0];
+        assert_eq!(
+            row.account_id, ACCOUNT,
+            "the turn's usage belongs to the account that paid for it"
+        );
+        assert_eq!(row.backend, CLI_DELEGATION_BACKEND);
+        assert_eq!(
+            row.service_key, "claude-code",
+            "a CLI turn's service identity is the engine, not a deployment"
+        );
+        assert_eq!(row.user_id, USER);
+        assert_eq!(row.node_id, NODE, "the row is this node's, so it publishes");
+        assert_eq!(row.prompt_tokens, 1_200);
+        assert_eq!(row.completion_tokens, 300);
+        assert_eq!(row.total_tokens, 1_500);
+        assert_eq!(row.success_count, 1);
+        assert_eq!(row.error_count, 0);
+
+        // The other half of the link: `group_by=account` shows a name, and the
+        // name comes from resolving exactly this dimension.
+        let names =
+            provider_accounts::repository::account_presentations(&db, &[row.account_id.clone()])
+                .expect("account names");
+        let presented = names.get(ACCOUNT).expect("the account is resolvable");
+        assert_eq!(presented.display_name, "Konto zespolu");
+        assert_eq!(presented.subtitle, "Claude Code");
     }
 }

@@ -79,10 +79,7 @@ impl BinaryDeploy {
                 self.manifest.engine.id
             ))
         })?;
-        if !matches!(
-            native.runtime,
-            NativeRuntime::Binary | NativeRuntime::ManagedCli
-        ) {
+        if native.runtime != NativeRuntime::Binary {
             return Err(DeployError::Manifest(format!(
                 "engine '{}' is not a binary runtime ({:?})",
                 self.manifest.engine.id, native.runtime
@@ -107,114 +104,11 @@ impl BinaryDeploy {
         Ok(path)
     }
 
-    async fn prepare_managed_cli_env(
-        &self,
-        native: &crate::services::manifest::NativeDeploy,
-        env: &mut std::collections::HashMap<String, String>,
-    ) -> DeployResult<()> {
-        if native.runtime != NativeRuntime::ManagedCli {
-            return Ok(());
-        }
-        // Refused before a CLI is downloaded: without the OS mechanism there is
-        // no isolation to put a vendor binary in, and the account would exist
-        // only to fail.
-        crate::code_studio::process_sandbox::ProcessSandbox::check_available().map_err(
-            |error| {
-                DeployError::Manifest(format!(
-                    "engine '{}' cannot run on this node: {error:#}",
-                    self.manifest.engine.id
-                ))
-            },
-        )?;
-        env.retain(|name, _| name == "PORT");
-        env.insert("TENTAFLOW_ENGINE_ID".into(), self.manifest.engine.id.clone());
-        // The release is the vendor's current one, not a pin: deploying this
-        // engine again is how a node moves forward.
-        let release = super::managed_cli::resolve_latest(&self.manifest.engine.id).await?;
-        let (install_root, bin_dir) = super::managed_cli::install(
-            &self.manifest.engine.id,
-            &release,
-            self.log_sink.as_ref(),
-        )
-        .await?;
-        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![bin_dir];
-        paths.extend(std::env::split_paths(&inherited_path));
-        let joined = std::env::join_paths(paths)
-            .map_err(|e| DeployError::Spawn(format!("build managed-cli PATH: {e}")))?;
-        env.insert("PATH".to_string(), joined.to_string_lossy().into_owned());
-        env.insert("TENTAFLOW_AGENT_RUNTIME_ROOT".into(), install_root.to_string_lossy().into_owned());
-        env.insert("TENTAFLOW_AGENT_EXECUTION".into(), "process".into());
-        let state_dir = crate::services::coding_agent::prepare_account_directory(&self.user_config)
-            .map_err(DeployError::Spawn)?;
-        env.insert(
-            "TENTAFLOW_CODING_AGENT_DATA_DIR".to_string(),
-            state_dir.to_string_lossy().into_owned(),
-        );
-        // The bridge process's OWN private directories. The engine credential
-        // homes are NOT among them: the bridge points every invocation at
-        // `credentials/` (an account-wide sign-in) or at an instance profile (a
-        // session), so a second, inherited credential location would only be a
-        // place for a login to get lost in.
-        for (name, directory) in [("HOME", "home"), ("XDG_DATA_HOME", "data"), ("TMPDIR", "tmp")] {
-            env.insert(name.into(), state_dir.join(directory).to_string_lossy().into_owned());
-        }
-        Ok(())
-    }
-
-    /// A listening bridge is not a usable account. `/health` says only that the
-    /// process is up; a node without a sandbox mechanism, without the
-    /// namespaces its kernel would have to allow, or without a working route to
-    /// the egress gateway would deploy "successfully" and then refuse every
-    /// turn. So readiness asks the bridge to launch a sandboxed process for
-    /// real and fails the deploy with what went wrong.
-    async fn verify_sandbox_ready(&self, port: u16) -> DeployResult<()> {
-        let directory = crate::services::coding_agent::account_directory(&self.user_config)
-            .map_err(DeployError::Manifest)?;
-        let token = std::fs::read_to_string(directory.join("bridge-token"))
-            .map_err(|e| DeployError::Spawn(format!("read the agent bridge token: {e}")))?;
-        let response = reqwest::Client::new()
-            .get(format!("http://127.0.0.1:{port}/runtime/status"))
-            .header("Authorization", format!("Bearer {}", token.trim()))
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-            .map_err(|e| {
-                DeployError::Spawn(format!("ask the bridge for its runtime status: {e}"))
-            })?;
-        if !response.status().is_success() {
-            return Err(DeployError::Spawn(format!(
-                "the agent bridge refused its runtime status with {}",
-                response.status()
-            )));
-        }
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| DeployError::Spawn(format!("read the bridge runtime status: {e}")))?;
-        if body
-            .pointer("/sandbox/ready")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
-            return Ok(());
-        }
-        Err(DeployError::Spawn(format!(
-            "this node cannot isolate a coding agent, so the account would refuse every turn: {}. \
-             A managed CLI needs macOS sandbox-exec or Linux /usr/bin/bwrap with unprivileged user namespaces.",
-            body.pointer("/sandbox/detail")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("the bridge reported no sandbox capability")
-        )))
-    }
 }
 
 #[async_trait]
 impl DeployStrategy for BinaryDeploy {
     async fn prepare(&mut self) -> DeployResult<PreparedDeploy> {
-        if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code" | "grok-build" | "muse-code") {
-            crate::services::coding_agent::account_directory(&self.user_config).map_err(DeployError::Manifest)?;
-        }
         let native = self
             .manifest
             .deploy
@@ -277,16 +171,6 @@ impl DeployStrategy for BinaryDeploy {
             });
         }
 
-        let managed_cli = native.runtime == NativeRuntime::ManagedCli;
-        let managed_cli_executable = if managed_cli {
-            Some(super::managed_cli::ensure_bridge(
-                &self.manifest.engine.id,
-                &self.manifest.native_source_hash,
-                self.log_sink.as_ref(),
-            )?)
-        } else {
-            None
-        };
         // Respawn istniejacego serwisu zachowuje port z DB.
         let port = self
             .ports
@@ -300,20 +184,17 @@ impl DeployStrategy for BinaryDeploy {
         let candidates = ["server.exe", "run.cmd", "run.ps1", "start.cmd"];
         #[cfg(not(windows))]
         let candidates = ["server", "run.sh", "start.sh", "build.sh"];
-        let exe = match managed_cli_executable {
-            Some(path) => path,
-            None => candidates
-                .iter()
-                .map(|n| root.join(n))
-                .find(|p| p.exists())
-                .ok_or_else(|| {
-                    DeployError::Spawn(format!(
-                        "no startup script in {} (looked for {:?})",
-                        root.display(),
-                        candidates
-                    ))
-                })?,
-        };
+        let exe = candidates
+            .iter()
+            .map(|n| root.join(n))
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                DeployError::Spawn(format!(
+                    "no startup script in {} (looked for {:?})",
+                    root.display(),
+                    candidates
+                ))
+            })?;
 
         // Typed schema params → env (Env bindings) + request_time → config_json.
         // Computed before spawn so the launch script receives the engine's
@@ -357,35 +238,9 @@ impl DeployStrategy for BinaryDeploy {
         }
         super::apply_engine_env(&self.user_config, &mut env);
         super::apply_gpu_selection_env(&self.user_config, &mut env);
-        if managed_cli { env.insert("PORT".into(),port.to_string()); }
-        self.prepare_managed_cli_env(native, &mut env).await?;
-
-        let agent_proxy = if managed_cli {
-            let account_id = self.user_config.get("account_id").and_then(serde_json::Value::as_str).ok_or_else(|| DeployError::Manifest("missing agent account_id".into()))?;
-            let proxy = crate::services::coding_agent_proxy::start(&self.manifest.engine.id, account_id).await.map_err(|e| DeployError::Spawn(e.to_string()))?;
-            env.insert("TENTAFLOW_AGENT_PROXY_PORT".into(), proxy.port().to_string());
-            // Where a sandbox has no route to this loopback endpoint, the same
-            // endpoint is served inside it and reaches us through this socket.
-            if let Some(socket) = proxy.socket_path() {
-                env.insert(
-                    "TENTAFLOW_AGENT_PROXY_SOCKET".into(),
-                    socket.to_string_lossy().into_owned(),
-                );
-            }
-            env.insert("HTTP_PROXY".into(), proxy.url().to_string());
-            env.insert("HTTPS_PROXY".into(), proxy.url().to_string());
-            Some(proxy)
-        } else { None };
 
         let mut cmd = Command::new(&exe);
         cmd.current_dir(&root);
-        if managed_cli {
-            cmd.env_clear();
-            // Linux and macOS only, per the four manifests this branch serves.
-            for name in ["LANG", "LC_ALL", "TZ"] {
-                if let Some(value) = std::env::var_os(name) { cmd.env(name, value); }
-            }
-        }
         cmd.envs(env);
         cmd.stdin(std::process::Stdio::null());
         // NO kill_on_drop: a successful deploy drops this strategy object once
@@ -418,7 +273,6 @@ impl DeployStrategy for BinaryDeploy {
             .spawn()
             .map_err(|e| DeployError::Spawn(format!("spawn {}: {}", exe.display(), e)))?;
         let pid = child.id().map(|v| v as i64);
-        if let (Some(proxy), Some(pid)) = (agent_proxy, child.id()) { proxy.monitor(pid); }
 
         // Pipe stdout / stderr into the log sink line-by-line so the dashboard
         // sees engine startup output in real time. Both pipes are owned tasks;
@@ -483,15 +337,7 @@ impl DeployStrategy for BinaryDeploy {
         .await;
 
         match outcome {
-            SmartProbeOutcome::Ready => {
-                if managed_cli {
-                    if let Err(error) = self.verify_sandbox_ready(port).await {
-                        self.kill_child().await;
-                        let _ = self.ports.release(port);
-                        return Err(error);
-                    }
-                }
-            }
+            SmartProbeOutcome::Ready => {}
             SmartProbeOutcome::ProcessExited(code) => {
                 self.kill_child().await;
                 let _ = self.ports.release(port);
@@ -530,16 +376,8 @@ impl DeployStrategy for BinaryDeploy {
             engine_id: self.manifest.engine.id.clone(),
             category: category_tag(&self.manifest).to_string(),
             display_name: resolve_display_name(&self.manifest),
-            deploy_method: if managed_cli {
-                DeployMethod::NativeManagedCli
-            } else {
-                DeployMethod::NativeBinary
-            },
-            transport: if managed_cli {
-                Transport::AgentRpc
-            } else {
-                Transport::HttpDirect
-            },
+            deploy_method: DeployMethod::NativeBinary,
+            transport: Transport::HttpDirect,
             runtime,
             models,
             config_json,

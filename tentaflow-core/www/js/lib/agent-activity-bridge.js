@@ -35,7 +35,7 @@ export function activityLabels() {
     perm_allow_run: t('agent_activity.perm_allow_run', 'Zezwól na przebieg'),
     perm_always: t('agent_activity.perm_always', 'Zawsze'),
     back: t('agent_activity.back', 'Wstecz'),
-    step_node: t('agent_activity.step_node', 'węzeł'),
+    step_node: t('agent_activity.step_node', 'node'),
     step_iteration: t('agent_activity.step_iteration', 'iteracja'),
     step_tool: t('agent_activity.step_tool', 'narzędzie'),
     step_compaction: t('agent_activity.step_compaction', 'kompakcja kontekstu'),

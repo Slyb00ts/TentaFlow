@@ -407,6 +407,7 @@ function runChainHtml(dict, runs) {
     ${cutFn('shortId')}
     ${cutSet('RUN_STATUSES')}
     ${cutFn('runStatusLabel')}
+    ${cutFn('runName')}
     ${cutFn('renderRunChain')}
     renderRunChain();
   `)(host, { runs }, t, escapeHtml, durationOf);

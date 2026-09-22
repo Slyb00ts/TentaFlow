@@ -802,7 +802,7 @@ test('the step-3 IQN preview shows a placeholder, never the node id or a guess, 
     const screen = fakeScreen({});
     screen.currentNode = () => ({ nodeId, nodeName: 'orion', isLocal: true });
     const { wwn } = await previewedWwn(screen, capabilities);
-    assert.equal(wwn, 'iqn.2026-09.local.tentaflow:‹nazwa hosta węzła›.vm-store');
+    assert.equal(wwn, 'iqn.2026-09.local.tentaflow:‹nazwa hosta noda›.vm-store');
     assert.ok(!wwn.includes(nodeId.slice(0, 12)), 'no slice of the node id');
     assert.ok(!wwn.includes(':orion.'), 'no guess from the fleet name either');
     screen.dispose();
@@ -1021,7 +1021,7 @@ test('a host NQN another NVMe-oF target already allows is named, because the key
   await flush();
   assert.match(win.textContent, /vm-a/);
   assert.ok(win.textContent.includes(esx), 'and the NQN the collision is about');
-  assert.match(win.textContent, /wspólnym dla całego węzła/);
+  assert.match(win.textContent, /wspólnym dla całego noda/);
   // The sentence has to be TRUE. The node refuses a conflicting apply; it does
   // not "decline to overwrite" and carry on, which is what five locales used
   // to say and what would have told the admin the opposite of what happens.

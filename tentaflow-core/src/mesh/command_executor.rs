@@ -1148,7 +1148,7 @@ impl MeshCommandExecutor {
         let Some(snap) = crate::services::deploy::distributed::model_snapshot_dir(&model_repo)
         else {
             return CommandResponse::fail(format!(
-                "model {} nie jest w cache tego węzła",
+                "model {} nie jest w cache tego noda",
                 model_repo
             ));
         };
@@ -1791,17 +1791,6 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
-        let _account = match crate::services::coding_agent::lock_account(service_id).await {
-            Ok(guard) => guard,
-            Err(error) => return CommandResponse::fail(error),
-        };
-        if let Err(error) = crate::services::coding_agent::ensure_mutation_allowed(
-            &actions.db,
-            service_id,
-        ) {
-            return CommandResponse::fail(error);
-        }
-
         let svc = {
             let conn = match actions.db.read() {
                 Ok(c) => c,
@@ -1832,11 +1821,7 @@ impl MeshCommandExecutor {
             );
         }
         // Best-effort runtime stop, then drop the row regardless.
-        if let Err(error) = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await {
-            if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
-                return CommandResponse::fail(error.to_string());
-            }
-        }
+        let _ = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await;
         // Scoped lock: drop the MutexGuard before awaiting again.
         {
             let conn = match actions.db.write() {
@@ -1896,17 +1881,6 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
-        let _account = match crate::services::coding_agent::lock_account(service_id).await {
-            Ok(guard) => guard,
-            Err(error) => return CommandResponse::fail(error),
-        };
-        if let Err(error) = crate::services::coding_agent::ensure_mutation_allowed(
-            &actions.db,
-            service_id,
-        ) {
-            return CommandResponse::fail(error);
-        }
-
         let svc = {
             let conn = match actions.db.read() {
                 Ok(c) => c,
@@ -1993,9 +1967,6 @@ impl MeshCommandExecutor {
         if restart_after_save && was_running {
             let ports = actions.port_allocator.clone();
             if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
-                if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
-                    return CommandResponse::fail(e.to_string());
-                }
                 tracing::warn!(service_id, "service_update_remote: stop failed: {}", e);
             }
             {
@@ -2016,7 +1987,6 @@ impl MeshCommandExecutor {
             let cfg_json_for_task = new_config_json.clone();
             let preserved_port = svc.runtime_port;
             tokio::spawn(async move {
-                let _account = _account;
                 match crate::services::deploy::respawn(
                     &engine_id,
                     deploy_method,
@@ -2074,17 +2044,6 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
-        let _account = match crate::services::coding_agent::lock_account(service_id).await {
-            Ok(guard) => guard,
-            Err(error) => return CommandResponse::fail(error),
-        };
-        if let Err(error) = crate::services::coding_agent::ensure_mutation_allowed(
-            &actions.db,
-            service_id,
-        ) {
-            return CommandResponse::fail(error);
-        }
-
         // When pausing, mirror the local handler: actively stop the runtime
         // and clear runtime metadata so health checks don't keep flapping.
         if paused {
@@ -2152,17 +2111,6 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
-        let _account = match crate::services::coding_agent::lock_account(service_id).await {
-            Ok(guard) => guard,
-            Err(error) => return CommandResponse::fail(error),
-        };
-        if let Err(error) = crate::services::coding_agent::ensure_mutation_allowed(
-            &actions.db,
-            service_id,
-        ) {
-            return CommandResponse::fail(error);
-        }
-
         let svc = {
             let conn = match actions.db.read() {
                 Ok(c) => c,
@@ -2288,6 +2236,19 @@ impl MeshCommandExecutor {
                 ))
             }
         };
+
+        // Same refusal as `dispatch::handlers::service_manifest_deploy`: a
+        // managed-CLI coding agent is never a `services` row, local or remote.
+        if manifest.engine.category == crate::services::manifest::Category::Agents
+            && manifest.deploy.native.as_ref().is_some_and(|native| {
+                native.runtime == crate::services::manifest::NativeRuntime::ManagedCli
+            })
+        {
+            return CommandResponse::fail(format!(
+                "engine '{}' is a managed coding-agent CLI; install it from the Konta agentów screen, not as a service",
+                engine_id
+            ));
+        }
 
         let resolved = match resolve_deploy_method(&manifest, deploy_method) {
             Ok(m) => m,
@@ -3274,12 +3235,18 @@ fn resolve_deploy_method(
                 manifest.deploy.native.as_ref().ok_or_else(|| {
                     format!("engine '{}' has no [deploy.native]", manifest.engine.id)
                 })?;
-            Ok(match native.runtime {
-                NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
-                NativeRuntime::Binary => DeployMethod::NativeBinary,
-                NativeRuntime::PythonBundle => DeployMethod::NativePythonBundle,
-                NativeRuntime::ManagedCli => DeployMethod::NativeManagedCli,
-            })
+            match native.runtime {
+                NativeRuntime::Embedded => Ok(DeployMethod::NativeEmbedded),
+                NativeRuntime::Binary => Ok(DeployMethod::NativeBinary),
+                NativeRuntime::PythonBundle => Ok(DeployMethod::NativePythonBundle),
+                // See the matching guard in `handle_service_deploy_remote`: a
+                // managed-CLI coding agent is never a `services` row.
+                NativeRuntime::ManagedCli => Err(format!(
+                    "engine '{}' is a managed coding-agent CLI; install it from the \
+                     Konta agentów screen, not as a service",
+                    manifest.engine.id
+                )),
+            }
         }
         other => Err(format!(
             "unknown deploy method '{}': expected docker/native/external",
@@ -3616,5 +3583,22 @@ mod tests {
         )
         .unwrap();
         Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    /// Mirrors `dispatch::handlers::resolve_deploy_method`'s own refusal: a
+    /// managed-CLI coding agent is never deployed as a `services` row, local
+    /// OR remote — this is the mesh-side entry `handle_service_deploy_remote`
+    /// consults before it would otherwise resolve a `DeployMethod`.
+    #[test]
+    fn resolve_deploy_method_refuses_a_managed_cli_agent() {
+        let manifest = crate::services::manifest::registry()
+            .by_id("codex")
+            .cloned()
+            .expect("codex manifest is embedded in the registry");
+        let error = resolve_deploy_method(&manifest, "native").unwrap_err();
+        assert!(
+            error.contains("Konta agentów"),
+            "the refusal must point at the agent accounts screen: {error}"
+        );
     }
 }

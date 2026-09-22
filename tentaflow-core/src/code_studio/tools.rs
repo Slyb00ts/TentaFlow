@@ -177,8 +177,6 @@ pub struct AccountApproval {
     /// principal has no account for this engine at all.
     pub account_id: Option<String>,
     pub account_name: Option<String>,
-    /// Accounts of this engine the principal could switch to instead.
-    pub candidate_accounts: Vec<String>,
     /// Principal the asking run acts for — the second half of the wake-up key,
     /// so a colleague's sign-in never settles this run.
     pub user_id: String,

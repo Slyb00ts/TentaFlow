@@ -681,8 +681,6 @@ pub use message_body::{
     SchedulerPayload,
     SchedulerRunsListRequest,
     SchedulerRunsListResponse,
-    ServiceAgentRequest,
-    ServiceAgentResponse,
     ServiceChange,
     ServiceDeleteRequest,
     ServiceDeleteResponse,

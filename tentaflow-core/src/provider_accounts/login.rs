@@ -707,6 +707,7 @@ mod tests {
             vec![
                 (
                     "/auth/status",
+                    200,
                     serde_json::json!({
                         "authenticated": false,
                         "login_flow_id": "auth-1",
@@ -716,6 +717,7 @@ mod tests {
                 ),
                 (
                     "/sessions/auth-1/events",
+                    200,
                     terminal(
                         "Error logging in with device code: error sending request for url \
                          (https://auth.openai.com/api/accounts/deviceauth/usercode)",
@@ -740,11 +742,13 @@ mod tests {
             vec![
                 (
                     "/auth/status",
+                    200,
                     serde_json::json!({"authenticated": false, "status": "authenticating"})
                         .to_string(),
                 ),
                 (
                     "/sessions/auth-2/events",
+                    200,
                     terminal(
                         "Open https://auth.openai.com/device?code=WXYZ-1234 and paste the code",
                     ),

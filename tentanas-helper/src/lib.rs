@@ -2925,7 +2925,7 @@ impl HelperCommand {
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
             Self::ElasticCacheAge { .. } => ("builtin", "Odczytuje, ile plików na cache własnej macierzy Elastic czeka na przeniesienie, bez przenoszenia."),
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
-            Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym węźle."),
+            Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym nodzie."),
             Self::ElasticAdopt { .. } => ("builtin", "Przepisuje właściciela dziennika macierzy Elastic na przejmującą instancję."),
             Self::DiskWipe { .. } => ("builtin", "Usuwa sygnatury systemów plików i tablicy partycji z jednego dysku po wyłącznym otwarciu urządzenia."),
             Self::SmartctlInfo { .. } => (

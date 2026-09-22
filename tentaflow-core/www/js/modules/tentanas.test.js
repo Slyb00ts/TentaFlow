@@ -276,7 +276,7 @@ test('the node card sub carries RAM and uptime, and drops them when the node pub
   });
   const root = await mountScreen();
   const subs = [...root.querySelectorAll('.node-card .nc-sub')].map((s) => s.textContent);
-  assert.equal(subs[0], 'Debian 12 · OpenZFS 2.2.4 · 128 GiB RAM · uptime 41 d 4 h · ten węzeł');
+  assert.equal(subs[0], 'Debian 12 · OpenZFS 2.2.4 · 128 GiB RAM · uptime 41 d 4 h · ten node');
   assert.equal(subs[1], 'Debian 12 · OpenZFS 2.2.4', 'a node without a summary shows neither RAM nor uptime');
   Screen.unmount();
 });
@@ -292,13 +292,13 @@ test('the fleet header is the canonical detail-header and the tab strip has no a
   assert.ok(chips.some((l) => /ostrzeżeni/.test(l)), `a warning chip is present: ${chips}`);
   assert.ok(chips.some((l) => /Usługi/.test(l)), `a services chip is present: ${chips}`);
   const sub = head.querySelector('.d-sub').textContent;
-  assert.match(sub, /^flota · 3 węzły · 2 wspierane/);
+  assert.match(sub, /^flota · 3 nody · 2 wspierane/);
   assert.match(sub, /TentaNas 1\.4\.0/);
   assert.match(sub, /ostatnie odświeżenie/);
   const badges = [...head.querySelectorAll('.d-badges tf-chip')].map((c) => c.getAttribute('label'));
   assert.match(badges[0], /1× NAS: orion/);
   assert.match(badges[1], /Kanały uprawnień: 1× tryb A · 1× nieuzbrojony/);
-  assert.match(badges[3], /mesh: 3 węzły/);
+  assert.match(badges[3], /mesh: 3 nody/);
   assert.ok(head.querySelector('[data-act="export-config"]'), 'export action present');
 
   const tabs = root.querySelector('#nas-tabs');
@@ -647,9 +647,9 @@ test('the sudo prompt for a nameless remote node reads naturally', async () => {
   await flush();
   const prompt = document.querySelector('tf-window.nas-modal');
   try {
-    assert.match(prompt.querySelector('.explain-box').textContent, /^Hasło trafi do tego węzła bez nazwy /);
-    assert.equal(prompt.querySelector('#nas-sudo-pass').getAttribute('label'), 'Hasło sudo użytkownika tentaflow na węźle bez nazwy');
-    assert.doesNotMatch(prompt.innerHTML, /Węzeł bez nazwy|bbbbbbbbbbbb/);
+    assert.match(prompt.querySelector('.explain-box').textContent, /^Hasło trafi do tego noda bez nazwy /);
+    assert.equal(prompt.querySelector('#nas-sudo-pass').getAttribute('label'), 'Hasło sudo użytkownika tentaflow na nodzie bez nazwy');
+    assert.doesNotMatch(prompt.innerHTML, /Node bez nazwy|bbbbbbbbbbbb/);
   } finally {
     // Closed even when an assertion fails, so a pending prompt never keeps
     // the test process alive.
@@ -691,7 +691,7 @@ test('"Uzbrój kanał" stays on the arm-channel prompt and never labels a one-sh
 // as having none — worse than silence. `arraysTotal` is on the wire now, so the
 // count can be what the Pools tab actually lists. The original intent is the
 // assertion that survives: the number must never be the ZFS count on its own.
-test('zakładka Pule liczy pule ZFS RAZEM z macierzami, pozostałe badge pozostają pomiarami węzła', async () => {
+test('zakładka Pule liczy pule ZFS RAZEM z macierzami, pozostałe badge pozostają pomiarami noda', async () => {
   stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL,
     nodes: [node({ poolsTotal: 0, arraysTotal: 2 }), node({ nodeId: REMOTE, isLocal: false, poolsTotal: 7, disksTotal: 9, sharesTotal: 3 })] } });
   const root = await mountScreen({ node: LOCAL, tab: 'pools' });
@@ -718,9 +718,9 @@ test('the node header carries the disk-warning and service chips plus the mockup
   const badges = [...root.querySelectorAll('#nas-head-badges tf-chip')].map((c) => c.getAttribute('label'));
   assert.equal(badges[0], 'OpenZFS 2.2.4');
   assert.equal(badges[1], 'Kanał uprawnień: tryb A');
-  assert.equal(badges[2], 'mesh: 3 węzły');
+  assert.equal(badges[2], 'mesh: 3 nody');
   const sub = root.querySelector('#nas-head-sub').textContent;
-  assert.match(sub, /^węzeł orion · uptime 1 h 0 min · TentaNas 1\.4\.0 · ostatnie odświeżenie/);
+  assert.match(sub, /^node orion · uptime 1 h 0 min · TentaNas 1\.4\.0 · ostatnie odświeżenie/);
   assert.ok(!/6\.1/.test(sub), 'the kernel is not in the header sub');
   Screen.unmount();
 });
@@ -742,8 +742,8 @@ test('the node header subline reads naturally for a node with no known hostname'
   const root = await mountScreen({ node: LOCAL });
   await flush();
   const sub = root.querySelector('#nas-head-sub').textContent;
-  assert.match(sub, /^Węzeł bez nazwy · uptime/);
-  assert.doesNotMatch(sub, /węzeł Węzeł bez nazwy/i, 'the word "węzeł" is not doubled');
+  assert.match(sub, /^Node bez nazwy · uptime/);
+  assert.doesNotMatch(sub, /node Node bez nazwy/i, 'the word "node" is not doubled');
   Screen.unmount();
 });
 
@@ -1152,7 +1152,7 @@ test('an Elastic Array alert opens that array, from the node and from the fleet'
 // registry knows one; it used to send the 64-hex node id, and every fleet
 // surface printed that as the name. One helper names such a node, and the id
 // is only a tooltip.
-test('a node with no known hostname is "Węzeł bez nazwy" everywhere, never its id', async () => {
+test('a node with no known hostname is "Node bez nazwy" everywhere, never its id', async () => {
   const nameless = {
     ...fixtures,
     tentaNasNodesListRequest: {
@@ -1169,11 +1169,11 @@ test('a node with no known hostname is "Węzeł bez nazwy" everywhere, never its
   await flush();
   await flush();
   const name = root.querySelector(`.node-card[data-node="${REMOTE}"] .nc-name`);
-  assert.equal(name.textContent.trim(), 'Węzeł bez nazwy');
+  assert.equal(name.textContent.trim(), 'Node bez nazwy');
   assert.equal(name.getAttribute('title'), REMOTE, 'the id is the tooltip');
   assert.doesNotMatch(root.textContent, /bbbbbbbbbbbb/, 'no visible text carries the node id');
   const offline = root.querySelector('#nas-fleet-alerts').rows.find((r) => r._row.node?.nodeId === REMOTE);
-  assert.match(offline.node, />Węzeł bez nazwy</);
+  assert.match(offline.node, />Node bez nazwy</);
   assert.match(offline.node, new RegExp(`title="${REMOTE}"`));
   Screen.unmount();
 });
@@ -1192,7 +1192,7 @@ test('a job author is a name, a system author in words, or an unknown account wi
   const subs = [...host.querySelectorAll('.job-sub')];
   assert.match(subs[0].textContent, /^Anna · /);
   assert.match(subs[1].textContent, /^harmonogram · /);
-  assert.match(subs[2].textContent, /^start węzła · /);
+  assert.match(subs[2].textContent, /^start noda · /);
   assert.match(subs[3].textContent, /^nieznane konto · /);
   assert.doesNotMatch(host.textContent, /0191f2c0|scheduler|startup/);
   assert.equal(subs[3].getAttribute('title'), uuid);
@@ -2256,7 +2256,7 @@ test('the post-install route forces the setup step on this node even when the ch
     const scope = root.querySelector('#nas-setup-scope').textContent;
     assert.match(scope, /orion/, 'it names the node being configured');
     assert.match(scope, /tylko dla niego/, 'and says it configures only that node');
-    assert.match(scope, /osobno na każdym węźle/, 'and that every other node is still its own job');
+    assert.match(scope, /osobno na każdym nodzie/, 'and that every other node is still its own job');
     // A healthy channel must not be described as a broken one.
     assert.match(root.querySelector('tf-alert').getAttribute('message'), /jest już skonfigurowany/);
     // The route itself collects no secret: the wizard does, after the install.

@@ -1514,14 +1514,10 @@ impl DeployStrategy for DockerDeploy {
             .map(|d| d.role == "worker")
             .unwrap_or(false);
 
-        let transport = if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code" | "grok-build" | "muse-code") {
-            Transport::AgentRpc
-        } else {
-            match &distributed {
-                Some(_) if is_worker => Transport::Embedded,
-                Some(_) => Transport::HttpDirect,
-                None => self.pick_transport(),
-            }
+        let transport = match &distributed {
+            Some(_) if is_worker => Transport::Embedded,
+            Some(_) => Transport::HttpDirect,
+            None => self.pick_transport(),
         };
         let internal_port = self.manifest.engine.default_port;
         let mut allocated = Vec::new();

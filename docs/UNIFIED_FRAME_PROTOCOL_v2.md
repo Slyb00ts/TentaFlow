@@ -191,7 +191,7 @@ The envelope is encoding-agnostic about body content. **Routing decisions are ma
 | `0x01` | UI | `0x0001..0x07FF` | Structured CBOR | Addon UI updates (Faza 6 catalog: PanelShell, StatePatch, Action, Event, Command, Batch). Kind = catalog tag. |
 | `0x02` | HostFunction | `0x0001..0x00FF` | Structured CBOR | Addon ↔ Core ABI calls (`sql.query`, `llm.chat`, `http.request`, etc.). |
 | `0x03` | Stream | `0x0001..0x00FF` | Structured CBOR + fragment bytes | Long-lived streams (LLM tokens, file upload, log tail). Uses `IS_FRAGMENT` heavily. |
-| `0x04` | Mesh | `0x0010..0x004C` | Structured CBOR | Peer-to-peer control (existing `MESH_MSG_HEARTBEAT`..`MESH_MSG_FRAME_PROXY_RESPONSE` discriminators become `kind` values). |
+| `0x04` | Mesh | `0x0010..0x0051` | Structured CBOR | Peer-to-peer control (existing `MESH_MSG_HEARTBEAT`..`MESH_MSG_ROBOTS_UPDATE` discriminators become `kind` values). The bound is the highest allocated UFP/2 mesh kind and is enforced BEFORE dispatch (`validate_channel_kind`), so a new mesh message must take a FREE slot inside it — `MESH_MSG_CAMERA_STREAM_SUBSCRIBE` (0x52) and `MESH_MSG_LIDAR_STREAM_SUBSCRIBE` (0x53) open their own QUIC bi-stream and are deliberately NOT kinds, which is why the bound is not extended for them. |
 | `0x05` | Control | `0x0001..0x00FF` | Structured CBOR | Handshake, auth, heartbeat, resume, rate-limit notifications, session_end. |
 | `0x06` | SyncLedger | `0x0001..0x00FF` | Structured CBOR | Existing Sync Ledger ops/acks/pulls/snapshots. |
 | `0x07` | Frontend | `0x0001..0xFFFF` | Structured CBOR | Frontend ↔ Core (chat completions, dashboard CRUD, settings) — replaces CBOR `MessageBody` enum. Kind = MessageBody variant index. |

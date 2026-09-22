@@ -886,6 +886,11 @@ impl CliBridge {
             ticket_id: request.ticket_id.map(str::to_string),
             last_seq: 0,
         };
+        // Counted until the session row below exists, so the account's session
+        // limit sees every start that is still on its way to the bridge.
+        let admission =
+            crate::services::agent_account::admit_session(&self.db, &self.handle.account_id)
+                .map_err(|refusal| anyhow!("[{}] {refusal}", refusal.code()))?;
         insert_instance(pool, &instance)?;
         let opening = self.close_guard(pool, &instance);
         let created = self
@@ -928,6 +933,7 @@ impl CliBridge {
             }
         }
         self.record_account_session(&instance, request.session_id, request.agent_id);
+        drop(admission);
         let bridge = self.clone();
         let pool = pool.clone();
         let watched = instance.clone();

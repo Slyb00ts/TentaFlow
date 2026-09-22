@@ -120,6 +120,15 @@ export function isOnDemand(service) {
   return String(service?.engine?.lifecycle || '').toLowerCase() === 'on-demand';
 }
 
+/// A managed-CLI coding agent (codex/claude-code/grok-build/muse-code) is never
+/// deployed as a `services` row — it runs through a provider account and an
+/// on-demand bridge instead. Catalog must open the "Konta agentów" screen for
+/// this tile, never the deploy wizard (server refuses the deploy anyway).
+export function isManagedCliAgent(service) {
+  return service?.engine?.category === 'agents'
+    && service?.deploy?.native?.runtime === 'managed-cli';
+}
+
 export function isEngineCompatible(service, hostOs, host) {
   if (!service) return false;
   // Cluster target ma os=null (heterogeniczne wezly) — nie filtrujemy po OS,

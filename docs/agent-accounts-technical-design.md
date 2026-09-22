@@ -123,7 +123,7 @@ CREATE TABLE agent_runtime_engines (          -- N01 matrix cells
 
 `agent_runtime_nodes` / `agent_runtime_engines` ARE synced (the admin edits them from any node; N01 is a fleet view) — see §C.1. `provider_account_node_state` is not.
 
-Vault context string (mirrors `agent_credential_context` at `tentaflow-core/src/code_studio/vault.rs:831`): `format!("provider-account:{account_id}")`, bound via `SettingsCipher::encrypt_bound` (`tentaflow-core/src/crypto/mod.rs`).
+Vault context string: `format!("provider-account:{account_id}")`, bound via `SettingsCipher::encrypt_bound` — the same bound-context mechanism the Code Studio vault uses (`tentaflow-core/src/code_studio/vault.rs:402`, `:627`); the cipher itself is in `tentaflow-core/src/crypto/mod.rs`.
 
 ### A.2 Migration 157 `retire_coding_agent_account_model` — `MigrationStep::Rust`
 
@@ -131,22 +131,22 @@ Data moved (all inside one transaction, in this order):
 
 | From | To | Rule |
 |---|---|---|
-| `services` rows whose `config_json` has `account_id` (written by `tentaflow-core/src/services/coding_agent.rs:20` `ensure_account_config`) | one `provider_accounts` row per service | `account_id` kept verbatim as PK; `scope='global'`; `credential_kind='provider_login'`; `engine_id` from the service's engine; `display_name` = service name; `home_node_id` = the service's node; `status='needs_login'` unless a credential row lands below; `created_by` = service creator or the org admin fallback |
-| `coding_agent_account_grants(service_id,user_id)` (`migrations.rs:1030`) | `provider_account_grants(account_id,'user',user_id,granted_by)` | joined through the service row |
-| `coding_agent_session_owners(service_id,session_id,vendor_session_id,user_id)` (`migrations.rs:1036`) | `provider_account_sessions` | `node_id` = the service's node; `agent_id`/`workspace_id` NULL (not known in the old model) |
+| `services` rows whose `config_json` has `account_id` (written by `tentaflow-core/src/services/coding_agent.rs:22` `ensure_account_config`) | one `provider_accounts` row per service | `account_id` kept verbatim as PK; `scope='global'`; `credential_kind='provider_login'`; `engine_id` from the service's engine; `display_name` = service name; `home_node_id` = the service's node; `status='needs_login'` unless a credential row lands below; `created_by` = service creator or the org admin fallback |
+| `coding_agent_account_grants(service_id,user_id)` (`migrations.rs:1529`) | `provider_account_grants(account_id,'user',user_id,granted_by)` | joined through the service row |
+| `coding_agent_session_owners(service_id,session_id,vendor_session_id,user_id)` (`migrations.rs:1535`) | `provider_account_sessions` | `node_id` = the service's node; `agent_id`/`workspace_id` NULL (not known in the old model) |
 | `services.config_json.account_id`, `.account_dir` | stripped from the JSON | the service row survives only as an engine runtime, see §D.2 |
 
-Dropped in the same step: `coding_agent_account_grants`, `coding_agent_session_owners`, `coding_agent_account_moves` (`migrations.rs:973`). The FK map at `migrations.rs:3806-3808` loses its three entries.
+Dropped in the same step: `coding_agent_account_grants`, `coding_agent_session_owners`, `coding_agent_account_moves` (`migrations.rs:973`). The FK map at `migrations.rs:4330-4332` loses its three entries.
 
 > **Corrected (2026-09-20).** Only ONE of the three was ever dropped, and not in
 > this step. The ladder is append-only: rung **149** (`migrations.rs:972`,
-> DDL const `CODING_AGENT_ACCOUNT_MOVES` at `:1254`) still CREATES
+> DDL const `CODING_AGENT_ACCOUNT_MOVES` at `:1259`) still CREATES
 > `coding_agent_account_moves` exactly as it did, because a database that already
 > ran it has it recorded as applied and editing that rung would desynchronise the
 > ladder instead of removing anything.
 > The table is dropped by the separate rung **163**
 > (`drop_coding_agent_account_moves`, `migrations.rs:1040`, const
-> `DROP_CODING_AGENT_ACCOUNT_MOVES` at `:1287-1290`) — a fresh database creates
+> `DROP_CODING_AGENT_ACCOUNT_MOVES` at `:1292`) — a fresh database creates
 > it at 149 and drops it at 163.
 >
 > `coding_agent_account_grants` and `coding_agent_session_owners` were NOT
@@ -155,16 +155,47 @@ Dropped in the same step: `coding_agent_account_grants`, `coding_agent_session_o
 > `provider_account_sessions` and deliberately keeps the old tables and their
 > rows — "nothing the running code still reads may move" — and
 > `services/coding_agent.rs` still reads both (`:211`, `:221`, `:316`, `:342`).
-> They are created at `migrations.rs:1477` and `:1483`. The FK map at
-> `migrations.rs:4278-4280` therefore KEEPS its three entries, one line per
+> They are created at `migrations.rs:1529` and `:1535`. The FK map at
+> `migrations.rs:4330-4332` therefore KEEPS its three entries, one line per
 > `(table, column)` pair (`coding_agent_account_grants.user_id`,
 > `coding_agent_account_grants.granted_by`,
 > `coding_agent_session_owners.user_id`). The line numbers this paragraph
-> originally carried (`:973`, `:3806-3808`) no longer point at any of it.
+> originally carried (`:973`, `:3806-3808`) no longer point at any of it, and the
+> citations this paragraph now carries were corrected on 2026-09-21.
+>
+> **Corrected (2026-09-22).** `coding_agent_account_grants` is now dropped by
+> rung **165** (`drop_coding_agent_account_grants`). Its one reader,
+> `services/coding_agent.rs::account_permission`, answered from it while the
+> account screen wrote only `provider_account_grants`, so a grant revoked in A04
+> kept working on the service console and a grant given in A04 never reached it.
+> `account_permission` now calls `provider_accounts::repository::user_may_use_account`
+> for the account the service row names. `coding_agent_session_owners` stays: it
+> is still the session-ownership table of that console.
 
-**Credentials are NOT migrated.** `code_agent_credentials` lives in the Code Studio *content* DB (`tentaflow-core/src/code_studio/db.rs:63-75`), is keyed `(org_id,node_id,engine_id)` and is encrypted with the **per-node** `SettingsCipher` key — a platform migration has neither the pool nor the cipher, and a cross-DB adoption hook would be exactly the parallel path the rules forbid. The bridge-held provider logins (`accounts/<uuid>/` on disk) are likewise unreachable from SQL. Therefore:
+> **Corrected (2026-09-22, later the same day).** The owner decided to remove
+> the entire old "agent account = services row" path rather than keep it
+> beside the new one. `coding_agent_session_owners` and its index are now
+> dropped by rung **166** (`drop_coding_agent_legacy_service_path`), which also
+> deletes every surviving `services` row with `deploy_method =
+> 'native_managed_cli'` — the coding-agent-as-a-service-row itself.
+> `services/coding_agent.rs` no longer has an `account_permission`,
+> `execute_authorized`, `execute_chat`, `lock_account` or model-discovery
+> cache: only the on-disk account layout (`account_root`,
+> `prepare_account_root`, `purge_account_credentials`, …) and the bridge HTTP
+> client (`call_bridge`, `route`) survive, shared with
+> `services::agent_runtime`. `Transport::AgentRpc` and
+> `DeployMethod::NativeManagedCli` are gone from the Rust enums;
+> `ServicePayload::ReqAgent`/`ResAgent` and `MeshCommandResponsePayload::
+> AgentRpcResult` are gone from the wire (`SCHEMA_VERSION` 31 → 32). Deploying
+> a managed-CLI manifest as a service is now refused before a `DeployMethod`
+> is even resolved (`dispatch::handlers::service_manifest_deploy`,
+> `mesh::command_executor::handle_service_deploy_remote`), and the catalog
+> tile for such an engine opens the "Konta agentów" screen instead of the
+> deploy wizard.
 
-- content-DB `STEPS` gains step `(2, "DROP TABLE code_agent_credentials;")` in `tentaflow-core/src/code_studio/db.rs:39`, and the idempotence test's table list (`:123-127`) loses the entry;
+**Credentials are NOT migrated.** `code_agent_credentials` lives in the Code Studio *content* DB (`tentaflow-core/src/code_studio/db.rs:243`), is keyed `(org_id,node_id,engine_id)` and is encrypted with the **per-node** `SettingsCipher` key — a platform migration has neither the pool nor the cipher, and a cross-DB adoption hook would be exactly the parallel path the rules forbid. The bridge-held provider logins (`accounts/<uuid>/` on disk) are likewise unreachable from SQL. Therefore:
+
+- content-DB `STEPS` gains step `(2, "DROP TABLE code_agent_credentials;")` in `tentaflow-core/src/code_studio/db.rs:83`, and the idempotence test's table checks (`:103`, `:322`, `:427`) lose the entry;
 - migration 157 sets every adopted account to `status='needs_login'`;
 - the operator re-runs A02 once per account, and re-enters one API key per `api_key` account. Flagged in §H-1.
 
@@ -398,6 +429,23 @@ After the change:
 
 `coding_agent_proxy::start(engine_id, account_id)` (`:97`) keeps both arguments — the proxy is still per account for egress attribution — but is called by the runtime manager, not by a deploy of an account service.
 
+> **Corrected (2026-09-22).** This section describes the transition PLAN, not
+> the tree any more: the "Today" half is gone, not merely superseded. The
+> owner decided to delete the whole old "agent account = services row" path
+> instead of keeping it beside the new one, so `ensure_account_config`,
+> `prepare_account_directory`, `sync_coding_agent_models` and the
+> `NativeManagedCli` branches of `deploy/mod.rs`/`deploy/binary.rs` this
+> section cites no longer exist — `binary.rs` no longer has a
+> `prepare_managed_cli_env` either, and a coding-agent bridge process is
+> started exclusively by `agent_runtime.rs` (§D.2), never by a `services`
+> deploy. `DeployMethod::NativeManagedCli` and `Transport::AgentRpc` are gone
+> from the Rust enums (`NativeRuntime::ManagedCli` in the MANIFEST schema
+> stays — it is what `agent_runtime::engine_source_hash` still reads).
+> Deploying a managed-CLI manifest as a `services` row is refused server-side
+> before a `DeployMethod` is even resolved. `coding_agent_proxy::start` is
+> unaffected — it was already called only from `agent_runtime.rs`, never from
+> a services deploy strategy.
+
 ### D.2 On-demand bridge start
 
 New `tentaflow-core/src/services/agent_runtime.rs`:
@@ -533,6 +581,139 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
 > ladder must not be rewritten, and the envelope comment is what tells a mixed
 > fleet why its handshake fails.
 
+> **E2E coverage of C01, C02 and `cli_model` (2026-09-21).** What WP7's "C01 flow
+> demonstrated live" has behind it, and what it does not.
+>
+> `tests/e2e/agent-accounts-code-studio.spec.js` (project
+> `agent-accounts-code-studio`) runs a real node with nothing stubbed below the
+> browser. A session is pinned to the harness flow (`resolve_harness_flow`), so
+> the turn runs the graph for real: the orchestrator's turn, the plan loop
+> (planner + critic), then the build loop — and because `code-implementer`
+> carries a `mode="user"` CLI runtime, the graph's own implementer spawn is the
+> one that cannot resolve an account for the person driving the session. It
+> asserts the ask card the console really paints (both rows and their order, the
+> account-less wording, the `who` line), the pending `account_login` row the
+> server wrote (field by field, `mandatory_interactive = false`), that every
+> standing grant decision is refused at the write with the remedy named while the
+> row stays pending, and that the deny settles the parked run as `failed` with
+> the C01 note — read back from the run list and from the workspace database
+> (`session_runs`, `approvals` including the exact `account_json`).
+>
+> **The resume half and C02's positive chip now run too**, on a node that has no
+> vendor CLI and no provider account. `tests/e2e/helpers/stand-in-cli.{c,js}`
+> compiles a small program into the cache tree the node's own managed-CLI
+> installation check reads (`<cache>/coding-agents/<engine>/<version>/
+> {installation-complete,bin/<exe>}`) and writes the `agent_runtime_nodes` /
+> `agent_runtime_engines` rows, so the node reaches it exactly the way it reaches
+> the vendor's binary — `services/agent_runtime.rs::start_bridge` puts the
+> engine's `bin/` first on the PATH the bridge runs with. There is no test branch
+> in the product. Two tests then drive the console:
+>
+> - the second describe signs in through A02 (the URL is read from the DOM the
+>   console paints, the code is typed back), and asserts the wake-up on the
+>   observable that means it: `delegate_cli` opens the `kind='cli'` run row only
+>   AFTER the account resolves, so the row appears with no click on the account
+>   card, and the `account_login` row settles `allow_once` with `decided_by` set.
+>   The resumed run then asks its OWN question — `cli_delegate` goes past the PEP
+>   in both delegation modes (`delegate_cli.rs` step 5) and, with no standing
+>   grant for the engine, `pep.rs` rule 10 answers `AskUser` — so the operator
+>   allows it once and the CLI turn completes: `session_runs` `completed` with
+>   the delegated model, the `cli_instances` row naming the account, and the
+>   credential byte-identical to the one the CLI wrote.
+> - the third asserts C02 positively: `RunInfo.account` on the CLI run (engine,
+>   `user` scope, the account name) read from the wire, and the chip in the
+>   agents dock rendered as one string — while the root run, which never started
+>   a CLI, names no account.
+>
+> Both also prove the work is not a bypass: the account's `processes/` records
+> (written by `coding-agent-bridge/src/process.rs`) are watched while the
+> children live, and `supervisor_root` must match
+> `/private/tmp/tfp-<24 hex>` — the macOS supervisor's temporary root — for the
+> `cli-login` terminal AND for the `codex-app-server` process that ran the turn.
+>
+> The seventh test drives the same account into its LAST state — gone. It signs in
+> through the console, asserts the two files the bridge owns (canonical and login
+> home), disconnects through U01's own control and its confirmation, and then
+> reads the filesystem: both are absent. That is the half a store-only purge
+> cannot give — the login home is a copy the bridge made, so nothing else can
+> know it is there — and the third assertion is the one that would catch a
+> regression: the account row is gone from the console, and the next turn parks
+> on a fresh `account_login` row with no `cli` run instead of delegating on the
+> credential the operator removed. `needs_login` is NOT what this path produces
+> (a deleted account has no row to carry it); that state is pinned in
+> `agent-accounts.spec.js`, where the key-clear leaves the account in place.
+>
+> The eighth purges the same account with NO bridge running, which is the state a
+> purge normally meets: it signs in, stops the node, restarts it on the same
+> database — `IDLE_GRACE` and the restart between them leave no bridge process —
+> and only then disconnects. The subject is the two files again, asserted from the
+> filesystem after a purge that had no bridge to tell, so a fix that removed them
+> only through a running bridge fails here and passes in the seventh.
+>
+> The ninth is the partial outcome, and it is the only place the operator's view of
+> a failed removal is pinned. It signs in with a bridge RUNNING and makes ONE tree
+> refuse the walk (a `0500` engine directory: the walk reads the directory and the
+> kernel refuses the `unlink`), then disconnects through U01. The bridge's arm
+> fails, Core's arm is attempted after it and fails on the same directory, and what
+> is asserted is the whole report: `ok = false` with `purge_incomplete` rendered as
+> an error toast, the login home gone (the second tree was attempted by both arms),
+> the canonical file still there and still byte-identical to what the sign-in
+> published, the store rows gone, and the node's warning naming the tree it could
+> not empty. That last assertion is the one that makes the acknowledgement
+> actionable — `AccountOpAck` carries no path, so the log is the only channel that
+> does. (The two arms' reports are NOT interchangeable here: the bridge names its
+> own path in the error body and `call_bridge` embeds it, and the assertion is a
+> substring of the account root, so it holds for either arm's wording.)
+>
+> The tenth is the case the ninth cannot be: a sign-in IN FLIGHT while the account
+> goes. The bridge refuses `DELETE /account/credential` WHOLE in that state
+> (`login_in_progress` — it will not promise a removal the sign-in would undo), so
+> no path is attempted on its side at all, and the node has to remove the trees
+> itself once it has stopped the bridge. The test signs in, opens a SECOND sign-in
+> and leaves it blocked on its stdin (the node's side of it is detached from the
+> page, so a reload — which is also how the disconnect control becomes reachable,
+> the login window being modal — leaves it running), then disconnects through U01.
+> Asserted: both trees absent, the three store tables empty, the success sentence
+> rendered instead of `purge_incomplete`, and the sign-in process the purge met
+> gone — its `cli-login` record, which the bridge deletes only after verifying the
+> pid is gone, does not survive. Without the fallback that test fails on exactly
+> the files the sign-in writes during the bridge's own shutdown.
+>
+> Still NOT covered on a machine that never signs in to a real vendor, and what
+> each would need:
+>
+> - **A real sign-in at a real provider**, a credential the provider would
+>   accept, and a vendor-side token ROTATION. The stand-in writes a well-formed
+>   credential file, prints a verification URL, exits 0 and answers `login
+>   status` with "Logged in" — the shape the product reads, and nothing more.
+>   Anything the product claims about the account beyond "a credential exists and
+>   the CLI exits 0" — a provider-reported plan, a subject, a rotation — needs the
+>   vendor's own CLI and a real account (WP6's acceptance).
+> - **`cli_model`'s option list.** The options are the `<engine_id>/<model>` rows
+>   of the model catalogue, written only by `services::coding_agent::sync_models`,
+>   which `services/supervisor.rs` reaches only after the bridge reports
+>   `auth.status.authenticated = true`. The stand-in DOES answer `model/list`, so
+>   the path is reachable, but what a real Codex reports there is not what the
+>   stand-in reports, so the resulting catalogue is not asserted. The G01 e2e
+>   covers the stored-value half — the select must keep the model the agent was
+>   saved with while the catalogue offers nothing for the engine.
+> - **Windows/Linux sandbox proofs.** `supervisor_root` is the macOS supervisor's
+>   root (`macos_supervisor::new_root`); the same tests on another platform would
+>   need that platform's equivalent.
+> - **What the ninth and tenth purge tests do NOT prove.** They read what the node
+>   can see: the two trees, the store rows, the acknowledgement, the log line, and
+>   the bridge's own process record. They do not prove that no writer survived the
+>   stop. The node waits for the bridge process and the bridge reaps the CLI
+>   children it tracked before it answers `/runtime/shutdown`, so the ordinary case
+>   is closed — but a shutdown the bridge itself could not confirm (a session that
+>   will not close) is only LOGGED by the node, and an orphan it left is reaped at
+>   the bridge's NEXT start. Core cannot see either, and neither case is
+>   reproducible on this machine, so neither test may be read as proving the trees
+>   cannot come back.
+>
+> The card and the chip logic itself is pinned at the unit level in
+> `tentaflow-core/www/js/modules/code-studio-session.account.test.js`.
+
 ---
 
 ## H. Risks and open questions that block a package
@@ -584,22 +765,42 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
    it to all of them), and by replacing `credentials/<engine>` with a directory symlink it could make
    the UNSANDBOXED bridge read, hash, publish and write arbitrary host paths — including the Claude
    sign-in writing a fresh token into a directory of the session's choosing. What replaces it:
-   - `accounts/<id>/credentials/` is in NO session's sandbox policy — not writable, not read-only, not
-     as a directory and not as a file. A session gets a private COPY in its own profile at start
-     (claude: the token in the process environment and no file at all; grok keeps its own mechanism
-     with no canonical path exposed).
+   - `accounts/<id>/credentials/` as a DIRECTORY is in no session's sandbox policy. Of the account's
+     own credential store that ONE FILE is the only path any session reaches — the profile
+     names the source and a destination inside itself, and `ProcessSandbox::with_credential`
+     (`process_sandbox.rs:717`) calls `CredentialExposure::install` (`:586-635`) → on Linux a `--bind` mount, so nothing inside the sandbox can
+     replace, rename over or write around the mount point; on macOS a symlink with the source allowed
+     literally, and a spawn that finds anything else at the destination refuses rather than run the
+     engine against a credential nobody else can see. The engine therefore rotates the ACCOUNT's own
+     file, which every other instance on the node reads; there is no per-session copy
+     (`main.rs:2393-2399`). Claude Code gets no file at all: its token travels in the process
+     environment (`main.rs:2358-2364`).
    - Sign-in, `login status` and discovery run in a separate bridge-private home
      `accounts/<id>/login/`, which no session can write either. A working copy of the canonical
      credential is placed there before the CLI runs and whatever the CLI leaves is extracted back.
-   - A session's changed copy is a REQUEST, published only if: the file is a bounded regular
-     non-symlink opened `O_NOFOLLOW` and stat'ed through the descriptor it is read from; the provider
-     identity in the new material equals the identity of the canonical credential (codex:
-     `tokens.account_id`, else the `sub` claim of `tokens.id_token`; an engine whose format carries no
-     stable subject — muse, grok — is never published); and the canonical credential still holds the
-     hash the session started from (CAS), so a session closing late cannot resurrect an older token.
-   - A refusal is reported as `credential_rejected {engine, reason, sha256}` (`identity_mismatch`,
-     `identity_unverifiable`, `stale_baseline`, `unsafe_credential_file`), a publication as
-     `credential_changed {engine, sha256}`; material never travels on either.
+   - A change to that file is a REQUEST, not a fact. The bridge polls it (`credentials::observe`),
+     takes it only if it is a bounded regular non-symlink opened `O_NOFOLLOW` and stat'ed through the
+     descriptor it is read from, and announces the digest; Core owns the revision CAS and returns
+     early on a digest it already stores, so a late announcement moves nothing and a rotation this
+     bridge never saw before a restart is still announced instead of staying on one node. The
+     identity comparison never suppresses the REPORT — every change is announced, as a publication or
+     as a refusal — but for codex it does decide whether the change is PUBLISHED: material
+     (`tokens.account_id`, else the `sub` claim of `tokens.id_token`) naming a different
+     account is a `Foreign` refusal, and codex material naming nobody where the bridge had announced
+     an account is `Unverifiable`. Neither becomes a revision, because material is fetched only on the
+     publication path. An engine whose format carries no stable subject (muse, grok) has nothing to
+     compare on either side and its rotation is announced as `Moved`, because
+     inventing a refusal from silence would disable accounts whose engine we cannot read
+     (`credentials.rs:686-707`).
+   - A refusal is reported as `credential_rejected {engine, reason, sha256}` carrying one of three
+     reasons — `identity_mismatch`, `identity_unverifiable`, `unsafe_credential_file` — and a
+     publication as `credential_changed {engine, sha256}`; material never travels on either. The
+     bridge names two further reasons it never reports, because it settles both on its own login
+     home before anything is published: `unusable_credential`, when what the CLI left is not a
+     non-empty JSON object (`credentials.rs:745-753`), and `stale_baseline`, when the canonical
+     credential moved under a probe that started from another version (`credentials.rs:761-765`).
+     Both are written to the bridge's stderr and no event is queued for either
+     (`main.rs:2641-2643`), so neither can reach Core at all.
    - After a publication the bridge fans the new material out to every live session whose copy is
      still the old one, so a rotation reaches the sessions running beside it; a session that changed
      its own copy is left alone.
@@ -663,13 +864,18 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
     leased the home, materialized the OLD canonical credential over what the CLI had just written,
     and the sign-in then published nothing.
 12. **One `identity_mismatch` from a VERIFIED identity puts the account in `needs_login`.** The
-    two-in-24-hours rule that guards the other rejection reasons exists because a single refusal can
-    be noise — a session closing late, a copy that never matched. `identity_mismatch` is not noise:
+    two-in-24-hours rule exists for a refusal that measured nothing, and among the reasons Core can
+    actually receive that is `identity_unverifiable` alone — `unsafe_credential_file` never moves the
+    status at all, and `stale_baseline`, which would not move it either, never reaches Core to try
+    (`repository.rs:1437-1500`, `main.rs:2641-2643`). A single refusal can be noise — a session closing late, a copy that never matched
+    — but `identity_mismatch` is not noise:
     the bridge compared two identities it could both read and they named different provider accounts,
     which means the credential in front of the sessions is not the one the account is supposed to
     hold. Leaving it `active` would keep every session on a token whose owner has already changed.
-    `identity_unverifiable` keeps the two-in-24-hours rule: it is the answer for an engine whose
-    format carries no stable subject (muse, grok), so it says nothing about the credential at all.
+    `identity_unverifiable` keeps the two-in-24-hours rule: it is the answer for CODEX material that
+    names nobody while this bridge had announced an account, so it says nothing about the credential
+    at all. Muse and Grok cannot raise it — their format never announces an identity, so there is no
+    announced account for the comparison to lose.
 13. **§C.2's credential-on-the-ledger is replaced: the material travels sealed per recipient on the
     mesh, and only the account's METADATA travels on the ledger.** §C.2 was written against a
     reading of `SharedSettingSecret` that the code no longer supports: a fleet secret does NOT
@@ -681,14 +887,18 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
     node on the path, and migration 158 exists only to scrub the secrets an earlier build left in
     the capture journal. A provider OAuth token has a larger blast radius than `hf_token`, so it
     takes the same route, not the one that was abandoned:
-    - new frame `MESH_MSG_PROVIDER_CREDENTIALS_SYNC` (0x54) carrying
+    - new frame `MESH_MSG_PROVIDER_CREDENTIALS_SYNC` (0x29) carrying
       `ProviderCredentialsSyncPayload`, built by `mesh/provider_credentials.rs::build_for_peer` and
       taken in by `::ingest`. Each entry is sealed with `MeshSecurity::seal_for_peer` bound to
       `provider-credential|<account>|<revision>|<sha256>`, so it opens on ONE peer and cannot be
       replanted under another account or revision. The receiver re-computes the digest of what it
       opened before storing, and stores it with the local `SettingsCipher::encrypt_bound`;
     - no `MeshCommandType` is added (correction 8 stands) and `SCHEMA_VERSION` stays 29 (correction
-      6): the frame is a new mesh discriminator, and an older peer that does not know it drops it;
+      6): the frame is a new mesh discriminator, and an older peer that does not know it drops it.
+      The value is a free slot INSIDE the Mesh channel kind range
+      (`tentaflow-sdk-spec/src/protocol/frame/channel.rs::valid_kind_range`, 0x10..=0x51) because
+      `validate_channel_kind` runs before dispatch and rejects anything above it as `UnknownKind` —
+      the first allocation (0x54) sat one past the bound and every fan-out was dropped in silence;
     - the ledger keeps `provider_accounts`, `provider_account_grants`, `agent_runtime_nodes` and
       `agent_runtime_engines` exactly as §C.1 registered them. `provider_account_credentials` is
       still NOT a sync resource and `sync_resource_acl` is not used for it: with the material off
@@ -705,9 +915,16 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
        overwriting each other's revision. A refusal is audited as
        `provider_account.credential_refused {reason: "not_home_node"}` — nothing in the resulting
        state records it, so the refusal IS the record. An account with NO home is closed in both
-       directions (that state is only reached by deleting the home node, and the honest answer is
-       that an administrator must name a new one);
+       directions (an account that never had one is in the same state, and either way the honest
+       answer is that a new home must be named — by a sign-in at the provider, or by pasting a key
+       on the chosen node);
     3. **revocation** — the revision must be above `provider_accounts.credential_revoked_revision`.
+       A submission BELOW the revision the receiver already holds is dropped — the home is the
+       single refresher and the material it holds is the newer one — and, like a `not_home_node`
+       refusal, it is the record: `provider_account.credential_refused {reason: "stale_revision",
+       revision, held_revision}`, naming the node that offered, the revision it offered and the
+       revision held when the offer was dropped. Without that row a satellite whose copy trails
+       the home loses its rotation to the next fan-out with no trace on the home.
     **The home node is the node where the credential was DELIBERATELY PLACED.** `write_credential`
     records it for a local mint (no expected revision), and a mint by an ADMINISTRATOR PASTING AN API
     KEY takes over a home that already exists: that key exists only where it was pasted, so pasting
@@ -728,13 +945,76 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
     an older row arriving late), and every node purges its own copy on the reconcile that the
     materializer starts after applying a `ProviderAccount` or `AgentRuntimeNode` row
     (`provider_accounts/credential_sync.rs`, also run at startup). A purge is BOTH halves: the store
-    row and the file the bridge owns (new bridge route `DELETE /account/credential`, refused while a
-    sign-in is running, exactly as the PUT is — correction 11). A sign-in after a clear mints ABOVE
+    row and EVERY file the node holds — the canonical credential and the private login home the
+    bridge keeps for its own sign-in, probe and discovery runs, each of the two trees whole. (That
+    scope is the node's own view
+    of the two account trees, measured on macOS with the codex bridge; on Linux they are the same
+    two trees, but a session reaches the canonical file through a bubblewrap `--bind` mount point
+    and no purge in this package was exercised against a live one.) The file half is done by
+    whichever of the two can do it: a RUNNING bridge is told to drop both (bridge route `DELETE
+    /account/credential`, refused while a sign-in is running, exactly as the PUT is — correction 11)
+    and is then stopped, while with NO bridge running Core removes both trees from the account root
+    itself (`services::coding_agent::purge_account_credentials`, called from
+    `agent_runtime::drop_account_credential`). The second case is the ordinary one, not an edge:
+    `IDLE_GRACE` releases a bridge fifteen minutes after its last turn and a node restart leaves
+    none at all, so a purge reaches a live bridge rarely and a purge that needed one would leave
+    the plaintext credential on disk exactly when nothing was there to remove it.
+    **The two arms remove the same thing, and it is the trees WHOLE.** Not the running engine's file
+    inside each of them: the account's engine is a row that can move under a live account while the
+    files of the previous one stay where they were (`sync/core_materializer.rs` writes `engine_id`
+    from the incoming row), so a purge that named a path would leave exactly the copies it was
+    written to remove. Neither arm names one — Core walks the two directories, and so does the
+    bridge (`credentials::remove_account_credentials`). What goes with a tree is a credential and
+    not state a later run needs: the per-engine directories exist before any engine uses them
+    (`credentials::prepare`), the bridge writes only a provider credential into the canonical one,
+    and the login home holds, beside its copy of that credential, whatever a sign-in, a probe or a
+    discovery run left in the CLI's own home — the scratch of a run that has ended, re-materialized
+    from the canonical file by the next lease. A session's own home is a different root and no part
+    of this.
+    That removal reaches BOTH trees even when one of them refuses — a `uchg` file on macOS, an
+    unreadable subtree, a `0500` parent directory: unlinking an entry needs write permission on its
+    PARENT, so the walk still reads the directory and is refused at `unlink` (EACCES). A file held
+    open by a running process is NOT one of those: POSIX unlinks it and the data leaves with the
+    last descriptor. The one held-open refusal that exists is a busy DIRECTORY's final `rmdir`,
+    which macOS answers with `EBUSY`. A sign-in in flight is not a partial failure either — the
+    bridge refuses that call whole (`login_in_progress`, so nothing is attempted on its side), and
+    Core removes the two trees itself once the bridge has been stopped. A failure in `credentials/`
+    used to return before `login/` was looked at, and the copy left behind is a retired token no row
+    names any more, so no reconcile can ever come back for it. Both arms attempt the second tree
+    regardless and report the failure; the acknowledgement an operator sees carries `ok = false`
+    with message key `agent_accounts.purge_incomplete` instead of a clean success, and the paths
+    that could not be emptied travel in the node's warning on EITHER arm (`AccountOpAck` has no
+    field for them): Core's `purge_account_credentials` names every tree it failed on, and a bridge
+    names its own in the error body that `call_bridge` embeds in the warning. The reconcile returns
+    an error for the same reason, after every stale account has been reached rather than instead of
+    reaching them — a store failure no longer stops the walk either, because the accounts it has not
+    reached are the only names left for their own files.
+    **What the walk does NOT protect against, stated because the opposite reads as a guarantee.** Both
+    arms remove a link as the link it is — neither descends into it — so a link planted where
+    `credentials/` or `login/` should be cannot aim the purge at a host path of somebody else's
+    choosing. The ACCOUNT DIRECTORY is not covered by that rule: it is resolved by joining
+    `<keys>/coding-agents/accounts` with the account id, so only the FINAL component of the path the
+    walk starts from is protected. An account directory that is ITSELF a symlink is followed by the
+    kernel when the two names are unlinked, and the purge then removes `credentials` and `login`
+    inside whatever it points at. The blast radius is exactly those two literal names — the walk
+    never goes deeper than the two roots and never names a file inside them — but a purge is not a
+    proof that the trees it removed were the account's own. Nothing in the product creates such a
+    link: the account root is made by `coding_agent::prepare_account_root`, which creates it as a
+    directory.
+    The login home is never a second source of truth: it is a working copy of the account's ONE file,
+    so the lease that hands it out clears it when there is no canonical credential to put there
+    rather than leaving the copy behind, and a publication from it cannot CREATE a credential the
+    account no longer has. Without that, a copy that outlived its file is what a removed credential
+    comes back from — the next probe reads it, the vendor CLI answers that the account is signed in,
+    and the publication after it puts the retired material back in front of every session on the
+    node. A sign-in is unaffected by either rule: it materializes BEFORE its CLI writes anything, so
+    a clear can only ever reach a copy of an earlier run. A sign-in after a clear mints ABOVE
     the mark, or every node that saw the revocation would refuse the new credential as covered by it.
     The same reconcile enforces the fleet flag: a node whose `receives_accounts` goes to 0 purges the
     material it already holds, and an account deleted anywhere drops the bridge copy from the arm
     that observed the delete (the FK cascade has already taken the row, so the reconcile cannot see
-    it). Because that purge is unconditional, `set_receives_accounts` REFUSES to turn the flag off
+    it). Which of the two removes the files depends on whether a bridge is running; THAT a purge
+    removes them does not, and that is why `set_receives_accounts` REFUSES to turn the flag off
     for a node that is some account's home: there the purge would drop the one copy every other
     node's is fanned out from, and for an account whose material exists only there, the credential
     itself. The refusal names the count and the remedy for the kinds
@@ -749,3 +1029,20 @@ Each package compiles, passes its tests, and leaves no old path behind it. WP1�
     one of them reaches the other directly. And a revocation reaches a node that never comes back
     online never at all — the material on its disk is exactly as retired as the token itself, which
     only the provider can invalidate.
+    **A lost home is RECORDED, never inferred.** Deleting the home node NULLs
+    `provider_accounts.home_node_id`, which is the same state an account that never had a home is in
+    — so migration rung 164 `provider_account_home_lost` (`db/migrations.rs:1045`) adds
+    `home_lost_node_id TEXT NULL`. It is set by the one UPDATE that NULLs the home
+    (`forget_node_tx`, `provider_accounts/repository.rs:697`) before the capture that publishes the
+    row, so the record cannot be a second write that gets lost; it is cleared by every path that
+    leaves the local node as the home — `claim_home_tx` including its early return for a home
+    already here (`:134`, `:143`), and `update_account` in the same statement when it names one —
+    and nothing ever sets it at creation. It is account metadata: it travels with the row through
+    `sync_capture` and the core materializer, so a peer receives the record of the loss together
+    with the absent home it explains, and a copy can therefore arrive carrying a loss this node
+    never recorded. That is why
+    the clearing sits on the claim itself rather than on this node's memory of having deleted
+    something. It is a node ID and not a name, because the node is gone from the registry and no
+    node can resolve one. A03 renders that state as its own — "Brak danych." plus the explanation
+    naming the deleted node by its short id (`www/js/modules/agent-accounts-window.js:240-247`) —
+    never as "no sessions", which is what an account that never had a home shows.

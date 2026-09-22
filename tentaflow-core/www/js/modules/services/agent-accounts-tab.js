@@ -200,14 +200,16 @@ function paintAccounts(body) {
     ${state.error.message
       ? `<p class="aa-error" role="alert" title="${escapeAttr(state.error.detail)}">${escapeHtml(state.error.message)}</p>`
       : ''}
+    <!-- On a phone the name and the status are what a person scans for; the
+         rest waits in the account detail one tap away. -->
     <tf-table variant="flush" id="aa-accounts-table" actions-label="${escapeAttr(I18n.t('common.actions'))}"
               empty-message="${escapeAttr(T('list_empty'))}">
       <tf-column key="account" label="${escapeAttr(T('col_account'))}" renderer="html" fill></tf-column>
-      <tf-column key="scope" label="${escapeAttr(T('col_scope'))}" renderer="html"></tf-column>
-      <tf-column key="credential" label="${escapeAttr(T('col_credential'))}"></tf-column>
+      <tf-column key="scope" label="${escapeAttr(T('col_scope'))}" renderer="html" priority="low"></tf-column>
+      <tf-column key="credential" label="${escapeAttr(T('col_credential'))}" priority="low"></tf-column>
       <tf-column key="status" label="${escapeAttr(T('col_status'))}" renderer="html"></tf-column>
-      <tf-column key="sessions" label="${escapeAttr(T('col_sessions'))}" renderer="html"></tf-column>
-      <tf-column key="nodes" label="${escapeAttr(T('col_used_on'))}"
+      <tf-column key="sessions" label="${escapeAttr(T('col_sessions'))}" renderer="html" priority="low"></tf-column>
+      <tf-column key="nodes" label="${escapeAttr(T('col_used_on'))}" priority="low"
                  hint="${escapeAttr(T('used_on_tooltip'))}"></tf-column>
     </tf-table>
     <div class="aa-foot" id="aa-accounts-foot"></div>`;
@@ -221,7 +223,7 @@ function paintAccounts(body) {
     scope: scopeChipHtml(account.scope),
     credential: credentialKindLabel(account.credential_kind),
     status: statusChipHtml(account),
-    sessions: `<b>${Number(account.session_count ?? 0)}</b>`,
+    sessions: sessionsCell(account),
     // The nodes that hold this account's credential, as this node measured
     // them — the column header carries the same caveat as its tooltip.
     nodes: usedOnLabel(account),
@@ -396,6 +398,18 @@ function sandboxChip(capable) {
 }
 
 /**
+ * "5 · 3 osoby" as in the mockup: the people are named only when there is more
+ * than one of them — "2 · 1 osoba" says nothing the reader did not assume.
+ */
+function sessionsCell(account) {
+  const sessions = Number(account.session_count ?? 0);
+  const people = Number(account.session_user_count ?? 0);
+  return `<b>${sessions}</b>` + (people > 1
+    ? ` <span class="tf-table__cell-sub">· ${escapeHtml(T('sessions_people', { count: people }))}</span>`
+    : '');
+}
+
+/**
  * One engine cell of the matrix: the state the owning node reports, plus the
  * menu that installs or removes it there.
  *
@@ -406,6 +420,12 @@ function sandboxChip(capable) {
  */
 function installCell(node, engineId, entry, gate) {
   const stateName = entry?.install_state ?? entry?.installState ?? 'absent';
+  // Nothing installed means one possible action, so it is the cell itself.
+  if (stateName === 'absent') {
+    return `<tf-button variant="secondary" size="sm" icon="download"
+      data-runtime-install data-node="${escapeAttr(node.node_id ?? '')}" data-engine="${escapeAttr(engineId)}"
+      ${gate.ok ? '' : `disabled title="${escapeAttr(T(gate.reason))}"`}>${escapeHtml(T('runtime_install'))}</tf-button>`;
+  }
   const trigger = `<tf-button variant="ghost" size="sm" icon="more"
       data-runtime-menu data-node="${escapeAttr(node.node_id ?? '')}" data-engine="${escapeAttr(engineId)}"
       data-state="${escapeAttr(stateName)}"
@@ -423,8 +443,6 @@ function installCell(node, engineId, entry, gate) {
     const reason = entry.last_error ?? entry.lastError ?? '';
     label = `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('install_error'))}"></tf-chip>`
       + (reason ? `<div class="tf-table__cell-sub">${escapeHtml(reason)}</div>` : '');
-  } else {
-    label = `<span class="tf-table__cell-sub">${escapeHtml(T('install_absent'))}</span>`;
   }
   // `tf-table__ent` is the shared "icon plus text on one line" cell layout from
   // controls.css — the only sheet a shadow root adopts, so this is what a cell
@@ -447,6 +465,11 @@ function wireRuntimeMenu(body) {
   let target = null;
 
   body.querySelector('#aa-runtime-table').addEventListener('click', (event) => {
+    const direct = event.composedPath().find((el) => el?.dataset?.runtimeInstall !== undefined);
+    if (direct) {
+      if (!direct.hasAttribute('disabled')) runInstall(direct.dataset.node, direct.dataset.engine, true);
+      return;
+    }
     const trigger = event.composedPath().find((el) => el?.dataset?.runtimeMenu !== undefined);
     if (!trigger || trigger.hasAttribute('disabled')) return;
     event.stopPropagation();
@@ -454,7 +477,6 @@ function wireRuntimeMenu(body) {
     const installed = target.state === 'installed';
     install.setAttribute('label', T(installed ? 'runtime_reinstall' : 'runtime_install'));
     uninstall.setAttribute('label', T('runtime_uninstall'));
-    uninstall.toggleAttribute('disabled', target.state === 'absent');
     menu.anchor = trigger;
     menu.open();
   });

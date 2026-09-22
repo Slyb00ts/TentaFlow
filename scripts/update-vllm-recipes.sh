@@ -67,7 +67,11 @@ def fetch_one(entry):
         "hf_id": hf_id,
         "base_argv": strip_serve_prefix(rc.get("argv")),
         "base_env": rc.get("env") or {},
-        "hardware_overrides": d.get("hardware_overrides") or {},
+        # Upstream sometimes puts a status string where an override object
+        # belongs (`"dgx_spark_gb10": "verified"`); only objects are overrides.
+        "hardware_overrides": {
+            k: v for k, v in (d.get("hardware_overrides") or {}).items() if isinstance(v, dict)
+        },
         "variants": {},
     }
     # Variants carry an alternative model_id (different weights/precision) plus

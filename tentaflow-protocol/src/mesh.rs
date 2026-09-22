@@ -1085,8 +1085,6 @@ pub enum MeshCommandResponsePayload {
     /// `CameraRecordingPull`. Confirms which files travelled; the bytes are not
     /// in this CBOR. Appended at END.
     CameraRecordingPullResult { pulled_refs: Vec<String> },
-    /// JSON response returned by a coding-agent bridge on the owner node.
-    AgentRpcResult { result_json: String },
     /// Code Studio: outcome of a `CodeStudioOp` executed on the owner node.
     /// Exactly one side is populated — `payload_cbor` holds the CBOR of the
     /// `CodeStudioPayload` response variant, `error` the protocol error with
@@ -1529,6 +1527,20 @@ impl std::fmt::Debug for MeshCommandType {
 // =============================================================================
 // Discriminant bytes dla identyfikacji wiadomosci na streamach QUIC
 // =============================================================================
+//
+// INVARIANT: a discriminant that travels as a UFP/2 unicast envelope MUST lie
+// inside the Mesh channel's kind range (`tentaflow_sdk_spec::protocol::frame::
+// channels::valid_kind_range(MESH)`, currently 0x10..=0x51). The receiver runs
+// `validate_channel_kind` on the envelope BEFORE any dispatch, so a value above
+// that bound is dropped as `UnknownKind` and the handler below is unreachable —
+// the sender sees a frame that never arrives and no error anywhere.
+//
+// A raw bi-stream discriminator is the exception and is NOT a UFP/2 kind: it
+// opens its own QUIC bi-stream and never enters an envelope, so its value may
+// sit outside the range (0x52 CAMERA_STREAM_SUBSCRIBE, 0x53
+// LIDAR_STREAM_SUBSCRIBE). Do not extend the range for those two — widening it
+// would bless them as valid envelope kinds. A new UFP/2 kind takes a FREE slot
+// inside the range (see MESH_MSG_PROVIDER_CREDENTIALS_SYNC = 0x29).
 
 pub const MESH_MSG_HEARTBEAT: u8 = 0x10;
 pub const MESH_MSG_FORWARD_REQ: u8 = 0x13;
@@ -1648,7 +1660,13 @@ pub const MESH_MSG_LIDAR_STREAM_SUBSCRIBE: u8 = 0x53;
 /// Agent-account credentials, each sealed for the one peer that receives the
 /// frame. Same reason as `MESH_MSG_SHARED_SECRETS_SYNC`: a provider token must
 /// not sit in a ledger body that a node which may not hold it stores and relays.
-pub const MESH_MSG_PROVIDER_CREDENTIALS_SYNC: u8 = 0x54;
+///
+/// It travels as a UFP/2 unicast envelope, so it takes the free slot next to the
+/// sibling it mirrors (0x28) and stays inside the Mesh channel kind range. It
+/// first carried 0x54, one past the raw bi-stream discriminators — a value the
+/// receiver's structural validator drops before dispatch, which is what made
+/// the fan-out silently deliver nothing.
+pub const MESH_MSG_PROVIDER_CREDENTIALS_SYNC: u8 = 0x29;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)
@@ -2631,6 +2649,24 @@ mod tests {
         .expect("encode");
 
         assert!(crate::cbor::decode::<MeshCommandType>(&bytes).is_err());
+    }
+
+    /// `AgentRpcResult` carried a coding-agent bridge's JSON answer back over
+    /// the mesh; the whole old "agent account = services row" path it served
+    /// is gone (SCHEMA_VERSION 32) and nothing constructs or matches it any
+    /// more. A frame still naming the old variant must not decode.
+    #[test]
+    fn a_frame_naming_the_removed_agent_rpc_result_does_not_decode() {
+        #[derive(SerdeSerialize)]
+        enum Removed {
+            AgentRpcResult { result_json: String },
+        }
+        let bytes = crate::cbor::encode(&Removed::AgentRpcResult {
+            result_json: "{}".to_string(),
+        })
+        .expect("encode");
+
+        assert!(crate::cbor::decode::<MeshCommandResponsePayload>(&bytes).is_err());
     }
 
     #[test]

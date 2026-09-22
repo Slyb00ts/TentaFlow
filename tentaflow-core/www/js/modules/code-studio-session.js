@@ -350,10 +350,9 @@ function runInfoOf(run) {
   const finished = parseAt(run.finished_at ?? run.finishedAt);
   const kind = String(run.kind || '');
   return {
-    // The widget renders this as the row's name. A raw `agent_id` is a uuid on
-    // the orchestrator, which says nothing; the run chain names a run by its
-    // kind and its ordinal, and the two lists must not disagree.
-    agent: [kind ? t(`run_kind.${kind}`) : '', run.ordinal ? `#${run.ordinal}` : ''].filter(Boolean).join(' '),
+    // The widget renders this as the row's name: the agent's name, else the
+    // kind of run, with its ordinal — the same name the run chain shows.
+    agent: [runName(run, run.run_id ?? run.runId, kind), run.ordinal ? `#${run.ordinal}` : ''].filter(Boolean).join(' '),
     status: run.status,
     parentRunId: run.parent_run_id ?? run.parentRunId ?? '',
     startedAt: Number.isNaN(started) ? 0 : started,
@@ -363,6 +362,14 @@ function runInfoOf(run) {
     model: run.model || '',
     accountLabel: accountChipLabel(run.account),
   };
+}
+
+// What a person reads as the run's name: the agent's name the server resolved,
+// else what kind of run it is. `agent_id` is a uuid and is never shown.
+function runName(run, runId, kind = run?.kind) {
+  if (run?.agent_name) return run.agent_name;
+  if (kind) return t(`run_kind.${kind}`);
+  return shortId(runId);
 }
 
 // C02 — the account a run's CLI actually ran on, as the chip's text.
@@ -451,6 +458,7 @@ export function mountSession(hostEl, context) {
     sessionId: context.sessionId || context.session?.session_id || '',
     workspace: context.workspace || {},
     session: context.session || {},
+    isAdmin: context.isAdmin === true,
     onExit: typeof context.onExit === 'function' ? context.onExit : null,
     onNewSession: typeof context.onNewSession === 'function' ? context.onNewSession : null,
   };
@@ -1271,8 +1279,8 @@ function openSubagentTab(runId) {
     stage: 'subagent',
     dot: dotClassFor(run?.status),
     mono: false,
-    label: run?.agent_id || shortId(runId),
-    title: run?.agent_id || shortId(runId),
+    label: runName(run, runId),
+    title: runName(run, runId),
     sub: run ? `${t(`run_kind.${run.kind}`)} · ${runStatusLabel(run.status)}` : '',
     // C02 — the account this sub-agent's CLI ran on, next to its state. A run
     // that resolved none carries no chip rather than an empty one.
@@ -1646,7 +1654,7 @@ function runStartedNode(ev, scope) {
       <div class="ev ev-spawn" data-run="${escapeAttr(runId)}">
         <span class="av">${sprite('brain')}</span>
         <span>
-          <span class="nm">${escapeHtml(ev.agentId || shortId(runId))}</span>
+          <span class="nm">${escapeHtml(runName(state.runs.find((r) => r.run_id === runId), runId, kind))}</span>
           <span class="ds">${escapeHtml(t(`trigger.${trigger}`))}</span>
         </span>
         ${account ? `<tf-chip size="sm" status="accent" label="${escapeAttr(account)}"></tf-chip>` : ''}
@@ -1779,10 +1787,18 @@ function askMarkNode(ev) {
   // the line has to say so — "wymagane uprawnienie" would send the reader
   // looking for an operator to approve something nobody can approve (C01).
   const account = ev.p.capability === ACCOUNT_LOGIN_CAPABILITY;
+  // The server's summary is English; the line says the same thing in the
+  // person's language. An account question names what the card below names.
+  const approval = account
+    ? state?.approvals?.find((a) => a.approval_id === ev.p.approval_id)
+    : null;
+  const what = account
+    ? (approval ? accountAskFromApproval(approval).who : '')
+    : capabilityQuestion(String(ev.p.capability || ''), ev.p.summary);
   return node(`
     <div class="ev ev-askmark" data-approval="${escapeAttr(ev.p.approval_id || '')}">
       <span class="cs-dot ask"></span>
-      <span><span class="q">${escapeHtml(t(account ? 'ask.account.anchor' : 'ask.anchor'))}</span> ${escapeHtml(String(ev.p.summary || ev.p.capability || ''))}</span>
+      <span><span class="q">${escapeHtml(t(account ? 'ask.account.anchor' : 'ask.anchor'))}</span> <span data-ask-what>${escapeHtml(what)}</span></span>
       <span class="go">${escapeHtml(t(account ? 'ask.account.go' : 'ask.go'))}</span>
     </div>
   `);
@@ -1862,7 +1878,7 @@ function openSubagent(runId) {
   const title = host.querySelector('[data-sub-title]');
   const meta = host.querySelector('[data-sub-meta]');
   const dot = host.querySelector('[data-sub-dot]');
-  if (title) title.textContent = run?.agent_id || shortId(runId);
+  if (title) title.textContent = runName(run, runId);
   if (meta) {
     meta.textContent = [
       run ? t(`run_kind.${run.kind}`) : '',
@@ -2071,21 +2087,48 @@ function questionFromToolCall(ev) {
   };
 }
 
+// Capabilities the permission engine can ask about (`pep.rs::Capability::slug`).
+// The server phrases its question in English around the slug, so the console
+// asks it in the person's language from the slug instead.
+const CAPABILITY_SLUGS = new Set([
+  'fs_read', 'code_search', 'fs_write', 'fs_delete', 'exec', 'terminal', 'git_read',
+  'git_branch', 'git_network', 'git_stage', 'git_commit', 'git_push', 'git_merge',
+  'git_merge_finalize', 'git_worktree', 'net_egress', 'cli_delegate', 'review_decide',
+  'secret_manage', 'task_plan', 'workspace_settings', 'member_manage',
+]);
+
+function capabilityQuestion(capability, fallback) {
+  return CAPABILITY_SLUGS.has(capability)
+    ? t('ask.permission', { what: t(`capability.${capability}`) })
+    : String(fallback || capability);
+}
+
 function askFromApproval(approval) {
   const capability = String(approval.capability || '');
   const mandatory = !!approval.mandatory_interactive || MANDATORY_CAPABILITIES.has(capability);
   if (capability === ACCOUNT_LOGIN_CAPABILITY) return accountAskFromApproval(approval);
+  const runId = String(approval.run_id || '');
   return {
     kind: REVIEW_CAPABILITIES.has(capability) ? 'review' : 'approval',
     approvalId: String(approval.approval_id || ''),
     capability,
-    who: shortId(approval.run_id || '') || t('session.orchestrator'),
-    question: String(approval.summary || capability),
+    who: runId ? runName(state?.runs?.find((r) => r.run_id === runId), runId) : t('session.orchestrator'),
+    question: capabilityQuestion(capability, approval.summary),
     detail: String(approval.detail || ''),
     mandatory,
     options: [],
     runId: String(approval.run_id || ''),
   };
+}
+
+// A shared (global) account is signed in by an administrator only — the
+// server refuses anyone else — so its card asks a person without that right to
+// fetch one instead of offering a sign-in that cannot succeed.
+function accountAskBody(account) {
+  if (account.mode === 'global') {
+    return ctx?.isAdmin ? 'ask.account.body_global_admin' : 'ask.account.body_global';
+  }
+  return account.accountId ? 'ask.account.body_relogin' : 'ask.account.body';
 }
 
 // C01 — the run is parked because the account its agent is bound to is not
@@ -2118,7 +2161,7 @@ function accountAskFromApproval(approval) {
       // the screen the sign-in opens say "konto użytkownika" alike.
       I18n.t(`agent_accounts.subtitle_${account.mode === 'global' ? 'global' : 'user'}`),
     ].filter(Boolean).join(' · '),
-    question: t(account.accountId ? 'ask.account.body_relogin' : 'ask.account.body', { engine }),
+    question: t(accountAskBody(account), { engine, account: account.accountName || engine }),
     detail: String(approval.summary || ''),
     mandatory: false,
     options: [],
@@ -2259,6 +2302,13 @@ function askOptions(ask) {
   }
   if (ask.kind === 'account') {
     const engine = ask.account?.engineName || ask.account?.engineId || '';
+    const cancel = {
+      label: t('ask.account.cancel'),
+      detail: t('ask.account.cancel_detail'),
+      action: 'answer-deny',
+      value: '',
+    };
+    if (ask.account?.mode === 'global' && !ctx?.isAdmin) return [{ key: '1', ...cancel }];
     return [
       {
         key: '1',
@@ -2267,13 +2317,7 @@ function askOptions(ask) {
         action: 'answer-login',
         value: '',
       },
-      {
-        key: '2',
-        label: t('ask.account.cancel'),
-        detail: t('ask.account.cancel_detail'),
-        action: 'answer-deny',
-        value: '',
-      },
+      { key: '2', ...cancel },
     ];
   }
   return APPROVAL_SCOPES.map((scope, i) => ({
@@ -2391,7 +2435,7 @@ function renderRunChain() {
       <span class="gnode"><span class="gdot"></span>${index < state.runs.length - 1 ? '<span class="gline"></span>' : ''}</span>
       <span>
         <span class="gmsg">${escapeHtml(t(`run_kind.${run.kind}`))} #${escapeHtml(String(run.ordinal))} — ${escapeHtml(t(`trigger.${run.trigger}`))}</span>
-        <span class="gmeta">${escapeHtml(run.agent_id || shortId(run.run_id))} · ${escapeHtml(runStatusLabel(run.status))} · ${escapeHtml(durationOf(run.started_at, run.finished_at))}</span>
+        <span class="gmeta">${escapeHtml(runName(run, run.run_id))} · ${escapeHtml(runStatusLabel(run.status))} · ${escapeHtml(durationOf(run.started_at, run.finished_at))}</span>
         ${run.note ? `<span class="gmeta">${escapeHtml(run.note)}</span>` : ''}
       </span>
     </div>
@@ -2651,12 +2695,24 @@ function renderTasks() {
   }).join('');
 }
 
+// An account line can reach the stream before the poll brings its approval in,
+// and is then drawn without the agent it is about; the poll fills it in.
+function fillAccountAnchors() {
+  for (const approval of state.approvals) {
+    if (approval.capability !== ACCOUNT_LOGIN_CAPABILITY) continue;
+    const who = accountAskFromApproval(approval).who;
+    host?.querySelectorAll(`.ev-askmark[data-approval="${CSS.escape(String(approval.approval_id || ''))}"] [data-ask-what]`)
+      .forEach((el) => { if (!el.textContent) el.textContent = who; });
+  }
+}
+
 async function loadApprovals() {
   try {
     const resp = await ApiBinary.one('codeStudioApprovalsListRequest', {
       workspaceId: ctx.workspaceId, sessionId: ctx.sessionId, status: 'pending',
     });
     state.approvals = resp.approvals || [];
+    fillAccountAnchors();
     const pending = state.approvals.find((a) => a.status === 'pending');
     // A typed question and a pane confirmation are ours, not the server's: a
     // poll that finds no pending approval must not wipe them off the composer.

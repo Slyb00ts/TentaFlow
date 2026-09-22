@@ -1269,10 +1269,10 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
     </div>
     <div class="ml-studio-section-card">
       <div class="ml-studio-section-card-head">
-        <div class="title">${sprite('transform')} Przenieś projekt <span class="ml-studio-section-sub">— eksport do archiwum i import na innym węźle (poza mesh)</span></div>
+        <div class="title">${sprite('transform')} Przenieś projekt <span class="ml-studio-section-sub">— eksport do archiwum i import na innym nodzie (poza mesh)</span></div>
         <tf-button variant="outline" icon="download" id="ml-studio-ov-export">Eksportuj projekt</tf-button>
       </div>
-      <p class="ml-studio-section-sub">Spakuj projekt (schemat, dane, opcjonalnie modele i historię treningów) do pobieralnego archiwum, a następnie zaimportuj je na innym węźle TentaFlow, który nie jest w tym samym meshu.</p>
+      <p class="ml-studio-section-sub">Spakuj projekt (schemat, dane, opcjonalnie modele i historię treningów) do pobieralnego archiwum, a następnie zaimportuj je na innym nodzie TentaFlow, który nie jest w tym samym meshu.</p>
     </div>
     <div class="ml-studio-section-card">
       <div class="ml-studio-section-card-head">
@@ -2765,7 +2765,7 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
         </div>
         ${onlyOne ? '' : '<tf-select id="ml-studio-ft-dataset" label="Zbiór treningowy"></tf-select>'}
         <div class="ml-studio-ft-resources" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:8px">
-          <tf-select id="ml-studio-ft-node" label="Węzeł treningowy" style="flex:1;min-width:200px"></tf-select>
+          <tf-select id="ml-studio-ft-node" label="Node treningowy" style="flex:1;min-width:200px"></tf-select>
           <tf-input type="number" id="ml-studio-ft-gpus" label="GPU (0 = wszystkie)" value="0" min="0" max="64" step="1" style="width:150px"></tf-input>
           <tf-toggle id="ml-studio-ft-multirig" label="Multi-rig (rozproszony)"></tf-toggle>
         </div>
@@ -2793,9 +2793,9 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
   cfg.multiRig = Boolean(cfg.multiRig);
   const nodeSel = byId('ml-studio-ft-node');
   if (nodeSel) {
-    nodeSel.setOptions([{ value: '', label: 'Lokalnie (ten węzeł)' }], cfg.targetNodeId);
+    nodeSel.setOptions([{ value: '', label: 'Lokalnie (ten node)' }], cfg.targetNodeId);
     ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).then((nodes) => {
-      const opts = [{ value: '', label: 'Lokalnie (ten węzeł)' }];
+      const opts = [{ value: '', label: 'Lokalnie (ten node)' }];
       (nodes || []).forEach((n) => {
         const id = n.nodeId || n.node_id;
         if (!id) return;
@@ -2829,7 +2829,7 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
       return;
     }
     if (cfg.multiRig && !cfg.targetNodeId) {
-      toast('Multi-rig (rozproszony) wymaga wybrania węzła zdalnego jako master.', 'error');
+      toast('Multi-rig (rozproszony) wymaga wybrania noda zdalnego jako master.', 'error');
       return;
     }
     const runBtn = byId('ml-studio-ft-run');
@@ -2915,7 +2915,7 @@ function startFtLive(host, runId, { selectTab }) {
       const rate = Number(st.syncRateBps ?? st.sync_rate_bps ?? 0);
       const pct = tot > 0 ? Math.max(0, Math.min(100, Math.round((sent / tot) * 100))) : 0;
       const phaseLabel = syncPhase === 'zipping' ? 'pakowanie datasetu'
-        : syncPhase === 'starting' ? 'uruchamianie treningu na węźle'
+        : syncPhase === 'starting' ? 'uruchamianie treningu na nodzie'
         : 'transfer datasetu przez mesh';
       const meta = byId('ml-studio-ft-progress-meta');
       const bar = byId('ml-studio-ft-progress-bar');
@@ -3176,7 +3176,7 @@ function renderRecogDataTab(panel, p) {
           <button type="button" class="ml-studio-source-tile" data-source="folder">
             <span class="st-ico">${sprite('folder')}</span>
             <span class="st-name">Z folderu (na serwerze)</span>
-            <span class="st-desc">Import całego katalogu obrazów/wideo z węzła.</span>
+            <span class="st-desc">Import całego katalogu obrazów/wideo z noda.</span>
           </button>
           <button type="button" class="ml-studio-source-tile" data-source="camera">
             <span class="st-ico">${sprite('record')}</span>
@@ -3204,7 +3204,7 @@ function renderRecogDataTab(panel, p) {
 
         <div class="ml-studio-source-body" id="ml-studio-source-folder" hidden>
           <tf-input id="ml-studio-recog-build-srcdir" label="Folder na serwerze (ścieżka)" placeholder="np. /mnt/dane/adr"></tf-input>
-          <p class="ml-studio-data-hint" style="margin:6px 0 0">Core czyta media wprost z dysku węzła — nic nie jest wgrywane przez przeglądarkę.</p>
+          <p class="ml-studio-data-hint" style="margin:6px 0 0">Core czyta media wprost z dysku noda — nic nie jest wgrywane przez przeglądarkę.</p>
         </div>
 
         <div class="ml-studio-source-body" id="ml-studio-source-camera" hidden>
@@ -3861,7 +3861,7 @@ function openRecogImportRecordingsModal(pid) {
       // Node unreachable / not trusted / timeout — show the server error verbatim
       // and leave the table empty instead of crashing the modal.
       if (errHost) {
-        errHost.innerHTML = `<tf-alert tone="danger" title="Nie udało się wczytać nagrań z węzła" message="${escapeAttr(err.message || 'Błąd protokołu.')}"></tf-alert>`;
+        errHost.innerHTML = `<tf-alert tone="danger" title="Nie udało się wczytać nagrań z noda" message="${escapeAttr(err.message || 'Błąd protokołu.')}"></tf-alert>`;
       }
     }
     applyCameraOptions();
@@ -3943,13 +3943,13 @@ function openRecogImportRecordingsModal(pid) {
     const renderSourceHint = () => {
       if (!srcHint) return;
       srcHint.innerHTML = state.sourceNodeId
-        ? '<tf-alert tone="info" message="Nagrania zostaną pobrane z wybranego węzła przez mesh, a klatki wyodrębnione i oznaczone lokalnie."></tf-alert>'
+        ? '<tf-alert tone="info" message="Nagrania zostaną pobrane z wybranego noda przez mesh, a klatki wyodrębnione i oznaczone lokalnie."></tf-alert>'
         : '';
     };
     if (srcSel?.setOptions) {
       const trusted = state.peers.filter(isTrustedPeer);
       const opts = [
-        { value: '', label: 'Ten węzeł (lokalny)' },
+        { value: '', label: 'Ten node (lokalny)' },
         ...trusted.map((p) => ({
           value: peerNodeIdHex(p),
           label: p.displayName || p.display_name || peerNodeIdHex(p).slice(0, 12),
@@ -5414,10 +5414,10 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
           <div id="ml-studio-recog-classes" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
         </section>
         <section class="ml-studio-data-card">
-          <div class="ml-studio-data-head">${sprite('services')} Węzeł treningu (mesh)
-            <span class="ml-studio-data-hint">trening lokalnie albo na zdalnym węźle (Node B); dataset COCO musi być widoczny na wybranym węźle</span>
+          <div class="ml-studio-data-head">${sprite('services')} Node treningu (mesh)
+            <span class="ml-studio-data-hint">trening lokalnie albo na zdalnym nodzie (Node B); dataset COCO musi być widoczny na wybranym nodzie</span>
           </div>
-          <tf-select id="ml-studio-recog-node" label="Węzeł"></tf-select>
+          <tf-select id="ml-studio-recog-node" label="Node"></tf-select>
         </section>
         <div id="ml-studio-train-form"></div>
         <div class="ml-studio-ft-actions">
@@ -5778,7 +5778,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
   (async () => {
     const nodeSel = byId('ml-studio-recog-node');
     if (!nodeSel) return;
-    const opts = [{ value: '', label: 'Lokalnie (ten węzeł)' }];
+    const opts = [{ value: '', label: 'Lokalnie (ten node)' }];
     try {
       const resp = await ApiBinary.one('meshNodeListRequest');
       for (const n of (resp.nodes || [])) {
@@ -6037,7 +6037,7 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
       const rate = Number(st.syncRateBps ?? st.sync_rate_bps ?? 0);
       const pct = tot > 0 ? Math.max(0, Math.min(100, Math.round((sent / tot) * 100))) : 0;
       const phaseLabel = syncPhase === 'zipping' ? 'pakowanie datasetu'
-        : syncPhase === 'starting' ? 'uruchamianie treningu na węźle'
+        : syncPhase === 'starting' ? 'uruchamianie treningu na nodzie'
         : 'transfer datasetu przez mesh';
       const meta = byId('ml-studio-recog-meta');
       const bar = byId('ml-studio-recog-bar');
@@ -6056,7 +6056,7 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
         `;
       }
       const chart = byId('ml-studio-recog-chart');
-      if (chart) chart.innerHTML = `<div class="ml-studio-ft-sync-note">${sprite('cloud')} Dataset przenoszony na węzeł treningowy przez mesh. Trening ruszy po zmaterializowaniu danych.</div>`;
+      if (chart) chart.innerHTML = `<div class="ml-studio-ft-sync-note">${sprite('cloud')} Dataset przenoszony na node treningowy przez mesh. Trening ruszy po zmaterializowaniu danych.</div>`;
       const badge = byId('ml-studio-recog-badge');
       if (badge) badge.innerHTML = '<tf-badge tone="info" value="transfer danych"></tf-badge>';
       return;
@@ -6849,7 +6849,7 @@ function openVisionPublishPanel(p, row, onDone) {
   modal.setAttribute('title', isOcr ? `Ustaw jako czytnik ADR — ${row._modelName}` : `Publikuj do kamer — ${row._modelName}`);
   modal.setAttribute('size', 'md');
   const bodyHtml = isOcr
-    ? `<p class="ml-studio-export-intro">Model zastąpi czytnik tablic ADR tego węzła: pliki <code>adr_ocr.onnx</code> i <code>adr_ocr_alphabet.txt</code> trafią do katalogu modeli wizji, a pipeline kamer zacznie ich używać od razu — bez restartu i bez rejestru (ten czytnik ładuje się po stałej nazwie, nie po aliasie). Poprzedni czytnik zostanie nadpisany.</p>`
+    ? `<p class="ml-studio-export-intro">Model zastąpi czytnik tablic ADR tego noda: pliki <code>adr_ocr.onnx</code> i <code>adr_ocr_alphabet.txt</code> trafią do katalogu modeli wizji, a pipeline kamer zacznie ich używać od razu — bez restartu i bez rejestru (ten czytnik ładuje się po stałej nazwie, nie po aliasie). Poprzedni czytnik zostanie nadpisany.</p>`
     : `<p class="ml-studio-export-intro">Model trafi do rejestru modeli wizyjnych (silnik onnx-cv). Pipeline'y kamer wskazują go przez alias lub bezpośrednio po nazwie — bez rekompilacji. Jeśli ONNX nie był jeszcze wyeksportowany, eksport uruchomi się automatycznie (RF-DETR: kilka minut).</p>
       <tf-input id="ml-studio-vision-name" label="Nazwa w rejestrze (a-z, 0-9, -, _)" value="${escapeAttr(suggested)}"></tf-input>
       <tf-select id="ml-studio-vision-op" label="Operacja" value="${op}" disabled>
@@ -7001,8 +7001,8 @@ async function deployFtModel(modelId, modelName, onDone, project) {
   modal.setAttribute('size', 'md');
   modal.innerHTML = `
     <div slot="body">
-      <p class="ml-studio-export-intro">Wybierz węzeł docelowy. „Węzeł modelu" wdraża tam, gdzie powstał artefakt. Inny węzeł → Core przeniesie artefakt przez mesh (np. model MLX na Mac mini).</p>
-      <tf-select id="ml-studio-deploy-node" label="Węzeł docelowy"></tf-select>
+      <p class="ml-studio-export-intro">Wybierz node docelowy. „Node modelu" wdraża tam, gdzie powstał artefakt. Inny node → Core przeniesie artefakt przez mesh (np. model MLX na Mac mini).</p>
+      <tf-select id="ml-studio-deploy-node" label="Node docelowy"></tf-select>
       <div id="ml-studio-deploy-status" style="margin-top:10px"></div>
     </div>
     <div slot="footer">
@@ -7018,9 +7018,9 @@ async function deployFtModel(modelId, modelName, onDone, project) {
 
   let targetNodeId = '';
   const sel = modal.querySelector('#ml-studio-deploy-node');
-  sel?.setOptions([{ value: '', label: 'Węzeł modelu (domyślnie)' }], '');
+  sel?.setOptions([{ value: '', label: 'Node modelu (domyślnie)' }], '');
   ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).then((nodes) => {
-    const opts = [{ value: '', label: 'Węzeł modelu (domyślnie)' }];
+    const opts = [{ value: '', label: 'Node modelu (domyślnie)' }];
     (nodes || []).forEach((n) => {
       const id = n.nodeId ?? n.node_id ?? '';
       const host = n.hostname ?? n.host ?? id.slice(0, 12);
@@ -7055,10 +7055,10 @@ async function deployFtModel(modelId, modelName, onDone, project) {
       const pct = tot > 0 ? Math.max(0, Math.min(100, Math.round((sent / tot) * 100))) : 0;
       const detail = tot > 0
         ? `${fmtBytes(sent)} / ${fmtBytes(tot)} · ${pct}% · ${fmtRate(rate)}`
-        : 'transfer artefaktu na węzeł docelowy…';
+        : 'transfer artefaktu na node docelowy…';
       st.innerHTML = `<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Transfer artefaktu — ${detail}</span></div>`;
     } else {
-      st.innerHTML = '<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Uruchamianie serwisu na węźle docelowym…</span></div>';
+      st.innerHTML = '<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Uruchamianie serwisu na nodzie docelowym…</span></div>';
     }
   };
 
@@ -7130,7 +7130,7 @@ function openFtChatPanel(modelId, modelName) {
   modal.setAttribute('size', 'lg');
   modal.innerHTML = `
     <div slot="body">
-      <p class="ml-studio-export-intro">Wpisz zapytanie — model odpowie przez lokalny silnik inferencji (a gdy żyje na innym węźle mesh, Core proxuje zapytanie do niego). Pierwsza odpowiedź może chwilę potrwać (ładowanie modelu).</p>
+      <p class="ml-studio-export-intro">Wpisz zapytanie — model odpowie przez lokalny silnik inferencji (a gdy żyje na innym nodzie mesh, Core proxuje zapytanie do niego). Pierwsza odpowiedź może chwilę potrwać (ładowanie modelu).</p>
       <tf-textarea id="ml-studio-chat-input" rows="3" placeholder="np. Czy nalepka ADR jest poprawnie naklejona?"></tf-textarea>
       <div style="display:flex;gap:8px;align-items:center;margin:10px 0">
         <tf-input type="number" id="ml-studio-chat-maxtok" label="Maks. tokenów" value="256" min="1" max="2048" step="16" style="width:160px"></tf-input>
@@ -7267,7 +7267,7 @@ function openFtExportPanel(p, modelId, modelName) {
           <span class="lbl">Rozmiar</span>
           <span class="val">${size}</span>
         </div>
-        <p class="ml-studio-export-note">Plik GGUF zapisany na węźle — gotowy do pobrania/deployu.</p>
+        <p class="ml-studio-export-note">Plik GGUF zapisany na nodzie — gotowy do pobrania/deployu.</p>
         <div class="ml-studio-export-deploy" id="ml-studio-export-deploy"></div>
       </div>
     `;
@@ -7454,7 +7454,7 @@ function openProjectExportModal(project) {
   // Widok 1: wybór zawartości archiwum + start eksportu.
   const renderForm = () => {
     body.innerHTML = `
-      <p class="ml-studio-export-intro">Spakuj projekt do archiwum, które przeniesiesz na inny węzeł TentaFlow — także spoza tego meshu. Schemat i dane są zawsze w paczce; modele i historię treningów dołączasz opcjonalnie.</p>
+      <p class="ml-studio-export-intro">Spakuj projekt do archiwum, które przeniesiesz na inny node TentaFlow — także spoza tego meshu. Schemat i dane są zawsze w paczce; modele i historię treningów dołączasz opcjonalnie.</p>
       <div style="display:flex;flex-direction:column;gap:12px">
         <div class="ml-studio-transfer-opt" style="display:flex;align-items:flex-start;gap:12px">
           <tf-toggle id="ml-studio-export-models"></tf-toggle>
@@ -7516,7 +7516,7 @@ function openProjectExportModal(project) {
     body.innerHTML = `
       <div class="ml-studio-export-result">
         <div class="ml-studio-export-result-head">${sprite('check')} <span>Archiwum gotowe</span> <tf-badge tone="success" value="Gotowe"></tf-badge></div>
-        <p class="ml-studio-export-note">Pobierz paczkę i wgraj ją na docelowym węźle przez „Importuj projekt". Link do pobrania jest jednorazowy i wygasa — pobierz teraz.</p>
+        <p class="ml-studio-export-note">Pobierz paczkę i wgraj ją na docelowym nodzie przez „Importuj projekt". Link do pobrania jest jednorazowy i wygasa — pobierz teraz.</p>
         <div class="ml-studio-export-result-row"><span class="lbl">Rozmiar archiwum</span><span class="val">${escapeHtml(sizeText)}</span></div>
       </div>
     `;
@@ -7652,7 +7652,7 @@ function openProjectImportModal() {
   const renderPick = (notice) => {
     body.innerHTML = `
       ${notice ? `<tf-alert tone="warning" message="${escapeAttr(notice)}"></tf-alert>` : ''}
-      <p class="ml-studio-export-intro">Wgraj archiwum projektu wyeksportowane na innym węźle. Duże pliki są wysyłane fragmentami i wznawiane po zerwaniu połączenia.</p>
+      <p class="ml-studio-export-intro">Wgraj archiwum projektu wyeksportowane na innym nodzie. Duże pliki są wysyłane fragmentami i wznawiane po zerwaniu połączenia.</p>
       <tf-file-input id="ml-studio-import-file" accept=".zip" label="Przeciągnij archiwum .zip lub kliknij, aby wybrać"></tf-file-input>
       <div class="ml-studio-transfer-picked" id="ml-studio-import-picked" style="margin-top:10px;font-size:13px;color:var(--text-2,#aaa);display:flex;align-items:center;gap:6px"></div>
     `;
@@ -9321,7 +9321,7 @@ function renderResourcePool(pool, nodes) {
     const empty = document.createElement('tf-empty-state');
     empty.setAttribute('icon', 'host');
     empty.setAttribute('title', 'Brak nodów w mesh');
-    empty.setAttribute('message', 'Sparuj węzeł w sekcji Mesh, aby udostępnić jego zasoby do przydziału.');
+    empty.setAttribute('message', 'Sparuj node w sekcji Mesh, aby udostępnić jego zasoby do przydziału.');
     pool.appendChild(empty);
     return;
   }

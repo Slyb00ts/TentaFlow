@@ -157,6 +157,7 @@ fn adopt_entry(
             sender_node_id,
             "not_home_node",
             entry.revision,
+            None,
         )?;
         return Ok(None);
     }
@@ -181,6 +182,7 @@ fn adopt_entry(
             sender_node_id,
             "digest_mismatch",
             entry.revision,
+            None,
         )?;
         return Ok(None);
     }
@@ -205,12 +207,30 @@ fn adopt_entry(
         &meta,
     )? {
         crate::provider_accounts::CredentialWrite::Applied { revision } => Ok(Some(revision)),
-        // A replay of what is already here, an older revision, or two writers
-        // that minted one revision — the last of which `set_credential` has
-        // already audited and answered by asking for a new sign-in.
+        // A replay of what is already here, or two writers that minted one
+        // revision — the last of which `set_credential` has already audited and
+        // answered by asking for a new sign-in.
         crate::provider_accounts::CredentialWrite::Unchanged { .. }
-        | crate::provider_accounts::CredentialWrite::Stale { .. }
         | crate::provider_accounts::CredentialWrite::Conflict { .. } => Ok(None),
+        // An older revision than this node holds. The home is the single
+        // refresher, so the newer material stays and the submission is dropped —
+        // but dropping it in silence is how a lost rotation becomes invisible
+        // from the node that dropped it: a satellite whose copy trails the home
+        // mints `base + 1`, the home discards it, and the home's next fan-out
+        // overwrites the satellite's newer material with the older one. Nothing
+        // in the resulting state records the submission, so the audit row IS the
+        // record.
+        crate::provider_accounts::CredentialWrite::Stale { revision } => {
+            store::record_credential_refusal(
+                &security.db,
+                &entry.account_id,
+                sender_node_id,
+                "stale_revision",
+                entry.revision,
+                Some(revision),
+            )?;
+            Ok(None)
+        }
     }
 }
 
@@ -456,6 +476,88 @@ mod tests {
         // Towards the home node the same satellite MAY submit what its CLI
         // rotated — that is how a rotation reaches the single refresher.
         assert!(build_for_peer(&first, &home_id).unwrap().is_some());
+    }
+
+    /// A satellite whose copy trails the home submits a LOWER revision than the
+    /// one the home already holds. The home keeps its own material — it is the
+    /// single refresher and that authority is the point — but it now says so in
+    /// the audit log, with the revision offered and the revision held, instead of
+    /// dropping the submission in silence. Silence was the defect: the home's
+    /// fan-out then overwrites the satellite's newer material with the older
+    /// revision, and nothing recorded that a rotation had ever been offered. Two
+    /// fleet nodes running one account concurrently reach exactly this.
+    #[test]
+    fn a_revision_below_the_home_is_dropped_with_an_audit() {
+        let (home, satellite) = (node(10), node(11));
+        let (home_id, sat_id) = (
+            home.ed25519_public_key_hex(),
+            satellite.ed25519_public_key_hex(),
+        );
+        trust(&home, &satellite);
+        trust(&satellite, &home);
+        for holder in [&home, &satellite] {
+            seed_account(holder, "acc-5", &home_id);
+            receives(holder, &sat_id, true);
+            receives(holder, &home_id, true);
+        }
+        // The home is at revision 3; the satellite's copy stopped at 2.
+        for material in ["one", "two", "three"] {
+            store::mint_credential(
+                &home.db,
+                home.settings_cipher(),
+                "acc-5",
+                material,
+                &CredentialMeta::default(),
+            )
+            .unwrap();
+        }
+        store::set_credential(
+            &satellite.db,
+            satellite.settings_cipher(),
+            "acc-5",
+            2,
+            "two",
+            &CredentialMeta::default(),
+        )
+        .unwrap();
+
+        let payload = build_for_peer(&satellite, &home_id)
+            .unwrap()
+            .expect("the satellite may submit to the home");
+        assert_eq!(payload.entries[0].revision, 2);
+        let adopted = ingest(&home, &sat_id, payload).unwrap();
+
+        assert!(
+            adopted.is_empty(),
+            "nothing moved: the home's revision wins"
+        );
+        assert_eq!(
+            store::credential_summary(&home.db, "acc-5")
+                .unwrap()
+                .unwrap()
+                .revision,
+            3
+        );
+        assert_eq!(material_on(&home, "acc-5").as_deref(), Some("three"));
+        assert_eq!(audit_reasons(&home, "acc-5"), vec!["stale_revision"]);
+
+        // The row an operator reads from the home: which node offered what, and
+        // what the home held when it refused.
+        let details: String = home
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT details FROM audit_log \
+                 WHERE action = 'provider_account.credential_refused' AND resource = 'acc-5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+        assert_eq!(details["peer_node_id"], serde_json::json!(sat_id));
+        assert_eq!(details["revision"], serde_json::json!(2));
+        assert_eq!(details["held_revision"], serde_json::json!(3));
     }
 
     /// A credential cleared on the home node leaves the satellites too. The

@@ -684,7 +684,7 @@ pub fn transient_reading(shares: &[ShareRow], computed: &[(&'static str, String)
         .collect();
     (!dropped.is_empty()).then(|| {
         format!(
-            "Odczyt węzła nie potwierdza źródeł działających share ({}); konfiguracje pozostają bez zmian",
+            "Odczyt noda nie potwierdza źródeł działających share ({}); konfiguracje pozostają bez zmian",
             dropped.join(", ")
         )
     })

@@ -67,12 +67,12 @@ test('n07/n08: the window title names the pool kind, the h1 stays "Nowa pula"', 
 // id, and the header printed that raw) — the "node.node_tag" badge next to
 // the wizard's h1 must fall back to the Polish "Węzeł bez nazwy" label
 // through `nodeLabel`, exactly like every other node name on this screen.
-test('the header node tag falls back to "Węzeł bez nazwy" instead of an empty string', async () => {
+test('the header node tag falls back to "Node bez nazwy" instead of an empty string', async () => {
   const screen = fakeScreen({ tentaNasPoolPlanRequest: plan });
   screen.currentNode = () => ({ nodeId: 'node-64hex', nodeName: '', isLocal: true });
   const win = openPoolWizard(screen, { freeDisks });
   await flush();
-  assert.match(win.querySelector('.install-header-meta .version').textContent, /Węzeł bez nazwy/);
+  assert.match(win.querySelector('.install-header-meta .version').textContent, /Node bez nazwy/);
   win.remove();
   screen.dispose();
 });

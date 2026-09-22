@@ -2760,7 +2760,8 @@ pub async fn run_rtsp_session(
     // pipeline is in pre-Online state. Cleared when first frame arrives.
     // Without this the UI sees `status_message = None` 99% of the time
     // because health ticks publish every second but failures publish once.
-    let mut last_error: Option<String> = None;
+    // Seeded below with the initial "connecting" reason before the loop starts.
+    let mut last_error: Option<String>;
     // FPS is a property of the CAMERA, not of one pipeline incarnation. Declared
     // outside `'outer` so a reconnect does not empty the window: rebuilding it per
     // attempt made the reported rate collapse to 0 and crawl back up over the next
