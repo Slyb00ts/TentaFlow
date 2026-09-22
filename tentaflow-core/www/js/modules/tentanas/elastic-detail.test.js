@@ -7,8 +7,20 @@
 import { fakeScreen, flush, click, confirmWindow, typeInto, I18n } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { drawElasticDetail, elasticCapacity, elasticCardHtml, elasticState } from './elastic-detail.js';
+import { drawElasticDetail, elasticCapacity, elasticCardSkeletonHtml, paintElasticCard, elasticState } from './elastic-detail.js';
 import { fmtOptionalBytes, jobCanCancel } from './format.js';
+
+// M2 (critic-round2-wave1-2026-09-22.md): the n05 array card is now a
+// skeleton + a painter, the same split as a ZFS pool card. This helper
+// exercises both together, exactly as `pools.js` does on first build, so the
+// tests below that only care about the rendered markup do not have to.
+function renderedElasticCard(array) {
+  const box = document.createElement('div');
+  box.innerHTML = elasticCardSkeletonHtml(array);
+  const card = box.firstElementChild;
+  paintElasticCard(card, array);
+  return card;
+}
 
 const GiB = 1024 ** 3;
 // `name` is the SLOT and `device` the by-uuid path the node mounts — the
@@ -38,8 +50,8 @@ test('null nie staje się zerem, zaś zmierzone zero pozostaje 0 B', () => {
   assert.equal(fmtOptionalBytes(0), '0 B');
   assert.equal(elasticCapacity(array({ usableBytes: null })).free, null);
   assert.equal(elasticCapacity(array()).free, 31 * GiB);
-  assert.match(elasticCardHtml(array({ usedBytes: null })), /nas-unmeasured/);
-  assert.doesNotMatch(elasticCardHtml(array({ usedBytes: null })), /width:0%/);
+  assert.match(renderedElasticCard(array({ usedBytes: null })).outerHTML, /nas-unmeasured/);
+  assert.doesNotMatch(renderedElasticCard(array({ usedBytes: null })).outerHTML, /width:0%/);
 });
 
 test('pending oznacza oczekiwanie na montowanie, nie tworzenie ani działający job, we wszystkich locale', async () => {
@@ -58,8 +70,7 @@ test('pending oznacza oczekiwanie na montowanie, nie tworzenie ani działający 
       assert.equal(elasticState(array({ state: 'creating' })).label, creating);
       assert.equal(elasticState(array({ state: 'unknown' })).label, unknown);
       assert.equal(I18n.t('tentanas.jobs.status_running'), runningJob);
-      const card = document.createElement('div');
-      card.innerHTML = elasticCardHtml(value);
+      const card = renderedElasticCard(value);
       assert.equal(card.querySelector('tf-chip[dot]').getAttribute('label'), pending);
       const { screen, body } = await mount(value);
       try {
@@ -1281,4 +1292,178 @@ test('odmowa zapisu polityki zostaje w oknie i nic nie zmienia', async () => {
   assert.ok(win.isConnected, 'okno zostaje otwarte po odmowie');
   assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayGetRequest').length, 1);
   screen.dispose();
+});
+
+// =============================================================================
+// Stable skeleton, keyed patching (owner's rule: a poll patches what changed
+// and never rebuilds a subtree; buttons and open sections survive it)
+// =============================================================================
+
+// Mounts the detail with its poll captured instead of timed, so a test runs
+// the NEXT poll itself, exactly when it has changed what the node answers.
+async function mountPolled(read) {
+  const screen = fakeScreen({ tentaNasElasticArrayGetRequest: () => ({ array: read() }) });
+  screen.array = 'media';
+  screen.openArray = (name) => { screen.array = name; };
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = document.createElement('div');
+  document.body.appendChild(body);
+  await drawElasticDetail(screen, body);
+  await flush();
+  const poll = async () => {
+    const next = scheduled.shift();
+    assert.ok(next, 'the pane armed its next poll');
+    await next();
+    await flush();
+  };
+  return { screen, body, poll };
+}
+
+// Every node a poll must leave standing, collected by a stable selector.
+const standing = (body) => ({
+  kpi: body.querySelector('.kpi'),
+  tiles: [...body.querySelectorAll('.kpi tf-stat-card')],
+  disks: body.querySelector('.disk-cells').closest('.section-card'),
+  folders: body.querySelector('.nas-folders'),
+  state: body.querySelector('.grid-2 > .section-card:first-child'),
+  snapraid: body.querySelector('.nas-snapraid'),
+  history: body.querySelector('.nas-snapraid-history'),
+  mover: body.querySelector('details[data-section="mover"]'),
+  danger: body.querySelector('.danger-zone'),
+  cell: body.querySelector('.disk-cell[data-branch="d1"]'),
+  fix: body.querySelector('.disk-cell[data-branch="d1"] [data-act="fix"]'),
+  buttons: ['refresh', 'back', 'sync', 'scrub', 'mover', 'mover-schedule', 'add-disk', 'destroy'].map((act) => body.querySelector(`[data-act="${act}"]`)),
+  run: body.querySelector('.nas-snapraid-history li'),
+});
+
+function assertSameNodes(before, after) {
+  for (const key of Object.keys(before)) {
+    if (Array.isArray(before[key])) {
+      assert.equal(after[key].length, before[key].length, key);
+      // `ok(===)`, never `equal` on DOM nodes: a failing `equal` diffs the
+      // whole document and does not return.
+      before[key].forEach((node, i) => assert.ok(node && after[key][i] === node, `${key}[${i}] is the same node`));
+    } else {
+      assert.ok(before[key] && after[key] === before[key], `${key} is the same node`);
+    }
+  }
+}
+
+test('a poll that changes the mover, the history and the cache figure patches values and keeps every node', async () => {
+  const lastRun = { startedAt: '2026-09-08T14:00:00Z', finishedAt: '2026-09-08T14:06:00Z', outcome: 'ok', movedBytes: 42 * GiB, movedFiles: 7, skippedBytes: 0, skippedFiles: 0, countsKnown: true, coupledSync: { kind: 'sync', outcome: 'ok' } };
+  let second = false;
+  // A scrub that counted errors keeps a repair on offer across both polls, so
+  // the repair button is one of the nodes that has to survive.
+  const read = () => moverArray({
+    protection: { status: 'window_open', cacheUnprotectedBytes: (second ? 20 : 18) * GiB, movedUnsyncedBytes: 0, protectedAsOf: '2026-09-07 12:00:00' },
+    snapraid: snapraidWith(second
+      ? [{ kind: 'sync', outcome: 'ok', jobId: 'sync-2', startedAt: '2026-09-08 14:06:00', finishedAt: '2026-09-08 14:07:00' }, { ...failedScrub, outcome: 'failed' }]
+      : [failedScrub]),
+  }, second ? { lastRun, history: [lastRun] } : {});
+  const { screen, body, poll } = await mountPolled(read);
+  try {
+    const before = standing(body);
+    assert.ok(before.fix, 'the fixture offers a repair');
+    before.mover.open = true;
+    before.mover.dispatchEvent(new window.Event('toggle'));
+    const details = before.run.querySelector('details');
+    details.open = true;
+    details.dispatchEvent(new window.Event('toggle'));
+    assert.match(moverRow(before.mover, 'Ostatni przebieg').textContent, /—/);
+    assert.equal(before.run.querySelector('tf-chip').getAttribute('label'), 'Wymaga uwagi');
+
+    second = true;
+    await poll();
+    assertSameNodes(before, { ...standing(body), run: body.querySelectorAll('.nas-snapraid-history li')[1] });
+    // The values moved.
+    assert.match(moverRow(before.mover, 'Ostatni przebieg').textContent, /42 GiB/);
+    assert.match(before.mover.querySelector('.mover-hist').textContent, /42 GiB/);
+    assert.equal(before.run.querySelector('tf-chip').getAttribute('label'), 'Błąd');
+    assert.equal(body.querySelectorAll('.nas-snapraid-history li').length, 2, 'the new run is added');
+    assert.equal(body.querySelector('.nas-cache-pending .v').textContent, '20 GiB');
+    assert.equal(before.tiles[1].getAttribute('value'), '20 GiB');
+    // And what the admin opened is still open.
+    assert.equal(before.mover.open, true);
+    assert.equal(details.open, true);
+
+    // The busy flag of a pending request is also a patch, not a rebuild.
+    let release;
+    screen.withSudo = async (fn) => { await new Promise((resolve) => { release = resolve; }); return fn('x'); };
+    click(body.querySelector('[data-act="sync"]'));
+    assert.ok(before.buttons[2].hasAttribute('disabled'), 'sync is disabled while its request is pending');
+    assertSameNodes(before, { ...standing(body), run: body.querySelectorAll('.nas-snapraid-history li')[1] });
+    release();
+    await flush();
+  } finally { screen.dispose(); }
+});
+
+test('a disk added to the array adds only its own cell', async () => {
+  const added = { ...disk, diskId: 'serial-7', name: 'd2', diskName: 'vdd', mountpoint: '/mnt/tentanas-branches/media/data/d2' };
+  let grown = false;
+  const { screen, body, poll } = await mountPolled(() => moverArray({ dataDisks: grown ? [disk, added] : [disk] }));
+  try {
+    const cells = [...body.querySelectorAll('.disk-cell')];
+    const hosts = [...body.querySelectorAll('.disk-cells')];
+    const section = body.querySelector('.disk-cells').closest('.section-card');
+    assert.equal(cells.length, 3, 'd1, parity and cache');
+    grown = true;
+    await poll();
+    const after = [...body.querySelectorAll('.disk-cell')];
+    assert.equal(after.length, 4);
+    for (const cell of cells) assert.ok(after.includes(cell), `${cell.dataset.branch} is the same node`);
+    const fresh = after.filter((cell) => !cells.includes(cell));
+    assert.equal(fresh.length, 1);
+    assert.equal(fresh[0].dataset.branch, 'd2');
+    assert.equal(fresh[0].querySelector('.dc-name').textContent.trim(), 'vdd');
+    [...body.querySelectorAll('.disk-cells')].forEach((host, i) => assert.ok(host === hosts[i], `cell host ${i} is the same node`));
+    assert.ok(body.querySelector('.disk-cells').closest('.section-card') === section);
+  } finally { screen.dispose(); }
+});
+
+// n11: KPI "Ochrona" reads "18 GiB na cache" in the warning colour, and the
+// SnapRAID card repeats the figure beside the parity it is outside of.
+test('bajty na cache poza parity prowadzą kafel Ochrona i mają wiersz na karcie SnapRAID', async () => {
+  let bytes = 18 * GiB;
+  const { screen, body, poll } = await mountPolled(() => moverArray({ protection: { status: 'window_open', cacheUnprotectedBytes: bytes, movedUnsyncedBytes: 0 } }));
+  try {
+    const tile = body.querySelector('.kpi tf-stat-card:nth-child(2)');
+    assert.equal(tile.getAttribute('value'), '18 GiB');
+    assert.equal(tile.getAttribute('accent'), 'warning');
+    assert.equal(tile.getAttribute('delta-type'), 'warn');
+    assert.equal(tile.getAttribute('delta'), 'Na dysku cache, jeszcze bez ochrony');
+    const rowOf = () => moverRow(body.querySelector('.nas-snapraid > .stat-rows'), 'Na dysku cache, jeszcze bez ochrony');
+    assert.ok(rowOf(), 'the SnapRAID card has the cache row');
+    assert.equal(rowOf().querySelector('.v').textContent, '18 GiB');
+    assert.ok(rowOf().querySelector('.v').classList.contains('num-warn'));
+    // Drained: the tile says the checkpoint's state again, on the same node.
+    bytes = 0;
+    await poll();
+    assert.ok(body.querySelector('.kpi tf-stat-card:nth-child(2)') === tile);
+    assert.equal(tile.getAttribute('value'), 'Dane poza checkpointem');
+    assert.equal(tile.hasAttribute('accent'), false);
+    assert.equal(tile.hasAttribute('delta-type'), false);
+    assert.equal(rowOf().querySelector('.v').textContent, '0 B');
+    assert.equal(rowOf().querySelector('.v').classList.contains('num-warn'), false);
+  } finally { screen.dispose(); }
+  // No cache, no row; no parity, no figure in the tile (every byte is outside).
+  const plain = await mount(array());
+  try {
+    assert.equal(moverRow(plain.body.querySelector('.nas-snapraid > .stat-rows'), 'Na dysku cache'), undefined);
+  } finally { plain.screen.dispose(); }
+  const bare = await mount(moverArray({ parityDisks: [], protection: { status: 'unprotected', cacheUnprotectedBytes: 18 * GiB } }));
+  try {
+    const tile = bare.body.querySelector('.kpi tf-stat-card:nth-child(2)');
+    assert.equal(tile.getAttribute('value'), 'Bez ochrony parity');
+    assert.equal(tile.hasAttribute('accent'), false);
+  } finally { bare.screen.dispose(); }
+});
+
+test('błędy parity mówią, z jakiego okna są liczone', async () => {
+  const { screen, body } = await mount(array({ snapraid: { ...snapraidWith([], 0), parityErrorsWindowDays: 30 } }));
+  try {
+    const r = moverRow(body.querySelector('.nas-snapraid > .stat-rows'), 'Błędy parity');
+    assert.equal(r.querySelector('.k').textContent, 'Błędy parity (30 dni)');
+    assert.equal(r.querySelector('.v').textContent, '0');
+  } finally { screen.dispose(); }
 });

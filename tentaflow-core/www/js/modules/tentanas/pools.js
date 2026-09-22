@@ -8,9 +8,9 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS,
-  fmtDate, fmtIn, fmtBytes, fmtRatio, pct, healthClass, healthChip, errMessage, layoutLabel, stateChipHtml, fmtSchedule,
+  fmtDate, fmtIn, fmtBytes, fmtRatio, pct, healthClass, healthChip, errMessage, layoutLabel, stateTone, stateLabel, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml, patchKeyedList } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl } from '/js/modules/tentanas/dom-patch.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
 import { followResponse, warningHtml, openRetypeDialog } from '/js/modules/tentanas/dialogs.js';
 import { journalOwnerPhrase, journalOwnerIds, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
@@ -21,7 +21,7 @@ import '/js/components/tf-menu.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-checkbox.js';
-import { elasticCardHtml, memberName } from '/js/modules/tentanas/elastic-detail.js';
+import { elasticCardSkeletonHtml, paintElasticCard, memberName } from '/js/modules/tentanas/elastic-detail.js';
 import { nodeT } from '/js/modules/tentanas/node-phrase.js';
 
 export async function drawPools(screen, body) {
@@ -170,13 +170,32 @@ function renderPools(screen, body, state) {
       });
     }
   } else {
-    // The "still loading" line is part of the SAME patched string rather than
-    // an insertAdjacentHTML afterwards: one host, one writer, or the cache
-    // would describe markup that is not what is on screen.
-    const loading = (!state.completed.has('zfs') || !state.completed.has('elastic'))
-      ? `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`
-      : '';
-    patchHtml(list, state.pools.map((p) => poolCardHtml(p)).join('') + state.arrays.map(elasticCardHtml).join('') + loading);
+    // Keyed by pool/array name rather than one joined string (B3): each
+    // card's own skeleton (icon, name, buttons, `tf-menu`) is built ONCE per
+    // key by `poolCardSkeletonHtml`/`elasticCardSkeletonHtml` and never
+    // re-parsed after that — `paintPoolCard`/`paintElasticCard` below write
+    // the values that move on their own between polls (scrub %, "za N min",
+    // capacity, used bytes, last sync, state) into it in place, so a poll
+    // that only ticks such a value never touches a sibling card, its buttons
+    // or an open `tf-menu`. This holds for BOTH kinds of card — an Elastic
+    // Array card used to be the one exception, still built as one baked
+    // string by `elasticCardHtml` and never repainted after (M2,
+    // critic-round2-wave1-2026-09-22.md). The "still loading" line rides the
+    // same keyed list as its own entry rather than a second write to this
+    // host, for the reason `patchHtml` used to need it here: one host, one
+    // writer.
+    const loading = !state.completed.has('zfs') || !state.completed.has('elastic');
+    patchKeyedList(list, [
+      ...state.pools.map((p) => ({ key: 'pool:' + p.name, html: poolCardSkeletonHtml(p) })),
+      ...state.arrays.map((a) => ({ key: 'array:' + a.name, html: elasticCardSkeletonHtml(a) })),
+      ...(loading ? [{ key: '__loading', html: `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>` }] : []),
+    ]);
+    // Pool cards are always the first `state.pools.length` children and array
+    // cards the next `state.arrays.length`, in the same order they were
+    // given — `patchKeyedList` places survivors and newcomers in item order,
+    // with the loading line, if any, following both.
+    state.pools.forEach((p, i) => paintPoolCard(list.children[i], p));
+    state.arrays.forEach((a, i) => paintElasticCard(list.children[state.pools.length + i], a));
   }
 
   const spares = spareDisks(state.pools);
@@ -187,10 +206,15 @@ function renderPools(screen, body, state) {
   setText(body.querySelector('#nas-free-hint'), spares.length
     ? T('pools.spare_hint', { pool: [...new Set(spares.map((s) => s.pool))].join(', ') })
     : T('pools.free_hint', { n: state.freeDisks.length, size: fmtBytes(state.freeDisks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0)) }));
-  patchHtml(body.querySelector('#nas-free-cells'), `
-    ${spares.map(({ disk, pool }) => {
-    const kind = state.diskKinds.get(disk.diskId) || '';
-    return `
+  // Keyed by disk id (B3, same fix as the pool cards): a pool's spare coming
+  // and going, or one disk's health flipping, no longer rebuilds every cell
+  // on the shelf.
+  patchKeyedList(body.querySelector('#nas-free-cells'), [
+    ...spares.map(({ disk, pool }) => {
+      const kind = state.diskKinds.get(disk.diskId) || '';
+      return {
+        key: 'spare:' + (disk.diskId || disk.name),
+        html: `
       <div class="disk-cell spare" data-disk="${escapeAttr(disk.diskId || disk.name)}" title="${escapeAttr(T('pools.spare_title', { pool }))}">
         <span class="health-dot ${healthClass(disk.state === 'online' ? 'ok' : 'warning')}"></span>
         <div class="dc-main">
@@ -198,9 +222,12 @@ function renderPools(screen, body, state) {
           <div class="dc-sub">${escapeHtml(T('pools.spare_sub', { size: fmtBytes(disk.sizeBytes), pool }))}</div>
         </div>
         ${kind ? `<span class="disk-kind ${escapeAttr(kind)}">${escapeHtml(kind)}</span>` : ''}
-      </div>`;
-  }).join('')}
-    ${state.freeDisks.map((d) => `
+      </div>`,
+      };
+    }),
+    ...state.freeDisks.map((d) => ({
+      key: 'free:' + d.diskId,
+      html: `
       <div class="disk-cell" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(d.name)}">
         <span class="health-dot ${healthClass(d.health)}"></span>
         <div class="dc-main">
@@ -208,8 +235,10 @@ function renderPools(screen, body, state) {
           <div class="dc-sub">${escapeHtml([fmtBytes(d.sizeBytes), d.model || '', T('pools.free_unused')].filter(Boolean).join(' · '))}</div>
         </div>
         <span class="disk-kind ${escapeAttr(d.kind)}">${escapeHtml(d.kind)}</span>
-      </div>`).join('')}
-    ${state.freeDisks.length ? `<div class="disk-cell empty" data-act="create">${sprite('plus')}&nbsp;${escapeHtml(T('pools.free_use'))}</div>` : ''}`);
+      </div>`,
+    })),
+    ...(state.freeDisks.length ? [{ key: 'create', html: `<div class="disk-cell empty" data-act="create">${sprite('plus')}&nbsp;${escapeHtml(T('pools.free_use'))}</div>` }] : []),
+  ]);
 }
 
 /** "6×8 TB + special vdev (mirror) + SLOG + hot-spare · odporność: 2 dyski" — the one-line topology under the pool name. */
@@ -242,9 +271,62 @@ function disksRowText(p) {
   return parts.join(' + ');
 }
 
-// Raw size splits into used, free and parity/reserve: usable is what the
-// layout leaves for data, the rest is redundancy the admin paid for.
-export function poolCardHtml(p) {
+// Stable per-pool skeleton: icon, name, the slots every chip lives in, the
+// action buttons and the `tf-menu`. Nothing here bakes in a value that moves
+// on its own between polls (scrub %, "za N min", capacity, the scan
+// percentage) — those are written into this same markup afterwards by
+// `paintPoolCard`, so a poll that only changes such a value never re-parses
+// this string and the card's buttons/menu stay the exact nodes an admin is
+// looking at, or has a menu open on (B3).
+function poolCardSkeletonHtml(p) {
+  return `
+    <div class="pool-card" data-pool="${escapeAttr(p.name)}">
+      <div class="pc-head">
+        <div class="pc-ico">${sprite('layers')}</div>
+        <div>
+          <span class="pc-name">${escapeHtml(p.name)}</span>
+          <span data-slot="state" ${SLOT}></span>
+          <span data-slot="layout" ${SLOT}></span>
+          <span data-slot="health" ${SLOT}></span>
+          <span data-slot="enc" ${SLOT}></span>
+          <span data-slot="scan" ${SLOT}></span>
+          <div class="pc-desc" data-f="desc"></div>
+        </div>
+        <div class="pc-actions">
+          <tf-button size="sm" variant="secondary" icon="external-link" data-act="details">${escapeHtml(T('pools.details'))}</tf-button>
+          <span data-part="scan-action" style="display:contents"></span>
+          <tf-button size="sm" variant="ghost" icon="more" data-act="more" title="${escapeAttr(T('pools.more'))}"></tf-button>
+          <tf-menu placement="bottom-end"></tf-menu>
+        </div>
+      </div>
+      <span data-slot="reason" ${SLOT}></span>
+      <div class="pc-body">
+        <div>
+          <div class="pc-cap"><span data-f="cap-label"></span><span class="v" data-f="cap-value"></span></div>
+          <div class="split-bar split-bar--3" data-f="bar"><span></span><span class="free"></span><span class="parity"></span></div>
+          <div class="legend-rows">
+            <div class="lr"><span class="sw" data-f="sw-used"></span>${escapeHtml(T('pools.legend_used'))}<span class="v" data-f="v-used"></span></div>
+            <div class="lr"><span class="sw free"></span>${escapeHtml(T('pools.legend_free'))}<span class="v" data-f="v-free"></span></div>
+            <div class="lr"><span class="sw parity"></span><span data-f="parity-label"></span><span class="v" data-f="v-parity"></span></div>
+          </div>
+        </div>
+        <div class="stat-rows">
+          <div class="sr"><span class="k">${sprite('cylinder')}${escapeHtml(T('pools.row_disks'))}</span><span class="v" data-f="disks"></span></div>
+          <div class="sr"><span class="k">${sprite('check')}${escapeHtml(T('pools.row_last_scrub'))}</span><span class="v" data-f="last-scrub"></span></div>
+          <div class="sr"><span class="k">${sprite('clock')}${escapeHtml(T('pools.row_next_scrub'))}</span><span class="v"><span class="sched-pill">${sprite('clock')} <span data-f="sched"></span></span> <span class="text-3" data-f="next-scrub"></span></span></div>
+          <div class="sr"><span class="k">${sprite('zap')}<span data-f="compression-label"></span></span><span class="v num-ok" data-f="ratio"></span></div>
+        </div>
+      </div>
+    </div>`;
+}
+
+// Writes everything that DOES move into a skeleton `patchKeyedList` just kept
+// or just built: the capacity split, the health/layout/scan chips, the
+// scrub row and the scan-status action button. Called once per poll for
+// every pool, on the SAME element for as long as that pool exists — an open
+// `tf-menu` (its own element, never rebuilt below) survives every one of
+// these calls, and so do the "Szczegoly"/scan-action/"..." buttons.
+function paintPoolCard(card, p) {
   const raw = Number(p.sizeBytes) || 0;
   const usable = Number(p.usableBytes) || 0;
   const used = Number(p.usedBytes) || 0;
@@ -255,61 +337,85 @@ export function poolCardHtml(p) {
   const health = healthChip(p.health);
   const scan = p.scan || {};
   const scanning = scan.status === 'running' || scan.status === 'paused';
-  const scanChip = scanning
-    ? `<tf-chip status="${scan.status === 'paused' ? 'warn' : 'accent'}" icon="${scan.kind === 'resilver' ? 'refresh' : 'shield'}" label="${escapeAttr(T('pools.scan_' + scan.kind, { pct: Math.round(Number(scan.progressPct) || 0) }))}"></tf-chip>`
-    : '';
+
+  // Fixed keys throughout: a slot's identity depends on whether it is shown
+  // at all, never on the value it currently holds, so a chip's own text/tone
+  // changing (rare) patches attributes on the SAME element instead of
+  // swapping it for a new one.
+  const stateEl = slotEl(card.querySelector('[data-slot="state"]'), true, 'state', '<tf-chip dot></tf-chip>');
+  if (stateEl) { setAttr(stateEl, 'status', stateTone(p.state)); setAttr(stateEl, 'label', stateLabel(p.state)); }
+  const layoutEl = slotEl(card.querySelector('[data-slot="layout"]'), true, 'layout', '<tf-chip status="accent"></tf-chip>');
+  if (layoutEl) setAttr(layoutEl, 'label', T('pools.layout_chip', { layout: layoutLabel(p.layout) }));
+  const healthEl = slotEl(card.querySelector('[data-slot="health"]'), p.health !== 'ok', 'health', '<tf-chip dot></tf-chip>');
+  if (healthEl) { setAttr(healthEl, 'status', health.status); setAttr(healthEl, 'label', health.label); }
+  slotEl(card.querySelector('[data-slot="enc"]'), Boolean(p.encryption && p.encryption !== 'off'), 'enc',
+    `<tf-chip status="info" icon="lock" label="${escapeAttr(T('pools.encrypted'))}"></tf-chip>`);
+  const scanEl = slotEl(card.querySelector('[data-slot="scan"]'), scanning, 'scan', '<tf-chip></tf-chip>');
+  if (scanEl) {
+    setAttr(scanEl, 'status', scan.status === 'paused' ? 'warn' : 'accent');
+    setAttr(scanEl, 'icon', scan.kind === 'resilver' ? 'refresh' : 'shield');
+    setAttr(scanEl, 'label', T('pools.scan_' + scan.kind, { pct: Math.round(Number(scan.progressPct) || 0) }));
+  }
+  setText(card.querySelector('[data-f="desc"]'), poolDescription(p));
+
+  const reasonEl = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(p.healthReason), 'reason',
+    `<div class="pc-reason">${sprite('alert')} <span data-f="text"></span></div>`);
+  if (reasonEl) {
+    setAttr(reasonEl, 'class', ('pc-reason ' + healthClass(p.health)).trim());
+    setText(reasonEl.querySelector('[data-f="text"]'), p.healthReason);
+  }
+
+  // The scan-status button (Skanuj teraz/Wstrzymaj/Wznow) is its own keyed
+  // slot: fixed per KIND of button, so it stays the same node while the scan
+  // stays in that state and only swaps when the state itself does — never on
+  // the percentage moving.
   const scanAction = scan.status === 'running'
-    ? `<tf-button size="sm" variant="ghost" icon="pause" data-act="pause">${escapeHtml(T('pool.scrub_pause'))}</tf-button>`
+    ? { key: 'pause', html: `<tf-button size="sm" variant="ghost" icon="pause" data-act="pause">${escapeHtml(T('pool.scrub_pause'))}</tf-button>` }
     : scan.status === 'paused'
-      ? `<tf-button size="sm" variant="ghost" icon="play" data-act="resume">${escapeHtml(T('pool.scrub_resume'))}</tf-button>`
-      : `<tf-button size="sm" variant="ghost" icon="refresh" data-act="scrub">${escapeHtml(T('pools.scrub_now'))}</tf-button>`;
-  return `
-    <div class="pool-card" data-pool="${escapeAttr(p.name)}">
-      <div class="pc-head">
-        <div class="pc-ico">${sprite('layers')}</div>
-        <div>
-          <span class="pc-name">${escapeHtml(p.name)}</span>
-          ${stateChipHtml(p.state)}
-          <tf-chip status="accent" label="${escapeAttr(T('pools.layout_chip', { layout: layoutLabel(p.layout) }))}"></tf-chip>
-          ${p.health !== 'ok' ? `<tf-chip status="${health.status}" dot label="${escapeAttr(health.label)}"></tf-chip>` : ''}
-          ${p.encryption && p.encryption !== 'off' ? `<tf-chip status="info" icon="lock" label="${escapeAttr(T('pools.encrypted'))}"></tf-chip>` : ''}
-          ${scanChip}
-          <div class="pc-desc">${escapeHtml(poolDescription(p))}</div>
-        </div>
-        <div class="pc-actions">
-          <tf-button size="sm" variant="secondary" icon="external-link" data-act="details">${escapeHtml(T('pools.details'))}</tf-button>
-          ${scanAction}
-          <tf-button size="sm" variant="ghost" icon="more" data-act="more" title="${escapeAttr(T('pools.more'))}"></tf-button>
-          <tf-menu placement="bottom-end">
-            ${scanning ? `<tf-menu-item action="scrub-stop" icon="stop">${escapeHtml(T('pool.scrub_stop'))}</tf-menu-item><tf-menu-divider></tf-menu-divider>` : ''}
-            <tf-menu-item action="datasets" icon="folder">${escapeHtml(T('pool.tab_datasets'))}</tf-menu-item>
-            <tf-menu-item action="snapshots" icon="clock">${escapeHtml(T('pool.tab_snapshots'))}</tf-menu-item>
-          </tf-menu>
-        </div>
-      </div>
-      ${p.healthReason ? `<div class="pc-reason ${healthClass(p.health)}">${sprite('alert')} ${escapeHtml(p.healthReason)}</div>` : ''}
-      <div class="pc-body">
-        <div>
-          <div class="pc-cap"><span>${escapeHtml(T('pools.capacity', { raw: fmtBytes(raw) }))}</span><span class="v">${escapeHtml(T('pools.capacity_value', { used: fmtBytes(used), usable: fmtBytes(usable), pct: usedPct }))}</span></div>
-          <div class="split-bar split-bar--3" title="${usedPct}%">
-            <span class="${tone}" style="width:${pct(used, raw)}%"></span>
-            <span class="free" style="width:${pct(free, raw)}%"></span>
-            <span class="parity" style="width:${pct(parity, raw)}%"></span>
-          </div>
-          <div class="legend-rows">
-            <div class="lr"><span class="sw ${tone || 'used'}"></span>${escapeHtml(T('pools.legend_used'))}<span class="v">${escapeHtml(fmtBytes(used))}</span></div>
-            <div class="lr"><span class="sw free"></span>${escapeHtml(T('pools.legend_free'))}<span class="v">${escapeHtml(fmtBytes(free))}</span></div>
-            <div class="lr"><span class="sw parity"></span>${escapeHtml(T('pools.legend_parity', { layout: p.layout }))}<span class="v">${escapeHtml(fmtBytes(parity))}</span></div>
-          </div>
-        </div>
-        <div class="stat-rows">
-          <div class="sr"><span class="k">${sprite('cylinder')}${escapeHtml(T('pools.row_disks'))}</span><span class="v">${escapeHtml(disksRowText(p))}</span></div>
-          <div class="sr"><span class="k">${sprite('check')}${escapeHtml(T('pools.row_last_scrub'))}</span><span class="v">${p.lastScrubAt ? `${escapeHtml(fmtDate(p.lastScrubAt))} · <span class="${scan.errors ? 'num-err' : ''}">${escapeHtml(T('pools.scrub_errors', { n: Number(scan.errors) || 0 }))}</span>` : escapeHtml(T('pools.never'))}</span></div>
-          <div class="sr"><span class="k">${sprite('clock')}${escapeHtml(T('pools.row_next_scrub'))}</span><span class="v"><span class="sched-pill">${sprite('clock')} ${escapeHtml(p.scrubSchedule ? fmtSchedule(p.scrubSchedule) : T('schedule.none'))}</span>${p.nextScrubAt ? ` <span class="text-3">${escapeHtml(fmtIn(p.nextScrubAt))}</span>` : ''}</span></div>
-          <div class="sr"><span class="k">${sprite('zap')}${escapeHtml(T('pools.row_compression', { algo: p.compression || 'off' }))}</span><span class="v num-ok">${escapeHtml(fmtRatio(p.compressRatio))}</span></div>
-        </div>
-      </div>
-    </div>`;
+      ? { key: 'resume', html: `<tf-button size="sm" variant="ghost" icon="play" data-act="resume">${escapeHtml(T('pool.scrub_resume'))}</tf-button>` }
+      : { key: 'scrub', html: `<tf-button size="sm" variant="ghost" icon="refresh" data-act="scrub">${escapeHtml(T('pools.scrub_now'))}</tf-button>` };
+  patchKeyedList(card.querySelector('[data-part="scan-action"]'), [scanAction]);
+
+  // The menu's OWN element is part of the fixed skeleton above and is never
+  // rebuilt here; only its items are kept in sync, so an admin who has it
+  // open never has it closed out from under them by a scan starting, ending
+  // or ticking its percentage.
+  patchKeyedList(card.querySelector('tf-menu'), [
+    ...(scanning ? [
+      { key: 'scrub-stop', html: `<tf-menu-item action="scrub-stop" icon="stop">${escapeHtml(T('pool.scrub_stop'))}</tf-menu-item>` },
+      { key: 'scrub-stop-div', html: '<tf-menu-divider></tf-menu-divider>' },
+    ] : []),
+    { key: 'datasets', html: `<tf-menu-item action="datasets" icon="folder">${escapeHtml(T('pool.tab_datasets'))}</tf-menu-item>` },
+    { key: 'snapshots', html: `<tf-menu-item action="snapshots" icon="clock">${escapeHtml(T('pool.tab_snapshots'))}</tf-menu-item>` },
+  ]);
+
+  setText(card.querySelector('[data-f="cap-label"]'), T('pools.capacity', { raw: fmtBytes(raw) }));
+  setText(card.querySelector('[data-f="cap-value"]'), T('pools.capacity_value', { used: fmtBytes(used), usable: fmtBytes(usable), pct: usedPct }));
+  const bar = card.querySelector('[data-f="bar"]');
+  setAttr(bar, 'title', `${usedPct}%`);
+  const [usedBar, freeBar, parityBar] = bar.children;
+  setAttr(usedBar, 'class', tone || null);
+  setAttr(usedBar, 'style', `width:${pct(used, raw)}%`);
+  setAttr(freeBar, 'style', `width:${pct(free, raw)}%`);
+  setAttr(parityBar, 'style', `width:${pct(parity, raw)}%`);
+
+  setAttr(card.querySelector('[data-f="sw-used"]'), 'class', 'sw ' + (tone || 'used'));
+  setText(card.querySelector('[data-f="v-used"]'), fmtBytes(used));
+  setText(card.querySelector('[data-f="v-free"]'), fmtBytes(free));
+  setText(card.querySelector('[data-f="parity-label"]'), T('pools.legend_parity', { layout: p.layout }));
+  setText(card.querySelector('[data-f="v-parity"]'), fmtBytes(parity));
+
+  setText(card.querySelector('[data-f="disks"]'), disksRowText(p));
+  // A small leaf with no buttons or menu of its own — `patchHtml` here writes
+  // only the "date · errors"/"never" text, exactly as `setText` would if the
+  // errors count did not need its own conditional class.
+  patchHtml(card.querySelector('[data-f="last-scrub"]'), p.lastScrubAt
+    ? `${escapeHtml(fmtDate(p.lastScrubAt))} · <span class="${scan.errors ? 'num-err' : ''}">${escapeHtml(T('pools.scrub_errors', { n: Number(scan.errors) || 0 }))}</span>`
+    : escapeHtml(T('pools.never')));
+  setText(card.querySelector('[data-f="sched"]'), p.scrubSchedule ? fmtSchedule(p.scrubSchedule) : T('schedule.none'));
+  setText(card.querySelector('[data-f="next-scrub"]'), p.nextScrubAt ? fmtIn(p.nextScrubAt) : '');
+  setText(card.querySelector('[data-f="compression-label"]'), T('pools.row_compression', { algo: p.compression || 'off' }));
+  setText(card.querySelector('[data-f="ratio"]'), fmtRatio(p.compressRatio));
 }
 
 // Starting a scrub answers with a job (it runs for hours); pause/resume/stop

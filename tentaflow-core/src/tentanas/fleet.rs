@@ -262,7 +262,12 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         disks_warning,
         pools_total: pools.len() as u32,
         shares_total,
-        alerts_active: super::db::count_open_alerts(db).unwrap_or(0),
+        // NODE-WIDE alerts only: this row is published into the instance's
+        // `addon_config`, which every tenant of every node reads, so it may
+        // not count (and thereby reveal) any tenant's own alerts. The asking
+        // tenant's figure for THIS node is completed at read time
+        // (`scope_local_alerts`).
+        alerts_active: super::db::count_open_node_alerts(db).unwrap_or(0),
         // BOTH figures come from the same set, which is the point of them.
         // Capacity used to sum the node's RAW DISKS while used summed the ZFS
         // pools, so the percentage compared a pool's allocation against disks
@@ -300,6 +305,24 @@ pub async fn publish_local_summary(main_db: &DbPool, addon_id: &str, db: &DbPool
         None,
     ) {
         tracing::warn!("tentanas: summary publish failed: {e}");
+    }
+}
+
+/// Replaces the local node's published alert figure with the count the
+/// asking organisation's alert list shows: node-wide alerts plus its own
+/// (`db::count_open_alerts_for_org`, the list's own visibility clause).
+///
+/// Only the LOCAL row can be completed: this node has its own database and
+/// nothing else. A remote node's row keeps the node-wide figure it published,
+/// which may undercount the tenant's own alerts there but never counts
+/// another tenant's. A failed read keeps the node-wide figure for the same
+/// reason.
+pub fn scope_local_alerts(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) {
+    let Ok(count) = super::db::count_open_alerts_for_org(db, org_id) else {
+        return;
+    };
+    for node in nodes.iter_mut().filter(|n| n.is_local) {
+        node.alerts_active = count;
     }
 }
 
@@ -538,5 +561,44 @@ mod tests {
         assert_eq!(s.disks_critical, 0);
         assert_eq!(s.arrays_total, 0);
         assert_eq!(s.arrays_unmeasured, 0);
+    }
+
+    /// The fleet badge of THIS node, per tenant: node-wide alerts plus the
+    /// asking organisation's own — never another tenant's — while a remote
+    /// row keeps the node-wide figure it published.
+    #[test]
+    fn the_local_alert_badge_counts_what_the_asking_tenant_is_shown() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at) VALUES
+               ('arr-a','org-a','nas','alpha','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z'),
+               ('arr-b','org-b','nas','bravo','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z');",
+        )
+        .unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        use super::super::db::raise_alert;
+        raise_alert(&db, "elastic:alpha:x", "warning", "elastic-array", "alpha", "Macierz alpha", "").unwrap();
+        raise_alert(&db, "elastic:bravo:x", "warning", "elastic-array", "bravo", "Macierz bravo", "").unwrap();
+        raise_alert(&db, "elastic:bravo:y", "warning", "elastic-array", "bravo", "Macierz bravo 2", "").unwrap();
+        raise_alert(&db, "disk:d1:temp", "warning", "disk", "d1", "Disk sda: hot", "").unwrap();
+        // What `local_summary` publishes for every tenant to read.
+        assert_eq!(super::super::db::count_open_node_alerts(&db).unwrap(), 1);
+
+        let fleet = || vec![
+            NasNodeInfo { node_id: "local".into(), is_local: true, alerts_active: 1, ..Default::default() },
+            NasNodeInfo { node_id: "peer".into(), is_local: false, alerts_active: 4, ..Default::default() },
+        ];
+        for (org, local) in [("org-a", 2), ("org-b", 3), ("org-c", 1)] {
+            let mut nodes = fleet();
+            scope_local_alerts(&mut nodes, &db, org);
+            assert_eq!((nodes[0].alerts_active, nodes[1].alerts_active), (local, 4), "{org}");
+            assert_eq!(
+                super::super::db::list_alerts_for_org(&db, org, false).unwrap().len() as u32,
+                local,
+                "{org}: the badge and the list agree"
+            );
+        }
     }
 }

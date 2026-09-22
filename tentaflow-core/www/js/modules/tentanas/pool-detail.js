@@ -14,7 +14,7 @@ import {
   layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE,
 } from '/js/modules/tentanas/format.js';
 import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
-import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass } from '/js/modules/tentanas/dom-patch.js';
 import { openScheduleEditor } from '/js/modules/tentanas/schedule-editor.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { scrubAction, trimAction } from '/js/modules/tentanas/pools.js';
@@ -306,24 +306,6 @@ function buildPane(host, kind, html, screen, state, refresh) {
   // one — and never twice on the ones that do not.
   root.addEventListener('click', (e) => onPaneClick(e, root, screen, state, refresh));
   return root;
-}
-
-// A slot holds at most one element: present while `on`, and the SAME element
-// for as long as it stays on, so its attributes can be patched in place. Used
-// for what appears and disappears with the data (a state chip, a media badge,
-// the scan bar). `hidden` would not do: the badge and component CSS set
-// `display`, which wins over the UA's `[hidden]` rule. The slot wrapper is
-// `display: contents` so it adds no box to the flex rows it sits in.
-const SLOT = 'style="display:contents"';
-function slotEl(slot, on, key, html) {
-  patchKeyedList(slot, on ? [{ key, html }] : []);
-  return on ? slot.firstElementChild : null;
-}
-
-// `classList.toggle` rewrites the class attribute even when nothing changes;
-// an unchanged node should see no mutation on a poll.
-function setClass(el, name, on) {
-  if (el && el.classList.contains(name) !== Boolean(on)) el.classList.toggle(name, Boolean(on));
 }
 
 // The pane's only click handler. Everything it acts on is read from `state`

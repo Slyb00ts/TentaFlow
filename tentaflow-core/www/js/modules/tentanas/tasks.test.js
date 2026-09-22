@@ -14,7 +14,7 @@ import { fakeScreen, flush, click, confirmWindow, window } from './_test-setup.j
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { drawTasks, openSmartScheduleEditor, jobSubject } = await import('./tasks.js');
+const { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow } = await import('./tasks.js');
 
 const jobs = [
   { jobId: 'j1', kind: 'pool_scrub', subject: 'tank', status: 'running', startedBy: 'admin', startedAt: '2026-09-02 08:00:00', finishedAt: null, progressPct: 40 },
@@ -708,4 +708,70 @@ test('an unchanged poll leaves the running jobs, the schedules and the strip alo
   scheduleRows(body).forEach((el, i) => assert.equal(el === rows[i], true, `schedule row ${i} survives the poll`));
   assert.equal(body.querySelector('#nas-prot .sr') === strip, true, 'the protection strip survives the poll');
   screen.dispose();
+});
+
+// The backlog after the 2026-09-21 critic pass: tasks.js used to carry its
+// own `runningJobSkeleton`/`paintRunningJob` because tentanas.js was
+// off-limits, while n02 kept a second copy (`jobRowHtml`/`wireJobRows`).
+// `jobRowSkeleton`/`paintJobRow` are now exported from here and imported by
+// tentanas.js — this proves the tab's own running-jobs row IS that shared
+// implementation, not a look-alike copy, by building the very same job
+// through it directly and comparing the result to what the tab painted.
+test('n15\'s running-jobs row is the shared job-row implementation n02 also imports from here', async () => {
+  const screen = fakeScreen(fixtures());
+  const body = mount();
+  // Its own detached host, appended to the document like every other row
+  // host in this file: the tf-chip/tf-progress-bar custom elements only
+  // upgrade and render their insides once connected, so a comparison against
+  // an unattached fragment would fault on their text, not on the row.
+  const host = mount();
+  try {
+    await drawTasks(screen, body);
+    await flush();
+    const row = body.querySelector('#nas-jobs-running .job-row');
+    const runningJob = jobs.find((j) => j.status === 'running');
+    assert.ok(row && runningJob, 'a running job is on screen');
+
+    host.innerHTML = jobRowSkeleton(runningJob);
+    const built = host.firstElementChild;
+    paintJobRow(built, runningJob);
+
+    assert.equal(built.querySelector('.job-name').textContent, row.querySelector('.job-name').textContent, 'same name/subject text');
+    assert.equal(!!built.querySelector('[data-act="cancel"]'), !!row.querySelector('[data-act="cancel"]'), 'same cancellability');
+    assert.equal(built.querySelector('[data-role="status"]').getAttribute('status'), row.querySelector('[data-role="status"]').getAttribute('status'), 'same status tone');
+    assert.equal(built.querySelector('[data-role="status"]').getAttribute('label'), row.querySelector('[data-role="status"]').getAttribute('label'), 'same status label');
+    assert.equal(built.querySelector('.job-sub').textContent, row.querySelector('.job-sub').textContent, 'same author/started-at text');
+    assert.equal(built.querySelector('tf-progress-bar').getAttribute('value'), row.querySelector('tf-progress-bar').getAttribute('value'), 'same progress value');
+  } finally {
+    screen.dispose();
+  }
+});
+
+// MINOR 8 (critic-round2-wave1-2026-09-22.md): `paintJobRow` used to flip the
+// icon's `running` class with `ico.classList.toggle('running', running)` on
+// EVERY poll, running or not. In happy-dom (unlike a spec-compliant
+// `DOMTokenList.toggle`, which is a no-op when the token already matches),
+// that unconditionally rewrites the `class` attribute and fires a mutation
+// record even when nothing changed — verified directly against happy-dom's
+// own `classList.toggle`, which does mutate on a redundant call. `setClass`
+// (dom-patch.js) checks `classList.contains` first and skips the call
+// entirely when the state already matches, so an unchanged poll should
+// mutate nothing on the icon.
+test('an unchanged poll leaves the running-job icon untouched (MINOR 8)', async () => {
+  const runningJob = jobs.find((j) => j.status === 'running');
+  const host = mount();
+  host.innerHTML = jobRowSkeleton(runningJob);
+  const row = host.firstElementChild;
+  paintJobRow(row, runningJob); // first paint: sets the 'running' class.
+  const ico = row.querySelector('[data-role="ico"]');
+
+  let mutations = 0;
+  const obs = new window.MutationObserver((recs) => { mutations += recs.length; });
+  obs.observe(ico, { attributes: true, attributeFilter: ['class'] });
+  paintJobRow(row, runningJob); // second paint, same status: nothing to change.
+  await flush();
+  obs.disconnect();
+
+  assert.equal(mutations, 0, 'the icon class attribute was not touched by an unchanged poll');
+  assert.ok(ico.classList.contains('running'), 'the icon is still marked running');
 });

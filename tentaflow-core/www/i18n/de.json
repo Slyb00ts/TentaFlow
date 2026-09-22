@@ -5325,7 +5325,7 @@
       "back": "Zurück zu Pools",
       "refresh": "Aktualisieren",
       "snapshot_only": "Parität beschreibt den letzten Sync. Spätere Schreibvorgänge sind nicht bestätigt geschützt.",
-      "tolerance": "Checkpoint-Toleranz: {n} Datenträger",
+      "tolerance": "Checkpoint-Toleranz: {n} {n|Datenträger|Datenträger|Datenträger}",
       "disks": "Array-Datenträger",
       "independent_fs": "Jeder Datenträger hat sein eigenes Dateisystem.",
       "data": "Daten",
@@ -5451,7 +5451,8 @@
       "member_cache": "Cache-Datenträger",
       "member_parity": "Paritätsdatenträger {n}",
       "disk_absent": "Datenträger fehlt",
-      "last_seen_as": "zuletzt gesehen als {name}"
+      "last_seen_as": "zuletzt gesehen als {name}",
+      "parity_errors_window": "Paritätsfehler ({n} {n|Tag|Tage|Tage})"
     },
     "wizard_pool": {
       "elastic_data": "Datenträger",
@@ -6464,6 +6465,7 @@
       "array_data": "Daten",
       "array_cache": "Cache",
       "array_parity": "Parität",
+      "other_org_array": "Im Array einer anderen Organisation",
       "mounted": "Eingehängt"
     },
     "disks": {

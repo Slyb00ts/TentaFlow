@@ -3242,13 +3242,17 @@ pub fn import_candidates(
                     "already_known",
                     "this node already has a database record of this array".to_string(),
                 ),
+                // The array holding the name may be ANOTHER organisation's
+                // (`known` is every owner's, because the name column is
+                // unique per node), so the sentence names neither array: the
+                // row already shows the journal's own name, and repeating it
+                // here as "a different array named …" told this tenant what
+                // another tenant had called its array.
                 Some(_) => (
                     "already_known",
-                    format!(
-                        "this node already has a different array named '{}', and an array name \
-                         is unique per node",
-                        spec.name
-                    ),
+                    "another array on this node already uses this name, and an array name \
+                     is unique per node"
+                        .to_string(),
                 ),
                 None if !disks_missing.is_empty() || !disks_reused.is_empty() => (
                     "incomplete",
@@ -4793,6 +4797,12 @@ where
     restored
 }
 
+/// Who the Tasks tab shows as the starter of a boot-time Restore: the node
+/// itself, not an account, exactly like `scheduler::STARTED_BY`. Every
+/// author check that lets the scheduler through must let this one through
+/// too (see `dispatch::tentanas::is_system_author`).
+pub const STARTED_BY_STARTUP: &str = "startup";
+
 pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
     static STARTING: OnceLock<Mutex<BTreeSet<(String,String)>>> = OnceLock::new();
     let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
@@ -4815,7 +4825,7 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
                         if !super::instance_should_run(&main_db,&db) {
                             anyhow::bail!("Instancja nie jest aktywna; przywracanie zatrzymane");
                         }
-                        spawn_restore(&db,row,"startup",None,Some(completion))
+                        spawn_restore(&db,row,STARTED_BY_STARTUP,None,Some(completion))
                     }),
                     || super::shares::apply(&db, &main_db, &owner.addon_id, None, super::shares::ApplyTrigger::Startup),
                 ).await;
@@ -9847,7 +9857,26 @@ pub(crate) mod tests {
             &no_orgs(),
         );
         assert_eq!(by_name[0].status, "already_known");
-        assert!(by_name[0].detail.contains("different array named 'produkt'"), "{}", by_name[0].detail);
+        assert!(by_name[0].detail.contains("already uses this name"), "{}", by_name[0].detail);
+    }
+
+    /// The array that already holds the name may be ANOTHER organisation's
+    /// (`known` is every owner's), so the clash sentence names no array: it
+    /// used to repeat the name as "a different array named '…'", telling this
+    /// tenant what another tenant had called its array.
+    #[test]
+    fn the_name_clash_sentence_names_no_array() {
+        let entry = lost_journal("ksiegowosc");
+        let clash = import_candidates(
+            &[entry.clone()],
+            &[], &member_disks(&entry),
+            &[("22222222-2222-4222-8222-222222222222".to_string(), "ksiegowosc".to_string())],
+            &this_addon(),
+            &no_orgs(),
+        );
+        assert_eq!(clash[0].status, "already_known");
+        assert!(!clash[0].detail.contains("ksiegowosc"), "{}", clash[0].detail);
+        assert!(!clash[0].detail.contains("22222222"), "{}", clash[0].detail);
     }
 
     #[test]

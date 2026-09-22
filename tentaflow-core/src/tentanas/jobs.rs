@@ -282,7 +282,30 @@ fn command_label(command: &HelperCommand) -> &'static str {
 
 /// Creates the row and spawns `body`. The returned job is the row as
 /// queued; callers answer with it and the UI polls.
+///
+/// The row's owner follows `store::insert_job`: an Elastic job belongs to
+/// its array's organisation, everything else is node-wide. A job that must
+/// belong to one organisation from birth uses `spawn_owned`.
 pub fn spawn<F, Fut>(db: &DbPool, kind: &str, subject: &str, started_by: &str,
+    intent: Option<ElasticJobIntent>, completion: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    body: F) -> Result<NasJob>
+where
+    F: FnOnce(JobHandle) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    spawn_owned(db, kind, subject, started_by, None, intent, completion, body)
+}
+
+/// `spawn` with an explicit OWNER written by the very INSERT that creates the
+/// row (`store::insert_job_owned`): a non-Elastic job that will name one
+/// organisation's array — a disk wipe releasing that array's journal logs it
+/// by name — is never node-wide, not even between two writes. A variant
+/// rather than a new parameter on `spawn` because every other caller (the
+/// scheduler, the pools, the snapshots, the Elastic paths) has no owner to
+/// give, and none of them should have to spell `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_owned<F, Fut>(db: &DbPool, kind: &str, subject: &str, started_by: &str,
+    owner: Option<&str>,
     intent: Option<ElasticJobIntent>, completion: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     body: F) -> Result<NasJob>
 where
@@ -327,7 +350,7 @@ where
         )
     );
     let mut registry = running().lock().unwrap_or_else(|p| p.into_inner());
-    store::insert_job(db, &job, intent.as_ref())?;
+    store::insert_job_owned(db, &job, intent.as_ref(), owner)?;
     let cancel = CancellationToken::new();
     registry.insert(job.job_id.clone(), RunningJob { cancel: cancel.clone(), cancellable });
     drop(registry);
@@ -609,6 +632,39 @@ mod tests {
                 .state,
             "active"
         );
+    }
+
+    /// A job spawned WITH an owner (the journal-releasing disk wipe) is that
+    /// organisation's from its INSERT: the returned row already reads as
+    /// org A's and never as org B's, the body — the first code that could log
+    /// the array's name — finds it owned when it starts, and it stays owned
+    /// once finished. A plain `spawn` of the same kind stays node-wide.
+    #[tokio::test]
+    async fn a_job_spawned_with_an_owner_is_owned_from_the_moment_it_exists() {
+        let db = database();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job = spawn_owned(&db, "disk_wipe", "sdq", "u-a", Some("org-a"), None, Some(tx), |h| async move {
+            anyhow::ensure!(store::job_for_org(h.db(), "org-b", &h.job_id)?.is_none(),
+                "another tenant saw the job while its body ran");
+            anyhow::ensure!(store::job_for_org(h.db(), "org-a", &h.job_id)?.is_some(),
+                "the owner did not see its own job");
+            Ok(())
+        })
+        .unwrap();
+        // Before the body has had any chance to run.
+        assert!(store::job_for_org(&db, "org-b", &job.job_id).unwrap().is_none());
+        assert!(store::job_for_org(&db, "org-a", &job.job_id).unwrap().is_some());
+        rx.await.unwrap().unwrap();
+        assert_eq!(finished(&db, &job.job_id).await.status, "succeeded");
+        assert!(store::job_for_org(&db, "org-b", &job.job_id).unwrap().is_none());
+
+        let shared = spawn(&db, "disk_wipe", "sdr", "u-a", None, None, |_| async { Ok(()) }).unwrap();
+        assert!(store::job_for_org(&db, "org-b", &shared.job_id).unwrap().is_some(), "node-wide");
+
+        // One owner rule: an Elastic kind takes its array's organisation and
+        // refuses an explicit one before any row or body exists.
+        assert!(spawn_owned(&db, "elastic_sync", "alpha", "u-a", Some("org-a"), None, None,
+            |_| async { Ok(()) }).is_err());
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ import {
   T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
   jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml, patchKeyedList } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/modules/tentanas/dom-patch.js';
 import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields, normalizeSchedule } from '/js/modules/tentanas/schedule-editor.js';
 import { openSnapshotScheduleEditor, keepSummary } from '/js/modules/tentanas/snapshots.js';
@@ -64,6 +64,55 @@ export function jobSubject(j) {
 
 function titleAttr(title) {
   return title ? ` title="${escapeAttr(title)}"` : '';
+}
+
+// ===== The running-job row: ONE skeleton + painter shared by the n02 node
+// dashboard (tentanas.js overview card) and this tab's own running-jobs list.
+// Before this, tentanas.js kept a second copy (`jobRowHtml`/`wireJobRows`)
+// that baked `progressPct` and the "started …" text straight into the row's
+// markup and re-rendered the whole row — Cancel button included — every time
+// either one ticked. This version carries only what a job's IDENTITY decides
+// (icon slot, name, subject, whether it can be cancelled) in the skeleton:
+// stable for the job's whole life. `progressPct`, the elapsed "started …"
+// text and the status chip tick on almost every poll, so they are left as
+// empty slots here and painted by `paintJobRow` below — otherwise keying this
+// list by `jobId` would still rebuild the row on every poll (a fresh string
+// every time) and the Cancel button under the cursor would never survive a
+// single tick.
+export function jobRowSkeleton(j, subject = jobSubject(j)) {
+  return `
+    <div class="job-row" data-job="${escapeAttr(j.jobId)}">
+      <div class="job-ico" data-role="ico"></div>
+      <div class="job-main">
+        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2"${titleAttr(subject.title)}>${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
+        <div class="job-sub" data-role="sub"></div>
+        ${j.progressPct != null ? `<tf-progress-bar data-role="progress" size="sm" tone="accent"></tf-progress-bar>` : ''}
+      </div>
+      <div class="job-actions">
+        <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
+        ${jobCanCancel(j) ? `<tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>` : ''}
+      </div>
+    </div>`;
+}
+
+// Only the icon's inner markup differs by state (spinning refresh vs a static
+// clock), so it goes through `patchHtml` too — the same "write only when it
+// changed" rule, just scoped to one child instead of the row.
+export function paintJobRow(row, j) {
+  if (!row) return;
+  const running = j.status === 'running';
+  const ico = row.querySelector('[data-role="ico"]');
+  setClass(ico, 'running', running);
+  patchHtml(ico, sprite(running ? 'refresh' : 'clock'));
+  const chip = row.querySelector('[data-role="status"]');
+  setAttr(chip, 'status', jobTone(j.status));
+  setAttr(chip, 'label', T('jobs.status_' + j.status));
+  const last = (j.log || []).slice(-1)[0] || '';
+  const author = jobAuthor(j.startedBy);
+  const sub = row.querySelector('[data-role="sub"]');
+  setText(sub, T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }) + (last ? ' · ' + last : ''));
+  setAttr(sub, 'title', author.title || '');
+  if (j.progressPct != null) setAttr(row.querySelector('[data-role="progress"]'), 'value', Number(j.progressPct));
 }
 
 // The history table's task cell: the kind, and the subject under it.
@@ -140,48 +189,10 @@ export async function drawTasks(screen, body) {
   filters.filters = ['all', 'errors', 'scrub', 'mover'].map((id) => ({ id, label: T('jobs.filter_' + id), active: id === state.filter }));
   filters.addEventListener('change', (e) => { state.filter = e.detail.id; paintHistory(); });
 
-  // The running-jobs skeleton carries only what a job's IDENTITY decides
-  // (icon slot, name, subject, whether it can be cancelled): fields that stay
-  // put for the job's whole life. `progressPct`, the elapsed "started …" text
-  // and the status chip tick on almost every 3 s poll, so they are left as
-  // empty slots here and painted by `paintRunningJob` below — otherwise
-  // keying this list by `jobId` would still rebuild the row on every poll
-  // (a fresh string every time) and the Cancel button under the cursor would
-  // never survive a single tick.
-  const runningJobSkeleton = (j, subject = jobSubject(j)) => `
-    <div class="job-row" data-job="${escapeAttr(j.jobId)}">
-      <div class="job-ico" data-role="ico"></div>
-      <div class="job-main">
-        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2"${titleAttr(subject.title)}>${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
-        <div class="job-sub" data-role="sub"></div>
-        ${j.progressPct != null ? `<tf-progress-bar data-role="progress" size="sm" tone="accent"></tf-progress-bar>` : ''}
-      </div>
-      <div class="job-actions">
-        <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
-        ${jobCanCancel(j) ? `<tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>` : ''}
-      </div>
-    </div>`;
-
-  // Only the icon's inner markup differs by state (spinning refresh vs a
-  // static clock), so it goes through `patchHtml` too — the same "write only
-  // when it changed" rule, just scoped to one child instead of the row.
-  const paintRunningJob = (row, j) => {
-    if (!row) return;
-    const running = j.status === 'running';
-    const ico = row.querySelector('[data-role="ico"]');
-    ico.classList.toggle('running', running);
-    patchHtml(ico, sprite(running ? 'refresh' : 'clock'));
-    const chip = row.querySelector('[data-role="status"]');
-    setAttr(chip, 'status', jobTone(j.status));
-    setAttr(chip, 'label', T('jobs.status_' + j.status));
-    const last = (j.log || []).slice(-1)[0] || '';
-    const author = jobAuthor(j.startedBy);
-    const sub = row.querySelector('[data-role="sub"]');
-    setText(sub, T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }) + (last ? ' · ' + last : ''));
-    setAttr(sub, 'title', author.title || '');
-    if (j.progressPct != null) setAttr(row.querySelector('[data-role="progress"]'), 'value', Number(j.progressPct));
-  };
-
+  // The running-jobs list uses the shared `jobRowSkeleton`/`paintJobRow`
+  // (above) — the very same row implementation the n02 node dashboard uses
+  // for its own running-jobs card (tentanas.js), so a job renders identically
+  // wherever it is running and keeps its identity across a poll in both.
   const paintHistory = () => {
     const rows = state.done.filter((j) => {
       if (state.filter === 'errors') return j.status === 'failed' || j.status === 'blocked';
@@ -242,8 +253,8 @@ export async function drawTasks(screen, body) {
         // keeps its own row (and every sibling's), unlike the old
         // `patchHtml` over the whole joined string, which rebuilt everyone's
         // Cancel button on every 3 s tick.
-        patchKeyedList(runEl, running.map((j) => ({ key: j.jobId, html: runningJobSkeleton(j) })));
-        running.forEach((j, i) => paintRunningJob(runEl.children[i], j));
+        patchKeyedList(runEl, running.map((j) => ({ key: j.jobId, html: jobRowSkeleton(j) })));
+        running.forEach((j, i) => paintJobRow(runEl.children[i], j));
       }
       setAttr(body.querySelector('#nas-jobs-count'), 'label', String(running.length));
       paintHistory();

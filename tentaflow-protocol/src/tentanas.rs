@@ -210,8 +210,16 @@ pub struct NasDisk {
     /// inventory never produces, 'spare' among them, and two call sites filtered
     /// on `role == "spare"` accordingly and matched nothing. The part a disk
     /// plays inside its owner is `vdev_role` (ZFS) or `array_role` (Elastic).
+    ///
+    /// One more value is set per REQUEST, not by `role_of`:
+    /// 'other_org_array' — a member of an Elastic Array of ANOTHER organisation
+    /// of this node, sent with `member_of`, `array_role`, the branch
+    /// filesystem and `mountpoints` blanked
+    /// (`tentanas::disks::hide_other_org_array`). The node's inventory is
+    /// shared by every tenant; that array's name is not.
     pub role: String,
-    /// Pool or array the disk belongs to, when `role` says so.
+    /// Pool or array the disk belongs to, when `role` says so. Never the
+    /// name of another organisation's array (see `role`).
     pub member_of: Option<String>,
     /// 'ok' | 'warning' | 'critical' | 'unknown'.
     pub health: String,
@@ -232,6 +240,9 @@ pub struct NasDisk {
     /// Last 60 samples of read+write throughput (bytes/s), oldest first — the
     /// row sparkline.
     pub io_history_bps: Vec<u64>,
+    /// Where lsblk reports the disk and its partitions mounted. Empty for a
+    /// disk of another organisation's Elastic Array: a branch is mounted at
+    /// `/mnt/tentanas-branches/<array>/…`, a path that names the array.
     pub mountpoints: Vec<String>,
     /// The top-level vdev of `member_of` that holds this disk: `vdev_role` is
     /// where the group sits ('data' | 'special' | 'log' | 'cache' | 'spare' |

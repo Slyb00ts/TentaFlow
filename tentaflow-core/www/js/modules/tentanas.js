@@ -20,7 +20,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, channelMode, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
-  layoutLabel, stateChipHtml, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
+  layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
 import { nodeT, nodeHeadSub } from '/js/modules/tentanas/node-phrase.js';
@@ -28,7 +28,7 @@ import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
-import { drawTasks, openSmartScheduleEditor, jobSubject } from '/js/modules/tentanas/tasks.js';
+import { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow } from '/js/modules/tentanas/tasks.js';
 import { drawShares, protocolChipHtml } from '/js/modules/tentanas/shares.js';
 import { warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openDiskWipeDialog } from '/js/modules/tentanas/disk-wipe.js';
@@ -57,7 +57,6 @@ import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
 import { openTargetDetail } from '/js/modules/tentanas/targets.js';
 import { drawElasticDetail, elasticState, elasticProtection, elasticCapacity } from '/js/modules/tentanas/elastic-detail.js';
-import { jobCanCancel } from '/js/modules/tentanas/format.js';
 
 // -----------------------------------------------------------------------------
 // Screen-local helpers
@@ -110,12 +109,132 @@ function wireCrumbs(root, handlers) {
   });
 }
 
-// ARC hit ratio (n02): a conic-gradient ring with the percentage inside.
-function donutHtml(pctValue, label) {
-  const p = Math.max(0, Math.min(100, Number(pctValue) || 0));
-  return `<div class="donut" style="background: conic-gradient(var(--success) 0 ${p}%, var(--bg-3) ${p}% 100%);">
-      <div class="dn-center"><div class="dn-val">${p.toFixed(1)}%</div><div class="dn-lbl">${escapeHtml(label)}</div></div>
+// n02 ARC card: a stable skeleton (the donut ring plus the five stat rows)
+// painted with `setText`/`setAttr`/`patchHtml`-per-slot instead of one string
+// for the whole card. `arc.sizeBytes`, `hitRatio` and the MRU/MFU split move
+// on almost every 5 s poll — rebuilding the whole card for that destroyed the
+// donut and every row (BLOCKER 2, n01-n10 critic 2026-09-21).
+function arcSkeletonHtml() {
+  return `
+    <div class="arc-flex">
+      <div class="donut" data-role="donut">
+        <div class="dn-center"><div class="dn-val" data-role="val"></div><div class="dn-lbl" data-role="lbl"></div></div>
+      </div>
+      <div class="stat-rows" style="flex:1">
+        <div class="sr"><span class="k">${escapeHtml(T('arc.row_usage'))}</span><span class="v" data-role="usage"></span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('arc.row_split'))}</span><span class="v" data-role="split"></span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('arc.row_demand'))}</span><span class="v" data-role="demand"></span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('arc.row_slog'))}</span><span class="v" data-role="slog"></span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('arc.row_l2arc'))}</span><span class="v" data-role="l2arc"></span></div>
+      </div>
     </div>`;
+}
+
+// n02 pool-mini row (ZFS pool): a stable skeleton keyed by pool name, painted
+// per poll. `poolDescription(p)` can include a live scrub percentage/ETA, and
+// the used/usable pair and fill bar move on every poll — none of that may
+// rebuild the row itself (its click handler, via delegation on the host, does
+// not care, but the node's identity across a poll does).
+function poolMiniSkeleton(p) {
+  return `
+    <div class="pool-mini" data-pool="${escapeAttr(p.name)}">
+      <div class="pm-ico">${sprite('layers')}</div>
+      <div class="pm-main">
+        <div class="pm-name"><span class="mono">${escapeHtml(p.name)}</span> <tf-chip data-role="state" dot></tf-chip></div>
+        <div class="pm-sub" data-role="sub"></div>
+        <tf-progress-bar data-role="bar" size="sm" tone="accent"></tf-progress-bar>
+      </div>
+      <div class="kv-inline"><span class="v" data-role="kv"></span></div>
+    </div>`;
+}
+
+function paintPoolMini(row, p) {
+  if (!row) return;
+  const chip = row.querySelector('[data-role="state"]');
+  setAttr(chip, 'status', stateTone(p.state));
+  setAttr(chip, 'label', stateLabel(p.state));
+  setText(row.querySelector('[data-role="sub"]'), poolDescription(p));
+  setAttr(row.querySelector('[data-role="bar"]'), 'value', pct(p.usedBytes, p.usableBytes));
+  setText(row.querySelector('[data-role="kv"]'), `${fmtBytes(p.usedBytes)} / ${fmtBytes(p.usableBytes)}`);
+}
+
+// One Elastic Array as a `.pool-mini` row of the node dashboard (n02:297) —
+// the same shape a ZFS pool gets, so the dashboard shows every pool the Pools
+// tab lists instead of only the ZFS half. Two chips carry the two questions an
+// array raises: is it up, and is what it holds protected.
+//
+// The fill bar is rendered ONLY for a measured array: `pct` reads a missing
+// capacity as 0, and a bar drawn at 0% claims an empty array where the node
+// merely never measured one. The used/usable pair says "—" there instead. The
+// bar's PRESENCE can flip between polls (a probe starts measuring), so it
+// lives in its own small `patchHtml`-managed slot rather than in the outer
+// skeleton the keyed list compares — the skeleton itself never changes for a
+// given array, so the row keeps its identity across a poll regardless.
+function arrayMiniSkeleton(a) {
+  return `
+      <div class="pool-mini" data-array="${escapeAttr(a.name)}">
+        <div class="pm-ico">${sprite('cylinder')}</div>
+        <div class="pm-main">
+          <div class="pm-name"><span class="mono">${escapeHtml(a.name)}</span> <tf-chip data-role="state" dot></tf-chip> <tf-chip data-role="protection" size="sm"></tf-chip></div>
+          <div class="pm-sub" data-role="sub"></div>
+          <div data-role="bar-slot"></div>
+        </div>
+        <div class="kv-inline"><span class="v" data-role="kv"></span></div>
+      </div>`;
+}
+
+function paintArrayMini(row, a) {
+  if (!row) return;
+  const state = elasticState(a);
+  const protection = elasticProtection(a);
+  setAttr(row.querySelector('[data-role="state"]'), 'status', state.tone);
+  setAttr(row.querySelector('[data-role="state"]'), 'label', state.label);
+  setAttr(row.querySelector('[data-role="protection"]'), 'status', protection.tone);
+  setAttr(row.querySelector('[data-role="protection"]'), 'label', protection.label);
+  const fs = a.filesystem ? String(a.filesystem).toUpperCase() : T('elastic.unknown');
+  const topology = T('elastic.topology', { data: (a.dataDisks || []).length, parity: (a.parityDisks || []).length, fs });
+  setText(row.querySelector('[data-role="sub"]'), `Elastic Array · ${topology}`);
+  const barSlot = row.querySelector('[data-role="bar-slot"]');
+  if (elasticCapacity(a).measured) {
+    patchHtml(barSlot, '<tf-progress-bar size="sm" tone="accent"></tf-progress-bar>');
+    setAttr(barSlot.querySelector('tf-progress-bar'), 'value', pct(a.usedBytes, a.usableBytes));
+  } else {
+    patchHtml(barSlot, '');
+  }
+  setText(row.querySelector('[data-role="kv"]'), `${fmtOptionalBytes(a.usedBytes)} / ${fmtOptionalBytes(a.usableBytes)}`);
+}
+
+// n02 overview alert row: a stable skeleton keyed by `alertId`. `severity`,
+// `subject` and whether the alert is acked decide the row's SHAPE (its class,
+// icon and which of Ack/acked-chip it offers) and stay fixed here — a change
+// to any of those really is a different row. `title` and `detail` are NOT
+// fixed: `raise_alert` refreshes both on the node on every re-raise, and a
+// cache-stuck alert's detail carries a wait time that changes every minute
+// below 1 h and every hour above (elastic.rs repair_blocker/cache wording).
+// So, like `fmtAgo(a.raisedAt)`, they are left as empty slots here and
+// written into place by `paintAlertRow` — baking them into this markup, as
+// the old code did, rebuilt the whole row (Ack button included) every time
+// either one ticked, not just once a minute.
+function alertRowSkeleton(a) {
+  const target = alertTarget(a);
+  const subjectLabel = [subjectKindLabel(a.subjectKind), alertSubjectName(a.subjectId, a.subjectKind)].filter(Boolean).join(' ');
+  return `
+      <div class="alert-row ${escapeAttr(a.severity)} ${a.ackedAt ? 'acked' : ''}" data-alert="${escapeAttr(a.alertId)}">
+        ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
+        <div class="a-main">
+          <div class="a-title" data-role="title"></div>
+          <div class="a-sub" title="${escapeAttr(a.subjectId)}"><span data-role="detail"></span> · ${escapeHtml(subjectLabel)} · <span data-role="ago"></span></div>
+        </div>
+        ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
+        <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${escapeAttr(a.alertId)}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
+      </div>`;
+}
+
+function paintAlertRow(row, a) {
+  if (!row) return;
+  setText(row.querySelector('[data-role="title"]'), a.title);
+  setText(row.querySelector('[data-role="detail"]'), a.detail);
+  setText(row.querySelector('[data-role="ago"]'), fmtAgo(a.raisedAt));
 }
 
 // One square per fleet node, in node order: the mount state of a share.
@@ -126,34 +245,6 @@ function mountDotsHtml(mounts, nodes) {
     const cls = state === 'mounted' || state === 'source' ? '' : state === 'pending' ? 'pending' : state === 'error' ? 'error' : 'na';
     return `<span class="md ${cls}" title="${escapeAttr(`${nodeLabel(n)}: ${m ? (m.detail || m.state) : T('fleet.mount_na')}`)}"></span>`;
   }).join('')}</span>`;
-}
-
-// One Elastic Array as a `.pool-mini` row of the node dashboard (n02:297) —
-// the same shape a ZFS pool gets, so the dashboard shows every pool the Pools
-// tab lists instead of only the ZFS half. Two chips carry the two questions an
-// array raises: is it up, and is what it holds protected.
-//
-// The fill bar is rendered ONLY for a measured array: `pct` reads a missing
-// capacity as 0, and a bar drawn at 0% claims an empty array where the node
-// merely never measured one. The used/usable pair says "—" there instead.
-function arrayMiniHtml(a) {
-  const state = elasticState(a);
-  const protection = elasticProtection(a);
-  const fs = a.filesystem ? String(a.filesystem).toUpperCase() : T('elastic.unknown');
-  const topology = T('elastic.topology', { data: (a.dataDisks || []).length, parity: (a.parityDisks || []).length, fs });
-  const bar = elasticCapacity(a).measured
-    ? `<tf-progress-bar value="${pct(a.usedBytes, a.usableBytes)}" size="sm" tone="accent"></tf-progress-bar>`
-    : '';
-  return `
-      <div class="pool-mini" data-array="${escapeAttr(a.name)}">
-        <div class="pm-ico">${sprite('cylinder')}</div>
-        <div class="pm-main">
-          <div class="pm-name"><span class="mono">${escapeHtml(a.name)}</span> <tf-chip status="${escapeAttr(state.tone)}" dot label="${escapeAttr(state.label)}"></tf-chip> <tf-chip size="sm" status="${escapeAttr(protection.tone)}" label="${escapeAttr(protection.label)}"></tf-chip></div>
-          <div class="pm-sub">Elastic Array · ${escapeHtml(topology)}</div>
-          ${bar}
-        </div>
-        <div class="kv-inline"><span class="v">${escapeHtml(fmtOptionalBytes(a.usedBytes))} / ${escapeHtml(fmtOptionalBytes(a.usableBytes))}</span></div>
-      </div>`;
 }
 
 // -----------------------------------------------------------------------------
@@ -1118,6 +1209,18 @@ const TentaNasScreen = {
         </div>
       </div>`;
     body.querySelector('[data-act="alert-history"]').addEventListener('click', () => this.switchTab('jobs'));
+    // Delegated ONCE on the container, exactly like the n15 Tasks tab's own
+    // running-jobs list (tasks.js): `patchKeyedList` keeps a row's Cancel/Log
+    // buttons as the very node a poll found them at, so re-attaching a
+    // listener to them on every poll would either stack a second handler on
+    // a survivor or silently do nothing for a row that moved.
+    body.querySelector('#nas-ov-jobs').addEventListener('click', (e) => {
+      const row = e.target.closest('.job-row');
+      if (!row) return;
+      const jobId = row.dataset.job;
+      if (e.target.closest('[data-act="log"]')) { this.openJobLog(jobId); return; }
+      if (e.target.closest('[data-act="cancel"]')) { e.stopPropagation(); this.cancelOverviewJob(jobId, body); }
+    });
     body.querySelector('[data-act="create-pool"]').addEventListener('click', () => {
       const nodeId = this.currentNode()?.nodeId;
       const surface = body.querySelector('#nas-ov-pools');
@@ -1390,16 +1493,23 @@ const TentaNasScreen = {
     setAttr(alertsCount, 'status', alerts.length ? 'err' : 'neutral');
     this.renderAlertList(body.querySelector('#nas-ov-alerts'), alerts, () => this.refreshOverview(body));
 
+    // Keyed by jobId, exactly like the n15 Tasks tab's running-jobs list
+    // (tasks.js), and painted with the very same `jobRowSkeleton`/
+    // `paintJobRow`: a job whose progress or elapsed-time text moves keeps
+    // its own row — Cancel button included — instead of the whole card being
+    // rebuilt on every 5 s poll (BLOCKER 2, n01-n10 critic 2026-09-21).
     const jobsEl = body.querySelector('#nas-ov-jobs');
-    if (patchHtml(jobsEl, running.map((j) => this.jobRowHtml(j)).join(''))) {
-      this.wireJobRows(jobsEl, () => this.refreshOverview(body));
-    }
+    patchKeyedList(jobsEl, running.map((j) => ({ key: j.jobId, html: jobRowSkeleton(j) })));
+    running.forEach((j, i) => paintJobRow(jobsEl.children[i], j));
 
     this.later(() => this.refreshOverview(body), POLL_OVERVIEW_MS);
   },
 
-  // n02 ARC card: the hit-ratio ring plus the five rows that say where the
-  // cache memory went and what backs it (SLOG, L2ARC).
+  // n02 ARC card: a stable skeleton (donut + five stat rows), built once and
+  // painted per poll with `setText`/`setAttr`/`patchHtml`-per-slot. Every
+  // field here — `sizeBytes`, `hitRatio`, the MRU/MFU split — moves on almost
+  // every 5 s poll, and rebuilding the card for that used to tear down the
+  // donut and every row (BLOCKER 2, n01-n10 critic 2026-09-21).
   paintArcCard(body, arc) {
     const host = body.querySelector('#nas-ov-arc');
     const actions = body.querySelector('#nas-ov-arc-actions');
@@ -1407,7 +1517,26 @@ const TentaNasScreen = {
     if (!arc) {
       patchHtml(host, `<div class="muted">${escapeHtml(T('arc.unavailable'))}</div>`);
       patchHtml(actions, '');
+      host.__tfArcBuilt = false;
+      actions.__tfArcBuilt = false;
       return;
+    }
+    if (!host.__tfArcBuilt) {
+      host.__tfHtml = null;
+      host.innerHTML = arcSkeletonHtml();
+      host.__tfArcBuilt = true;
+    }
+    // Wired ONCE per host, on a flag of its own: `__tfArcBuilt` flips back to
+    // false whenever ARC goes unavailable (above) so the skeleton is rebuilt
+    // when it returns, but the delegated click listener lives on `host`
+    // itself, which is never replaced — adding it again on every rebuild
+    // stacked one more `click` handler per off/on cycle, so one l2arc click
+    // called `openPool` once per cycle it had survived.
+    if (!host.__tfArcWired) {
+      host.__tfArcWired = true;
+      host.addEventListener('click', (e) => {
+        if (e.target.closest('[data-act="arc-l2arc"]')) this.openPool(this.overviewArcBiggestPool?.name);
+      });
     }
     const ramPct = arc.ramBytes ? Math.round((Number(arc.maxBytes) || 0) / Number(arc.ramBytes) * 100) : 0;
     const mru = Number(arc.mruBytes) || 0;
@@ -1416,26 +1545,37 @@ const TentaNasScreen = {
     const prefetch = Number(arc.prefetchHits) || 0;
     const l2 = (arc.l2arcPools || []);
     const biggest = (this.overviewPools || []).slice().sort((a, b) => (Number(b.sizeBytes) || 0) - (Number(a.sizeBytes) || 0))[0];
-    const rows = [
-      [T('arc.row_usage'), `${escapeHtml(fmtBytes(arc.sizeBytes))} / ${escapeHtml(fmtBytes(arc.maxBytes))}`],
-      [T('arc.row_split'), `${pct(mru, mru + mfu)}% / ${pct(mfu, mru + mfu)}%`],
-      [T('arc.row_demand'), `${pct(demand, demand + prefetch)}% / ${pct(prefetch, demand + prefetch)}%`],
-      [T('arc.row_slog'), (arc.slogPools || []).length ? `<span class="mono">${escapeHtml(arc.slogPools.join(', '))}</span>` : `<span class="text-3">${escapeHtml(T('arc.slog_none'))}</span>`],
-      [T('arc.row_l2arc'), l2.length
-        ? `<span class="mono">${escapeHtml(l2.join(', '))}</span>`
-        : biggest
-          ? `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))} — <a data-act="arc-l2arc">${escapeHtml(T('arc.l2arc_add', { pool: biggest.name }))}</a></span>`
-          : `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))}</span>`],
-    ];
-    const changed = patchHtml(host, `
-      <div class="arc-flex">
-        ${donutHtml(arc.hitRatio, T('arc.hit_ratio'))}
-        <div class="stat-rows" style="flex:1">${rows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('')}</div>
-      </div>`);
-    if (changed) host.querySelector('[data-act="arc-l2arc"]')?.addEventListener('click', () => this.openPool(biggest.name));
-    if (patchHtml(actions, `<tf-button variant="ghost" size="sm" icon="settings" data-act="arc-limit">${escapeHtml(T('arc.change_limit', { pct: ramPct }))}</tf-button>`)) {
+    this.overviewArcBiggestPool = biggest;
+    const p = Math.max(0, Math.min(100, Number(arc.hitRatio) || 0));
+    setAttr(host.querySelector('[data-role="donut"]'), 'style', `background: conic-gradient(var(--success) 0 ${p}%, var(--bg-3) ${p}% 100%);`);
+    setText(host.querySelector('[data-role="val"]'), `${p.toFixed(1)}%`);
+    setText(host.querySelector('[data-role="lbl"]'), T('arc.hit_ratio'));
+    setText(host.querySelector('[data-role="usage"]'), `${fmtBytes(arc.sizeBytes)} / ${fmtBytes(arc.maxBytes)}`);
+    setText(host.querySelector('[data-role="split"]'), `${pct(mru, mru + mfu)}% / ${pct(mfu, mru + mfu)}%`);
+    setText(host.querySelector('[data-role="demand"]'), `${pct(demand, demand + prefetch)}% / ${pct(prefetch, demand + prefetch)}%`);
+    patchHtml(host.querySelector('[data-role="slog"]'), (arc.slogPools || []).length
+      ? `<span class="mono">${escapeHtml(arc.slogPools.join(', '))}</span>`
+      : `<span class="text-3">${escapeHtml(T('arc.slog_none'))}</span>`);
+    patchHtml(host.querySelector('[data-role="l2arc"]'), l2.length
+      ? `<span class="mono">${escapeHtml(l2.join(', '))}</span>`
+      : biggest
+        ? `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))} — <a data-act="arc-l2arc">${escapeHtml(T('arc.l2arc_add', { pool: biggest.name }))}</a></span>`
+        : `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))}</span>`);
+    if (!actions.__tfArcBuilt) {
+      actions.__tfHtml = null;
+      actions.innerHTML = `<tf-button variant="ghost" size="sm" icon="settings" data-act="arc-limit"></tf-button>`;
+      actions.__tfArcBuilt = true;
       actions.querySelector('[data-act="arc-limit"]').addEventListener('click', () => this.switchTab('environment'));
     }
+    // `tf-button` is light-DOM: it owns an inner `<button>` it built itself,
+    // and watches its own children for a caller overwriting them so it can
+    // rebuild that `<button>` from scratch (see tf-button.js). `setText` here
+    // used to write straight into the host's light DOM, which that observer
+    // reads as exactly such an overwrite — so a ramPct% text change on every
+    // ARC poll tore the button down and rebuilt it. `setAttr` on `label`
+    // updates the same text through the attribute path the component
+    // re-renders from in place, with no rebuild.
+    setAttr(actions.querySelector('[data-act="arc-limit"]'), 'label', T('arc.change_limit', { pct: ramPct }));
   },
 
   // n02 pool mini-list: name + state, the one-line topology and the fill bar.
@@ -1508,28 +1648,37 @@ const TentaNasScreen = {
     </div>`;
   },
 
+  // n02 pool mini-list: name + state, the one-line topology and the fill bar.
+  // Both kinds of pool live here, ZFS first and then the Elastic Arrays, keyed
+  // by `pool:<name>`/`array:<name>` so a row keeps its identity (and its
+  // click handler, wired ONCE via delegation below) across a poll even though
+  // its description, fill bar and used/usable pair move on almost every one
+  // (a live scrub percentage/ETA in particular) — BLOCKER 2, n01-n10 critic
+  // 2026-09-21.
   paintPoolsMini(body, pools, arrays = []) {
     const host = body.querySelector('#nas-ov-pools');
     if (!host) return;
+    if (!host.__tfPoolsWired) {
+      host.__tfPoolsWired = true;
+      host.addEventListener('click', (e) => {
+        const row = e.target.closest('.pool-mini');
+        if (!row) return;
+        if (row.dataset.pool) this.openPool(row.dataset.pool);
+        // `data-array`, so the click lands on the ARRAY detail (n11) and not
+        // on a ZFS pool route that has no such pool to open.
+        else if (row.dataset.array) this.openArray(row.dataset.array);
+      });
+    }
     if (!pools.length && !arrays.length) {
       patchHtml(host, `<div class="muted">${escapeHtml(T('pools.empty_title'))}</div>`);
       return;
     }
-    const html = pools.map((p) => `
-      <div class="pool-mini" data-pool="${escapeAttr(p.name)}">
-        <div class="pm-ico">${sprite('layers')}</div>
-        <div class="pm-main">
-          <div class="pm-name"><span class="mono">${escapeHtml(p.name)}</span> ${stateChipHtml(p.state)}</div>
-          <div class="pm-sub">${escapeHtml(poolDescription(p))}</div>
-          <tf-progress-bar value="${pct(p.usedBytes, p.usableBytes)}" size="sm" tone="accent"></tf-progress-bar>
-        </div>
-        <div class="kv-inline"><span class="v">${escapeHtml(fmtBytes(p.usedBytes))} / ${escapeHtml(fmtBytes(p.usableBytes))}</span></div>
-      </div>`).join('') + arrays.map((a) => arrayMiniHtml(a)).join('');
-    if (!patchHtml(host, html)) return;
-    host.querySelectorAll('.pool-mini[data-pool]').forEach((el) => el.addEventListener('click', () => this.openPool(el.dataset.pool)));
-    // `data-array`, so the click lands on the ARRAY detail (n11) and not on a
-    // ZFS pool route that has no such pool to open.
-    host.querySelectorAll('.pool-mini[data-array]').forEach((el) => el.addEventListener('click', () => this.openArray(el.dataset.array)));
+    const items = [
+      ...pools.map((p) => ({ key: `pool:${p.name}`, html: poolMiniSkeleton(p), paint: (row) => paintPoolMini(row, p) })),
+      ...arrays.map((a) => ({ key: `array:${a.name}`, html: arrayMiniSkeleton(a), paint: (row) => paintArrayMini(row, a) })),
+    ];
+    patchKeyedList(host, items.map(({ key, html }) => ({ key, html })));
+    items.forEach((it, i) => it.paint(host.children[i]));
   },
 
   // What the disk-telemetry banner should say, or null when SMART is live and
@@ -1626,43 +1775,44 @@ const TentaNasScreen = {
 
   // Every row ends with the same drill-down the fleet alert table offers
   // ("Szczegóły" → the disk, "Dyski", "Uzbrój" → the environment tab), with
-  // "Potwierdź" staying the ghost action next to it (n02).
+  // "Potwierdź" staying the ghost action next to it (n02). Keyed by
+  // `alertId`, with `fmtAgo(a.raisedAt)` written into its own element by
+  // `paintAlertRow`: baking it into the row's markup — as the old single
+  // `patchHtml` over the joined string did — rebuilt the whole list (Ack and
+  // "Szczegóły" buttons included) about once a minute, for every alert still
+  // inside its first minute (BLOCKER 2, n01-n10 critic 2026-09-21).
   renderAlertList(el, alerts, onChange) {
     if (!alerts.length) {
       patchHtml(el, `<div class="muted">${escapeHtml(T('alerts.none'))}</div>`);
       return;
     }
-    // `subjectId` is a machine id — wwn-5000cca27dc7a4c6 for a disk, a request
-    // UUID for an approval — and the title already names the subject, so the
-    // subline carries only the kind. The fleet alert table never printed it.
-    const html = alerts.map((a, i) => {
-      const target = alertTarget(a);
-      return `
-      <div class="alert-row ${escapeAttr(a.severity)} ${a.ackedAt ? 'acked' : ''}">
-        ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
-        <div class="a-main">
-          <div class="a-title">${escapeHtml(a.title)}</div>
-          <div class="a-sub" title="${escapeAttr(a.subjectId)}">${escapeHtml(a.detail)} · ${escapeHtml([subjectKindLabel(a.subjectKind), alertSubjectName(a.subjectId, a.subjectKind)].filter(Boolean).join(' '))} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
-        </div>
-        ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
-        <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${i}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
-      </div>`;
-    }).join('');
-    if (!patchHtml(el, html)) return;
-    el.querySelectorAll('[data-ack]').forEach((b) => b.addEventListener('click', async () => {
-      try {
-        await this.nas('tentaNasAlertAckRequest', { alertId: b.dataset.ack });
-        onChange();
-      } catch (e) {
-        toast(errMessage(e), 'error');
-      }
-    }));
-    el.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => {
-      const target = alertTarget(alerts[Number(b.dataset.goto)]);
-      if (target.extra.array) this.openArray(target.extra.array);
-      else if (target.extra.pool) this.openPool(target.extra.pool);
-      else this.switchTab(target.tab, { disk: target.extra.disk || null, target: target.extra.target || null });
-    }));
+    if (!el.__tfAlertsWired) {
+      el.__tfAlertsWired = true;
+      el.addEventListener('click', async (e) => {
+        const ackBtn = e.target.closest('[data-ack]');
+        if (ackBtn) {
+          try {
+            await this.nas('tentaNasAlertAckRequest', { alertId: ackBtn.dataset.ack });
+            el.__tfAlertsOnChange?.();
+          } catch (err) {
+            toast(errMessage(err), 'error');
+          }
+          return;
+        }
+        const gotoBtn = e.target.closest('[data-goto]');
+        if (!gotoBtn) return;
+        const a = el.__tfAlertsByKey?.get(gotoBtn.dataset.goto);
+        if (!a) return;
+        const target = alertTarget(a);
+        if (target.extra.array) this.openArray(target.extra.array);
+        else if (target.extra.pool) this.openPool(target.extra.pool);
+        else this.switchTab(target.tab, { disk: target.extra.disk || null, target: target.extra.target || null });
+      });
+    }
+    el.__tfAlertsOnChange = onChange;
+    el.__tfAlertsByKey = new Map(alerts.map((a) => [String(a.alertId), a]));
+    patchKeyedList(el, alerts.map((a) => ({ key: a.alertId, html: alertRowSkeleton(a) })));
+    alerts.forEach((a, i) => paintAlertRow(el.children[i], a));
   },
 
   // ---------------------------------------------------------------------------
@@ -2438,44 +2588,22 @@ const TentaNasScreen = {
   },
 
   // ---------------------------------------------------------------------------
-  // Job rows shared by the overview card and the tasks tab (n02/n15)
+  // Job rows shared by the overview card and the tasks tab (n02/n15) — the
+  // markup and painter (`jobRowSkeleton`/`paintJobRow`) live in
+  // modules/tentanas/tasks.js and are imported above; this is only the
+  // cancel action the overview's delegated click listener (drawOverview)
+  // calls into, the same confirm-then-cancel flow n15 runs for its own list.
   // ---------------------------------------------------------------------------
 
-  jobRowHtml(j) {
-    const running = j.status === 'running';
-    const last = (j.log || []).slice(-1)[0] || '';
-    const author = jobAuthor(j.startedBy);
-    const subject = jobSubject(j);
-    return `
-      <div class="job-row" data-job="${escapeAttr(j.jobId)}">
-        <div class="job-ico ${running ? 'running' : ''}">${sprite(running ? 'refresh' : 'clock')}</div>
-        <div class="job-main">
-          <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2"${subject.title ? ` title="${escapeAttr(subject.title)}"` : ''}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip></div>
-          <div class="job-sub"${author.title ? ` title="${escapeAttr(author.title)}"` : ''}>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}${last ? ' · ' + escapeHtml(last) : ''}</div>
-          ${j.progressPct != null ? `<tf-progress-bar value="${Number(j.progressPct)}" size="sm" tone="accent"></tf-progress-bar>` : ''}
-        </div>
-        <div class="job-actions">
-          <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
-          ${jobCanCancel(j) ? `<tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>` : ''}
-        </div>
-      </div>`;
-  },
-
-  wireJobRows(el, onChange) {
-    el.querySelectorAll('.job-row').forEach((row) => {
-      const id = row.dataset.job;
-      row.querySelector('[data-act="log"]').addEventListener('click', () => this.openJobLog(id));
-      row.querySelector('[data-act="cancel"]')?.addEventListener('click', async () => {
-        const ok = await TfWindow.confirm({ title: T('jobs.cancel'), message: T('jobs.cancel_confirm'), confirmLabel: T('jobs.cancel'), cancelLabel: I18n.t('common.cancel'), danger: true });
-        if (!ok) return;
-        try {
-          await this.nas('tentaNasJobCancelRequest', { jobId: id });
-          onChange();
-        } catch (e) {
-          toast(errMessage(e), 'error');
-        }
-      });
-    });
+  async cancelOverviewJob(jobId, body) {
+    const ok = await TfWindow.confirm({ title: T('jobs.cancel'), message: T('jobs.cancel_confirm'), confirmLabel: T('jobs.cancel'), cancelLabel: I18n.t('common.cancel'), danger: true });
+    if (!ok) return;
+    try {
+      await this.nas('tentaNasJobCancelRequest', { jobId });
+      this.refreshOverview(body);
+    } catch (e) {
+      toast(errMessage(e), 'error');
+    }
   },
 
   // ---------------------------------------------------------------------------

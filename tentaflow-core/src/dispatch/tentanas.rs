@@ -221,26 +221,119 @@ fn staging_dir(g: &Gate) -> Result<std::path::PathBuf, ProtocolError> {
 /// Admin") and a bare `0191f2c0-…` is the one thing an admin cannot recognise.
 /// So the id is resolved HERE, at the read boundary, for display only.
 ///
-/// An id with no account behind it is returned unchanged, which is what keeps
-/// the scheduler's own `started_by = "scheduler"` readable, and what a deleted
-/// account falls back to.
+/// The map answers for every id it was given except a system author
+/// (`is_system_author`), which passes through unchanged so the scheduler's own
+/// `started_by = "scheduler"` stays readable. Everything else is decided by
+/// `names_for_org`: a member of the asking organisation by name, anyone else
+/// as an empty author.
 fn display_names(
     ctx: &HandlerContext,
     ids: &[String],
 ) -> std::collections::HashMap<String, String> {
-    if ids.is_empty() {
+    // Distinct, and without the system authors: 50 jobs by one admin are one
+    // lookup, and "scheduler" is nobody's account to look up.
+    let authors: std::collections::BTreeSet<String> = ids
+        .iter()
+        .filter(|id| !is_system_author(id))
+        .cloned()
+        .collect();
+    if authors.is_empty() {
         return std::collections::HashMap::new();
     }
-    crate::db::repository::lookup_user_names(&ctx.state.db, ids)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(id, row)| {
+    let asking_org = ctx.org_context.as_ref().map(|o| o.org_id.as_str()).unwrap_or("");
+    let members = org_members_among(ctx, asking_org, &authors);
+    // Only the members' accounts are read: nobody else's name is ever needed.
+    let member_ids: Vec<String> = members.iter().cloned().collect();
+    let accounts =
+        crate::db::repository::lookup_user_names(&ctx.state.db, &member_ids).unwrap_or_default();
+    names_for_org(&authors, accounts, &members)
+}
+
+/// An author that is the node itself rather than an account: the scheduler's
+/// unattended runs (`scheduler::STARTED_BY`) and a boot-time Elastic Restore
+/// (`elastic::STARTED_BY_STARTUP`). Every other author is the `user_id` of
+/// the request's org context.
+fn is_system_author(id: &str) -> bool {
+    matches!(id, tentanas::scheduler::STARTED_BY | tentanas::elastic::STARTED_BY_STARTUP)
+}
+
+/// Which of `ids` belong to `org_id`, in ONE query over the distinct ids (per
+/// chunk of the platform's name-lookup size; a job list holds a handful of
+/// authors). A failed read answers "none of them": the cost is a blank
+/// author, never another tenant's name.
+///
+/// A membership row is the ONLY way an account belongs to an organisation:
+/// the org admin is a member whose `role_id` is the admin role, and an org
+/// context is resolved from the memberships (`rbac::resolve_org_context`
+/// refuses a user without one), so everyone who can start a job in this org
+/// has the row this looks for.
+fn org_members_among(
+    ctx: &HandlerContext,
+    org_id: &str,
+    ids: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let mut members = std::collections::BTreeSet::new();
+    if org_id.is_empty() {
+        return members;
+    }
+    let Ok(conn) = ctx.state.db.read() else {
+        return members;
+    };
+    let ids: Vec<&String> = ids.iter().collect();
+    for chunk in ids.chunks(500) {
+        let placeholders = (2..chunk.len() + 2).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT user_id FROM org_memberships WHERE org_id = ?1 AND user_id IN ({placeholders})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&org_id];
+        params.extend(chunk.iter().map(|id| *id as &dyn rusqlite::ToSql));
+        let found = conn.prepare(&sql).and_then(|mut stmt| {
+            let rows = stmt
+                .query_map(params.as_slice(), |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>();
+            rows
+        });
+        match found {
+            Ok(rows) => members.extend(rows),
+            Err(e) => {
+                tracing::warn!("tentanas: org membership lookup failed: {e}");
+                return std::collections::BTreeSet::new();
+            }
+        }
+    }
+    members
+}
+
+/// The shown name of every author, under the tenant rule: a member of the
+/// asking organisation by its name, and ANY other id — an account of another
+/// organisation of this node, a deleted account, an id known only on another
+/// node — as an empty author. The node is one TentaNas instance for every
+/// tenant on it, so the job list, the job modal and the approvals list can
+/// carry rows another tenant's user started; that user's name is not this
+/// tenant's to read, and neither is its raw id (the screen would put it in
+/// the author tooltip). Empty rather than the id, and the screen shows "—".
+///
+/// A member without a usable name (no account row any more, or an account
+/// with neither a display name nor a username) is left out of the map, so
+/// its id — this organisation's own identifier — passes through as before.
+fn names_for_org(
+    authors: &std::collections::BTreeSet<String>,
+    mut accounts: std::collections::HashMap<String, crate::db::repository::UserNameRow>,
+    members: &std::collections::BTreeSet<String>,
+) -> std::collections::HashMap<String, String> {
+    authors
+        .iter()
+        .filter_map(|id| {
+            if !members.contains(id) {
+                return Some((id.clone(), String::new()));
+            }
+            let row = accounts.remove(id)?;
             let name = if row.display_name.is_empty() {
                 row.username
             } else {
                 row.display_name
             };
-            (!name.is_empty()).then_some((id, name))
+            (!name.is_empty()).then(|| (id.clone(), name))
         })
         .collect()
 }
@@ -445,7 +538,9 @@ async fn packages_install(
 
 fn jobs_list(ctx: &HandlerContext, limit: u32) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let mut jobs = store::list_jobs(&g.db, if limit == 0 { 50 } else { limit })
+    // Scoped to the caller's organisation: this database is the whole
+    // node's, and another tenant's array jobs name that tenant's array.
+    let mut jobs = store::list_jobs_for_org(&g.db, &g.org_id, if limit == 0 { 50 } else { limit })
         .map_err(|e| internal("jobs", e))?;
     name_jobs(ctx, Some(&g.db), &mut jobs);
     Ok(tn(P::JobsListResponse { jobs }))
@@ -453,7 +548,7 @@ fn jobs_list(ctx: &HandlerContext, limit: u32) -> Result<MessageBody, ProtocolEr
 
 fn job_get(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let job = store::job(&g.db, job_id)
+    let job = store::job_for_org(&g.db, &g.org_id, job_id)
         .map_err(|e| internal("jobs", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
     Ok(job_response_in(ctx, Some(&g.db), job))
@@ -461,7 +556,9 @@ fn job_get(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolEr
 
 fn job_cancel(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_ADMIN)?;
-    let job = store::job(&g.db, job_id)
+    // Another tenant's job is "not found" here as in `job_get`: an admin of
+    // one organisation must not stop another organisation's array work.
+    let job = store::job_for_org(&g.db, &g.org_id, job_id)
         .map_err(|e| internal("jobs", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
     if matches!(job.kind.as_str(), "elastic_create" | "elastic_restore") {
@@ -488,6 +585,11 @@ async fn disks_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> 
         }
         disks = tentanas::disks::snapshot().0;
     }
+    // BEFORE the advice: a replacement advice names the disk's `member_of`.
+    let own_arrays = own_array_names(&g)?;
+    for disk in disks.iter_mut() {
+        tentanas::disks::hide_other_org_array(disk, &own_arrays);
+    }
     let advice = tentanas::disks::advice(&g.db, &disks);
     Ok(tn(P::DisksListResponse {
         disks,
@@ -499,7 +601,8 @@ async fn disks_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> 
 
 fn disk_get(ctx: &HandlerContext, disk_id: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let disk = tentanas::disks::disk(disk_id).ok_or_else(|| ProtocolError::not_found("disk not found"))?;
+    let mut disk = tentanas::disks::disk(disk_id).ok_or_else(|| ProtocolError::not_found("disk not found"))?;
+    tentanas::disks::hide_other_org_array(&mut disk, &own_array_names(&g)?);
     let row = store::disk_row(&g.db, disk_id).map_err(|e| internal("disk", e))?;
     let (mut attributes, self_tests) = row
         .as_ref()
@@ -616,11 +719,16 @@ async fn wipe_plan_of(
     tentanas::disks::refresh_inventory(&g.db)
         .await
         .map_err(|e| internal("inventory", e))?;
-    let disk = tentanas::disks::disk(disk_id).ok_or_else(|| {
+    let mut disk = tentanas::disks::disk(disk_id).ok_or_else(|| {
         ProtocolError::not_found(disk_gone_message(tentanas::disks::shown_disk_name(
             &g.db, disk_id, None,
         )))
     })?;
+    // A member of another organisation's LIVE array: the plan refuses it
+    // without the array's name (`ROLE_OTHER_ORG_ARRAY`), where the member arm
+    // would have printed it — and the name would reach the dialog and the
+    // wipe's own refusal text.
+    tentanas::disks::hide_other_org_array(&mut disk, &own_array_names(g)?);
     let journals = tentanas::elastic::journals(&g.db, explicit)
         .await
         .map_err(|e| privileged_error("elastic journals", e))?;
@@ -719,11 +827,18 @@ async fn disk_wipe(
     command
         .plan()
         .map_err(|e| broker_error("disk_wipe", catalog_error(e)))?;
-    let job = tentanas::jobs::spawn(
+    // A wipe that releases a journal logs the array it released by name, and
+    // that array is this organisation's (the plan refuses anyone else's), so
+    // the job is this organisation's instead of the node's — from the INSERT
+    // that creates the row (`spawn_owned`), never through a later write that
+    // could fail and leave a node-wide row naming the array.
+    let owner = plan.journal_claim.is_some().then_some(g.org_id.as_str());
+    let job = tentanas::jobs::spawn_owned(
         &g.db,
         "disk_wipe",
         &disk.name,
         &g.user_id,
+        owner,
         None,
         None,
         move |h| tentanas::disks::wipe_job(h, command, explicit),
@@ -2138,7 +2253,10 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let datasets = tentanas::datasets::list("")
         .await
         .map_err(|e| broker_error("datasets", e))?;
-    let arrays = store::elastic_arrays_all(&g.db).map_err(|e| internal("elastic arrays", e))?;
+    // Only the caller's own arrays can be a share's source. The node holds
+    // every tenant's arrays; resolving against all of them let one
+    // organisation publish another's union over SMB or NFS.
+    let arrays = store::elastic_arrays(&g.db, &elastic_owner(&g)).map_err(|e| internal("elastic arrays", e))?;
     let source = tentanas::shares::resolve_source(&datasets, &arrays, source_path)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let now = store::now();
@@ -3234,13 +3352,16 @@ async fn snapshot_browse(
 
 fn alerts_list(ctx: &HandlerContext, include_acked: bool) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let alerts = store::list_alerts(&g.db, include_acked).map_err(|e| internal("alerts", e))?;
+    // Scoped like the job list: shared hardware for everyone, an alert about
+    // an array only for the organisation that owns it (migration 18).
+    let alerts = store::list_alerts_for_org(&g.db, &g.org_id, include_acked)
+        .map_err(|e| internal("alerts", e))?;
     Ok(tn(P::AlertsListResponse { alerts }))
 }
 
 fn alert_ack(ctx: &HandlerContext, alert_id: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    if !store::ack_alert(&g.db, alert_id).map_err(|e| internal("alerts", e))? {
+    if !store::ack_alert_for_org(&g.db, &g.org_id, alert_id).map_err(|e| internal("alerts", e))? {
         return Err(ProtocolError::not_found("alert not found or already acknowledged"));
     }
     alerts_list(ctx, false)
@@ -3530,6 +3651,13 @@ async fn execute_approved(
 
 fn elastic_owner(g: &Gate) -> ElasticOwner {
     ElasticOwner { org_id: g.org_id.clone(), addon_id: g.addon_id.clone() }
+}
+
+/// The asking organisation's array names, for `disks::hide_other_org_array`.
+/// An unreadable table is an error, not an empty set: an empty set would call
+/// every one of this organisation's own arrays "another organisation's".
+fn own_array_names(g: &Gate) -> Result<std::collections::BTreeSet<String>, ProtocolError> {
+    store::elastic_array_names_of_org(&g.db, &g.org_id).map_err(|e| internal("elastic arrays", e))
 }
 
 /// Every organisation this node has a record of — the set an Elastic
@@ -4618,9 +4746,13 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
     match payload {
         P::NodesListRequest {} => {
             let g = gate(ctx, PERM_READ)?;
+            let mut nodes = tentanas::fleet::nodes(ctx, &g.addon_id);
+            // The published summary counts node-wide alerts only; this node's
+            // row becomes what this tenant's alert list shows.
+            tentanas::fleet::scope_local_alerts(&mut nodes, &g.db, &g.org_id);
             Ok(tn(P::NodesListResponse {
                 local_node_id: ctx.state.local_node_id.to_string(),
-                nodes: tentanas::fleet::nodes(ctx, &g.addon_id),
+                nodes,
             }))
         }
         P::EnvironmentRequest { refresh } => environment(ctx, *refresh).await,
@@ -7471,5 +7603,161 @@ mod registration_tests {
         }
         // A real one passes through unchanged: `wwn_for` sanitises it itself.
         assert_eq!(target_host_for_create("Helios_02.lan").unwrap(), "Helios_02.lan");
+    }
+
+    // ----- tenants ------------------------------------------------------------------
+
+    /// An Elastic Array of `org`, written through the real create path, with
+    /// its create job; answers the job id.
+    fn tenant_array(g: &Gate, org: &str, name: &str) -> String {
+        let mut spec = tentanas::elastic::tests::create_spec(name);
+        spec.owner = ElasticOwner { org_id: org.into(), addon_id: g.addon_id.clone() };
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_create".into(),
+            subject: name.into(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&g.db, &job, Some(&tentanas::jobs::ElasticJobIntent::Create(spec))).unwrap();
+        job.job_id
+    }
+
+    /// The node's ONE TentaNas database holds every tenant's array work (the
+    /// package is a singleton and `app_db` keys the pool by instance id). The
+    /// job list, the job modal, the alert list and acknowledging answer for
+    /// the caller's organisation and for the shared hardware only — another
+    /// tenant's job or alert is "not found", like an id that never existed.
+    #[tokio::test]
+    async fn the_job_and_alert_handlers_never_hand_a_tenant_another_organisations_array_work() {
+        let fixture = dispatch_fixture();
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let mine = tenant_array(&g, &g.org_id, "media");
+        let theirs = tenant_array(&g, "org-other-tenant", "ksiegowosc");
+        store::raise_alert(&g.db, "k-mine", "warning", "elastic-array", "media", "Macierz media", "").unwrap();
+        store::raise_alert(&g.db, "k-theirs", "warning", "elastic-array", "ksiegowosc", "Macierz ksiegowosc", "")
+            .unwrap();
+        store::raise_alert(&g.db, "k-disk", "warning", "disk", "d1", "Disk sda: hot", "").unwrap();
+
+        let Ok(MessageBody::TentaNasBody(P::JobsListResponse { jobs })) = jobs_list(&fixture.ctx, 0) else {
+            panic!("jobs list");
+        };
+        assert_eq!(jobs.iter().map(|j| j.subject.as_str()).collect::<Vec<_>>(), vec!["media"]);
+        assert!(job_get(&fixture.ctx, &mine).is_ok());
+        let refused = job_get(&fixture.ctx, &theirs).expect_err("another tenant's job");
+        assert_eq!(refused.code, ProtocolErrorCode::NotFound);
+
+        let Ok(MessageBody::TentaNasBody(P::AlertsListResponse { alerts })) = alerts_list(&fixture.ctx, true) else {
+            panic!("alerts list");
+        };
+        let subjects: std::collections::BTreeSet<_> = alerts.iter().map(|a| a.subject_id.as_str()).collect();
+        assert_eq!(subjects, ["d1", "media"].into());
+        let their_alert = store::list_alerts(&g.db, true).unwrap()
+            .into_iter().find(|a| a.subject_id == "ksiegowosc").unwrap().alert_id;
+        let refused = alert_ack(&fixture.ctx, &their_alert).expect_err("another tenant's alert");
+        assert_eq!(refused.code, ProtocolErrorCode::NotFound);
+        assert!(store::list_alerts(&g.db, false).unwrap().iter().any(|a| a.alert_id == their_alert),
+            "and it stays unacknowledged for its owner");
+    }
+
+    /// A job another tenant's user started on SHARED hardware stays on the
+    /// list, but its author reaches this tenant as nobody: the account is
+    /// that tenant's, and so are its name AND its id — as is the id of an
+    /// account that no longer exists. A member of the asking organisation is
+    /// named as before, its org admin included (a membership row with the
+    /// admin role, the only way an admin belongs to an org), one author on
+    /// many jobs is named on every one of them, and every system author
+    /// (`scheduler`, `startup`) is untouched.
+    #[tokio::test]
+    async fn a_job_author_of_another_organisation_is_not_named_to_this_one() {
+        let fixture = dispatch_fixture();
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let db = &fixture.ctx.state.db;
+        for (id, name) in [("u-member", "Anna"), ("u-stranger", "Obca Osoba"), ("u-admin", "Szefowa")] {
+            db.write().unwrap().execute(
+                "INSERT INTO user_accounts (id, username, display_name, password_hash, is_active, must_change_password, role) \
+                 VALUES (?1, ?1, ?2, 'test', 1, 0, 'user')",
+                rusqlite::params![id, name],
+            ).unwrap();
+        }
+        let org = crate::services::org::create_organization(db, "Tenant", "tenant-x", None, None, None, None).unwrap();
+        let other = crate::services::org::create_organization(db, "Other", "tenant-y", None, None, None, None).unwrap();
+        let role = "role-nas-tenant-test";
+        db.write().unwrap().execute(
+            "INSERT OR IGNORE INTO roles (role_id, name, permissions_json, created_at) \
+             VALUES (?1, ?1, '[]', 'now')",
+            rusqlite::params![role],
+        ).unwrap();
+        let admin_role = crate::services::org::repo::list_roles(db).unwrap()
+            .into_iter().find(|r| r.name == "org_admin").expect("the seeded org admin role").role_id;
+        for (org_id, user, role) in [
+            (&org.org_id, "u-member", role),
+            (&other.org_id, "u-stranger", role),
+            (&org.org_id, "u-admin", admin_role.as_str()),
+        ] {
+            db.write().unwrap().execute(
+                "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+                 VALUES (?1, ?2, ?3, 'now', 'test')",
+                rusqlite::params![org_id, user, role],
+            ).unwrap();
+        }
+        let mut ctx = fixture.ctx.clone();
+        ctx.org_context.as_mut().unwrap().org_id = org.org_id.clone();
+        let started_by = [
+            "u-member", "u-stranger", "scheduler", "startup", "u-deleted", "u-admin", "u-member", "u-member",
+        ];
+        let mut jobs: Vec<tentaflow_protocol::tentanas::NasJob> = started_by
+            .into_iter()
+            .map(|by| tentaflow_protocol::tentanas::NasJob {
+                kind: "pool_scrub".into(), subject: "tank".into(), started_by: by.into(), ..Default::default()
+            })
+            .collect();
+        name_jobs(&ctx, Some(&g.db), &mut jobs);
+        let authors: Vec<&str> = jobs.iter().map(|j| j.started_by.as_str()).collect();
+        // Both system authors — the scheduler's unattended runs and a
+        // boot-time Elastic Restore (elastic::STARTED_BY_STARTUP) — pass
+        // through untouched, exactly like a real "start węzła" row on rig11.
+        assert_eq!(authors, vec!["Anna", "", "scheduler", "startup", "", "Szefowa", "Anna", "Anna"]);
+
+        // The lookup itself: distinct ids in, members of the asking org out.
+        let ids: std::collections::BTreeSet<String> =
+            ["u-member", "u-stranger", "u-deleted", "u-admin"].map(String::from).into();
+        assert_eq!(org_members_among(&ctx, &org.org_id, &ids),
+            ["u-admin", "u-member"].map(String::from).into());
+        assert_eq!(org_members_among(&ctx, &other.org_id, &ids), ["u-stranger"].map(String::from).into());
+        assert!(org_members_among(&ctx, "", &ids).is_empty(), "no org, no members");
+    }
+
+    /// The Disks tab and the wipe plan: a disk of another tenant's LIVE array
+    /// leaves the server as "another organisation's array", and the caller's
+    /// own array names are what decides it.
+    #[test]
+    fn own_array_names_are_the_callers_organisations_only() {
+        let fixture = dispatch_fixture();
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        tenant_array(&g, &g.org_id, "media");
+        tenant_array(&g, "org-other-tenant", "ksiegowosc");
+        assert_eq!(own_array_names(&g).unwrap(), ["media".to_string()].into());
+        // As the inventory holds it: named, and mounted at its branch, whose
+        // path spells the array.
+        let branch = |array: &str| NasDisk {
+            disk_id: "wwn-0x5000c500a1b2c3d4".into(), name: "sdg".into(), path: "/dev/sdg".into(),
+            role: "array_member".into(), member_of: Some(array.into()), array_role: "data".into(),
+            mountpoints: vec![format!("/mnt/tentanas-branches/{array}/data/d1")],
+            fs_uuid: Some("33333333-3333-4333-8333-333333333333".into()),
+            ..Default::default()
+        };
+        let mut theirs = branch("ksiegowosc");
+        tentanas::disks::hide_other_org_array(&mut theirs, &own_array_names(&g).unwrap());
+        assert_eq!(theirs.role, tentanas::disks::ROLE_OTHER_ORG_ARRAY);
+        // The whole disk as it goes out, not one field of it.
+        let wire = serde_json::to_string(&theirs).unwrap();
+        assert!(!wire.contains("ksiegowosc"), "{wire}");
+        assert!(!wire.contains("tentanas-branches"), "{wire}");
+        // The caller's own array is not touched.
+        let mut mine = branch("media");
+        tentanas::disks::hide_other_org_array(&mut mine, &own_array_names(&g).unwrap());
+        assert_eq!(mine, branch("media"));
     }
 }

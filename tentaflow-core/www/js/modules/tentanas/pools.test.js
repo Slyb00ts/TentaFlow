@@ -221,3 +221,155 @@ test('an unchanged poll leaves the pool cards and the free-disk shelf alone', as
   [...body.querySelectorAll('#nas-free-cells .disk-cell')].forEach((el, i) => assert.equal(el === cells[i], true, `free-disk cell ${i} survives the poll`));
   screen.dispose();
 });
+
+// B3 (critic-mockups-n01-n10-2026-09-21.md): a scrub's own % and "za N min"
+// used to sit INSIDE the joined string the whole list was compared against,
+// so a scan ticking rebuilt every card, its menu button and any open
+// `tf-menu` at least once a minute, and every 5 s during a scrub. The card
+// must instead be a stable skeleton keyed by pool name, with only the moving
+// values patched into it.
+test('two polls with a changed scrub % and a changed next-scrub time keep the card, its menu button and an open tf-menu the same nodes; the values update', async () => {
+  const inMs = (ms) => new Date(Date.now() + ms).toISOString().slice(0, 19).replace('T', ' ');
+  let call = 0;
+  const scans = [
+    { kind: 'scrub', status: 'running', progressPct: 10, errors: 0 },
+    { kind: 'scrub', status: 'running', progressPct: 55, errors: 0 },
+  ];
+  // Minutes away, then hours away: `fmtIn` buckets these into visibly
+  // different Polish text ("za N min" vs "za N godz"), so the assertion does
+  // not depend on exact wording, only on the text having actually moved.
+  const nextScrubs = [inMs(5 * 60 * 1000), inMs(3 * 3600 * 1000)];
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: () => ({ pools: [pool({ scan: scans[call], nextScrubAt: nextScrubs[call] })], freeDisks: [] }),
+    tentaNasDisksListRequest: { disks: [] },
+  });
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = mount();
+  await drawPools(screen, body);
+  await flush();
+
+  const card = body.querySelector('.pool-card[data-pool="tank"]');
+  const moreBtn = card.querySelector('[data-act="more"]');
+  const pauseBtn = card.querySelector('[data-act="pause"]');
+  const menu = card.querySelector('tf-menu');
+  assert.ok(card && moreBtn && pauseBtn && menu, 'the running scan offers its card, more button, pause button and menu');
+  menu.anchor = moreBtn;
+  menu.open();
+  assert.ok(menu.hasAttribute('open'), 'the menu opened');
+  const scanChipBefore = [...card.querySelectorAll('tf-chip')].find((c) => /%/.test(c.getAttribute('label') || ''));
+  assert.match(scanChipBefore.getAttribute('label'), /10%/);
+  const nextScrubTextBefore = card.querySelector('.text-3').textContent;
+
+  call = 1;
+  assert.ok(scheduled.length, 'the tab armed its poll');
+  await scheduled[0]();
+  await flush();
+
+  assert.ok(body.querySelector('.pool-card[data-pool="tank"]') === card, 'the card is the SAME node after the scrub %/time changed');
+  assert.ok(card.querySelector('[data-act="more"]') === moreBtn, 'the more button is the SAME node');
+  assert.ok(card.querySelector('[data-act="pause"]') === pauseBtn, 'the scan-action button is the SAME node');
+  assert.ok(card.querySelector('tf-menu') === menu, 'the tf-menu is the SAME node');
+  assert.ok(menu.hasAttribute('open'), 'the open menu is still open after the poll');
+  const scanChipAfter = [...card.querySelectorAll('tf-chip')].find((c) => /%/.test(c.getAttribute('label') || ''));
+  assert.match(scanChipAfter.getAttribute('label'), /55%/, 'the scan % actually updated');
+  assert.notEqual(card.querySelector('.text-3').textContent, nextScrubTextBefore, 'the next-scrub time actually updated');
+  screen.dispose();
+});
+
+// B3: the old whole-list `patchHtml` rebuilt every card whenever ANY pool
+// changed, so adding or removing one pool tore down every sibling's menu and
+// buttons too.
+test('a pool added or removed changes only that card', async () => {
+  let call = 0;
+  const sets = [
+    [pool({ name: 'tank' }), pool({ name: 'backup' })],
+    [pool({ name: 'tank' }), pool({ name: 'backup' }), pool({ name: 'extra' })],
+    [pool({ name: 'tank' }), pool({ name: 'extra' })],
+  ];
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: () => ({ pools: sets[call], freeDisks: [] }),
+    tentaNasDisksListRequest: { disks: [] },
+  });
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = mount();
+  await drawPools(screen, body);
+  await flush();
+  const tankCard = body.querySelector('.pool-card[data-pool="tank"]');
+  const backupCard = body.querySelector('.pool-card[data-pool="backup"]');
+  assert.ok(tankCard && backupCard, 'both pools start with a card');
+
+  call = 1;
+  assert.ok(scheduled.length, 'the tab armed its poll');
+  await scheduled[0]();
+  await flush();
+  assert.ok(body.querySelector('.pool-card[data-pool="tank"]') === tankCard, 'tank keeps its card when a pool is added');
+  assert.ok(body.querySelector('.pool-card[data-pool="backup"]') === backupCard, 'backup keeps its card when a pool is added');
+  const extraCard = body.querySelector('.pool-card[data-pool="extra"]');
+  assert.ok(extraCard, 'the new pool gets its own card');
+
+  call = 2;
+  await scheduled[0]();
+  await flush();
+  assert.equal(body.querySelector('.pool-card[data-pool="backup"]'), null, 'the removed pool loses its card');
+  assert.ok(body.querySelector('.pool-card[data-pool="tank"]') === tankCard, 'tank keeps its card when a pool is removed');
+  assert.ok(body.querySelector('.pool-card[data-pool="extra"]') === extraCard, 'extra keeps its card when a pool is removed');
+  screen.dispose();
+});
+
+// M2 (critic-round2-wave1-2026-09-22.md): the Elastic Array card used to be
+// built by `elasticCardHtml`, which baked used bytes, the last sync and the
+// state into the returned string, so ANY of those changing (which happens on
+// every write to the array) gave `patchKeyedList` a fresh string and rebuilt
+// the whole card, "Szczegóły" button included. It is now a skeleton
+// (`elasticCardSkeletonHtml`) painted in place by `paintElasticCard`, the
+// same split as a ZFS pool card.
+const GiB = 1024 ** 3;
+function elasticArray(overrides) {
+  return {
+    name: 'media', kind: 'elastic-array', filesystem: 'xfs', state: 'active', stateDetail: '',
+    unionPath: '/mnt/media', usableBytes: 20 * GiB, usedBytes: 5 * GiB,
+    dataDisks: [{ sizeBytes: 10 * GiB }, { sizeBytes: 10 * GiB }],
+    parityDisks: [{ sizeBytes: 10 * GiB }],
+    protection: { status: 'protected', protectedAsOf: '2026-09-01 02:00:00' },
+    ...overrides,
+  };
+}
+
+test('two polls with changed used bytes, last sync and state keep the Elastic Array card and its "Szczegóły" button the same nodes; the values update', async () => {
+  let call = 0;
+  const versions = [
+    elasticArray({ usedBytes: 5 * GiB, state: 'active', protection: { status: 'protected', protectedAsOf: '2026-09-01 02:00:00' } }),
+    elasticArray({ usedBytes: 12 * GiB, state: 'needs_attention', protection: { status: 'unprotected', protectedAsOf: '2026-09-07 02:00:00' } }),
+  ];
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: { pools: [], freeDisks: [] },
+    tentaNasElasticArraysListRequest: () => ({ arrays: [versions[call]] }),
+    tentaNasDisksListRequest: { disks: [] },
+  });
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = mount();
+  await drawPools(screen, body);
+  await flush();
+
+  const card = body.querySelector('.pool-card[data-array="media"]');
+  const detailsBtn = card.querySelector('[data-act="array-details"]');
+  assert.ok(card && detailsBtn, 'the array card and its details button are on screen');
+  assert.match(card.querySelector('[data-f="cap-value"]').textContent, /5\.0 GiB/, 'used bytes painted');
+  const stateLabelBefore = card.querySelector('[data-f="state"]').getAttribute('label');
+  const lastSyncBefore = card.querySelector('[data-f="last-sync"]').textContent;
+
+  call = 1;
+  assert.ok(scheduled.length, 'the tab armed its poll');
+  await scheduled[0]();
+  await flush();
+
+  assert.ok(body.querySelector('.pool-card[data-array="media"]') === card, 'the array card is the SAME node after used bytes/sync/state changed');
+  assert.ok(card.querySelector('[data-act="array-details"]') === detailsBtn, 'the "Szczegóły" button is the SAME node');
+  assert.match(card.querySelector('[data-f="cap-value"]').textContent, /12 GiB/, 'used bytes actually updated');
+  assert.notEqual(card.querySelector('[data-f="state"]').getAttribute('label'), stateLabelBefore, 'the state chip label actually updated');
+  assert.notEqual(card.querySelector('[data-f="last-sync"]').textContent, lastSyncBefore, 'the last-sync date actually updated');
+  screen.dispose();
+});

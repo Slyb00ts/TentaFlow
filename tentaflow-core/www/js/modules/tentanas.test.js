@@ -16,6 +16,19 @@ import { existsSync, readFileSync } from 'node:fs';
 
 const { ApiBinary } = await import('../protocol/api-binary-shim.js');
 const { default: Screen } = await import('./tentanas.js');
+// The shared job-row implementation (BLOCKER 2, n01-n10 critic 2026-09-21):
+// tentanas.js imports these from tasks.js rather than keeping its own
+// `jobRowHtml`/`wireJobRows` copy, so the tests build rows the same way.
+const { jobRowSkeleton, paintJobRow } = await import('./tentanas/tasks.js');
+
+// Renders one job row through the shared skeleton + painter, the way both
+// tentanas.js (n02) and tasks.js (n15) do it, and returns the row element.
+function buildJobRow(container, j) {
+  container.insertAdjacentHTML('beforeend', jobRowSkeleton(j));
+  const row = container.lastElementChild;
+  paintJobRow(row, j);
+  return row;
+}
 
 const LOCAL = 'nodeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const REMOTE = 'nodebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -215,12 +228,11 @@ test('rzeczywiste wiersze jobów Elastic nie mają Anuluj, log pozostaje dostęp
   const host = document.createElement('div');
   document.body.append(host);
   const jobs = ['elastic_create', 'elastic_restore', 'pool_scrub'].map((kind) => ({ jobId: kind, kind, subject: 'media', status: 'running', progressPct: 1, log: [] }));
-  host.innerHTML = jobs.map((job) => Screen.jobRowHtml(job)).join('');
+  jobs.forEach((job) => buildJobRow(host, job));
   assert.equal(host.querySelectorAll('[data-act="cancel"]').length, 1);
   assert.equal(host.querySelectorAll('[data-act="log"]').length, 3);
   assert.match(host.textContent, /Tworzenie Elastic Array/);
   assert.match(host.textContent, /Przywracanie montowania Elastic Array/);
-  Screen.wireJobRows(host, () => {});
   host.remove();
   Screen.unmount();
 });
@@ -956,6 +968,198 @@ test('a dashboard poll that brings the same Elastic Array mutates no node of the
   Screen.unmount();
 });
 
+// The owner's hard rule, end to end on n02: a poll that moves the ARC numbers,
+// a job's progress and an alert's age must not rebuild the ARC card, the job
+// row, its Cancel button, the alert row or its buttons — only the values
+// painted inside them move (BLOCKER 2, n01-n10 critic 2026-09-21). Before the
+// fix, `paintArcCard` and `renderAlertList` each compared one joined string
+// for the WHOLE card, and the running-jobs card used `patchHtml` over the
+// whole list — any one of these three changing rebuilt everything alongside
+// it, including buttons the fixed-node assertions below catch as `!==`.
+test('n02: a poll with changed ARC numbers, job progress and a newer alert time keeps every card, row and button the same node', async () => {
+  const runningV1 = [{ jobId: 'j1', kind: 'smart_test', subject: 'sda', status: 'running', progressPct: 10, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started'] }];
+  const runningV2 = [{ jobId: 'j1', kind: 'smart_test', subject: 'sda', status: 'running', progressPct: 55, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started', 'halfway'] }];
+  const alertV1 = { alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'nvme0n1', title: 'nvme0n1: pending sectors', detail: 'w 7 dni', raisedAt: '2026-08-01 10:00:00', ackedAt: null, resolvedAt: null };
+  const alertV2 = { ...alertV1, raisedAt: '2026-09-20 10:00:00' };
+  const arcV1 = { ...arc };
+  const arcV2 = { ...arc, sizeBytes: 2.5e9, hitRatio: 88.1, mruBytes: 9e8, mfuBytes: 1.3e9 };
+  let poll = 0;
+  stubTransport({
+    ...fixtures,
+    tentaNasJobsListRequest: () => ({ jobs: poll === 0 ? runningV1 : runningV2 }),
+    tentaNasAlertsListRequest: () => ({ alerts: [poll === 0 ? alertV1 : alertV2] }),
+    tentaNasArcStatsRequest: () => ({ arc: poll === 0 ? arcV1 : arcV2 }),
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+
+  const arcHost = root.querySelector('#nas-ov-arc');
+  const donut1 = arcHost.querySelector('.donut');
+  const dnVal1 = arcHost.querySelector('.dn-val');
+  const jobRow1 = root.querySelector('#nas-ov-jobs .job-row');
+  const cancelBtn1 = jobRow1.querySelector('[data-act="cancel"]');
+  const bar1 = jobRow1.querySelector('tf-progress-bar');
+  const alertRow1 = root.querySelector('#nas-ov-alerts .alert-row');
+  const gotoBtn1 = alertRow1.querySelector('[data-goto]');
+  const ackBtn1 = alertRow1.querySelector('[data-ack]');
+  const agoText1 = alertRow1.querySelector('.a-sub').textContent;
+  assert.equal(bar1.getAttribute('value'), '10');
+  assert.match(dnVal1.textContent, /94\.2%/);
+
+  poll = 1;
+  await Screen.refreshOverview(body);
+  await flush();
+
+  // ARC: the very same card AND the very same donut ring inside it — a full
+  // `host.innerHTML =` on every poll (the pre-fix behaviour) keeps the outer
+  // container's identity but destroys everything inside it, which the two
+  // checks below catch that a container-only check would miss.
+  assert.ok(root.querySelector('#nas-ov-arc') === arcHost, 'the ARC card container is the same node');
+  assert.ok(arcHost.querySelector('.donut') === donut1, 'the donut ring is the same node');
+  assert.ok(arcHost.querySelector('.dn-val') === dnVal1, 'its value element is the same node');
+  assert.match(dnVal1.textContent, /88\.1%/, 'and its hit ratio moved');
+
+  // The running job: the very same row and Cancel button, its progress moved.
+  const jobRow2 = root.querySelector('#nas-ov-jobs .job-row');
+  assert.ok(jobRow2 === jobRow1, 'the job row survives the poll');
+  assert.ok(jobRow2.querySelector('[data-act="cancel"]') === cancelBtn1, 'its Cancel button is the same node');
+  const bar2 = jobRow2.querySelector('tf-progress-bar');
+  assert.ok(bar2 === bar1, 'the progress bar is the same node');
+  assert.equal(bar2.getAttribute('value'), '55', 'and its value moved');
+
+  // The alert: the very same row and buttons, its age moved.
+  const alertRow2 = root.querySelector('#nas-ov-alerts .alert-row');
+  assert.ok(alertRow2 === alertRow1, 'the alert row survives the poll');
+  assert.ok(alertRow2.querySelector('[data-goto]') === gotoBtn1, 'its "Szczegóły" button is the same node');
+  assert.ok(alertRow2.querySelector('[data-ack]') === ackBtn1, 'its "Potwierdź" button is the same node');
+  assert.notEqual(alertRow2.querySelector('.a-sub').textContent, agoText1, 'and the relative time moved');
+  Screen.unmount();
+});
+
+// MINOR 6 (critic-round2-wave1-2026-09-22.md): `alertRowSkeleton`'s comment
+// claimed "everything here is fixed for the life of an alert", but
+// `raise_alert` refreshes title, detail and severity on the node, and a
+// cache-stuck alert's detail carries a wait time that changes every minute
+// below 1 h and every hour above. Before the fix, both were baked into the
+// row's markup, so `patchKeyedList` rebuilt the whole row — Ack and
+// "Szczegóły" buttons included — every time either one ticked.
+test('n02: an alert whose title/detail change keeps its row and its Ack/"Szczegóły" buttons (MINOR 6)', async () => {
+  const alertV1 = { alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'nvme0n1', title: 'nvme0n1: pending sectors', detail: 'w 7 dni', raisedAt: '2026-08-01 10:00:00', ackedAt: null, resolvedAt: null };
+  const alertV2 = { ...alertV1, title: 'nvme0n1: cache stuck', detail: 'w 42 min' };
+  let poll = 0;
+  stubTransport({
+    ...fixtures,
+    tentaNasAlertsListRequest: () => ({ alerts: [poll === 0 ? alertV1 : alertV2] }),
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+  try {
+    const alertRow1 = root.querySelector('#nas-ov-alerts .alert-row');
+    const gotoBtn1 = alertRow1.querySelector('[data-goto]');
+    const ackBtn1 = alertRow1.querySelector('[data-ack]');
+    assert.match(alertRow1.querySelector('.a-title').textContent, /pending sectors/);
+    assert.match(alertRow1.querySelector('.a-sub').textContent, /w 7 dni/);
+
+    poll = 1;
+    await Screen.refreshOverview(body);
+    await flush();
+
+    const alertRow2 = root.querySelector('#nas-ov-alerts .alert-row');
+    assert.ok(alertRow2 === alertRow1, 'the alert row is the SAME node after title/detail changed');
+    assert.ok(alertRow2.querySelector('[data-goto]') === gotoBtn1, 'its "Szczegóły" button is the SAME node');
+    assert.ok(alertRow2.querySelector('[data-ack]') === ackBtn1, 'its "Potwierdź" button is the SAME node');
+    assert.match(alertRow2.querySelector('.a-title').textContent, /cache stuck/, 'the title actually updated');
+    assert.match(alertRow2.querySelector('.a-sub').textContent, /w 42 min/, 'the detail actually updated');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// MINOR 7, part 1 (critic-round2-wave1-2026-09-22.md): `paintArcCard` used to
+// add its delegated click listener on `host` inside the `!host.__tfArcBuilt`
+// branch, and ARC going unavailable reset that very flag — so each
+// unavailable→available cycle wired one MORE `click` listener onto the same
+// `host` node, and one l2arc click called `openPool` once per cycle it had
+// survived.
+test('n02: ARC unavailable→available twice still fires the l2arc click exactly once per click (MINOR 7)', async () => {
+  const arcAvailable = { ...arc, l2arcPools: [] };
+  let available = true;
+  stubTransport({
+    ...fixtures,
+    tentaNasArcStatsRequest: () => ({ arc: available ? arcAvailable : null }),
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+
+  let opens = 0;
+  const originalOpenPool = Screen.openPool;
+  Screen.openPool = () => { opens += 1; };
+  try {
+    const clickL2arc = () => {
+      const link = root.querySelector('#nas-ov-arc [data-act="arc-l2arc"]');
+      assert.ok(link, 'the l2arc add-link is offered while ARC is available');
+      click(link);
+    };
+
+    clickL2arc();
+    assert.equal(opens, 1, 'the first click opens the pool exactly once');
+
+    for (let i = 0; i < 2; i++) {
+      available = false;
+      await Screen.refreshOverview(body);
+      await flush();
+      assert.equal(root.querySelector('#nas-ov-arc [data-act="arc-l2arc"]'), null, 'ARC unavailable hides the link');
+      available = true;
+      await Screen.refreshOverview(body);
+      await flush();
+    }
+
+    opens = 0;
+    clickL2arc();
+    assert.equal(opens, 1, 'after two unavailable/available cycles, one click still opens the pool exactly once');
+  } finally {
+    Screen.openPool = originalOpenPool;
+    Screen.unmount();
+  }
+});
+
+// MINOR 7, part 2: the settings button's label used to be written with
+// `setText` on the `tf-button` host, which replaces its light-DOM content —
+// exactly what `tf-button` treats as a caller overwriting its insides, so it
+// rebuilds its inner `<button>` from scratch (tf-button.js). `setAttr` on
+// `label` goes through the attribute the component re-renders from in place.
+test('n02: the ARC settings button keeps its node when its label changes (MINOR 7)', async () => {
+  const arcA = { ...arc, maxBytes: 2e9, ramBytes: 8e9 }; // ramPct 25
+  const arcB = { ...arc, maxBytes: 4e9, ramBytes: 8e9 }; // ramPct 50
+  let poll = 0;
+  stubTransport({
+    ...fixtures,
+    tentaNasArcStatsRequest: () => ({ arc: poll === 0 ? arcA : arcB }),
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+  try {
+    const limitBtn = root.querySelector('#nas-ov-arc-actions [data-act="arc-limit"]');
+    assert.ok(limitBtn, 'the settings button is offered');
+    const labelBefore = limitBtn.getAttribute('label');
+    assert.match(labelBefore, /25/);
+
+    poll = 1;
+    await Screen.refreshOverview(body);
+    await flush();
+
+    assert.ok(root.querySelector('#nas-ov-arc-actions [data-act="arc-limit"]') === limitBtn, 'the settings button is the SAME node after its label changed');
+    assert.notEqual(limitBtn.getAttribute('label'), labelBefore, 'and the label actually updated');
+    assert.match(limitBtn.getAttribute('label'), /50/);
+  } finally {
+    Screen.unmount();
+  }
+});
+
 test('every overview alert row carries the drill-down of its subject (n02)', async () => {
   stubTransport({
     ...fixtures,
@@ -1188,7 +1392,7 @@ test('a job author is a name, a system author in words, or an unknown account wi
   document.body.append(host);
   const uuid = '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70';
   const job = (startedBy) => ({ jobId: startedBy, kind: 'pool_scrub', subject: 'tank', status: 'succeeded', startedBy, startedAt: '2026-09-01 10:00:00', log: [] });
-  host.innerHTML = ['Anna', 'scheduler', 'startup', uuid].map((by) => Screen.jobRowHtml(job(by))).join('');
+  ['Anna', 'scheduler', 'startup', uuid].forEach((by) => buildJobRow(host, job(by)));
   const subs = [...host.querySelectorAll('.job-sub')];
   assert.match(subs[0].textContent, /^Anna · /);
   assert.match(subs[1].textContent, /^harmonogram · /);
@@ -1210,7 +1414,7 @@ test('a job row marks a last-known subject and keeps a disk id out of the text',
   document.body.append(host);
   const wwn = 'wwn-0x5000cca27dc7a4c6';
   const job = (jobId, subject, extra = {}) => ({ jobId, kind: 'smart_test', subject, status: 'succeeded', startedBy: 'Anna', startedAt: '2026-09-01 10:00:00', log: [], ...extra });
-  host.innerHTML = [job('a', 'sdq', { subjectLastKnown: true }), job('b', wwn), job('c', 'sdd')].map((j) => Screen.jobRowHtml(j)).join('');
+  [job('a', 'sdq', { subjectLastKnown: true }), job('b', wwn), job('c', 'sdd')].forEach((j) => buildJobRow(host, j));
   const subject = (id) => host.querySelector(`.job-row[data-job="${id}"] .job-name .mono`);
   assert.equal(subject('a').textContent, 'ostatnio widziany jako sdq');
   assert.equal(subject('b').textContent, '');

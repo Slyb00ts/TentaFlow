@@ -6412,6 +6412,7 @@
       "array_data": "Data",
       "array_cache": "Cache",
       "array_parity": "Parity",
+      "other_org_array": "In another organisation's array",
       "mounted": "Mounted"
     },
     "disks": {
@@ -6939,7 +6940,7 @@
       "back": "Back to pools",
       "refresh": "Refresh",
       "snapshot_only": "Parity describes the last sync. Later writes have no confirmed protection.",
-      "tolerance": "Checkpoint tolerance: {n} disks",
+      "tolerance": "Checkpoint tolerance: {n} {n|disk|disks|disks}",
       "disks": "Array disks",
       "independent_fs": "Each data disk has its own filesystem.",
       "data": "Data",
@@ -7065,7 +7066,8 @@
       "member_cache": "cache disk",
       "member_parity": "parity disk {n}",
       "disk_absent": "disk missing",
-      "last_seen_as": "last seen as {name}"
+      "last_seen_as": "last seen as {name}",
+      "parity_errors_window": "Parity errors ({n} {n|day|days|days})"
     },
     "wizard_pool": {
       "elastic_data": "Data disks",

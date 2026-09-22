@@ -7,7 +7,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
-import { patchHtml, setAttr, setText } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
 import '/js/components/tf-button.js';
@@ -134,32 +134,142 @@ export function elasticCapacity(array) {
   return { measured, free, parityBytes, raw };
 }
 
-export function elasticCardHtml(array) {
-  const state = elasticState(array);
-  const c = elasticCapacity(array);
-  const widths = c.raw > 0 ? [Number(array.usedBytes), c.free, c.parityBytes].map((n) => n / c.raw * 100) : null;
+// Stable per-array skeleton (n05, Pools tab): the icon, the name, the
+// "Elastic Array" chip and the "Szczegóły" button never move on their own.
+// Everything that DOES — the state chip, the topology line, the capacity
+// split, the legend figures, the mountpoint/last-sync/protection rows and the
+// state-detail reason — is left as an empty slot here and written into this
+// SAME markup afterwards by `paintElasticCard`, the same split
+// `poolCardSkeletonHtml`/`paintPoolCard` use for a ZFS pool card (pools.js).
+// Before this, `elasticCardHtml` baked used bytes, the last sync and the
+// state straight into the returned string, so any write to the array (used
+// bytes), a completed sync or a state change gave `patchKeyedList` a fresh
+// string and rebuilt the whole card, "Szczegóły" button included (M2,
+// critic-round2-wave1-2026-09-22.md).
+export function elasticCardSkeletonHtml(array) {
   return `<div class="pool-card nas-elastic-card" data-array="${escapeAttr(array.name)}">
     <div class="pc-head">
       <div class="pc-ico">${sprite('cylinder')}</div>
       <div class="pc-meta"><span class="pc-name">${escapeHtml(array.name)}</span>
-        <tf-chip status="${state.tone}" dot label="${escapeAttr(state.label)}"></tf-chip>
+        <tf-chip dot data-f="state"></tf-chip>
         <tf-chip status="accent" label="Elastic Array"></tf-chip>
-        <div class="pc-desc">${escapeHtml(T('elastic.topology', { data: (array.dataDisks || []).length, parity: (array.parityDisks || []).length, fs: array.filesystem.toUpperCase() }))}</div>
+        <div class="pc-desc" data-f="desc"></div>
       </div>
       <div class="pc-actions"><tf-button variant="secondary" size="sm" icon="external-link" data-act="array-details">${escapeHtml(T('elastic.details'))}</tf-button></div>
     </div>
     <div class="pc-body">
-      <div><div class="pc-cap"><span>${escapeHtml(T('elastic.capacity'))}</span><span class="v">${escapeHtml(fmtOptionalBytes(array.usedBytes))} / ${escapeHtml(fmtOptionalBytes(array.usableBytes))}</span></div>
-        <div class="split-bar ${widths ? '' : 'nas-unmeasured'}" aria-label="${escapeAttr(widths ? T('elastic.capacity') : T('elastic.unmeasured'))}">${widths ? widths.map((w, i) => `<span class="${['data', 'free', 'parity'][i]}" style="width:${w}%"></span>`).join('') : ''}</div>
+      <div>
+        <div class="pc-cap"><span>${escapeHtml(T('elastic.capacity'))}</span><span class="v" data-f="cap-value"></span></div>
+        <div class="split-bar" data-f="bar"><span class="data"></span><span class="free"></span><span class="parity"></span></div>
         <div class="legend-rows mt-sm">
-          <div class="lr"><span class="sw data"></span>${escapeHtml(T('elastic.used'))}<span class="v">${escapeHtml(fmtOptionalBytes(array.usedBytes))}</span></div>
-          <div class="lr"><span class="sw free"></span>${escapeHtml(T('elastic.free'))}<span class="v">${escapeHtml(fmtOptionalBytes(c.free))}</span></div>
-          <div class="lr"><span class="sw parity"></span>${escapeHtml(T('elastic.parity'))}<span class="v">${escapeHtml(fmtOptionalBytes(c.parityBytes))}</span></div>
-        </div>${!widths ? `<div class="hint">${escapeHtml(T('elastic.unmeasured'))}</div>` : ''}
+          <div class="lr"><span class="sw data"></span>${escapeHtml(T('elastic.used'))}<span class="v" data-f="v-used"></span></div>
+          <div class="lr"><span class="sw free"></span>${escapeHtml(T('elastic.free'))}<span class="v" data-f="v-free"></span></div>
+          <div class="lr"><span class="sw parity"></span>${escapeHtml(T('elastic.parity'))}<span class="v" data-f="v-parity"></span></div>
+        </div>
+        <div ${SLOT} data-slot="unmeasured"></div>
       </div>
-      <div class="stat-rows">${row(T('elastic.mountpoint'), array.unionPath || '—')}${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.protection'), protectionLabel(array))}</div>
+      <div class="stat-rows">${rowSkel(T('elastic.mountpoint'), 'mountpoint')}${rowSkel(T('elastic.last_sync'), 'last-sync')}${rowSkel(T('elastic.protection'), 'protection')}</div>
     </div>
-    ${array.stateDetail ? `<div class="pc-reason">${escapeHtml(array.stateDetail)}</div>` : ''}
+    <div ${SLOT} data-slot="reason"></div>
+  </div>`;
+}
+
+// Writes everything that DOES move into a skeleton `patchKeyedList` just kept
+// or just built, on the SAME element for as long as that array exists — an
+// open `tf-menu` has no place on this card, but the "Szczegóły" button does,
+// and it survives every one of these calls exactly like a ZFS card's does
+// (`paintPoolCard`).
+export function paintElasticCard(card, array) {
+  if (!card) return;
+  const state = elasticState(array);
+  const c = elasticCapacity(array);
+  const widths = c.raw > 0 ? [Number(array.usedBytes), c.free, c.parityBytes].map((n) => n / c.raw * 100) : null;
+
+  const stateChip = field(card, 'state');
+  setAttr(stateChip, 'status', state.tone);
+  setAttr(stateChip, 'label', state.label);
+  setText(field(card, 'desc'), T('elastic.topology', { data: (array.dataDisks || []).length, parity: (array.parityDisks || []).length, fs: String(array.filesystem || '').toUpperCase() }));
+
+  setText(field(card, 'cap-value'), `${fmtOptionalBytes(array.usedBytes)} / ${fmtOptionalBytes(array.usableBytes)}`);
+
+  // Fixed 3 spans (data/free/parity) throughout, so the "measured" and
+  // "unmeasured" states differ only by a class and by whether each span
+  // carries a width — never by which nodes exist, which is what a keyed
+  // patch needs to leave the card's own identity alone.
+  const bar = field(card, 'bar');
+  setClass(bar, 'nas-unmeasured', !widths);
+  setAttr(bar, 'aria-label', widths ? T('elastic.capacity') : T('elastic.unmeasured'));
+  const [dataBar, freeBar, parityBar] = bar.children;
+  setAttr(dataBar, 'style', widths ? `width:${widths[0]}%` : null);
+  setAttr(freeBar, 'style', widths ? `width:${widths[1]}%` : null);
+  setAttr(parityBar, 'style', widths ? `width:${widths[2]}%` : null);
+
+  setText(field(card, 'v-used'), fmtOptionalBytes(array.usedBytes));
+  setText(field(card, 'v-free'), fmtOptionalBytes(c.free));
+  setText(field(card, 'v-parity'), fmtOptionalBytes(c.parityBytes));
+
+  slotEl(card.querySelector('[data-slot="unmeasured"]'), !widths, 'unmeasured', `<div class="hint">${escapeHtml(T('elastic.unmeasured'))}</div>`);
+
+  setText(field(card, 'mountpoint'), array.unionPath || '—');
+  setText(field(card, 'last-sync'), fmtDate(array.protection?.protectedAsOf));
+  setText(field(card, 'protection'), protectionLabel(array));
+
+  const reason = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(array.stateDetail), 'reason', '<div class="pc-reason"></div>');
+  if (reason) setText(reason, array.stateDetail);
+}
+
+// ---------------------------------------------------------------------------
+// Patch primitives of the detail pane
+// ---------------------------------------------------------------------------
+
+// A field of the pane by its `data-f` name. Names are unique per pane.
+const field = (root, name) => root.querySelector(`[data-f="${name}"]`);
+
+// A stat row whose VALUE is patched later; the label is fixed markup.
+const rowSkel = (label, name) => `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v" data-f="${name}"></span></div>`;
+
+// The cadence pill is the control: clicking the cadence is how n11 reaches the
+// dialog that sets it, which is where an admin looks for it first. Only the
+// text inside it moves on a poll.
+const pillRowSkel = (label, name, act, admin) => (admin
+  ? `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v"><button type="button" class="sched-pill" data-act="${escapeAttr(act)}" title="${escapeAttr(T('elastic.schedule_edit'))}">${sprite('clock')} <span data-f="${name}"></span></button></span></div>`
+  : rowSkel(label, name));
+
+// Keys that must stay unique although the wire gives no id: two runs with the
+// same identity fields get `#1`, `#2`… in their list order, so a duplicate is
+// never silently dropped by the keyed patch.
+function uniqueKeys(items, keyOf) {
+  const seen = new Map();
+  return items.map((item) => {
+    const base = keyOf(item);
+    const n = seen.get(base) || 0;
+    seen.set(base, n + 1);
+    return n ? `${base}#${n}` : base;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Disk cells
+// ---------------------------------------------------------------------------
+
+// A cell is keyed by the member's SLOT and disk id — what the node's rows key
+// the member by — and its markup is fixed per key. Everything that describes
+// the disk's current condition (its name, the usage figure, the tri-states,
+// the kind badge, the repair button) is written into that one cell, so a poll
+// that moves a figure or a history row leaves the cell and its buttons as the
+// same nodes. Only a member that joins or leaves the array adds or removes a
+// cell.
+const diskKey = (disk) => `disk:${disk.name}:${disk.diskId}`;
+
+function diskSkeletonHtml(disk) {
+  return `<div class="disk-cell" data-disk="${escapeAttr(disk.diskId)}" data-branch="${escapeAttr(disk.name)}">
+    <span class="health-dot"></span>
+    <div class="dc-main"><div class="dc-name"><span data-f="disk-name"></span></div>
+      <div ${SLOT} data-slot="absent"></div>
+      <div ${SLOT} data-slot="last-seen"></div>
+      <div class="dc-sub"><span data-fig="disk-usage"></span> · <span data-f="disk-fs"></span></div>
+      <div class="dc-sub" data-f="disk-state"></div>
+    </div><span ${SLOT} data-slot="kind"></span><span ${SLOT} data-slot="fix"></span><tf-button variant="ghost" size="sm" icon="external-link" data-act="disk"></tf-button>
   </div>`;
 }
 
@@ -169,9 +279,9 @@ export function elasticCardHtml(array) {
 // "show me this disk".
 //
 // The cell is named by the disk's KERNEL name (n11: `sdg`, `nvme2n1`). The
-// slot stays in `data-branch` because the figures and the repair find the
-// member by it; the by-uuid device and the branch mountpoint identify, they
-// do not name, so they are the name's tooltip.
+// slot stays in `data-branch` because the repair finds the member by it; the
+// by-uuid device and the branch mountpoint identify, they do not name, so
+// they are the name's tooltip.
 //
 // The naming rule (`disks::ShownDiskName` on the node): a LIVE name when
 // there is one; otherwise the member's part in the array, with the name it
@@ -180,22 +290,47 @@ export function elasticCardHtml(array) {
 // (`devicePresent === false`): a member it found is not missing just because
 // no name reached this cell, and the cell must not contradict its own
 // "Obecny: tak" line.
-function diskHtml(disk, filesystem, repair = '') {
+function paintDiskCell(cell, disk, filesystem, repair = '') {
+  if (!cell) return;
   const live = String(disk.diskName || '').trim();
   const lastKnown = String(disk.diskLastName || '').trim();
   const absent = !live && disk.devicePresent === false;
-  const shown = live || (absent ? T('elastic.disk_absent') : memberPart(disk));
-  const where = [disk.device, disk.mountpoint].filter(Boolean).join(' · ');
-  const [kindClass, kindLabel] = KIND_BADGE[disk.kind] || [];
-  return `<div class="disk-cell" data-disk="${escapeAttr(disk.diskId)}" data-branch="${escapeAttr(disk.name)}">
-    <span class="health-dot ${healthClass(disk.health)}"></span>
-    <div class="dc-main"><div class="dc-name"><span class="${live ? 'mono' : ''} ${absent ? 'num-err' : ''}" title="${escapeAttr(where)}">${escapeHtml(shown)}</span></div>
-      ${absent ? `<div class="dc-sub">${escapeHtml(memberPart(disk))}</div>` : ''}
-      ${!live && lastKnown ? `<div class="dc-sub" data-role="last-seen">${escapeHtml(T('elastic.last_seen_as', { name: lastKnown }))}</div>` : ''}
-      <div class="dc-sub"><span data-fig="disk-usage"></span> · ${escapeHtml(filesystem.toUpperCase())}</div>
-      <div class="dc-sub">${escapeHtml(T('elastic.mounted'))}: ${escapeHtml(triState(disk.mounted))} · ${escapeHtml(T('elastic.present'))}: ${escapeHtml(triState(disk.devicePresent))}</div>
-    </div>${kindLabel ? `<span class="disk-kind ${kindClass}">${kindLabel}</span>` : ''}${repair ? `<tf-button variant="danger" size="sm" icon="shield" data-act="fix" title="${escapeAttr(repair)}">${escapeHtml(T('elastic.repair'))}</tf-button>` : ''}<tf-button variant="ghost" size="sm" icon="external-link" data-act="disk" title="${escapeAttr(T('elastic.disk_details', { name: memberName(disk) }))}"></tf-button>
-  </div>`;
+  const dot = cell.querySelector('.health-dot');
+  const dotClass = `health-dot ${healthClass(disk.health)}`;
+  if (dot.className !== dotClass) dot.className = dotClass;
+  const nameEl = field(cell, 'disk-name');
+  setText(nameEl, live || (absent ? T('elastic.disk_absent') : memberPart(disk)));
+  setClass(nameEl, 'mono', Boolean(live));
+  setClass(nameEl, 'num-err', absent);
+  setAttr(nameEl, 'title', [disk.device, disk.mountpoint].filter(Boolean).join(' · '));
+  const part = slotEl(cell.querySelector('[data-slot="absent"]'), absent, 'absent', '<div class="dc-sub"></div>');
+  if (part) setText(part, memberPart(disk));
+  const seen = slotEl(cell.querySelector('[data-slot="last-seen"]'), !live && Boolean(lastKnown), 'last-seen', '<div class="dc-sub" data-role="last-seen"></div>');
+  if (seen) setText(seen, T('elastic.last_seen_as', { name: lastKnown }));
+  setText(cell.querySelector('[data-fig="disk-usage"]'), `${fmtOptionalBytes(disk.usedBytes)} / ${fmtOptionalBytes(disk.sizeBytes)}`);
+  setText(field(cell, 'disk-fs'), String(filesystem || '').toUpperCase());
+  setText(field(cell, 'disk-state'), `${T('elastic.mounted')}: ${triState(disk.mounted)} · ${T('elastic.present')}: ${triState(disk.devicePresent)}`);
+  // The kind is part of the badge's key, so a changed kind swaps the one
+  // badge and nothing else.
+  const kind = String(disk.kind || '');
+  const [kindClass, kindLabel] = KIND_BADGE[kind] || [];
+  slotEl(cell.querySelector('[data-slot="kind"]'), Boolean(kindLabel), `kind:${kind}`, `<span class="disk-kind ${escapeAttr(kindClass || '')}">${escapeHtml(kindLabel || '')}</span>`);
+  const fix = slotEl(cell.querySelector('[data-slot="fix"]'), Boolean(repair), 'fix', `<tf-button variant="danger" size="sm" icon="shield" data-act="fix">${escapeHtml(T('elastic.repair'))}</tf-button>`);
+  if (fix) setAttr(fix, 'title', repair);
+  // An icon-only button: its accessible name is its title, and the inner
+  // <button> the component builds is what assistive tech reads.
+  const drill = cell.querySelector('[data-act="disk"]');
+  const title = T('elastic.disk_details', { name: memberName(disk) });
+  setAttr(drill, 'title', title);
+  setAttr(drill.querySelector('button'), 'aria-label', title);
+}
+
+// One disk group's cells: keyed, then painted. `repairOf(disk)` answers the
+// repair reason for that member ('' for none).
+function paintDiskCells(host, disks, filesystemOf, repairOf = () => '') {
+  patchKeyedList(host, disks.map((d) => ({ key: diskKey(d), html: diskSkeletonHtml(d) })));
+  const cells = [...host.children];
+  disks.forEach((d, i) => paintDiskCell(cells[i], d, filesystemOf(d), repairOf(d)));
 }
 
 /// The repair dialog. The retype is the DISK and not the array: what the
@@ -353,18 +488,55 @@ function openElasticDestroyDialog(screen, array, onDone) {
   });
 }
 
-function snapraidHistoryHtml(history, expanded) {
-  const outcomes = { running: 'run_running', ok: 'run_ok', partial: 'run_partial', interrupted: 'run_interrupted', nothing_repaired: 'run_nothing_repaired', failed: 'run_failed', needs_attention: 'error', refused: 'run_refused' };
-  const refusals = { no_parity: 'no_parity', precondition_failed: 'refused_precondition', unsynced_changes: 'refused_dirty', empty_parity: 'refused_empty' };
-  return `<div class="nas-snapraid-history mt-md"><div class="title">${escapeHtml(T('elastic.history'))}</div>${history.length ? `<ol>${history.map((run) => {
-    const label = run.kind === 'sync' ? 'Sync' : run.kind === 'scrub' ? 'Scrub' : run.kind === 'fix' ? T('elastic.run_fix') : run.kind;
-    const result = T(`elastic.${outcomes[run.outcome] || 'unknown'}`);
-    const key = JSON.stringify([run.operationId, run.jobId, run.startedAt, run.kind]);
-    const detail = run.outcome === 'refused' && refusals[run.detail] ? T(`elastic.${refusals[run.detail]}`) : run.detail;
-    return `<li><details data-run="${escapeAttr(key)}" ${expanded.has(key) ? 'open' : ''}><summary><strong>${escapeHtml(label)}</strong><span class="hint">${escapeHtml(fmtDate(run.finishedAt || run.startedAt))}</span><tf-chip status="${run.outcome === 'ok' ? 'ok' : run.outcome === 'failed' || run.outcome === 'needs_attention' ? 'err' : 'warn'}" label="${escapeAttr(result)}"></tf-chip></summary>
-      <div class="stat-rows">${row(T('elastic.run_started'), fmtDate(run.startedAt))}${row(T('elastic.run_finished'), fmtDate(run.finishedAt))}${row(T('elastic.run_blocks'), `${run.checkedBlocks ?? '—'} / ${run.totalBlocks ?? '—'}`)}${row(T('elastic.run_errors'), `${run.errorsFile ?? '—'} / ${run.errorsIo ?? '—'} / ${run.errorsData ?? '—'}`)}${row(T('elastic.run_exit'), run.exitCode ?? '—')}</div>
-      ${detail ? `<div class="hint">${escapeHtml(detail)}</div>` : ''}</details>${run.jobId ? `<tf-button variant="ghost" size="sm" data-act="history-job" data-job="${escapeAttr(run.jobId)}">${escapeHtml(T('elastic.history_job'))}</tf-button>` : ''}</li>`;
-  }).join('')}</ol>` : `<div class="hint mt-sm">${escapeHtml(T('elastic.history_empty'))}</div>`}</div>`;
+const RUN_OUTCOMES = { running: 'run_running', ok: 'run_ok', partial: 'run_partial', interrupted: 'run_interrupted', nothing_repaired: 'run_nothing_repaired', failed: 'run_failed', needs_attention: 'error', refused: 'run_refused' };
+const RUN_REFUSALS = { no_parity: 'no_parity', precondition_failed: 'refused_precondition', unsynced_changes: 'refused_dirty', empty_parity: 'refused_empty' };
+const runKey = (run) => JSON.stringify([run.operationId, run.jobId, run.startedAt, run.kind]);
+
+// A run's row is keyed by its identity (operation, job, start, kind), so its
+// markup is fixed per key: the kind label and the job link never change for
+// the same run. What a running run changes as it ends — the outcome chip, the
+// finish time, the counters — is written into the row, which keeps its
+// <details> (and whether the admin opened it) across polls.
+function runSkeletonHtml(run, key) {
+  const label = run.kind === 'sync' ? 'Sync' : run.kind === 'scrub' ? 'Scrub' : run.kind === 'fix' ? T('elastic.run_fix') : run.kind;
+  return `<li><details data-run="${escapeAttr(key)}"><summary><strong>${escapeHtml(label)}</strong><span class="hint" data-f="run-when"></span><tf-chip></tf-chip></summary>
+      <div class="stat-rows">${rowSkel(T('elastic.run_started'), 'run-started')}${rowSkel(T('elastic.run_finished'), 'run-finished')}${rowSkel(T('elastic.run_blocks'), 'run-blocks')}${rowSkel(T('elastic.run_errors'), 'run-errors')}${rowSkel(T('elastic.run_exit'), 'run-exit')}</div>
+      <div ${SLOT} data-slot="run-detail"></div></details>${run.jobId ? `<tf-button variant="ghost" size="sm" data-act="history-job" data-job="${escapeAttr(run.jobId)}">${escapeHtml(T('elastic.history_job'))}</tf-button>` : ''}</li>`;
+}
+
+function paintRun(li, run) {
+  const chip = li.querySelector('summary tf-chip');
+  setAttr(chip, 'status', run.outcome === 'ok' ? 'ok' : run.outcome === 'failed' || run.outcome === 'needs_attention' ? 'err' : 'warn');
+  setAttr(chip, 'label', T(`elastic.${RUN_OUTCOMES[run.outcome] || 'unknown'}`));
+  setText(field(li, 'run-when'), fmtDate(run.finishedAt || run.startedAt));
+  setText(field(li, 'run-started'), fmtDate(run.startedAt));
+  setText(field(li, 'run-finished'), fmtDate(run.finishedAt));
+  setText(field(li, 'run-blocks'), `${run.checkedBlocks ?? '—'} / ${run.totalBlocks ?? '—'}`);
+  setText(field(li, 'run-errors'), `${run.errorsFile ?? '—'} / ${run.errorsIo ?? '—'} / ${run.errorsData ?? '—'}`);
+  setText(field(li, 'run-exit'), run.exitCode ?? '—');
+  const detail = run.outcome === 'refused' && RUN_REFUSALS[run.detail] ? T(`elastic.${RUN_REFUSALS[run.detail]}`) : run.detail;
+  const hint = slotEl(li.querySelector('[data-slot="run-detail"]'), Boolean(detail), 'detail', '<div class="hint"></div>');
+  if (hint) setText(hint, detail);
+}
+
+// `expanded` carries the open runs across a row that IS rebuilt — the pane
+// coming back after a failed read — so a fresh row opens the way the admin
+// left it. A row that survives a poll keeps its own <details> state.
+function paintHistory(section, history, expanded) {
+  const list = slotEl(section.querySelector('[data-slot="history-list"]'), history.length > 0, 'list', '<ol></ol>');
+  slotEl(section.querySelector('[data-slot="history-empty"]'), history.length === 0, 'empty', `<div class="hint mt-sm">${escapeHtml(T('elastic.history_empty'))}</div>`);
+  if (!list) return;
+  const keys = uniqueKeys(history, runKey);
+  patchKeyedList(list, history.map((run, i) => ({ key: keys[i], html: runSkeletonHtml(run, keys[i]) })));
+  const rows = [...list.children];
+  history.forEach((run, i) => {
+    const li = rows[i];
+    if (!li.__tfRun) {
+      li.__tfRun = true;
+      li.querySelector('details').open = expanded.has(keys[i]);
+    }
+    paintRun(li, run);
+  });
 }
 
 const moverMoved = (run) => !run ? '—' : `${fmtOptionalBytes(run.movedBytes)} · ${Number(run.movedFiles) || 0}`;
@@ -427,39 +599,55 @@ const moverScheduleValue = (m) => (!m.schedule ? T('elastic.mover_window_none')
 const cadenceValue = (schedule, enabled) => (!schedule ? T('elastic.mover_schedule_none')
   : enabled ? fmtSchedule(schedule) : `${fmtSchedule(schedule)} · ${T('schedule.off')}`);
 
-// The pill is the control: clicking the cadence is how n11 reaches the dialog
-// that sets it, which is where an admin looks for it first.
-const schedulePill = (label, value, act, admin) => (admin
-  ? `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v"><button type="button" class="sched-pill" data-act="${escapeAttr(act)}" title="${escapeAttr(T('elastic.schedule_edit'))}">${sprite('clock')} ${escapeHtml(value)}</button></span></div>`
-  : row(label, value));
-
 // Moving files off the cache is automatic, so nothing here is something an
 // admin has to operate: the rules, the optional window, the manual run and the
 // history live in a collapsed section. The main view carries only the one fact
-// about the DATA (`cachePendingHtml`).
-function moverAdvancedHtml(array, disabled, reason, admin, open) {
+// about the DATA (`cachePendingHtml`). The section is built once per pane and
+// only written into, so a run starting or finishing never closes it on the
+// admin who opened it.
+function moverSkeletonHtml(admin) {
+  return `<details class="section-card nas-mover" data-section="mover"><summary class="section-card-head"><div class="title">${sprite('transform')} ${escapeHtml(T('elastic.mover'))}</div></summary>
+    <div class="actions mb-sm">
+    ${admin ? `<tf-button variant="ghost" size="sm" icon="edit" data-act="mover-schedule">${escapeHtml(T('elastic.mover_settings'))}</tf-button>` : ''}
+    <tf-button variant="secondary" size="sm" icon="play" data-act="mover">${escapeHtml(T('elastic.mover_run_now'))}</tf-button></div>
+    <div class="explain-box mb-sm nas-mover-explain" data-f="mover-explain"></div>
+    <div ${SLOT} data-slot="mover-reason"></div>
+    <div ${SLOT} data-slot="mover-restricted"></div>
+    <div class="stat-rows">${pillRowSkel(T('elastic.mover_schedule'), 'mover-window', 'mover-schedule', admin)}${rowSkel(T('elastic.mover_rules'), 'mover-rules')}${row(T('elastic.mover_open_files'), T('elastic.mover_open_files_skipped'))}${rowSkel(T('elastic.mover_last_run'), 'mover-last')}${rowSkel(T('elastic.mover_moved'), 'mover-moved')}${rowSkel(T('elastic.mover_skipped'), 'mover-skipped')}</div>
+    <div class="mover-hist">${escapeHtml(T('elastic.mover_history'))}: <span data-part="mover-runs" ${SLOT}></span></div>
+    <div class="explain-box mt-md nas-mover-parity-note" data-f="mover-parity-note"></div>
+    <div class="hint mt-sm">${escapeHtml(T('elastic.mover_name_note'))}</div>
+  </details>`;
+}
+
+function paintMover(section, array, disabled, reason) {
   const m = array.mover || {};
   const last = m.lastRun || null;
   const history = m.history || [];
-  return `<details class="section-card nas-mover" data-section="mover" ${open ? 'open' : ''}><summary class="section-card-head"><div class="title">${sprite('transform')} ${escapeHtml(T('elastic.mover'))}</div></summary>
-    <div class="actions mb-sm">
-    ${admin ? `<tf-button variant="ghost" size="sm" icon="edit" data-act="mover-schedule">${escapeHtml(T('elastic.mover_settings'))}</tf-button>` : ''}
-    <tf-button variant="secondary" size="sm" icon="play" data-act="mover" ${disabled ? 'disabled' : ''}>${escapeHtml(T('elastic.mover_run_now'))}</tf-button></div>
-    <div class="explain-box mb-sm nas-mover-explain">${escapeHtml(moverExplain(m))}</div>
-    ${reason ? `<div class="hint mb-sm">${escapeHtml(reason)}</div>` : ''}
-    ${m.enabled && m.schedule ? `<div class="hint mb-sm">${escapeHtml(T('elastic.mover_restricted'))}</div>` : ''}
-    <div class="stat-rows">${schedulePill(T('elastic.mover_schedule'), moverScheduleValue(m), 'mover-schedule', admin)}${row(T('elastic.mover_rules'), moverRulesValue(m))}${row(T('elastic.mover_open_files'), T('elastic.mover_open_files_skipped'))}${row(T('elastic.mover_last_run'), moverLastRun(last))}${row(T('elastic.mover_moved'), moverMoved(last))}${row(T('elastic.mover_skipped'), moverSkipped(last))}</div>
-    <div class="mover-hist">${escapeHtml(T('elastic.mover_history'))}: ${history.length ? history.map((run) => `<span>${escapeHtml(fmtDate(run.finishedAt || run.startedAt))} · ${escapeHtml(fmtOptionalBytes(run.movedBytes))}</span>`).join('') : `<span>${escapeHtml(T('elastic.mover_history_empty'))}</span>`}</div>
-    <div class="explain-box mt-md nas-mover-parity-note">${escapeHtml(m.coupledSync === false ? T('elastic.mover_coupled_off') : T('elastic.mover_coupled_warning'))}</div>
-    <div class="hint mt-sm">${escapeHtml(T('elastic.mover_name_note'))}</div>
-  </details>`;
+  setAttr(section.querySelector('[data-act="mover"]'), 'disabled', disabled);
+  setText(field(section, 'mover-explain'), moverExplain(m));
+  const hint = slotEl(section.querySelector('[data-slot="mover-reason"]'), Boolean(reason), 'reason', '<div class="hint mb-sm"></div>');
+  if (hint) setText(hint, reason);
+  slotEl(section.querySelector('[data-slot="mover-restricted"]'), Boolean(m.enabled && m.schedule), 'restricted', `<div class="hint mb-sm">${escapeHtml(T('elastic.mover_restricted'))}</div>`);
+  setText(field(section, 'mover-window'), moverScheduleValue(m));
+  setText(field(section, 'mover-rules'), moverRulesValue(m));
+  setText(field(section, 'mover-last'), moverLastRun(last));
+  setText(field(section, 'mover-moved'), moverMoved(last));
+  setText(field(section, 'mover-skipped'), moverSkipped(last));
+  // One pill per run, keyed by the run: a new run adds its pill at the front
+  // and every older pill stays the node it was.
+  const keys = uniqueKeys(history, (run) => `run:${run.startedAt || ''}:${run.finishedAt || ''}`);
+  patchKeyedList(section.querySelector('[data-part="mover-runs"]'), history.length
+    ? history.map((run, i) => ({ key: keys[i], html: `<span>${escapeHtml(fmtDate(run.finishedAt || run.startedAt))} · ${escapeHtml(fmtOptionalBytes(run.movedBytes))}</span>` }))
+    : [{ key: 'empty', html: `<span>${escapeHtml(T('elastic.mover_history_empty'))}</span>` }]);
+  setText(field(section, 'mover-parity-note'), m.coupledSync === false ? T('elastic.mover_coupled_off') : T('elastic.mover_coupled_warning'));
 }
 
 // The one line the main view says about moving: how much data sits on the cache
 // outside parity. A figure, never a fault — a non-zero value is the normal state
 // of an array with a cache, and the stuck alert is what reports a problem. The
-// number itself is written after the patch (`paintFigures`), so a changing byte
-// count never rebuilds the pane.
+// number itself is written by the paint, so a changing byte count changes one
+// text node.
 const cachePendingHtml = () => `<div class="stat-rows nas-cache-pending"><div class="sr"><span class="k">${escapeHtml(T('elastic.cache_pending'))}</span><span class="v" data-fig="cache-pending"></span></div></div>`;
 
 // §5.3's three per-folder answers, in the order the mockup lists them. `yes`
@@ -553,27 +741,54 @@ export function openFolderCacheDialog(screen, array, folder, onDone) {
 // ordinary empty directory and the node's `read_dir` of it says nothing. The
 // table therefore has THREE states, not two — a read list, an unread one, and
 // an unread one that still carries the folders somebody pinned.
-function foldersPanelHtml(array, admin) {
-  const folders = array.folders || [];
-  const known = array.foldersKnown === true;
-  const cell = (folder) => {
-    const label = cachePolicyLabel(folder.cachePolicy);
-    if (!admin) return escapeHtml(label);
-    return `<button type="button" class="sched-pill" data-act="folder-cache" data-folder="${escapeAttr(folder.name)}" title="${escapeAttr(T('elastic.folder_cache_edit'))}">${sprite('folder')} ${escapeHtml(label)}</button>`;
-  };
-  const rows = folders.map((folder) => `<div class="fr" data-folder="${escapeAttr(folder.name)}">
-    <span class="fr-name"><span class="mono">${escapeHtml(folder.name)}</span><span class="fr-sub mono">${escapeHtml(folder.path || '')}</span></span>
-    <span class="fr-share">${escapeHtml(folder.shareLabel || T('elastic.folders_share_none'))}</span>
-    <span class="fr-cache">${cell(folder)}${folder.cachePolicy === 'only' ? `<tf-chip status="warn" label="${escapeAttr(T('elastic.folder_pinned_badge'))}"></tf-chip>` : ''}</span>
-  </div>`).join('');
+function foldersSkeletonHtml(admin) {
   return `<div class="section-card nas-folders"><div class="section-card-head"><div class="title">${sprite('folder')} ${escapeHtml(T('elastic.folders'))}</div><span class="hint">${escapeHtml(T('elastic.folders_hint'))}</span></div>
-    ${folders.length ? `<div class="nas-folder-rows"><div class="fr fr-head"><span>${escapeHtml(T('elastic.folders_col_name'))}</span><span>${escapeHtml(T('elastic.folders_col_share'))}</span><span>${escapeHtml(T('elastic.folders_col_cache'))}</span></div>${rows}</div>` : ''}
-    ${known && !folders.length ? `<div class="hint mt-sm">${escapeHtml(T('elastic.folders_none'))}</div>` : ''}
-    ${known ? '' : `<div class="hint mt-sm">${escapeHtml(T(folders.length ? 'elastic.folders_unknown_partial' : 'elastic.folders_unknown'))}</div>`}
-    ${folders.some((f) => f.cachePolicy === 'only') ? `<div class="wizard-warning danger nas-folders-pinned">${sprite('alert')}<div>${escapeHtml(T('elastic.folders_pinned_note'))}</div></div>` : ''}
+    <div ${SLOT} data-slot="folder-table"></div>
+    <div ${SLOT} data-slot="folders-none"></div>
+    <div ${SLOT} data-slot="folders-unknown"></div>
+    <div ${SLOT} data-slot="folders-pinned"></div>
     <div class="explain-box mt-md">${escapeHtml(T('elastic.folders_explain'))}</div>
     ${admin ? '' : `<div class="hint mt-sm">${escapeHtml(T('elevation.admin_only'))}</div>`}
   </div>`;
+}
+
+// A row is keyed by the folder's name; what the node may change about it —
+// its path, its share, its policy — is written into the row, so a policy
+// saved in the dialog updates the pill's text instead of replacing the row.
+function folderSkeletonHtml(folder, admin) {
+  const cell = admin
+    ? `<button type="button" class="sched-pill" data-act="folder-cache" data-folder="${escapeAttr(folder.name)}" title="${escapeAttr(T('elastic.folder_cache_edit'))}">${sprite('folder')} <span data-f="folder-policy"></span></button>`
+    : '<span data-f="folder-policy"></span>';
+  return `<div class="fr" data-folder="${escapeAttr(folder.name)}">
+    <span class="fr-name"><span class="mono">${escapeHtml(folder.name)}</span><span class="fr-sub mono" data-f="folder-path"></span></span>
+    <span class="fr-share" data-f="folder-share"></span>
+    <span class="fr-cache">${cell}<span ${SLOT} data-slot="folder-pinned"></span></span>
+  </div>`;
+}
+
+function paintFolders(card, array, admin) {
+  const folders = array.folders || [];
+  const known = array.foldersKnown === true;
+  const table = slotEl(card.querySelector('[data-slot="folder-table"]'), folders.length > 0, 'table', '<div class="nas-folder-rows"></div>');
+  if (table) {
+    patchKeyedList(table, [
+      { key: 'head', html: `<div class="fr fr-head"><span>${escapeHtml(T('elastic.folders_col_name'))}</span><span>${escapeHtml(T('elastic.folders_col_share'))}</span><span>${escapeHtml(T('elastic.folders_col_cache'))}</span></div>` },
+      ...folders.map((folder) => ({ key: `folder:${folder.name}`, html: folderSkeletonHtml(folder, admin) })),
+    ]);
+    const rows = [...table.children].slice(1);
+    folders.forEach((folder, i) => {
+      const r = rows[i];
+      setText(field(r, 'folder-path'), folder.path || '');
+      setText(field(r, 'folder-share'), folder.shareLabel || T('elastic.folders_share_none'));
+      setText(field(r, 'folder-policy'), cachePolicyLabel(folder.cachePolicy));
+      const chip = slotEl(r.querySelector('[data-slot="folder-pinned"]'), folder.cachePolicy === 'only', 'pinned', '<tf-chip status="warn"></tf-chip>');
+      if (chip) setAttr(chip, 'label', T('elastic.folder_pinned_badge'));
+    });
+  }
+  slotEl(card.querySelector('[data-slot="folders-none"]'), known && !folders.length, 'none', `<div class="hint mt-sm">${escapeHtml(T('elastic.folders_none'))}</div>`);
+  const unknown = slotEl(card.querySelector('[data-slot="folders-unknown"]'), !known, 'unknown', '<div class="hint mt-sm"></div>');
+  if (unknown) setText(unknown, T(folders.length ? 'elastic.folders_unknown_partial' : 'elastic.folders_unknown'));
+  slotEl(card.querySelector('[data-slot="folders-pinned"]'), folders.some((f) => f.cachePolicy === 'only'), 'pinned', `<div class="wizard-warning danger nas-folders-pinned">${sprite('alert')}<div>${escapeHtml(T('elastic.folders_pinned_note'))}</div></div>`);
 }
 
 // The mockup's four choices (n15). 0 is "no age limit" and is a real setting,
@@ -704,12 +919,75 @@ export function openElasticScheduleEditor(screen, { name, kind, schedule, enable
   });
 }
 
+// The pane's structure, and nothing about the array's current state: it is a
+// function of the admin flag and the visit's array name only, so every poll
+// yields the same string and the keyed patch in `draw` keeps the pane as it
+// is. What the array reports is written into it by `paintPane`.
+function paneSkeletonHtml(name, admin) {
+  return `<div class="stack" data-pane="elastic">
+    <div class="kpi" data-part="kpi"></div>
+    <div class="section-card"><div class="section-card-head"><div class="title">${sprite('cylinder')} ${escapeHtml(T('elastic.disks'))}</div><span class="hint">${escapeHtml(T('elastic.independent_fs'))}</span></div>
+      <div class="vdev-group" data-group="data"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.data'))} · MERGERFS</span><span class="mono" data-f="union-path"></span><span class="hint">${escapeHtml(T('elastic.policy'))}: <span data-f="create-policy"></span></span>${admin ? `<span class="actions"><tf-button variant="secondary" size="sm" icon="plus" data-act="add-disk">${escapeHtml(T('elastic.add_disk'))}</tf-button></span>` : ''}</div>
+        <div class="disk-cells" data-part="data-cells"></div>
+        <div ${SLOT} data-slot="add-disk-reason"></div></div>
+      <div class="vdev-group" data-group="parity"><div class="vg-head"><span class="vg-type">PARITY · SNAPRAID</span></div><div class="disk-cells" data-part="parity-cells"></div><div ${SLOT} data-slot="no-parity"></div></div>
+      <div class="vdev-group" data-group="cache"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.cache'))}</span><span class="hint">${escapeHtml(T('elastic.cache_no_protection'))}</span></div><div class="disk-cells" data-part="cache-cells"></div><div ${SLOT} data-slot="cache-foot"></div></div>
+    </div>
+    ${foldersSkeletonHtml(admin)}
+    <div class="grid-2"><div class="section-card nas-elastic-state"><div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('elastic.state'))}</div><tf-chip dot data-f="state-chip"></tf-chip></div>
+      <div class="stat-rows">${rowSkel(T('elastic.mountpoint'), 'state-path')}${rowSkel(T('elastic.state'), 'state-detail')}<div class="sr"><span class="k">${escapeHtml(T('elastic.unprotected_bytes'))}</span><span class="v" data-fig="moved-unsynced"></span></div><div class="sr"><span class="k">${escapeHtml(T('elastic.updated'))}</span><span class="v" data-fig="updated"></span></div></div>
+      <div class="explain-box mt-md">${escapeHtml(T('elastic.restore_hint'))}</div>
+      <div ${SLOT} data-slot="restore"></div>
+      ${admin ? '' : `<div class="hint mt-sm">${escapeHtml(T('elevation.admin_only'))}</div>`}
+      <div ${SLOT} data-part="message"></div>
+    </div><div class="section-card nas-snapraid"><div class="section-card-head"><div class="title">${sprite('shield')} SnapRAID</div><div class="actions">
+      <tf-button variant="secondary" size="sm" icon="refresh" data-act="sync">${escapeHtml(T('elastic.sync_now'))}</tf-button><tf-button variant="ghost" size="sm" icon="search" data-act="scrub">${escapeHtml(T('elastic.scrub_now'))}</tf-button></div></div>
+      <div ${SLOT} data-slot="maintenance-reason"></div><div ${SLOT} data-slot="repair-unavailable"></div>
+      <div class="stat-rows" data-part="snapraid-rows"></div>
+      <div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>
+      <div class="nas-snapraid-history mt-md"><div class="title">${escapeHtml(T('elastic.history'))}</div><div ${SLOT} data-slot="history-list"></div><div ${SLOT} data-slot="history-empty"></div></div>
+    </div></div>
+    ${moverSkeletonHtml(admin)}
+    ${admin ? `<div class="section-card danger-zone"><h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
+      ${dangerRowHtml({ title: T('elastic.dissolve', { name }), desc: T('elastic.dissolve_desc'), action: T('elastic.dissolve_action'), icon: 'trash', act: 'destroy' })}
+    </div>` : ''}
+  </div>`;
+}
+
+// The bytes a cache holds outside parity, when that is the fact the
+// "Ochrona" tile has to lead with (n11: "18 GiB na cache", warning colour).
+// Only an array WITH parity and a cache has such bytes to report; with no
+// parity every byte is outside it and the tile says so in words instead.
+function cacheWaitingBytes(array) {
+  const bytes = array.protection?.cacheUnprotectedBytes;
+  if (!(array.parityDisks || []).length || !(array.cacheDisks || []).length || !knownBytes(bytes)) return null;
+  return Number(bytes) > 0 ? Number(bytes) : null;
+}
+
+// n11: "Błędy parity (30 dni)". The window is the node's, so the label says
+// which one the count covers; an absent window keeps the bare label rather
+// than inventing one.
+function parityErrorsLabel(snapraid) {
+  const days = Number(snapraid?.parityErrorsWindowDays);
+  return Number.isFinite(days) && days > 0
+    ? T('elastic.parity_errors_window', { n: days })
+    : T('elastic.parity_errors');
+}
+
 export async function drawElasticDetail(screen, body) {
   const name = screen.array;
   const sourceNodeId = screen.currentNode()?.nodeId;
   const view = document.createElement('div');
   view.className = 'stack nas-elastic-detail';
+  // The heading is the same for the whole visit and is written once. The
+  // pane below it is `[data-part="main"]`, a keyed host that holds the error,
+  // the loading line or the pane skeleton — so a failed read swaps the pane
+  // out and a good one puts it back, and nothing else ever replaces it.
+  view.innerHTML = `<tf-breadcrumb class="nas-crumbs"><tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item><tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item></tf-breadcrumb><div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
+      <tf-button variant="ghost" data-act="back">${escapeHtml(T('elastic.back'))}</tf-button><tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
+    <div data-part="main" ${SLOT}></div>`;
   body.replaceChildren(view);
+  const main = view.querySelector('[data-part="main"]');
   const isCurrent = () => !screen.disposed && view.isConnected && screen.currentNode()?.nodeId === sourceNodeId && screen.array === name;
   let epoch = 0;
   let array = null;
@@ -748,6 +1026,11 @@ export async function drawElasticDetail(screen, body) {
           // missing disk is named as the thing to fix first rather than
           // reported as "nothing to repair".
           : repairBlocker(array) || (!repairEvidence(array) ? T('elastic.repair_none') : '');
+  // ONE reason for the whole array, rendered on every data disk. An array
+  // with no parity evidence gets no repair control at all, so the button
+  // cannot be the thing that suggests a repair is due; and an array a repair
+  // could not run on gets none either, with `repairReason` saying why.
+  const repairFor = () => (array && !repairReason() ? repairEvidence(array) : '');
   const addDiskReason = () => !screen.isAdmin ? T('elevation.admin_only')
     : !array?.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
       : array.unresolvedOperation ? T('elastic.add_disk_unresolved')
@@ -763,153 +1046,210 @@ export async function drawElasticDetail(screen, body) {
           : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running')
             : array.mover?.lastRun?.outcome === 'running' ? T('elastic.mover_running') : '';
 
+  // THE OWNER'S RULE: a poll patches what changed and never rebuilds a
+  // subtree. `main` holds at most an error and the pane; the pane's skeleton
+  // is a pure function of the visit, so an ordinary poll matches its key and
+  // markup and keeps every node — the KPI tiles, the disk cells, an open
+  // <details>, a button under the cursor. Only a failed read (the pane goes)
+  // or an admin flag that flipped (a different skeleton) builds it anew.
   const draw = (error = '') => {
     if (!isCurrent()) return;
-    const status = array && elasticState(array);
-    const maintenanceDisabled = busy || submitted || Boolean(maintenanceReason());
-    const moverDisabled = busy || submitted || Boolean(moverReason());
+    patchKeyedList(main, [
+      ...(error ? [{ key: 'error', html: `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(error)}"></tf-alert>` }] : []),
+      ...(array ? [{ key: 'pane', html: paneSkeletonHtml(name, screen.isAdmin) }]
+        : error ? [] : [{ key: 'loading', html: `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>` }]),
+    ]);
+    const pane = main.querySelector('[data-pane="elastic"]');
+    if (!pane || !array) return;
+    if (!pane.__tfWired) {
+      pane.__tfWired = true;
+      // A fresh pane opens the mover section the way the admin left it; one
+      // that survives a poll keeps its own state and is never touched here.
+      const mover = pane.querySelector('details[data-section="mover"]');
+      mover.open = moverOpen;
+      mover.addEventListener('toggle', () => { if (isCurrent() && mover.isConnected) moverOpen = mover.open; });
+    }
+    paintPane(pane);
+  };
+
+  // Every value the array reports, written into the pane's existing nodes.
+  // setAttr/setText touch a node only when its value differs, and the keyed
+  // lists add or remove only the disk, folder or run that came or went.
+  const paintPane = (pane) => {
+    const admin = screen.isAdmin;
+    const status = elasticState(array);
+    const lock = busy || submitted;
+    const maintenanceBlocked = maintenanceReason();
+    const moverBlocked = moverReason();
     const addDiskBlocked = addDiskReason();
-    const addDiskDisabled = busy || submitted || Boolean(addDiskBlocked);
-    // ONE reason for the whole array, rendered on every data disk. An array
-    // with no parity evidence gets no repair control at all, so the button
-    // cannot be the thing that suggests a repair is due; and an array a repair
-    // could not run on gets none either, with `repairReason` saying why.
-    const repairBlocked = array ? repairReason() : T('elevation.admin_only');
-    // A member with no kernel name gets no repair button even then: the
-    // admin confirms by retyping the name on the cell, and "brak dysku" is
-    // not a disk anyone can confirm overwriting.
-    const repairFor = () => (repairBlocked ? '' : repairEvidence(array));
+    const repair = repairFor();
     // A repair that CANNOT RUN has to say so where the admin is looking for
     // it. "Nothing to repair" and "you are not an admin" are not news and stay
     // silent; a data disk that is missing or unmounted is the one thing they
     // have to act on before a repair is possible at all, and it would
     // otherwise show only as an absent button.
-    const repairUnavailable = array && screen.isAdmin ? repairBlocker(array) : '';
-    const html = `<tf-breadcrumb class="nas-crumbs"><tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item><tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item></tf-breadcrumb><div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
-      <tf-button variant="ghost" data-act="back">${escapeHtml(T('elastic.back'))}</tf-button><tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
-      ${error ? `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(error)}"></tf-alert>` : ''}
-      ${array ? `<div class="kpi">
-        <tf-stat-card icon="cylinder" data-fig="capacity" label="${escapeAttr(T('elastic.capacity'))}"></tf-stat-card>
-        <tf-stat-card icon="shield" label="${escapeAttr(T('elastic.protection'))}" value="${escapeAttr(protectionLabel(array))}" delta="${escapeAttr(T('elastic.last_sync') + ': ' + fmtDate(array.protection?.protectedAsOf))}"></tf-stat-card>
-        <tf-stat-card icon="database" label="${escapeAttr(T('elastic.parity'))}" value="${(array.parityDisks || []).length}" delta="${escapeAttr(T('elastic.tolerance', { n: array.protection?.faultTolerance ?? '—' }))}"></tf-stat-card>
-        <tf-stat-card icon="database" data-fig="cache" label="${escapeAttr(T('elastic.cache'))}"></tf-stat-card>
-      </div>
-      <div class="section-card"><div class="section-card-head"><div class="title">${sprite('cylinder')} ${escapeHtml(T('elastic.disks'))}</div><span class="hint">${escapeHtml(T('elastic.independent_fs'))}</span></div>
-        <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.data'))} · MERGERFS</span><span class="mono">${escapeHtml(array.unionPath)}</span><span class="hint">${escapeHtml(T('elastic.policy'))}: ${escapeHtml(array.createPolicy)}</span>${screen.isAdmin ? `<span class="actions"><tf-button variant="secondary" size="sm" icon="plus" data-act="add-disk" ${addDiskDisabled ? 'disabled' : ''} title="${escapeAttr(addDiskBlocked || T('elastic.add_disk_online'))}">${escapeHtml(T('elastic.add_disk'))}</tf-button></span>` : ''}</div>
-          <div class="disk-cells">${(array.dataDisks || []).map((d) => diskHtml(d, d.filesystem || array.filesystem, d.diskName ? repairFor() : '')).join('')}</div>
-          ${screen.isAdmin && addDiskBlocked ? `<div class="hint">${escapeHtml(addDiskBlocked)}</div>` : ''}</div>
-        <div class="vdev-group"><div class="vg-head"><span class="vg-type">PARITY · SNAPRAID</span></div><div class="disk-cells">${(array.parityDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${!(array.parityDisks || []).length ? `<div class="hint">${escapeHtml(T('elastic.no_parity'))}</div>` : ''}</div>
-        <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.cache'))}</span><span class="hint">${escapeHtml(T('elastic.cache_no_protection'))}</span></div><div class="disk-cells">${(array.cacheDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${(array.cacheDisks || []).length ? cachePendingHtml() : `<div class="hint">${escapeHtml(T('elastic.cache_none'))}</div>`}</div>
-      </div>
-      ${foldersPanelHtml(array, screen.isAdmin)}
-      <div class="grid-2"><div class="section-card"><div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('elastic.state'))}</div><tf-chip status="${status.tone}" dot label="${escapeAttr(status.label)}"></tf-chip></div>
-        <div class="stat-rows">${row(T('elastic.mountpoint'), array.unionPath)}${row(T('elastic.state'), array.stateDetail || status.label)}<div class="sr"><span class="k">${escapeHtml(T('elastic.unprotected_bytes'))}</span><span class="v" data-fig="moved-unsynced"></span></div><div class="sr"><span class="k">${escapeHtml(T('elastic.updated'))}</span><span class="v" data-fig="updated"></span></div></div>
-        <div class="explain-box mt-md">${escapeHtml(T('elastic.restore_hint'))}</div>
-        ${screen.isAdmin && canRestore() ? `<tf-button variant="secondary" class="mt-md" data-act="restore" ${busy || submitted ? 'disabled' : ''}>${escapeHtml(T('elastic.restore'))}</tf-button>` : ''}
-        ${!screen.isAdmin ? `<div class="hint mt-sm">${escapeHtml(T('elevation.admin_only'))}</div>` : ''}
-        ${message ? `<div class="explain-box mt-md" role="status">${escapeHtml(message)}</div><tf-button variant="ghost" data-act="jobs">${escapeHtml(T('elastic.jobs'))}</tf-button>` : ''}
-      </div><div class="section-card nas-snapraid"><div class="section-card-head"><div class="title">${sprite('shield')} SnapRAID</div><div class="actions">
-        <tf-button variant="secondary" size="sm" icon="refresh" data-act="sync" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.sync_now'))}</tf-button><tf-button variant="ghost" size="sm" icon="search" data-act="scrub" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.scrub_now'))}</tf-button></div></div>
-        ${maintenanceReason() ? `<div class="hint mb-sm">${escapeHtml(maintenanceReason())}</div>` : ''}${repairUnavailable ? `<div class="hint mb-sm">${escapeHtml(repairUnavailable)}</div>` : ''}<div class="stat-rows">
-        ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.last_scrub'), fmtDate(array.snapraid?.lastScrub?.finishedAt))}${schedulePill(T('elastic.sync_schedule'), cadenceValue(array.snapraid?.syncSchedule, array.snapraid?.syncScheduleEnabled), 'sync-schedule', screen.isAdmin)}${schedulePill(T('elastic.scrub_schedule'), cadenceValue(array.snapraid?.scrubSchedule, array.snapraid?.scrubScheduleEnabled), 'scrub-schedule', screen.isAdmin)}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
-      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div></div>
-      ${moverAdvancedHtml(array, moverDisabled, moverReason(), screen.isAdmin, moverOpen)}
-      ${screen.isAdmin ? `<div class="section-card danger-zone"><h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
-        ${dangerRowHtml({ title: T('elastic.dissolve', { name: array.name }), desc: T('elastic.dissolve_desc'), action: T('elastic.dissolve_action'), icon: 'trash', act: 'destroy', disabled: busy || submitted })}
-      </div>` : ''}` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
-    // The whole pane is one patched string. An array that is simply sitting
-    // there polls to byte-identical markup, so nothing is destroyed and every
-    // listener below stays bound; when it DOES differ the pane is rebuilt and
-    // re-wired in the same breath, so a handler can never outlive its markup.
-    // The byte figures that move on every write are NOT in that string: they
-    // are written in place after it, so a growing cache changes text nodes
-    // instead of rebuilding the pane.
-    const rebuilt = patchHtml(view, html);
-    if (array) paintFigures();
-    if (!rebuilt) return;
-    view.querySelector('[data-act="back"]').addEventListener('click', () => { if (isCurrent()) screen.openArray(null); });
-    view.querySelector('.nas-crumbs').addEventListener('click', (event) => {
-      if (!event.target.closest('a')) return;
-      event.preventDefault();
-      if (isCurrent()) screen.openArray(null);
-    });
-    view.querySelector('[data-act="refresh"]').addEventListener('click', refresh);
-    view.querySelector('[data-act="jobs"]')?.addEventListener('click', () => { if (isCurrent()) screen.switchTab('jobs'); });
-    view.querySelectorAll('[data-act="disk"]').forEach((button) => {
-      button.querySelector('button')?.setAttribute('aria-label', button.title);
-      button.addEventListener('click', () => { if (isCurrent()) screen.openDisk(button.closest('[data-disk]').dataset.disk); });
-    });
-    for (const action of ['restore', 'sync', 'scrub', 'mover']) view.querySelector(`[data-act="${action}"]`)?.addEventListener('click', () => execute(action));
-    // querySelectorAll: every faulted data disk carries its own repair button.
-    view.querySelectorAll('[data-act="fix"]').forEach((button) => button.addEventListener('click', () => {
-      if (!isCurrent() || !array || repairReason()) return;
-      const branch = button.closest('[data-branch]')?.dataset.branch;
-      const disk = (array.dataDisks || []).find((d) => d.name === branch);
-      if (!disk) return;
-      openElasticFixDialog(screen, array, disk, repairFor(), refresh);
-    }));
-    view.querySelector('[data-act="add-disk"]')?.addEventListener('click', () => {
-      if (isCurrent() && array && !addDiskReason()) openAddDataDiskDialog(screen, array, refresh);
-    });
-    view.querySelector('[data-act="destroy"]')?.addEventListener('click', () => {
-      if (isCurrent() && array) openElasticDestroyDialog(screen, array, () => screen.openArray(null));
-    });
-    // querySelectorAll, not querySelector: the header button AND the pill both
-    // carry this action, and binding only the first match left the pill — the
-    // control this panel documents as the way in — doing nothing at all.
-    view.querySelectorAll('[data-act="mover-schedule"]').forEach((el) => el.addEventListener('click', () => {
-      if (isCurrent() && array) openMoverScheduleEditor(screen, array, refresh);
-    }));
-    for (const kind of ['sync', 'scrub']) view.querySelectorAll(`[data-act="${kind}-schedule"]`).forEach((el) => el.addEventListener('click', () => {
-      if (!isCurrent() || !array) return;
-      const s = array.snapraid || {};
-      openElasticScheduleEditor(screen, {
-        name,
-        kind,
-        schedule: kind === 'sync' ? s.syncSchedule : s.scrubSchedule,
-        enabled: kind === 'sync' ? s.syncScheduleEnabled : s.scrubScheduleEnabled,
-      }, refresh);
-    }));
-    // querySelectorAll: every folder row carries its own control, and the
-    // folder is read back out of the array by name at CLICK time rather than
-    // captured — a poll between the render and the click may have changed the
-    // stored policy, and the dialog must open on the current one.
-    view.querySelectorAll('[data-act="folder-cache"]').forEach((button) => button.addEventListener('click', () => {
-      if (!isCurrent() || !array || !screen.isAdmin) return;
-      const folder = (array.folders || []).find((f) => f.name === button.dataset.folder);
-      if (folder) openFolderCacheDialog(screen, array, folder, refresh);
-    }));
-    view.querySelectorAll('[data-act="history-job"]').forEach((button) => button.addEventListener('click', () => {
-      if (isCurrent()) screen.openJobLog(button.dataset.job, finishJob);
-    }));
-    view.querySelector('details[data-section="mover"]')?.addEventListener('toggle', (event) => {
-      if (isCurrent() && event.currentTarget.isConnected) moverOpen = event.currentTarget.open;
-    });
-    view.querySelectorAll('details[data-run]').forEach((details) => details.addEventListener('toggle', () => {
-      if (!isCurrent() || !details.isConnected) return;
-      if (details.open) expanded.add(details.dataset.run); else expanded.delete(details.dataset.run);
-    }));
+    const repairUnavailable = admin ? repairBlocker(array) : '';
+    const cacheWaiting = cacheWaitingBytes(array);
+
+    paintStatCards(pane.querySelector('[data-part="kpi"]'), [
+      { key: 'capacity', attrs: { icon: 'cylinder', 'data-fig': 'capacity', label: T('elastic.capacity'), value: fmtOptionalBytes(array.usedBytes), suffix: '/ ' + fmtOptionalBytes(array.usableBytes) } },
+      // n11 leads the tile with the bytes waiting on the cache, in the warning
+      // colour, whenever there are any: that is how much a disk failure right
+      // now could cost. With nothing waiting the tile says the checkpoint's
+      // state and when it was taken.
+      { key: 'protection', attrs: cacheWaiting != null
+        ? { icon: 'shield', 'data-fig': 'protection', label: T('elastic.protection'), value: fmtOptionalBytes(cacheWaiting), delta: T('elastic.cache_pending'), 'delta-type': 'warn', accent: 'warning' }
+        : { icon: 'shield', 'data-fig': 'protection', label: T('elastic.protection'), value: protectionLabel(array), delta: `${T('elastic.last_sync')}: ${fmtDate(array.protection?.protectedAsOf)}`, 'delta-type': null, accent: null } },
+      { key: 'parity', attrs: { icon: 'database', label: T('elastic.parity'), value: String((array.parityDisks || []).length), delta: T('elastic.tolerance', { n: array.protection?.faultTolerance ?? '—' }) } },
+      { key: 'cache', attrs: { icon: 'database', 'data-fig': 'cache', label: T('elastic.cache'), value: fmtOptionalBytes(array.cacheUsedBytes), suffix: '/ ' + fmtOptionalBytes(array.cacheSizeBytes) } },
+    ]);
+
+    // Disks. A member with no kernel name gets no repair button: the admin
+    // confirms by retyping the name on the cell, and "brak dysku" is not a
+    // disk anyone can confirm overwriting.
+    setText(field(pane, 'union-path'), array.unionPath || '');
+    setText(field(pane, 'create-policy'), array.createPolicy || '');
+    const addDisk = pane.querySelector('[data-act="add-disk"]');
+    setAttr(addDisk, 'disabled', lock || Boolean(addDiskBlocked));
+    setAttr(addDisk, 'title', addDiskBlocked || T('elastic.add_disk_online'));
+    const addHint = slotEl(pane.querySelector('[data-slot="add-disk-reason"]'), admin && Boolean(addDiskBlocked), 'hint', '<div class="hint"></div>');
+    if (addHint) setText(addHint, addDiskBlocked);
+    paintDiskCells(pane.querySelector('[data-part="data-cells"]'), array.dataDisks || [], (d) => d.filesystem || array.filesystem, (d) => (d.diskName ? repair : ''));
+    paintDiskCells(pane.querySelector('[data-part="parity-cells"]'), array.parityDisks || [], () => array.filesystem);
+    slotEl(pane.querySelector('[data-slot="no-parity"]'), !(array.parityDisks || []).length, 'none', `<div class="hint">${escapeHtml(T('elastic.no_parity'))}</div>`);
+    paintDiskCells(pane.querySelector('[data-part="cache-cells"]'), array.cacheDisks || [], () => array.filesystem);
+    const hasCache = (array.cacheDisks || []).length > 0;
+    patchKeyedList(pane.querySelector('[data-slot="cache-foot"]'), hasCache
+      ? [{ key: 'pending', html: cachePendingHtml() }]
+      : [{ key: 'none', html: `<div class="hint">${escapeHtml(T('elastic.cache_none'))}</div>` }]);
+    setText(pane.querySelector('[data-fig="cache-pending"]'), fmtOptionalBytes(array.protection?.cacheUnprotectedBytes));
+
+    paintFolders(pane.querySelector('.nas-folders'), array, admin);
+
+    // Array state.
+    const chip = field(pane, 'state-chip');
+    setAttr(chip, 'status', status.tone);
+    setAttr(chip, 'label', status.label);
+    setText(field(pane, 'state-path'), array.unionPath || '');
+    setText(field(pane, 'state-detail'), array.stateDetail || status.label);
+    setText(pane.querySelector('[data-fig="moved-unsynced"]'), fmtOptionalBytes(array.protection?.movedUnsyncedBytes));
+    setText(pane.querySelector('[data-fig="updated"]'), fmtDate(array.updatedAt));
+    const restore = slotEl(pane.querySelector('[data-slot="restore"]'), admin && Boolean(canRestore()), 'restore', `<tf-button variant="secondary" class="mt-md" data-act="restore">${escapeHtml(T('elastic.restore'))}</tf-button>`);
+    if (restore) setAttr(restore, 'disabled', lock);
+    const note = pane.querySelector('[data-part="message"]');
+    patchKeyedList(note, message ? [
+      { key: 'text', html: '<div class="explain-box mt-md" role="status"></div>' },
+      { key: 'jobs', html: `<tf-button variant="ghost" data-act="jobs">${escapeHtml(T('elastic.jobs'))}</tf-button>` },
+    ] : []);
+    if (message) setText(note.firstElementChild, message);
+
+    // SnapRAID.
+    for (const act of ['sync', 'scrub']) setAttr(pane.querySelector(`.nas-snapraid [data-act="${act}"]`), 'disabled', lock || Boolean(maintenanceBlocked));
+    const reasonHint = slotEl(pane.querySelector('[data-slot="maintenance-reason"]'), Boolean(maintenanceBlocked), 'hint', '<div class="hint mb-sm"></div>');
+    if (reasonHint) setText(reasonHint, maintenanceBlocked);
+    const repairHint = slotEl(pane.querySelector('[data-slot="repair-unavailable"]'), Boolean(repairUnavailable), 'hint', '<div class="hint mb-sm"></div>');
+    if (repairHint) setText(repairHint, repairUnavailable);
+    const snapraid = array.snapraid || {};
+    const rows = pane.querySelector('[data-part="snapraid-rows"]');
+    patchKeyedList(rows, [
+      { key: 'last-sync', html: rowSkel(T('elastic.last_sync'), 'sr-last-sync') },
+      { key: 'last-scrub', html: rowSkel(T('elastic.last_scrub'), 'sr-last-scrub') },
+      { key: 'sync-schedule', html: pillRowSkel(T('elastic.sync_schedule'), 'sr-sync-schedule', 'sync-schedule', admin) },
+      { key: 'scrub-schedule', html: pillRowSkel(T('elastic.scrub_schedule'), 'sr-scrub-schedule', 'scrub-schedule', admin) },
+      // n11 repeats the cache figure on this card, beside the parity it is
+      // outside of. Only an array with a cache has the row at all.
+      ...(hasCache ? [{ key: 'cache-pending', html: rowSkel(T('elastic.cache_pending'), 'sr-cache-pending') }] : []),
+      { key: 'parity-errors', html: '<div class="sr"><span class="k" data-f="sr-parity-errors-label"></span><span class="v" data-f="sr-parity-errors"></span></div>' },
+      { key: 'config', html: rowSkel(T('elastic.config'), 'sr-config') },
+    ]);
+    setText(field(rows, 'sr-last-sync'), fmtDate(array.protection?.protectedAsOf));
+    setText(field(rows, 'sr-last-scrub'), fmtDate(snapraid.lastScrub?.finishedAt));
+    setText(field(rows, 'sr-sync-schedule'), cadenceValue(snapraid.syncSchedule, snapraid.syncScheduleEnabled));
+    setText(field(rows, 'sr-scrub-schedule'), cadenceValue(snapraid.scrubSchedule, snapraid.scrubScheduleEnabled));
+    const cacheRow = field(rows, 'sr-cache-pending');
+    if (cacheRow) {
+      setText(cacheRow, fmtOptionalBytes(array.protection?.cacheUnprotectedBytes));
+      setClass(cacheRow, 'num-warn', cacheWaiting != null);
+    }
+    setText(field(rows, 'sr-parity-errors-label'), parityErrorsLabel(snapraid));
+    setText(field(rows, 'sr-parity-errors'), snapraid.parityErrors ?? '—');
+    setText(field(rows, 'sr-config'), snapraid.configPath || '—');
+    paintHistory(pane.querySelector('.nas-snapraid-history'), snapraid.history || [], expanded);
+
+    paintMover(pane.querySelector('details[data-section="mover"]'), array, lock || Boolean(moverBlocked), moverBlocked);
+    setAttr(pane.querySelector('.danger-zone [data-act="destroy"]'), 'disabled', lock);
   };
 
-  // Every figure that changes while an array simply serves: capacity, the cache
-  // fill and what waits on it, per-disk usage, new data outside sync and the
-  // last update. setAttr/setText touch a node only when its value differs.
-  const paintFigures = () => {
-    const cap = view.querySelector('tf-stat-card[data-fig="capacity"]');
-    setAttr(cap, 'value', fmtOptionalBytes(array.usedBytes));
-    setAttr(cap, 'suffix', '/ ' + fmtOptionalBytes(array.usableBytes));
-    const cache = view.querySelector('tf-stat-card[data-fig="cache"]');
-    setAttr(cache, 'value', fmtOptionalBytes(array.cacheUsedBytes));
-    setAttr(cache, 'suffix', '/ ' + fmtOptionalBytes(array.cacheSizeBytes));
-    setText(view.querySelector('[data-fig="cache-pending"]'), fmtOptionalBytes(array.protection?.cacheUnprotectedBytes));
-    setText(view.querySelector('[data-fig="moved-unsynced"]'), fmtOptionalBytes(array.protection?.movedUnsyncedBytes));
-    setText(view.querySelector('[data-fig="updated"]'), fmtDate(array.updatedAt));
-    const disks = [...(array.dataDisks || []), ...(array.parityDisks || []), ...(array.cacheDisks || [])];
-    view.querySelectorAll('.disk-cell[data-disk]').forEach((cell) => {
-      const disk = disks.find((d) => d.diskId === cell.dataset.disk && d.name === cell.dataset.branch);
-      if (disk) setText(cell.querySelector('[data-fig="disk-usage"]'), `${fmtOptionalBytes(disk.usedBytes)} / ${fmtOptionalBytes(disk.sizeBytes)}`);
-    });
-  };
+  // ONE click listener for the visit. Buttons come and go with the data (a
+  // repair on a faulted disk, Restore on a pending array), and a listener per
+  // button would have to be re-bound on exactly the polls that create one and
+  // never twice on the ones that do not. Everything it acts on is read from
+  // the CURRENT `array` at click time, never captured when a button was made:
+  // a poll between the render and the click may have changed it, and a dialog
+  // must open on the state the admin is looking at.
+  view.addEventListener('click', (event) => {
+    if (!isCurrent()) return;
+    const target = event.target;
+    if (target.closest?.('.nas-crumbs')) {
+      if (!target.closest('a')) return;
+      event.preventDefault();
+      screen.openArray(null);
+      return;
+    }
+    const el = target.closest?.('[data-act]');
+    if (!el || !view.contains(el) || el.hasAttribute('disabled')) return;
+    const act = el.dataset.act;
+    switch (act) {
+      case 'back': screen.openArray(null); return;
+      case 'refresh': refresh(); return;
+      case 'jobs': screen.switchTab('jobs'); return;
+      case 'disk': screen.openDisk(el.closest('[data-disk]').dataset.disk); return;
+      case 'restore': case 'sync': case 'scrub': case 'mover': execute(act); return;
+      case 'history-job': screen.openJobLog(el.dataset.job, finishJob); return;
+      default: break;
+    }
+    if (!array) return;
+    switch (act) {
+      case 'fix': {
+        if (repairReason()) return;
+        const branch = el.closest('[data-branch]')?.dataset.branch;
+        const disk = (array.dataDisks || []).find((d) => d.name === branch);
+        if (disk) openElasticFixDialog(screen, array, disk, repairFor(), refresh);
+        return;
+      }
+      case 'add-disk': if (!addDiskReason()) openAddDataDiskDialog(screen, array, refresh); return;
+      case 'destroy': openElasticDestroyDialog(screen, array, () => screen.openArray(null)); return;
+      // The header button AND the pill both carry this action; delegation
+      // serves both, so neither can be the one left unbound.
+      case 'mover-schedule': openMoverScheduleEditor(screen, array, refresh); return;
+      case 'sync-schedule':
+      case 'scrub-schedule': {
+        const kind = act === 'sync-schedule' ? 'sync' : 'scrub';
+        const s = array.snapraid || {};
+        openElasticScheduleEditor(screen, {
+          name,
+          kind,
+          schedule: kind === 'sync' ? s.syncSchedule : s.scrubSchedule,
+          enabled: kind === 'sync' ? s.syncScheduleEnabled : s.scrubScheduleEnabled,
+        }, refresh);
+        return;
+      }
+      case 'folder-cache': {
+        if (!screen.isAdmin) return;
+        const folder = (array.folders || []).find((f) => f.name === el.dataset.folder);
+        if (folder) openFolderCacheDialog(screen, array, folder, refresh);
+        return;
+      }
+      default:
+    }
+  });
+  // `toggle` does not bubble, so the history's <details> are followed in the
+  // capture phase: one listener for every run row, present and future.
+  view.addEventListener('toggle', (event) => {
+    const details = event.target;
+    if (!isCurrent() || !details?.matches?.('details[data-run]') || !details.isConnected) return;
+    if (details.open) expanded.add(details.dataset.run); else expanded.delete(details.dataset.run);
+  }, true);
 
   const finishJob = async (job) => {
     if (!isCurrent()) return;

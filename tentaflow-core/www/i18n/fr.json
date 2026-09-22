@@ -5325,7 +5325,7 @@
       "back": "Retour aux pools",
       "refresh": "Actualiser",
       "snapshot_only": "La parité décrit la dernière synchronisation. La protection des écritures ultérieures n’est pas confirmée.",
-      "tolerance": "Tolérance du point de contrôle : {n} disques",
+      "tolerance": "Tolérance du point de contrôle : {n} {n|disque|disques|disques}",
       "disks": "Disques de l’array",
       "independent_fs": "Chaque disque de données possède son propre système de fichiers.",
       "data": "Données",
@@ -5451,7 +5451,8 @@
       "member_cache": "disque de cache",
       "member_parity": "disque de parité {n}",
       "disk_absent": "disque absent",
-      "last_seen_as": "vu pour la dernière fois comme {name}"
+      "last_seen_as": "vu pour la dernière fois comme {name}",
+      "parity_errors_window": "Erreurs de parité ({n} {n|jour|jours|jours})"
     },
     "wizard_pool": {
       "elastic_data": "Disques de données",
@@ -6464,6 +6465,7 @@
       "array_data": "Données",
       "array_cache": "Cache",
       "array_parity": "Parité",
+      "other_org_array": "Dans la matrice d'une autre organisation",
       "mounted": "Monté"
     },
     "disks": {

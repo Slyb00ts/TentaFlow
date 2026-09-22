@@ -172,3 +172,21 @@ export function paintJobLog(pre, lines) {
   pre.__tfLog = text;
   if (atBottom) pre.scrollTop = pre.scrollHeight;
 }
+
+// A one-element slot for what appears and disappears with the data (a state
+// chip, a media badge, a scan bar, a hint): the element stays the same node
+// for as long as it stays on, so its attributes can be patched in place.
+// `hidden` would not do — badge and component CSS set `display`, which wins
+// over the UA's `[hidden]` rule — and the wrapper is `display: contents` so it
+// adds no box to the flex rows it sits in. Put `SLOT` on the wrapper element.
+export const SLOT = 'style="display:contents"';
+export function slotEl(slot, on, key, html) {
+  patchKeyedList(slot, on ? [{ key, html }] : []);
+  return on ? slot.firstElementChild : null;
+}
+
+// `classList.toggle` rewrites the class attribute even when nothing changes;
+// an unchanged node should see no mutation on a poll.
+export function setClass(el, name, on) {
+  if (el && el.classList.contains(name) !== Boolean(on)) el.classList.toggle(name, Boolean(on));
+}

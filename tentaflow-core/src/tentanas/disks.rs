@@ -303,8 +303,112 @@ pub struct JournalClaim {
 /// language, because the detail beside it is the node's sentence.
 pub const JOURNAL_OTHER_ORG: &str = "journal_other_org";
 
+/// The role a disk of ANOTHER organisation's live Elastic Array is shown
+/// under (`hide_other_org_array`). The disk inventory is the node's — every
+/// tenant's Disks tab reads the same lsblk scan and the same array rows — so
+/// the membership `apply_array_membership` fills in names every tenant's
+/// arrays. The disk stays visible (it is shared hardware, and hiding it would
+/// look like a free disk), but only as "in another organisation's array".
+pub const ROLE_OTHER_ORG_ARRAY: &str = "other_org_array";
+
+/// Turns a disk of an Elastic Array that `own_arrays` (the asking
+/// organisation's array names) does not hold into a disk of "another
+/// organisation's array": no array name, no part in it, no branch filesystem,
+/// no mount path. Applied per request, on the copy that leaves the server —
+/// the shared inventory keeps the real membership, which the node's own
+/// checks (pool eligibility, array claims) need whoever asks.
+///
+/// The role rewrite below only touches an Elastic member (`array_role` set):
+/// a ZFS pool or an mdraid set is named by a label ON the disk, which any
+/// admin of the node can read with lsblk, and neither is owned by a tenant.
+/// But a branch mountpoint is scrubbed off EVERY disk regardless of role,
+/// because a member whose disk id has drifted stops being one (see
+/// `own_branch_mount`) while its mount still names the array by path.
+///
+/// EVERY field of `NasDisk` was weighed against "can it carry the array's
+/// name or the array's shape", and this is the list of what goes:
+/// - `member_of`: the array's name itself.
+/// - `mountpoints`: a branch is mounted at
+///   `/mnt/tentanas-branches/<array>/{data,cache}/<disk>` or `…/parity/<n>`
+///   (`tentanas_helper::elastic::BRANCH_ROOT`), and lsblk reports that path
+///   for the disk and its partitions. ALL of them go, not only the ones under
+///   the branch root: every mount of another tenant's member is that
+///   tenant's, its path is chosen by it, and "mounted" is already said by
+///   the role and refused by the wipe plan.
+/// - `array_role`: the disk's part in the array (data/cache/parity), which
+///   says how that tenant built it.
+/// - `fs_type` / `fs_label` / `fs_uuid`: the branch filesystem; the label is
+///   the branch name and the UUID is the array's `expected_uuid`.
+/// - `vdev_role` / `vdev_kind`: empty for an Elastic member (they describe a
+///   ZFS vdev of `member_of`), cleared so no future filler can put the
+///   array's layout there.
+///
+/// Kept, because they are the shared HARDWARE every admin of the node reads
+/// with lsblk/smartctl and none is written from an array: `disk_id`, `name`,
+/// `path` (`/dev/…`), `kind`, `model`, `serial`, `wwn`, `size_bytes`,
+/// `transport`, `rotational`, `removable`, `firmware`, the SMART figures
+/// (`health`, `temperature_c`, `power_on_hours`, `reallocated_sectors`,
+/// `pending_sectors`, `crc_errors`, `media_errors`, `wear_pct`,
+/// `smart_available`, `smart_passed`, `smart_read_at`), `health_reason`
+/// (built by `score_health` from SMART counters only) and the I/O figures
+/// (`io`, `io_history_bps`: numbers). `role` stays, rewritten to
+/// `ROLE_OTHER_ORG_ARRAY`.
+pub fn hide_other_org_array(disk: &mut NasDisk, own_arrays: &std::collections::BTreeSet<String>) {
+    // A branch mount names its array by PATH alone
+    // (`/mnt/tentanas-branches/<array>/{data,cache}/<disk>` or
+    // `…/parity/<n>`), so it leaks even off an `array_member`: a disk whose
+    // id drifted (a WWN that stops reporting behind a new HBA or USB bridge)
+    // falls out of `array_membership` entirely and is reported as plain
+    // "mounted", but lsblk still shows where it is mounted. Every mountpoint
+    // under another organisation's branch is dropped here, whatever this
+    // disk's role turns out to be.
+    disk.mountpoints.retain(|path| own_branch_mount(path, own_arrays));
+
+    if disk.role != "array_member" || disk.array_role.is_empty() {
+        return;
+    }
+    if disk.member_of.as_ref().is_some_and(|name| own_arrays.contains(name)) {
+        return;
+    }
+    disk.role = ROLE_OTHER_ORG_ARRAY.to_string();
+    disk.member_of = None;
+    disk.array_role.clear();
+    disk.mountpoints.clear();
+    disk.fs_uuid = None;
+    disk.fs_label = None;
+    disk.fs_type = None;
+    disk.vdev_role.clear();
+    disk.vdev_kind.clear();
+}
+
+/// Whether `path` may be shown to this caller: anything outside the Elastic
+/// branch root is shared hardware or a ZFS/mdraid mount, named by a label ON
+/// the disk rather than by an org, so it is always kept. A branch mount is
+/// kept only when its `<array>` segment is one of `own_arrays` — otherwise
+/// it names another organisation's array and must go, exactly like
+/// `member_of` above.
+fn own_branch_mount(path: &str, own_arrays: &std::collections::BTreeSet<String>) -> bool {
+    match path.strip_prefix(tentanas_helper::elastic::BRANCH_ROOT) {
+        Some(rest) => rest.split('/').next().is_some_and(|array| own_arrays.contains(array)),
+        None => true,
+    }
+}
+
 fn refuse(code: &str, detail: String) -> NasDiskWipeRefusal {
     NasDiskWipeRefusal { code: code.to_string(), detail }
+}
+
+/// The one refusal for a disk another organisation of this node holds, live
+/// or through its journal alike. It names no array — the caller may not know
+/// it — and says only what this organisation cannot do.
+fn refuse_other_org(name: &str) -> NasDiskWipeRefusal {
+    refuse(
+        JOURNAL_OTHER_ORG,
+        format!(
+            "{name}: dysk należy do macierzy Elastic innej organizacji na tym węźle — \
+             ta organizacja nie może go wyczyścić ani przejąć"
+        ),
+    )
 }
 
 /// Everything clearing `disk` would remove and every reason the node would
@@ -351,6 +455,10 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
                 disk.array_role
             ),
         )),
+        // Another organisation's LIVE array (`hide_other_org_array` ran on
+        // this disk before the plan): refused like its journal would be, and
+        // without the name the `elastic_member` sentence above would print.
+        ROLE_OTHER_ORG_ARRAY => refusals.push(refuse_other_org(name)),
         "mounted" => refusals.push(refuse(
             "mounted",
             format!(
@@ -379,13 +487,11 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         // (`journal_claim_of`). The owner's rule is that a tenant may not
         // destroy what it may not adopt, and it may not adopt this.
         _ if journal.claim.owner_kind == super::elastic::OWNER_KIND_OTHER_ORG_ON_NODE => {
-            refusals.push(refuse(
-                JOURNAL_OTHER_ORG,
-                format!(
-                    "{name}: dysk należy do macierzy Elastic innej organizacji na tym nodzie — \
-                     ta organizacja nie może go wyczyścić ani przejąć"
-                ),
-            ));
+            // A live array of that organisation has already been refused by
+            // its role; one sentence says it once.
+            if !refusals.iter().any(|r| r.code == JOURNAL_OTHER_ORG) {
+                refusals.push(refuse_other_org(name));
+            }
             None
         }
         Some(true) => {
@@ -423,7 +529,15 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         fs_type: disk.fs_type.clone(),
         fs_label: disk.fs_label.clone(),
         fs_uuid: disk.fs_uuid.clone(),
-        mountpoints: disk.mountpoints.clone(),
+        // Never for another tenant's member: `hide_other_org_array` has
+        // cleared them already, and the plan repeats the rule on its own
+        // because a branch mount path is `/mnt/tentanas-branches/<array>/…`
+        // and the dialog prints this list ("zamontowany w …").
+        mountpoints: if disk.role == ROLE_OTHER_ORG_ARRAY {
+            Vec::new()
+        } else {
+            disk.mountpoints.clone()
+        },
         allowed: refusals.is_empty(),
         refusals,
         journal_claim: claim,
@@ -2227,7 +2341,7 @@ mod tests {
             assert!(!plan.allowed, "{serving:?}");
             assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
             assert_eq!(plan.refusals[0].code, JOURNAL_OTHER_ORG);
-            assert!(plan.refusals[0].detail.contains("innej organizacji na tym nodzie"), "{:?}", plan.refusals[0]);
+            assert!(plan.refusals[0].detail.contains("innej organizacji na tym węźle"), "{:?}", plan.refusals[0]);
             assert!(plan.journal_claim.is_none(), "no claim to acknowledge, and none to read a name from");
             // What the plan says about the claim, as it would be serialised:
             // the array's name and id appear nowhere in it. (Only these two
@@ -2246,6 +2360,158 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A member of ANOTHER organisation's live Elastic Array as the node's
+    /// inventory really holds it: named by `apply_array_membership`, and
+    /// MOUNTED at its branch, whose path spells the array
+    /// (`/mnt/tentanas-branches/<array>/…`, lsblk's mountpoints of the disk
+    /// and its partition). Its hardware identity names nothing, so the whole
+    /// serialised disk can be searched for the array's name.
+    fn other_org_member(array_role: &str) -> NasDisk {
+        let part = if array_role == "parity" { "parity/1".to_string() } else { format!("{array_role}/d1") };
+        NasDisk {
+            disk_id: "wwn-0x5000c500a1b2c3d4".to_string(),
+            serial: "ZL2ABCDE".to_string(),
+            wwn: Some("0x5000c500a1b2c3d4".to_string()),
+            role: "array_member".to_string(),
+            member_of: Some("produkt".to_string()),
+            array_role: array_role.to_string(),
+            mountpoints: vec![format!("/mnt/tentanas-branches/produkt/{part}")],
+            fs_type: None,
+            fs_label: None,
+            fs_uuid: Some("33333333-3333-4333-8333-333333333333".to_string()),
+            ..used_disk()
+        }
+    }
+
+    /// A disk of ANOTHER organisation's live array on the Disks tab: the
+    /// shared inventory names that array (`apply_array_membership` reads every
+    /// tenant's rows) and lsblk reports its branch mount, so the copy a tenant
+    /// receives says only "another organisation's array" — no name, no part,
+    /// no branch filesystem, no mount path.
+    #[test]
+    fn a_disk_of_another_organisations_live_array_reaches_the_tenant_without_the_array_name() {
+        let theirs = other_org_member("data");
+        assert!(serde_json::to_string(&theirs).unwrap().contains("/mnt/tentanas-branches/produkt/"),
+            "the fixture carries the name where a real mounted branch does");
+        let own: std::collections::BTreeSet<String> = ["media".to_string()].into();
+        let mut shown = theirs.clone();
+        hide_other_org_array(&mut shown, &own);
+        assert_eq!(shown.role, ROLE_OTHER_ORG_ARRAY);
+        assert_eq!(shown.member_of, None);
+        assert!(shown.array_role.is_empty());
+        assert!(shown.mountpoints.is_empty(), "{:?}", shown.mountpoints);
+        assert_eq!((shown.fs_uuid.as_deref(), shown.fs_label.as_deref(), shown.fs_type.as_deref()), (None, None, None));
+        // The property the name promises: the WHOLE disk as it goes out.
+        let wire = serde_json::to_string(&shown).unwrap();
+        assert!(!wire.contains("produkt"), "{wire}");
+        assert!(!wire.contains("tentanas-branches"), "{wire}");
+        // The disk itself stays: it is shared hardware, not the array.
+        assert_eq!((shown.disk_id.as_str(), shown.name.as_str(), shown.serial.as_str()),
+            (theirs.disk_id.as_str(), theirs.name.as_str(), theirs.serial.as_str()));
+
+        // The owner's own array keeps its name, its part and its mount.
+        let own_disk = NasDisk {
+            member_of: Some("media".to_string()),
+            mountpoints: vec!["/mnt/tentanas-branches/media/data/d1".to_string()],
+            ..theirs.clone()
+        };
+        let mut kept = own_disk.clone();
+        hide_other_org_array(&mut kept, &own);
+        assert_eq!(kept, own_disk);
+
+        // A pool or an mdraid set is named by the disk's own label and owned
+        // by no tenant: untouched.
+        for disk in [
+            NasDisk { role: "pool_member".to_string(), member_of: Some("tank".to_string()), ..used_disk() },
+            NasDisk { role: "array_member".to_string(), member_of: Some("nas:0".to_string()), ..used_disk() },
+        ] {
+            let mut same = disk.clone();
+            hide_other_org_array(&mut same, &own);
+            assert_eq!(same, disk);
+        }
+    }
+
+    /// A disk whose id has DRIFTED (N2): the inventory no longer recognises
+    /// it as an Elastic member at all — a WWN that stops reporting behind a
+    /// new HBA or USB bridge changes `disk_id`, so `array_membership` (keyed
+    /// on `disk_id`) no longer matches it, and it falls through to plain
+    /// `role = "mounted"`. Its mountpoint still spells another
+    /// organisation's array by path, and `hide_other_org_array` must scrub
+    /// it even though the `array_member` arm never runs.
+    #[test]
+    fn a_mounted_disk_under_another_organisations_branch_names_no_array() {
+        let own: std::collections::BTreeSet<String> = ["media".to_string()].into();
+        // Based on `other_org_member`, not `used_disk()` directly: that
+        // fixture's hardware identity (`disk_id`/`serial`/`wwn`) is chosen to
+        // NOT already contain "produkt", so a `contains("produkt")` search
+        // below can only find a leak through `mountpoints`, never a
+        // coincidence of the fixture's own naming.
+        let mut drifted = NasDisk {
+            role: "mounted".to_string(),
+            member_of: None,
+            array_role: String::new(),
+            ..other_org_member("data")
+        };
+        assert!(drifted.mountpoints[0].starts_with("/mnt/tentanas-branches/produkt/"),
+            "{:?}", drifted.mountpoints);
+        hide_other_org_array(&mut drifted, &own);
+        assert!(drifted.mountpoints.is_empty(), "{:?}", drifted.mountpoints);
+        // Role is untouched — this disk was never recognised as a member —
+        // but the whole serialised disk must not carry the other org's name.
+        assert_eq!(drifted.role, "mounted");
+        let wire = serde_json::to_string(&drifted).unwrap();
+        assert!(!wire.contains("produkt"), "{wire}");
+        assert!(!wire.contains("tentanas-branches"), "{wire}");
+
+        // Mounted under the caller's OWN array: the path is kept.
+        let mut own_mount = NasDisk {
+            role: "mounted".to_string(),
+            member_of: None,
+            array_role: String::new(),
+            mountpoints: vec!["/mnt/tentanas-branches/media/data/d1".to_string()],
+            ..other_org_member("data")
+        };
+        let before = own_mount.mountpoints.clone();
+        hide_other_org_array(&mut own_mount, &own);
+        assert_eq!(own_mount.mountpoints, before);
+    }
+
+    /// The wipe plan of that disk refuses with the one "another organisation"
+    /// sentence — where the Elastic member arm would have printed
+    /// "macierzy Elastic produkt" and the dialog "zamontowany w
+    /// /mnt/tentanas-branches/produkt/…" — and says it ONCE when the array's
+    /// journal refuses the same disk as well. The whole plan is searched.
+    #[test]
+    fn the_wipe_plan_of_another_organisations_live_array_member_names_no_array() {
+        let mut disk = other_org_member("parity");
+        hide_other_org_array(&mut disk, &std::collections::BTreeSet::new());
+        // The journal names its member by the identity the disk really has.
+        let mut spec = crate::tentanas::elastic::tests::create_spec("produkt");
+        spec.parity[0].disk_id = disk.disk_id.clone();
+        spec.parity[0].wwn = disk.wwn.clone();
+        spec.parity[0].serial = Some(disk.serial.clone());
+        let orgs: std::collections::BTreeSet<String> = ["org".to_string(), "inna-org".to_string()].into();
+        let asking = tentanas_helper::elastic::ElasticOwner { org_id: "inna-org".into(), addon_id: spec.owner.addon_id.clone() };
+        let with_journal = journal_claim_of(&disk, &[journal_entry(spec, Some(true))], &asking, &orgs);
+        assert!(with_journal.is_some());
+        for claim in [None, with_journal] {
+            let plan = plan_wipe(&disk, claim);
+            assert!(!plan.allowed);
+            assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
+            assert_eq!(plan.refusals[0].code, JOURNAL_OTHER_ORG);
+            assert!(plan.mountpoints.is_empty(), "{:?}", plan.mountpoints);
+            assert!(plan.fs_uuid.is_none() && plan.fs_label.is_none());
+            let wire = serde_json::to_string(&plan).unwrap();
+            assert!(!wire.contains("produkt"), "{wire}");
+            assert!(!wire.contains("tentanas-branches"), "{wire}");
+            assert!(matches!(wipe_command(&plan, &disk, "sdc", "produkt"), Err(WipeRefusal::NotAvailable(_))));
+        }
+        // Even a plan built from a disk that was NOT passed through the hide
+        // step but carries the role prints no mount path.
+        let unhidden = NasDisk { role: ROLE_OTHER_ORG_ARRAY.to_string(), ..other_org_member("data") };
+        assert!(plan_wipe(&unhidden, None).mountpoints.is_empty());
     }
 
     /// The other half of the rule: a journal whose organisation this node has

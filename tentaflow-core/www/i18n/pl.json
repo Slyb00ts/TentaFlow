@@ -6463,6 +6463,7 @@
       "array_data": "Dane",
       "array_cache": "Cache",
       "array_parity": "Parzystość",
+      "other_org_array": "W macierzy innej organizacji",
       "mounted": "Zamontowany"
     },
     "disks": {
@@ -6990,7 +6991,7 @@
       "back": "Powrót do pul",
       "refresh": "Odśwież",
       "snapshot_only": "Parity opisuje ostatni sync. Późniejsze zapisy nie mają potwierdzonej ochrony.",
-      "tolerance": "Odporność checkpointu: {n} dysków",
+      "tolerance": "Odporność checkpointu: {n} {n|dysk|dyski|dysków}",
       "disks": "Dyski macierzy",
       "independent_fs": "Każdy dysk danych ma własny system plików.",
       "data": "Dane",
@@ -7116,7 +7117,8 @@
       "member_cache": "dysk cache",
       "member_parity": "dysk parity {n}",
       "disk_absent": "brak dysku",
-      "last_seen_as": "ostatnio widziany jako {name}"
+      "last_seen_as": "ostatnio widziany jako {name}",
+      "parity_errors_window": "Błędy parity ({n} {n|dzień|dni|dni})"
     },
     "wizard_pool": {
       "elastic_data": "Dyski danych",
