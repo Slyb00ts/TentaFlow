@@ -24,7 +24,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, errMessage, jobKindLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, errMessage, jobKindLabel, nodeLabel } from '/js/modules/tentanas/format.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -47,6 +47,22 @@ export const targetNameValid = (name) => NAME_RE.test(name);
 // the two together, because a constant duplicated across two languages with
 // nothing checking it is a divergence waiting to happen.
 export const WWN_AUTHORITY = '2026-09.local.tentaflow';
+
+/**
+ * The IQN/NQN host segment for the step-3 preview, or '' when it is unknown.
+ *
+ * It is the node's OWN answer (`wwnHost` in the block capabilities, computed by
+ * `targets::wwn_host` — the very function `wwn_for` names the target with), not
+ * something derived here. Neither the fleet display name (an admin-editable
+ * label, not the kernel hostname the server uses) nor any slice of the node id
+ * is what the node puts into the IQN, so deriving from either would show an
+ * identity the target will never have. An older node that does not send the
+ * field, or a node whose hostname sanitises to nothing (which refuses to create
+ * the target), answers '' and the preview shows a placeholder instead.
+ */
+export function iqnHostPart(caps) {
+  return typeof caps?.wwnHost === 'string' ? caps.wwnHost : '';
+}
 
 /** "1T", "500G", "2048" (bytes) → bytes. 0 when it is not a size at all. */
 export function parseSize(text) {
@@ -411,7 +427,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     <div class="install-header">
       <div class="big-ico">${sprite('target')}</div>
       <div class="install-header-meta">
-        <h1>${escapeHtml(editing ? T('wizard_target.heading_edit', { name: target.name }) : T('wizard_target.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
+        <h1>${escapeHtml(editing ? T('wizard_target.heading_edit', { name: target.name }) : T('wizard_target.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: nodeLabel(node) }))}</span></h1>
         <div class="sub">${escapeHtml(T('wizard_target.sub'))}</div>
       </div>
     </div>
@@ -697,7 +713,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     state.portalInterface !== unselectedPortal && Boolean(state.portalInterface) && primaryAddress(caps, state.portalInterface) === '';
   const wwnPreview = () => {
     const prefix = state.protocol === 'nvmet' ? 'nqn' : 'iqn';
-    const host = (node.nodeName || '').toLowerCase().replace(/[^a-z0-9-]/g, '');
+    const host = iqnHostPart(caps) || T('wizard_target.iqn_host_unknown');
     return editing ? target.wwn : `${prefix}.${WWN_AUTHORITY}:${host}.${state.name}`;
   };
 

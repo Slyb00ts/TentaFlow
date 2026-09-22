@@ -78,6 +78,40 @@ test('the pending list names the operation, who asked and when it expires', asyn
   screen.dispose();
 });
 
+// The owner's rule (format.js `jobAuthor`): a machine id is never shown as a
+// name. `requestedBy`/`decidedBy` used to be printed raw, so an account the
+// server could not resolve (deleted, or one that exists only on the node that
+// forwarded the request) showed its UUID in the open. Both columns must route
+// through `jobAuthor` — the UUID becomes "nieznane konto" with the id moved to
+// a tooltip, and a system author (the scheduler) reads as its translated name
+// with no tooltip at all.
+test('an unresolved account reads "nieznane konto" with the id in a tooltip; the scheduler is not a UUID', async () => {
+  const uuid = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+  const screen = fakeScreen({
+    tentaNasApprovalsListRequest: {
+      approvals: [pending({ requestId: 'r-uuid', requestedBy: uuid, status: 'approved', decidedBy: 'scheduler' })],
+      settings: settings(),
+    },
+  });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+
+  const table = body.querySelector('#nas-approvals-table');
+  // The raw id lives ONLY in a title= tooltip, never as visible text.
+  const wrap = document.createElement('div');
+  wrap.innerHTML = table.rows[0].requested;
+  assert.doesNotMatch(wrap.textContent, new RegExp(uuid), 'the id is not visible text');
+  assert.match(wrap.textContent, /nieznane konto/);
+  assert.equal(wrap.querySelector('.tf-table__cell-sub').getAttribute('title'), uuid);
+  // The scheduler is a system author, not an unresolved account: it is
+  // translated and gets no tooltip.
+  assert.match(table.rows[0].status, /harmonogram/);
+  assert.doesNotMatch(table.rows[0].status, /title="scheduler"/);
+  screen.dispose();
+});
+
 test('the author of a request gets no approve button, only the reason why', async () => {
   const screen = fakeScreen({
     tentaNasApprovalsListRequest: { approvals: [pending({ isOwnRequest: true })], settings: settings() },

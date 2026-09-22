@@ -11,9 +11,10 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
   fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
-  layoutLabel, stateTone, stateLabel, stateChipHtml, fmtSchedule,
+  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml, paintStatCards } from '/js/modules/tentanas/dom-patch.js';
+import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
+import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
 import { openScheduleEditor } from '/js/modules/tentanas/schedule-editor.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { scrubAction, trimAction } from '/js/modules/tentanas/pools.js';
@@ -110,10 +111,18 @@ export async function drawPoolDetail(screen, body) {
     }
     if (screen.disposed || !body.isConnected) return;
     recordIoSample(state);
-    paintKpis(body, state);
-    if (screen.poolTab === 'topology') paintTopology(screen, body, state, refresh);
-    if (screen.poolTab === 'properties') paintPropertiesTab(screen, body, state, refresh);
-    if (screen.poolTab === 'stats') pushLiveSample(body, state);
+    // A paint step throwing must not stop the poll loop (MINOR 7): `poll`
+    // awaits `refresh`, and an uncaught rejection here would keep it from
+    // ever reaching `screen.later`, silently freezing n06 until the tab is
+    // reopened. Log it — a real bug must still be visible — and keep polling.
+    try {
+      paintKpis(body, state);
+      if (screen.poolTab === 'topology') paintTopology(screen, body, state, refresh);
+      if (screen.poolTab === 'properties') paintPropertiesTab(screen, body, state, refresh);
+      if (screen.poolTab === 'stats') pushLiveSample(body, state);
+    } catch (e) {
+      console.error(e);
+    }
   };
   const poll = async () => {
     await refresh();
@@ -182,7 +191,10 @@ function paintKpis(body, state) {
   const cap = capacityParts(p.usedBytes, p.usableBytes);
   const io = p.io || {};
   const scan = p.scan || {};
-  const diskWarnings = (p.vdevs || []).flatMap((v) => v.disks || []).filter((d) => d.state !== 'online' || (Number(d.readErrors) || 0) + (Number(d.writeErrors) || 0) + (Number(d.cksumErrors) || 0) > 0).length;
+  // "1 ostrzeżenie dysku" (n06:188) counts what the topology cells show: a
+  // disk whose SMART health warns inside an ONLINE leaf is a warning too (M3).
+  const inventory = inventoryOf(state.disks);
+  const diskWarnings = (p.vdevs || []).flatMap((v) => v.disks || []).filter((d) => diskCondition(d, inventoryFor(inventory, d)).tone !== 'ok').length;
   const frag = Math.round(Number(p.fragmentationPct) || 0);
   // Four tiles created once; every later poll writes only the attributes that
   // moved, so a tile keeps its identity while its numbers change.
@@ -237,6 +249,11 @@ function drawInner(screen, body, state, refresh) {
   // invalidation: `__tfHtml` would go on describing markup that is no longer
   // on screen, and the next `patchHtml` carrying that same string would be
   // dropped as a no-op — a pane permanently stuck on stale content.
+  //
+  // The topology and properties panes are the exception that polls: they
+  // build a skeleton once (`buildPane`) and recognise it on later polls by
+  // identity (`paneRoot`), so any other tab's write here makes them rebuild
+  // on their next visit instead of patching nodes that are gone.
   host.__tfHtml = null;
   switch (screen.poolTab) {
     case 'datasets':
@@ -254,6 +271,146 @@ function drawInner(screen, body, state, refresh) {
     default:
       paintTopology(screen, body, state, refresh);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pane skeletons (shared by the topology and properties panes)
+// ---------------------------------------------------------------------------
+
+// A pane of this screen is built ONCE per visit of its inner tab and then only
+// written into. Every poll lands on the same nodes, so a button under the
+// cursor, the "Wymuś eksport" checkbox, the properties table and the live
+// chart all survive it — the owner's rule is literal: patch what changed,
+// never rebuild a subtree on a refresh. Only a vdev or a disk that appears
+// or disappears changes the structure, and then only its own group or cell.
+//
+// `paneRoot` answers the root only while `host` still shows the pane of this
+// kind. The other inner tabs write the host with `innerHTML`, which detaches
+// the old root, so a stale reference can never pass for the live one.
+function paneRoot(host, kind) {
+  const root = host.__poolPane;
+  return root && root.parentNode === host && root.dataset.pane === kind ? root : null;
+}
+
+function buildPane(host, kind, html, screen, state, refresh) {
+  // ONE HOST, ONE WRITER: this direct write replaces whatever a patch helper
+  // last cached for the host, so its caches go with it.
+  host.innerHTML = `<div class="stack" data-pane="${kind}">${html}</div>`;
+  host.__tfHtml = null;
+  host.__tfKeyed = null;
+  const root = host.firstElementChild;
+  host.__poolPane = root;
+  // One delegated listener for the pane's lifetime. Buttons come and go with
+  // the data (a scrub's pause/stop, a disk's online/offline), and a listener
+  // per button would have to be re-bound on exactly the polls that create
+  // one — and never twice on the ones that do not.
+  root.addEventListener('click', (e) => onPaneClick(e, root, screen, state, refresh));
+  return root;
+}
+
+// A slot holds at most one element: present while `on`, and the SAME element
+// for as long as it stays on, so its attributes can be patched in place. Used
+// for what appears and disappears with the data (a state chip, a media badge,
+// the scan bar). `hidden` would not do: the badge and component CSS set
+// `display`, which wins over the UA's `[hidden]` rule. The slot wrapper is
+// `display: contents` so it adds no box to the flex rows it sits in.
+const SLOT = 'style="display:contents"';
+function slotEl(slot, on, key, html) {
+  patchKeyedList(slot, on ? [{ key, html }] : []);
+  return on ? slot.firstElementChild : null;
+}
+
+// `classList.toggle` rewrites the class attribute even when nothing changes;
+// an unchanged node should see no mutation on a poll.
+function setClass(el, name, on) {
+  if (el && el.classList.contains(name) !== Boolean(on)) el.classList.toggle(name, Boolean(on));
+}
+
+// The pane's only click handler. Everything it acts on is read from `state`
+// at click time — the pool, its vdevs and the free disks move with every
+// poll, and a closure captured at build time would act on the first poll's.
+function onPaneClick(e, root, screen, state, refresh) {
+  const el = e.target.closest?.('[data-act]');
+  if (!el || !root.contains(el) || el.hasAttribute('disabled')) return;
+  const act = el.dataset.act;
+  const p = state.res.pool;
+  const free = state.freeDisks;
+  const vdevOf = () => (p.vdevs || []).find((x) => x.id === el.dataset.vdev);
+  const scrub = /^scrub-(start|pause|resume|stop)$/.exec(act);
+  if (scrub) { scrubAction(screen, p.name, scrub[1], refresh); return; }
+  const trim = /^trim-(start|suspend|resume|cancel)$/.exec(act);
+  if (trim) { trimAction(screen, p.name, trim[1], refresh); return; }
+  switch (act) {
+    case 'scrub-schedule': openScrubScheduleEditor(screen, p, refresh); return;
+    case 'trim-schedule': openTrimScheduleEditor(screen, p, refresh); return;
+    case 'add-vdev': openAddVdevDialog(screen, p, el.dataset.role, free, refresh); return;
+    case 'expand': {
+      const v = vdevOf();
+      if (!v) return;
+      openPickDiskDialog(screen, {
+        title: T('pool.vdev_expand_title', { id: v.id }),
+        explain: T('pool.vdev_expand_explain', { layout: layoutLabel(v.kind) }),
+        disks: free,
+        minBytes: Math.min(...(v.disks || []).map((d) => Number(d.sizeBytes) || 0)),
+        confirmLabel: T('pool.vdev_expand'),
+        onPick: async (disk) => {
+          const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolExpandVdevRequest', { name: p.name, vdevId: v.id, diskId: disk.diskId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.vdev_expand_title', { id: v.id }));
+          followResponse(screen, res, refresh, T('pool.vdev_expand_done'));
+          return res !== null;
+        },
+      });
+      return;
+    }
+    case 'remove-vdev': {
+      const v = vdevOf();
+      if (v) removeVdev(screen, p, v, refresh);
+      return;
+    }
+    case 'replace': {
+      const v = vdevOf();
+      const d = (v?.disks || []).find((x) => x.name === el.dataset.device);
+      if (d) openReplaceWizard(screen, { pool: p, vdev: v, disk: d, freeDisks: free, disks: state.disks, onDone: refresh });
+      return;
+    }
+    case 'offline':
+    case 'online':
+    case 'clear':
+      deviceAction(screen, p, act, el.dataset.device, refresh);
+      return;
+    case 'disk': screen.openDisk(el.dataset.disk); return;
+    case 'export': exportPool(screen, p, Boolean(root.querySelector('#nas-export-force')?.checked)); return;
+    case 'destroy': openPoolDestroyDialog(screen, p, state.res.datasets || [], () => leavePool(screen)); return;
+  }
+}
+
+async function removeVdev(screen, p, v, refresh) {
+  const ok = await TfWindow.confirm({ title: T('pool.vdev_remove'), message: T('pool.vdev_remove_confirm', { id: bareVdevLabel(p.vdevs, v), role: T('pool.role_' + v.role) }), confirmLabel: T('pool.vdev_remove'), cancelLabel: I18n.t('common.cancel'), danger: true });
+  if (!ok) return;
+  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolRemoveVdevRequest', { name: p.name, vdevId: v.id, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.vdev_remove'));
+  followResponse(screen, res, refresh, T('pool.vdev_remove_done'));
+}
+
+async function deviceAction(screen, p, action, device, refresh) {
+  if (action === 'offline') {
+    const ok = await TfWindow.confirm({ title: T('pool.disk_offline'), message: T('pool.disk_offline_confirm', { device, ft: p.faultTolerance }), confirmLabel: T('pool.disk_offline'), cancelLabel: I18n.t('common.cancel'), danger: true });
+    if (!ok) return;
+  }
+  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDeviceStateRequest', { name: p.name, device, action, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.disk_' + action));
+  followResponse(screen, res, refresh, T('pool.disk_' + action + '_done', { device }));
+}
+
+async function exportPool(screen, p, force) {
+  const ok = await TfWindow.confirm({ title: T('danger.export'), message: T('danger.export_confirm', { name: p.name }), confirmLabel: T('danger.export_action'), cancelLabel: I18n.t('common.cancel'), danger: true });
+  if (!ok) return;
+  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolExportRequest', { name: p.name, force, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('danger.export'));
+  followResponse(screen, res, () => leavePool(screen), T('danger.export_done', { name: p.name }));
+}
+
+function leavePool(screen) {
+  screen.pool = null;
+  screen.clearTimers();
+  screen.setLocation();
+  screen.drawTab();
 }
 
 // ---------------------------------------------------------------------------
@@ -288,215 +445,389 @@ function paintIoRows(host, io) {
   write('latency', `${(Number(io.readLatencyMs) || 0).toFixed(1)} / ${(Number(io.writeLatencyMs) || 0).toFixed(1)} ms`);
 }
 
-function paintTopology(screen, body, state, refresh) {
-  const host = body.querySelector('#nas-pool-tab-body');
-  const p = state.res.pool;
-  const admin = screen.isAdmin;
-  const scan = p.scan || {};
-  const free = state.freeDisks;
-  const vdevs = p.vdevs || [];
-  // `zpool status` knows the leaf, not the device behind it: media kind and
-  // temperature (n06:223) come from the node's disk inventory, matched by id
-  // or by kernel name (a partition leaf carries neither on its own).
+const TONE_RANK = { ok: 0, warn: 1, err: 2 };
+const leafErrors = (d) => (Number(d.readErrors) || 0) + (Number(d.writeErrors) || 0) + (Number(d.cksumErrors) || 0);
+
+// `zpool status` knows the leaf, not the device behind it: media kind,
+// temperature and SMART health (n06:223-226) come from the node's disk
+// inventory, matched by id or by kernel name (a partition leaf carries
+// neither on its own).
+function inventoryOf(disks) {
   const inventory = new Map();
-  for (const d of state.disks) {
+  for (const d of disks) {
     if (d.diskId) inventory.set(d.diskId, d);
     if (d.name) inventory.set(d.name, d);
   }
+  return inventory;
+}
+const inventoryFor = (inventory, d) => (d.diskId && inventory.get(d.diskId)) || inventory.get(d.name);
 
-  const vdevHtml = (v) => {
-    const raidz = /^raidz/.test(v.kind);
-    const removable = v.role === 'cache' || v.role === 'log' || v.role === 'spare';
-    const actions = [];
-    // RAIDZ expansion is always on the group so the admin learns it exists;
-    // without a free disk it is disabled with the reason.
-    if (admin && raidz) actions.push(`<tf-button size="sm" variant="secondary" icon="plus" data-act="expand" data-vdev="${escapeAttr(v.id)}" ${free.length ? '' : `disabled title="${escapeAttr(T('pools.no_free_disks'))}"`}>${escapeHtml(T('pool.vdev_expand'))}</tf-button>`);
-    if (admin && removable) actions.push(`<tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="remove-vdev" data-vdev="${escapeAttr(v.id)}">${escapeHtml(T('pool.vdev_remove'))}</tf-button>`);
-    const disks = (v.disks || []).map((d) => {
-      const bad = d.state !== 'online';
-      const resilvering = scan.kind === 'resilver' && scan.status === 'running' && bad;
-      const errs = (Number(d.readErrors) || 0) + (Number(d.writeErrors) || 0) + (Number(d.cksumErrors) || 0);
-      const acts = [];
-      if (admin) {
-        if (free.length && v.role !== 'spare') acts.push(`<tf-button size="sm" variant="ghost" icon="refresh" data-act="replace" data-vdev="${escapeAttr(v.id)}" data-device="${escapeAttr(d.name)}" title="${escapeAttr(T('pool.disk_replace'))}"></tf-button>`);
-        if (d.state === 'online') acts.push(`<tf-button size="sm" variant="ghost" icon="ban" data-act="offline" data-device="${escapeAttr(d.name)}" title="${escapeAttr(T('pool.disk_offline'))}"></tf-button>`);
-        else if (d.state === 'offline') acts.push(`<tf-button size="sm" variant="ghost" icon="play" data-act="online" data-device="${escapeAttr(d.name)}" title="${escapeAttr(T('pool.disk_online'))}"></tf-button>`);
-        if (errs) acts.push(`<tf-button size="sm" variant="ghost" icon="check" data-act="clear" data-device="${escapeAttr(d.name)}" title="${escapeAttr(T('pool.disk_clear'))}"></tf-button>`);
-      }
-      if (d.diskId) acts.push(`<tf-button size="sm" variant="ghost" icon="chevron-right" data-act="disk" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(T('disks.details'))}"></tf-button>`);
-      const inv = (d.diskId && inventory.get(d.diskId)) || inventory.get(d.name);
-      const sub = [fmtBytes(d.sizeBytes), inv?.temperatureC == null ? null : `${inv.temperatureC}°C`, d.note || null].filter(Boolean).join(' · ');
-      return `
-        <div class="disk-cell ${bad ? 'faulted' : ''} ${resilvering ? 'resilver' : ''} ${v.role === 'spare' ? 'spare' : ''}">
-          <div class="dc-main">
-            <div class="dc-name"><span class="health-dot ${stateTone(d.state)}"></span><span class="mono">${escapeHtml(d.name)}</span>${bad ? `<tf-chip size="sm" status="${stateTone(d.state)}" label="${escapeAttr(stateLabel(d.state))}"></tf-chip>` : ''}</div>
-            <div class="dc-sub">${escapeHtml(sub)}</div>
-            <div class="dc-sub mono ${errs ? 'num-err' : ''}">R ${Number(d.readErrors) || 0} · W ${Number(d.writeErrors) || 0} · CKSUM ${Number(d.cksumErrors) || 0}</div>
-          </div>
-          ${inv ? `<span class="disk-kind ${escapeAttr(inv.kind)}">${escapeHtml(inv.kind)}</span>` : ''}
-          <div class="dc-actions">${acts.join('')}</div>
-        </div>`;
-    }).join('');
-    const hintKey = VDEV_HINTS[v.role];
-    const hint = hintKey ? T(hintKey, { pool: p.name }) : T('pool.tolerance_hint', { n: v.faultTolerance });
-    return `
-      <div class="vdev-group" data-vdev="${escapeAttr(v.id)}">
-        <div class="vg-head">
-          <span class="vg-type">${escapeHtml(v.role === 'data' ? layoutLabel(v.kind) : `${T('pool.role_' + v.role)} · ${layoutLabel(v.kind)}`)}</span>
-          <span class="mono text-3">${escapeHtml(v.id)}</span>
-          ${v.state === 'online' ? '' : stateChipHtml(v.state)}
-          <span class="hint">${escapeHtml(hint)}</span>
-          <span class="spacer"></span>
-          ${actions.join('')}
-        </div>
-        <div class="disk-cells">${disks || `<div class="muted">${escapeHtml(T('pool.vdev_empty'))}</div>`}</div>
-      </div>`;
-  };
+/// The condition a topology cell shows for one pool leaf (n06:226, M3). The
+/// zpool leaf state alone called a reallocating disk healthy — an ONLINE leaf
+/// says nothing about the platters. The tone is the WORSE of the leaf state
+/// and the disk's SMART health from the inventory, so a FAULTED leaf stays red
+/// on a disk SMART calls fine, and a disk SMART warns about turns amber inside
+/// an ONLINE vdev. An unknown SMART health is no signal either way. Leaf error
+/// counters make an otherwise clean disk a warning, as the KPI always counted
+/// them. Tones are `ok | warn | err`: the `.health-dot` modifiers and values
+/// tf-chip's `status` allowlist accepts (anything else renders as `info`).
+export function diskCondition(d, inv) {
+  const errs = leafErrors(d);
+  const leaf = stateTone(d.state);
+  const smart = healthClass(inv?.health);
+  let tone = leaf;
+  if (smart && TONE_RANK[smart] > TONE_RANK[tone]) tone = smart;
+  if (errs && tone === 'ok') tone = 'warn';
+  // The chip names the WHY: a leaf that is not online says its zpool state;
+  // otherwise it names the SMART health grade (M5) — the server's reason text
+  // is English free text ("8 reallocated sectors"), so it goes in `title=`
+  // only, never on the chip itself.
+  let chip = null;
+  if (d.state !== 'online') chip = { status: leaf, label: stateLabel(d.state) };
+  else if (smart === 'warn' || smart === 'err') {
+    chip = { status: smart, label: T('health.' + inv.health), title: inv.healthReason || null };
+  }
+  return { tone, errs, chip };
+}
 
+// For a composite vdev (`raidz2-0`, `mirror-1`, `special-0`…) `id` is a name
+// zpool itself generated, so it is safe to show. For a bare leaf — cache,
+// log, spare or single-disk data (`kind === 'disk'`) — `pools.rs::leaf()`
+// sets `id` to the leaf's own path, which is often a by-id serial or WWN
+// path (M4, hard rule: no machine identifier as visible text). Label it by
+// role instead, with an ordinal when the pool carries more than one bare
+// vdev of that role, and keep the real id in `title=` only.
+function bareVdevLabel(vdevs, v) {
+  if (v.kind !== 'disk') return v.id;
+  const bare = (vdevs || []).filter((x) => x.kind === 'disk' && x.role === v.role);
+  const ordinal = bare.length > 1 ? bare.indexOf(v) + 1 : 0;
+  const role = T('pool.role_' + v.role);
+  return ordinal ? `${role} ${ordinal}` : role;
+}
+
+// The per-key markup of one vdev group: only what cannot change while the
+// group exists (its id, role, layout and the buttons its role offers). The
+// state chip, the hint, the button states and the disk cells are written
+// into it afterwards, so a poll never re-parses a group.
+function vdevSkeletonHtml(v, admin, vdevs) {
+  const raidz = /^raidz/.test(v.kind);
+  const removable = v.role === 'cache' || v.role === 'log' || v.role === 'spare';
+  // `vg-type` names the layout ("RAIDZ1", "Mirror") and, for a composite
+  // non-data vdev, its role too ("Special · Mirror"). A bare leaf already
+  // gets its role from `bareVdevLabel` in the mono span right next to it
+  // ("Cache 1"), so repeating the role here would print it twice on the
+  // same header (MINOR 10) — a bare leaf's `vg-type` shows only the layout.
+  return `
+    <div class="vdev-group" data-vdev="${escapeAttr(v.id)}">
+      <div class="vg-head">
+        <span class="vg-type">${escapeHtml(v.role === 'data' || v.kind === 'disk' ? layoutLabel(v.kind) : `${T('pool.role_' + v.role)} · ${layoutLabel(v.kind)}`)}</span>
+        <span class="mono text-3" title="${escapeAttr(v.id)}">${escapeHtml(bareVdevLabel(vdevs, v))}</span>
+        <span data-slot="state" ${SLOT}></span>
+        <span class="hint" data-f="hint"></span>
+        <span class="spacer"></span>
+        ${admin && raidz ? `<tf-button size="sm" variant="secondary" icon="plus" data-act="expand" data-vdev="${escapeAttr(v.id)}">${escapeHtml(T('pool.vdev_expand'))}</tf-button>` : ''}
+        ${admin && removable ? `<tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="remove-vdev" data-vdev="${escapeAttr(v.id)}">${escapeHtml(T('pool.vdev_remove'))}</tf-button>` : ''}
+      </div>
+      <div class="disk-cells"></div>
+    </div>`;
+}
+
+// A leaf `zpool status` can no longer find prints as its numeric GUID
+// (`leaf()` in tentaflow-core/src/tentanas/pools.rs keeps `name` verbatim for
+// a non-`/` row) — never show that as a device name (M4, hard rule). A
+// missing leaf's kernel name never contains only digits, so that is the
+// test. The same leak reaches a REMOVED or FAULTED device whose by-id
+// symlink is gone: `kernel_name_of` cannot canonicalise the path, so it
+// falls back to the path's basename (`zfs.rs:209-219`), and
+// `strip_partition_suffix` only folds the kernel's own naming schemes —
+// `sdX`, `nvmeXnY`, `mmcblkX` — never a by-id name, which keeps its
+// `-partN` suffix (`zfs.rs:226-229`). That basename is `wwn-0x…-part1` or
+// `ata-…_SERIAL-part1`, exactly the disk the replace wizard is for, so it
+// gets the same treatment as the GUID shape.
+//
+// Prefer the real kernel name from the disk inventory when the leaf
+// resolves to one there (matched by `disk_id` or by name, same as
+// `inventoryFor` elsewhere on this screen); otherwise fall back to a
+// translated "missing disk" label. The id goes in `title=` only. The wire
+// is not changed by this: the GUID/by-id text stays `d.name` for every
+// server request (device actions, replace) — only what is painted on
+// screen changes.
+//
+// `zpool`'s own "was /dev/…" annotation on a removed leaf is not
+// parenthesized, so `parse_config_row` — which only captures a note inside
+// `(...)` (pools.rs:176-180) — never puts it in `note`. Recovering a kernel
+// name by parsing `note` for "was …" would be dead code (unreachable given
+// the parser), so this does not attempt it; the note text itself is shown
+// verbatim in the sub-line (`d.note`, unrelated to the leaf's name) exactly
+// as before.
+// The shapes (digit-only GUID, UUID, every by-id/by-path prefix) live in
+// `machine-id.js`'s `isDiskIdShape` — a ZFS leaf name is only ever a kernel
+// name or a disk id/by-id basename, never a human-chosen name, so the disk
+// rule (not the narrower opaque-only rule) applies here. Re-exported under
+// this name because that is what every call site below reads it as, and so
+// pool-detail.test.js keeps its import unchanged.
+// `dm-name-…` / `dm-uuid-…` are by-id LINKS; `dm-0` is a real kernel name (a
+// LUKS or LVM device) and must stay visible as the disk it is.
+export const isUnresolvedLeafName = isDiskIdShape;
+function leafDisplayName(d, inv) {
+  if (!isUnresolvedLeafName(d.name)) return d.name;
+  const kernelName = inv && inv.name && !isUnresolvedLeafName(inv.name) ? inv.name : null;
+  return kernelName || T('elastic.disk_absent');
+}
+function leafDisplayTitle(d) {
+  return isUnresolvedLeafName(d.name) ? d.name : null;
+}
+
+function diskSkeletonHtml(d, v, inv) {
+  const name = leafDisplayName(d, inv);
+  const title = leafDisplayTitle(d);
+  return `
+    <div class="disk-cell ${v.role === 'spare' ? 'spare' : ''}" data-device="${escapeAttr(d.name)}">
+      <div class="dc-main">
+        <div class="dc-name"><span class="health-dot"></span><span class="mono"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(name)}</span><span data-slot="chip" ${SLOT}></span></div>
+        <div class="dc-sub" data-f="sub"></div>
+        <div class="dc-sub mono" data-f="errs"></div>
+      </div>
+      <span data-slot="kind" ${SLOT}></span>
+      <div class="dc-actions"></div>
+    </div>`;
+}
+
+// The icon buttons of one disk cell. Each key's markup is fixed, so a button
+// that stays offered across polls is the same element; only the set changes
+// (an offline disk trades "offline" for "online", errors add "clear").
+function diskButtons(d, v, admin, freeCount) {
+  const btn = (act, icon, title, data) => ({ key: act, html: `<tf-button size="sm" variant="ghost" icon="${icon}" data-act="${act}" ${data} title="${escapeAttr(title)}"></tf-button>` });
+  const dev = `data-device="${escapeAttr(d.name)}"`;
+  const out = [];
+  if (admin) {
+    if (freeCount && v.role !== 'spare') out.push(btn('replace', 'refresh', T('pool.disk_replace'), `data-vdev="${escapeAttr(v.id)}" ${dev}`));
+    if (d.state === 'online') out.push(btn('offline', 'ban', T('pool.disk_offline'), dev));
+    else if (d.state === 'offline') out.push(btn('online', 'play', T('pool.disk_online'), dev));
+    if (leafErrors(d)) out.push(btn('clear', 'check', T('pool.disk_clear'), dev));
+  }
+  if (d.diskId) out.push({ ...btn('disk', 'chevron-right', T('disks.details'), `data-disk="${escapeAttr(d.diskId)}"`), key: 'disk:' + d.diskId });
+  return out;
+}
+
+function paintDiskCell(cell, d, v, ctx) {
+  const inv = inventoryFor(ctx.inventory, d);
+  const cond = diskCondition(d, inv);
+  const bad = d.state !== 'online';
+  setClass(cell, 'faulted', bad);
+  setClass(cell, 'warn', !bad && cond.tone !== 'ok');
+  setClass(cell, 'resilver', bad && ctx.resilvering);
+  const dot = cell.querySelector('.health-dot');
+  for (const t of ['ok', 'warn', 'err']) setClass(dot, t, cond.tone === t);
+  const chip = slotEl(cell.querySelector('[data-slot="chip"]'), Boolean(cond.chip), 'chip', '<tf-chip size="sm"></tf-chip>');
+  if (chip) {
+    setAttr(chip, 'status', cond.chip.status);
+    setAttr(chip, 'label', cond.chip.label);
+    setAttr(chip, 'title', cond.chip.title || null);
+  }
+  setText(cell.querySelector('[data-f="sub"]'), [fmtBytes(d.sizeBytes), inv?.temperatureC == null ? null : `${inv.temperatureC}°C`, d.note || null].filter(Boolean).join(' · '));
+  const errs = cell.querySelector('[data-f="errs"]');
+  setText(errs, `R ${Number(d.readErrors) || 0} · W ${Number(d.writeErrors) || 0} · CKSUM ${Number(d.cksumErrors) || 0}`);
+  setClass(errs, 'num-err', cond.errs > 0);
+  // The media badge exists only for a leaf the inventory knows; its kind is
+  // part of the key, so a changed kind swaps the one badge, nothing else.
+  // `KIND_BADGE` (format.js) is shared with elastic-detail.js (n11) so both
+  // screens spell the same wire kind ("HDD"/"NVMe") the same way (MINOR 12).
+  const kind = inv ? String(inv.kind) : '';
+  const [kindClass, kindLabel] = KIND_BADGE[kind] || [];
+  slotEl(cell.querySelector('[data-slot="kind"]'), Boolean(kindLabel), 'kind:' + kind, `<span class="disk-kind ${escapeAttr(kindClass || '')}">${escapeHtml(kindLabel || '')}</span>`);
+  patchKeyedList(cell.querySelector('.dc-actions'), diskButtons(d, v, ctx.admin, ctx.free.length));
+}
+
+function paintVdevGroup(group, v, ctx) {
+  const chip = slotEl(group.querySelector('[data-slot="state"]'), v.state !== 'online', 'chip', '<tf-chip dot></tf-chip>');
+  if (chip) {
+    setAttr(chip, 'status', stateTone(v.state));
+    setAttr(chip, 'label', stateLabel(v.state));
+  }
+  const hintKey = VDEV_HINTS[v.role];
+  setText(group.querySelector('[data-f="hint"]'), hintKey ? T(hintKey, { pool: ctx.pool.name }) : T('pool.tolerance_hint', { n: v.faultTolerance }));
+  // RAIDZ expansion is always on the group so the admin learns it exists;
+  // without a free disk it is disabled with the reason.
+  const expand = group.querySelector('[data-act="expand"]');
+  setAttr(expand, 'disabled', !ctx.free.length);
+  setAttr(expand, 'title', ctx.free.length ? null : T('pools.no_free_disks'));
+
+  const cellsHost = group.querySelector('.disk-cells');
+  const disks = v.disks || [];
+  patchKeyedList(cellsHost, disks.length
+    ? disks.map((d) => ({ key: 'disk:' + d.name, html: diskSkeletonHtml(d, v, inventoryFor(ctx.inventory, d)) }))
+    : [{ key: 'empty', html: `<div class="muted">${escapeHtml(T('pool.vdev_empty'))}</div>` }]);
+  const cells = new Map([...cellsHost.children].map((el) => [el.dataset.device, el]));
+  for (const d of disks) paintDiskCell(cells.get(d.name), d, v, ctx);
+}
+
+function topologySkeletonHtml(screen) {
+  const admin = screen.isAdmin;
   // The three shortcuts of the mockup; "Dodaj vdev" opens the dialog with
   // the role select, so log/special/dedup groups are reachable from it.
-  const freeNvme = free.some((d) => d.kind === 'nvme');
-  const addButton = (role, icon, enabled, reason) => `<tf-button size="sm" variant="secondary" icon="${icon}" data-act="add-vdev" data-role="${role}" ${enabled ? '' : `disabled title="${escapeAttr(reason)}"`}>${escapeHtml(T('pool.add_' + role))}</tf-button>`;
-  const addButtons = admin
-    ? addButton('data', 'plus', free.length > 0, T('pools.no_free_disks')) + addButton('cache', 'zap', freeNvme, T('pool.no_free_nvme')) + addButton('spare', 'cylinder', free.length > 0, T('pools.no_free_disks'))
-    : '';
+  const addButton = (role, icon) => `<tf-button size="sm" variant="secondary" icon="${icon}" data-act="add-vdev" data-role="${role}">${escapeHtml(T('pool.add_' + role))}</tf-button>`;
+  const row = (icon, label, value) => `<div class="sr"><span class="k">${sprite(icon)} ${escapeHtml(label)}</span><span class="v">${value}</span></div>`;
+  return `
+    <div class="section-card">
+      <div class="section-card-head">
+        <div class="title">${sprite('layers')} ${escapeHtml(T('pool.topology_title'))}</div>
+        ${admin ? `<div class="actions">${addButton('data', 'plus')}${addButton('cache', 'zap')}${addButton('spare', 'cylinder')}</div>` : ''}
+      </div>
+      <div data-part="vdevs"></div>
+    </div>
+    <div class="grid-2 pool-topology">
+      <div class="section-card">
+        <div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('pool.scrub_title_card'))}</div>
+          <div class="actions" data-part="scrub-actions"></div></div>
+        <div data-slot="scan-bar"></div>
+        <div class="stat-rows">
+          ${row('check', T('pool.scrub_last'), '<span data-f="last-when"></span><span data-f="last-sep"></span><span data-f="last-errs"></span>')}
+          ${row('clock', T('pool.scrub_schedule'), `<span class="sched-pill" ${admin ? 'data-act="scrub-schedule" role="button"' : ''}>${sprite('clock')} <span data-f="scrub-sched"></span></span> <span class="text-3" data-f="scrub-next"></span>`)}
+          ${row('cylinder', T('pool.errors'), '<span class="mono" data-f="pool-errors"></span>')}
+          ${row('zap', T('pool.autotrim'), '<span data-f="autotrim"></span>')}
+          ${row('zap', T('pool.trim_state'), '<span data-f="trim-label"></span> <span class="mono" data-f="trim-pct"></span> <span class="text-3" data-f="trim-last"></span> <span data-part="trim-buttons" style="display:contents"></span>')}
+          ${row('clock', T('pool.trim_schedule'), `<span class="sched-pill" data-f="trim-pill">${sprite('clock')} <span data-f="trim-sched"></span></span> <span class="text-3" data-f="trim-next"></span>`)}
+        </div>
+      </div>
+      <div class="section-card">
+        <div class="section-card-head"><div class="title">${sprite('trend')} ${escapeHtml(T('pool.io_title'))}</div><span class="hint">${escapeHtml(T('pool.io_hint'))}</span></div>
+        <div class="stat-rows">${IO_ROWS.map(([key, labelKey]) => `<div class="sr"><span class="k">${escapeHtml(T(labelKey))}</span><span class="v mono" data-io="${key}"></span></div>`).join('')}</div>
+        <tf-stream-chart id="nas-pool-io-live" class="mt-sm"></tf-stream-chart>
+        <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(IO_WINDOW_SECS) }))}</div>
+      </div>
+    </div>
+    ${propertiesSectionHtml(screen)}`;
+}
 
+// Fixed markup per button key, so a button offered on two consecutive polls
+// is the same element (a running scrub's "Zatrzymaj" survives the pause).
+const actionButton = (act, variant, icon, labelKey) => ({ key: act, html: `<tf-button variant="${variant}" size="sm" icon="${icon}" data-act="${act}">${escapeHtml(T(labelKey))}</tf-button>` });
+
+function scrubButtons(status) {
+  if (status === 'running') return [actionButton('scrub-pause', 'ghost', 'pause', 'pool.scrub_pause'), actionButton('scrub-stop', 'ghost', 'stop', 'pool.scrub_stop')];
+  if (status === 'paused') return [actionButton('scrub-resume', 'secondary', 'play', 'pool.scrub_resume'), actionButton('scrub-stop', 'ghost', 'stop', 'pool.scrub_stop')];
+  return [actionButton('scrub-start', 'secondary', 'play', 'pool.scrub_now')];
+}
+
+function trimButtons(trimState) {
+  if (trimState === 'trimming') return [actionButton('trim-suspend', 'ghost', 'pause', 'pool.trim_suspend'), actionButton('trim-cancel', 'ghost', 'stop', 'pool.trim_cancel')];
+  if (trimState === 'suspended') return [actionButton('trim-resume', 'secondary', 'play', 'pool.trim_resume'), actionButton('trim-cancel', 'ghost', 'stop', 'pool.trim_cancel')];
+  return [actionButton('trim-start', 'secondary', 'play', 'pool.trim_now')];
+}
+
+function paintScrubCard(root, admin, p) {
+  const scan = p.scan || {};
+  const f = (name) => root.querySelector(`[data-f="${name}"]`);
   const scanRunning = scan.status === 'running' || scan.status === 'paused';
-  const scrubButtons = !admin ? '' : scan.status === 'running'
-    ? `<tf-button variant="ghost" size="sm" icon="pause" data-act="scrub-pause">${escapeHtml(T('pool.scrub_pause'))}</tf-button>
-       <tf-button variant="ghost" size="sm" icon="stop" data-act="scrub-stop">${escapeHtml(T('pool.scrub_stop'))}</tf-button>`
-    : scan.status === 'paused'
-      ? `<tf-button variant="secondary" size="sm" icon="play" data-act="scrub-resume">${escapeHtml(T('pool.scrub_resume'))}</tf-button>
-         <tf-button variant="ghost" size="sm" icon="stop" data-act="scrub-stop">${escapeHtml(T('pool.scrub_stop'))}</tf-button>`
-      : `<tf-button variant="secondary" size="sm" icon="play" data-act="scrub-start">${escapeHtml(T('pool.scrub_now'))}</tf-button>`;
-  const lastScrub = p.lastScrubAt
-    ? [fmtDate(p.lastScrubAt), scan.status === 'finished' && scan.durationSecs ? fmtDuration(scan.durationSecs) : '', scan.status === 'finished' ? `<span class="${scan.errors ? 'num-err' : 'num-ok'}">${escapeHtml(T('pools.scrub_errors', { n: Number(scan.errors) || 0 }))}</span>` : ''].filter(Boolean).join(' · ')
-    : escapeHtml(T('pools.never'));
-  const scrubRows = [
-    ['check', T('pool.scrub_last'), lastScrub],
-    ['clock', T('pool.scrub_schedule'), `<span class="sched-pill" ${admin ? 'data-act="scrub-schedule" role="button"' : ''}>${sprite('clock')} ${escapeHtml(p.scrubSchedule ? fmtSchedule(p.scrubSchedule) : T('schedule.none'))}</span>${p.nextScrubAt ? ` <span class="text-3">${escapeHtml(fmtIn(p.nextScrubAt))}</span>` : ''}`],
-    ['cylinder', T('pool.errors'), `<span class="mono ${(p.readErrors || p.writeErrors || p.cksumErrors) ? 'num-err' : ''}">${Number(p.readErrors) || 0} / ${Number(p.writeErrors) || 0} / ${Number(p.cksumErrors) || 0}</span>`],
-    ['zap', T('pool.autotrim'), p.autotrim ? `<span class="num-ok">${escapeHtml(T('schedule.on'))}</span>` : escapeHtml(T('schedule.off'))],
-  ];
+  const scanPct = Math.round(Number(scan.progressPct) || 0);
+
+  // The scan chip leads the actions; both are keyed, so the chip keeps its
+  // node while its percentage moves and the buttons keep theirs.
+  const actions = root.querySelector('[data-part="scrub-actions"]');
+  patchKeyedList(actions, [
+    ...(scanRunning ? [{ key: 'scan-chip', html: '<tf-chip></tf-chip>' }] : []),
+    ...(admin ? scrubButtons(scan.status) : []),
+  ]);
+  if (scanRunning) {
+    const chip = actions.firstElementChild;
+    setAttr(chip, 'status', scan.status === 'paused' ? 'warn' : 'accent');
+    setAttr(chip, 'label', T('pools.scan_' + scan.kind, { pct: scanPct }));
+  }
+  const bar = slotEl(root.querySelector('[data-slot="scan-bar"]'), scanRunning, 'bar', '<tf-progress-bar tone="accent"></tf-progress-bar>');
+  if (bar) {
+    setAttr(bar, 'value', String(scanPct));
+    setAttr(bar, 'label', T('pool.scan_eta', { eta: fmtDuration(scan.etaSecs), scanned: fmtBytes(scan.scannedBytes) }));
+  }
+
+  const finished = Boolean(p.lastScrubAt) && scan.status === 'finished';
+  setText(f('last-when'), p.lastScrubAt
+    ? [fmtDate(p.lastScrubAt), finished && scan.durationSecs ? fmtDuration(scan.durationSecs) : ''].filter(Boolean).join(' · ')
+    : T('pools.never'));
+  setText(f('last-sep'), finished ? ' · ' : '');
+  const lastErrs = f('last-errs');
+  setText(lastErrs, finished ? T('pools.scrub_errors', { n: Number(scan.errors) || 0 }) : '');
+  setClass(lastErrs, 'num-err', finished && Boolean(scan.errors));
+  setClass(lastErrs, 'num-ok', finished && !scan.errors);
+
+  setText(f('scrub-sched'), p.scrubSchedule ? fmtSchedule(p.scrubSchedule) : T('schedule.none'));
+  setText(f('scrub-next'), p.nextScrubAt ? fmtIn(p.nextScrubAt) : '');
+  const errors = f('pool-errors');
+  setText(errors, `${Number(p.readErrors) || 0} / ${Number(p.writeErrors) || 0} / ${Number(p.cksumErrors) || 0}`);
+  setClass(errors, 'num-err', Boolean(p.readErrors || p.writeErrors || p.cksumErrors));
+  const autotrim = f('autotrim');
+  setText(autotrim, T(p.autotrim ? 'schedule.on' : 'schedule.off'));
+  setClass(autotrim, 'num-ok', Boolean(p.autotrim));
+
   // `zpool trim` (§5.10, research R7), next to the scrub it belongs beside:
   // both are the pool's own maintenance, both run on a clock. A pool whose
   // devices cannot TRIM says so instead of offering an action ZFS refuses.
   const trimState = String(p.trimState || 'idle');
   const trimSupported = trimState !== 'unsupported';
   const trimRunning = trimState === 'trimming' || trimState === 'suspended';
-  const trimButtons = !admin || !trimSupported ? '' : trimState === 'trimming'
-    ? `<tf-button variant="ghost" size="sm" icon="pause" data-act="trim-suspend">${escapeHtml(T('pool.trim_suspend'))}</tf-button>
-       <tf-button variant="ghost" size="sm" icon="stop" data-act="trim-cancel">${escapeHtml(T('pool.trim_cancel'))}</tf-button>`
-    : trimState === 'suspended'
-      ? `<tf-button variant="secondary" size="sm" icon="play" data-act="trim-resume">${escapeHtml(T('pool.trim_resume'))}</tf-button>
-         <tf-button variant="ghost" size="sm" icon="stop" data-act="trim-cancel">${escapeHtml(T('pool.trim_cancel'))}</tf-button>`
-      : `<tf-button variant="secondary" size="sm" icon="play" data-act="trim-start">${escapeHtml(T('pool.trim_now'))}</tf-button>`;
-  scrubRows.push(
-    ['zap', T('pool.trim_state'), trimSupported
-      ? `${escapeHtml(T('pool.trim_state_' + trimState))}${trimRunning ? ` <span class="mono">${Math.round(Number(p.trimProgressPct) || 0)}%</span>` : ''}${p.lastTrimAt ? ` <span class="text-3">${escapeHtml(fmtDate(p.lastTrimAt))}</span>` : ''} ${trimButtons}`
-      : `<span class="text-3">${escapeHtml(T('pool.trim_unsupported'))}</span>`],
-    ['clock', T('pool.trim_schedule'), `<span class="sched-pill" ${admin && trimSupported ? 'data-act="trim-schedule" role="button"' : ''}>${sprite('clock')} ${escapeHtml(p.trimSchedule ? fmtSchedule(p.trimSchedule) : T('schedule.none'))}</span>${p.nextTrimAt ? ` <span class="text-3">${escapeHtml(fmtIn(p.nextTrimAt))}</span>` : ''}`],
-  );
-  const io = p.io || {};
+  const trimLabel = f('trim-label');
+  setText(trimLabel, trimSupported ? T('pool.trim_state_' + trimState) : T('pool.trim_unsupported'));
+  setClass(trimLabel, 'text-3', !trimSupported);
+  setText(f('trim-pct'), trimSupported && trimRunning ? `${Math.round(Number(p.trimProgressPct) || 0)}%` : '');
+  setText(f('trim-last'), trimSupported && p.lastTrimAt ? fmtDate(p.lastTrimAt) : '');
+  patchKeyedList(root.querySelector('[data-part="trim-buttons"]'), admin && trimSupported ? trimButtons(trimState) : []);
+  const trimPill = f('trim-pill');
+  setAttr(trimPill, 'data-act', admin && trimSupported ? 'trim-schedule' : null);
+  setAttr(trimPill, 'role', admin && trimSupported ? 'button' : null);
+  setText(f('trim-sched'), p.trimSchedule ? fmtSchedule(p.trimSchedule) : T('schedule.none'));
+  setText(f('trim-next'), p.nextTrimAt ? fmtIn(p.nextTrimAt) : '');
+}
 
-  const html = `
-    <div class="stack">
-      <div class="section-card">
-        <div class="section-card-head">
-          <div class="title">${sprite('layers')} ${escapeHtml(T('pool.topology_title'))}</div>
-          ${addButtons ? `<div class="actions">${addButtons}</div>` : ''}
-        </div>
-        ${vdevs.map(vdevHtml).join('') || `<div class="muted">${escapeHtml(T('pool.no_vdevs'))}</div>`}
-      </div>
-      <div class="grid-2 pool-topology">
-        <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('pool.scrub_title_card'))}</div>
-            <div class="actions">${scanRunning ? `<tf-chip status="${scan.status === 'paused' ? 'warn' : 'accent'}" label="${escapeAttr(T('pools.scan_' + scan.kind, { pct: Math.round(Number(scan.progressPct) || 0) }))}"></tf-chip>` : ''}${scrubButtons}</div></div>
-          ${scanRunning ? `<tf-progress-bar value="${Math.round(Number(scan.progressPct) || 0)}" tone="accent" label="${escapeAttr(T('pool.scan_eta', { eta: fmtDuration(scan.etaSecs), scanned: fmtBytes(scan.scannedBytes) }))}"></tf-progress-bar>` : ''}
-          <div class="stat-rows">${scrubRows.map(([icon, k, v]) => `<div class="sr"><span class="k">${sprite(icon)} ${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('')}</div>
-        </div>
-        <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('trend')} ${escapeHtml(T('pool.io_title'))}</div><span class="hint">${escapeHtml(T('pool.io_hint'))}</span></div>
-          <div class="stat-rows">${IO_ROWS.map(([key, labelKey]) => `<div class="sr"><span class="k">${escapeHtml(T(labelKey))}</span><span class="v mono" data-io="${key}"></span></div>`).join('')}</div>
-          <tf-stream-chart id="nas-pool-io-live" class="mt-sm"></tf-stream-chart>
-          <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(IO_WINDOW_SECS) }))}</div>
-        </div>
-      </div>
-      ${propertiesSectionHtml(screen, state)}
-    </div>`;
-  // The three IO numbers are what a 5 s poll moves on an otherwise idle pool,
-  // and they are the reason this pane used to be rebuilt every time. They are
-  // rendered as empty slots above and written as TEXT below, so the markup
-  // compared here stays identical across polls and the vdev cells, their
-  // buttons and the chart are never destroyed under the cursor. (A disk
-  // crossing a temperature degree still rebuilds the pane — the comparison is
-  // over the whole joined string and cannot tell which cell moved.)
-  const rebuilt = patchHtml(host, html);
-  paintIoRows(host, io);
-  if (!rebuilt) {
-    // The pane survived, so its chart still owns the points it was seeded
-    // with: feed it the newest sample instead of re-seeding it from scratch.
-    const chart = host.querySelector('#nas-pool-io-live');
+function paintTopology(screen, body, state, refresh) {
+  const host = body.querySelector('#nas-pool-tab-body');
+  const p = state.res.pool;
+  const admin = screen.isAdmin;
+  const free = state.freeDisks;
+  let root = paneRoot(host, 'topology');
+  const built = !root;
+  if (built) root = buildPane(host, 'topology', topologySkeletonHtml(screen), screen, state, refresh);
+
+  if (admin) {
+    const freeNvme = free.some((d) => d.kind === 'nvme');
+    for (const [role, enabled, reason] of [['data', free.length > 0, T('pools.no_free_disks')], ['cache', freeNvme, T('pool.no_free_nvme')], ['spare', free.length > 0, T('pools.no_free_disks')]]) {
+      const b = root.querySelector(`[data-act="add-vdev"][data-role="${role}"]`);
+      setAttr(b, 'disabled', !enabled);
+      setAttr(b, 'title', enabled ? null : reason);
+    }
+  }
+
+  // Vdev groups are keyed by id and their disk cells by leaf name: a poll
+  // that moves a temperature, a counter or a health dot writes those values
+  // into the nodes on screen, and only a vdev or disk that comes or goes
+  // changes the structure — and then only its own group or cell.
+  const vdevs = p.vdevs || [];
+  const vdevHost = root.querySelector('[data-part="vdevs"]');
+  patchKeyedList(vdevHost, vdevs.length
+    ? vdevs.map((v) => ({ key: `vdev:${v.id}:${v.role}:${v.kind}`, html: vdevSkeletonHtml(v, admin, vdevs) }))
+    : [{ key: 'none', html: `<div class="muted">${escapeHtml(T('pool.no_vdevs'))}</div>` }]);
+  const scan = p.scan || {};
+  const ctx = {
+    pool: p, admin, free,
+    inventory: inventoryOf(state.disks),
+    resilvering: scan.kind === 'resilver' && scan.status === 'running',
+  };
+  const groups = new Map([...vdevHost.children].map((el) => [el.dataset.vdev, el]));
+  for (const v of vdevs) paintVdevGroup(groups.get(v.id), v, ctx);
+
+  paintScrubCard(root, admin, p);
+  paintIoRows(root, p.io || {});
+  const chart = root.querySelector('#nas-pool-io-live');
+  if (built) {
+    // A fresh pane seeds its chart from the samples kept on `state`: the
+    // chart is new because the TAB was (re)opened, never because of a poll.
+    mountIoChart(chart, 72, state);
+  } else {
+    // The chart already owns the points it was seeded with and every one
+    // pushed since; feed it the newest sample so it keeps moving.
     const last = state.ioSamples[state.ioSamples.length - 1];
-    if (chart && last) chart.push(last.t, { read: last.read, write: last.write });
-    // Rows only — the danger-zone listeners below are still attached to the
-    // markup that is on screen, and binding them twice would fire them twice.
-    paintProperties(screen, host, state, refresh, { wire: false });
-    return;
+    if (last) chart.push(last.t, { read: last.read, write: last.write });
   }
-  // A rebuilt pane needs its chart seeded from the samples kept on `state`,
-  // because the element that held them has just been replaced.
-  mountIoChart(host.querySelector('#nas-pool-io-live'), 72, state);
-  paintProperties(screen, host, state, refresh);
-
-  for (const act of ['start', 'pause', 'resume', 'stop']) {
-    host.querySelector(`[data-act="scrub-${act}"]`)?.addEventListener('click', () => scrubAction(screen, p.name, act, refresh));
-  }
-  host.querySelector('[data-act="scrub-schedule"]')?.addEventListener('click', () => openScrubScheduleEditor(screen, p, refresh));
-  for (const act of ['start', 'suspend', 'resume', 'cancel']) {
-    host.querySelector(`[data-act="trim-${act}"]`)?.addEventListener('click', () => trimAction(screen, p.name, act, refresh));
-  }
-  host.querySelector('[data-act="trim-schedule"]')?.addEventListener('click', () => openTrimScheduleEditor(screen, p, refresh));
-  host.querySelectorAll('[data-act="add-vdev"]').forEach((b) => b.addEventListener('click', () => openAddVdevDialog(screen, p, b.dataset.role, free, refresh)));
-  host.querySelectorAll('[data-act="expand"]').forEach((b) => b.addEventListener('click', () => {
-    const v = vdevs.find((x) => x.id === b.dataset.vdev);
-    openPickDiskDialog(screen, {
-      title: T('pool.vdev_expand_title', { id: v.id }),
-      explain: T('pool.vdev_expand_explain', { layout: layoutLabel(v.kind) }),
-      disks: free,
-      minBytes: Math.min(...(v.disks || []).map((d) => Number(d.sizeBytes) || 0)),
-      confirmLabel: T('pool.vdev_expand'),
-      onPick: async (disk) => {
-        const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolExpandVdevRequest', { name: p.name, vdevId: v.id, diskId: disk.diskId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.vdev_expand_title', { id: v.id }));
-        followResponse(screen, res, refresh, T('pool.vdev_expand_done'));
-        return res !== null;
-      },
-    });
-  }));
-  host.querySelectorAll('[data-act="remove-vdev"]').forEach((b) => b.addEventListener('click', async () => {
-    const v = vdevs.find((x) => x.id === b.dataset.vdev);
-    const ok = await TfWindow.confirm({ title: T('pool.vdev_remove'), message: T('pool.vdev_remove_confirm', { id: v.id, role: T('pool.role_' + v.role) }), confirmLabel: T('pool.vdev_remove'), cancelLabel: I18n.t('common.cancel'), danger: true });
-    if (!ok) return;
-    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolRemoveVdevRequest', { name: p.name, vdevId: v.id, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.vdev_remove'));
-    followResponse(screen, res, refresh, T('pool.vdev_remove_done'));
-  }));
-  host.querySelectorAll('[data-act="replace"]').forEach((b) => b.addEventListener('click', () => {
-    const v = vdevs.find((x) => x.id === b.dataset.vdev);
-    const d = (v.disks || []).find((x) => x.name === b.dataset.device);
-    openReplaceWizard(screen, { pool: p, vdev: v, disk: d, freeDisks: free, disks: state.disks, onDone: refresh });
-  }));
-  for (const action of ['offline', 'online', 'clear']) {
-    host.querySelectorAll(`[data-act="${action}"]`).forEach((b) => b.addEventListener('click', async () => {
-      const device = b.dataset.device;
-      if (action === 'offline') {
-        const ok = await TfWindow.confirm({ title: T('pool.disk_offline'), message: T('pool.disk_offline_confirm', { device, ft: p.faultTolerance }), confirmLabel: T('pool.disk_offline'), cancelLabel: I18n.t('common.cancel'), danger: true });
-        if (!ok) return;
-      }
-      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDeviceStateRequest', { name: p.name, device, action, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.disk_' + action));
-      followResponse(screen, res, refresh, T('pool.disk_' + action + '_done', { device }));
-    }));
-  }
-  host.querySelectorAll('[data-act="disk"]').forEach((b) => b.addEventListener('click', () => screen.openDisk(b.dataset.disk)));
+  paintProperties(screen, root, state, refresh);
 }
 
 function openScrubScheduleEditor(screen, pool, refresh) {
@@ -601,8 +932,9 @@ function paintStats(body, state) {
 }
 
 // One ring of read/write samples per pool screen: n06 draws it both on the
-// topology IO card and on the Statystyki tab, and the topology card is
-// re-rendered on every poll, so the samples cannot live in the chart.
+// topology IO card and on the Statystyki tab, and switching inner tabs mounts
+// a fresh chart, so the samples cannot live in either chart. (A POLL never
+// re-mounts one — it only pushes the newest sample.)
 function recordIoSample(state) {
   const io = state.res.pool.io || {};
   const now = Date.now();
@@ -653,10 +985,11 @@ export const sourceChipHtml = (source) => `<tf-chip size="sm" status="${source =
 
 // n06 shows "Właściwości puli" + "Strefa niebezpieczna" at the foot of the
 // topology pane AND keeps a dedicated Właściwości tab for them, so the two
-// panes emit the same markup from here and share `paintProperties`.
-function propertiesSectionHtml(screen, state) {
-  const p = state.res.pool;
-  const childNames = (state.res.datasets || []).filter((d) => d.name !== p.name).map((d) => d.name.slice(p.name.length + 1)).join(', ') || '—';
+// panes emit the same skeleton from here and share `paintProperties`. Nothing
+// in it depends on a poll: the rows and the destroy row's list of datasets
+// are written by `paintProperties` into the nodes this builds once.
+function propertiesSectionHtml(screen) {
+  const name = screen.pool;
   return `
     <div class="section-card">
       <div class="section-card-head"><div class="title">${sprite('settings')} ${escapeHtml(T('props.title'))}</div><span class="hint">${escapeHtml(T('props.hint'))}</span></div>
@@ -670,25 +1003,22 @@ function propertiesSectionHtml(screen, state) {
       <h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
       ${dangerRowHtml({ title: T('danger.export'), desc: T('danger.export_desc'), action: T('danger.export_action'), icon: 'arrow-out', act: 'export' })}
       <tf-checkbox id="nas-export-force" label="${escapeAttr(T('danger.export_force'))}"></tf-checkbox>
-      ${dangerRowHtml({ title: T('danger.destroy', { name: p.name }), desc: T('danger.destroy_desc', { names: childNames }), action: T('danger.destroy_action'), icon: 'trash', act: 'destroy' })}
+      ${dangerRowHtml({ title: T('danger.destroy', { name }), desc: '', action: T('danger.destroy_action'), icon: 'trash', act: 'destroy' })}
     </div>` : ''}`;
 }
 
 function paintPropertiesTab(screen, body, state, refresh) {
   const host = body.querySelector('#nas-pool-tab-body');
-  const rebuilt = patchHtml(host, `<div class="stack">${propertiesSectionHtml(screen, state)}</div>`);
-  paintProperties(screen, host, state, refresh, { wire: rebuilt });
+  const root = paneRoot(host, 'properties') || buildPane(host, 'properties', propertiesSectionHtml(screen), screen, state, refresh);
+  paintProperties(screen, root, state, refresh);
 }
 
-// Fills the "Właściwości puli" table and wires the danger zone that follows
-// it on the topology and properties tabs (n06).
-// `wire` is false when the caller re-used the markup that is already on
-// screen: the rows still have to be refreshed, but the danger-zone listeners
-// below are already attached and binding them again would fire them twice.
-function paintProperties(screen, host, state, refresh, { wire = true } = {}) {
+// Fills the "Właściwości puli" table and the dataset list of the destroy row
+// on the topology and properties panes (n06). Its buttons are handled by the
+// pane's delegated listener (`onPaneClick`), so there is nothing to wire here.
+function paintProperties(screen, host, state, refresh) {
   const p = state.res.pool;
   const admin = screen.isAdmin;
-  const datasets = state.res.datasets || [];
   const table = host.querySelector('#nas-pool-props');
   const props = state.res.properties || [];
   const editable = (name) => admin && (name in POOL_PROPS || name in DATASET_PROPS);
@@ -702,26 +1032,26 @@ function paintProperties(screen, host, state, refresh, { wire = true } = {}) {
     wrap.querySelector('[data-act="edit"]').addEventListener('click', (e) => { e.stopPropagation(); openPropertyEditor(screen, p.name, live()._prop, refresh); });
     return wrap;
   };
-  table.rows = props.map((pr) => ({
+  const rows = props.map((pr) => ({
     _prop: pr,
     name: `<span class="tf-table__cell--mono">${escapeHtml(pr.name)}</span>`,
     value: `<span class="tf-table__cell--mono">${escapeHtml(pr.value ?? '—')}</span>${pr.name === 'compression' && p.compressRatio ? ` <tf-chip size="sm" status="ok" label="${escapeAttr(T('pool.ratio_chip', { ratio: fmtRatio(p.compressRatio) }))}"></tf-chip>` : ''}${pr.inheritedFrom ? `<div class="tf-table__cell-sub">${escapeHtml(T('props.inherited_from', { from: pr.inheritedFrom }))}</div>` : ''}`,
   }));
+  // `rows =` is a full table render (M10): every cell, every row-action
+  // button and any hover on them is rebuilt. The properties of a pool change
+  // when someone edits one, not on a 5 s poll, so the assignment happens only
+  // when the rows really differ from what the table was last given.
+  const sig = JSON.stringify(rows);
+  if (table.__tfRows !== sig) {
+    table.__tfRows = sig;
+    table.rows = rows;
+  }
 
-  if (!admin) return;
-  host.querySelector('[data-act="export"]').addEventListener('click', async () => {
-    const force = Boolean(host.querySelector('#nas-export-force').checked);
-    const ok = await TfWindow.confirm({ title: T('danger.export'), message: T('danger.export_confirm', { name: p.name }), confirmLabel: T('danger.export_action'), cancelLabel: I18n.t('common.cancel'), danger: true });
-    if (!ok) return;
-    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolExportRequest', { name: p.name, force, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('danger.export'));
-    followResponse(screen, res, () => { screen.pool = null; screen.clearTimers(); screen.setLocation(); screen.drawTab(); }, T('danger.export_done', { name: p.name }));
-  });
-  host.querySelector('[data-act="destroy"]').addEventListener('click', () => openPoolDestroyDialog(screen, p, datasets, () => {
-    screen.pool = null;
-    screen.clearTimers();
-    screen.setLocation();
-    screen.drawTab();
-  }));
+  const destroyRow = host.querySelector('[data-act="destroy"]')?.closest('.dz-row');
+  if (destroyRow) {
+    const childNames = (state.res.datasets || []).filter((d) => d.name !== p.name).map((d) => d.name.slice(p.name.length + 1)).join(', ') || '—';
+    setText(destroyRow.querySelector('.dz-desc'), T('danger.destroy_desc', { names: childNames }));
+  }
 }
 
 // One property at a time: a select for enumerated values, a text field for
@@ -988,12 +1318,26 @@ export function openPickDiskDialog(screen, { title, explain, disks, minBytes = 0
   });
   return win;
 }
+
+const resilverActive = (scan) => scan?.kind === 'resilver' && (scan.status === 'running' || scan.status === 'paused');
+
 // Replace (n17c): pick the replacement (a hot-spare of the pool first, then
 // the free disks) → the replace job → the resilver followed from `zpool
 // status` until the vdev is whole again. The install-wizard shell keeps it
 // consistent with pool creation.
+//
+// The window is built once. A step change swaps the step body (a structural
+// change, once per step); every 1.5 s tick only writes the rail classes, the
+// progress bar's attributes and the log's new tail into the nodes on screen.
 export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks = [], onDone }) {
   if (screen.openWindow) { screen.openWindow.remove(); screen.openWindow = null; }
+  // The disk being replaced is exactly the one M4 flags: a leaf `zpool
+  // status` no longer finds prints as its numeric GUID or, if its by-id
+  // symlink is gone, as that by-id basename. Every visible spot below uses
+  // this label instead of `disk.name`; the wire request still sends
+  // `disk.name` (the GUID/by-id text), which is what the server needs to
+  // find it.
+  const oldDiskLabel = leafDisplayName(disk, inventoryFor(inventoryOf(disks), disk));
   const minBytes = Number(disk.sizeBytes) || 0;
   const byId = new Map(disks.map((d) => [d.diskId, d]));
   const candidates = [
@@ -1004,7 +1348,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   const steps = [T('replace.step_pick'), T('replace.step_run'), T('replace.step_resilver')];
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
-  win.setAttribute('title', T('replace.title', { device: disk.name, pool: pool.name, layout: layoutLabel(vdev.kind) }));
+  win.setAttribute('title', T('replace.title', { device: oldDiskLabel, pool: pool.name, layout: layoutLabel(vdev.kind) }));
   win.setAttribute('icon', 'refresh');
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
@@ -1014,13 +1358,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   win.setAttribute('initial-y', 'center');
   screen.openWindow = win;
 
-  // n17c shows the step rail alone in the window body — the window title
-  // already names the disk, the pool and its layout.
-  const header = () => `
-    <div class="install-progress">${steps.map((s, i) => `<div class="install-step ${i === state.step ? 'active' : i < state.step ? 'done' : ''}"><span class="num">${i < state.step ? sprite('check') : i + 1}</span><span class="label">${escapeHtml(s)}</span></div>`).join('')}</div>`;
-
   const optionHtml = (d) => {
-    const on = state.pick && state.pick.diskId === d.diskId;
     const name = d.spare
       ? `${escapeHtml(T('replace.spare_name', { name: d.name, pool: pool.name }))} <tf-chip size="sm" status="ok" dot label="${escapeAttr(T('replace.spare_ready'))}"></tf-chip>`
       : escapeHtml(T('replace.free_name', { name: d.name, size: fmtBytes(d.sizeBytes), model: d.model || '—' }));
@@ -1028,8 +1366,8 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
       ? T('replace.spare_sub', { size: fmtBytes(d.sizeBytes), model: d.model || '—', serial: d.serial || '—' })
       : T('replace.free_sub', { serial: d.serial || '—' });
     return `
-      <div class="target-option ${on ? 'checked' : ''} ${d.small ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" ${d.small ? `title="${escapeAttr(T('pool.disk_too_small', { min: fmtBytes(minBytes) }))}"` : ''}>
-        <tf-checkbox ${on ? 'checked' : ''} ${d.small ? 'disabled' : ''}></tf-checkbox>
+      <div class="target-option ${d.small ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" ${d.small ? `title="${escapeAttr(T('pool.disk_too_small', { min: fmtBytes(minBytes) }))}"` : ''}>
+        <tf-checkbox ${d.small ? 'disabled' : ''}></tf-checkbox>
         <div class="t-body">
           <div class="t-name">${name}</div>
           <div class="t-sub">${escapeHtml(sub)}${d.small ? ` · ${escapeHtml(T('pool.disk_too_small', { min: fmtBytes(minBytes) }))}` : ''}</div>
@@ -1038,67 +1376,120 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   };
 
   const explainHtml = () => (state.pick
-    ? T('replace.explain', { old: escapeHtml(disk.name), new: escapeHtml(state.pick.name), pool: escapeHtml(pool.name), layout: escapeHtml(layoutLabel(vdev.kind)), ft: Math.max(0, (Number(vdev.faultTolerance) || 0) - 1) })
+    ? T('replace.explain', { old: escapeHtml(oldDiskLabel), new: escapeHtml(state.pick.name), pool: escapeHtml(pool.name), layout: escapeHtml(layoutLabel(vdev.kind)), ft: Math.max(0, (Number(vdev.faultTolerance) || 0) - 1) })
     : escapeHtml(T('replace.explain_pick')));
 
-  const stepPick = () => `
-    <div class="stack" id="nas-rp-list">${candidates.map(optionHtml).join('') || `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}</div>
-    <div class="explain-box mt-md" id="nas-rp-explain">${explainHtml()}</div>
-    <div class="wizard-warning mt-md">${sprite('alert')}<div>${escapeHtml(T('replace.warning', { device: disk.name }))}</div></div>`;
-
-  const jobLog = () => `<pre class="job-log mono mt-sm">${escapeHtml((state.job?.log || []).join('\n'))}</pre>`;
-
-  const stepRun = () => `
-    <h2 class="wizard-section-title">${escapeHtml(T('replace.run_title', { old: disk.name, new: state.pick.name }))}</h2>
-    <p class="wizard-section-sub">${escapeHtml(T('replace.sub_run'))}</p>
-    ${state.job ? `<tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar>${jobLog()}` : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
-
-  const stepResilver = () => {
-    if (state.result) {
-      const ok = state.result.ok;
-      return `<div class="result-box ${ok ? 'ok' : 'err'}">${sprite(ok ? 'check-circle' : 'alert')}<h3>${escapeHtml(ok ? T('replace.done_title') : T('replace.failed_title'))}</h3><p>${escapeHtml(state.result.detail || '')}</p></div>${state.job ? jobLog() : ''}`;
+  // One skeleton per phase. What moves inside a phase (bar value and label,
+  // log tail) is left empty here and written by `paint`.
+  const phaseHtml = (phase) => {
+    switch (phase) {
+      case 'pick': return `
+        <div class="stack" id="nas-rp-list">${candidates.map(optionHtml).join('') || `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}</div>
+        <div class="explain-box mt-md" id="nas-rp-explain">${explainHtml()}</div>
+        <div class="wizard-warning mt-md">${sprite('alert')}<div>${escapeHtml(T('replace.warning', { device: oldDiskLabel }))}</div></div>`;
+      case 'run': return `
+        <h2 class="wizard-section-title">${escapeHtml(T('replace.run_title', { old: oldDiskLabel, new: state.pick.name }))}</h2>
+        <p class="wizard-section-sub">${escapeHtml(T('replace.sub_run'))}</p>
+        <div data-slot="bar"></div>
+        <pre class="job-log mono mt-sm"></pre>`;
+      case 'resilver': return `
+        <h2 class="wizard-section-title">${escapeHtml(T('replace.step_resilver'))}</h2>
+        <p class="wizard-section-sub">${escapeHtml(T('replace.sub_resilver'))}</p>
+        <tf-progress-bar tone="accent"></tf-progress-bar>
+        ${warningHtml('info', T('replace.warning', { device: oldDiskLabel }))}
+        <pre class="job-log mono mt-sm"></pre>`;
+      default: {
+        const ok = state.result.ok;
+        return `<div class="result-box ${ok ? 'ok' : 'err'}">${sprite(ok ? 'check-circle' : 'alert')}<h3>${escapeHtml(ok ? T('replace.done_title') : T('replace.failed_title'))}</h3><p>${escapeHtml(state.result.detail || '')}</p></div><pre class="job-log mono mt-sm"></pre>`;
+      }
     }
-    const scan = state.scan || {};
-    const pctDone = Math.round(Number(scan.progressPct) || 0);
-    return `
-      <h2 class="wizard-section-title">${escapeHtml(T('replace.step_resilver'))}</h2>
-      <p class="wizard-section-sub">${escapeHtml(T('replace.sub_resilver'))}</p>
-      <tf-progress-bar value="${pctDone}" tone="accent" label="${escapeAttr(T('replace.resilver_progress', { pct: pctDone, eta: fmtDuration(scan.etaSecs) }))}"></tf-progress-bar>
-      ${warningHtml('info', T('replace.warning', { device: disk.name }))}`;
   };
 
-  const footer = () => {
+  // n17c shows the step rail alone in the window body — the window title
+  // already names the disk, the pool and its layout.
+  win.innerHTML = `
+    <div slot="body">
+      <div class="install-progress">${steps.map((s, i) => `<div class="install-step" data-step="${i}"><span class="num"></span><span class="label">${escapeHtml(s)}</span></div>`).join('')}</div>
+      <div class="install-step-body"></div>
+    </div>
+    <div slot="footer"></div>`;
+  const stepBody = win.querySelector('.install-step-body');
+  const footer = win.querySelector('[slot="footer"]');
+
+  const paint = () => {
+    win.querySelectorAll('.install-progress .install-step').forEach((el, i) => {
+      setClass(el, 'active', i === state.step);
+      setClass(el, 'done', i < state.step);
+      const num = el.querySelector('.num');
+      const want = i < state.step ? 'done' : String(i + 1);
+      if (num.dataset.v !== want) {
+        num.dataset.v = want;
+        num.innerHTML = i < state.step ? sprite('check') : String(i + 1);
+      }
+    });
+
+    const phase = state.result ? `result-${state.result.ok ? 'ok' : 'err'}` : ['pick', 'run', 'resilver'][state.step];
+    if (stepBody.dataset.phase !== phase) {
+      stepBody.dataset.phase = phase;
+      stepBody.innerHTML = phaseHtml(phase);
+      if (phase === 'pick') wirePickList();
+    }
+    if (phase === 'run') {
+      const bar = slotEl(stepBody.querySelector('[data-slot="bar"]'), Boolean(state.job), 'bar', '<tf-progress-bar tone="accent"></tf-progress-bar>');
+      if (bar) {
+        setAttr(bar, 'value', String(Number(state.job.progressPct) || 0));
+        setAttr(bar, 'label', T('jobs.status_' + state.job.status));
+      }
+    } else if (phase === 'resilver') {
+      const scan = state.scan || {};
+      const pctDone = Math.round(Number(scan.progressPct) || 0);
+      const bar = stepBody.querySelector('tf-progress-bar');
+      setAttr(bar, 'value', String(pctDone));
+      setAttr(bar, 'label', T('replace.resilver_progress', { pct: pctDone, eta: fmtDuration(scan.etaSecs) }));
+    }
+    const log = stepBody.querySelector('.job-log');
+    if (log) {
+      setAttr(log, 'hidden', !state.job);
+      paintJobLog(log, state.job?.log);
+    }
+
+    // Footer buttons are keyed: "Anuluj" and "Wstecz" are the same nodes for
+    // the window's whole life, only the forward button changes with the phase.
     const running = state.step > 0 && !state.result;
-    const finished = Boolean(state.result);
-    let next;
-    if (finished) next = `<tf-button variant="primary" icon="check" data-wizard-next>${escapeHtml(I18n.t('common.close'))}</tf-button>`;
-    else if (state.step === 0) next = `<tf-button variant="primary" icon="play" data-wizard-next ${state.pick ? '' : 'disabled'}>${escapeHtml(T('replace.start'))}</tf-button>`;
-    else next = '';
-    return `
-      <tf-button variant="ghost" data-wizard-cancel ${running ? 'disabled' : ''}>${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-      <tf-button variant="ghost" icon="chevron-left" data-wizard-back disabled>${escapeHtml(I18n.t('common.back'))}</tf-button>
-      <span class="spacer"></span>
-      ${next}`;
+    patchKeyedList(footer, [
+      { key: 'cancel', html: `<tf-button variant="ghost" data-wizard-cancel>${escapeHtml(I18n.t('common.cancel'))}</tf-button>` },
+      { key: 'back', html: `<tf-button variant="ghost" icon="chevron-left" data-wizard-back disabled>${escapeHtml(I18n.t('common.back'))}</tf-button>` },
+      { key: 'spacer', html: '<span class="spacer"></span>' },
+      ...(state.result
+        ? [{ key: 'close', html: `<tf-button variant="primary" icon="check" data-wizard-next>${escapeHtml(I18n.t('common.close'))}</tf-button>` }]
+        : state.step === 0
+          ? [{ key: 'start', html: `<tf-button variant="primary" icon="play" data-wizard-next>${escapeHtml(T('replace.start'))}</tf-button>` }]
+          : []),
+    ]);
+    setAttr(footer.querySelector('[data-wizard-cancel]'), 'disabled', running);
+    if (!state.result && state.step === 0) setAttr(footer.querySelector('[data-wizard-next]'), 'disabled', !state.pick);
   };
 
-  const draw = () => {
-    win.innerHTML = `<div slot="body">${header()}<div class="install-step-body">${[stepPick, stepRun, stepResilver][state.step]()}</div></div><div slot="footer">${footer()}</div>`;
-    const list = win.querySelector('#nas-rp-list');
-    if (list) {
-      list.addEventListener('click', (e) => {
-        const opt = e.target.closest('.target-option[data-disk]');
-        if (!opt || opt.classList.contains('disabled') || e.target.closest('tf-checkbox')) return;
-        pick(opt.dataset.disk);
-      });
-      list.addEventListener('change', (e) => {
-        const opt = e.target.closest('.target-option[data-disk]');
-        if (!opt || opt.classList.contains('disabled')) return;
-        pick(opt.dataset.disk);
-      });
-    }
-    win.querySelector('[data-wizard-cancel]').addEventListener('click', () => win.close());
-    win.querySelector('[data-wizard-next]')?.addEventListener('click', next);
-  };
+  function wirePickList() {
+    const list = stepBody.querySelector('#nas-rp-list');
+    list.addEventListener('click', (e) => {
+      const opt = e.target.closest('.target-option[data-disk]');
+      if (!opt || opt.classList.contains('disabled') || e.target.closest('tf-checkbox')) return;
+      pick(opt.dataset.disk);
+    });
+    list.addEventListener('change', (e) => {
+      const opt = e.target.closest('.target-option[data-disk]');
+      if (!opt || opt.classList.contains('disabled')) return;
+      pick(opt.dataset.disk);
+    });
+  }
+
+  footer.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-wizard-cancel], [data-wizard-next]');
+    if (!btn || btn.hasAttribute('disabled')) return;
+    if (btn.hasAttribute('data-wizard-cancel')) win.close();
+    else next();
+  });
 
   // One replacement at a time: picking an option unchecks the others.
   const pick = (diskId) => {
@@ -1109,21 +1500,27 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
       o.querySelector('tf-checkbox').checked = Boolean(on);
     });
     win.querySelector('#nas-rp-explain').innerHTML = explainHtml();
-    const btn = win.querySelector('[data-wizard-next]');
-    if (state.pick) btn.removeAttribute('disabled'); else btn.setAttribute('disabled', '');
+    paint();
   };
 
   const next = async () => {
     if (state.result) { win.close(); return; }
     if (state.step !== 0 || !state.pick) return;
-    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolReplaceDiskRequest', { name: pool.name, old: disk.name, diskId: state.pick.diskId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('replace.title', { device: disk.name, pool: pool.name, layout: layoutLabel(vdev.kind) }));
+    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolReplaceDiskRequest', { name: pool.name, old: disk.name, diskId: state.pick.diskId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('replace.title', { device: oldDiskLabel, pool: pool.name, layout: layoutLabel(vdev.kind) }));
     if (!res) return;
     state.step = 1;
     state.job = res.job || null;
-    draw();
+    paint();
     if (state.job) await pollJob(); else await pollResilver();
   };
 
+  // The replace job spans `zpool replace` AND the resilver it starts (the
+  // core follows the scan before it reports the job done), so waiting for the
+  // job to finish before looking at the scan left step 3 unreachable for the
+  // whole resilver. Each tick therefore also reads the pool's scan: once a
+  // resilver runs, the rail moves to step 3 and shows its progress and ETA
+  // while the job's log keeps growing underneath. A failed PoolGet here is
+  // not the job's failure — the job stays the authority, the rail just waits.
   const pollJob = async () => {
     if (!win.isConnected || !state.job) return;
     try {
@@ -1132,29 +1529,43 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     } catch (e) {
       state.step = 2;
       state.result = { ok: false, detail: errMessage(e) };
-      draw();
+      paint();
+      // A failed job left the pool page showing the pre-replace topology
+      // until its next poll (MINOR 7) — refresh it the same way a
+      // successful replace does.
+      if (onDone) onDone(state.job);
       return;
     }
+    if (!win.isConnected) return;
     const s = state.job.status;
     if (s === 'running' || s === 'queued') {
-      draw();
+      try {
+        const r = await screen.nas('tentaNasPoolGetRequest', { name: pool.name });
+        const scan = r.pool?.scan || null;
+        if (resilverActive(scan)) {
+          state.scan = scan;
+          state.step = 2;
+        }
+      } catch { /* the job decides; the rail only waits for the next tick */ }
+      if (!win.isConnected) return;
+      paint();
       state.timer = setTimeout(pollJob, POLL_JOB_MODAL_MS);
       return;
     }
     if (s !== 'succeeded' && s !== 'done') {
       state.step = 2;
       state.result = { ok: false, detail: state.job.error || T('jobs.status_' + s) };
-      draw();
+      paint();
+      if (onDone) onDone(state.job);
       return;
     }
     state.step = 2;
-    draw();
+    paint();
     await pollResilver();
   };
 
-  // The replace job returns once `zpool replace` is accepted; the resilver
-  // it starts is the pool's scan, so the last step reads `PoolGet` until
-  // that scan is no longer a running resilver.
+  // After the job, `PoolGet` is read until the scan is no longer a running
+  // resilver (a job without a follower, or one that returned early).
   const pollResilver = async () => {
     if (!win.isConnected) return;
     try {
@@ -1162,20 +1573,21 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
       state.scan = r.pool?.scan || {};
     } catch (e) {
       state.result = { ok: false, detail: errMessage(e) };
-      draw();
+      paint();
+      if (onDone) onDone(state.job);
       return;
     }
-    const active = state.scan.kind === 'resilver' && (state.scan.status === 'running' || state.scan.status === 'paused');
-    if (active) {
-      draw();
+    if (!win.isConnected) return;
+    if (resilverActive(state.scan)) {
+      paint();
       state.timer = setTimeout(pollResilver, POLL_JOB_MODAL_MS);
       return;
     }
     const failed = state.scan.kind === 'resilver' && Number(state.scan.errors) > 0;
     state.result = failed
       ? { ok: false, detail: T('pools.scrub_errors', { n: Number(state.scan.errors) || 0 }) }
-      : { ok: true, detail: T('replace.done_detail', { device: disk.name }) };
-    draw();
+      : { ok: true, detail: T('replace.done_detail', { device: oldDiskLabel }) };
+    paint();
     if (onDone) onDone(state.job);
   };
 
@@ -1183,7 +1595,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     if (state.timer) clearTimeout(state.timer);
     if (screen.openWindow === win) screen.openWindow = null;
   });
-  draw();
+  paint();
   document.body.appendChild(win);
   return win;
 }

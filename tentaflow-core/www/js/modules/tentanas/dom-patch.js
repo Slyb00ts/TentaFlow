@@ -155,3 +155,20 @@ export function paintStatCards(host, specs) {
   });
   return built;
 }
+
+// Writes a job log into its <pre> without disturbing the reader. A log only
+// grows while its job runs, so the new tail is APPENDED as a text node — the
+// text already on screen, and with it the scroll position of someone reading
+// an earlier line, is left alone. A reader parked at the bottom is kept at
+// the bottom so the tail stays in view. Anything but growth rewrites it.
+export function paintJobLog(pre, lines) {
+  if (!pre) return;
+  const text = (lines || []).join('\n');
+  const prev = pre.__tfLog ?? pre.textContent;
+  if (text === prev) return;
+  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  if (prev && text.startsWith(prev)) pre.appendChild(document.createTextNode(text.slice(prev.length)));
+  else pre.textContent = text;
+  pre.__tfLog = text;
+  if (atBottom) pre.scrollTop = pre.scrollHeight;
+}

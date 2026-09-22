@@ -6442,7 +6442,8 @@
         "target": "target",
         "approval": "zatwierdzenie",
         "elevation": "kanał uprawnień",
-        "node": "węzeł"
+        "node": "węzeł",
+        "elastic-array": "macierz Elastic"
       },
       "history": "Historia alertów"
     },
@@ -6632,7 +6633,12 @@
       "kind_snapshot_release": "Zdjęcie ochrony snapshotu",
       "kind_target_create": "Tworzenie targetu",
       "kind_target_update": "Zapis targetu",
-      "kind_target_delete": "Usuwanie targetu"
+      "kind_target_delete": "Usuwanie targetu",
+      "by_startup": "start węzła",
+      "by_scheduler": "harmonogram",
+      "by_unknown_account": "nieznane konto",
+      "subject_last_known": "ostatnio widziany jako {name}",
+      "smart_batch_refused": "Test SMART nie ruszył na {n} {n|dysku|dyskach|dyskach}: {disks}"
     },
     "elevation": {
       "title": "Kanał uprawnień systemowych",
@@ -6717,7 +6723,8 @@
       "other_nodes_hint": "Stan kanału uprawnień i funkcji na pozostałych węzłach",
       "arm_node": "Uzbrój…",
       "arm_node_title": "Uzbrój kanał uprawnień — {node} (tryb B)",
-      "armed_node": "Kanał na {node} uzbrojony"
+      "armed_node": "Kanał na węźle {node} uzbrojony",
+      "armed_node_unnamed": "Kanał na węźle bez nazwy uzbrojony"
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -6758,7 +6765,9 @@
       "remember_sub": "Węzeł przechowa hasło w RAM przez {ttl}, potem je wyzeruje.",
       "confirm": "Wykonaj",
       "arm_confirm": "Uzbrój kanał",
-      "ttl_info": "Po upływie {ttl} (lub wylogowaniu / restarcie) hasło jest czyszczone z pamięci i trzeba je podać ponownie."
+      "ttl_info": "Po upływie {ttl} (lub wylogowaniu / restarcie) hasło jest czyszczone z pamięci i trzeba je podać ponownie.",
+      "explain_remote_unnamed": "Hasło trafi do tego węzła bez nazwy zaszyfrowanym kanałem mesh. Po obu stronach żyje tylko w RAM i jest zerowane po użyciu — nigdy nie jest synchronizowane ani logowane.",
+      "password_label_unnamed": "Hasło sudo użytkownika {user} na węźle bez nazwy"
     },
     "setup": {
       "title": "Kanał uprawnień systemowych nie jest skonfigurowany",
@@ -6785,7 +6794,8 @@
       "probe_failed_title": "Nie udało się odczytać stanu węzła",
       "probe_failed_msg": "Sonda środowiska nie odpowiedziała: {error}",
       "probe_failed_hint": "Dopóki węzeł nie odpowie, panel nie wie, czy kanał uprawnień działa — dlatego nie pokazuje kafelków, które i tak zgłosiłyby ten sam błąd.",
-      "probe_retry": "Spróbuj ponownie"
+      "probe_retry": "Spróbuj ponownie",
+      "node_scope_unnamed": "Konfigurujesz kanał dla tego węzła bez nazwy — i tylko dla niego. Instalacja TentaNas objęła całą flotę, ale uprawnienia systemowe ustawia się osobno na każdym węźle."
     },
     "wizard": {
       "title": "Kanał uprawnień systemowych — {node}",
@@ -7099,7 +7109,12 @@
       "folders_pinned_note": "Foldery oznaczone „poza parity” zostają wyłącznie na cache, a SnapRAID nigdy nie obejmuje cache: ich pliki pozostają poza parity tak długo, jak trwa przypięcie.",
       "folder_cache_saved": "Zapisano politykę cache folderu.",
       "folder_cache_edit": "Zmień politykę cache",
-      "schedule_edit": "Edytuj harmonogram"
+      "schedule_edit": "Edytuj harmonogram",
+      "member_data": "dysk danych {n}",
+      "member_cache": "dysk cache",
+      "member_parity": "dysk parity {n}",
+      "disk_absent": "brak dysku",
+      "last_seen_as": "ostatnio widziany jako {name}"
     },
     "wizard_pool": {
       "elastic_data": "Dyski danych",
@@ -7232,7 +7247,8 @@
       "scrub_now": "Scrub teraz",
       "spare_hint": "Dysk hot-spare przejmuje rolę automatycznie przy awarii dysku w {pool}.",
       "spare_title": "Hot-spare puli {pool}",
-      "spare_sub": "{size} · hot-spare ({pool})"
+      "spare_sub": "{size} · hot-spare ({pool})",
+      "title_unnamed": "Pule na węźle bez nazwy"
     },
     "pool": {
       "scrub_now": "Scrub teraz",
@@ -7365,10 +7381,11 @@
       "nothing": "Ten dysk nie zgłasza żadnej sygnatury — nie ma czego usuwać.",
       "bad_plan": "Niepełna lub niespójna odpowiedź planu. Czyszczenie zablokowane.",
       "refused": "Węzeł odmawia wyczyszczenia tego dysku",
+      "refusal_journal_other_org": "{name}: dysk należy do macierzy Elastic innej organizacji na tym węźle. Ta organizacja nie może go wyczyścić ani przejąć tej macierzy.",
       "explain": "Przed zapisem węzeł otwiera urządzenie na wyłączność. Jądro odmawia takiego otwarcia, gdy dysk albo którakolwiek z jego partycji nosi system plików zamontowany w dowolnej przestrzeni montowań — także w prywatnej przestrzeni branchy macierzy Elastic, której nie widać ani w lsblk, ani w /proc/mounts. Tej odmowy nie da się wymusić: nie ma opcji wymuszenia i nie ma ponawiania.",
       "journal_title": "Rezerwacja dziennika macierzy Elastic",
       "journal_body": "Ten dysk był w macierzy {name} jako {role}. Macierz jest rozwiązana, ale węzeł zachował jej dziennik, więc import macierzy przywraca ją w całości — razem z {n} {n|dyskiem|dyskami|dyskami} z dziennika.",
-      "journal_foreign": "Dziennik należy do innej instancji ({org} / {addon}).",
+      "journal_foreign": "Właściciel zapisany w dzienniku: {owner}.",
       "journal_cost": "Czyszczenie usunie dziennik macierzy {name}; zniknie wtedy także rezerwacja jej nazwy i pozostałych dysków.",
       "journal_ack": "Rozumiem, że macierz {name} przestanie być odtwarzalna importem, i zwalniam rezerwację jej dziennika.",
       "retype": "Przepisz nazwę urządzenia, aby potwierdzić:",
@@ -7446,7 +7463,10 @@
       "retype": "Wpisz nazwę macierzy, aby potwierdzić:",
       "confirm": "Przejmij macierz",
       "done": "Macierz {name} została przejęta",
-      "reown_warning": "Dziennik wskazuje właściciela {owner}. Przejęcie przypisuje macierz tej instancji — od tej pory ona nią zarządza."
+      "reown_warning": "Właściciel zapisany w dzienniku: {owner}. Przejęcie przypisuje macierz tej instancji — od tej pory ona nią zarządza.",
+      "unnamed": "macierz bez nazwy",
+      "own_journal": "Dziennik już wskazuje tę instancję jako właściciela. Przejęcie tylko dopisuje macierz do jej bazy.",
+      "member_serial": "{part} (S/N {serial})"
     },
     "import": {
       "title": "Importuj pulę",
@@ -8026,7 +8046,8 @@
       "role_unsupported": "tylko dostęp do share'ów przez aplikacje",
       "severity_critical": "krytyczny",
       "severity_warning": "ostrzeżenie",
-      "severity_info": "informacja"
+      "severity_info": "informacja",
+      "act_array": "Macierz"
     },
     "node": {
       "head_sub_node": "węzeł {name}",
@@ -8034,7 +8055,8 @@
       "chip_ok": "Dyski OK",
       "badge_zfs": "OpenZFS {v}",
       "badge_channel": "Kanał uprawnień: {mode}",
-      "badge_ram": "{v} RAM"
+      "badge_ram": "{v} RAM",
+      "unnamed": "Węzeł bez nazwy"
     },
     "tiering": {
       "title": "Tiering i cache zapisu",
@@ -8061,7 +8083,7 @@
       "l2arc_none": "brak",
       "unavailable": "Moduł ZFS nie raportuje statystyk ARC na tym węźle",
       "settings_title": "Ustawienia ZFS węzła",
-      "settings_hint": "Parametry modułu ZFS na {node} ({ram} RAM)",
+      "settings_hint": "Parametry modułu ZFS na węźle {node} ({ram} RAM)",
       "slider_name": "Cache w RAM (ARC) — limit",
       "slider_desc": "Ile pamięci węzła może zająć cache odczytu ZFS (zfs_arc_max).",
       "slider_value": "{pct}% = {size}",
@@ -8071,7 +8093,8 @@
       "warning": "Większy ARC = szybsze odczyty, ale mniej RAM dla pozostałych usług węzła (np. ML Studio). Zmiana wymaga zapisu parametru modułu przez kanał uprawnień.",
       "apply": "Zastosuj",
       "applied": "Limit ARC zapisany",
-      "l2arc_add": "dodaj do {pool}"
+      "l2arc_add": "dodaj do {pool}",
+      "settings_hint_unnamed": "Parametry modułu ZFS na węźle bez nazwy ({ram} RAM)"
     },
     "approvals": {
       "title": "Oczekujące na zatwierdzenie",
@@ -8377,7 +8400,14 @@
       "portal_moves": "Portal przeniesie się z {from} na {to}. Initiatory zalogowane na starym adresie stracą ścieżkę — stary portal przestaje nasłuchiwać.",
       "portal_interface_gone": "Interfejs {iface} nie ma już na tym węźle adresu, który portal mógłby związać. Zmiany zapiszesz, ale portal zostaje tam, gdzie był — przenieść go można dopiero po wybraniu innego interfejsu.",
       "portal_drifted": "Portal tego targetu jest na {from}, a interfejs {iface} ma teraz {to}. Target czeka zamrożony — możesz zapisać zmiany bez ruszania portalu albo przenieść go tutaj.",
-      "portal_move_confirm": "Przenieś portal na {to} — initiatory zalogowane na starym adresie stracą ścieżkę"
+      "portal_move_confirm": "Przenieś portal na {to} — initiatory zalogowane na starym adresie stracą ścieżkę",
+      "iqn_host_unknown": "‹nazwa hosta węzła›"
+    },
+    "journal_owner": {
+      "this_instance": "ta instancja TentaNas",
+      "this_org": "inna instancja TentaNas tej organizacji",
+      "this_org_named": "instancja „{name}” tej organizacji",
+      "other_installation": "inna instalacja TentaNas"
     }
   },
   "agent_accounts": {

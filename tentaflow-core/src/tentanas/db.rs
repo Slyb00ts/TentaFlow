@@ -799,6 +799,20 @@ pub fn disk_row(pool: &DbPool, disk_id: &str) -> Result<Option<DiskRow>> {
         .optional()?)
 }
 
+/// The kernel name a disk was last seen under, kept after it leaves the live
+/// inventory. `None` for a disk never recorded, or recorded without a name.
+pub fn disk_last_name(pool: &DbPool, disk_id: &str) -> Result<Option<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT name FROM nas_disks WHERE disk_id = ?1",
+            params![disk_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .filter(|name| !name.is_empty()))
+}
+
 pub fn store_smart(
     pool: &DbPool,
     disk_id: &str,
@@ -1144,6 +1158,9 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasJob> {
         } else {
             log.lines().map(str::to_string).collect()
         },
+        // Stored subjects are what the job was spawned on; whether a shown
+        // name is only remembered is decided on the way out (`name_jobs`).
+        subject_last_known: false,
     })
 }
 
@@ -2985,16 +3002,20 @@ pub fn elastic_array_identities(pool: &DbPool) -> Result<Vec<(String, String)>> 
 /// with a sentence naming the disk rather than surface as a raw SQL error.
 ///
 /// The array arrives `active` — it is complete, its disks are verified and its
-/// union may well be serving already — carrying the reason it arrived with in
-/// `state_detail`, the way an imported target row does.
-pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, previous: &ElasticOwner,
-    started_by: &str) -> Result<()> {
+/// union may well be serving already — with an EMPTY `state_detail`: the
+/// Elastic card and the detail screen print that column as text, and an
+/// adopted array's origin used to be written there as the previous owner's
+/// org/addon ids — machine ids on screen, and possibly another tenant's. The
+/// job row already says the array was adopted (its kind is `elastic_import`),
+/// and who it was taken from is the node's log (`elastic::import_apply`), not
+/// anything this database shows.
+pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, started_by: &str) -> Result<()> {
     spec.validate()?;
     let at = now();
-    let detail = format!(
-        "adopted from owner {}/{}: the journal and the disks of this array were already on \
-         this node and this instance had no record of it",
-        previous.org_id, previous.addon_id);
+    // The job's one log line: what happened, without an owner. The job-log
+    // window and the job row's sub-text both print it.
+    let job_log = "the journal and the disks of this array were already on this node and this \
+         instance had no record of it; the journal now names this instance as the owner";
     let mut conn = write(pool)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let closing: bool = tx.query_row(
@@ -3026,12 +3047,12 @@ pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, previous: &Elasti
     tx.execute("INSERT INTO nas_jobs
         (job_id,kind,subject,status,progress_pct,started_by,started_at,finished_at,log)
         VALUES (?1,'elastic_import',?2,'succeeded',100,?3,?4,?4,?5)",
-        params![job_id,spec.name,started_by,at,detail])?;
+        params![job_id,spec.name,started_by,at,job_log])?;
     tx.execute("INSERT INTO nas_elastic_arrays
         (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
-        VALUES (?1,?2,?3,?4,?5,'active',?6,?7,?7)",
+        VALUES (?1,?2,?3,?4,?5,'active','',?6,?6)",
         params![spec.array_id,spec.owner.org_id,spec.owner.addon_id,spec.name,
-            spec.filesystem.as_str(),detail,at])?;
+            spec.filesystem.as_str(),at])?;
     insert_elastic_disks(&tx, spec)?;
     // The origin operation (migration 14): `elastic_spec` reads the persisted
     // intention from it, so an adopted array without this row could not be
@@ -4906,7 +4927,7 @@ mod tests {
             bytes: 32 * 1024 * 1024 * 1024, expected_uuid: uuid::Uuid::new_v4().to_string(),
         });
 
-        elastic_import(&pool, &spec, &previous_owner(), "admin").unwrap();
+        elastic_import(&pool, &spec, "admin").unwrap();
 
         // The row belongs to THIS addon, not to the owner the journal carried.
         let (org, addon, state, detail): (String, String, String, String) = pool.read().unwrap().query_row(
@@ -4914,9 +4935,10 @@ mod tests {
             params![spec.array_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
         assert_eq!((org.as_str(), addon.as_str()), ("org-default", "tentanas-8dd19dc4"));
         assert_eq!(state, "active");
-        // An imported row keeps the reason it arrived with, and that reason
-        // names where it came from.
-        assert!(detail.contains("adopted from owner orgtentanas-rig11/addontentanas"), "{detail}");
+        // The state detail is printed as text on the Elastic card and the
+        // detail screen, so an adoption leaves it empty rather than write the
+        // previous owner's ids there (MAJOR A, 2026-09-22).
+        assert_eq!(detail, "", "an adopted array's state names nobody");
 
         // Nothing is readable without the origin operation row, so the read
         // back is what proves the adoption is a whole array and not a header.
@@ -4943,6 +4965,35 @@ mod tests {
         );
     }
 
+    /// MAJOR A of 2026-09-22: the array's state detail (the Elastic card's
+    /// reason line and the detail screen's state row) and the job log (the
+    /// job row's sub-text and the job-log window) are all printed as text. An
+    /// adoption writes no owner id into any of them — neither the owner it
+    /// was taken from, which may be another installation's tenant, nor the
+    /// adopting one. The audit of who it came from is the server log.
+    #[test]
+    fn an_adoption_writes_no_owner_id_into_the_array_state_or_the_job_log() {
+        let pool = pool();
+        let mut spec = super::super::elastic::tests::create_spec("media");
+        spec.owner = ElasticOwner { org_id: "org-adopting-7f3a".into(), addon_id: "tentanas-adopting-91c2".into() };
+
+        elastic_import(&pool, &spec, "admin").unwrap();
+
+        let conn = pool.read().unwrap();
+        let detail: String = conn.query_row(
+            "SELECT state_detail FROM nas_elastic_arrays WHERE array_id=?1",
+            params![spec.array_id], |r| r.get(0)).unwrap();
+        let log: String = conn.query_row(
+            "SELECT log FROM nas_jobs WHERE kind='elastic_import'", [], |r| r.get(0)).unwrap();
+        assert_eq!(detail, "", "the state line stays empty");
+        assert!(!log.is_empty(), "the job still says what happened");
+        let previous = previous_owner();
+        for id in [&spec.owner.org_id, &spec.owner.addon_id, &previous.org_id, &previous.addon_id] {
+            assert!(!log.contains(id.as_str()), "the job log names no owner id ({id}): {log}");
+        }
+        assert!(!log.contains("from owner"), "nor a previous owner at all: {log}");
+    }
+
     #[test]
     fn an_adoption_that_collides_refuses_in_words_and_writes_nothing() {
         let pool = pool();
@@ -4955,7 +5006,7 @@ mod tests {
             rows("nas_elastic_disk_aliases"), rows("nas_jobs"));
 
         // Same array, offered a second time.
-        let again = elastic_import(&pool, &created, &previous_owner(), "admin").unwrap_err().to_string();
+        let again = elastic_import(&pool, &created, "admin").unwrap_err().to_string();
         assert!(again.contains("już zapisana w tej instancji"), "{again}");
 
         // A different array that wants a disk this one already holds. The
@@ -4963,19 +5014,19 @@ mod tests {
         // pre-check is that the admin is told WHICH disk.
         let mut overlapping = super::super::elastic::tests::create_spec("archiwum");
         overlapping.data[0] = created.data[0].clone();
-        let taken = elastic_import(&pool, &overlapping, &previous_owner(), "admin").unwrap_err().to_string();
+        let taken = elastic_import(&pool, &overlapping, "admin").unwrap_err().to_string();
         assert!(taken.contains(&created.data[0].disk_id), "the refusal names the disk: {taken}");
 
         // Only the filesystem UUID is shared: still a refusal, because that
         // UUID is the identity a second array must not be able to claim.
         let mut same_uuid = super::super::elastic::tests::create_spec("archiwum");
         same_uuid.data[0].expected_uuid = created.data[0].expected_uuid.clone();
-        assert!(elastic_import(&pool, &same_uuid, &previous_owner(), "admin").is_err());
+        assert!(elastic_import(&pool, &same_uuid, "admin").is_err());
 
         // A different array whose NAME is taken.
         let mut renamed = super::super::elastic::tests::create_spec("produkt");
         renamed.owner = previous_owner();
-        let name = elastic_import(&pool, &renamed, &previous_owner(), "admin").unwrap_err().to_string();
+        let name = elastic_import(&pool, &renamed, "admin").unwrap_err().to_string();
         assert!(name.contains("Nazwa macierzy jest już zajęta"), "{name}");
 
         assert_eq!(
@@ -7731,6 +7782,7 @@ mod tests {
             finished_at: None,
             error: None,
             log: vec![],
+            subject_last_known: false,
         };
         insert_job(&p, &j, None).unwrap();
         append_job_log(&p, "j1", "first").unwrap();

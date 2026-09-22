@@ -5232,7 +5232,12 @@
       "kind_snapshot_release": "Levée de la protection d'un snapshot",
       "kind_target_create": "Creation d'une cible",
       "kind_target_update": "Enregistrement d'une cible",
-      "kind_target_delete": "Suppression d'une cible"
+      "kind_target_delete": "Suppression d'une cible",
+      "by_startup": "démarrage du nœud",
+      "by_scheduler": "planificateur",
+      "by_unknown_account": "compte inconnu",
+      "subject_last_known": "vu pour la dernière fois comme {name}",
+      "smart_batch_refused": "Test SMART non lancé sur {n} {n|disque|disques|disques} : {disks}"
     },
     "danger": {
       "retype": "Saisissez {name} pour confirmer :",
@@ -5439,7 +5444,12 @@
       "folders_pinned_note": "Les dossiers marqués „hors parité” restent uniquement sur le cache, et SnapRAID ne couvre jamais le cache : leurs fichiers restent hors parité aussi longtemps que l'épinglage dure.",
       "folder_cache_saved": "La politique de cache du dossier a été enregistrée.",
       "folder_cache_edit": "Modifier la politique de cache",
-      "schedule_edit": "Modifier la planification"
+      "schedule_edit": "Modifier la planification",
+      "member_data": "disque de données {n}",
+      "member_cache": "disque de cache",
+      "member_parity": "disque de parité {n}",
+      "disk_absent": "disque absent",
+      "last_seen_as": "vu pour la dernière fois comme {name}"
     },
     "wizard_pool": {
       "elastic_data": "Disques de données",
@@ -5572,7 +5582,8 @@
       "scrub_now": "Scrub maintenant",
       "spare_hint": "Un disque hot-spare prend le relais automatiquement en cas de panne d’un disque de {pool}.",
       "spare_title": "Hot-spare du pool {pool}",
-      "spare_sub": "{size} · hot-spare ({pool})"
+      "spare_sub": "{size} · hot-spare ({pool})",
+      "title_unnamed": "Pools sur un nœud sans nom"
     },
     "pool": {
       "scrub_now": "Scrub maintenant",
@@ -5705,10 +5716,11 @@
       "nothing": "Ce disque ne signale aucune signature : il n'y a rien à supprimer.",
       "bad_plan": "Réponse du plan incomplète ou incohérente. Effacement bloqué.",
       "refused": "Le nœud refuse d'effacer ce disque",
+      "refusal_journal_other_org": "{name} appartient à une matrice Elastic d'une autre organisation de ce nœud. Cette organisation ne peut ni effacer le disque ni adopter cette matrice.",
       "explain": "Avant toute écriture, le nœud ouvre le périphérique en mode exclusif. Le noyau refuse cette ouverture dès que le disque, ou l'une de ses partitions, porte un système de fichiers monté dans n'importe quel espace de noms de montage — y compris l'espace privé des branches d'un Elastic Array, invisible dans lsblk comme dans /proc/mounts. Ce refus ne peut pas être forcé : il n'y a ni option de forçage ni nouvelle tentative.",
       "journal_title": "Réservation du journal d'un Elastic Array",
       "journal_body": "Ce disque faisait partie de la matrice {name} en tant que {role}. La matrice est dissoute, mais le nœud a conservé son journal : l'import de matrice la ramène entière, avec les {n} {n|disque|disques} que le journal recense.",
-      "journal_foreign": "Le journal appartient à une autre instance ({org} / {addon}).",
+      "journal_foreign": "Propriétaire enregistré dans le journal : {owner}.",
       "journal_cost": "L'effacement supprime le journal de la matrice {name} ; la réservation de son nom et de ses autres disques disparaît avec lui.",
       "journal_ack": "Je comprends que la matrice {name} ne sera plus récupérable par import, et je libère la réservation de son journal.",
       "retype": "Ressaisissez le nom du périphérique pour confirmer :",
@@ -5786,7 +5798,10 @@
       "retype": "Saisissez le nom de la matrice pour confirmer :",
       "confirm": "Adopter la matrice",
       "done": "La matrice {name} a été adoptée",
-      "reown_warning": "Le journal désigne {owner} comme propriétaire. L’adoption attribue la matrice à cette instance, qui la gère ensuite."
+      "reown_warning": "Le journal désigne {owner} comme propriétaire. L’adoption attribue la matrice à cette instance, qui la gère ensuite.",
+      "unnamed": "matrice sans nom",
+      "own_journal": "Le journal désigne déjà cette instance comme propriétaire. La reprise ajoute seulement la matrice à sa base de données.",
+      "member_serial": "{part} (N° de série {serial})"
     },
     "import": {
       "title": "Importer un pool",
@@ -6428,7 +6443,8 @@
         "target": "cible",
         "approval": "approbation",
         "elevation": "canal de privilèges",
-        "node": "nœud"
+        "node": "nœud",
+        "elastic-array": "matrice Elastic"
       },
       "history": "Historique des alertes"
     },
@@ -6637,7 +6653,8 @@
       "other_nodes_hint": "État du canal de privilèges et des fonctions sur les autres nœuds",
       "arm_node": "Armer…",
       "arm_node_title": "Armer le canal de privilèges — {node} (mode B)",
-      "armed_node": "Canal de {node} armé"
+      "armed_node": "Canal de {node} armé",
+      "armed_node_unnamed": "Canal du nœud sans nom armé"
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -6678,7 +6695,9 @@
       "remember_sub": "Le nœud garde le mot de passe en RAM pendant {ttl}, puis l'efface.",
       "confirm": "Exécuter",
       "arm_confirm": "Armer le canal",
-      "ttl_info": "Au bout de {ttl} (ou à la déconnexion / au redémarrage), le mot de passe est effacé de la mémoire et doit être saisi à nouveau."
+      "ttl_info": "Au bout de {ttl} (ou à la déconnexion / au redémarrage), le mot de passe est effacé de la mémoire et doit être saisi à nouveau.",
+      "explain_remote_unnamed": "Le mot de passe voyage vers ce nœud sans nom par le maillage chiffré. Des deux côtés il ne vit qu'en RAM et est effacé après usage — il n'est jamais synchronisé ni journalisé.",
+      "password_label_unnamed": "Mot de passe sudo de {user} sur le nœud sans nom"
     },
     "setup": {
       "title": "Le canal de privilèges système n'est pas configuré",
@@ -6705,7 +6724,8 @@
       "probe_failed_title": "Impossible de lire l'état de ce nœud",
       "probe_failed_msg": "La sonde d'environnement n'a pas répondu : {error}",
       "probe_failed_hint": "Tant que le nœud ne répond pas, le panneau ignore si le canal de privilèges fonctionne — il n'affiche donc pas de tuiles qui signaleraient toutes la même erreur.",
-      "probe_retry": "Réessayer"
+      "probe_retry": "Réessayer",
+      "node_scope_unnamed": "Vous configurez le canal pour ce nœud sans nom — et pour lui seul. L'installation de TentaNas a couvert toute la flotte, mais les privilèges système se configurent séparément sur chaque nœud."
     },
     "refreshed": "dernière actualisation {t}",
     "duration": {
@@ -6759,7 +6779,8 @@
       "role_unsupported": "accès aux partages via les applications uniquement",
       "severity_critical": "critique",
       "severity_warning": "avertissement",
-      "severity_info": "information"
+      "severity_info": "information",
+      "act_array": "Matrice"
     },
     "node": {
       "head_sub_node": "nœud {name}",
@@ -6767,7 +6788,8 @@
       "chip_ok": "Disques OK",
       "badge_zfs": "OpenZFS {v}",
       "badge_channel": "Canal de privilèges : {mode}",
-      "badge_ram": "{v} RAM"
+      "badge_ram": "{v} RAM",
+      "unnamed": "Nœud sans nom"
     },
     "tiering": {
       "title": "Tiering et cache d’écriture",
@@ -6804,7 +6826,8 @@
       "warning": "Un ARC plus grand accélère les lectures mais laisse moins de RAM aux autres services du nœud (p. ex. ML Studio). La modification écrit un paramètre du module via le canal de privilèges.",
       "apply": "Appliquer",
       "applied": "Limite ARC enregistrée",
-      "l2arc_add": "ajoutez-en à {pool}"
+      "l2arc_add": "ajoutez-en à {pool}",
+      "settings_hint_unnamed": "Paramètres du module ZFS sur un nœud sans nom ({ram} de RAM)"
     },
     "approvals": {
       "title": "En attente de validation",
@@ -7110,7 +7133,14 @@
       "portal_moves": "Le portail passe de {from} à {to}. Les initiateurs connectés sur l'ancienne adresse perdent leur chemin — l'ancien portail cesse d'écouter.",
       "portal_interface_gone": "L'interface {iface} n'a plus sur ce nœud d'adresse qu'un portail puisse lier. Tu peux quand même enregistrer tes modifications ; le portail reste où il était, et le déplacer suppose de choisir une autre interface.",
       "portal_drifted": "Le portail de cette cible est sur {from}, et l'interface {iface} a maintenant {to}. La cible est gelée et en attente : tu peux enregistrer tes modifications sans toucher au portail, ou le déplacer ici.",
-      "portal_move_confirm": "Déplacer le portail vers {to} — les initiateurs sur l'ancienne adresse perdent leur chemin"
+      "portal_move_confirm": "Déplacer le portail vers {to} — les initiateurs sur l'ancienne adresse perdent leur chemin",
+      "iqn_host_unknown": "‹nom d'hôte du nœud›"
+    },
+    "journal_owner": {
+      "this_instance": "cette instance TentaNas",
+      "this_org": "une autre instance TentaNas de cette organisation",
+      "this_org_named": "l'instance « {name} » de cette organisation",
+      "other_installation": "une autre installation TentaNas"
     }
   },
   "agent_accounts": {

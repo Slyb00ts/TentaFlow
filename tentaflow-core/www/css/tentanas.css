@@ -389,6 +389,9 @@
 .nas-root .disk-cell.empty:hover { border-color: var(--accent-1); }
 .nas-root .disk-cell.empty .icon { color: var(--accent-1); }
 .nas-root .disk-cell.faulted { border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); background: color-mix(in srgb, var(--danger) 8%, var(--bg-card)); }
+/* n06:226 — a disk whose SMART health warns (sdd, "realokacje") keeps its
+   ONLINE leaf but gets the amber edge; pool-detail.js `diskCondition` sets it. */
+.nas-root .disk-cell.warn { border-color: color-mix(in srgb, var(--warning) 50%, var(--border)); }
 .nas-root .disk-cell.resilver { border-color: color-mix(in srgb, var(--accent-1) 60%, var(--border)); }
 .nas-root .disk-cell.resilver > .icon { color: var(--accent-1); animation: nas-spin 1.4s linear infinite; }
 .nas-root .disk-cell.spare { border-style: dashed; }

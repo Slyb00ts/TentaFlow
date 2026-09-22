@@ -108,6 +108,7 @@ impl JobHandle {
                 finished_at: None,
                 error: None,
                 log: Vec::new(),
+                subject_last_known: false,
             },
             None,
         );
@@ -299,6 +300,7 @@ where
         finished_at: None,
         error: None,
         log: Vec::new(),
+        subject_last_known: false,
     };
     // `intent.is_none()` alone made the one IRREVERSIBLE job of this family the
     // only cancellable one: a disk wipe carries no elastic intent, so it got a

@@ -17,7 +17,7 @@ const {
   openTargetWizard, targetNameValid, parseSize, transportOptions, transportsOf,
   sharedWithoutAuth, AUTH_METHODS, defaultTransport, defaultMethod, parseHostNqns, WWN_AUTHORITY,
   primaryAddress, sharedHostTargets, sharedHostNqns, sharedHostNeighbours, sharedHostWarning,
-  authenticates, bindableAddresses, ALL_INTERFACES_ADDRESS, invalidHostNqns,
+  authenticates, bindableAddresses, ALL_INTERFACES_ADDRESS, invalidHostNqns, iqnHostPart,
 } = await import('./target-wizard.js');
 
 const { parseInitiators } = await import('./targets.js');
@@ -32,6 +32,8 @@ const caps = (over = {}) => ({
   nvmetDetail: '',
   rdmaDetail: '',
   dhchapDetail: '',
+  // The node's own IQN host segment (`targets::wwn_host` on the server).
+  wwnHost: 'orion',
   interfaces: [
     // The LAN comes first on purpose: the wizard must still start on the
     // dedicated one (§5.5b), not on whatever the node listed first.
@@ -749,22 +751,9 @@ test('editing an NVMe-oF subsystem sends the host NQNs the admin just typed', as
   screen.dispose();
 });
 
-test('the step-3 IQN preview derives the same WWN the node would create', async () => {
-  // The authority is a constant in tentanas/targets.rs and this file carries a
-  // copy, because step 3 previews the WWN of a target that does not exist yet.
-  // Pinning the CONSTANT is not enough: the preview also sanitises the node
-  // name, and the two implementations do it differently (`to_ascii_lowercase`
-  // + an ASCII filter over there, `.toLowerCase()` + a regex here). A node
-  // called `Helios_02.lan` is exactly where those two can disagree.
-  //
-  // So this asserts the whole derived string against a literal, and
-  // `the_wizard_previews_the_wwn_with_this_module_s_own_naming_authority` in
-  // targets.rs asserts `wwn_for` against THE SAME literal. Either side
-  // drifting fails one of them.
-  assert.equal(WWN_AUTHORITY, '2026-09.local.tentaflow');
-  const screen = fakeScreen({});
-  screen.currentNode = () => ({ nodeId: 'n1', nodeName: 'Helios_02.lan', isLocal: true });
-  const win = openTargetWizard(screen, { capabilities: caps() });
+// Walks a fresh wizard to its step-3 summary and returns the previewed WWN.
+async function previewedWwn(screen, capabilities) {
+  const win = openTargetWizard(screen, { capabilities });
   await flush();
   typeInto(win.querySelector('#nas-tw-name'), 'vm-store');
   await flush();
@@ -777,11 +766,47 @@ test('the step-3 IQN preview derives the same WWN the node would create', async 
   await flush();
   click(nextButton(win));
   await flush();
-  assert.equal(
-    win.querySelector('#nas-tw-sum-wwn').textContent,
-    'iqn.2026-09.local.tentaflow:helios02lan.vm-store'
-  );
+  return { win, wwn: win.querySelector('#nas-tw-sum-wwn').textContent };
+}
+
+test('the step-3 IQN preview prints the host segment the node itself sends, not the fleet name', async () => {
+  // The authority is a constant in tentanas/targets.rs and this file carries a
+  // copy (pinned by `the_wizard_previews_the_wwn_with_this_module_s_own_naming_authority`
+  // there). The HOST segment is not derived here at all: the node sends
+  // `wwnHost`, computed by `targets::wwn_host` — the function `wwn_for` names
+  // the real target with. The fleet display name is an admin-editable label
+  // and must not leak into the identity, so the two differ in this fixture.
+  assert.equal(WWN_AUTHORITY, '2026-09.local.tentaflow');
+  const screen = fakeScreen({});
+  screen.currentNode = () => ({ nodeId: 'n1', nodeName: 'Magazyn główny', isLocal: true });
+  const { wwn } = await previewedWwn(screen, caps({ wwnHost: 'helios02lan' }));
+  assert.equal(wwn, 'iqn.2026-09.local.tentaflow:helios02lan.vm-store');
   screen.dispose();
+});
+
+// The owner's rules: an IQN/NQN is a MACHINE identity, so the preview never
+// shows one the node will not create, and never a slice of the node id. When
+// the node does not say (an older node without `wwnHost`, or a hostname that
+// sanitises to nothing — the server then refuses the create), the preview
+// says so with a placeholder.
+test('iqnHostPart is the node\'s own wwnHost and nothing else', () => {
+  assert.equal(iqnHostPart({ wwnHost: 'helios02lan' }), 'helios02lan');
+  assert.equal(iqnHostPart({ wwnHost: '' }), '');
+  assert.equal(iqnHostPart({}), '', 'an older node that does not send it');
+  assert.equal(iqnHostPart(null), '');
+});
+
+test('the step-3 IQN preview shows a placeholder, never the node id or a guess, when the node sends no host segment', async () => {
+  const nodeId = 'ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100';
+  for (const capabilities of [caps({ wwnHost: '' }), caps({ wwnHost: undefined })]) {
+    const screen = fakeScreen({});
+    screen.currentNode = () => ({ nodeId, nodeName: 'orion', isLocal: true });
+    const { wwn } = await previewedWwn(screen, capabilities);
+    assert.equal(wwn, 'iqn.2026-09.local.tentaflow:‹nazwa hosta węzła›.vm-store');
+    assert.ok(!wwn.includes(nodeId.slice(0, 12)), 'no slice of the node id');
+    assert.ok(!wwn.includes(':orion.'), 'no guess from the fleet name either');
+    screen.dispose();
+  }
 });
 
 test('§5.5a: RDMA is the starting transport when the probe found it on the chosen interface', () => {

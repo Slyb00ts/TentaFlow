@@ -85,6 +85,22 @@ test('the chips navigate: snapshots to the pool\'s Snapshoty tab for that datase
   screen.dispose();
 });
 
+// M12 (critic n01-n10): `tf-progress-bar`'s allowlist is
+// accent/success/warning/danger — 'critical' is not in it and silently falls
+// back to the neutral accent (blue), so a >90% dataset never looked full.
+test('a dataset over 90% usage draws the bar with the danger tone, not the invalid "critical"', async () => {
+  const full = ds('tank/full', { usedBytes: 95 * GB, availableBytes: 5 * GB });
+  const screen = fakeScreen({ tentaNasDatasetsListRequest: { datasets: [ds('tank'), full] }, tentaNasSharesListRequest: { shares: [] } });
+  const host = mount();
+  await drawDatasets(screen, host, { pool: 'tank' });
+  await flush();
+  const table = host.querySelector('#nas-ds-table');
+  const row = table.rows.find((r) => r._ds.name === 'tank/full');
+  assert.match(row.usage, /tone="danger"/, 'tf-progress-bar only accepts danger, not "critical"');
+  assert.doesNotMatch(row.usage, /tone="critical"/);
+  screen.dispose();
+});
+
 test('a viewer gets no create buttons and no row actions', async () => {
   const screen = fakeScreen(fixtures(), { admin: false });
   const host = mount();

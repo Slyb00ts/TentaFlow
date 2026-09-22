@@ -5232,7 +5232,12 @@
       "kind_snapshot_release": "Aufheben des Snapshot-Schutzes",
       "kind_target_create": "Target wird angelegt",
       "kind_target_update": "Target wird gespeichert",
-      "kind_target_delete": "Target wird geloescht"
+      "kind_target_delete": "Target wird gelöscht",
+      "by_startup": "Knotenstart",
+      "by_scheduler": "Zeitplan",
+      "by_unknown_account": "unbekanntes Konto",
+      "subject_last_known": "zuletzt gesehen als {name}",
+      "smart_batch_refused": "SMART-Test auf {n} {n|Laufwerk|Laufwerken|Laufwerken} nicht gestartet: {disks}"
     },
     "danger": {
       "retype": "Zur Bestätigung {name} eingeben:",
@@ -5439,7 +5444,12 @@
       "folders_pinned_note": "Ordner mit der Markierung „außerhalb der Parität” bleiben ausschließlich auf dem Cache, und SnapRAID deckt den Cache nie ab: ihre Dateien bleiben so lange außerhalb der Parität, wie die Anheftung besteht.",
       "folder_cache_saved": "Die Cache-Richtlinie des Ordners wurde gespeichert.",
       "folder_cache_edit": "Cache-Richtlinie ändern",
-      "schedule_edit": "Zeitplan bearbeiten"
+      "schedule_edit": "Zeitplan bearbeiten",
+      "member_data": "Daten-Datenträger {n}",
+      "member_cache": "Cache-Datenträger",
+      "member_parity": "Paritätsdatenträger {n}",
+      "disk_absent": "Datenträger fehlt",
+      "last_seen_as": "zuletzt gesehen als {name}"
     },
     "wizard_pool": {
       "elastic_data": "Datenträger",
@@ -5572,7 +5582,8 @@
       "scrub_now": "Jetzt scrubben",
       "spare_hint": "Ein Hot-Spare-Laufwerk springt automatisch ein, wenn ein Laufwerk in {pool} ausfällt.",
       "spare_title": "Hot-Spare des Pools {pool}",
-      "spare_sub": "{size} · hot-spare ({pool})"
+      "spare_sub": "{size} · hot-spare ({pool})",
+      "title_unnamed": "Pools auf einem Knoten ohne Namen"
     },
     "pool": {
       "scrub_now": "Jetzt scrubben",
@@ -5705,10 +5716,11 @@
       "nothing": "Dieser Datenträger meldet keine Signatur — es gibt nichts zu entfernen.",
       "bad_plan": "Unvollständige oder widersprüchliche Planantwort. Löschen gesperrt.",
       "refused": "Der Knoten verweigert das Löschen dieses Datenträgers",
+      "refusal_journal_other_org": "{name} gehört zu einem Elastic Array einer anderen Organisation auf diesem Knoten. Diese Organisation kann den Datenträger weder löschen noch das Array übernehmen.",
       "explain": "Vor jedem Schreibvorgang öffnet der Knoten das Gerät exklusiv. Der Kernel verweigert dieses Öffnen, sobald der Datenträger oder eine seiner Partitionen ein Dateisystem trägt, das in irgendeinem Mount-Namespace eingehängt ist — auch im privaten Branch-Namespace eines Elastic Array, der weder in lsblk noch in /proc/mounts sichtbar ist. Diese Verweigerung lässt sich nicht erzwingen: es gibt kein Force-Flag und keinen Wiederholungsversuch.",
       "journal_title": "Journal-Reservierung eines Elastic Array",
       "journal_body": "Dieser Datenträger gehörte als {role} zum Array {name}. Das Array ist aufgelöst, der Knoten hat aber sein Journal behalten, sodass der Array-Import es vollständig zurückbringt — zusammen mit den {n} {n|Datenträger|Datenträgern} aus dem Journal.",
-      "journal_foreign": "Das Journal gehört einer anderen Instanz ({org} / {addon}).",
+      "journal_foreign": "Im Journal eingetragener Eigentümer: {owner}.",
       "journal_cost": "Das Löschen entfernt das Journal von Array {name}; damit entfällt auch die Reservierung seines Namens und seiner übrigen Datenträger.",
       "journal_ack": "Mir ist klar, dass Array {name} nicht mehr per Import wiederherstellbar ist, und ich gebe seine Journal-Reservierung frei.",
       "retype": "Gerätenamen zur Bestätigung erneut eingeben:",
@@ -5786,7 +5798,10 @@
       "retype": "Array-Namen zur Bestätigung eingeben:",
       "confirm": "Array übernehmen",
       "done": "Array {name} wurde übernommen",
-      "reown_warning": "Das Journal nennt {owner} als Eigentümer. Die Übernahme weist das Array dieser Instanz zu, die es danach verwaltet."
+      "reown_warning": "Das Journal nennt {owner} als Eigentümer. Die Übernahme weist das Array dieser Instanz zu, die es danach verwaltet.",
+      "unnamed": "Array ohne Namen",
+      "own_journal": "Das Journal nennt bereits diese Instanz als Eigentümer. Die Übernahme trägt das Array nur in ihre Datenbank ein.",
+      "member_serial": "{part} (S/N {serial})"
     },
     "import": {
       "title": "Pool importieren",
@@ -6428,7 +6443,8 @@
         "target": "Target",
         "approval": "Freigabe",
         "elevation": "Rechtekanal",
-        "node": "Knoten"
+        "node": "Knoten",
+        "elastic-array": "Elastic Array"
       },
       "history": "Warnungsverlauf"
     },
@@ -6637,7 +6653,8 @@
       "other_nodes_hint": "Zustand von Rechtekanal und Funktionen auf den übrigen Knoten",
       "arm_node": "Scharfschalten…",
       "arm_node_title": "Rechtekanal scharfschalten — {node} (Modus B)",
-      "armed_node": "Kanal auf {node} scharfgeschaltet"
+      "armed_node": "Kanal auf {node} scharfgeschaltet",
+      "armed_node_unnamed": "Kanal auf dem Knoten ohne Namen scharfgeschaltet"
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -6678,7 +6695,9 @@
       "remember_sub": "Der Knoten behält das Passwort {ttl} im RAM und nullt es danach.",
       "confirm": "Ausführen",
       "arm_confirm": "Kanal scharfschalten",
-      "ttl_info": "Nach {ttl} (oder beim Abmelden / Neustart) wird das Passwort aus dem Speicher gelöscht und muss erneut eingegeben werden."
+      "ttl_info": "Nach {ttl} (oder beim Abmelden / Neustart) wird das Passwort aus dem Speicher gelöscht und muss erneut eingegeben werden.",
+      "explain_remote_unnamed": "Das Passwort erreicht diesen Knoten ohne Namen über das verschlüsselte Mesh. Auf beiden Seiten lebt es nur im RAM und wird nach der Verwendung genullt — es wird nie synchronisiert oder protokolliert.",
+      "password_label_unnamed": "sudo-Passwort von {user} auf dem Knoten ohne Namen"
     },
     "setup": {
       "title": "Der Systemrechtekanal ist nicht eingerichtet",
@@ -6705,7 +6724,8 @@
       "probe_failed_title": "Der Zustand dieses Knotens konnte nicht gelesen werden",
       "probe_failed_msg": "Die Umgebungssonde hat nicht geantwortet: {error}",
       "probe_failed_hint": "Solange der Knoten nicht antwortet, weiß das Panel nicht, ob der Rechtekanal funktioniert — deshalb zeigt es keine Kacheln, die alle denselben Fehler melden würden.",
-      "probe_retry": "Erneut versuchen"
+      "probe_retry": "Erneut versuchen",
+      "node_scope_unnamed": "Du konfigurierst den Kanal für diesen Knoten ohne Namen — und nur für ihn. Die Installation von TentaNas umfasste die gesamte Flotte, aber die Systemrechte werden auf jedem Knoten separat eingerichtet."
     },
     "refreshed": "letzte Aktualisierung {t}",
     "duration": {
@@ -6759,7 +6779,8 @@
       "role_unsupported": "Freigabezugriff nur über Apps",
       "severity_critical": "kritisch",
       "severity_warning": "warnung",
-      "severity_info": "hinweis"
+      "severity_info": "hinweis",
+      "act_array": "Array"
     },
     "node": {
       "head_sub_node": "Knoten {name}",
@@ -6767,7 +6788,8 @@
       "chip_ok": "Festplatten OK",
       "badge_zfs": "OpenZFS {v}",
       "badge_channel": "Rechtekanal: {mode}",
-      "badge_ram": "{v} RAM"
+      "badge_ram": "{v} RAM",
+      "unnamed": "Knoten ohne Namen"
     },
     "tiering": {
       "title": "Tiering und Schreibcache",
@@ -6804,7 +6826,8 @@
       "warning": "Ein größerer ARC bedeutet schnellere Lesevorgänge, aber weniger RAM für die anderen Dienste des Knotens (z. B. ML Studio). Die Änderung schreibt einen Modulparameter über den Rechtekanal.",
       "apply": "Anwenden",
       "applied": "ARC-Limit gespeichert",
-      "l2arc_add": "zu {pool} hinzufügen"
+      "l2arc_add": "zu {pool} hinzufügen",
+      "settings_hint_unnamed": "ZFS-Modulparameter auf einem Knoten ohne Namen ({ram} RAM)"
     },
     "approvals": {
       "title": "Wartet auf Freigabe",
@@ -7110,7 +7133,14 @@
       "portal_moves": "Das Portal wechselt von {from} auf {to}. Initiatoren, die auf der alten Adresse angemeldet sind, verlieren ihren Pfad — das alte Portal hört auf zu lauschen.",
       "portal_interface_gone": "Die Schnittstelle {iface} hat auf diesem Knoten keine Adresse mehr, die ein Portal binden kann. Du kannst deine Änderungen trotzdem speichern; das Portal bleibt, wo es war — verschieben geht erst mit einer anderen Schnittstelle.",
       "portal_drifted": "Das Portal dieses Targets liegt auf {from}, und die Schnittstelle {iface} hat jetzt {to}. Das Target wartet eingefroren — du kannst deine Änderungen speichern, ohne das Portal anzufassen, oder es hier verschieben.",
-      "portal_move_confirm": "Portal auf {to} verschieben — Initiatoren auf der alten Adresse verlieren ihren Pfad"
+      "portal_move_confirm": "Portal auf {to} verschieben — Initiatoren auf der alten Adresse verlieren ihren Pfad",
+      "iqn_host_unknown": "‹Hostname des Knotens›"
+    },
+    "journal_owner": {
+      "this_instance": "diese TentaNas-Instanz",
+      "this_org": "eine andere TentaNas-Instanz dieser Organisation",
+      "this_org_named": "die Instanz „{name}“ dieser Organisation",
+      "other_installation": "eine andere TentaNas-Installation"
     }
   },
   "agent_accounts": {

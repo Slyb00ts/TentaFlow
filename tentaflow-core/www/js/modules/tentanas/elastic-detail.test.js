@@ -11,9 +11,13 @@ import { drawElasticDetail, elasticCapacity, elasticCardHtml, elasticState } fro
 import { fmtOptionalBytes, jobCanCancel } from './format.js';
 
 const GiB = 1024 ** 3;
-const disk = { diskId: 'serial-1', name: 'd1', device: '/dev/vdb', role: 'data', kind: 'hdd', filesystem: 'xfs', mountpoint: '/mnt/tentanas-branches/media/data/d1', sizeBytes: 32 * GiB, usedBytes: 0, freeBytes: 31 * GiB, mounted: true, devicePresent: true, health: 'unknown' };
+// `name` is the SLOT and `device` the by-uuid path the node mounts — the
+// production shapes (`db.rs` `elastic_arrays`). `diskName` is the kernel name
+// the node looked up in its inventory, and the only one the screen may show.
+const BY_UUID = '/dev/disk/by-uuid/2a7f1c30-9e64-4b8d-a5f2-71c3e806d914';
+const disk = { diskId: 'serial-1', name: 'd1', diskName: 'vdb', device: BY_UUID, role: 'data', kind: 'hdd', filesystem: 'xfs', mountpoint: '/mnt/tentanas-branches/media/data/d1', sizeBytes: 32 * GiB, usedBytes: 0, freeBytes: 31 * GiB, mounted: true, devicePresent: true, health: 'unknown' };
 function array(overrides = {}) {
-  return { name: 'media', kind: 'elastic-array', state: 'active', stateDetail: '', enabled: true, parityRunAvailable: true, filesystem: 'xfs', unionPath: '/mnt/media', createPolicy: 'mfs', dataDisks: [disk], parityDisks: [{ ...disk, diskId: 'serial-2', name: 'p1', mountpoint: '/mnt/tentanas-branches/media/parity/1' }], cacheDisks: [], usableBytes: 31 * GiB, usedBytes: 0, protection: { status: 'unknown', faultTolerance: null, movedUnsyncedBytes: null, protectedAsOf: '2026-09-07 12:00:00' }, snapraid: { parityErrors: null, configPath: '/etc/tentanas/snapraid-media.conf' }, updatedAt: '2026-09-07 12:01:00', ...overrides };
+  return { name: 'media', kind: 'elastic-array', state: 'active', stateDetail: '', enabled: true, parityRunAvailable: true, filesystem: 'xfs', unionPath: '/mnt/media', createPolicy: 'mfs', dataDisks: [disk], parityDisks: [{ ...disk, diskId: 'serial-2', name: 'parity1', diskName: 'vdc', index: 1, mountpoint: '/mnt/tentanas-branches/media/parity/1' }], cacheDisks: [], usableBytes: 31 * GiB, usedBytes: 0, protection: { status: 'unknown', faultTolerance: null, movedUnsyncedBytes: null, protectedAsOf: '2026-09-07 12:00:00' }, snapraid: { parityErrors: null, configPath: '/etc/tentanas/snapraid-media.conf' }, updatedAt: '2026-09-07 12:01:00', ...overrides };
 }
 
 async function mount(value, fixtures = {}, options) {
@@ -81,7 +85,13 @@ test('creating i needs_attention pochodzą z rzeczywistego kontraktu backendu', 
 test('detal ma prawdziwe role, ścieżki, null ochrony oraz działający link dysku i powrót', async () => {
   const { screen, body } = await mount(array());
   assert.match(body.textContent, /\/mnt\/media/);
-  assert.match(body.textContent, /\/dev\/vdb/);
+  // n11 names each disk by its kernel name. The slot and the filesystem UUID
+  // are keys, not names: the UUID path is the name's tooltip, never text.
+  const cells = [...body.querySelectorAll('.disk-cell[data-disk]')];
+  assert.deepEqual(cells.map((c) => c.querySelector('.dc-name').textContent.trim()), ['vdb', 'vdc']);
+  assert.doesNotMatch(body.textContent, /by-uuid|2a7f1c30/);
+  assert.equal(cells[0].querySelector('.dc-name [title]').getAttribute('title'), `${BY_UUID} · /mnt/tentanas-branches/media/data/d1`);
+  assert.equal(cells[0].querySelector('.disk-kind').textContent, 'HDD');
   assert.match(body.textContent, /Nowe dane poza sync—/);
   assert.match(body.textContent, /Błędy parity—/);
   assert.equal(body.querySelectorAll('.kpi tf-stat-card').length, 4);
@@ -999,7 +1009,11 @@ test('naprawa wymaga przepisania nazwy dysku i wysyła dokładnie jedno żądani
   assert.ok(confirm.hasAttribute('disabled'), 'przycisk startuje zablokowany');
   typeInto(win.querySelector('#nas-retype'), 'media');
   assert.ok(confirm.hasAttribute('disabled'), 'nazwa macierzy nie uzbraja naprawy dysku');
+  // The admin retypes the name on the cell. The slot is not it.
   typeInto(win.querySelector('#nas-retype'), 'd1');
+  assert.ok(confirm.hasAttribute('disabled'), 'the slot key does not arm the repair');
+  assert.match(win.textContent, /Przepisz nazwę dysku, aby potwierdzić: vdb/);
+  typeInto(win.querySelector('#nas-retype'), 'vdb');
   assert.equal(confirm.hasAttribute('disabled'), false);
   confirmWindow(win);
   await flush();
@@ -1079,6 +1093,61 @@ test('rozwiązanie obiecuje zachowanie danych, wymaga przepisania nazwy i wysył
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0].payload, { name: 'media', confirmName: 'media', sudoPassword: 'hunter2' });
   assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['job-kill']);
+  screen.dispose();
+});
+
+/// A member the helper found NO device for (`devicePresent: false`) arrives
+/// with no live name — that is what a failed or pulled disk looks like. The
+/// cell says the disk is missing and which member it was; every sentence names
+/// it by its part in the array; and no repair is offered on it, because
+/// "brak dysku" is nothing an admin can retype to confirm overwriting.
+test('członek bez nazwy z inwentarza jest „brakiem dysku” z rolą w macierzy, bez slotu i bez naprawy', async () => {
+  const lost = { ...disk, diskId: 'serial-9', name: 'd2', diskName: '', devicePresent: false, mounted: false, mountpoint: '/mnt/tentanas-branches/media/data/d2' };
+  const { screen, body } = await mount(array({ dataDisks: [disk, lost], snapraid: snapraidWith([failedScrub]) }), {
+    tentaNasElasticArrayDestroyRequest: { job: { jobId: 'job-kill', status: 'running' } },
+  });
+  const cell = body.querySelector('.disk-cell[data-branch="d2"]');
+  assert.equal(cell.querySelector('.dc-name').textContent.trim(), 'brak dysku');
+  assert.match(cell.textContent, /dysk danych 2/);
+  assert.doesNotMatch(cell.textContent, /\bd2\b/, 'the slot key is not printed');
+  assert.equal(Boolean(cell.querySelector('[data-act="fix"]')), false, 'no repair on a disk nobody can name');
+  // An absent data disk blocks the repair of the whole array, and the
+  // reason names the member by its part, not by a slot or an id.
+  assert.equal(body.querySelector('[data-act="fix"]'), null, 'no repair while a data disk is absent');
+  assert.match(body.textContent, /dysk danych 2/);
+  assert.equal(cell.querySelector('[data-act="disk"]').getAttribute('title'), 'Szczegóły dysku dysk danych 2');
+
+  click(body.querySelector('.danger-zone [data-act="destroy"]'));
+  await flush();
+  const win = document.querySelector('tf-window');
+  assert.match(win.textContent, /: vdb, dysk danych 2/, 'the dissolve list names disks, not slots');
+  win.remove();
+  screen.dispose();
+});
+
+/// The same cell said red "brak dysku" and "Obecny: tak" at once whenever no
+/// name reached it — right after a core start, before the inventory's first
+/// pass. Absence is the helper's `devicePresent === false` and nothing else;
+/// a present member without a live name is named by its part in the array,
+/// and a remembered name appears only on its own line, marked as last-known,
+/// never in the name's place.
+test('obecny członek bez nazwy nie jest „brakiem dysku”, a ostatnia znana nazwa jest oznaczona', async () => {
+  const unnamed = { ...disk, diskId: 'serial-8', name: 'd2', diskName: '', diskLastName: 'sdq', devicePresent: true, mountpoint: '/mnt/tentanas-branches/media/data/d2' };
+  const gone = { ...disk, diskId: 'serial-9', name: 'd3', diskName: '', diskLastName: 'sdr', devicePresent: false, mounted: false, mountpoint: '/mnt/tentanas-branches/media/data/d3' };
+  const { screen, body } = await mount(array({ dataDisks: [disk, unnamed, gone] }));
+  const present = body.querySelector('.disk-cell[data-branch="d2"]');
+  assert.equal(present.querySelector('.dc-name').textContent.trim(), 'dysk danych 2');
+  assert.doesNotMatch(present.textContent, /brak dysku/, 'present is not missing');
+  assert.equal(Boolean(present.querySelector('.dc-name .num-err')), false, 'no error styling on a present member');
+  assert.match(present.textContent, /Obecny: Tak/);
+  assert.equal(present.querySelector('[data-role="last-seen"]').textContent.trim(), 'ostatnio widziany jako sdq');
+  assert.notEqual(present.querySelector('.dc-name').textContent.trim(), 'sdq', 'the remembered name is never the name');
+  const missing = body.querySelector('.disk-cell[data-branch="d3"]');
+  assert.equal(missing.querySelector('.dc-name').textContent.trim(), 'brak dysku');
+  assert.equal(Boolean(missing.querySelector('.dc-name .num-err')), true);
+  assert.equal(missing.querySelector('[data-role="last-seen"]').textContent.trim(), 'ostatnio widziany jako sdr');
+  // A live name needs no "last seen" line.
+  assert.equal(body.querySelector('.disk-cell[data-branch="d1"] [data-role="last-seen"]'), null);
   screen.dispose();
 });
 

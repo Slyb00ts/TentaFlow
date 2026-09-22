@@ -298,6 +298,11 @@ pub struct JournalClaim {
     pub serving: Option<bool>,
 }
 
+/// The wipe refusal for a disk that another organisation of this node still
+/// claims through its Elastic journal. A code the dialog words in the admin's
+/// language, because the detail beside it is the node's sentence.
+pub const JOURNAL_OTHER_ORG: &str = "journal_other_org";
+
 fn refuse(code: &str, detail: String) -> NasDiskWipeRefusal {
     NasDiskWipeRefusal { code: code.to_string(), detail }
 }
@@ -369,6 +374,20 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         ));
     }
     let claim = journal.and_then(|journal| match journal.serving {
+        // Another tenant's array, served or dissolved alike: refused, and
+        // refused WITHOUT its name — the claim carries none by now
+        // (`journal_claim_of`). The owner's rule is that a tenant may not
+        // destroy what it may not adopt, and it may not adopt this.
+        _ if journal.claim.owner_kind == super::elastic::OWNER_KIND_OTHER_ORG_ON_NODE => {
+            refusals.push(refuse(
+                JOURNAL_OTHER_ORG,
+                format!(
+                    "{name}: dysk należy do macierzy Elastic innej organizacji na tym węźle — \
+                     ta organizacja nie może go wyczyścić ani przejąć"
+                ),
+            ));
+            None
+        }
         Some(true) => {
             refusals.push(refuse(
                 "journal_serving",
@@ -546,9 +565,23 @@ pub async fn wipe_job(
 /// Identity, never the device name: a journal records a member's WWN and
 /// serial, and matching on either is what makes the claim survive the kernel
 /// renaming the disk between two boots.
+///
+/// `current` is the instance asking. Whether the journal is somebody else's
+/// is decided HERE, against it — the dialog used to infer "foreign" from the
+/// owner ids merely being filled in, which they always are, and so called
+/// this instance's own dissolved arrays another instance's.
+///
+/// A journal of another organisation that lives on this node
+/// (`OWNER_KIND_OTHER_ORG_ON_NODE`, decided against `orgs_on_node`) is still
+/// returned — the disk IS claimed, and pretending otherwise would offer to
+/// erase another tenant's array — but as a claim that carries nothing but
+/// that code: no array id, no name, no role, no member count, no ids.
+/// `plan_wipe` turns it into a refusal that names no array.
 pub fn journal_claim_of(
     disk: &NasDisk,
     journals: &[tentanas_helper::elastic::ElasticJournalEntry],
+    current: &tentanas_helper::elastic::ElasticOwner,
+    orgs_on_node: &std::collections::BTreeSet<String>,
 ) -> Option<JournalClaim> {
     for entry in journals {
         let members = || {
@@ -573,14 +606,38 @@ pub fn journal_claim_of(
         }) else {
             continue;
         };
+        let foreign = entry.spec.owner != *current;
+        let kind = super::elastic::owner_kind(&entry.spec.owner, current, orgs_on_node);
+        if kind == super::elastic::OWNER_KIND_OTHER_ORG_ON_NODE {
+            // Blanked HERE, at the one place the journal is read for a wipe,
+            // so no later step can leak what this tenant may not know.
+            return Some(JournalClaim {
+                claim: NasDiskWipeJournalClaim {
+                    owner_foreign: true,
+                    owner_kind: kind.to_string(),
+                    ..Default::default()
+                },
+                serving: entry.union_mounted,
+            });
+        }
+        // Another installation's ids never leave the node: the dialog words
+        // the owner from `owner_kind`, and the wipe path re-reads the journal
+        // itself rather than trusting anything the client carries back.
+        let (owner_org_id, owner_addon_id) = super::elastic::owner_ids_for(kind, &entry.spec.owner);
         return Some(JournalClaim {
             claim: NasDiskWipeJournalClaim {
                 array_id: entry.spec.array_id.clone(),
                 name: entry.spec.name.clone(),
                 array_role: role.to_string(),
                 member_count: members().count() as u32,
-                owner_org_id: entry.spec.owner.org_id.clone(),
-                owner_addon_id: entry.spec.owner.addon_id.clone(),
+                owner_org_id,
+                owner_addon_id,
+                owner_foreign: foreign,
+                owner_kind: kind.to_string(),
+                // The instance's display name is the platform database's, and
+                // the dispatch handler adds it only for an owner of the asking
+                // organisation.
+                owner_instance_name: String::new(),
             },
             serving: entry.union_mounted,
         });
@@ -1496,6 +1553,71 @@ pub fn disk_name(disk_id: &str) -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
+// -----------------------------------------------------------------------------
+// Naming a disk to the admin — ONE rule for every surface
+// -----------------------------------------------------------------------------
+//
+// THE RULE (alerts, SMART job subjects and Elastic member cells all go through
+// `shown_disk_name` / `pick_shown_name`):
+//
+//   1. A LIVE name when there is one: the kernel name the inventory holds for
+//      the `disk_id` right now, or — for an Elastic member the inventory does
+//      not hold yet (a core that has just started, a member whose id scheme
+//      changed) — the kernel name the helper observed for that member's
+//      device in the same read. Both are the device as it is NOW.
+//   2. Otherwise the LAST KNOWN name the database remembers, and always
+//      MARKED as last-known wherever it is shown ("last seen as sdq"). It is
+//      never presented as the current device: once a disk is gone the kernel
+//      may hand the same name to a different disk, and an unmarked `sdq`
+//      would point the admin at the wrong drive in the shelf.
+//   3. Otherwise no name — the surface says what the disk IS (its part in the
+//      array, "a disk") and keeps the id in a tooltip. The id (`wwn-…`,
+//      `sn-…`, `dev-…`) is NEVER the visible text.
+//
+// Whether a disk is ABSENT is a separate question with its own evidence (the
+// helper's `device_present`), never inferred from a missing name.
+
+/// What `shown_disk_name` found, and how it may be presented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShownDiskName {
+    /// The device as it is now — shown as-is.
+    Live(String),
+    /// The name it was last seen under — shown only marked as last-known.
+    LastKnown(String),
+    /// Nothing to name it by; the id stays out of the text.
+    Unknown,
+}
+
+/// The rule itself, over its three inputs. `last_known` is only consulted
+/// when neither live source has a name.
+pub fn pick_shown_name(
+    inventory: Option<String>,
+    observed_now: Option<&str>,
+    last_known: impl FnOnce() -> Option<String>,
+) -> ShownDiskName {
+    let named = |n: &str| {
+        let n = n.trim();
+        (!n.is_empty()).then(|| n.to_string())
+    };
+    if let Some(name) = inventory.as_deref().and_then(named) {
+        return ShownDiskName::Live(name);
+    }
+    if let Some(name) = observed_now.and_then(named) {
+        return ShownDiskName::Live(name);
+    }
+    match last_known().as_deref().and_then(named) {
+        Some(name) => ShownDiskName::LastKnown(name),
+        None => ShownDiskName::Unknown,
+    }
+}
+
+/// `pick_shown_name` against this node's live inventory and its database.
+pub fn shown_disk_name(db: &DbPool, disk_id: &str, observed_now: Option<&str>) -> ShownDiskName {
+    pick_shown_name(disk_name(disk_id), observed_now, || {
+        store::disk_last_name(db, disk_id).ok().flatten()
+    })
+}
+
 pub fn device_path(disk_id: &str) -> Option<String> {
     state().read().disks.get(disk_id).map(|l| l.disk.path.clone())
 }
@@ -1795,16 +1917,16 @@ fn sync_health_alert(db: &DbPool, disk_id: &str, previous: &str, health: &str, r
                 // gets its own timestamp.
                 store::resolve_alert(db, &key)?;
             }
-            let name = disk(disk_id).map(|d| d.name).unwrap_or_else(|| disk_id.to_string());
-            store::raise_alert(
-                db,
-                &key,
-                health,
-                "disk",
-                disk_id,
-                &format!("Disk {name}: {health}"),
-                reason,
-            )?;
+            // Named by THE rule (`shown_disk_name`). A disk that has LEFT the
+            // inventory is exactly the one whose alert matters most: it is
+            // titled by the name it was last seen under, said as such, and
+            // never by its id — which stays the alert's subject, not its text.
+            let title = match shown_disk_name(db, disk_id, None) {
+                ShownDiskName::Live(name) => format!("Disk {name}: {health}"),
+                ShownDiskName::LastKnown(name) => format!("Disk last seen as {name}: {health}"),
+                ShownDiskName::Unknown => format!("Disk: {health}"),
+            };
+            store::raise_alert(db, &key, health, "disk", disk_id, &title, reason)?;
         }
         _ => store::resolve_alert(db, &key)?,
     }
@@ -2070,6 +2192,82 @@ mod tests {
         assert!(!plan.allowed);
     }
 
+    /// No organisation of this node is involved: every other org is one the
+    /// node has never heard of, which is what these tests were written for.
+    fn no_orgs() -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+
+    /// The owner's rule of 2026-09-22 on the wipe path: a disk that belongs
+    /// to a journal of ANOTHER ORGANISATION THAT EXISTS ON THIS NODE is
+    /// refused — served, dissolved or unknown alike — and nothing about that
+    /// array reaches the plan: not its name, id, role, size or owner ids.
+    #[test]
+    fn a_disk_of_another_org_on_this_node_is_refused_and_its_array_name_is_not_sent() {
+        let disk = used_disk();
+        let spec = crate::tentanas::elastic::tests::create_spec("produkt");
+        // The journal's owner org ("org") is a tenant of this node; the
+        // admin asking is another one.
+        let orgs: std::collections::BTreeSet<String> = ["org".to_string(), "inna-org".to_string()].into();
+        let asking = tentanas_helper::elastic::ElasticOwner { org_id: "inna-org".into(), addon_id: spec.owner.addon_id.clone() };
+        for serving in [Some(false), Some(true), None] {
+            let claim = journal_claim_of(&disk, &[journal_entry(spec.clone(), serving)], &asking, &orgs)
+                .expect("the disk is still claimed");
+            assert_eq!(claim.claim.owner_kind, crate::tentanas::elastic::OWNER_KIND_OTHER_ORG_ON_NODE);
+            assert_eq!(
+                claim.claim,
+                NasDiskWipeJournalClaim {
+                    owner_foreign: true,
+                    owner_kind: crate::tentanas::elastic::OWNER_KIND_OTHER_ORG_ON_NODE.to_string(),
+                    ..Default::default()
+                },
+                "nothing but the code"
+            );
+            let plan = plan_wipe(&disk, Some(claim));
+            assert!(!plan.allowed, "{serving:?}");
+            assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
+            assert_eq!(plan.refusals[0].code, JOURNAL_OTHER_ORG);
+            assert!(plan.refusals[0].detail.contains("innej organizacji na tym węźle"), "{:?}", plan.refusals[0]);
+            assert!(plan.journal_claim.is_none(), "no claim to acknowledge, and none to read a name from");
+            // What the plan says about the claim, as it would be serialised:
+            // the array's name and id appear nowhere in it. (Only these two
+            // fields — the disk's own serial and WWN in this fixture contain
+            // the word too, and those are the disk's, not the array's.)
+            let wire = serde_json::to_string(&(&plan.refusals, &plan.journal_claim)).unwrap();
+            assert!(!wire.contains("produkt") && !wire.contains(&spec.array_id), "{wire}");
+            assert!(serde_json::to_string(&plan).unwrap().find(&spec.array_id).is_none());
+
+            // Refused on the node, whatever the request acknowledges — the
+            // array's real name included, as a client that guessed it would.
+            for ack in ["", "produkt"] {
+                assert!(
+                    matches!(wipe_command(&plan, &disk, "sdc", ack), Err(WipeRefusal::NotAvailable(_))),
+                    "{serving:?} / '{ack}'"
+                );
+            }
+        }
+    }
+
+    /// The other half of the rule: a journal whose organisation this node has
+    /// NO record of (disks moved in from another machine) is claimed exactly
+    /// as before — named, acknowledgeable and wipeable once acknowledged.
+    #[test]
+    fn a_disk_of_an_org_unknown_to_this_node_keeps_its_claim_and_can_be_wiped() {
+        let disk = used_disk();
+        let spec = crate::tentanas::elastic::tests::create_spec("produkt");
+        let orgs: std::collections::BTreeSet<String> = ["inna-org".to_string()].into();
+        let asking = tentanas_helper::elastic::ElasticOwner { org_id: "inna-org".into(), addon_id: spec.owner.addon_id.clone() };
+        let claim = journal_claim_of(&disk, &[journal_entry(spec.clone(), Some(false))], &asking, &orgs)
+            .expect("claimed");
+        assert_eq!(claim.claim.owner_kind, crate::tentanas::elastic::OWNER_KIND_OTHER_INSTALLATION);
+        assert_eq!(claim.claim.name, "produkt");
+        assert_eq!((claim.claim.owner_org_id.as_str(), claim.claim.owner_addon_id.as_str()), ("", ""));
+        let plan = plan_wipe(&disk, Some(claim));
+        assert!(plan.allowed, "{:?}", plan.refusals);
+        let command = wipe_command(&plan, &disk, "sdc", "produkt").expect("acknowledged by name");
+        assert!(matches!(command, HelperCommand::DiskWipe { release_journal: Some(ref id), .. } if *id == spec.array_id));
+    }
+
     /// The journal question, in all three states a dissolved array can be in.
     ///
     /// The claim is reported apart from the refusals ONLY when it can be
@@ -2081,19 +2279,38 @@ mod tests {
         let spec = crate::tentanas::elastic::tests::create_spec("produkt");
         let journals = vec![journal_entry(spec.clone(), Some(false))];
 
-        let claim = journal_claim_of(&disk, &journals).expect("dziennik rezerwuje ten dysk");
+        let claim = journal_claim_of(&disk, &journals, &spec.owner, &no_orgs()).expect("dziennik rezerwuje ten dysk");
         assert_eq!(claim.claim.name, "produkt");
         assert_eq!(claim.claim.array_id, spec.array_id);
         assert_eq!(claim.claim.array_role, "data");
         assert_eq!(claim.claim.member_count, 2, "jeden data i jeden parity");
         assert_eq!(claim.claim.owner_org_id, "org");
+        // The instance that dissolved it is the one asking: its own journal,
+        // never "another instance's".
+        assert!(!claim.claim.owner_foreign);
+        assert_eq!(claim.claim.owner_kind, crate::tentanas::elastic::OWNER_KIND_THIS_INSTANCE);
+        let other = tentanas_helper::elastic::ElasticOwner { org_id: "org".into(), addon_id: "inny".into() };
+        let foreign = journal_claim_of(&disk, &journals, &other, &no_orgs()).expect("dziennik");
+        assert!(foreign.claim.owner_foreign);
+        // Same organisation, another instance: nameable to this tenant.
+        assert_eq!(foreign.claim.owner_kind, crate::tentanas::elastic::OWNER_KIND_THIS_ORG);
+        let tenant = tentanas_helper::elastic::ElasticOwner { org_id: "inna-org".into(), addon_id: spec.owner.addon_id.clone() };
+        let other_tenant = journal_claim_of(&disk, &journals, &tenant, &no_orgs()).expect("dziennik");
+        assert!(other_tenant.claim.owner_foreign);
+        assert_eq!(other_tenant.claim.owner_kind, crate::tentanas::elastic::OWNER_KIND_OTHER_INSTALLATION);
+        // And another tenant's ids stay on the node — not even a tooltip.
+        assert_eq!(
+            (other_tenant.claim.owner_org_id.as_str(), other_tenant.claim.owner_addon_id.as_str()),
+            ("", "")
+        );
+        assert_eq!(foreign.claim.owner_addon_id, spec.owner.addon_id, "own organisation: kept");
         let plan = plan_wipe(&disk, Some(claim));
         assert!(plan.allowed, "{:?}", plan.refusals);
         let reported = plan.journal_claim.as_ref().expect("rezerwacja w planie");
         assert_eq!(reported.name, "produkt");
 
         // Serving: the array is publishing its union right now.
-        let serving = journal_claim_of(&disk, &[journal_entry(spec.clone(), Some(true))])
+        let serving = journal_claim_of(&disk, &[journal_entry(spec.clone(), Some(true))], &spec.owner, &no_orgs())
             .expect("dziennik");
         let plan = plan_wipe(&disk, Some(serving));
         assert!(!plan.allowed);
@@ -2103,7 +2320,7 @@ mod tests {
 
         // Unknown mount state. THIS is the incident: unreadable is not free.
         let unknown =
-            journal_claim_of(&disk, &[journal_entry(spec.clone(), None)]).expect("dziennik");
+            journal_claim_of(&disk, &[journal_entry(spec.clone(), None)], &spec.owner, &no_orgs()).expect("dziennik");
         let plan = plan_wipe(&disk, Some(unknown));
         assert!(!plan.allowed);
         assert_eq!(plan.refusals[0].code, "journal_unknown");
@@ -2128,7 +2345,7 @@ mod tests {
             ..used_disk()
         };
         assert_eq!(
-            journal_claim_of(&renamed, &journals).expect("po numerze seryjnym").claim.array_role,
+            journal_claim_of(&renamed, &journals, &spec.owner, &no_orgs()).expect("po numerze seryjnym").claim.array_role,
             "data"
         );
 
@@ -2139,7 +2356,7 @@ mod tests {
             wwn: Some("wwn-obcy".to_string()),
             ..used_disk()
         };
-        assert!(journal_claim_of(&stranger, &journals).is_none());
+        assert!(journal_claim_of(&stranger, &journals, &spec.owner, &no_orgs()).is_none());
 
         // The parity disk of the same array is claimed as parity.
         let parity = NasDisk {
@@ -2149,7 +2366,7 @@ mod tests {
             ..used_disk()
         };
         assert_eq!(
-            journal_claim_of(&parity, &journals).expect("parity").claim.array_role,
+            journal_claim_of(&parity, &journals, &spec.owner, &no_orgs()).expect("parity").claim.array_role,
             "parity"
         );
     }
@@ -2214,7 +2431,7 @@ mod tests {
     fn releasing_a_journal_claim_takes_more_than_the_typed_device_name() {
         let disk = used_disk();
         let spec = crate::tentanas::elastic::tests::create_spec("produkt");
-        let claim = journal_claim_of(&disk, &[journal_entry(spec.clone(), Some(false))])
+        let claim = journal_claim_of(&disk, &[journal_entry(spec.clone(), Some(false))], &spec.owner, &no_orgs())
             .expect("dziennik");
         let plan = plan_wipe(&disk, Some(claim));
 
@@ -3281,5 +3498,65 @@ mod tests {
         healthy.health = "ok".to_string();
         let rows = advice(&db, &[healthy, spare]);
         assert!(rows.is_empty());
+    }
+
+    /// A disk that has LEFT the live inventory is the one whose alert matters
+    /// most, and its title used to fall back to the id (`Disk wwn-5000…`).
+    /// The database keeps the row, so the title names the disk as it was last
+    /// seen — and says so, because the kernel may have given that name to
+    /// another disk since.
+    #[test]
+    fn a_health_alert_for_a_disk_gone_from_the_inventory_uses_its_last_known_name() {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        store::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        // An id no test puts into the process-wide live map.
+        let id = "wwn-left-the-inventory-5000cca27dc7a4c6";
+        store::upsert_disk_seen(
+            &db,
+            &DiskIdentity {
+                disk_id: id,
+                name: "sdq",
+                model: "HGST",
+                serial: "S1",
+                wwn: None,
+                size_bytes: 1,
+                kind: "hdd",
+            },
+        )
+        .expect("record the disk");
+        assert!(disk_name(id).is_none(), "the disk is not in the live inventory");
+        sync_health_alert(&db, id, "ok", "warning", "2 reallocated sectors").expect("raise");
+        let alert = store::list_alerts(&db, false)
+            .expect("alerts")
+            .into_iter()
+            .find(|a| a.subject_id == id)
+            .expect("the alert is raised");
+        assert_eq!(alert.title, "Disk last seen as sdq: warning");
+        assert!(!alert.title.contains("wwn-"), "{}", alert.title);
+
+        // A disk the node never recorded: still never the id.
+        let unknown = "wwn-never-recorded-5000cca27dc7a4c7";
+        sync_health_alert(&db, unknown, "ok", "critical", "8 reallocated sectors").expect("raise");
+        let alert = store::list_alerts(&db, false)
+            .expect("alerts")
+            .into_iter()
+            .find(|a| a.subject_id == unknown)
+            .expect("the alert is raised");
+        assert_eq!(alert.title, "Disk: critical");
+    }
+
+    #[test]
+    fn a_disk_is_named_live_first_then_last_known_and_never_by_its_id() {
+        let never = || -> Option<String> { panic!("a live name must not consult the database") };
+        assert_eq!(pick_shown_name(Some("sdg".into()), Some("sdh"), never), ShownDiskName::Live("sdg".into()));
+        // The inventory does not hold it yet, the helper saw the device now.
+        assert_eq!(pick_shown_name(None, Some("sdh"), never), ShownDiskName::Live("sdh".into()));
+        assert_eq!(pick_shown_name(Some(String::new()), Some(" sdh "), never), ShownDiskName::Live("sdh".into()));
+        // Nothing live: the remembered name, as last-known — never as live.
+        assert_eq!(pick_shown_name(None, None, || Some("sdq".into())), ShownDiskName::LastKnown("sdq".into()));
+        assert_eq!(pick_shown_name(None, Some(""), || Some("sdq".into())), ShownDiskName::LastKnown("sdq".into()));
+        assert_eq!(pick_shown_name(None, None, || None), ShownDiskName::Unknown);
+        assert_eq!(pick_shown_name(None, None, || Some("  ".into())), ShownDiskName::Unknown);
     }
 }

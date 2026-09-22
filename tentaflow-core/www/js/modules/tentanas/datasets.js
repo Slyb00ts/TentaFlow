@@ -186,7 +186,11 @@ function datasetRow(d, state) {
   const root = d.name === state.pool;
   const cap = d.kind === 'volume' ? Number(d.volsizeBytes) || 0 : (Number(d.quotaBytes) || 0) || (Number(d.usedBytes) || 0) + (Number(d.availableBytes) || 0);
   const usedPct = pct(d.usedBytes, cap);
-  const tone = usedPct > 90 ? 'critical' : usedPct > 75 ? 'warning' : 'accent';
+  // M12 (critic n01-n10): `tf-progress-bar`'s tone allowlist is
+  // accent/success/warning/danger (`tf-progress-bar.js`); 'critical' is not
+  // in it, so a >90% dataset silently fell back to the neutral accent blue
+  // instead of the danger red the mockup shows (n09).
+  const tone = usedPct > 90 ? 'danger' : usedPct > 75 ? 'warning' : 'accent';
   const open = !state.collapsed.has(d.name);
   const count = Number(d.snapshotCount) || 0;
   const shares = sharesOf(state.shares, d);

@@ -6391,7 +6391,8 @@
         "target": "target",
         "approval": "approval",
         "elevation": "privilege channel",
-        "node": "node"
+        "node": "node",
+        "elastic-array": "Elastic Array"
       },
       "history": "Alert history"
     },
@@ -6581,7 +6582,12 @@
       "kind_snapshot_release": "Lifting a snapshot's protection",
       "kind_target_create": "Creating a target",
       "kind_target_update": "Saving a target",
-      "kind_target_delete": "Deleting a target"
+      "kind_target_delete": "Deleting a target",
+      "by_startup": "node startup",
+      "by_scheduler": "scheduler",
+      "by_unknown_account": "unknown account",
+      "subject_last_known": "last seen as {name}",
+      "smart_batch_refused": "SMART test not started on {n} {n|disk|disks|disks}: {disks}"
     },
     "elevation": {
       "title": "System privilege channel",
@@ -6666,7 +6672,8 @@
       "other_nodes_hint": "Permission-channel and feature state on the remaining nodes",
       "arm_node": "Arm…",
       "arm_node_title": "Arm the permission channel — {node} (mode B)",
-      "armed_node": "Channel on {node} armed"
+      "armed_node": "Channel on {node} armed",
+      "armed_node_unnamed": "Channel on the unnamed node armed"
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -6707,7 +6714,9 @@
       "remember_sub": "The node keeps the password in RAM for {ttl}, then zeroes it.",
       "confirm": "Run",
       "arm_confirm": "Arm the channel",
-      "ttl_info": "After {ttl} (or on logout / restart) the password is cleared from memory and has to be entered again."
+      "ttl_info": "After {ttl} (or on logout / restart) the password is cleared from memory and has to be entered again.",
+      "explain_remote_unnamed": "The password travels to this unnamed node over the encrypted mesh. On both sides it lives only in RAM and is zeroed after use — it is never synced or logged.",
+      "password_label_unnamed": "Sudo password of {user} on the unnamed node"
     },
     "setup": {
       "title": "The system privilege channel is not configured",
@@ -6734,7 +6743,8 @@
       "probe_failed_title": "Could not read the state of this node",
       "probe_failed_msg": "The environment probe did not answer: {error}",
       "probe_failed_hint": "Until the node answers, the panel does not know whether the privilege channel works — so it does not show tiles that would all report this same failure.",
-      "probe_retry": "Try again"
+      "probe_retry": "Try again",
+      "node_scope_unnamed": "You are configuring the channel for this unnamed node — and only for it. Installing TentaNas covered the whole fleet, but system privileges are set up separately on every node."
     },
     "wizard": {
       "title": "System privilege channel — {node}",
@@ -7048,7 +7058,12 @@
       "folders_pinned_note": "Folders marked „outside parity” stay on the cache only, and SnapRAID never covers the cache: their files stay outside parity for as long as the pin lasts.",
       "folder_cache_saved": "The folder's cache policy was saved.",
       "folder_cache_edit": "Change the cache policy",
-      "schedule_edit": "Edit schedule"
+      "schedule_edit": "Edit schedule",
+      "member_data": "data disk {n}",
+      "member_cache": "cache disk",
+      "member_parity": "parity disk {n}",
+      "disk_absent": "disk missing",
+      "last_seen_as": "last seen as {name}"
     },
     "wizard_pool": {
       "elastic_data": "Data disks",
@@ -7181,7 +7196,8 @@
       "scrub_now": "Scrub now",
       "spare_hint": "A hot-spare disk takes over automatically when a disk in {pool} fails.",
       "spare_title": "Hot-spare of pool {pool}",
-      "spare_sub": "{size} · hot-spare ({pool})"
+      "spare_sub": "{size} · hot-spare ({pool})",
+      "title_unnamed": "Pools on an unnamed node"
     },
     "pool": {
       "scrub_now": "Scrub now",
@@ -7314,10 +7330,11 @@
       "nothing": "This disk reports no signature at all — there is nothing to remove.",
       "bad_plan": "Incomplete or inconsistent plan response. Clearing blocked.",
       "refused": "The node refuses to clear this disk",
+      "refusal_journal_other_org": "{name} belongs to an Elastic Array of another organisation on this node. This organisation can neither clear the disk nor adopt that array.",
       "explain": "Before writing anything the node opens the device exclusively. The kernel refuses that open whenever the disk, or any of its partitions, carries a filesystem mounted in any mount namespace — the Elastic Array branch namespace included, which is visible in neither lsblk nor /proc/mounts. That refusal cannot be forced: there is no override flag and no retry.",
       "journal_title": "Elastic Array journal claim",
       "journal_body": "This disk was part of array {name} as {role}. The array is dissolved, but the node kept its journal, so the array import brings it back whole — together with the {n} {n|disk|disks} the journal lists.",
-      "journal_foreign": "The journal belongs to another instance ({org} / {addon}).",
+      "journal_foreign": "Owner recorded in the journal: {owner}.",
       "journal_cost": "Clearing drops the journal of array {name}; the claim on its name and on its remaining disks goes with it.",
       "journal_ack": "I understand that array {name} will no longer be recoverable by import, and I release its journal claim.",
       "retype": "Retype the device name to confirm:",
@@ -7395,7 +7412,10 @@
       "retype": "Type the array name to confirm:",
       "confirm": "Adopt the array",
       "done": "Array {name} has been adopted",
-      "reown_warning": "The journal names {owner} as the owner. Adopting assigns the array to this instance, which manages it from then on."
+      "reown_warning": "The journal names {owner} as the owner. Adopting assigns the array to this instance, which manages it from then on.",
+      "unnamed": "unnamed array",
+      "own_journal": "The journal already names this instance as the owner. Adopting only adds the array to its database.",
+      "member_serial": "{part} (S/N {serial})"
     },
     "import": {
       "title": "Import pool",
@@ -7975,7 +7995,8 @@
       "role_unsupported": "share access through apps only",
       "severity_critical": "critical",
       "severity_warning": "warning",
-      "severity_info": "info"
+      "severity_info": "info",
+      "act_array": "Array"
     },
     "node": {
       "head_sub_node": "node {name}",
@@ -7983,7 +8004,8 @@
       "chip_ok": "Disks OK",
       "badge_zfs": "OpenZFS {v}",
       "badge_channel": "Permission channel: {mode}",
-      "badge_ram": "{v} RAM"
+      "badge_ram": "{v} RAM",
+      "unnamed": "Unnamed node"
     },
     "tiering": {
       "title": "Tiering and write cache",
@@ -8020,7 +8042,8 @@
       "warning": "A larger ARC means faster reads but less RAM for the node's other services (e.g. ML Studio). The change writes a module parameter through the permission channel.",
       "apply": "Apply",
       "applied": "ARC limit saved",
-      "l2arc_add": "add to {pool}"
+      "l2arc_add": "add to {pool}",
+      "settings_hint_unnamed": "ZFS module parameters on an unnamed node ({ram} RAM)"
     },
     "approvals": {
       "title": "Waiting for approval",
@@ -8326,7 +8349,14 @@
       "portal_moves": "The portal moves from {from} to {to}. Initiators logged in on the old address lose their path — the old portal stops listening.",
       "portal_interface_gone": "Interface {iface} no longer has an address on this node that a portal can bind. You can still save your changes; the portal stays where it was, and moving it means picking another interface.",
       "portal_drifted": "This target's portal is on {from}, and interface {iface} now has {to}. The target is frozen and waiting — you can save your changes without touching the portal, or move it here.",
-      "portal_move_confirm": "Move the portal to {to} — initiators logged in on the old address lose their path"
+      "portal_move_confirm": "Move the portal to {to} — initiators logged in on the old address lose their path",
+      "iqn_host_unknown": "‹node hostname›"
+    },
+    "journal_owner": {
+      "this_instance": "this TentaNas instance",
+      "this_org": "another TentaNas instance of this organisation",
+      "this_org_named": "the “{name}” instance of this organisation",
+      "other_installation": "another TentaNas installation"
     }
   },
   "agent_accounts": {

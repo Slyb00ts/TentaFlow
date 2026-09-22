@@ -12,7 +12,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, fmtAgo, fmtIn, fmtDate, errMessage, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { T, sprite, fmtAgo, fmtIn, fmtDate, errMessage, ADMIN_TIMEOUT_MS, jobAuthor } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
@@ -86,15 +86,19 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
     // The card stays out of the way while nothing waits and the switch is off:
     // an empty list plus a disabled feature is noise, not information.
     card.hidden = !open.length && !state.settings?.enabled;
-    table.rows = state.approvals.map((a) => ({
-      _approval: a,
-      operation: `<span class="tf-table__cell-title">${escapeHtml(operationLabel(a.operation))}</span><div class="tf-table__cell-sub">${escapeHtml(a.detail)}</div>`,
-      subject: `<span class="tf-table__cell--mono">${escapeHtml(a.subject)}</span>`,
-      requested: `<span>${escapeHtml(fmtAgo(a.requestedAt))}</span><div class="tf-table__cell-sub">${escapeHtml(T('approvals.requested_by', { user: a.requestedBy }))}</div>`,
-      expires: `<span class="tf-table__cell--mono">${escapeHtml(a.status === 'pending' ? fmtIn(a.expiresAt) : fmtDate(a.expiresAt))}</span>`,
-      status: `<tf-chip size="sm" dot status="${statusTone(a.status)}" label="${escapeAttr(T('approvals.status_' + a.status))}"></tf-chip>${
-        a.decidedBy ? `<div class="tf-table__cell-sub">${escapeHtml(T('approvals.decided_by', { user: a.decidedBy }))}</div>` : ''}`,
-    }));
+    table.rows = state.approvals.map((a) => {
+      const requester = jobAuthor(a.requestedBy);
+      const decider = a.decidedBy ? jobAuthor(a.decidedBy) : null;
+      return {
+        _approval: a,
+        operation: `<span class="tf-table__cell-title">${escapeHtml(operationLabel(a.operation))}</span><div class="tf-table__cell-sub">${escapeHtml(a.detail)}</div>`,
+        subject: `<span class="tf-table__cell--mono">${escapeHtml(a.subject)}</span>`,
+        requested: `<span>${escapeHtml(fmtAgo(a.requestedAt))}</span><div class="tf-table__cell-sub"${requester.title ? ` title="${escapeAttr(requester.title)}"` : ''}>${escapeHtml(T('approvals.requested_by', { user: requester.label }))}</div>`,
+        expires: `<span class="tf-table__cell--mono">${escapeHtml(a.status === 'pending' ? fmtIn(a.expiresAt) : fmtDate(a.expiresAt))}</span>`,
+        status: `<tf-chip size="sm" dot status="${statusTone(a.status)}" label="${escapeAttr(T('approvals.status_' + a.status))}"></tf-chip>${
+          decider ? `<div class="tf-table__cell-sub"${decider.title ? ` title="${escapeAttr(decider.title)}"` : ''}>${escapeHtml(T('approvals.decided_by', { user: decider.label }))}</div>` : ''}`,
+      };
+    });
   };
 
   table.rowActions = (row, idx, currentRow) => {

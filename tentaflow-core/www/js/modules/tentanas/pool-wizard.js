@@ -11,8 +11,9 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel,
+  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel,
 } from '/js/modules/tentanas/format.js';
+import { setAttr, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-checkbox.js';
@@ -153,7 +154,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     <div class="install-header">
       <div class="big-ico">${sprite(elastic ? 'cylinder' : 'layers')}</div>
       <div class="install-header-meta">
-        <h1>${escapeHtml(T('wizard_pool.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
+        <h1>${escapeHtml(T('wizard_pool.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: nodeLabel(node) }))}</span></h1>
         <div class="sub">${escapeHtml(elastic && state.step === 1 ? T('wizard_pool.elastic_data_sub') : elastic && state.step === 2 ? T('wizard_pool.elastic_parity_sub') : subs[state.step])}</div>
       </div>
     </div>
@@ -597,7 +598,21 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     }
     const s = state.job.status;
     if (s === 'running' || s === 'queued') {
-      draw();
+      // M15 (critic n01-n10): every 1.5 s tick used to `draw()` the whole
+      // window — header, rail, footer, the log `<pre>` from scratch — which
+      // reset the log's scroll position on every single tick. The step body
+      // was already built (by the `draw()` right before this poll started),
+      // so a running job only needs its bar's attributes and the log's new
+      // tail repainted in place.
+      const bar = win.querySelector('.install-step-body tf-progress-bar');
+      const log = win.querySelector('.install-step-body .job-log');
+      if (bar && log) {
+        setAttr(bar, 'value', String(Number(state.job.progressPct) || 0));
+        setAttr(bar, 'label', T('jobs.status_' + state.job.status));
+        paintJobLog(log, state.job.log);
+      } else {
+        draw();
+      }
       state.timer = setTimeout(pollJob, POLL_JOB_MODAL_MS);
       return;
     }

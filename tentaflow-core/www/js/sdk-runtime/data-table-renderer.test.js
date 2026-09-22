@@ -256,6 +256,95 @@ test('Table selectable=multi merges clicked row into bound selection', () => {
   assertEq(got, { selected_ids: ['r1', 'r2'], mode: 'multi', changed_row_id: 'r2' });
 });
 
+// MAJOR B (critic 2026-09-22): `transformRows` used to build fresh `{...row}`
+// objects on every rebuild and never set `_selected`, so tf-table's
+// row-sync (which reads `row._selected` as the one source of truth) found no
+// own key on any row and left the DOM tick exactly where it was — on the
+// SLOT, not the row. Fixed by deriving `_selected` from the `selected_ids`
+// bind in `transformRows` itself, so it now travels with the row.
+
+test('Table MAJOR B: a row selected on page 1 does not leave a tick on an unselected row after paging to page 2', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }] },
+      { path: PATH('sel'), value: [] },
+      { path: PATH('page'), value: 1 },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id' })],
+    selectMode: 'multi',
+    selectedIdsBind: { kind: 'bound', path: PATH('sel') },
+    pagination: [[0, 2], [1, PATH('page')], [2, false]],
+  })));
+  const sr = mount(el);
+  // Page 1 shows a, b — select a.
+  toggleRow(sr, 0, true);
+  // Host writes the selection back, as an addon does on selection_change.
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('sel'), op: { kind: 'set', value: ['a'] } }],
+  });
+  assert(
+    sr.querySelectorAll('tbody tr')[0].querySelector('.tf-table__row-select').hasAttribute('checked'),
+    'sanity: a is ticked on page 1',
+  );
+
+  // Host advances to page 2 — c, d, neither ever selected.
+  store.applyPatch({
+    base_revision: 1, new_revision: 2,
+    ops: [{ path: PATH('page'), op: { kind: 'set', value: 2 } }],
+  });
+  const boxes = sr.querySelectorAll('tbody tr .tf-table__row-select');
+  assertEq(boxes.length, 2);
+  assert(!boxes[0].hasAttribute('checked'), 'c must not be ticked — it was never selected');
+  assert(!boxes[1].hasAttribute('checked'), 'd must not be ticked — it was never selected');
+});
+
+test('Table MAJOR B: a client-side sort keeps the tick on the selected DATA row, not the DOM slot', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'a', name: 'B' }, { id: 'b', name: 'A' }] },
+      { path: PATH('sel'), value: [] },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name', field: 'name', sortable: true })],
+    sortable: true,
+    selectMode: 'multi',
+    selectedIdsBind: { kind: 'bound', path: PATH('sel') },
+  })));
+  const sr = mount(el);
+  // Row 'a' ("B") sits at slot 0 — select it.
+  toggleRow(sr, 0, true);
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('sel'), op: { kind: 'set', value: ['a'] } }],
+  });
+  assert(
+    sr.querySelectorAll('tbody tr')[0].querySelector('.tf-table__row-select').hasAttribute('checked'),
+    'sanity: a is ticked in slot 0',
+  );
+
+  // Client-side sort (tf-table's own comparator, no store change): 'A' (row
+  // b) now sorts before 'B' (row a) — rows are recycled by index, so slot 0
+  // now belongs to a different logical row.
+  sr.querySelector('th.sortable').click();
+  const rows = sr.querySelectorAll('tbody tr');
+  assertEq(rows[0].querySelector('td').textContent, 'A');
+  assertEq(rows[1].querySelector('td').textContent, 'B');
+  assert(!rows[0].querySelector('.tf-table__row-select').hasAttribute('checked'), 'slot 0 (now b) must be unticked');
+  assert(rows[1].querySelector('.tf-table__row-select').hasAttribute('checked'), 'slot 1 (now a, still selected) must be ticked');
+});
+
 test('Table selectable != none bez selected_ids throws', () => {
   setup();
   const engine = makeEngine();

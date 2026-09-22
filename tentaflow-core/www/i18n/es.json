@@ -5232,7 +5232,12 @@
       "kind_snapshot_release": "Retirada de la protección de un snapshot",
       "kind_target_create": "Creando un destino",
       "kind_target_update": "Guardando un destino",
-      "kind_target_delete": "Eliminando un destino"
+      "kind_target_delete": "Eliminando un destino",
+      "by_startup": "arranque del nodo",
+      "by_scheduler": "programador",
+      "by_unknown_account": "cuenta desconocida",
+      "subject_last_known": "visto por última vez como {name}",
+      "smart_batch_refused": "Prueba SMART no iniciada en {n} {n|disco|discos|discos}: {disks}"
     },
     "danger": {
       "retype": "Escribe {name} para confirmar:",
@@ -5439,7 +5444,12 @@
       "folders_pinned_note": "Las carpetas marcadas „fuera de la paridad” se quedan solo en la caché, y SnapRAID nunca cubre la caché: sus archivos permanecen fuera de la paridad mientras dure el anclaje.",
       "folder_cache_saved": "Se guardó la política de caché de la carpeta.",
       "folder_cache_edit": "Cambiar la política de caché",
-      "schedule_edit": "Editar programación"
+      "schedule_edit": "Editar programación",
+      "member_data": "disco de datos {n}",
+      "member_cache": "disco de caché",
+      "member_parity": "disco de paridad {n}",
+      "disk_absent": "falta el disco",
+      "last_seen_as": "visto por última vez como {name}"
     },
     "wizard_pool": {
       "elastic_data": "Discos de datos",
@@ -5572,7 +5582,8 @@
       "scrub_now": "Scrub ahora",
       "spare_hint": "Un disco hot-spare toma el relevo automáticamente si falla un disco de {pool}.",
       "spare_title": "Hot-spare del pool {pool}",
-      "spare_sub": "{size} · hot-spare ({pool})"
+      "spare_sub": "{size} · hot-spare ({pool})",
+      "title_unnamed": "Pools en un nodo sin nombre"
     },
     "pool": {
       "scrub_now": "Scrub ahora",
@@ -5705,10 +5716,11 @@
       "nothing": "Este disco no informa de ninguna firma: no hay nada que eliminar.",
       "bad_plan": "Respuesta del plan incompleta o incoherente. Borrado bloqueado.",
       "refused": "El nodo se niega a borrar este disco",
+      "refusal_journal_other_org": "{name} pertenece a una matriz Elastic de otra organización de este nodo. Esta organización no puede borrar el disco ni adoptar esa matriz.",
       "explain": "Antes de escribir algo, el nodo abre el dispositivo en modo exclusivo. El núcleo rechaza esa apertura cuando el disco, o cualquiera de sus particiones, lleva un sistema de archivos montado en cualquier espacio de nombres de montaje, incluido el espacio privado de las ramas de un Elastic Array, que no se ve ni en lsblk ni en /proc/mounts. Ese rechazo no se puede forzar: no hay opción de forzado ni reintento.",
       "journal_title": "Reserva del diario de un Elastic Array",
       "journal_body": "Este disco formaba parte de la matriz {name} como {role}. La matriz está disuelta, pero el nodo conservó su diario, así que la importación de matrices la recupera completa, junto con los {n} {n|disco|discos} que figuran en el diario.",
-      "journal_foreign": "El diario pertenece a otra instancia ({org} / {addon}).",
+      "journal_foreign": "Propietario registrado en el diario: {owner}.",
       "journal_cost": "El borrado elimina el diario de la matriz {name}; con él desaparece la reserva de su nombre y de sus demás discos.",
       "journal_ack": "Entiendo que la matriz {name} dejará de poder recuperarse mediante importación y libero la reserva de su diario.",
       "retype": "Vuelve a escribir el nombre del dispositivo para confirmar:",
@@ -5786,7 +5798,10 @@
       "retype": "Escribe el nombre del array para confirmar:",
       "confirm": "Adoptar el array",
       "done": "El array {name} ha sido adoptado",
-      "reown_warning": "El diario indica que el propietario es {owner}. La adopción asigna el array a esta instancia, que lo gestiona a partir de ese momento."
+      "reown_warning": "El diario indica que el propietario es {owner}. La adopción asigna el array a esta instancia, que lo gestiona a partir de ese momento.",
+      "unnamed": "matriz sin nombre",
+      "own_journal": "El diario ya indica esta instancia como propietaria. La adopción solo añade la matriz a su base de datos.",
+      "member_serial": "{part} (N.º de serie {serial})"
     },
     "import": {
       "title": "Importar pool",
@@ -6428,7 +6443,8 @@
         "target": "destino",
         "approval": "aprobación",
         "elevation": "canal de privilegios",
-        "node": "nodo"
+        "node": "nodo",
+        "elastic-array": "matriz Elastic"
       },
       "history": "Historial de alertas"
     },
@@ -6637,7 +6653,8 @@
       "other_nodes_hint": "Estado del canal de privilegios y de las funciones en los demás nodos",
       "arm_node": "Activar…",
       "arm_node_title": "Activar el canal de privilegios — {node} (modo B)",
-      "armed_node": "Canal de {node} activado"
+      "armed_node": "Canal de {node} activado",
+      "armed_node_unnamed": "Canal del nodo sin nombre activado"
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -6678,7 +6695,9 @@
       "remember_sub": "El nodo guarda la contraseña en RAM durante {ttl} y luego la pone a cero.",
       "confirm": "Ejecutar",
       "arm_confirm": "Activar el canal",
-      "ttl_info": "Pasados {ttl} (o al cerrar sesión / reiniciar) la contraseña se borra de la memoria y hay que introducirla de nuevo."
+      "ttl_info": "Pasados {ttl} (o al cerrar sesión / reiniciar) la contraseña se borra de la memoria y hay que introducirla de nuevo.",
+      "explain_remote_unnamed": "La contraseña viaja a este nodo sin nombre por la malla cifrada. En ambos extremos vive solo en RAM y se pone a cero tras usarse — nunca se sincroniza ni se registra.",
+      "password_label_unnamed": "Contraseña sudo de {user} en el nodo sin nombre"
     },
     "setup": {
       "title": "El canal de privilegios del sistema no está configurado",
@@ -6705,7 +6724,8 @@
       "probe_failed_title": "No se pudo leer el estado de este nodo",
       "probe_failed_msg": "La sonda del entorno no respondió: {error}",
       "probe_failed_hint": "Mientras el nodo no responda, el panel no sabe si el canal de privilegios funciona — por eso no muestra tarjetas que informarían todas del mismo fallo.",
-      "probe_retry": "Reintentar"
+      "probe_retry": "Reintentar",
+      "node_scope_unnamed": "Estás configurando el canal para este nodo sin nombre — y solo para él. La instalación de TentaNas abarcó toda la flota, pero los privilegios del sistema se configuran por separado en cada nodo."
     },
     "refreshed": "última actualización {t}",
     "duration": {
@@ -6759,7 +6779,8 @@
       "role_unsupported": "acceso a recursos solo desde apps",
       "severity_critical": "crítico",
       "severity_warning": "advertencia",
-      "severity_info": "información"
+      "severity_info": "información",
+      "act_array": "Matriz"
     },
     "node": {
       "head_sub_node": "nodo {name}",
@@ -6767,7 +6788,8 @@
       "chip_ok": "Discos OK",
       "badge_zfs": "OpenZFS {v}",
       "badge_channel": "Canal de privilegios: {mode}",
-      "badge_ram": "{v} RAM"
+      "badge_ram": "{v} RAM",
+      "unnamed": "Nodo sin nombre"
     },
     "tiering": {
       "title": "Tiering y caché de escritura",
@@ -6804,7 +6826,8 @@
       "warning": "Un ARC mayor significa lecturas más rápidas, pero menos RAM para los demás servicios del nodo (p. ej. ML Studio). El cambio escribe un parámetro del módulo a través del canal de privilegios.",
       "apply": "Aplicar",
       "applied": "Límite de ARC guardado",
-      "l2arc_add": "añádelo a {pool}"
+      "l2arc_add": "añádelo a {pool}",
+      "settings_hint_unnamed": "Parámetros del módulo ZFS en un nodo sin nombre ({ram} de RAM)"
     },
     "approvals": {
       "title": "Pendiente de aprobación",
@@ -7110,7 +7133,14 @@
       "portal_moves": "El portal se traslada de {from} a {to}. Los initiators conectados en la dirección anterior pierden su ruta: el portal antiguo deja de escuchar.",
       "portal_interface_gone": "La interfaz {iface} ya no tiene en este nodo una dirección que un portal pueda enlazar. Puedes guardar tus cambios igualmente; el portal se queda donde estaba y moverlo requiere elegir otra interfaz.",
       "portal_drifted": "El portal de este destino está en {from}, y la interfaz {iface} ahora tiene {to}. El destino está congelado y esperando: puedes guardar tus cambios sin tocar el portal, o moverlo aquí.",
-      "portal_move_confirm": "Mover el portal a {to}: los initiators conectados en la dirección anterior pierden su ruta"
+      "portal_move_confirm": "Mover el portal a {to}: los initiators conectados en la dirección anterior pierden su ruta",
+      "iqn_host_unknown": "‹nombre de host del nodo›"
+    },
+    "journal_owner": {
+      "this_instance": "esta instancia de TentaNas",
+      "this_org": "otra instancia de TentaNas de esta organización",
+      "this_org_named": "la instancia «{name}» de esta organización",
+      "other_installation": "otra instalación de TentaNas"
     }
   },
   "agent_accounts": {

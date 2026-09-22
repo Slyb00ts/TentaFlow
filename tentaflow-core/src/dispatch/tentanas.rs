@@ -245,7 +245,11 @@ fn display_names(
         .collect()
 }
 
-fn name_jobs(ctx: &HandlerContext, jobs: &mut [tentaflow_protocol::tentanas::NasJob]) {
+fn name_jobs(
+    ctx: &HandlerContext,
+    db: Option<&DbPool>,
+    jobs: &mut [tentaflow_protocol::tentanas::NasJob],
+) {
     let ids: Vec<String> = jobs.iter().map(|j| j.started_by.clone()).collect();
     let names = display_names(ctx, &ids);
     for job in jobs.iter_mut() {
@@ -257,17 +261,60 @@ fn name_jobs(ctx: &HandlerContext, jobs: &mut [tentaflow_protocol::tentanas::Nas
         // spawn refuses a second job on — two call sites depend on it, so the
         // stored subject stays the id and only the shown one becomes `sdg`.
         // n15 reads "SMART long: sdd".
+        //
+        // Named by the one disk-naming rule (`disks::shown_disk_name`): live
+        // first, then — for a disk that has since left the inventory — the
+        // name it was last seen under, and never the id. A job row is a
+        // record of what an operation ran on, and the last-known name is the
+        // name that disk had — sent FLAGGED (`subject_last_known`), because
+        // the naming rule shows a remembered name only marked as such. The id
+        // is kept only when the node never knew any name at all, and every
+        // job renderer passes the subject through `jobSubject`
+        // (`www/js/modules/tentanas/tasks.js`), which drops a machine-id shape
+        // (`wwn-…`, `sn-…`, `dev-…`) from the visible text and keeps it as the
+        // tooltip.
         if job.kind == "smart_test" {
-            if let Some(name) = tentanas::disks::disk_name(&job.subject) {
+            if let Some((name, last_known)) = smart_subject_name(&job.subject, |id| {
+                match db {
+                    Some(db) => tentanas::disks::shown_disk_name(db, id, None),
+                    None => tentanas::disks::pick_shown_name(tentanas::disks::disk_name(id), None, || None),
+                }
+            }) {
                 job.subject = name;
+                job.subject_last_known = last_known;
             }
         }
     }
 }
 
+/// The shown subject of a SMART job spawned on `disk_id`, with whether it is
+/// only REMEMBERED: `(live name, false)`, or `(last-seen name, true)` once the
+/// disk has left the inventory. `None` keeps the stored subject (a disk the
+/// node never named).
+fn smart_subject_name(
+    disk_id: &str,
+    shown: impl FnOnce(&str) -> tentanas::disks::ShownDiskName,
+) -> Option<(String, bool)> {
+    match shown(disk_id) {
+        tentanas::disks::ShownDiskName::Live(name) => Some((name, false)),
+        tentanas::disks::ShownDiskName::LastKnown(name) => Some((name, true)),
+        tentanas::disks::ShownDiskName::Unknown => None,
+    }
+}
+
 fn job_response(ctx: &HandlerContext, job: tentaflow_protocol::tentanas::NasJob) -> MessageBody {
+    job_response_in(ctx, None, job)
+}
+
+/// `job_response` with this instance's database at hand, so a SMART job on a
+/// disk that has left the inventory is titled by its last-known name.
+fn job_response_in(
+    ctx: &HandlerContext,
+    db: Option<&DbPool>,
+    job: tentaflow_protocol::tentanas::NasJob,
+) -> MessageBody {
     let mut job = job;
-    name_jobs(ctx, std::slice::from_mut(&mut job));
+    name_jobs(ctx, db, std::slice::from_mut(&mut job));
     tn(P::JobResponse { job })
 }
 
@@ -400,7 +447,7 @@ fn jobs_list(ctx: &HandlerContext, limit: u32) -> Result<MessageBody, ProtocolEr
     let g = gate(ctx, PERM_READ)?;
     let mut jobs = store::list_jobs(&g.db, if limit == 0 { 50 } else { limit })
         .map_err(|e| internal("jobs", e))?;
-    name_jobs(ctx, &mut jobs);
+    name_jobs(ctx, Some(&g.db), &mut jobs);
     Ok(tn(P::JobsListResponse { jobs }))
 }
 
@@ -409,7 +456,7 @@ fn job_get(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolEr
     let job = store::job(&g.db, job_id)
         .map_err(|e| internal("jobs", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
-    Ok(job_response(ctx, job))
+    Ok(job_response_in(ctx, Some(&g.db), job))
 }
 
 fn job_cancel(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolError> {
@@ -557,8 +604,12 @@ async fn disk_locate(ctx: &HandlerContext, disk_id: &str, enable: bool) -> Resul
 /// disk left over from a DISSOLVED array is claimed by one of them while
 /// nothing in the database says so — which is the single most likely reason a
 /// disk on a real node reads as `used` with a bare `xfs` signature.
+///
+/// `orgs_on_node` (from the function of that name) is what turns a disk of
+/// another tenant of this node into a refusal that does not name its array.
 async fn wipe_plan_of(
     g: &Gate,
+    orgs_on_node: &std::collections::BTreeSet<String>,
     disk_id: &str,
     explicit: Option<&ElevationToken>,
 ) -> Result<NasDiskWipePlan, ProtocolError> {
@@ -566,13 +617,55 @@ async fn wipe_plan_of(
         .await
         .map_err(|e| internal("inventory", e))?;
     let disk = tentanas::disks::disk(disk_id).ok_or_else(|| {
-        ProtocolError::not_found(format!("Dysk '{disk_id}' nie istnieje na tym węźle"))
+        ProtocolError::not_found(disk_gone_message(tentanas::disks::shown_disk_name(
+            &g.db, disk_id, None,
+        )))
     })?;
     let journals = tentanas::elastic::journals(&g.db, explicit)
         .await
         .map_err(|e| privileged_error("elastic journals", e))?;
-    let claim = tentanas::disks::journal_claim_of(&disk, &journals.arrays);
+    let claim = tentanas::disks::journal_claim_of(&disk, &journals.arrays, &elastic_owner(g), orgs_on_node);
     Ok(tentanas::disks::plan_wipe(&disk, claim))
+}
+
+/// Why a wipe plan cannot be read for a disk the inventory no longer holds,
+/// naming the disk by the one naming rule — the dialog toasts this, and the
+/// disk id (`wwn-…`) is not a name. The disk is by definition not live here,
+/// so a remembered name is said as last-seen.
+fn disk_gone_message(shown: tentanas::disks::ShownDiskName) -> String {
+    match shown {
+        tentanas::disks::ShownDiskName::Live(name) => {
+            format!("disk {name} is not in this node's inventory")
+        }
+        tentanas::disks::ShownDiskName::LastKnown(name) => {
+            format!("the disk last seen as {name} is no longer on this node")
+        }
+        tentanas::disks::ShownDiskName::Unknown => "this disk is no longer on this node".to_string(),
+    }
+}
+
+/// The display name of a journal owner's instance, for the ONE kind whose
+/// name this caller may learn: another instance of the caller's own
+/// organisation.
+///
+/// Everything else answers empty WITHOUT a lookup. The organisation's name is
+/// never resolved at all — for this org the admin knows it, and for another
+/// org it is another tenant's name, which a node shared by several tenants
+/// must not hand to the admin of one of them (OWASP A01). `lookup` is the
+/// platform database read, passed in so the rule is testable without one.
+fn own_org_instance_name(kind: &str, lookup: impl FnOnce() -> Option<String>) -> String {
+    if kind != tentanas::elastic::OWNER_KIND_THIS_ORG {
+        return String::new();
+    }
+    lookup().map(|n| n.trim().to_string()).unwrap_or_default()
+}
+
+/// The platform database's display name for an addon instance, when it has one.
+fn addon_display_name(ctx: &HandlerContext, addon_id: &str) -> Option<String> {
+    crate::db::repository::get_addon(&ctx.state.db, addon_id)
+        .ok()
+        .flatten()
+        .map(|addon| if addon.display_name.trim().is_empty() { addon.name } else { addon.display_name })
 }
 
 async fn disk_wipe_plan(
@@ -585,9 +678,12 @@ async fn disk_wipe_plan(
     // could not perform the operation anyway.
     let g = gate_destructive(ctx)?;
     let explicit = secret.map(token);
-    Ok(tn(P::DiskWipePlanResponse {
-        plan: wipe_plan_of(&g, disk_id, explicit.as_deref()).await?,
-    }))
+    let mut plan = wipe_plan_of(&g, &orgs_on_node(ctx)?, disk_id, explicit.as_deref()).await?;
+    if let Some(claim) = plan.journal_claim.as_mut() {
+        claim.owner_instance_name =
+            own_org_instance_name(&claim.owner_kind, || addon_display_name(ctx, &claim.owner_addon_id));
+    }
+    Ok(tn(P::DiskWipePlanResponse { plan }))
 }
 
 async fn disk_wipe(
@@ -599,7 +695,10 @@ async fn disk_wipe(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     let explicit = secret.map(token);
-    let plan = wipe_plan_of(&g, disk_id, explicit.as_deref()).await?;
+    // The node's own plan, read under the same tenant rule the dialog was
+    // shown: a disk of another organisation of this node refuses HERE, not
+    // merely by the dialog having no claim to acknowledge.
+    let plan = wipe_plan_of(&g, &orgs_on_node(ctx)?, disk_id, explicit.as_deref()).await?;
     let disk = tentanas::disks::disk(disk_id)
         .ok_or_else(|| ProtocolError::not_found("Dysk zniknął z inwentarza"))?;
     // Every gate between "an admin clicked" and "a device is opened" lives in
@@ -982,6 +1081,16 @@ async fn pool_import_scan(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
+    let pools = importable_pools(&g, secret).await?;
+    remember_import_scan(&g.org_id, &pools, std::time::Instant::now());
+    Ok(tn(P::PoolImportScanResponse { pools }))
+}
+
+/// What `zpool import` offers on this host.
+async fn importable_pools(
+    g: &Gate,
+    secret: Option<&SudoSecret>,
+) -> Result<Vec<tentaflow_protocol::tentanas::NasImportablePool>, ProtocolError> {
     // The scan opens every disk on the host, so unlike the other pool reads it
     // needs root.
     let explicit = secret.map(token);
@@ -995,9 +1104,77 @@ async fn pool_import_scan(
     .map_err(|e| broker_error("import scan", e))?;
     // `zpool import` exits 1 when it finds nothing at all — an empty list, not
     // a failure.
-    Ok(tn(P::PoolImportScanResponse {
-        pools: tentanas::pools::parse_import_scan(&out.stdout),
-    }))
+    Ok(tentanas::pools::parse_import_scan(&out.stdout))
+}
+
+/// How long the names of the last import scan title an import job.
+///
+/// A scan and the import it leads to are one sitting of one dialog: minutes,
+/// not hours. Past this the name may belong to a pool that was renamed,
+/// imported elsewhere or unplugged since, and a job titled by a stale name is
+/// worse than one titled by its kind alone.
+const IMPORT_SCAN_NAMES_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// guid → name of the importable pools the last scan saw, and when.
+type ImportScanNames = (std::time::Instant, std::collections::HashMap<String, String>);
+
+/// The last import scan's names, per organisation, in this process.
+///
+/// WHY a cache and not a second scan. The import request used to re-run the
+/// privileged `zpool import` scan (up to 120 s) BEFORE answering, only to
+/// learn the pool's name for the job title — inside the client's own 120 s
+/// timeout. A slow scan then showed the admin a timeout while the node went
+/// on to import anyway, and the retry failed against the imported pool. The
+/// dialog always scans first (it cannot offer a GUID otherwise), so that
+/// scan's answer is the name; nothing privileged runs before the reply.
+///
+/// Keyed by organisation: the scan is a node-wide fact, but what one tenant's
+/// admin scanned is not a title for another tenant's jobs. Being in-process
+/// is also what makes it per node — each node titles its own imports.
+fn import_scan_names() -> &'static std::sync::Mutex<std::collections::HashMap<String, ImportScanNames>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, ImportScanNames>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Records what a scan found. The whole answer replaces the previous one: a
+/// pool the new scan no longer lists must not keep titling jobs.
+fn remember_import_scan(
+    org_id: &str,
+    pools: &[tentaflow_protocol::tentanas::NasImportablePool],
+    at: std::time::Instant,
+) {
+    let names = pools
+        .iter()
+        .filter(|pool| !pool.name.is_empty())
+        .map(|pool| (pool.guid.clone(), pool.name.clone()))
+        .collect();
+    if let Ok(mut cache) = import_scan_names().lock() {
+        cache.insert(org_id.to_string(), (at, names));
+    }
+}
+
+/// The subject of an import job: the new name when the admin gave one,
+/// otherwise the NAME the last scan gave this GUID, and when neither is known
+/// — no scan in this process, an expired one, or a GUID it did not list — an
+/// empty subject. The job row then reads as its kind alone ("Import puli").
+///
+/// Never the GUID: a 20-digit number in the job list is what nobody can tell
+/// from any other. A GUID the pool no longer answers to is not refused here
+/// either — the helper refuses it when the job runs, and that refusal is the
+/// job's own error rather than a guess made from a cache.
+fn import_job_subject(org_id: &str, guid: &str, new_name: &str, now: std::time::Instant) -> String {
+    if !new_name.is_empty() {
+        return new_name.to_string();
+    }
+    let Ok(cache) = import_scan_names().lock() else {
+        return String::new();
+    };
+    cache
+        .get(org_id)
+        .filter(|(at, _)| now.saturating_duration_since(*at) < IMPORT_SCAN_NAMES_TTL)
+        .and_then(|(_, names)| names.get(guid).cloned())
+        .unwrap_or_default()
 }
 
 async fn pool_add_vdev(
@@ -2510,6 +2687,23 @@ fn target_auth_columns(
     ))
 }
 
+/// The hostname a new target's IQN / NQN is built from, or the refusal when it
+/// would give the target an empty host segment.
+///
+/// The segment `wwn_for` uses is the SANITISED hostname, so that is what is
+/// judged — a hostname of `___` is as unusable as an empty one. The wizard
+/// shows a placeholder in that case (`wwn_host` is empty on the wire), and
+/// this is the matching refusal rather than a malformed `iqn.…:.name`.
+fn target_host_for_create(hostname: &str) -> Result<String, ProtocolError> {
+    if tentanas::targets::wwn_host(hostname).is_empty() {
+        return Err(ProtocolError::bad_request(
+            "this node has no usable hostname, and a target's IQN / NQN is built from it — \
+             set the node's hostname first",
+        ));
+    }
+    Ok(hostname.to_string())
+}
+
 async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
     let P::TargetCreateRequest {
         name,
@@ -2529,6 +2723,10 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         return Err(ProtocolError::bad_request("expected TargetCreateRequest"));
     };
     let g = gate_targets(ctx)?;
+    // Checked before anything else is read or written: the host segment is
+    // part of the target's permanent identity, and a node whose hostname is
+    // empty (or holds nothing an IQN may carry) would publish `iqn.…:.name`.
+    let node = target_host_for_create(&tentanas::config_io::hostname())?;
     if store::target_by_name(&g.db, name)
         .map_err(|e| internal("targets", e))?
         .is_some()
@@ -2606,7 +2804,6 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     let (method, username, secret, mutual_username, mutual_secret, hash, dhgroup) =
         target_auth_columns(ctx, &target_id, protocol, auth.as_ref(), None)?;
     let now = store::now();
-    let node = tentanas::config_io::hostname();
     let row = store::TargetRow {
         name: name.clone(),
         protocol: protocol.clone(),
@@ -3335,6 +3532,28 @@ fn elastic_owner(g: &Gate) -> ElasticOwner {
     ElasticOwner { org_id: g.org_id.clone(), addon_id: g.addon_id.clone() }
 }
 
+/// Every organisation this node has a record of — the set an Elastic
+/// journal's owner is judged against (`tentanas::elastic::owner_kind`).
+///
+/// WHY it matters: TentaNas is ONE package instance per node, shared by every
+/// organisation on it, and a journal of another organisation that lives here
+/// is that tenant's array — hidden from the import scan, refused for
+/// adoption and refused for a wipe. A journal whose organisation this node
+/// has never heard of came in on disks from another machine and stays
+/// adoptable. This lookup is what tells the two apart.
+///
+/// Every row counts, whatever its status: a soft-deleted organisation
+/// (`status = 'deleted'`, `services::org::delete_organization`) keeps its row
+/// and its data under its retention policy, and letting another tenant adopt
+/// its array would hand that tenant the deleted one's files. A failed read is
+/// an error, never an empty set — an empty set would make every other tenant
+/// "unknown", which is exactly the case that is shown and adoptable.
+fn orgs_on_node(ctx: &HandlerContext) -> Result<std::collections::BTreeSet<String>, ProtocolError> {
+    crate::services::org::list_organizations(&ctx.state.db, None)
+        .map(|orgs| orgs.into_iter().map(|org| org.org_id).collect())
+        .map_err(|e| internal("organisations", e))
+}
+
 /// The one way this module reads the root's Elastic claims.
 ///
 /// WHY it exists: three call sites — the capabilities read, the plan the
@@ -3459,10 +3678,18 @@ async fn elastic_import_scan(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     let explicit = secret.map(token);
-    let candidates =
-        tentanas::elastic::import_scan(&g.db, &elastic_owner(&g), explicit.as_deref())
+    // Another tenant of this node never appears in this list at all
+    // (`orgs_on_node`), so nothing below can name one.
+    let orgs = orgs_on_node(ctx)?;
+    let mut candidates =
+        tentanas::elastic::import_scan(&g.db, &elastic_owner(&g), &orgs, explicit.as_deref())
             .await
             .map_err(|e| privileged_error("elastic import scan", e))?;
+    for candidate in candidates.iter_mut() {
+        candidate.owner_instance_name = own_org_instance_name(&candidate.owner_kind, || {
+            addon_display_name(ctx, &candidate.owner_addon_id)
+        });
+    }
     Ok(tn(P::ElasticArrayImportScanResponse { candidates }))
 }
 
@@ -3479,10 +3706,15 @@ async fn elastic_import(
     tentanas_helper::elastic::validate_elastic_uuid(array_id)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let owner = elastic_owner(&g);
+    // The same tenant rule as the scan: another org of this node's journal is
+    // not a candidate, so the adoption refuses it like a journal that is not
+    // there — hiding it in the dialog alone would not stop a crafted request.
+    let orgs = orgs_on_node(ctx)?;
     let explicit = secret.map(token);
     let name = tentanas::elastic::import_apply(
         &g.db,
         &owner,
+        &orgs,
         array_id,
         confirm_name,
         &g.user_id,
@@ -4502,11 +4734,16 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             sudo_password,
         } => {
             let g = gate_destructive(ctx)?;
+            // Titled from the dialog's own scan, never by a second one: the
+            // reply must not wait on privileged work that can outlast the
+            // client's timeout (`import_scan_names`).
+            let subject =
+                import_job_subject(&g.org_id, guid, new_name, std::time::Instant::now());
             spawn_pool_job(
                 ctx,
                 &g,
                 "pool_import",
-                if new_name.is_empty() { guid } else { new_name },
+                &subject,
                 HelperCommand::ZpoolImport {
                     guid: guid.clone(),
                     new_name: new_name.clone(),
@@ -5406,6 +5643,30 @@ mod registration_tests {
         assert!(store::list_jobs(&g.db,100).unwrap().is_empty());
         assert!(store::elastic_claims(&g.db).unwrap().is_empty());
         assert_eq!(tentanas::elevation::audit_entries(&g.db),0);
+    }
+
+    /// The set an Elastic journal's owner is judged against: every
+    /// organisation this node has a row for, a soft-deleted one included —
+    /// its data is still under retention, so its array must stay out of
+    /// another tenant's reach — and never an org the node has not heard of.
+    #[test]
+    fn orgs_on_node_holds_every_organisation_of_this_node_a_deleted_one_included() {
+        let fixture = dispatch_fixture();
+        let db = &fixture.ctx.state.db;
+        let live = crate::services::org::create_organization(db, "Tenant A", "tenant-a", None, None, None, None).unwrap();
+        let gone = crate::services::org::create_organization(db, "Tenant B", "tenant-b", None, None, None, None).unwrap();
+        assert!(crate::services::org::delete_organization(db, &gone.org_id).unwrap());
+
+        let orgs = orgs_on_node(&fixture.ctx).unwrap();
+        assert!(orgs.contains(&live.org_id));
+        assert!(orgs.contains(&gone.org_id), "a soft-deleted org still owns its arrays");
+        assert!(!orgs.contains("org-from-another-machine"));
+        let asking = ElasticOwner { org_id: live.org_id.clone(), addon_id: "nas".into() };
+        let journal_owner = ElasticOwner { org_id: gone.org_id.clone(), addon_id: "nas".into() };
+        assert_eq!(
+            tentanas::elastic::owner_kind(&journal_owner, &asking, &orgs),
+            tentanas::elastic::OWNER_KIND_OTHER_ORG_ON_NODE
+        );
     }
 
     /// The recovery path is admin-only and validates what it was given before
@@ -7096,4 +7357,119 @@ mod registration_tests {
     // name without the suffix slipped past its own filter) and that no two arms
     // answer to one name. Moved by agreement between the two sessions working in
     // this tree; what stays here is what is about THIS family.
+
+    /// A pool imported under its own name is titled by that NAME in the job
+    /// list, resolved from the scan by the GUID the request carries — never
+    /// by the GUID itself, and never by a nameless row.
+    #[test]
+    fn a_kept_name_import_is_titled_from_the_last_scan_and_never_by_its_guid() {
+        use tentaflow_protocol::tentanas::NasImportablePool;
+        // A per-test organisation: the cache is process-wide.
+        let org = "org-import-title-test";
+        let t0 = std::time::Instant::now();
+        let pools = vec![
+            NasImportablePool { name: "tank".into(), guid: "1111".into(), ..Default::default() },
+            NasImportablePool { name: "tank".into(), guid: "2222".into(), ..Default::default() },
+            NasImportablePool { name: String::new(), guid: "3333".into(), ..Default::default() },
+        ];
+        // No scan yet: the kind alone, not the GUID.
+        assert_eq!(import_job_subject(org, "2222", "", t0), "");
+        remember_import_scan(org, &pools, t0);
+        assert_eq!(import_job_subject(org, "2222", "", t0), "tank");
+        assert_eq!(import_job_subject(org, "3333", "", t0), "", "no name, no title");
+        assert_eq!(import_job_subject(org, "9999", "", t0), "", "not in the scan");
+        // A new name is the title whatever the cache says.
+        assert_eq!(import_job_subject(org, "2222", "archiwum", t0), "archiwum");
+        // Another organisation's scan does not title this one's jobs.
+        assert_eq!(import_job_subject("org-import-title-other", "2222", "", t0), "");
+        // Stale: past the TTL the name no longer titles anything.
+        let later = t0 + IMPORT_SCAN_NAMES_TTL + Duration::from_secs(1);
+        assert_eq!(import_job_subject(org, "2222", "", later), "");
+        // A newer scan REPLACES the old answer: a pool it no longer lists
+        // stops titling jobs.
+        remember_import_scan(org, &pools[..1], t0);
+        assert_eq!(import_job_subject(org, "2222", "", t0), "");
+        assert_eq!(import_job_subject(org, "1111", "", t0), "tank");
+    }
+
+    #[test]
+    fn the_import_request_answers_without_a_second_privileged_scan() {
+        // The arm of `PoolImportRequest` must not call `importable_pools`: a
+        // second scan of up to 120 s inside the client's 120 s timeout is what
+        // showed the admin a failure while the node imported anyway.
+        let src = include_str!("tentanas.rs");
+        let arm = src
+            .split("P::PoolImportRequest {")
+            .nth(1)
+            .and_then(|rest| rest.split("P::PoolAddVdevRequest {").next())
+            .expect("the PoolImportRequest arm");
+        assert!(!arm.contains("importable_pools("), "{arm}");
+        assert!(arm.contains("import_job_subject("), "{arm}");
+    }
+
+    #[test]
+    fn only_an_owner_of_the_asking_org_is_named_and_another_tenant_is_never_looked_up() {
+        use crate::tentanas::elastic::{OWNER_KIND_OTHER_INSTALLATION, OWNER_KIND_THIS_INSTANCE, OWNER_KIND_THIS_ORG};
+        assert_eq!(own_org_instance_name(OWNER_KIND_THIS_ORG, || Some(" NAS biuro ".into())), "NAS biuro");
+        assert_eq!(own_org_instance_name(OWNER_KIND_THIS_ORG, || None), "");
+        // The lookup itself must not run for another tenant — not merely have
+        // its answer dropped.
+        for kind in [OWNER_KIND_OTHER_INSTALLATION, OWNER_KIND_THIS_INSTANCE, "", "garbage"] {
+            let name = own_org_instance_name(kind, || panic!("{kind}: another tenant's name was looked up"));
+            assert_eq!(name, "", "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_smart_job_on_a_disk_gone_from_the_inventory_is_titled_by_its_last_known_name() {
+        use tentanas::disks::ShownDiskName;
+        let id = "wwn-5000cca27dc7a4c6";
+        // A live name is shown as it is; a remembered one travels flagged, so
+        // the screen can mark it as last-known (the one naming rule).
+        assert_eq!(smart_subject_name(id, |_| ShownDiskName::Live("sdg".into())), Some(("sdg".to_string(), false)));
+        assert_eq!(smart_subject_name(id, |_| ShownDiskName::LastKnown("sdq".into())), Some(("sdq".to_string(), true)));
+        assert_eq!(smart_subject_name(id, |_| ShownDiskName::Unknown), None);
+        // Through the real rule and a real database: the disk is recorded,
+        // then gone from the live map.
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        tentanas::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let gone = "wwn-smart-subject-left-the-inventory-5000cca2";
+        tentanas::db::upsert_disk_seen(
+            &db,
+            &tentanas::db::DiskIdentity {
+                disk_id: gone,
+                name: "sdq",
+                model: "HGST",
+                serial: "S9",
+                wwn: None,
+                size_bytes: 1,
+                kind: "hdd",
+            },
+        )
+        .expect("record the disk");
+        assert!(tentanas::disks::disk_name(gone).is_none());
+        let named = smart_subject_name(gone, |id| tentanas::disks::shown_disk_name(&db, id, None));
+        assert_eq!(named, Some(("sdq".to_string(), true)), "gone, so the name is flagged as last-known");
+    }
+
+    #[test]
+    fn a_wipe_plan_for_a_vanished_disk_names_it_and_never_by_its_id() {
+        use tentanas::disks::ShownDiskName;
+        let last = disk_gone_message(ShownDiskName::LastKnown("sdq".into()));
+        assert!(last.contains("last seen as sdq"), "{last}");
+        let unknown = disk_gone_message(ShownDiskName::Unknown);
+        assert!(!unknown.contains("wwn-") && !unknown.contains("sn-"), "{unknown}");
+    }
+
+    #[test]
+    fn a_target_is_refused_when_the_hostname_leaves_no_iqn_host_segment() {
+        // `iqn.2026-09.local.tentaflow:.vm-store` is what these used to produce.
+        for hostname in ["", "   ", "___", "..."] {
+            let err = target_host_for_create(hostname).expect_err(hostname);
+            assert!(err.message.contains("hostname"), "{hostname:?}: {}", err.message);
+        }
+        // A real one passes through unchanged: `wwn_for` sanitises it itself.
+        assert_eq!(target_host_for_create("Helios_02.lan").unwrap(), "Helios_02.lan");
+    }
 }

@@ -470,6 +470,35 @@ class TfTable extends HTMLElement {
     this._thead.replaceChildren(tr);
   }
 
+  // The header select-all box was built once in `_renderThead` and never
+  // touched again, so it kept whatever `checked` a previous click left it at:
+  // once the host cleared the selection (a bulk action, a filter change) the
+  // box stayed ticked with every row unticked underneath it (MINOR D, critic
+  // 2026-09-22, probe S3). Re-derived from the rows ON SCREEN on every render
+  // instead — all selected -> checked, none -> unchecked, a mix ->
+  // indeterminate (tf-checkbox supports the attribute) — and written only
+  // when a value actually differs, the same rule every other sync in this file
+  // follows so an unrelated poll cannot cause a spurious re-render of the box.
+  _syncSelectAllBox(rows) {
+    if (!this._isMultiSelect()) return;
+    const cb = this._thead && this._thead.querySelector('.tf-table__select-all');
+    if (!cb) return;
+    const total = rows.length;
+    let selectedCount = 0;
+    for (const r of rows) if (r && typeof r === 'object' && r._selected) selectedCount += 1;
+    const allSelected = total > 0 && selectedCount === total;
+    const noneSelected = selectedCount === 0;
+    const indeterminate = total > 0 && !allSelected && !noneSelected;
+    if (cb.hasAttribute('indeterminate') !== indeterminate) {
+      if (indeterminate) cb.setAttribute('indeterminate', '');
+      else cb.removeAttribute('indeterminate');
+    }
+    if (cb.hasAttribute('checked') !== allSelected) {
+      if (allSelected) cb.setAttribute('checked', '');
+      else cb.removeAttribute('checked');
+    }
+  }
+
   _updateSortIndicators() {
     const ths = this._thead.querySelectorAll('th.sortable');
     ths.forEach((th) => {
@@ -548,7 +577,14 @@ class TfTable extends HTMLElement {
     if (tbody.children.length === 1 && current?.classList.contains('tf-table__empty-row')) {
       const td = current.firstElementChild;
       if (td.colSpan !== span) td.colSpan = span;
-      if (td.textContent !== text) td.textContent = text;
+      // Same source-cache rule as `_writeCell`'s text branch (see there for
+      // why comparing against a DOM read-back is the wrong contract to build
+      // on), applied here because this cell is written directly and never
+      // goes through `_writeCell`.
+      if (td.__tfText !== text) {
+        td.textContent = text;
+        td.__tfText = text;
+      }
       return;
     }
     const tr = document.createElement('tr');
@@ -557,6 +593,7 @@ class TfTable extends HTMLElement {
     td.className = 'tf-table__empty-cell';
     td.colSpan = span;
     td.textContent = text;
+    td.__tfText = text;
     tr.appendChild(td);
     tbody.replaceChildren(tr);
   }
@@ -612,6 +649,17 @@ class TfTable extends HTMLElement {
     }
   }
 
+  // Builds the row checkbox exactly the way `_buildRow` always has, factored
+  // out so the recycle path (`_syncRowSelectBox`) creates the SAME node shape
+  // when a checkbox is missing — one construction site, not two that could
+  // drift apart.
+  _makeRowCheckbox() {
+    const cb = document.createElement('tf-checkbox');
+    cb.className = 'tf-table__row-select';
+    cb.setAttribute('aria-label', 'Zaznacz wiersz');
+    return cb;
+  }
+
   _buildRow(cols, row, idx) {
     const rtr = document.createElement('tr');
     rtr.dataset.idx = String(idx);
@@ -631,9 +679,7 @@ class TfTable extends HTMLElement {
       // The select-all box lives in the first header cell, so the per-row box
       // belongs in the matching first data cell — no extra column.
       if (i === 0 && this._isMultiSelect()) {
-        const cb = document.createElement('tf-checkbox');
-        cb.className = 'tf-table__row-select';
-        cb.setAttribute('aria-label', 'Zaznacz wiersz');
+        const cb = this._makeRowCheckbox();
         if (row && row._selected) cb.setAttribute('checked', '');
         td.appendChild(cb);
       }
@@ -659,6 +705,39 @@ class TfTable extends HTMLElement {
     if (next) tr.dataset.rowClass = next; else delete tr.dataset.rowClass;
   }
 
+  // Multi-select cell 0 is recycled by index, so a poll, a sort or a filter
+  // can hand this <td> a DIFFERENT logical row than the one whose tick is
+  // still sitting in the DOM. The row's own `_selected` field is the single
+  // source of truth for what should be checked (the same field `_buildRow`
+  // reads, and the field select-all / `_onChange` set on the data the host
+  // reassigns) — this brings the checkbox and the `<tr>`'s `selected` class
+  // back in line with it on every update, creating the checkbox first when a
+  // table only just became multi-select (see the `selectable` toggle test).
+  // Writes only when a value differs, so an unchanged row's checkbox is left
+  // completely alone, which is what lets it survive an unrelated poll intact.
+  //
+  // A row with no OWN `_selected` key (a table that never uses selection, or
+  // a poll that only refreshes other fields) leaves the existing checked /
+  // selected state untouched rather than forcing it to false — otherwise a
+  // user's in-flight click, or a caller that manages selection without ever
+  // setting the field, would be silently unticked on the very next render.
+  _syncRowSelectBox(td, tr, row) {
+    let cb = td.firstElementChild;
+    if (!(cb && cb.tagName === 'TF-CHECKBOX' && cb.classList.contains('tf-table__row-select'))) {
+      cb = this._makeRowCheckbox();
+      td.insertBefore(cb, td.firstChild);
+    }
+    if (!(row && typeof row === 'object' && Object.prototype.hasOwnProperty.call(row, '_selected'))) return;
+    const selected = !!row._selected;
+    if (cb.hasAttribute('checked') !== selected) {
+      if (selected) cb.setAttribute('checked', '');
+      else cb.removeAttribute('checked');
+    }
+    if (tr.classList.contains('selected') !== selected) {
+      tr.classList.toggle('selected', selected);
+    }
+  }
+
   _updateRowCells(tr, cols, row, idx) {
     const tds = tr.children;
     this._applyRowClass(tr, row);
@@ -677,7 +756,23 @@ class TfTable extends HTMLElement {
       this._applyHideBelow(td, cols[i]);
       this._applyCardLabel(td, cols[i]);
       if (stickySet.has(i)) this._applySticky(td, i);
-      this._writeCell(td, cols[i], row[cols[i].key]);
+      const isSelectCell = i === 0 && this._isMultiSelect();
+      // Ensure the checkbox exists and its state matches the row BEFORE the
+      // value write below: `_writeCell`'s `keepExisting` path decides whether
+      // it can reuse the cached holder by looking at the td's children, and it
+      // must find the checkbox (new or existing) already in place.
+      if (isSelectCell) this._syncRowSelectBox(td, tr, row);
+      // Cell 0 of a multi-select row carries the row checkbox ahead of its
+      // value (see _buildRow). Without `keepExisting` here this recycled
+      // write went straight into the td — for the html renderer, `__tfHtml`
+      // is never recorded on that path (see `_buildRow`'s own `keepExisting`
+      // call), so it wrote unconditionally; for every other renderer the
+      // first poll after a fresh build found no matching cache either and
+      // wrote too. Either way `td.innerHTML =` / `td.textContent =` deleted
+      // the checkbox outright. Routing through the same `keepExisting` path
+      // the build uses keeps the checkbox untouched and rewrites only the
+      // value holder.
+      this._writeCell(td, cols[i], row[cols[i].key], isSelectCell);
     }
     if (this._rowActions) {
       // A recycled <tr> may now show a different logical row. The actions
@@ -788,10 +883,58 @@ class TfTable extends HTMLElement {
       return;
     }
     if (keepExisting) {
-      const holder = document.createElement('span');
+      // Multi-select cell 0 holds the row checkbox PLUS the value: the
+      // checkbox is appended by the caller (build path) or already sits there
+      // (update path), and the value goes into a separate holder <span> so it
+      // can be rewritten without ever touching the checkbox node. The holder
+      // is cached on the td (`__tfValueHolder`) and REUSED across updates —
+      // never recreated — for the same reason `_writeActionsCell` keeps its
+      // node: recreating it here would still delete nothing visible, but it
+      // would reset the holder's own `__tfHtml`/`__tfText`/`__tfRenderer`
+      // cache every poll, defeating the source-cache rule below for every
+      // multi-select first column. `_buildRow` and `_updateRowCells` both
+      // funnel through here so the two paths produce the exact same DOM shape
+      // (checkbox, then holder) and can never diverge.
+      let holder = td.__tfValueHolder;
+      // A plain write in between (the table stopped being multi-select, or a
+      // column change handed this recycled cell to another renderer) replaces
+      // the td's children and leaves the cached holder detached — writing the
+      // value into it would put it nowhere on screen.
+      if (!holder || holder.parentNode !== td) {
+        // Whatever that plain write left (a text node, stale markup) goes too;
+        // only the row checkbox stays.
+        for (const node of [...td.childNodes]) {
+          if (!(node.nodeType === 1 && node.classList.contains('tf-table__row-select'))) node.remove();
+        }
+        holder = document.createElement('span');
+        holder.className = 'tf-table__cell-value';
+        td.appendChild(holder);
+        td.__tfValueHolder = holder;
+      }
+      // The value now lives in the HOLDER, which keeps its own
+      // `__tfHtml`/`__tfText` source cache. The td's own cache still describes
+      // whatever a PLAIN write last put directly on the td, before multi-select
+      // wrapped the value in a holder. Left in place, that stale cache survives
+      // untouched here (this branch never writes td.__tfHtml/__tfText) and later
+      // matches again the moment `selectable` turns off and cell 0 goes back to
+      // a plain write with the SAME value — skipping the very write that must
+      // remove the checkbox and holder from the td (MINOR E, critic
+      // 2026-09-22). Clearing it on every entry into this branch means the next
+      // plain write always finds no cache to (falsely) agree with.
+      td.__tfHtml = undefined;
+      td.__tfText = undefined;
       this._writeCell(holder, col, value);
-      td.appendChild(holder);
       return;
+    }
+    // The source caches below (`__tfHtml`, `__tfText`) describe what ONE
+    // renderer last wrote. Cells are recycled by index and a column change
+    // rebuilds only the head, so the same <td> can be written by another
+    // renderer (chip, img) and later by its old one with the old string —
+    // a cache left from before would then skip a write the cell needs.
+    if (td.__tfRenderer !== col.renderer) {
+      td.__tfRenderer = col.renderer;
+      td.__tfHtml = undefined;
+      td.__tfText = undefined;
     }
     if (col.renderer === 'chip') {
       const chip = typeof value === 'object' && value
@@ -826,7 +969,29 @@ class TfTable extends HTMLElement {
       const next = value ?? '';
       // Skip jesli identyczne — eliminuje koszt parsowania HTML komorki gdy
       // wiersz przyszedl niezmieniony z API (najczestsze w 2-sekundowym refreshu).
-      if (td.innerHTML !== next) td.innerHTML = next;
+      //
+      // The comparison MUST be against the SOURCE string this component last
+      // wrote (cached on the cell as `__tfHtml`), never against `td.innerHTML`
+      // read back from the browser. Once a cell has been parsed, its innerHTML
+      // is a RE-SERIALIZATION, not the original string: a custom element such
+      // as <tf-chip> renders into its own light DOM and replaces the markup it
+      // was given, a self-closing `<use/>` comes back as `<use></use>`, and
+      // attribute quoting/order gets normalized. Comparing `td.innerHTML !==
+      // next` is therefore true on almost every poll even when nothing
+      // changed, and every table in the product rewrote every html cell on
+      // every refresh (critic 2026-09-21: mockups n01-n10 M11, n11-n19 MAJOR
+      // 9) — tearing down live subtrees the owner's hard rule says must only
+      // be patched. `__tfHtml` starts undefined on a fresh `<td>` (including
+      // one recycled from a previous, unrelated row), so the first write for
+      // any cell always happens; after that it can only match when THIS
+      // component produced the current content from this exact string, which
+      // is exactly "unchanged" — even for a row-recycled cell now showing a
+      // different logical row, since identical source text means identical
+      // visible content regardless of which row it came from.
+      if (td.__tfHtml !== next) {
+        td.innerHTML = next;
+        td.__tfHtml = next;
+      }
     } else if (col.renderer === 'img') {
       // Small inline thumbnail from an image URL cell. An empty value renders a
       // muted em-dash so a missing thumbnail is visible but unobtrusive. The URL
@@ -851,7 +1016,14 @@ class TfTable extends HTMLElement {
     } else {
       const next = value ?? '';
       const txt = typeof next === 'string' ? next : String(next);
-      if (td.textContent !== txt) td.textContent = txt;
+      // Plain text does not go through HTML parsing, so `td.textContent` read
+      // back is exact today — but cache the SOURCE string here too rather than
+      // rely on that being true forever, for the same reason the html branch
+      // above cannot trust `td.innerHTML`: one write path, one comparison rule.
+      if (td.__tfText !== txt) {
+        td.textContent = txt;
+        td.__tfText = txt;
+      }
     }
   }
 
@@ -870,6 +1042,7 @@ class TfTable extends HTMLElement {
 
     const rows = this._sortedRows();
     this._renderTbody(cols, rows);
+    this._syncSelectAllBox(rows);
     this._renderPager();
   }
 
@@ -977,10 +1150,17 @@ class TfTable extends HTMLElement {
       const idx = tr ? parseInt(tr.dataset.idx, 10) : NaN;
       if (!Number.isInteger(idx)) return;
       const checked = typeof target.checked === 'boolean' ? target.checked : !!rowBox.checked;
+      const row = this._sortedRows()[idx];
+      // The DATA row is the one source of selection truth: every render syncs
+      // the box FROM `row._selected` (`_syncRowSelectBox`), so a click that
+      // only toggled the box would be undone by the next render — a sort
+      // header click, a page change — before the host had reassigned rows.
+      if (row && typeof row === 'object') row._selected = checked;
+      rowBox.toggleAttribute('checked', checked);
       tr.classList.toggle('selected', checked);
       this.dispatchEvent(new CustomEvent('row-select', {
         bubbles: true,
-        detail: { row: this._sortedRows()[idx], index: idx, selected: checked },
+        detail: { row, index: idx, selected: checked },
       }));
       return;
     }
@@ -988,6 +1168,11 @@ class TfTable extends HTMLElement {
     if (!box) return;
     // Host odzwierciedla stan atrybutem; input niesie go wprost.
     const checked = typeof target.checked === 'boolean' ? target.checked : !!box.checked;
+    // Same rule as a row box: what the user sees selected is written into the
+    // rows on screen, so a render before the host answers keeps it.
+    for (const row of this._rows) {
+      if (row && typeof row === 'object') row._selected = checked;
+    }
     this.dispatchEvent(new CustomEvent('select-all', {
       bubbles: true,
       detail: { selected: checked },

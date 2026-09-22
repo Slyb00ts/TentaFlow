@@ -430,7 +430,13 @@ pub struct NasReplacementAdvice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasDiskWipeRefusal {
     /// 'system' | 'zfs_pool' | 'mdraid' | 'elastic_member' | 'mounted' |
-    /// 'journal_serving' | 'journal_unknown'.
+    /// 'journal_serving' | 'journal_unknown' | 'journal_other_org'.
+    ///
+    /// 'journal_other_org': the disk belongs to an Elastic journal of ANOTHER
+    /// organisation that exists on this node. Its `detail` names no array,
+    /// and the plan carries no `journal_claim` for it — one tenant is not
+    /// told another tenant's array name, and may not destroy what it may not
+    /// adopt. The screen words this code in the admin's language.
     ///
     /// Every code here is produced by `tentanas::disks::plan_wipe`; a code
     /// documented and never produced is a promise to the frontend that
@@ -461,11 +467,36 @@ pub struct NasDiskWipeJournalClaim {
     /// Members the journal lists, so the dialog can say how much of the array
     /// is being given up ("1 z 9 dysków").
     pub member_count: u32,
-    /// The owner the journal records. Shown when it is not this instance's
-    /// own, because then the array belongs to another provisioning and
-    /// acknowledging its loss is not this admin's own array to lose.
+    /// The owner the journal records, as ids. They identify, they do not
+    /// name: the dialog carries them only in a tooltip and composes its
+    /// sentence from `owner_kind` / `owner_instance_name`. EMPTY for an
+    /// 'other_installation' owner — another tenant's ids never reach this
+    /// tenant's browser, not even as a tooltip.
     pub owner_org_id: String,
     pub owner_addon_id: String,
+    /// Whether that owner is NOT the instance asking. Decided on the node,
+    /// which knows its own org and addon; the dialog used to infer "foreign"
+    /// from the ids merely being present, and called this instance's own
+    /// journal somebody else's.
+    #[serde(default)]
+    pub owner_foreign: bool,
+    /// Whose journal it is, as a code the front end turns into a sentence:
+    /// 'this_instance' | 'this_org' (another instance of the asking
+    /// organisation) | 'other_installation' (an organisation this node has
+    /// no record of — disks moved in from another machine). Empty from an
+    /// older node, which sent 'other_installation' for every other
+    /// organisation, this node's tenants included.
+    ///
+    /// Never 'other_org_on_node': a journal of another organisation that
+    /// exists on this node is not reported as a claim at all but as the
+    /// refusal 'journal_other_org', without its name.
+    #[serde(default)]
+    pub owner_kind: String,
+    /// The owning instance's display name — sent ONLY for 'this_org', whose
+    /// admin may know it. Another organisation's names never cross the
+    /// tenant boundary, so for every other kind this is empty.
+    #[serde(default)]
+    pub owner_instance_name: String,
 }
 
 /// What clearing one disk would remove, and everything that stops it.
@@ -540,6 +571,14 @@ pub struct NasJob {
     pub finished_at: Option<String>,
     pub error: Option<String>,
     pub log: Vec<String>,
+    /// `subject` is a disk name the node only REMEMBERS — the disk has left
+    /// its inventory — and not the device as it is now. Set for a SMART job
+    /// only (its stored subject is the `disk_id`, swapped for a name on the
+    /// way out). The screen marks such a name ("ostatnio widziany jako sdq"):
+    /// the kernel may since have handed it to another disk, and an unmarked
+    /// `sdq` would point the admin at the wrong drive in the shelf.
+    #[serde(default)]
+    pub subject_last_known: bool,
 }
 
 // =============================================================================
@@ -1326,6 +1365,14 @@ pub struct NasBlockCapabilities {
     pub dhchap_detail: String,
     pub interfaces: Vec<NasBlockInterface>,
     pub volumes: Vec<NasBlockVolume>,
+    /// The host segment this node puts into every IQN / NQN it creates — its
+    /// own kernel hostname through the same sanitiser the create path uses
+    /// (`targets::wwn_host`). The wizard previews a new target's identity with
+    /// exactly this, never with a display label or the node id. Empty when the
+    /// hostname is unknown or sanitises to nothing (the node then refuses to
+    /// create a target) and from a node too old to send it.
+    #[serde(default)]
+    pub wwn_host: String,
 }
 
 // =============================================================================
@@ -1357,10 +1404,25 @@ pub struct NasBlockCapabilities {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasElasticBranch {
     pub disk_id: String,
-    /// Kernel name (`sdg`) — what the branch directory and the snapraid data
-    /// entry are called.
+    /// The SLOT (`d1`, `c1`) — what the branch directory and the snapraid
+    /// data entry are called, and what a request names a member by. It is a
+    /// key, not a disk name: the screen shows `disk_name`.
     pub name: String,
+    /// The node's view of the member's filesystem (`/dev/disk/by-uuid/…`) —
+    /// what mount is pointed at. A tooltip at most, never a label.
     pub device: String,
+    /// The disk's LIVE kernel name (`sdg`, `nvme2n1`): the node's inventory
+    /// entry for `disk_id`, or else the name the helper resolved the member's
+    /// device to in this same read (a core that has just started has no
+    /// inventory yet). EMPTY when neither has the disk now.
+    #[serde(default)]
+    pub disk_name: String,
+    /// The name the disk was LAST seen under, sent only when `disk_name` is
+    /// empty. The screen marks it as last-known and never presents it as the
+    /// current device: the kernel may since have given it to another disk.
+    /// Whether the member is ABSENT is `device_present`'s answer, not this.
+    #[serde(default)]
+    pub disk_last_name: String,
     /// 'hdd' | 'ssd' | 'nvme' | 'unknown', from the disk inventory.
     pub kind: String,
     /// 'data' | 'cache'.
@@ -1394,8 +1456,15 @@ pub struct NasElasticBranch {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasElasticParity {
     pub disk_id: String,
+    /// The slot (`parity1`), as `NasElasticBranch::name`.
     pub name: String,
     pub device: String,
+    /// The live kernel name, as `NasElasticBranch::disk_name`.
+    #[serde(default)]
+    pub disk_name: String,
+    /// As `NasElasticBranch::disk_last_name`.
+    #[serde(default)]
+    pub disk_last_name: String,
     /// 1-based. It decides both the snapraid directive (`parity` /
     /// `2-parity`) and the file name.
     pub index: u8,
@@ -1740,24 +1809,41 @@ pub struct NasElasticImportCandidate {
     pub name: String,
     /// 'xfs' | 'ext4'.
     pub filesystem: String,
-    /// The owner the journal records. When it differs from this addon's own,
-    /// adopting re-owns the array, and the dialog has to say so rather than
-    /// quietly reassigning somebody else's storage.
+    /// The owner the journal records, as ids — sent ONLY when that owner is
+    /// the asking organisation's (`owner_kind` 'this_instance' | 'this_org')
+    /// and EMPTY for 'other_installation': another installation's ids are not this
+    /// tenant's to read, not even in a tooltip. Nothing on the client needs
+    /// them — the adoption request carries only `array_id` and the retyped
+    /// name, and the node re-reads the owner from the journal itself. The
+    /// screen composes its sentence from `owner_kind`.
     pub owner_org_id: String,
     pub owner_addon_id: String,
+    /// Whether the journal's owner is NOT the instance that scanned.
+    #[serde(default)]
+    pub owner_foreign: bool,
+    /// As `NasDiskWipeJournalClaim::owner_kind` / `owner_instance_name`.
+    /// A journal of another organisation that exists on this node is never a
+    /// candidate: the scan leaves it out and the adoption refuses it.
+    #[serde(default)]
+    pub owner_kind: String,
+    #[serde(default)]
+    pub owner_instance_name: String,
     pub data_disks: u32,
     pub parity_disks: u32,
     pub cache_disks: u32,
     /// Members whose filesystem UUID still matches what the journal recorded.
     pub disks_matched: u32,
-    /// Members this node cannot find, named as the journal knew them.
-    pub disks_missing: Vec<String>,
+    /// Members this node cannot find. Structured, never a sentence: the
+    /// dialog names each by its part in the array and the serial printed on
+    /// the drive — the kernel name went with the disk, and the journal's
+    /// `disk_id` is not something to read.
+    pub disks_missing: Vec<NasElasticImportMember>,
     /// Members that are present but whose filesystem UUID has changed: the
     /// disk was reused for something else. Kept apart from `disks_missing`
     /// because the remedy differs — a missing disk may come back, a reused one
     /// is gone, and adopting it would claim data that is no longer the
-    /// array's.
-    pub disks_reused: Vec<String>,
+    /// array's. Named by the kernel name the disk has now (`disk_name`).
+    pub disks_reused: Vec<NasElasticImportMember>,
     /// The union is still published on the host: the array is live and serving
     /// right now, even though the database has never heard of it.
     pub union_mounted: bool,
@@ -1766,6 +1852,32 @@ pub struct NasElasticImportCandidate {
     /// One sentence naming what adopting this would do, or why it cannot be
     /// done.
     pub detail: String,
+}
+
+/// One member of a scanned journal that stops the adoption, as DATA: the
+/// dialog composes "dysk danych 2 (S/N …)" from it with the same helper the
+/// Elastic detail screen names its members with, so the words follow the
+/// admin's language instead of arriving as a Polish sentence in every locale.
+///
+/// The fields mirror `NasElasticBranch` / `NasElasticParity` by name, which is
+/// what lets one front-end helper read all three.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasElasticImportMember {
+    /// The SLOT (`d2`, `c1`, `parity1`) — a key the dialog never prints; a
+    /// data member's ordinal is its trailing digits.
+    pub name: String,
+    /// 'data' | 'cache' | 'parity'.
+    pub role: String,
+    /// A parity member's 1-based level; `None` for data and cache, exactly as
+    /// only `NasElasticParity` carries an `index`.
+    pub index: Option<u8>,
+    /// The kernel name the disk has NOW on this node (`sdh`) — filled only
+    /// for a reused member, which is here. A missing member has none.
+    pub disk_name: String,
+    /// The serial number the journal recorded — the label printed on the
+    /// drive, the one thing that finds a missing disk in a shelf. Empty when
+    /// the journal holds none.
+    pub serial: String,
 }
 
 /// Whether this node can run an Elastic Array at all — probed, never assumed.
@@ -3558,6 +3670,12 @@ mod tests {
                 member_count: 9,
                 owner_org_id: "org".to_string(),
                 owner_addon_id: "nas".to_string(),
+                // All travel: the flag decides the warning, the kind and the
+                // own-org instance name are what the dialog composes its
+                // sentence from instead of the ids.
+                owner_foreign: true,
+                owner_kind: "this_org".to_string(),
+                owner_instance_name: "TentaNas".to_string(),
             }),
             allowed: false,
         };
@@ -3598,6 +3716,39 @@ mod tests {
         let back: TentaNasPayload =
             crate::cbor::decode(&crate::cbor::encode(&named).expect("encode")).expect("decode");
         assert_eq!(back, named);
+    }
+
+    /// An import candidate's refusing members travel as data — role, level,
+    /// kernel name, serial — so the dialog can name them in the admin's
+    /// language; a parity member keeps its level and a data member none.
+    #[test]
+    fn an_import_candidate_carries_its_members_as_data() {
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ElasticArrayImportScanResponse {
+            candidates: vec![NasElasticImportCandidate {
+                array_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                name: "archiwum".to_string(),
+                owner_kind: "other_installation".to_string(),
+                status: "incomplete".to_string(),
+                disks_missing: vec![NasElasticImportMember {
+                    name: "parity1".to_string(),
+                    role: "parity".to_string(),
+                    index: Some(1),
+                    disk_name: String::new(),
+                    serial: "WD-7788".to_string(),
+                }],
+                disks_reused: vec![NasElasticImportMember {
+                    name: "d2".to_string(),
+                    role: "data".to_string(),
+                    index: None,
+                    disk_name: "sdh".to_string(),
+                    serial: String::new(),
+                }],
+                ..Default::default()
+            }],
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
     }
 
     /// The N2.5 additions (§5.10): every optional field of the new requests
@@ -3889,9 +4040,13 @@ mod tests {
             create_policy: "mfs".to_string(),
             filesystem: "xfs".to_string(),
             data_disks: vec![NasElasticBranch {
-                disk_id: "d1".to_string(),
-                name: "sdg".to_string(),
-                device: "/dev/sdg".to_string(),
+                disk_id: "wwn-5000cca27dc7a4c6".to_string(),
+                name: "d1".to_string(),
+                device: "/dev/disk/by-uuid/2a7f1c30-9e64-4b8d-a5f2-71c3e806d914".to_string(),
+                // The kernel name is what the screen shows, and the slot is
+                // not: both have to survive the wire as distinct values.
+                disk_name: "sdg".to_string(),
+                disk_last_name: String::new(),
                 kind: "hdd".to_string(),
                 role: "data".to_string(),
                 filesystem: "xfs".to_string(),
@@ -4028,6 +4183,11 @@ mod tests {
         );
         assert_eq!(decoded.cache_disks[0].mounted, None);
         assert_eq!(decoded.data_disks[0].mounted, Some(true));
+        assert_eq!(
+            (decoded.data_disks[0].name.as_str(), decoded.data_disks[0].disk_name.as_str()),
+            ("d1", "sdg"),
+            "the slot and the kernel name are two fields"
+        );
         assert_eq!(decoded.mover.last_run.expect("a run").skipped_files, 3);
         assert!(decoded.folders_known, "a readable union stays readable over the wire");
         assert_eq!(decoded.folders[0].cache_policy, "only");

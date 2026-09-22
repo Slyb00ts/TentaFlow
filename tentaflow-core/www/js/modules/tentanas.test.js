@@ -480,6 +480,75 @@ test('the bulk SMART button starts a short test for every selected disk', async 
   Screen.unmount();
 });
 
+// n03's own bulk SMART used to abort on the first refusal of ANY kind, which
+// made it behave differently from the "SMART all disks" schedule action in
+// tasks.js (MINOR 5 of the round-1 review). Both now share `runDiskBatch`
+// (format.js): a disk-specific refusal does not stop the batch.
+test('the bulk SMART button continues past a disk-specific refusal in the middle', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      disks: [disk({}), disk({ diskId: 'sdb', name: 'sdb' }), disk({ diskId: 'sdc', name: 'sdc' })],
+      telemetry: fixtures.tentaNasDisksListRequest.telemetry,
+    },
+    tentaNasDiskSmartTestRequest: (payload) => (payload.diskId === 'sdb'
+      ? Promise.reject(new Error('dysk zajęty'))
+      : Promise.resolve({ job: { jobId: `j-${payload.diskId}`, kind: 'smart_test', subject: payload.diskId, status: 'queued', log: [] } })),
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  const table = root.querySelector('#nas-disk-table');
+  for (const row of table.rows) {
+    table.dispatchEvent(new window.CustomEvent('row-select', { detail: { row, index: 0, selected: true } }));
+  }
+  // Every toast, recorded at the append: utils.js keeps its container in a
+  // module variable that an earlier test's teardown may have detached.
+  const toasts = [];
+  const append = window.Node.prototype.appendChild;
+  window.Node.prototype.appendChild = function (child) {
+    const kind = /(?:^|\s)toast-(\w+)/.exec(child?.className || '')?.[1];
+    if (kind && kind !== 'container') toasts.push({ kind, text: child.textContent });
+    return append.call(this, child);
+  };
+  try {
+    await Screen.startSmartTestBulk();
+    await flush();
+  } finally {
+    window.Node.prototype.appendChild = append;
+  }
+  const sent = kinds('tentaNasDiskSmartTestRequest');
+  assert.deepEqual(sent.map((c) => c.payload.diskId), ['sda', 'sdb', 'sdc'], 'sdc is still tried after sdb refuses — the batch does not stop');
+  // The refusal is a translated sentence around the node's per-disk reason.
+  assert.match(toasts.filter((t) => t.kind === 'warning').map((t) => t.text).join('\n'), /Test SMART nie ruszył na 1 dysku: sdb: dysk zajęty/);
+  Screen.unmount();
+});
+
+// M1: a privilege/credential error must stop the WHOLE batch at once — the
+// same rejected password (or the same unarmed channel) would otherwise be
+// replayed against sudo once per remaining disk.
+test('the bulk SMART button stops at once on a privilege/credential error and sends exactly one request', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      disks: [disk({}), disk({ diskId: 'sdb', name: 'sdb' }), disk({ diskId: 'sdc', name: 'sdc' })],
+      telemetry: fixtures.tentaNasDisksListRequest.telemetry,
+    },
+    tentaNasDiskSmartTestRequest: () => Promise.reject(Object.assign(
+      new Error('Kanał uprawnień systemowych nie jest dostępny (sudo rejected the password)'), { code: 'NotAvailable' },
+    )),
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  const table = root.querySelector('#nas-disk-table');
+  for (const row of table.rows) {
+    table.dispatchEvent(new window.CustomEvent('row-select', { detail: { row, index: 0, selected: true } }));
+  }
+  await Screen.startSmartTestBulk();
+  await flush();
+  const sent = kinds('tentaNasDiskSmartTestRequest');
+  assert.equal(sent.length, 1, 'sda fails with a credential error — sdb and sdc are never sent');
+  assert.equal(sent[0].payload.diskId, 'sda');
+  Screen.unmount();
+});
+
 test('environment tab lists features, the fleet nodes with their capabilities and the elevation rows', async () => {
   stubTransport(fixtures);
   const root = await mountScreen({ node: LOCAL, tab: 'environment' });
@@ -568,6 +637,29 @@ test('withSudo skips the prompt on a provisioned helper and asks for a password 
   Screen.unmount();
 });
 
+// A remote node with no known hostname: the prompt must not say "do węzła
+// Węzeł bez nazwy" or "tentaflow@Węzeł bez nazwy".
+test('the sudo prompt for a nameless remote node reads naturally', async () => {
+  stubTransport(fixtures);
+  await mountScreen({ node: LOCAL });
+  await flush();
+  const pending = Screen.promptSudo('x', { nodeId: REMOTE, nodeName: '', isLocal: false });
+  await flush();
+  const prompt = document.querySelector('tf-window.nas-modal');
+  try {
+    assert.match(prompt.querySelector('.explain-box').textContent, /^Hasło trafi do tego węzła bez nazwy /);
+    assert.equal(prompt.querySelector('#nas-sudo-pass').getAttribute('label'), 'Hasło sudo użytkownika tentaflow na węźle bez nazwy');
+    assert.doesNotMatch(prompt.innerHTML, /Węzeł bez nazwy|bbbbbbbbbbbb/);
+  } finally {
+    // Closed even when an assertion fails, so a pending prompt never keeps
+    // the test process alive.
+    prompt.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'cancel' } }));
+    await pending;
+    prompt.remove();
+    Screen.unmount();
+  }
+});
+
 test('"Uzbrój kanał" stays on the arm-channel prompt and never labels a one-shot sudo prompt', async () => {
   stubTransport(fixtures);
   await mountScreen({ node: LOCAL });
@@ -630,6 +722,28 @@ test('the node header carries the disk-warning and service chips plus the mockup
   const sub = root.querySelector('#nas-head-sub').textContent;
   assert.match(sub, /^węzeł orion · uptime 1 h 0 min · TentaNas 1\.4\.0 · ostatnie odświeżenie/);
   assert.ok(!/6\.1/.test(sub), 'the kernel is not in the header sub');
+  Screen.unmount();
+});
+
+// The node view's header subline used to wrap EVERY node — named or not — in
+// "node.head_sub_node" ("węzeł {name}"). With a nameless node that doubled the
+// word: "node.unnamed" is itself "Węzeł bez nazwy" ("node without a name"),
+// so the sentence read "węzeł Węzeł bez nazwy". `nodeHeadSub` skips the
+// template for the nameless case instead of nesting one translation inside
+// another.
+test('the node header subline reads naturally for a node with no known hostname', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasNodesListRequest: {
+      ...fixtures.tentaNasNodesListRequest,
+      nodes: fixtures.tentaNasNodesListRequest.nodes.map((n) => (n.nodeId === LOCAL ? { ...n, nodeName: '' } : n)),
+    },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const sub = root.querySelector('#nas-head-sub').textContent;
+  assert.match(sub, /^Węzeł bez nazwy · uptime/);
+  assert.doesNotMatch(sub, /węzeł Węzeł bez nazwy/i, 'the word "węzeł" is not doubled');
   Screen.unmount();
 });
 
@@ -935,13 +1049,18 @@ test('an alert subline prints a subject name but never a machine id', async () =
         { alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'wwn-5000cca27dc7a4c6', title: 'Disk sdg: warning', detail: '1 UDMA CRC errors', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
         { alertId: 'a2', severity: 'warning', subjectKind: 'approval', subjectId: '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70', title: 'Operacja czeka na drugiego admina', detail: 'pool tank', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
         { alertId: 'a3', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'produkt', title: 'Macierz oczekuje na przywrócenie', detail: 'wymagane jawne Przywróć', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
+        // The third disk-id shape `disks.rs` builds: a virtual disk with no
+        // WWN and no serial is keyed `dev-<kernel name>`.
+        { alertId: 'a4', severity: 'warning', subjectKind: 'disk', subjectId: 'dev-vdb', title: 'Disk vdb: warning', detail: 'SMART', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
       ],
     },
   });
   const root = await mountScreen({ node: LOCAL });
   await flush();
   const rows = [...root.querySelectorAll('#nas-ov-alerts .alert-row')];
-  assert.equal(rows.length, 3);
+  assert.equal(rows.length, 4);
+  assert.doesNotMatch(rows[3].querySelector('.a-sub').textContent, /dev-vdb/);
+  assert.equal(rows[3].querySelector('.a-sub').getAttribute('title'), 'dev-vdb');
 
   const disk = rows[0].querySelector('.a-sub');
   assert.doesNotMatch(disk.textContent, /wwn-/);
@@ -949,8 +1068,156 @@ test('an alert subline prints a subject name but never a machine id', async () =
 
   assert.doesNotMatch(rows[1].querySelector('.a-sub').textContent, /0191f2c0/);
 
-  // …and a real name still shows, next to the translated kind.
-  assert.match(rows[2].querySelector('.a-sub').textContent, /produkt/);
+  // …and a real name still shows, next to the translated kind — the raw
+  // `elastic-array` enum never reaches the Polish sentence.
+  assert.match(rows[2].querySelector('.a-sub').textContent, /macierz Elastic produkt/);
+  assert.doesNotMatch(rows[2].querySelector('.a-sub').textContent, /elastic-array/);
+  Screen.unmount();
+});
+
+// A pool/target/array/dataset alert's `subjectId` is a NAME the node chose
+// (`spec.name`, `row.name`) — never a disk id, even when that name happens to
+// take the same shape as one. Routing every kind through the disk rule (the
+// old single `isMachineId`) hid a pool named `usb-backup`, a target
+// `pci-store`, a share `dev-backups` or a dataset `2024`/`sn-archive`/
+// `mmc-media` as if it were an id; only `subjectKind === 'disk'` may use it.
+test('a pool/target name is never hidden as an id, even in a disk-id shape', async () => {
+  const names = ['dev-backups', 'usb-backup', 'pci-store', '2024', 'sn-archive', 'mmc-media'];
+  const alerts = names.map((name, i) => ({
+    alertId: `p${i}`, severity: 'warning', subjectKind: 'target', subjectId: name,
+    title: `target ${name}`, detail: 'x', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null,
+  }));
+  stubTransport({ ...fixtures, tentaNasAlertsListRequest: { alerts } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const rows = [...root.querySelectorAll('#nas-ov-alerts .alert-row')];
+  assert.equal(rows.length, names.length);
+  names.forEach((name, i) => {
+    const sub = rows[i].querySelector('.a-sub');
+    assert.match(sub.textContent, new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `${name} must stay visible`);
+  });
+  Screen.unmount();
+});
+
+// The exact same `wwn-…` string is a disk id on a `disk` alert (hidden,
+// tooltip only — already covered above) but a plain name on any other
+// subject kind, because only a disk alert's subject can BE a disk id.
+test('a wwn- shaped subject is hidden only for a disk alert, shown for other kinds', async () => {
+  const wwn = 'wwn-0x5000c500a1b2c3d4';
+  const alerts = [
+    { alertId: 'd1', severity: 'warning', subjectKind: 'disk', subjectId: wwn, title: 'Disk warning', detail: 'x', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
+    { alertId: 'p1', severity: 'warning', subjectKind: 'target', subjectId: wwn, title: 'target warning', detail: 'x', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
+  ];
+  stubTransport({ ...fixtures, tentaNasAlertsListRequest: { alerts } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const rows = [...root.querySelectorAll('#nas-ov-alerts .alert-row')];
+  assert.doesNotMatch(rows[0].querySelector('.a-sub').textContent, /wwn-/, 'hidden for the disk alert');
+  assert.equal(rows[0].querySelector('.a-sub').getAttribute('title'), wwn);
+  assert.match(rows[1].querySelector('.a-sub').textContent, /wwn-/, 'shown for the target alert');
+  Screen.unmount();
+});
+
+// An Elastic Array alert asks for something done on that array's own pane — a
+// restore, a repair, a settled mover. Without its own branch the button led to
+// the Overview the admin was already on.
+test('an Elastic Array alert opens that array, from the node and from the fleet', async () => {
+  const alert = { alertId: 'a1', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'produkt', title: 'Macierz wymaga interwencji', detail: 'x', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null };
+  stubTransport({ ...fixtures, tentaNasAlertsListRequest: { alerts: [alert] } });
+  let root = await mountScreen({ node: LOCAL });
+  await flush();
+  const go = root.querySelector('#nas-ov-alerts [data-goto]');
+  assert.equal(go.textContent.trim(), 'Macierz');
+  click(go);
+  await flush();
+  assert.equal(Screen.tab, 'pools');
+  assert.equal(Screen.array, 'produkt');
+  Screen.unmount();
+
+  root = await mountScreen();
+  await flush();
+  await flush();
+  const table = root.querySelector('#nas-fleet-alerts');
+  const row = table.rows.find((r) => r._row.alert?.subjectKind === 'elastic-array');
+  const actions = table.rowActions(row, 0, () => row);
+  assert.equal(actions.querySelector('[data-act="go"]').textContent.trim(), 'Macierz');
+  click(actions.querySelector('[data-act="go"]'));
+  await flush();
+  assert.equal(Screen.tab, 'pools');
+  assert.equal(Screen.array, 'produkt');
+  Screen.unmount();
+});
+
+// The node sends an EMPTY name when neither the peer store nor the sync
+// registry knows one; it used to send the 64-hex node id, and every fleet
+// surface printed that as the name. One helper names such a node, and the id
+// is only a tooltip.
+test('a node with no known hostname is "Węzeł bez nazwy" everywhere, never its id', async () => {
+  const nameless = {
+    ...fixtures,
+    tentaNasNodesListRequest: {
+      ...fixtures.tentaNasNodesListRequest,
+      nodes: fixtures.tentaNasNodesListRequest.nodes.map((n) => (n.nodeId === REMOTE ? { ...n, nodeName: '' } : n)),
+    },
+    tentaNasAlertsListRequest: (payload, options) => {
+      if (options.targetNodeId === REMOTE) throw new Error('mesh timeout');
+      return { alerts: [] };
+    },
+  };
+  stubTransport(nameless);
+  const root = await mountScreen();
+  await flush();
+  await flush();
+  const name = root.querySelector(`.node-card[data-node="${REMOTE}"] .nc-name`);
+  assert.equal(name.textContent.trim(), 'Węzeł bez nazwy');
+  assert.equal(name.getAttribute('title'), REMOTE, 'the id is the tooltip');
+  assert.doesNotMatch(root.textContent, /bbbbbbbbbbbb/, 'no visible text carries the node id');
+  const offline = root.querySelector('#nas-fleet-alerts').rows.find((r) => r._row.node?.nodeId === REMOTE);
+  assert.match(offline.node, />Węzeł bez nazwy</);
+  assert.match(offline.node, new RegExp(`title="${REMOTE}"`));
+  Screen.unmount();
+});
+
+// A job's author is a person by display name, or one of the node's own two
+// system authors in words. An id the node could not resolve to an account is
+// not a name: it is the tooltip.
+test('a job author is a name, a system author in words, or an unknown account with the id as tooltip', async () => {
+  stubTransport(fixtures);
+  await mountScreen({ node: LOCAL, tab: 'pools' });
+  const host = document.createElement('div');
+  document.body.append(host);
+  const uuid = '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70';
+  const job = (startedBy) => ({ jobId: startedBy, kind: 'pool_scrub', subject: 'tank', status: 'succeeded', startedBy, startedAt: '2026-09-01 10:00:00', log: [] });
+  host.innerHTML = ['Anna', 'scheduler', 'startup', uuid].map((by) => Screen.jobRowHtml(job(by))).join('');
+  const subs = [...host.querySelectorAll('.job-sub')];
+  assert.match(subs[0].textContent, /^Anna · /);
+  assert.match(subs[1].textContent, /^harmonogram · /);
+  assert.match(subs[2].textContent, /^start węzła · /);
+  assert.match(subs[3].textContent, /^nieznane konto · /);
+  assert.doesNotMatch(host.textContent, /0191f2c0|scheduler|startup/);
+  assert.equal(subs[3].getAttribute('title'), uuid);
+  host.remove();
+  Screen.unmount();
+});
+
+// A SMART job's subject is a disk id the node swaps for a name. A name it only
+// remembers is marked as last-known; an id it could not swap is a tooltip.
+// The overview card and the job-log header render the same way.
+test('a job row marks a last-known subject and keeps a disk id out of the text', async () => {
+  stubTransport(fixtures);
+  await mountScreen({ node: LOCAL, tab: 'pools' });
+  const host = document.createElement('div');
+  document.body.append(host);
+  const wwn = 'wwn-0x5000cca27dc7a4c6';
+  const job = (jobId, subject, extra = {}) => ({ jobId, kind: 'smart_test', subject, status: 'succeeded', startedBy: 'Anna', startedAt: '2026-09-01 10:00:00', log: [], ...extra });
+  host.innerHTML = [job('a', 'sdq', { subjectLastKnown: true }), job('b', wwn), job('c', 'sdd')].map((j) => Screen.jobRowHtml(j)).join('');
+  const subject = (id) => host.querySelector(`.job-row[data-job="${id}"] .job-name .mono`);
+  assert.equal(subject('a').textContent, 'ostatnio widziany jako sdq');
+  assert.equal(subject('b').textContent, '');
+  assert.equal(subject('b').getAttribute('title'), wwn);
+  assert.equal(subject('c').textContent, 'sdd');
+  assert.doesNotMatch(host.textContent, /wwn-/);
+  host.remove();
   Screen.unmount();
 });
 
@@ -2383,4 +2650,54 @@ test('the tiering bar is omitted when only one side was measured', async () => {
   assert.equal(block.querySelector('.split-bar'), null,
     'half a split drawn as a bar would read as a measurement');
   Screen.unmount();
+});
+
+// The job-log window used to do `pre.textContent = (j.log || []).join('\n')`
+// on every 1.5 s poll (POLL_JOB_MODAL_MS) even though the log only ever
+// grows while a job runs — `dom-patch.js`'s append-only `paintJobLog` exists
+// for exactly this. A full rewrite replaces the `<pre>`'s text node with a
+// brand new one on every tick; a reader partway through an earlier line has
+// their selection and scroll position quietly reset under them each time.
+test('the job-log window appends the growing tail instead of rewriting the whole log', async () => {
+  let calls = 0;
+  const logByCall = [['line one'], ['line one', 'line two']];
+  stubTransport({
+    ...fixtures,
+    tentaNasJobGetRequest: () => {
+      const log = logByCall[Math.min(calls, logByCall.length - 1)];
+      calls += 1;
+      return {
+        job: {
+          jobId: 'j1', kind: 'smart_test', subject: 'sda', status: 'running', progressPct: 40,
+          startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log,
+        },
+      };
+    },
+  });
+  await mountScreen({ node: LOCAL });
+  try {
+    Screen.openJobLog('j1');
+    await flush();
+    const pre = document.getElementById('nas-joblog');
+    assert.ok(pre, 'the job-log window is open');
+    assert.equal(pre.textContent, 'line one');
+    const preAfterTick1 = pre;
+    const firstTextNodeAfterTick1 = pre.firstChild;
+    assert.ok(firstTextNodeAfterTick1, 'the first tick painted a text node');
+
+    // POLL_JOB_MODAL_MS is 1500 ms; wait past it for the second real tick.
+    await new Promise((r) => setTimeout(r, 1700));
+    await flush();
+    assert.equal(pre.textContent, 'line one\nline two', 'the tail grew');
+    const preAfterTick2 = document.getElementById('nas-joblog');
+    assert.ok(preAfterTick2 === preAfterTick1, 'the <pre> is the same node across ticks');
+    assert.ok(pre.firstChild === firstTextNodeAfterTick1, 'the first text node is untouched — only the tail was appended');
+  } finally {
+    // `Screen.unmount()` marks the screen disposed, so the job log's own
+    // poll loop (`isCurrent()`) stops rescheduling itself the next time its
+    // pending timer fires — this MUST run even when an assertion above
+    // throws, or that timer keeps firing every 1.5 s forever and the test
+    // process never exits.
+    Screen.unmount();
+  }
 });

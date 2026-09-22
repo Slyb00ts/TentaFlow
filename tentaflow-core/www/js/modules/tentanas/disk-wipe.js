@@ -28,6 +28,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, sprite, fmtBytes, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { journalOwnerPhrase, journalOwnerIds, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
 import '/js/components/tf-checkbox.js';
 
 // `NasDiskWipeJournalClaim.arrayRole` → the locale key the Disks tab already
@@ -42,11 +43,13 @@ const ARRAY_PART_KEYS = {
 function lossListHtml(plan) {
   const items = [];
   if (plan.fsType) {
-    const detail = [
-      plan.fsLabel ? T('wipe_disk.fs_label', { label: plan.fsLabel }) : '',
-      plan.fsUuid ? T('wipe_disk.fs_uuid', { uuid: plan.fsUuid }) : '',
-    ].filter(Boolean).join(' · ');
-    items.push(`<b>${escapeHtml(T('wipe_disk.fs', { type: plan.fsType }))}</b>${detail ? ` — ${escapeHtml(detail)}` : ''}`);
+    // The label is what an admin named the filesystem, so it is text. The
+    // UUID identifies it and names nothing — no mockup prints one — so it is
+    // the tooltip of the line, there for the admin who wants to check it
+    // against `blkid` before erasing.
+    const detail = plan.fsLabel ? T('wipe_disk.fs_label', { label: plan.fsLabel }) : '';
+    const title = plan.fsUuid ? ` title="${escapeAttr(T('wipe_disk.fs_uuid', { uuid: plan.fsUuid }))}"` : '';
+    items.push(`<b${title}>${escapeHtml(T('wipe_disk.fs', { type: plan.fsType }))}</b>${detail ? ` — ${escapeHtml(detail)}` : ''}`);
   }
   if (plan.mountpoints?.length) {
     items.push(escapeHtml(T('wipe_disk.mounted_at', { paths: plan.mountpoints.join(', ') })));
@@ -57,16 +60,37 @@ function lossListHtml(plan) {
     <ul class="loss-list">${items.map((i) => `<li class="ll bad">${sprite('trash')}<span>${i}</span></li>`).join('')}</ul>`;
 }
 
+// The refusals the dialog words itself, by code, in the admin's language.
+// Every other refusal is the node's own sentence (`detail`).
+// `journal_other_org` is one the admin must be able to read in full: the
+// disk is another organisation's on this node, and the node's detail names
+// no array on purpose — so the wording here must not either.
+const REFUSAL_KEYS = {
+  journal_other_org: 'wipe_disk.refusal_journal_other_org',
+};
+
+function refusalText(refusal, plan) {
+  const key = REFUSAL_KEYS[refusal?.code];
+  return key ? T(key, { name: plan.name }) : (refusal?.detail || '');
+}
+
 function journalHtml(claim) {
   const role = T(ARRAY_PART_KEYS[claim.arrayRole] || ('role.' + claim.arrayRole));
-  const foreign = claim.ownerOrgId || claim.ownerAddonId
-    ? ` ${T('wipe_disk.journal_foreign', { org: claim.ownerOrgId || '—', addon: claim.ownerAddonId || '—' })}`
+  // "Foreign" is the NODE's verdict (`owner_foreign`), taken against the
+  // instance asking — never inferred from the owner ids: those used to be
+  // always filled in, which called this instance's own dissolved arrays
+  // another instance's, and for another installation the node now blanks
+  // them altogether. The owner phrase is composed from the node's code
+  // (`journalOwnerPhrase`); the ids, when this org may see them, are only the
+  // tooltip.
+  const foreign = claim.ownerForeign
+    ? ` <span title="${escapeAttr(journalOwnerIds(claim))}">${escapeHtml(T('wipe_disk.journal_foreign', { owner: journalOwnerPhrase(claim) }))}</span>`
     : '';
   return `
     <div class="wizard-warning danger">${sprite('alert')}<div>
       <b>${escapeHtml(T('wipe_disk.journal_title'))}</b><br>
       ${escapeHtml(T('wipe_disk.journal_body', { name: claim.name, role, n: claim.memberCount || 0 }))}
-      ${escapeHtml(foreign)}<br>
+      ${foreign}<br>
       ${escapeHtml(T('wipe_disk.journal_cost', { name: claim.name }))}
     </div></div>
     <tf-checkbox id="nas-wipe-ack" label="${escapeAttr(T('wipe_disk.journal_ack', { name: claim.name }))}"></tf-checkbox>`;
@@ -89,10 +113,13 @@ export async function openDiskWipeDialog(screen, disk, onDone) {
   if (!plan || typeof plan.name !== 'string' || !plan.name || !Array.isArray(plan.refusals)) {
     throw new Error(T('wipe_disk.bad_plan'));
   }
-  const claim = plan.allowed ? plan.journalClaim : null;
+  // Another organisation's claim is never shown, whatever carries it: the
+  // node refuses such a disk (`journal_other_org`) and sends no claim, and a
+  // claim of that kind that did arrive must not print its array's name.
+  const claim = plan.allowed && !isOtherOrgOnNode(plan.journalClaim) ? plan.journalClaim : null;
   const bodyHtml = `
     ${warningHtml('danger', T('wipe_disk.warning', { name: plan.name }))}
-    ${plan.refusals.map((r) => `<div class="wizard-warning danger">${sprite('alert')}<div><b>${escapeHtml(T('wipe_disk.refused'))}</b><br>${escapeHtml(r.detail)}</div></div>`).join('')}
+    ${plan.refusals.map((r) => `<div class="wizard-warning danger">${sprite('alert')}<div><b>${escapeHtml(T('wipe_disk.refused'))}</b><br>${escapeHtml(refusalText(r, plan))}</div></div>`).join('')}
     ${lossListHtml(plan)}
     ${claim ? journalHtml(claim) : ''}
     <div class="explain-box">${escapeHtml(T('wipe_disk.explain'))}</div>`;

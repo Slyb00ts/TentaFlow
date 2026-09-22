@@ -9,7 +9,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, channelMode, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel, transportLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, channelMode, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel, transportLabel, nodeLabel } from '/js/modules/tentanas/format.js';
 import { openShareUsersDialog } from '/js/modules/tentanas/share-users.js';
 import { pathCrumbsHtml, wirePathCrumbs } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-window.js';
@@ -117,7 +117,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     <div class="install-header">
       <div class="big-ico">${sprite('share')}</div>
       <div class="install-header-meta">
-        <h1>${escapeHtml(editing ? T('wizard_share.heading_edit', { name: share.name }) : T('wizard_share.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
+        <h1>${escapeHtml(editing ? T('wizard_share.heading_edit', { name: share.name }) : T('wizard_share.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: nodeLabel(node) }))}</span></h1>
         <div class="sub">${escapeHtml(T('wizard_share.sub'))}</div>
       </div>
     </div>
@@ -295,7 +295,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
           <tf-toggle id="nas-sw-fleet" ${state.fleetMount ? 'checked' : ''}></tf-toggle>
         </div>
         ${state.fleetMount ? `<div class="stat-rows" id="nas-sw-fleet-plan">${plan.map((p) => `
-          <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k"><span class="mono fw-700">${escapeHtml(p.nodeName)}</span></span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
+          <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k"><span class="mono fw-700" title="${escapeAttr(p.nodeId)}">${escapeHtml(nodeLabel(p))}</span></span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('wizard_share.fleet_off_note'))}</div>`}
         ${editing ? toggleCard('nas-sw-enabled', T('wizard_share.enabled'), T('wizard_share.enabled_sub'), state.enabled) : ''}
         <div class="stat-rows mt-md">

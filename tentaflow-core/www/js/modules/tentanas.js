@@ -20,13 +20,15 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, channelMode, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
-  layoutLabel, stateChipHtml, fmtSchedule,
+  layoutLabel, stateChipHtml, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
+import { nodeT, nodeHeadSub } from '/js/modules/tentanas/node-phrase.js';
+import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
-import { drawTasks, openSmartScheduleEditor } from '/js/modules/tentanas/tasks.js';
+import { drawTasks, openSmartScheduleEditor, jobSubject } from '/js/modules/tentanas/tasks.js';
 import { drawShares, protocolChipHtml } from '/js/modules/tentanas/shares.js';
 import { warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openDiskWipeDialog } from '/js/modules/tentanas/disk-wipe.js';
@@ -122,7 +124,7 @@ function mountDotsHtml(mounts, nodes) {
     const m = (mounts || []).find((x) => x.nodeId === n.nodeId);
     const state = m ? m.state : 'na';
     const cls = state === 'mounted' || state === 'source' ? '' : state === 'pending' ? 'pending' : state === 'error' ? 'error' : 'na';
-    return `<span class="md ${cls}" title="${escapeAttr(`${n.nodeName}: ${m ? (m.detail || m.state) : T('fleet.mount_na')}`)}"></span>`;
+    return `<span class="md ${cls}" title="${escapeAttr(`${nodeLabel(n)}: ${m ? (m.detail || m.state) : T('fleet.mount_na')}`)}"></span>`;
   }).join('')}</span>`;
 }
 
@@ -561,9 +563,9 @@ const TentaNasScreen = {
     // The worst state leads: a failure is `err` and says "failures", and only
     // a fleet with no failure at all falls back to the warning wording.
     const diskChip = critDisks
-      ? { status: 'err', label: `${critDisks} ${T('kpi.failures_suffix', { n: critDisks })} (${critNodes.map((n) => n.nodeName).join(', ')})` }
+      ? { status: 'err', label: `${critDisks} ${T('kpi.failures_suffix', { n: critDisks })} (${critNodes.map(nodeLabel).join(', ')})` }
       : { status: warnDisks ? 'warn' : 'ok', label: warnDisks
-        ? T('fleet.chip_warnings', { n: warnDisks, nodes: warnNodes.map((n) => n.nodeName).join(', ') })
+        ? T('fleet.chip_warnings', { n: warnDisks, nodes: warnNodes.map(nodeLabel).join(', ') })
         : T('fleet.chip_ok') };
     patchHtml(root.querySelector('#nas-fleet-chips'), [
       `<tf-chip status="${diskChip.status}" dot label="${escapeAttr(diskChip.label)}"></tf-chip>`,
@@ -579,7 +581,7 @@ const TentaNasScreen = {
     ].filter(Boolean).join(' · '));
 
     patchHtml(root.querySelector('#nas-fleet-badges'), [
-      `<tf-chip status="accent" label="${escapeAttr(T('fleet.badge_nas', { n: nasNodes.length, nodes: nasNodes.map((n) => n.nodeName).join(' · ') }))}"></tf-chip>`,
+      `<tf-chip status="accent" label="${escapeAttr(T('fleet.badge_nas', { n: nasNodes.length, nodes: nasNodes.map(nodeLabel).join(' · ') }))}"></tf-chip>`,
       `<tf-chip status="${unarmed.length ? 'warn' : 'ok'}" icon="shield" label="${escapeAttr(T('fleet.badge_channels', { parts: channelParts || '—' }))}"></tf-chip>`,
       `<tf-chip label="${escapeAttr(T('fleet.badge_pools', { n: pools + arrays, capacity: fmtBytes(cap) }))}"></tf-chip>`,
       `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: nodes.length }))}"></tf-chip>`,
@@ -605,7 +607,7 @@ const TentaNasScreen = {
         icon: 'cylinder',
         accent: critDisks ? 'danger' : warnDisks ? 'warning' : null,
         delta: critDisks || warnDisks
-          ? T('kpi.fleet_health_on', { nodes: [...new Set([...critNodes, ...warnNodes])].map((n) => n.nodeName).join(', ') })
+          ? T('kpi.fleet_health_on', { nodes: [...new Set([...critNodes, ...warnNodes])].map(nodeLabel).join(', ') })
           : T('kpi.fleet_health_ok'),
         'delta-type': critDisks || warnDisks ? 'warn' : null,
       } },
@@ -615,7 +617,7 @@ const TentaNasScreen = {
       } },
       { key: 'nodes', attrs: {
         label: T('kpi.nodes'), value: String(ready.length), suffix: T('kpi.fleet_nodes_suffix', { total: nodes.length }), icon: 'network',
-        delta: unarmed.length ? T('kpi.node_unarmed', { node: unarmed[0].nodeName }) : null,
+        delta: unarmed.length ? T('kpi.node_unarmed', { node: nodeLabel(unarmed[0]) }) : null,
         'delta-type': unarmed.length ? 'warn' : null,
       } },
     ]);
@@ -683,13 +685,13 @@ const TentaNasScreen = {
     table.rows = this.fleetAlertRows().map((r) => (r.error ? {
       _row: r,
       level: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('fleet.node_offline'))}"></tf-chip>`,
-      node: `<span class="mono">${escapeHtml(r.node.nodeName)}</span>`,
+      node: `<span class="mono" title="${escapeAttr(r.node.nodeId)}">${escapeHtml(nodeLabel(r.node))}</span>`,
       alert: escapeHtml(T('fleet.node_unreachable', { error: r.error })),
       since: '—',
     } : {
       _row: r,
       level: `<tf-chip size="sm" status="${r.alert.severity === 'critical' ? 'err' : r.alert.severity === 'warning' ? 'warn' : 'info'}" dot label="${escapeAttr(T('fleet.severity_' + (['critical', 'warning'].includes(r.alert.severity) ? r.alert.severity : 'info')))}"></tf-chip>`,
-      node: `<span class="mono">${escapeHtml(r.node.nodeName)}</span>`,
+      node: `<span class="mono" title="${escapeAttr(r.node.nodeId)}">${escapeHtml(nodeLabel(r.node))}</span>`,
       alert: `<div class="cell-2"><div class="l1">${escapeHtml(r.alert.title)}</div><div class="l2">${escapeHtml(r.alert.detail)}</div></div>`,
       since: fmtAgo(r.alert.raisedAt),
     }));
@@ -711,7 +713,7 @@ const TentaNasScreen = {
       })),
       ...offline.map((r) => ({
         _node: r.node,
-        resource: `<span class="mono">${escapeHtml(r.node.nodeName)}</span>`,
+        resource: `<span class="mono" title="${escapeAttr(r.node.nodeId)}">${escapeHtml(nodeLabel(r.node))}</span>`,
         protocol: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('fleet.node_offline'))}"></tf-chip>`,
         source: escapeHtml(T('fleet.node_unreachable', { error: r.shares })),
         mounts: '—',
@@ -753,7 +755,7 @@ const TentaNasScreen = {
         <div class="nc-head">
           <span class="health-dot ${healthClass(unsupported || !n.online ? 'unknown' : n.health)}"></span>
           <div style="flex:1;min-width:0">
-            <div class="nc-name">${escapeHtml(n.nodeName)}</div>
+            <div class="nc-name" title="${escapeAttr(n.nodeId)}">${escapeHtml(nodeLabel(n))}</div>
             <div class="nc-sub">${escapeHtml(sub)}</div>
           </div>
           ${statusChip}
@@ -780,12 +782,12 @@ const TentaNasScreen = {
   async drawNode() {
     const node = this.currentNode();
     this.root.innerHTML = `
-      ${crumbsHtml([{ label: T('title'), act: 'fleet' }, { label: node.nodeName }])}
+      ${crumbsHtml([{ label: T('title'), act: 'fleet' }, { label: nodeLabel(node) }])}
       <div class="tf-detail-header">
         <div class="big-ico">${sprite('cylinder')}</div>
         <div class="d-meta">
           <div class="d-name">${escapeHtml(T('title'))} <span id="nas-head-chips"></span></div>
-          <div class="d-sub" id="nas-head-sub">${escapeHtml(T('node.head_sub_node', { name: node.nodeName }))}</div>
+          <div class="d-sub" id="nas-head-sub">${escapeHtml(nodeHeadSub(node))}</div>
           <div class="d-badges" id="nas-head-badges"></div>
         </div>
         <div class="d-actions">
@@ -802,7 +804,7 @@ const TentaNasScreen = {
     const sel = this.root.querySelector('#nas-node-select');
     sel.setOptions(this.nodes.map((n) => ({
       value: n.nodeId,
-      label: n.nodeName + (n.isLocal ? ` (${T('this_node')})` : '') + (n.instanceStatus !== 'ready' ? ` — ${T('instance.' + n.instanceStatus)}` : ''),
+      label: nodeLabel(n) + (n.isLocal ? ` (${T('this_node')})` : '') + (n.instanceStatus !== 'ready' ? ` — ${T('instance.' + n.instanceStatus)}` : ''),
       disabled: n.instanceStatus !== 'ready',
     })), this.nodeId);
     sel.addEventListener('change', (e) => { if (e.detail.value !== this.nodeId) this.selectNode(e.detail.value); });
@@ -857,7 +859,7 @@ const TentaNasScreen = {
       ];
       this.root.querySelector('#nas-head-badges').innerHTML = badges.join('');
       const sub = [
-        T('node.head_sub_node', { name: node.nodeName }),
+        nodeHeadSub(node),
         T('uptime', { d: fmtDuration(env.uptimeSecs) }),
         env.elevation.coreVersion ? T('fleet.head_version', { v: env.elevation.coreVersion }) : null,
         T('refreshed', { t: fmtAgo(env.probedAt) }),
@@ -979,7 +981,7 @@ const TentaNasScreen = {
         <tf-alert tone="${unusable ? 'warning' : 'info'}" title="${escapeAttr(this.forceSetup ? T('setup.post_install_title') : T('setup.title'))}" message="${escapeAttr(missing)}"></tf-alert>
         <div class="section-card">
           <div class="section-card-head"><div class="title">${sprite('key')} ${escapeHtml(T('elevation.title'))}</div><span class="hint">${escapeHtml(T('elevation.hint'))}</span></div>
-          <p class="wizard-section-sub" id="nas-setup-scope">${escapeHtml(T('setup.node_scope', { node: node?.nodeName || '—' }))}</p>
+          <p class="wizard-section-sub" id="nas-setup-scope">${escapeHtml(nodeT('setup.node_scope', node))}</p>
           <p class="wizard-section-sub">${escapeHtml(T('setup.lead'))}</p>
           ${admin ? `
           <div class="grid-2 mt-md">
@@ -1640,7 +1642,7 @@ const TentaNasScreen = {
         ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
         <div class="a-main">
           <div class="a-title">${escapeHtml(a.title)}</div>
-          <div class="a-sub" title="${escapeAttr(a.subjectId)}">${escapeHtml(a.detail)} · ${escapeHtml([subjectKindLabel(a.subjectKind), alertSubjectName(a.subjectId)].filter(Boolean).join(' '))} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
+          <div class="a-sub" title="${escapeAttr(a.subjectId)}">${escapeHtml(a.detail)} · ${escapeHtml([subjectKindLabel(a.subjectKind), alertSubjectName(a.subjectId, a.subjectKind)].filter(Boolean).join(' '))} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
         </div>
         ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
         <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${i}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
@@ -1657,7 +1659,8 @@ const TentaNasScreen = {
     }));
     el.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => {
       const target = alertTarget(alerts[Number(b.dataset.goto)]);
-      if (target.extra.pool) this.openPool(target.extra.pool);
+      if (target.extra.array) this.openArray(target.extra.array);
+      else if (target.extra.pool) this.openPool(target.extra.pool);
       else this.switchTab(target.tab, { disk: target.extra.disk || null, target: target.extra.target || null });
     }));
   },
@@ -1811,16 +1814,24 @@ const TentaNasScreen = {
   },
 
   // One password for the whole batch: the prompt appears once and every
-  // selected disk starts its short self-test with it.
+  // selected disk starts its short self-test with it. A disk-specific
+  // refusal (busy, a test already runs, the disk rejects the command) does
+  // not stop the batch; a privilege/credential error does, at once, instead
+  // of replaying the same rejected password against sudo once per remaining
+  // disk (`runDiskBatch` / `isBatchHaltError` in format.js — shared with the
+  // "SMART all disks" schedule action in tasks.js).
   async startSmartTestBulk() {
     const targets = (this.disks || []).filter((d) => this.diskSelection.has(d.diskId));
     if (!targets.length) return;
-    const ok = await this.withSudo(async (sudoPassword) => {
-      for (const d of targets) await this.nas('tentaNasDiskSmartTestRequest', { diskId: d.diskId, kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS });
-      return true;
-    }, T('disks.smart_selected_title', { n: targets.length }));
-    if (!ok) return;
-    toast(T('disks.smart_selected_done', { n: targets.length }), 'success');
+    const outcome = await this.withSudo((sudoPassword) => runDiskBatch(targets, (d) => this.nas(
+      'tentaNasDiskSmartTestRequest', { diskId: d.diskId, kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS },
+    )), T('disks.smart_selected_title', { n: targets.length }));
+    // `outcome` is null both when the prompt was cancelled and when the
+    // batch halted on a privilege/credential error — `withSudo`'s own catch
+    // already toasted that one error.
+    if (!outcome) return;
+    if (outcome.started.length) toast(T('disks.smart_selected_done', { n: outcome.started.length }), 'success');
+    if (outcome.refused.length) toast(T('jobs.smart_batch_refused', { n: outcome.refused.length, disks: refusedBatchNames(outcome.refused) }), 'warning');
     this.diskSelection.clear();
     this.applyDiskRows();
     this.refreshJobsBadge();
@@ -2433,12 +2444,14 @@ const TentaNasScreen = {
   jobRowHtml(j) {
     const running = j.status === 'running';
     const last = (j.log || []).slice(-1)[0] || '';
+    const author = jobAuthor(j.startedBy);
+    const subject = jobSubject(j);
     return `
       <div class="job-row" data-job="${escapeAttr(j.jobId)}">
         <div class="job-ico ${running ? 'running' : ''}">${sprite(running ? 'refresh' : 'clock')}</div>
         <div class="job-main">
-          <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2">${escapeHtml(j.subject)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip></div>
-          <div class="job-sub">${escapeHtml(T('jobs.started_by', { by: j.startedBy, t: fmtAgo(j.startedAt) }))}${last ? ' · ' + escapeHtml(last) : ''}</div>
+          <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2"${subject.title ? ` title="${escapeAttr(subject.title)}"` : ''}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip></div>
+          <div class="job-sub"${author.title ? ` title="${escapeAttr(author.title)}"` : ''}>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}${last ? ' · ' + escapeHtml(last) : ''}</div>
           ${j.progressPct != null ? `<tf-progress-bar value="${Number(j.progressPct)}" size="sm" tone="accent"></tf-progress-bar>` : ''}
         </div>
         <div class="job-actions">
@@ -2560,7 +2573,7 @@ const TentaNasScreen = {
         <div class="section-card">
           <div class="section-card-head">
             <div class="title">${sprite('cpu')} ${escapeHtml(T('arc.settings_title'))}</div>
-            <span class="hint">${escapeHtml(T('arc.settings_hint', { node: this.currentNode().nodeName, ram: fmtBytes(env.ramBytes) }))}</span>
+            <span class="hint">${escapeHtml(nodeT('arc.settings_hint', this.currentNode(), { ram: fmtBytes(env.ramBytes) }))}</span>
           </div>
           <div id="nas-env-arc"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
         </div>
@@ -2645,7 +2658,7 @@ const TentaNasScreen = {
       // The node id is NOT a name and the mockups never show one (n16 prints
       // `atlas`, `orion`). It stays reachable as the tooltip, for the one case
       // two nodes answer to the same hostname.
-      name: `<div class="cell-2" title="${escapeAttr(n.nodeId)}"><div class="l1">${escapeHtml(n.nodeName)}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div></div>`,
+      name: `<div class="cell-2" title="${escapeAttr(n.nodeId)}"><div class="l1">${escapeHtml(nodeLabel(n))}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div></div>`,
       platform: n.instanceStatus === 'ready' ? (n.osName || '—') : T('instance.' + n.instanceStatus),
       channel: { status: channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok', label: T('elevation.mode_' + channelMode(n.elevationMode)), dot: true },
       features: (n.features || []).join(' · ') || (n.instanceStatus === 'ready' ? T('env.features_unknown') : T('instance.' + n.instanceStatus)),
@@ -2672,11 +2685,11 @@ const TentaNasScreen = {
   // n17b for a node other than the selected one: the password goes straight to
   // that node, the view stays where it is.
   async armNode(node) {
-    const creds = await this.promptSudo(T('env.arm_node_title', { node: node.nodeName }), node, T('sudo.arm_confirm'));
+    const creds = await this.promptSudo(T('env.arm_node_title', { node: nodeLabel(node) }), node, T('sudo.arm_confirm'));
     if (!creds) return;
     try {
       await this.nasOn(node, 'tentaNasElevationArmRequest', { sudoPassword: creds.password, ttlSecs: 0 }, { timeoutMs: ADMIN_TIMEOUT_MS });
-      toast(T('env.armed_node', { node: node.nodeName }), 'success');
+      toast(nodeT('env.armed_node', node), 'success');
       await this.loadNodes();
       if (!this.disposed) this.drawTab();
     } catch (e) {
@@ -2861,7 +2874,7 @@ const TentaNasScreen = {
     return new Promise((resolve) => {
       const win = document.createElement('tf-window');
       win.className = 'nas-modal';
-      win.setAttribute('title', title || T('sudo.title', { node: node.nodeName }));
+      win.setAttribute('title', title || T('sudo.title', { node: nodeLabel(node) }));
       win.setAttribute('icon', 'key');
       win.setAttribute('buttons', 'close');
       win.setAttribute('width', '520');
@@ -2869,8 +2882,8 @@ const TentaNasScreen = {
       win.setAttribute('initial-y', 'center');
       win.innerHTML = `
         <div slot="body" class="stack">
-          <div class="explain-box">${escapeHtml(node.isLocal ? T('sudo.explain_local') : T('sudo.explain_remote', { node: node.nodeName }))}</div>
-          <tf-input id="nas-sudo-pass" type="password" autocomplete="current-password" autofocus label="${escapeAttr(T('sudo.password_label', { user, node: node.nodeName }))}"></tf-input>
+          <div class="explain-box">${escapeHtml(node.isLocal ? T('sudo.explain_local') : nodeT('sudo.explain_remote', node))}</div>
+          <tf-input id="nas-sudo-pass" type="password" autocomplete="current-password" autofocus label="${escapeAttr(nodeT('sudo.password_label', node, { user }))}"></tf-input>
           <div class="toggle-card">
             <div class="tc-text"><span>${escapeHtml(T('sudo.remember', { ttl }))}</span><span class="tc-sub">${escapeHtml(T('sudo.remember_sub', { ttl }))}</span></div>
             <tf-toggle id="nas-sudo-remember"></tf-toggle>
@@ -2916,7 +2929,7 @@ const TentaNasScreen = {
 
     const win = document.createElement('tf-window');
     win.className = 'nas-modal';
-    win.setAttribute('title', T('wizard.title', { node: node.nodeName }));
+    win.setAttribute('title', T('wizard.title', { node: nodeLabel(node) }));
     win.setAttribute('icon', 'key');
     win.setAttribute('buttons', 'close');
     win.setAttribute('draggable', '');
@@ -2930,7 +2943,7 @@ const TentaNasScreen = {
       <div class="install-header">
         <div class="big-ico">${sprite('key')}</div>
         <div class="install-header-meta">
-          <h1>${escapeHtml(T('wizard.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
+          <h1>${escapeHtml(T('wizard.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: nodeLabel(node) }))}</span></h1>
           <div class="sub">${escapeHtml(T('wizard.sub', { user: env?.elevation?.coreUser || 'tentaflow', os: env?.osName || '' }))}</div>
         </div>
       </div>
@@ -2950,9 +2963,9 @@ const TentaNasScreen = {
       const plan = state.plan;
       return `
         <h2 class="wizard-section-title">${escapeHtml(helper ? T('wizard.password_title_helper') : T('wizard.password_title_interactive'))}</h2>
-        <p class="wizard-section-sub">${escapeHtml(node.isLocal ? T('sudo.explain_local') : T('sudo.explain_remote', { node: node.nodeName }))}</p>
+        <p class="wizard-section-sub">${escapeHtml(node.isLocal ? T('sudo.explain_local') : nodeT('sudo.explain_remote', node))}</p>
         <div class="stack">
-          <tf-input id="nas-wz-pass" type="password" autocomplete="current-password" autofocus label="${escapeAttr(T('sudo.password_label', { user: env?.elevation?.coreUser || 'tentaflow', node: node.nodeName }))}" value="${escapeAttr(state.password)}"></tf-input>
+          <tf-input id="nas-wz-pass" type="password" autocomplete="current-password" autofocus label="${escapeAttr(nodeT('sudo.password_label', node, { user: env?.elevation?.coreUser || 'tentaflow' }))}" value="${escapeAttr(state.password)}"></tf-input>
           ${helper ? (plan ? `
             ${plan.helperSourcePresent ? '' : `<div class="wizard-warning danger">${escapeHtml(T('wizard.helper_source_missing', { path: plan.helperSource }))}</div>`}
             <p class="wizard-section-sub">${escapeHtml(T('wizard.plan_intro'))}</p>
@@ -3187,13 +3200,13 @@ const TentaNasScreen = {
         const r = await this.nas('tentaNasJobGetRequest', { jobId });
         if (!isCurrent() || !win.isConnected) return;
         const j = r.job;
+        const author = jobAuthor(j.startedBy);
+        const subject = jobSubject(j);
         const head = win.querySelector('#nas-joblog-head');
         const pre = win.querySelector('#nas-joblog');
         if (!head || !pre) return;
-        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span class="mono">${escapeHtml(j.subject)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · ${escapeHtml(T('jobs.started_by', { by: j.startedBy, t: fmtAgo(j.startedAt) }))}${j.error ? `<div class="num-err mt-sm">${escapeHtml(j.error)}</div>` : ''}`);
-        const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
-        pre.textContent = (j.log || []).join('\n');
-        if (atBottom) pre.scrollTop = pre.scrollHeight;
+        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span class="mono"${subject.title ? ` title="${escapeAttr(subject.title)}"` : ''}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span${author.title ? ` title="${escapeAttr(author.title)}"` : ''}>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(j.error)}</div>` : ''}`);
+        paintJobLog(pre, j.log);
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }
       } catch (e) {
@@ -3218,7 +3231,8 @@ const TentaNasScreen = {
 function subjectKindLabel(kind) {
   const key = `alerts.subject.${kind}`;
   const label = T(key);
-  return label === key ? kind : label;
+  // `T` answers a missing key with the FULL path, prefix included.
+  return label === `tentanas.${key}` ? kind : label;
 }
 
 // An alert's `subjectId` is a NAME for most kinds — the node passes `spec.name`
@@ -3229,10 +3243,19 @@ function subjectKindLabel(kind) {
 // nothing the title has not already said, so the subline drops them rather
 // than deciding per kind — a kind added later must not silently start
 // printing a GUID.
-const MACHINE_ID = /^(wwn-|sn-|eui\.|nqn\.)|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-function alertSubjectName(subjectId) {
+// `dev-<name>` is the third shape `disks.rs` gives a disk: a virtual disk with
+// neither a WWN nor a serial is keyed by its kernel name behind that prefix,
+// and the title already names it. Only a `disk` subject can take that shape;
+// every other kind's subject is a pool/target/array/dataset name that must
+// not be hidden just because it starts with the same prefix (a pool named
+// `usb-backup`, a target `pci-store`) or is all digits (a pool `2024`) — so
+// only `disk` uses the disk rule, everything else (including `approval`,
+// whose subject is a request UUID) uses the narrower opaque rule.
+// The shapes live in machine-id.js, shared with the job rows.
+function alertSubjectName(subjectId, subjectKind) {
   const value = String(subjectId || '');
-  return MACHINE_ID.test(value) ? '' : value;
+  const isId = subjectKind === 'disk' ? isDiskIdShape(value) : isOpaqueId(value);
+  return isId ? '' : value;
 }
 
 function alertTarget(alert) {
@@ -3244,6 +3267,13 @@ function alertTarget(alert) {
       : { act: 'disks', tab: 'disks', extra: {} };
   }
   if (alert.subjectKind === 'pool') return { act: 'pool', tab: 'pools', extra: { pool: alert.subjectId } };
+  // An Elastic Array raises on its NAME (`elastic.rs`, `scheduler.rs`), and
+  // what the alert asks for — a restore, a repair, a settled mover — is done
+  // on that array's own pane. Without this branch the button led to the
+  // Overview the admin was already on.
+  if (alert.subjectKind === 'elastic-array' && alert.subjectId) {
+    return { act: 'array', tab: 'pools', extra: { array: alert.subjectId } };
+  }
   // A four-eyes request (§5.10) is answered where its queue is, not on the
   // overview: the admin who followed the alert came to decide on it.
   if (alert.subjectKind === 'approval') return { act: 'manage', tab: 'jobs', extra: {} };

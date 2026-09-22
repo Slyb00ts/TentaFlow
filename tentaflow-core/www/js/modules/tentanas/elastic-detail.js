@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
 import { patchHtml, setAttr, setText } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
@@ -22,6 +22,28 @@ import '/js/components/tf-toggle.js';
 const knownBytes = (value) => value != null && Number.isFinite(Number(value)) && Number(value) >= 0;
 const row = (label, value) => `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v">${escapeHtml(value)}</span></div>`;
 const triState = (value) => value === true ? T('elastic.yes') : value === false ? T('elastic.no') : T('elastic.unknown');
+
+// A member's part in the array, in words: "dysk danych 2", "dysk cache",
+// "dysk parity 1". The wire's `name` is the SLOT (`d2`, `c1`, `parity1`) —
+// what the branch directory is called and what a request names the member
+// by — which makes it a key, not something to print. A parity entry carries
+// its 1-based `index`; a data slot carries its ordinal as the trailing digits.
+function memberPart(disk) {
+  if (disk.index != null) return T('elastic.member_parity', { n: disk.index });
+  if (disk.role === 'cache') return T('elastic.member_cache');
+  const n = /(\d+)$/.exec(String(disk.name || ''))?.[1] || '';
+  return T('elastic.member_data', { n });
+}
+
+// What every sentence calls a member: its LIVE kernel name (`sdg` — the
+// node's inventory, or the helper's own observation of the member's device in
+// the same read), or its part in the array when nothing names the device now.
+// The name it was last seen under (`diskLastName`) is never used here: a
+// sentence would present it as the current device, and the kernel may have
+// handed that name to another disk since. The cell shows it, marked.
+export function memberName(disk) {
+  return String(disk?.diskName || '').trim() || memberPart(disk);
+}
 
 // One entry per mutation the detail can send, so a new action cannot reach the
 // transport without also naming the sentence the admin sees for it.
@@ -46,8 +68,8 @@ const ACTION_APPROVAL = { restore: 'elastic.approval', sync: 'elastic.maintenanc
 // been read yet, and treating it as absence would block every array.
 function repairBlocker(array) {
   for (const member of array?.dataDisks || []) {
-    if (member.devicePresent === false) return T('elastic.repair_disk_absent', { disk: member.name });
-    if (member.mounted === false) return T('elastic.repair_disk_unmounted', { disk: member.name });
+    if (member.devicePresent === false) return T('elastic.repair_disk_absent', { disk: memberName(member) });
+    if (member.mounted === false) return T('elastic.repair_disk_unmounted', { disk: memberName(member) });
   }
   return '';
 }
@@ -145,43 +167,69 @@ export function elasticCardHtml(array) {
 // not. It is rendered as its own button rather than folded into the drill-in,
 // because a repair overwrites the disk and must never be one click away from
 // "show me this disk".
+//
+// The cell is named by the disk's KERNEL name (n11: `sdg`, `nvme2n1`). The
+// slot stays in `data-branch` because the figures and the repair find the
+// member by it; the by-uuid device and the branch mountpoint identify, they
+// do not name, so they are the name's tooltip.
+//
+// The naming rule (`disks::ShownDiskName` on the node): a LIVE name when
+// there is one; otherwise the member's part in the array, with the name it
+// was LAST seen under on its own line, marked as such — never in the name's
+// place. "brak dysku" is said ONLY when the helper says the device is absent
+// (`devicePresent === false`): a member it found is not missing just because
+// no name reached this cell, and the cell must not contradict its own
+// "Obecny: tak" line.
 function diskHtml(disk, filesystem, repair = '') {
+  const live = String(disk.diskName || '').trim();
+  const lastKnown = String(disk.diskLastName || '').trim();
+  const absent = !live && disk.devicePresent === false;
+  const shown = live || (absent ? T('elastic.disk_absent') : memberPart(disk));
+  const where = [disk.device, disk.mountpoint].filter(Boolean).join(' · ');
+  const [kindClass, kindLabel] = KIND_BADGE[disk.kind] || [];
   return `<div class="disk-cell" data-disk="${escapeAttr(disk.diskId)}" data-branch="${escapeAttr(disk.name)}">
     <span class="health-dot ${healthClass(disk.health)}"></span>
-    <div class="dc-main"><div class="dc-name"><span class="mono">${escapeHtml(disk.name)}</span></div>
+    <div class="dc-main"><div class="dc-name"><span class="${live ? 'mono' : ''} ${absent ? 'num-err' : ''}" title="${escapeAttr(where)}">${escapeHtml(shown)}</span></div>
+      ${absent ? `<div class="dc-sub">${escapeHtml(memberPart(disk))}</div>` : ''}
+      ${!live && lastKnown ? `<div class="dc-sub" data-role="last-seen">${escapeHtml(T('elastic.last_seen_as', { name: lastKnown }))}</div>` : ''}
       <div class="dc-sub"><span data-fig="disk-usage"></span> · ${escapeHtml(filesystem.toUpperCase())}</div>
-      <div class="dc-sub">${escapeHtml(disk.device || disk.name)}</div>
       <div class="dc-sub">${escapeHtml(T('elastic.mounted'))}: ${escapeHtml(triState(disk.mounted))} · ${escapeHtml(T('elastic.present'))}: ${escapeHtml(triState(disk.devicePresent))}</div>
-      <div class="dc-sub mono">${escapeHtml(disk.mountpoint)}</div>
-    </div>${repair ? `<tf-button variant="danger" size="sm" icon="shield" data-act="fix" title="${escapeAttr(repair)}">${escapeHtml(T('elastic.repair'))}</tf-button>` : ''}<tf-button variant="ghost" size="sm" icon="external-link" data-act="disk" title="${escapeAttr(T('elastic.disk_details', { name: disk.name }))}"></tf-button>
+    </div>${kindLabel ? `<span class="disk-kind ${kindClass}">${kindLabel}</span>` : ''}${repair ? `<tf-button variant="danger" size="sm" icon="shield" data-act="fix" title="${escapeAttr(repair)}">${escapeHtml(T('elastic.repair'))}</tf-button>` : ''}<tf-button variant="ghost" size="sm" icon="external-link" data-act="disk" title="${escapeAttr(T('elastic.disk_details', { name: memberName(disk) }))}"></tf-button>
   </div>`;
 }
 
 /// The repair dialog. The retype is the DISK and not the array: what the
 /// operation overwrites is that one disk, so the mistake worth making
 /// impossible is repairing the wrong disk of the right array.
+///
+/// The admin retypes the name they SEE on the cell, the kernel name — which
+/// is why the repair is offered only on a member that has one. The request
+/// still addresses the member by its slot (`disk`, echoed in `confirmDisk`,
+/// which the node compares with it): the slot is what the node's rows key the
+/// member by, and a kernel name can move between boots.
 function openElasticFixDialog(screen, array, disk, evidence, onDone) {
+  const shown = memberName(disk);
   const bodyHtml = `
-    ${warningHtml('danger', T('elastic.repair_warning', { disk: disk.name, name: array.name }))}
+    ${warningHtml('danger', T('elastic.repair_warning', { disk: shown, name: array.name }))}
     <ul class="loss-list">
-      <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.repair_loses', { disk: disk.name, path: disk.mountpoint }))}</span></li>
+      <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.repair_loses', { disk: shown, path: disk.mountpoint }))}</span></li>
       <li class="ll">${sprite('shield')}<span>${escapeHtml(evidence)}</span></li>
     </ul>
     <div class="explain-box">${escapeHtml(T('elastic.repair_explain'))}</div>`;
   return openRetypeDialog({
-    title: T('elastic.repair_title', { disk: disk.name, name: array.name }),
+    title: T('elastic.repair_title', { disk: shown, name: array.name }),
     icon: 'alert',
-    name: disk.name,
+    name: shown,
     bodyHtml,
-    retypeLabel: `${escapeHtml(T('elastic.repair_retype'))} <span class="mono num-err">${escapeHtml(disk.name)}</span>`,
-    confirmLabel: T('elastic.repair_confirm', { disk: disk.name }),
+    retypeLabel: `${escapeHtml(T('elastic.repair_retype'))} <span class="mono num-err">${escapeHtml(shown)}</span>`,
+    confirmLabel: T('elastic.repair_confirm', { disk: shown }),
     confirmIcon: 'shield',
     onConfirm: async () => {
       const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArrayFixRequest', {
         name: array.name, disk: disk.name, confirmDisk: disk.name, sudoPassword,
-      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.repair_title', { disk: disk.name, name: array.name }));
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.repair_title', { disk: shown, name: array.name }));
       if (res === null) return false;
-      followResponse(screen, res, onDone, T('elastic.repair_done', { disk: disk.name }));
+      followResponse(screen, res, onDone, T('elastic.repair_done', { disk: shown }));
       return true;
     },
   });
@@ -283,7 +331,7 @@ function openElasticDestroyDialog(screen, array, onDone) {
     ${warningHtml('danger', T('elastic.dissolve_warning', { name: array.name }))}
     <ul class="loss-list">
       <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.dissolve_loses', { path: array.unionPath }))}</span></li>
-      <li class="ll">${sprite('shield')}<span>${escapeHtml(T('elastic.dissolve_keeps', { n: disks.length, disks: disks.map((d) => d.name).join(', ') || '—' }))}</span></li>
+      <li class="ll">${sprite('shield')}<span>${escapeHtml(T('elastic.dissolve_keeps', { n: disks.length, disks: disks.map(memberName).join(', ') || '—' }))}</span></li>
       <li class="ll">${sprite('info')}<span>${escapeHtml(T('elastic.dissolve_reimport'))}</span></li>
     </ul>
     <div class="explain-box">${escapeHtml(T('elastic.dissolve_explain'))}</div>`;
@@ -727,6 +775,9 @@ export async function drawElasticDetail(screen, body) {
     // cannot be the thing that suggests a repair is due; and an array a repair
     // could not run on gets none either, with `repairReason` saying why.
     const repairBlocked = array ? repairReason() : T('elevation.admin_only');
+    // A member with no kernel name gets no repair button even then: the
+    // admin confirms by retyping the name on the cell, and "brak dysku" is
+    // not a disk anyone can confirm overwriting.
     const repairFor = () => (repairBlocked ? '' : repairEvidence(array));
     // A repair that CANNOT RUN has to say so where the admin is looking for
     // it. "Nothing to repair" and "you are not an admin" are not news and stay
@@ -745,7 +796,7 @@ export async function drawElasticDetail(screen, body) {
       </div>
       <div class="section-card"><div class="section-card-head"><div class="title">${sprite('cylinder')} ${escapeHtml(T('elastic.disks'))}</div><span class="hint">${escapeHtml(T('elastic.independent_fs'))}</span></div>
         <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.data'))} · MERGERFS</span><span class="mono">${escapeHtml(array.unionPath)}</span><span class="hint">${escapeHtml(T('elastic.policy'))}: ${escapeHtml(array.createPolicy)}</span>${screen.isAdmin ? `<span class="actions"><tf-button variant="secondary" size="sm" icon="plus" data-act="add-disk" ${addDiskDisabled ? 'disabled' : ''} title="${escapeAttr(addDiskBlocked || T('elastic.add_disk_online'))}">${escapeHtml(T('elastic.add_disk'))}</tf-button></span>` : ''}</div>
-          <div class="disk-cells">${(array.dataDisks || []).map((d) => diskHtml(d, d.filesystem || array.filesystem, repairFor())).join('')}</div>
+          <div class="disk-cells">${(array.dataDisks || []).map((d) => diskHtml(d, d.filesystem || array.filesystem, d.diskName ? repairFor() : '')).join('')}</div>
           ${screen.isAdmin && addDiskBlocked ? `<div class="hint">${escapeHtml(addDiskBlocked)}</div>` : ''}</div>
         <div class="vdev-group"><div class="vg-head"><span class="vg-type">PARITY · SNAPRAID</span></div><div class="disk-cells">${(array.parityDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${!(array.parityDisks || []).length ? `<div class="hint">${escapeHtml(T('elastic.no_parity'))}</div>` : ''}</div>
         <div class="vdev-group"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.cache'))}</span><span class="hint">${escapeHtml(T('elastic.cache_no_protection'))}</span></div><div class="disk-cells">${(array.cacheDisks || []).map((d) => diskHtml(d, array.filesystem)).join('')}</div>${(array.cacheDisks || []).length ? cachePendingHtml() : `<div class="hint">${escapeHtml(T('elastic.cache_none'))}</div>`}</div>

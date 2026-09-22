@@ -13,6 +13,7 @@ import {
 import { setAttr, setText, patchHtml, patchKeyedList } from '/js/modules/tentanas/dom-patch.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
 import { followResponse, warningHtml, openRetypeDialog } from '/js/modules/tentanas/dialogs.js';
+import { journalOwnerPhrase, journalOwnerIds, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
@@ -20,7 +21,8 @@ import '/js/components/tf-menu.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-checkbox.js';
-import { elasticCardHtml } from '/js/modules/tentanas/elastic-detail.js';
+import { elasticCardHtml, memberName } from '/js/modules/tentanas/elastic-detail.js';
+import { nodeT } from '/js/modules/tentanas/node-phrase.js';
 
 export async function drawPools(screen, body) {
   const node = screen.currentNode();
@@ -31,7 +33,7 @@ export async function drawPools(screen, body) {
   body.innerHTML = `
     <div class="stack">
       <div class="section-card-head nas-pools-heading">
-        <div class="title">${sprite('layers')} ${escapeHtml(T('pools.title', { node: node ? node.nodeName : '' }))} <tf-chip size="sm" status="neutral" id="nas-pools-count" label="0"></tf-chip></div>
+        <div class="title">${sprite('layers')} ${escapeHtml(nodeT('pools.title', node))} <tf-chip size="sm" status="neutral" id="nas-pools-count" label="0"></tf-chip></div>
         <div class="actions">
           <tf-button variant="secondary" icon="download" data-act="import" ${screen.isAdmin ? '' : 'disabled'}>${escapeHtml(T('pools.import'))}</tf-button>
           <tf-button variant="secondary" icon="download" data-act="import-array" ${screen.isAdmin ? '' : 'disabled'}>${escapeHtml(T('pools.import_array'))}</tf-button>
@@ -456,6 +458,21 @@ export function openImportDialog(screen, onDone) {
 // The scan is behind an explicit button rather than firing on open, because
 // it needs sudo: opening a dialog must never be what makes a node ask for a
 // root password.
+
+// One member that stops an adoption, in words. The node sends the member as
+// data (slot, role, parity level, kernel name, serial) and the words are the
+// Elastic detail screen's own — `memberName`, so "dysk danych 2" is spelled
+// in ONE place for both screens and follows the admin's language. A reused
+// member is here and goes by its kernel name; a missing one has none, so it
+// is its part in the array plus the serial printed on the drive — a physical
+// label the admin reads off the disk in the shelf, which is the only way to
+// find it.
+function importMemberLabel(member) {
+  const name = memberName(member);
+  const serial = String(member?.serial || '').trim();
+  return String(member?.diskName || '').trim() || !serial ? name : T('elastic_import.member_serial', { part: name, serial });
+}
+
 export function openElasticImportDialog(screen, onDone) {
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
@@ -497,6 +514,13 @@ export function openElasticImportDialog(screen, onDone) {
     unreadable: ['err', 'status_unreadable'],
   };
 
+  // The journal owner is worded by `journalOwnerPhrase` from the node's code:
+  // this instance, another instance of this organisation (by name when the
+  // node gave one), or "another installation" — never another tenant's name
+  // or ids, which the node does not send. The adoption request does not need
+  // the ids either (it names the array and the retyped name), so the own
+  // organisation's ids are only the tooltip.
+
   const candidateHtml = (c) => {
     const [tone, label] = CHIP[c.status] || CHIP.incomplete;
     const total = (c.disksMatched || 0) + (c.disksMissing || []).length + (c.disksReused || []).length;
@@ -504,14 +528,14 @@ export function openElasticImportDialog(screen, onDone) {
       <div class="vdev-group ${c.status === 'importable' ? 'picked' : ''}" data-array="${escapeAttr(c.arrayId)}" title="${escapeAttr(c.detail || '')}">
         <div class="vg-head">
           <span class="vg-type">${escapeHtml(T('elastic_import.vg_type', { fs: c.filesystem || '' }))}</span>
-          <span class="mono fw-800">${escapeHtml(c.name)}</span>
+          <span class="mono fw-800" title="${escapeAttr(c.arrayId || '')}">${escapeHtml(c.name || T('elastic_import.unnamed'))}</span>
           <tf-chip size="sm" status="${escapeAttr(tone)}" dot label="${escapeAttr(T('elastic_import.' + label))}"></tf-chip>
           <span class="hint">${escapeHtml(T('elastic_import.counts', { data: c.dataDisks || 0, parity: c.parityDisks || 0, cache: c.cacheDisks || 0 }))}</span>
         </div>
-        <div class="hint">${escapeHtml(T('elastic_import.owner', { owner: `${c.ownerOrgId || '—'}/${c.ownerAddonId || '—'}` }))}</div>
+        ${c.status === 'unreadable' && !c.name ? '' : `<div class="hint" title="${escapeAttr(journalOwnerIds(c))}">${escapeHtml(T('elastic_import.owner', { owner: journalOwnerPhrase(c) }))}</div>`}
         <div class="hint">${escapeHtml(T('elastic_import.matched', { n: c.disksMatched || 0, total }))}${c.unionMounted ? ` · ${escapeHtml(T('elastic_import.union_mounted'))}` : ''}</div>
-        ${(c.disksMissing || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.missing', { disks: c.disksMissing.join(', ') }))}</div>` : ''}
-        ${(c.disksReused || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.reused', { disks: c.disksReused.join(', ') }))}</div>` : ''}
+        ${(c.disksMissing || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.missing', { disks: c.disksMissing.map(importMemberLabel).join(', ') }))}</div>` : ''}
+        ${(c.disksReused || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.reused', { disks: c.disksReused.map(importMemberLabel).join(', ') }))}</div>` : ''}
         ${c.status === 'unreadable' ? `<div class="num-err">${escapeHtml(c.detail || '')}</div>` : ''}
         <div class="row">
           <tf-button size="sm" variant="primary" icon="download" data-act="adopt" ${c.status === 'importable' ? '' : 'disabled'}>${escapeHtml(T('elastic_import.adopt'))}</tf-button>
@@ -545,7 +569,10 @@ export function openElasticImportDialog(screen, onDone) {
       if (!win.isConnected) return;
       // `null` is a cancelled sudo prompt: nothing was scanned, so the dialog
       // keeps saying it has not looked yet.
-      if (res) state.candidates = res.candidates || [];
+      // Another organisation of this node is not a candidate: the node leaves
+      // its journals out, and a reply that still carried one must not put
+      // that tenant's array name on this tenant's screen.
+      if (res) state.candidates = (res.candidates || []).filter((c) => !isOtherOrgOnNode(c));
     } catch (err) {
       state.error = errMessage(err);
     } finally {
@@ -563,7 +590,9 @@ export function openElasticImportDialog(screen, onDone) {
     confirmIcon: 'download',
     name: c.name,
     bodyHtml: `
-      ${warningHtml('danger', T('elastic_import.reown_warning', { owner: `${c.ownerOrgId || '—'}/${c.ownerAddonId || '—'}` }))}
+      ${c.ownerForeign === false
+    ? `<div class="explain-box">${escapeHtml(T('elastic_import.own_journal'))}</div>`
+    : warningHtml('danger', T('elastic_import.reown_warning', { owner: journalOwnerPhrase(c) }))}
       <div class="explain-box">${T('elastic_import.adopt_explain', { n: c.disksMatched || 0, name: escapeHtml(c.name) })}</div>`,
     retypeLabel: `${escapeHtml(T('elastic_import.retype'))} <span class="mono num-err">${escapeHtml(c.name)}</span>`,
     confirmLabel: T('elastic_import.confirm'),

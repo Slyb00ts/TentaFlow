@@ -317,7 +317,14 @@ fn prefixed_map(db: &DbPool, addon_id: &str, prefix: &str) -> HashMap<String, St
 /// node's NAME — on every install, in every fleet view. The machine's own
 /// hostname is what the rest of the core already shows for itself, so it is
 /// what this asks first for the local row.
-fn node_name(ctx: &HandlerContext, node_id: &str) -> String {
+///
+/// A peer the store has no hostname for (paired, offline since this node
+/// started) falls back to the name the sync registry recorded for it, and
+/// then to NOTHING. An empty name is deliberate: the 64-hex node id used to
+/// fill that gap and was printed as the node's name on every fleet surface,
+/// while the screen has one helper (`nodeLabel`) that says "Węzeł bez nazwy"
+/// and keeps the id in a tooltip.
+pub(crate) fn node_name(ctx: &HandlerContext, node_id: &str) -> String {
     if node_id == ctx.state.local_node_id.to_string() {
         let local = crate::mesh::node_info_collector::local_hostname();
         if !local.is_empty() && local != "unknown" {
@@ -328,7 +335,19 @@ fn node_name(ctx: &HandlerContext, node_id: &str) -> String {
         .mesh_peer_store
         .get_hostname(node_id)
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| node_id.to_string())
+        .or_else(|| registry_name(ctx, node_id))
+        .unwrap_or_default()
+}
+
+/// `sync_nodes.display_name` of one node, when the registry has a non-empty
+/// one. Asked only after the peer store came up empty, so a healthy fleet
+/// never pays for it.
+fn registry_name(ctx: &HandlerContext, node_id: &str) -> Option<String> {
+    crate::db::repository::lookup_sync_node_info(&ctx.state.db, &[node_id.to_string()])
+        .ok()?
+        .remove(node_id)
+        .map(|(name, _)| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 /// This node plus every trust-paired peer, each with its instance status
