@@ -74,3 +74,8 @@ repo = "Supertone/supertonic-3"
 id = "supertonic-3-f5"
 display_name = "Supertonic v3 (F5, zenski)"
 repo = "Supertone/supertonic-3"
+
+[[model_preset]]
+id = "supertonic-3-jarvis"
+display_name = "Supertonic v3 (Jarvis, klon)"
+repo = "Supertone/supertonic-3"
