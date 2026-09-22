@@ -475,16 +475,12 @@ this" from "nobody watches this", with no time heuristics.
 
 ## TentaNas — kontrakt wykonania Elastic
 
-- A2.2: trwały service-mode zapisuje Hold przed globalnym RO i jawny Resume przed RW; zwykły Restore/startup nie konsumuje Hold, a Inspect rozdziela intent od niezależnego pomiaru RO/RW. Odbiór ograniczono do helper/core, release i normalnego rebootu profilu 1×XFS bez parity; mover, publiczne API/UI, crash/cgroup i parity runtime pozostają poza zakresem.
-
+- A2.2: trwały service-mode zapisuje Hold przed globalnym RO i jawny Resume przed RW; zwykły Restore/startup nie konsumuje Hold, a Inspect rozdziela intent od niezależnego pomiaru RO/RW.
 - C1: helper 0.11 przechowuje pojedynczy opcjonalny `cache` (`ElasticDiskSpec`) i rolę Cache; migracja DB 11 rezerwuje data/parity/cache atomowo, zachowując aliasy i klucze obce. Create przyjmuje najwyżej jeden cache, a N08B/N11 pokazują cache osobno: jego pojemność nie wchodzi do sumy danych ani ochrony parity, zaś brak pomiaru pozostaje nieznany.
-- Rezerwacje cache są objęte globalnymi claims i świeżą walidacją tożsamości nośnika. C1 nie dodaje nowych wariantów routera; dalsze typed operacje wymagają właściciela `dispatch/mod.rs`. Runtime C1 przyjęto wyłącznie dla single-cache Create/Restore/Inspect.
-- Runtime C1 na zachowanej VM `qsX37C` potwierdził Create w jednej próbie, payload UID 1000 2 MiB tylko na cache (SHA `98fcc45f1d8a3d052566e14be3a89a9260b61ff8ee1199737f875a16619f36a5`), autoRestore po normalnym restarcie, cache RW (32 GiB; `getxattr` wykazał minfreespace 20 GiB), data NC, niezmieniony payload oraz brak tego payloadu na branchach data/parity. Zachowane FSUUID to `658ed183-48ca-469d-9409-e614b21f5aac`, `671fb9fc-81a2-4685-999a-958dafec8a89` i `9e13e0ed-3f17-449b-9db3-eedc21643855`; spec SHA `897aa60654bb01ec50cac2811dd9d90022b4f1f3476b94a45e12efae068af2a7`, config SHA `e11e378882922e30ab310f18d50de83211438c6344d5f108306fbf216ba3f5de`. Zaakceptowany screenshot: `inspect-postboot-r2/detail.png`, log: `inspect-postboot-r2.log`. VM jest dowodem C1 i nie służy do mutacji C2; mover i reszta E2 pozostają poza odbiorem.
-
+- Rezerwacje cache są objęte globalnymi claims i świeżą walidacją tożsamości nośnika. C1 nie dodaje nowych wariantów routera; dalsze typed operacje wymagają właściciela `dispatch/mod.rs`.
 - Schema 9 zapisuje job, macierz, dyski, aliasy i operację atomowo w IMMEDIATE; synchronous=FULL dotyczy wyłącznie writera NAS.
 - E2-08 rozszerza schema 10 o sync/scrub. Przyjęcie zapisuje job i nową intencję w jednej transakcji; końcowy job, wynik operacji i stan macierzy są finalizowane razem po ponownej walidacji właściciela/ID/rodzaju. Kandydat odpowiedzi i log joba nie są terminalną historią. Przyjęte operacje nie podlegają anulowaniu ani automatycznemu retry.
 - Kontrakt helpera 0.8 rozdziela rc transportu od wyniku narzędzia. Odmowa przed rozpoczęciem nie degraduje zdrowej macierzy; utrata odpowiedzi lub rozpoczęta awaria zachowuje needs_attention. Get/List pokazują ostatnie próby, ostatni udany Sync i rzeczywiście zakończony Scrub; nieznana próba nie zastępuje potwierdzonego wyniku, a `None` liczników nie oznacza zera ani bieżącej ochrony danych.
-- Adaptery Sync/Scrub, router i konsument UI są zintegrowane. Exact testy core/helper, nowy WASM i NAS Playwright zaliczono. E2-08 odebrano operacyjnie na świeżej VM kjpyi0 z poprawką c5: rzeczywisty UI Sync własnych 17 MiB, pełny Scrub 68/68 bloków i osobny Sync bez zmian (`Nothing to do`), zgodne terminalne joby/history oraz surowe root receipt/logi. Normalny restart przywrócił obie macierze (XFS z dwiema parity i ext4 bez parity), zachował spec/UUID/config/content/parity, korpus i receipt/logi. Odczytowe UI po restarcie bez mutacji pokazuje Active i trzy zakończone próby; history/lastSync/lastScrub równe stanowi przed restartem. Kontrolna ext4 pozostaje Active/No parity, bez historii i z niedostępnymi CTA SnapRAID. Pierwszy nieudany live Sync starej TNuDcB oraz jego failed/needs_attention/pending pozostają nietknięte; regresja parsera używa dosłownego logu i stdout, bez przepisywania tamtej historii. Ten zakres nie zamyka całego Elastic, korupcji/fix, awarii dysku ani cache/mover.
 - Helper 0.7 utrwala root journal przed mutacją; globalne rezerwacje i wspólny lock chronią dyski oraz przestrzeń mountów także przed objętymi guardem operacjami ZFS w obu kanałach brokera.
 - Create/restore po przyjęciu nie podlegają cancel ani cancel_all; utrata nadzoru core oznacza needs_attention, nie zakończenie I/O ani zwolnienie rezerwacji.
 - Przywracanie przy starcie szereguje macierze oraz właścicieli globalnym mutexem asynchronicznym procesu. Następne zadanie rusza po zakończeniu body, utrwaleniu wyniku i usunięciu poprzedniego z rejestru; błąd lub brak sygnału zatrzymuje kolejkę bez retry. Ręczne operacje nadal podlegają niezależnej, nieblokującej blokadzie roota.
@@ -495,24 +491,20 @@ this" from "nobody watches this", with no time heuristics.
 - UI listuje ZFS i Elastic niezależnie; `elastic-detail.js` odczytuje Get i oferuje jawne odtworzenie montowań. Istniejący hash używa `array=<name>` wyłącznie zamiast `pool`/`dataset`; powrót, reload i odnośnik dysku przechodzą przez rzeczywistą powłokę, bez nowego routera. Nieznane bajty/ochrona pozostają nieznane, a `creating` nie oferuje Restore.
 - Jeden kreator obsługuje ZFS oraz Elastic bez cache: aktualne Capabilities, snapshot podglądu po wyborze danych/FS/parity i oddzielne przepisanie nazwy przed Create. Zmiana draftu unieważnia plan; busy działa przed sudo, a wynik job/approval/unknown nigdy nie uruchamia automatycznego retry. Callback po opuszczeniu wyniku prowadzi do detalu, Zadań albo świeżej listy.
 - UI nie oferuje Anuluj dla jobów elastic_create/elastic_restore. Zatwierdzenie przechwytuje węzeł i konkretną tabelę przed dialogiem; sprawdza aktualność także po dialogu, w withSudo/remember i przed wysyłką. Detal i kreator odrzucają spóźnione callbacki obcego węzła/powierzchni.
-- `tests/e2e/tentanas-elastic-ui.spec.js` sprawdza rzeczywistą powłokę i komponenty z kontrolowanym transportem. Oddzielny, przyjęty przez krytyka odbiór PM na VM obejmuje dwa Create na `ffb57702c` (XFS/2 parity i ext4/0 parity), a na `8882f62fd` normalny restart z automatycznym reconcile obu oraz jednokrotne UI Restore po kontrolowanej utracie jednej unii; audyty root zachowały tożsamość, pliki i journal.
-- Powyższy odbiór dotyczy pustych macierzy i odtwarzania montowań, nie ochrony danych użytkownika przez sync/scrub/fix, korupcji/utraty dysku, cache/mover ani ENOSPC na tych macierzach. Cache, mover, foldery/share'y, rozbudowa, sync/scrub/fix i usuwanie macierzy nie mają w tym przyroście przycisków.
+- Zakres: powyższe dotyczy pustych macierzy i odtwarzania montowań, nie ochrony danych użytkownika przez sync/scrub/fix, korupcji/utraty dysku, cache/mover ani ENOSPC na tych macierzach. Cache, mover, foldery/share'y, rozbudowa, sync/scrub/fix i usuwanie macierzy nie mają w tym przyroście przycisków. Dowody odbioru poszczególnych przebiegów (VM, joby, identyfikatory) żyją w `tests/infra/tentanas-vm/README.md` i raportach, nie w tym pliku.
 
 ## TentaNas — prywatna VM do testów operacyjnych
 
-- A2.1: helper 0.9 i `elastic_namespace.rs` tworzą prywatne schema 2, zachowując publiczne schema 1 bez migracji/adopcji. Kotwica boot/PID/start/ns/binarka/SHA/FUSE; child zapisuje zamiar przed publikacją i kończy po ACK, parent tylko odczytuje journal. Wszystkie prywatne operacje sprawdzają namespace i hostową publikację, bez fallbacku; Restore bez mkfs, żywa kotwica może ponownie eksportować ten sam FUSE na pusty cel. Opublikowany helper `00c674c6…`: exact 163 helper/262 core PASS, Clippy 101 bez nowych diagnostyk. Nowy `guest_private_lifecycle.py` i testy przypinają osobne L/P, fazy jednokrotne, 400 trwałych zdarzeń oraz jawny BOOT_JSON związany z prereboot receipt bez zmiany manifestu. Minimalny runtime A2.1 L/P odebrany przez PM/krytyka: izolacja, Restore/Inspect w tym samym i nowym boot, P Sync/Scrub/no-change, integralność payloadu/parity. Nie zamyka to A2/E2-09/movera, service-inhibit, crash, mmap ani restartu core/cgroup; szczegóły i granice w README infrastruktury A2.1.
-- `guest_writer_gate_probe.py` mierzy A0 dla service-mode movera na małych plikach OS, bez formatowania dodatkowych dysków, transferu i unlink. R3 `mOudMN` (UUID `5a6b69ca-df2a-4083-b90d-7bbd3f486a3f`, boot `95a783e6-9609-4d4b-a0cf-4725d87987f4`, dowody `crrYg8`) na opublikowanym `fdd5ad4f…`, exact 217 PASS, wykonało preflight/prepare/local/global kod 0, journal `global/pending=null`. Local: bypass potwierdzony, umount busy 16 jest odmową, nie sukcesem odmontowania. Global: held FD daje remount EBUSY; po close/unmap remount 0, wszystkie cztery tryby otwarcia trzech aliasów EROFS 30 przy superblock/statvfs RO. Direct backing write 15 B pozostaje możliwy, mmap ENODEV 19 oznacza nieprzetestowany wariant. PM potwierdził osiem identity/SHA, puste dane NC i pięć dodatkowych dysków; Dispatch przyjął niezależnie wynik tylko w zakresie FUSE. Pełne A0/E2-09 otwarte: następnie izolacja direct branch przed copy/unlink. Raw mountinfo rodzica/aktorów i tożsamości są utrwalane przed syscall; brak dowodu blokuje komendę. Python 3.13+ / `trackfd=False`, prywatny journal/lock, dostępne testowe branche. R1/r2 pozostają historycznie failed/pending, bez retry/reset. Szczegóły i granice: `tests/infra/tentanas-vm/README.md`, sekcja sondy A0.
-- A1 `guest_branch_isolation_probe.py` / `test_guest_branch_isolation_probe.py`: prywatne branche na tmpfs ≤8 MiB i publikacja tylko FUSE. VM `DpCJ1y`, UUID `77b5de74-031a-4d95-9e36-9d52b9e8ee96`, boot `c32a49c0-a9b1-46a6-94a5-bc96242b9af5`, dowody `ByvrXm`; opublikowany `9f7b9c7b…`, exact 244 PASS, preflight/run kod 0, completed/pending true/null. 14/14 tras direct/proc UID 1000 i userns odmówiło 13 (open→setns, nie dowód samego syscalła setns); po held EBUSY 16 global RO kod 0 i 12/12 otwarć EROFS 30, root worker dodatnie 13 B. PM potwierdził cztery identity/SHA, pięć dzieci zakończonych, pięć dodatkowych dysków pustych; dispatch FINAL ACCEPT dotyczy tylko private-tmpfs/FUSE. Przypięty mergerfs celowo zachowany utrzymuje prywatny tmpfs, raw/pending trwałe. Mmap ENODEV nieprzetestowane; tmpfs volatile, bez crash/recovery, mkfs, copy/unlink i zmian produktu. Nie jest to odbiór całego E2-09 ani produkcyjnej architektury; brak retry/unmount/cleanup. Szczegóły w README infrastruktury.
-
-- `guest_cache_probe.py` to zamknięta sonda E2-03 dla jednego UUID `49efc20d-4b22-44e5-ac25-2ad5063b19eb`: preflight → nc → race → enospc, logiczny cache=data1 32 GiB/data=parity 40 GiB. Piny binarek i root-owned fixture, dokładne seriale/FS/mounty/opcje, trwały pending, ten sam boot oraz inode locka EX/NB odmawiają podmian i ponowień. Operator zapewnia 64 GiB wolnego hosta; sonda pilnuje 2 GiB OS i limitu fillera 32 GiB/20 minut. OS służy małemu journalowi/logom, trzy pozostałe puste dyski są nietykalne. Stara VM `44fc2cf1…` pozostaje `nc/pending=race`, bez odtworzenia utraconego writer fstat. R2 `5185b7bd…` zaliczyło NC/race, lecz odmówiło na progu create i zachowuje `race/pending=enospc`; rzeczywiste errno utracone, późniejszy odczyt bez obu backing plików, fizyczne ENOSPC niezaliczone. R3 na exact `325ca3467…` wykonało NC/race/ENOSPC kod 0, `enospc/pending=null`, ten sam boot; trzy bazowe pomiary E2-03 przyjęte niezależnie przez krytyka. Zmierzono policy EROFS 30 poniżej 20 GiB bez obiektów, held 19 B, fizyczny write 28 fillera i append 4060 B; końcowe 4096 B zostało na cache, `no_spill_nc`. Wolne cache 266240 B, więc nie twierdzić zero free; sześć wcześniejszych plików zachowało treść/tożsamość, trzy pozostałe dyski puste. To trzy bazowe pomiary E2-03, nie produkcyjny cache/mover, inne warianty polityk ani przyjęta architektura E2-09. Ścieżkowy getattr/newest sprawia, że rozmiar/inode fstat unii są obserwacją; dowód zapisu opiera się na backing device/inode, rozmiarze, SHA i markerze, direct FD pozostaje ścisły. Próg create dopuszcza odmowę polityki 28|30, osobno wymaga braku obiektów i utrwala raw przed oceną; fizyczny filler/held write nadal tylko ENOSPC/28. Testy lokalne nie dowodzą FUSE ani produkcyjnego movera. NC wyklucza automatyczny spill; nierozstrzygnięty append bez errno nie staje się sukcesem relokacji. Brak retry/reset/cleanup; podstawa źródłowa i szczegóły w README stanowiska.
-- Sonda E2-03 traktuje XFS `allocated` jako obserwację: odzyskanie spekulacyjnej prealokacji EOF nie zmienia dowodu treści. Pozostałe pola metryk zachowanych plików są ścisłe; bilans fillera uwzględnia zmierzoną signed deltę ich alokacji na cache i held-append, bez zwiększania tolerancji 16 MiB ani limitów.
+- A2.1: helper 0.9 i `elastic_namespace.rs` tworzą prywatne schema 2, zachowując publiczne schema 1 bez migracji/adopcji. Kotwica boot/PID/start/ns/binarka/SHA/FUSE; child zapisuje zamiar przed publikacją i kończy po ACK, parent tylko odczytuje journal. Wszystkie prywatne operacje sprawdzają namespace i hostową publikację, bez fallbacku; Restore bez mkfs, żywa kotwica może ponownie eksportować ten sam FUSE na pusty cel. Nie zamyka to A2/E2-09/movera, service-inhibit, crash, mmap ani restartu core/cgroup; szczegóły w README infrastruktury A2.1.
+- `guest_writer_gate_probe.py` mierzy A0 dla service-mode movera na małych plikach OS, bez formatowania dodatkowych dysków, transferu i unlink. Local: bypass potwierdzony, umount busy 16 jest odmową, nie sukcesem odmontowania. Global: held FD daje remount EBUSY; po close/unmap remount 0, wszystkie cztery tryby otwarcia trzech aliasów EROFS 30 przy superblock/statvfs RO. Direct backing write pozostaje możliwy, mmap ENODEV oznacza nieprzetestowany wariant. Pełne A0/E2-09 otwarte: następnie izolacja direct branch przed copy/unlink. Raw mountinfo rodzica/aktorów i tożsamości są utrwalane przed syscall; brak dowodu blokuje komendę. Python 3.13+ / `trackfd=False`, prywatny journal/lock. Szczegóły: `tests/infra/tentanas-vm/README.md`, sekcja sondy A0.
+- A1 `guest_branch_isolation_probe.py` / `test_guest_branch_isolation_probe.py`: prywatne branche na tmpfs ≤8 MiB i publikacja tylko FUSE. 14/14 tras direct/proc UID 1000 i userns odmówiło (open→setns, nie dowód samego syscalła setns); po held EBUSY global RO wszystkie otwarcia dają EROFS, root worker nadal zapisuje. Przyjęty zakres dotyczy tylko private-tmpfs/FUSE. Przypięty mergerfs celowo zachowany utrzymuje prywatny tmpfs, raw/pending trwałe. Mmap ENODEV nieprzetestowane; tmpfs volatile, bez crash/recovery, mkfs, copy/unlink i zmian produktu. Nie jest to odbiór całego E2-09 ani produkcyjnej architektury; brak retry/unmount/cleanup. Szczegóły w README infrastruktury.
+- `guest_cache_probe.py` to zamknięta sonda E2-03: preflight → nc → race → enospc, logiczny cache=data1 32 GiB/data=parity 40 GiB. Piny binarek i root-owned fixture, dokładne seriale/FS/mounty/opcje, trwały pending, ten sam boot oraz inode locka EX/NB odmawiają podmian i ponowień. Operator zapewnia 64 GiB wolnego hosta; sonda pilnuje 2 GiB OS i limitu fillera 32 GiB/20 minut. Zmierzona policy: poniżej 20 GiB wolnego bez obiektów odmowa EROFS zanim dojdzie do fizycznego zapisu; fizyczny filler/held write kończy się tylko ENOSPC/28; NC wyklucza automatyczny spill, a nierozstrzygnięty append bez errno nie staje się sukcesem relokacji. Ścieżkowy getattr/newest sprawia, że rozmiar/inode fstat unii są obserwacją; dowód zapisu opiera się na backing device/inode, rozmiarze, SHA i markerze — direct FD pozostaje ścisły. To trzy bazowe pomiary E2-03, nie produkcyjny cache/mover, inne warianty polityk ani przyjęta architektura E2-09; testy lokalne nie dowodzą FUSE ani produkcyjnego movera. Brak retry/reset/cleanup; podstawa źródłowa w README stanowiska.
+- Sonda E2-03 traktuje XFS `allocated` jako obserwację: odzyskanie spekulacyjnej prealokacji EOF nie zmienia dowodu treści.
 - Wersjonowany `readonly-elastic-audit.py` wymaga prywatnego kontraktu stanowiska i SHA bajtów: seed/create/postcreate rozdzielają bootstrap, tworzenie i zatwierdzoną specyfikację. Odczyt candidate wskazuje dokładnie jeden journal po osobnym powiązaniu job/array/operation; nie oznacza Ready ani nie aktualizuje zaufanego kontraktu. Pełny audyt porównuje spec/owner, rzeczywiste UUID/FS, mounty, config i opcje mergerfs.
 - `tests/infra/tentanas-vm/guest_e2_snapraid.py` zachowuje zamknięte fazy preflight/corpus/protect/verify bez Create/mkfs. Bieżący odbiór UI wybiera wyłącznie preflight/corpus/verify, nie CLI protect. Korpus wymaga osobnego przypiętego checkpointu pustej macierzy i tworzy trwały manifest losowych danych SHA/bytes/inode/device/mtime_ns; pending blokuje retry. Verify jest odczytem corpus_only również po legalnym restarcie, nie dowodem Sync/Scrub ani niezmienności content. Receipt/logi i baseline po ostatniej operacji trzeba odebrać osobno.
-- W rzeczywistym przebiegu PM zapisano 17 MiB, a protect wykonał diff 2 / sync 0 / diff 0 / check 0 / scrub 0. Końcowa walidacja CR odmówiła kodem 1, pozostawiając `protect/pending=05-scrub`; poprawka dekodera nie usuwa tego dowodu. Normalne verify nie zostało wykonane. Krytyk przyjął odrębny pomiar CLI z pięciu zachowanych logów i świeżych SHA, nie ukończenie fazy protect; PM potwierdził 142/142 testy Python i pięć parserów. Journal aplikacji/config i oryginalne SHA danych zachowane; content 3×1384 B, parity 2×17 MiB. Nie zalicza to korupcji/fix, restartu niepustych danych, cache/mover ani ręcznych akcji produkcyjnego UI.
 - `tests/infra/tentanas-vm/vm.py` jest jednym kontrolerem Python3 bez shell=True:
   create/start/status/ssh/inventory/stop oraz bootstrap-packages/install-packages.
-  Nie jest częścią core ani produkcyjnym
-  hypervisorem. Szczegóły i komendy opisuje lokalny README.
+  Nie jest częścią core ani produkcyjnym hypervisorem. Szczegóły i komendy opisuje lokalny README.
 - `create --profile e2` wybiera OS12/data32/data32/parity40/cache1/spare40 GiB;
   domyślny `storage` zachowuje małe dyski, a manifest musi odpowiadać dokładnej mapie.
   Tylko E2 zapisuje losowy port API: loopback → guest8090, bez SSH forwarding.
@@ -564,8 +556,7 @@ this" from "nobody watches this", with no time heuristics.
   (sześć dla storage/E2, sam OS dla block),
   root tylko na OS, cache jako NVMe, pozostałe role jako virtio oraz brak
   partycji/FS/mountów na pięciu nośnikach testowych. Nie zastępuje przyszłego
-  preflight sformatowanej macierzy. Testy guardów używają prawdziwych małych
-  QCOW2, ale nie zastępują realnego cyklu SnapRAID/mergerfs ani testów core/UI.
+  preflight sformatowanej macierzy.
 - `guest_packages.py` rozdziela pobranie od instalacji zestawu pakietów profilu (pięć
   narzędzi storage; dla block `open-iscsi nvme-cli`)
   z zależnościami. Bootstrap zachowuje oryginalne źródła i stan apt, używa tylko
@@ -591,29 +582,21 @@ this" from "nobody watches this", with no time heuristics.
   Dopiero poprawna sonda, guardy automatyki i blokada TCP443 tego samego
   publicznego IP osiągalnego podczas download pozwalają zapisać root-owned
   mode600 `/var/lib/tentanas-vm-packages/<uuid>/ready.json` z network=restricted.
-  Pakiety i receipt nie dowodzą wykonania sync/scrub/fix ani implementacji E2.
 - `storage RUNTIME {preflight,prepare,exercise,verify,corruption}` przekazuje wyłącznie UUID,
   sześć ról z manifestu i zamkniętą fazę do `guest_storage.py` na stdin,
   z jednym cytowanym JSON argv przez istniejący ścisły SSH. Wymaga restricted
   oraz pełnej tożsamości procesu; lokalne oczekiwanie SSH ma limit 900 s,
   nie gwarancję zatrzymania zdalnej operacji/rollbacku. Po timeout rozpoznać
   stan gościa i journal, bez zakładania zakończenia czy kasowania journala.
-  Nie wywołuje pustego inventory
-  V01 po formatowaniu: guardy pakietów/automatyki/dysków/FS należą do gościa.
-  Przygotowanie jest jednorazowe; verify nigdy nie jest fallbackiem do mkfs.
+  Nie wywołuje pustego inventory V01 po formatowaniu: guardy pakietów/automatyki/dysków/FS
+  należą do gościa. Przygotowanie jest jednorazowe; verify nigdy nie jest fallbackiem do mkfs.
 - Faza corruption ma jednorazowy journal: corruption.before zachowuje poprzedni
   baseline/boot_id, stage=corrupting blokuje verify, a pełny sukces aktualizuje
   istniejące baseline/boot_id i przywraca exercised. Verify zachowuje znaczenie
   kontroli ostatniego ukończonego checkpointu po jego restarcie, bez aliasu.
-  Original.json pozostaje niezmienny, obecność corruption blokuje ponowienie.
-  Rzeczywisty V02.7 wykrył zmieniony SHA przy diff 0: pełny scrub 1 wskazał
-  jeden błędny blok d2/restore.bin, ograniczony fix 0 przywrócił oryginalny SHA,
-  check 0 i czysty pełny scrub 268 bloków potwierdziły naprawę, bez sync/mkfs.
-  Original/config/parity zachowane; baseline content odnowiony po scrub.
-  Powtórzenie fazy i verify w tym samym boot odmawiają bez zmiany journala.
-  Normalny restart/verify po korupcji potwierdził nowy boot_id, check 0 przy
-  100% / 138 MB, identyczne siedem SHA i journal, bez mkfs/sync.
-- Zamknięte `detach-data2` utrwala intent i hostowy operation_id przed wewnętrznym
+  Original.json pozostaje niezmienny, obecność corruption blokuje ponowienie;
+  powtórzenie fazy i verify w tym samym boot odmawiają bez zmiany journala.
+- `detach-data2` utrwala intent i hostowy operation_id przed wewnętrznym
   replacement-arm. Po zwykłym stop mierzy SHA starego QCOW2 i zapisuje zgodne
   intent/state.retirement/retired-data2.json; kończy stopped. Kolejny start
   i restart pomijają cały drive/device data2, zachowując manifest sześciu ról
@@ -626,55 +609,39 @@ this" from "nobody watches this", with no time heuristics.
   Publiczne replacement-preflight/prepare/recover oraz verify po odłączeniu
   otrzymują replacement_id tylko z pełnego rekordu hosta; gość wiąże je z journalem
   i fizycznym spare, nie zmieniając pierwotnego manifestu/configu logicznego d2.
-  Inventory V01 i pakiety po odłączeniu odmawiają. Rzeczywisty V03 potwierdził
-  pięć dysków bez starego data2, jeden mkfs spare i nowy UUID logicznego d2,
-  licznik formatów 4. Fix naprawił 256 błędów, bez nieodzyskanych; pierwotny SHA
-  odzyskanych 64 MiB oraz całego korpusu 131 MiB zgodny. Check poprzedzał sync;
-  końcowy scrub miał 268 czystych bloków. Zwykły restart/verify zachował profil
-  pięciu dysków, UUID i siedem SHA, bez mkfs/sync oraz zmian journala.
-  Content ma nowy wspólny baseline; parity/config/original i wycofany obraz
-  pozostały niezmienione. To utrata dostępu gościa do nośnika, nie test elektroniki.
+  Inventory V01 i pakiety po odłączeniu odmawiają. To utrata dostępu gościa do
+  nośnika, nie test elektroniki.
 - V04a dodaje zamknięte enospc-preflight/enospc tylko dla detached/restricted,
   z replacement_id z rekordu hosta i guardem completed replacement po stronie
   gościa. Przed mutującym SSH host wymaga statvfs(runtime).f_bavail * f_frsize
-  co najmniej 3 GiB; brak pomiaru odmawia. PM osobno eksportuje i sprawdza SHA
-  korpusu przed próbą; kontroler nie tworzy managera backupów ani nie dowodzi
-  wykonania eksportu. Zakres to istniejący nowy plik przypięty do data2/spare,
-  zapis przez unię przy wolnym data1 i moveonenospc=false, nie create-policy,
-  pełna unia, cache/mover ani parity ENOSPC. Odbiór operacyjny V04-r3 opisano poniżej.
-  Przyjęty rzeczywisty cache.files=libfuse (nie off), z wyłączonymi writeback,
-  direct_io, kernel_cache i auto_cache oraz cache.statfs=0. Ustawień VM nie zmieniano.
-  Pierwszy rzeczywisty fill dał errno 28/write, lecz faza zakończyła się kodem 1:
-  guard free<=2 MiB błędnie odrzucił 16 MiB wewnętrznej rezerwy ext4 przy
-  available=0. Cleanup usunął tylko własny plik; siedem pierwotnych SHA i osobny
-  check operatora potwierdziły integralność. Journal pozostaje pending z cleaned=true,
-  bez completed/retry. Odebrana korekta wymaga available==0 oraz bilansu
-  abs(before.free-after.free-allocated_bytes)<=2*chunk, przy zachowaniu wszystkich
-  guardów errno/inode/payload. Bez parsera sysfs i bez stałej rezerwy 16 MiB.
-  Regresja ma rzeczywisty mały plik 8 KiB z pomiarem rezerwy 16 MiB, a retrospekcja
-  sprawdza zmierzone 936513536 B; nie uruchamia ponownie starej VM.
-  Świeży V04-r3 na 58cpLt został odebrany: errno28/write, available data2=0
-  i bilans free równy alokacji 936513536 B mimo rezerwy 16 MiB, wolna druga
-  gałąź, cleanup własnego pliku, pierwotne SHA/check0 i completed/count4.
-  Odmowa verify bez restartu oraz późniejszy normalny restart/verify0 zachowały
-  journal i SHA; bez sync/mkfs. Wcześniejsza 6CpFrJ pominęła corruption i
-  odmówiła detach z trwałym host intent; została zatrzymana bez retry.
-  Nie kasować historii ani pending pVtkPK/6CpFrJ i nie rozszerzać V04a na mover.
+  co najmniej 3 GiB; brak pomiaru odmawia. Zakres to istniejący nowy plik przypięty
+  do data2/spare, zapis przez unię przy wolnym data1 i moveonenospc=false, nie
+  create-policy, pełna unia, cache/mover ani parity ENOSPC. Przyjęty FUSE cache
+  config to cache.files=libfuse (nie off), z wyłączonymi writeback, direct_io,
+  kernel_cache i auto_cache oraz cache.statfs=0. Wczesna wersja guarda (`free<=2 MiB`)
+  błędnie odrzucała przy `available=0` z powodu 16 MiB wewnętrznej rezerwy ext4;
+  poprawiony guard wymaga `available==0` oraz bilansu
+  `abs(before.free-after.free-allocated_bytes)<=2*chunk`, przy zachowaniu wszystkich
+  guardów errno/inode/payload — bez parsera sysfs i bez stałej rezerwy 16 MiB.
+  Cleanup usuwa tylko własny plik; journal pozostaje pending z cleaned=true, bez
+  completed/retry aż do potwierdzonego przebiegu.
 - Tożsamość FS/UUID całych dysków jest sondowana bez cache przez `blkid -p`,
   oddzielnie od seriali/topologii lsblk i podpisów wipefs. Opóźnione dane udev
   po mkfs nie mogą zastępować rzeczywistego pomiaru. Journal format_pending
   może oznaczać wykonany mkfs przy zerowym liczniku potwierdzonych formatów;
   nie usuwać go ani nie ponawiać prepare po częściowej fazie. Stanowisko i jego
   journal zachowuje się jako dowód, a nowy przebieg wymaga nowego pustego runtime.
-- Rzeczywisty checkpoint harnessu obejmuje trzy ext4 i 131 MiB na obu gałęziach,
-  diff/sync/full scrub 268 bloków oraz odzyskanie 64 MiB ze zgodnym pierwotnym SHA.
-  Restart/verify potwierdziły nowy boot_id, trzy UUID i SHA siedmiu plików,
-  check 0 przy 100% / 138 MB, bez mkfs/sync oraz zmian journala. Pomiar statvfs unii dwóch
-  niezależnych FS dał sumę 2041405440 B; nie przenosić starego wniosku o jednej
-  gałęzi z katalogów na wspólnym FS. Pakiety SnapRAID 12.4-1 / mergerfs 2.40.2-5
-  identyfikuje dpkg+SHA, rzeczywiste CLI to vnone/vunknown, nie host 14.7.
-  Oddzielne wyniki cichej korupcji i zimnej utraty całego data2 opisano powyżej.
-  Nie rozszerzać dowodu na utratę wielu dysków, cache/mover, ENOSPC całej unii czy pełne E2.
+- Pomiar statvfs unii dwóch niezależnych FS sumuje ich pojemności — nie przenosić
+  wniosków z testu jednej gałęzi/katalogów na wspólnym FS na ten przypadek.
+  Identyfikacja wersji SnapRAID/mergerfs musi iść przez zainstalowany dpkg + SHA
+  binarki, nie przez własne `--version` narzędzia (w tym środowisku zwraca
+  `vnone`/`vunknown`, nie wersję hosta).
+- Zakres stanowiska ogółem: pomiary pustego bootstrapu, izolacji, cichej korupcji
+  (wykryj → scrub → fix → zweryfikuj) i zimnej utraty pojedynczego dysku danych.
+  Nie rozszerzać dowodów zebranych tu na utratę wielu dysków, cache/mover, ENOSPC
+  całej unii czy pełne E2-09/produkcyjną architekturę. Wyniki poszczególnych
+  przebiegów (VM, UUID, SHA, receipt) żyją w `tests/infra/tentanas-vm/README.md`
+  i powiązanych raportach, nie w tym pliku.
 
 ## Analytics (dashboard)
 
