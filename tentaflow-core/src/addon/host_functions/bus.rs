@@ -274,7 +274,7 @@ fn call_context(state: &AddonState, svc: &bus::BusService) -> BusCallContext {
             .unwrap_or_else(|| DEFAULT_ORG_ID.to_string()),
         actor: Some(state.addon_id.clone()),
         correlation_id: None,
-        origin: "addon".to_string(),
+        origin: bus::ADDON_ORIGIN.to_string(),
     }
 }
 

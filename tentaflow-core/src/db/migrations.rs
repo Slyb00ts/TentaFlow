@@ -1055,6 +1055,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "drop_coding_agent_legacy_service_path",
             MigrationStep::Sql(DROP_CODING_AGENT_LEGACY_SERVICE_PATH),
         ),
+        (
+            167,
+            "bus_field_policy_subject_kind_and_compact_cleanup",
+            MigrationStep::Sql(BUS_FIELD_POLICY_SUBJECT_KIND_AND_COMPACT_CLEANUP),
+        ),
+        (
+            168,
+            "topic_acl_actions_and_groups",
+            MigrationStep::Sql(TOPIC_ACL_ACTIONS_AND_GROUPS),
+        ),
     ]
 }
 
@@ -1403,6 +1413,58 @@ DROP TABLE IF EXISTS coding_agent_session_owners;
 DELETE FROM services WHERE deploy_method = 'native_managed_cli';
 ";
 
+// v168 — per-topic bus ACL grows an `action` dimension and starts honouring
+// `subject_type = 'group'` rows. `resource_permissions` is shared platform-
+// wide (models/flows/addons/model bundles/API keys all key off it), so this
+// widens the existing table in place instead of forking a topic-only one.
+//
+// MAPPING for rows recorded before this rung: every one of them acted on
+// EVERY action alike — the old bus authorizer's `topic_acl_allows` took no
+// action parameter at all (a `topic` deny row blocked produce, consume AND
+// admin together), and for every OTHER `resource_type` the concept of an
+// "action" never existed to begin with. Both are preserved exactly by
+// pinning every pre-existing row's `action` to `'*'`: the authorizer's new
+// action-aware lookup treats a `'*'` row as matching every action it is
+// asked about, so a deny recorded yesterday still denies produce/consume/
+// admin today, and a model/flow/addon/API-key ACL row keeps meaning "this
+// subject, this resource, full stop" — nothing downstream of THOSE resource
+// types reads the new column, so they are untouched in behaviour.
+//
+// The UNIQUE constraint widens from (resource_type, resource_id,
+// subject_type, subject_id) to include `action`, so a topic can now carry
+// independent read/write/admin rows per subject instead of one overwriting
+// another — while every pre-existing row, pinned at `action = '*'`, keeps
+// colliding with itself exactly as it did before (still exactly one row per
+// (type, id, subject) pair for anything that never asked for an
+// action-scoped grant). No FK touches this table (`subject_id` names a row
+// in a different table depending on `subject_type`), so no
+// `foreign_key_check` follow-up is needed, unlike the CHECK-widening rung
+// that last rebuilt this table (`api_keys_access_v2`).
+const TOPIC_ACL_ACTIONS_AND_GROUPS: &str = "
+DROP INDEX IF EXISTS idx_resperm_subject;
+DROP INDEX IF EXISTS idx_resperm_resource;
+CREATE TABLE resource_permissions_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL
+        CHECK(subject_type IN ('user','group','api_key')),
+    subject_id TEXT NOT NULL,
+    action TEXT NOT NULL DEFAULT '*' CHECK(action IN ('read','write','admin','*')),
+    access_level TEXT NOT NULL CHECK(access_level IN ('allow','deny')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(resource_type, resource_id, subject_type, subject_id, action)
+);
+INSERT INTO resource_permissions_new
+    (id, resource_type, resource_id, subject_type, subject_id, action, access_level, created_at)
+    SELECT id, resource_type, resource_id, subject_type, subject_id, '*', access_level, created_at
+    FROM resource_permissions;
+DROP TABLE resource_permissions;
+ALTER TABLE resource_permissions_new RENAME TO resource_permissions;
+CREATE INDEX idx_resperm_subject ON resource_permissions(subject_type, subject_id);
+CREATE INDEX idx_resperm_resource ON resource_permissions(resource_type, resource_id);
+";
+
 // v160 — the accounts this node already runs, adopted into the replicated
 // registry.
 //
@@ -1709,6 +1771,59 @@ fn model_metrics_rollup_add_account_id(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+// =============================================================================
+// v167 — TentaBus field policies distinguish subject kind (user / group /
+// addon), and a stored `cleanup_policy = 'compact'` is rewritten to 'delete'.
+// =============================================================================
+//
+// SUM/tentabus/DECYZJE-2026-09-22.md, `FP-subject-type`: `bus_field_policies`
+// could only target `subject_type IN ('user','any')`, so a group- or
+// addon-scoped rule was indistinguishable from a user row (an addon actor and
+// a user actor are both raw strings in `BusCallContext.actor`, per
+// `bus::field_policies::resolve`'s doc). Widens the CHECK to also accept
+// `'group'` and `'addon'`; no existing row uses either value yet (the DB
+// constraint blocked writing one), so the rebuild's `INSERT ... SELECT`
+// preserves every row unchanged. Neither `bus_field_policies` nor anything
+// referencing it carries a foreign key (see `BUS_FIELD_POLICIES`'s own doc
+// comment), so the rebuild runs as a plain `MigrationStep::Sql` batch inside
+// the runner's own transaction — no `PRAGMA foreign_keys` dance needed.
+//
+// SUM/tentabus/DECYZJE-2026-09-22.md, `C9-cleanup-policy-compact`: real
+// per-key compaction is deferred to M5; until then a topic whose stored
+// `cleanup_policy` is 'compact' behaves exactly like 'delete' at the engine
+// level (`bus::retention::sweep_partition` never branches on the value), so
+// rewriting the stored value to 'delete' changes nothing about how such a
+// topic is swept — it only stops the wizard/API from re-offering a choice
+// that was never actually implemented. `create_topic`/`update_topic` reject
+// `compact` outright from this version on (`bus::topics::reject_cleanup_compact`),
+// so no new row can reintroduce the value this statement clears.
+const BUS_FIELD_POLICY_SUBJECT_KIND_AND_COMPACT_CLEANUP: &str = r#"
+DROP INDEX IF EXISTS idx_bus_field_policies_lookup;
+CREATE TABLE bus_field_policies_new (
+    instance_id           TEXT NOT NULL,
+    org_id                TEXT NOT NULL,
+    topic                 TEXT NOT NULL,
+    subject_type          TEXT NOT NULL CHECK(subject_type IN ('user','group','addon','any')),
+    subject_id            TEXT NOT NULL,
+    direction             TEXT NOT NULL CHECK(direction IN ('write','read')),
+    fields_json           TEXT NOT NULL,
+    required_fields_json  TEXT,
+    created_at_ms         INTEGER NOT NULL,
+    updated_at_ms         INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id, topic, subject_type, subject_id, direction)
+);
+INSERT INTO bus_field_policies_new
+    SELECT instance_id, org_id, topic, subject_type, subject_id, direction,
+           fields_json, required_fields_json, created_at_ms, updated_at_ms
+    FROM bus_field_policies;
+DROP TABLE bus_field_policies;
+ALTER TABLE bus_field_policies_new RENAME TO bus_field_policies;
+CREATE INDEX IF NOT EXISTS idx_bus_field_policies_lookup
+    ON bus_field_policies(instance_id, org_id, topic, direction);
+
+UPDATE bus_topics SET cleanup_policy = 'delete' WHERE cleanup_policy = 'compact';
+"#;
 
 /// Which agents an agent may delegate to.
 ///
@@ -13559,5 +13674,95 @@ mod tests {
             [],
         )
         .expect("a connector host carries its connector, not a node id");
+    }
+
+    /// v167 (`FP-subject-type` / `C9-cleanup-policy-compact`,
+    /// SUM/tentabus/DECYZJE-2026-09-22.md): a pre-167 `bus_topics` row
+    /// stored with `cleanup_policy='compact'` is rewritten to `'delete'`,
+    /// an existing `bus_field_policies` row survives the table rebuild
+    /// unchanged, and the widened `subject_type` CHECK accepts `'group'`/
+    /// `'addon'` (while still rejecting anything else).
+    #[test]
+    fn migration_v167_rewrites_compact_cleanup_and_widens_field_policy_subject_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 166);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute(
+            "INSERT INTO bus_topics \
+                (instance_id, org_id, name, partitions, retention_ms, retention_bytes, \
+                 cleanup_policy, delivery, dedup_window_ms, max_delivery_attempts, \
+                 retry_backoff_ms, validation, content_type, replication_factor, acks, \
+                 durability, max_inline_bytes, compression, environment, created_at_ms, \
+                 updated_at_ms) \
+             VALUES \
+                ('tentabus-00000001', 'org-1', 'orders.legacy-compact', 1, 86400000, 0, \
+                 'compact', 'at_least_once', 86400000, 5, 1000, 'off', 'application/json', 1, \
+                 'leader', 'os', 65536, 'lz4', 'prod', 1000, 1000)",
+            [],
+        )
+        .expect("insert a pre-167 topic with cleanup_policy=compact");
+        conn.execute(
+            "INSERT INTO bus_field_policies \
+                (instance_id, org_id, topic, subject_type, subject_id, direction, fields_json, \
+                 required_fields_json, created_at_ms, updated_at_ms) \
+             VALUES \
+                ('tentabus-00000001', 'org-1', 'orders.legacy-compact', 'any', '*', 'read', \
+                 '[\"a\"]', NULL, 1000, 1000)",
+            [],
+        )
+        .expect("insert a pre-167 field policy row");
+
+        run(&conn).expect("v167 must apply cleanly on top of a pre-167 database");
+
+        let cleanup_policy: String = conn
+            .query_row(
+                "SELECT cleanup_policy FROM bus_topics WHERE name = 'orders.legacy-compact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cleanup_policy, "delete",
+            "a stored 'compact' value must be rewritten to 'delete'"
+        );
+
+        let surviving_subject_type: String = conn
+            .query_row(
+                "SELECT subject_type FROM bus_field_policies WHERE topic = 'orders.legacy-compact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            surviving_subject_type, "any",
+            "the pre-existing field policy row must survive the table rebuild unchanged"
+        );
+
+        for subject_type in ["group", "addon"] {
+            conn.execute(
+                "INSERT INTO bus_field_policies \
+                    (instance_id, org_id, topic, subject_type, subject_id, direction, \
+                     fields_json, required_fields_json, created_at_ms, updated_at_ms) \
+                 VALUES \
+                    ('tentabus-00000001', 'org-1', 'orders.legacy-compact', ?1, 'sub-1', \
+                     'write', '[\"a\"]', NULL, 2000, 2000)",
+                rusqlite::params![subject_type],
+            )
+            .unwrap_or_else(|e| panic!("subject_type='{subject_type}' must be accepted: {e}"));
+        }
+        let rejected = conn.execute(
+            "INSERT INTO bus_field_policies \
+                (instance_id, org_id, topic, subject_type, subject_id, direction, fields_json, \
+                 required_fields_json, created_at_ms, updated_at_ms) \
+             VALUES \
+                ('tentabus-00000001', 'org-1', 'orders.legacy-compact', 'robot', 'sub-2', \
+                 'write', '[\"a\"]', NULL, 3000, 3000)",
+            [],
+        );
+        assert!(
+            rejected.is_err(),
+            "the CHECK constraint must still reject a subject_type outside the allow-list"
+        );
     }
 }

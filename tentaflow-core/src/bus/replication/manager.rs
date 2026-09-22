@@ -656,12 +656,7 @@ impl ReplicationManager {
     /// — so a `Hello` that reaches this manager WITHOUT having gone through
     /// the router (a direct test call, or a future bug) is still refused
     /// rather than answered from a registry that is not its own.
-    pub(crate) async fn accept_hello(
-        &self,
-        hello: ReplHello,
-        recv: BusRecv,
-        mut send: BusSend,
-    ) {
+    pub(crate) async fn accept_hello(&self, hello: ReplHello, recv: BusRecv, mut send: BusSend) {
         if hello.instance_id != self.instance_id {
             // W5 review finding D4: this arm is only reachable when
             // `replication::router` already matched `hello.instance_id` to
@@ -1249,7 +1244,9 @@ impl ReplicationManager {
             })
             .collect();
         for (key, have) in due {
-            if let Ok(Some(stored)) = self.assignments.get(&self.instance_id, &key.0, &key.1, key.2)
+            if let Ok(Some(stored)) = self
+                .assignments
+                .get(&self.instance_id, &key.0, &key.1, key.2)
             {
                 if stored.leader_node_id != self.local_node_id && stored.leader_epoch >= have {
                     tracing::warn!(
@@ -3318,7 +3315,6 @@ mod tests {
         assert!(handle.disconnected.load(Ordering::SeqCst));
     }
 
-
     // ---- Stale leadership: a peer proved this node's claim is over -------
     //
     // The three-process chaos scenario's phase 5, reproduced at manager
@@ -3334,7 +3330,15 @@ mod tests {
     #[tokio::test]
     async fn a_leader_refused_with_a_newer_epoch_steps_down_onto_the_ledgers_row() {
         let fx = build("a");
-        let stale = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 2);
+        let stale = assignment(
+            "org",
+            "orders",
+            0,
+            "a",
+            &["a", "b", "c"],
+            &["a", "b", "c"],
+            2,
+        );
         fx.manager.apply_assignment(stale).await;
         assert_eq!(
             fx.manager.role("org", "orders", 0),
@@ -3376,7 +3380,15 @@ mod tests {
     #[tokio::test]
     async fn a_leader_refused_with_a_newer_epoch_steps_down_even_with_no_ledger_row_yet() {
         let fx = build("a");
-        let stale = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 2);
+        let stale = assignment(
+            "org",
+            "orders",
+            0,
+            "a",
+            &["a", "b", "c"],
+            &["a", "b", "c"],
+            2,
+        );
         fx.manager.apply_assignment(stale).await;
         let handle = fx.leader_factory.handles.lock()[0].clone();
         handle.note_stale_epoch(3);
@@ -3399,17 +3411,24 @@ mod tests {
             handle.stopped.load(Ordering::SeqCst),
             "the leader handle must be stopped, not just relabelled — it is what feeds replicas"
         );
-        assert!(
-            fx.manager
-                .preflight("org", "orders", 0, Acks::Quorum)
-                .is_err()
-        );
+        assert!(fx
+            .manager
+            .preflight("org", "orders", 0, Acks::Quorum)
+            .is_err());
     }
 
     #[tokio::test]
     async fn a_leader_refused_with_its_own_or_an_older_epoch_keeps_leading() {
         let fx = build("a");
-        let a = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 3);
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "a",
+            &["a", "b", "c"],
+            &["a", "b", "c"],
+            3,
+        );
         fx.manager.apply_assignment(a).await;
         // Equal, then older: neither proves anything. A stale probe from a
         // peer that has not caught up must never unseat a live leader.

@@ -526,6 +526,7 @@ pub fn addon_teardown_plan(
             description: p.entry.description.to_string(),
             removed: p.entry.removed,
             size_bytes: p.size_bytes,
+            count_vars: p.entry.count_vars.clone(),
         })
         .collect();
 

@@ -3345,6 +3345,7 @@
       "spawn": "Spawn subagent",
       "await_subagents": "Await subagents",
       "subagent_status": "Subagent status",
+      "on_subagent_complete": "On subagent complete",
       "interval": "Time gate",
       "workspace_context": "Workspace context",
       "patch_review": "Change review",
@@ -3386,6 +3387,7 @@
       "spawn": "Deterministically launch a subagent in the background (returns run_ids)",
       "await_subagents": "Block until named subagents finish (with timeout)",
       "subagent_status": "Snapshot of subagent statuses into a flow variable",
+      "on_subagent_complete": "Reactive entry point: the flow starts when a subagent run reaches a final state. A filter can narrow this to one agent's children and/or one status.",
       "interval": "Time gate (sleep) for periodic polling inside a loop region",
       "workspace_context": "Binds the turn to a Code Studio session: repository state from the broker, branch, changed files, toolchain, and AGENTS.md / CLAUDE.md inserted as data behind an anti-injection fence. Publishes the Code Studio tools the agent may call.",
       "patch_review": "Closes the change set, shows the diff and blocks the run until a person decides. Records per-file or per-hunk verdicts, rebuilds a file from the accepted hunks and detects a concurrent-edit conflict. The same implementation backs the gate on core.git_commit.",
@@ -5622,7 +5624,8 @@
       "tentanas_nfs_conf": "App-owned NFS server drop-in enabling the RDMA transport (the listener is closed with it)",
       "tentanas_arc_limit": "App-owned modprobe drop-in holding the ARC limit (the running cap stays until reboot)",
       "tentanas_keystore": "ZFS dataset encryption keys (kept: the datasets survive uninstall)",
-      "tentaquant_data_dir": "Laboratory data directory (tentaquant.db: projects, notebooks, runs — and the files/ content store)"
+      "tentaquant_data_dir": "Laboratory data directory (tentaquant.db: projects, notebooks, runs — and the files/ content store)",
+      "tentabus_data_dir": "Instance data directory: log/ (topics, partitions and segments) plus tentabus.db (consumer groups: {groups} {groups|consumer group|consumer groups}, pause state). Core rows are tracked separately in the platform database: {topics} {topics|topic|topics}, {assignments} {assignments|partition assignment|partition assignments}, {field_policies} {field_policies|field policy|field policies}, {schema_subjects} {schema_subjects|schema subject|schema subjects}, {schema_versions} {schema_versions|schema version|schema versions}, {acl_rows} {acl_rows|topic ACL row|topic ACL rows}, {org_quotas} {org_quotas|org quota|org quotas}."
     }
   },
   "addon_reload": {
@@ -5892,7 +5895,7 @@
     },
     "tentabus": {
       "name": "TentaBus",
-      "desc": "Durable message bus: topics, consumer groups, DLQ"
+      "desc": "Durable message bus: topics, partitions, consumer groups, DLQ, schema registry"
     }
   },
   "coming_soon": {
@@ -9817,6 +9820,7 @@
     "kpi_msgs_in": "Msgs/s (in)",
     "kpi_lag": "Total lag",
     "kpi_dlq_depth": "DLQ depth",
+    "head_dlq_badge_title": "{count} {count|message|messages} in the dead-letter queue",
     "kpi_disk": "Disk usage",
     "kpi_partitions": "Total partitions",
     "kpi_groups": "Consumer groups",
@@ -10125,7 +10129,9 @@
       "schema_type_unsupported": "This schema type does not support the requested operation.",
       "schema_ref_id_collision": "Schema reference id collision — register the schema again.",
       "instance_mismatch": "The request was addressed to a different TentaBus instance than the one that served it — a server-side configuration error.",
-      "authorizer_instance_mismatch": "The permission check is wired to a different TentaBus instance than the engine — a server-side configuration error."
+      "authorizer_instance_mismatch": "The permission check is wired to a different TentaBus instance than the engine — a server-side configuration error.",
+      "invalid_instance_id": "Invalid TentaBus instance id.",
+      "replication_internal_error": "Internal server-side replication error."
     },
     "tab_replication": "Replication",
     "wizard_field_nodes": "Replica nodes",

@@ -279,7 +279,7 @@ impl GlueLeaderFactory {
             acks,
             self.local_env,
             partition.clone(),
-            self.config,
+            self.config.clone(),
             Arc::clone(&self.metrics),
         ));
 
@@ -1181,6 +1181,7 @@ mod tests {
             replica_lag_max_bytes: 64 * 1024 * 1024,
             replica_lag_max_ms: 5_000,
             batch_fetch_max_bytes: 1024 * 1024,
+            ..LeaderConfig::default()
         }
     }
 

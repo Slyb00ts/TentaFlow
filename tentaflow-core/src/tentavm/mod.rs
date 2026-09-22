@@ -237,6 +237,7 @@ fn teardown_entries(
         kind: "tentavm_data_dir",
         description: "instance data directory (tentavm.db: connector secrets, provisioning inputs, job history)".into(),
         removed: true,
+        ..Default::default()
     }];
     if exists(&guests) {
         entries.push(TeardownEntry {
@@ -244,6 +245,7 @@ fn teardown_entries(
             kind: "tentavm_guest_runtime",
             description: "machine runtime files of this environment: disks, seed, NVRAM and TPM (kept — the machines keep running)".into(),
             removed: false,
+            ..Default::default()
         });
     }
     entries.push(TeardownEntry {
@@ -257,6 +259,7 @@ fn teardown_entries(
         kind: "tentavm_registry_rows",
         description: "registry rows of this environment (machines, grants, settings, jobs, tags) stay in the shared database: deleting them is a replicated operation and lands with the sync step".into(),
         removed: false,
+        ..Default::default()
     });
     entries
 }

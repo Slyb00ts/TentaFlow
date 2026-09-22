@@ -1040,6 +1040,37 @@ fn gate_p13(_c: &mut Criterion) {
     // is sound in place of an actual 10 GiB run.
     run_p13(&world, "p13-512mib", 512 * 1024 * 1024);
     run_p13(&world, "p13-2gib", 2 * 1024 * 1024 * 1024);
+
+    // Decision 2026-09-22 (TentaBus 1C, OTWARTE-POZYCJE.md
+    // `P13-never-at-full-scale`): the plan's literal target is 10 GiB, but
+    // forcing every default run (CI included) through a full 10 GiB
+    // write+sweep would multiply this gate's wall time for no gain on a
+    // shared host — the write phase alone is the dominant cost, and it
+    // scales linearly with target size regardless of what the sweep does.
+    // `TENTABUS_P13_TARGET_GIB` opts a local run into an arbitrary scale,
+    // including the literal 10 GiB target, without changing the default
+    // fast path above:
+    //   TENTABUS_P13_TARGET_GIB=10 cargo bench --bench bus_path -- gate_p13
+    //
+    // Measured 2026-09-22 (release-fast, this machine, `=3`) — three points
+    // now, where M1-WYNIKI.md only ever had two:
+    //     512 MiB ->  1 segment  swept in  11.43 ms (11.43 ms/segment)
+    //   2 048 MiB ->  7 segments swept in  99.40 ms (14.20 ms/segment)
+    //   3 072 MiB -> 11 segments swept in 153.84 ms (13.99 ms/segment)
+    // Per-SEGMENT cost is flat across a 6x range of total bytes, which is
+    // the O(segments)-not-O(bytes) claim measured rather than argued. At
+    // 256 MiB/segment the literal 10 GiB target is 40 segments, i.e.
+    // ~0.56 s at the measured ~14 ms/segment — still well inside the 2 s
+    // gate. The full 10 GiB pass itself remains unrun here purely for wall
+    // time (the WRITE phase dominates: 8.22 s for 3 GiB scales to ~27 s).
+    if let Ok(gib_str) = std::env::var("TENTABUS_P13_TARGET_GIB") {
+        let gib: f64 = gib_str
+            .parse()
+            .expect("TENTABUS_P13_TARGET_GIB must be a positive number of GiB");
+        assert!(gib > 0.0, "TENTABUS_P13_TARGET_GIB must be positive");
+        let target_bytes = (gib * 1024.0 * 1024.0 * 1024.0) as u64;
+        run_p13(&world, "p13-scaled", target_bytes);
+    }
 }
 
 criterion_group!(benches, gate_p1, gate_p5, gate_p4, gate_p10, gate_p13);

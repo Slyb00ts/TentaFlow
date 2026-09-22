@@ -6339,6 +6339,13 @@ pub struct AddonTeardownEntry {
     pub description: String,
     pub removed: bool,
     pub size_bytes: u64,
+    /// Named counts for the dashboard's `addon_uninstall.entries.<kind>` i18n
+    /// template (W6-i18n-teardown). `#[serde(default)]` so an older peer
+    /// omitting this field still decodes — appended, not inserted, per
+    /// `MessageBody`'s append-only struct-field contract. Empty for every
+    /// `kind` that has no per-instance counts to render.
+    #[serde(default)]
+    pub count_vars: std::collections::BTreeMap<String, i64>,
 }
 
 /// Another installed instance that declares `[[uses_app]]` on the package

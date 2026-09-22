@@ -435,11 +435,19 @@ pub struct BusDlqListResultWire {
 }
 
 // =============================================================================
-// ACL (PLAN §8.1 decision D6: `resource_permissions` with
-// `resource_type = "topic"`, actions folded into the table's existing
-// allow/deny-per-subject shape — see the authorizer's doc for what this
-// does NOT model)
+// ACL (SUM/tentabus/DECYZJE-2026-09-22.md, `topic-acl-actions`:
+// `resource_permissions` with `resource_type = "topic"`, migration 168 adds
+// an `action` column so a subject can hold independent read/write/admin
+// grants instead of one row applying to every action — see the
+// authorizer's doc for the full priority chain)
 // =============================================================================
+
+/// A peer that predates migration 168 never sends `action` — defaulting to
+/// `'*'` reproduces the only meaning a row could have back then (applies to
+/// every action), so an old `AclSetRequest` still behaves exactly as before.
+fn default_acl_action() -> String {
+    "*".to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BusAclEntryWire {
@@ -448,6 +456,10 @@ pub struct BusAclEntryWire {
     pub subject_id: String,
     /// 'allow' | 'deny'.
     pub access_level: String,
+    /// 'read' | 'write' | 'admin' | '*' (matches every action). Absent on
+    /// a pre-168 wire payload — decodes to `'*'` via `default_acl_action`.
+    #[serde(default = "default_acl_action")]
+    pub action: String,
 }
 
 // =============================================================================
@@ -867,6 +879,11 @@ pub enum BusPayload {
         /// 'allow' | 'deny' | 'clear' ('clear' removes the row entirely,
         /// reverting the subject to default-allow).
         access_level: String,
+        /// 'read' | 'write' | 'admin' | '*' (matches every action).
+        /// Defaults to `'*'` for a pre-168 caller — see
+        /// `BusAclEntryWire::action`'s doc.
+        #[serde(default = "default_acl_action")]
+        action: String,
     },
     AclSetResponse,
 
@@ -1499,6 +1516,7 @@ mod tests {
                 subject_type: "user".to_string(),
                 subject_id: "u-1".to_string(),
                 access_level: "allow".to_string(),
+                action: "read".to_string(),
             }],
         });
         round_trip(BusPayload::AclSetRequest {
@@ -1506,8 +1524,74 @@ mod tests {
             subject_type: "user".to_string(),
             subject_id: "u-1".to_string(),
             access_level: "deny".to_string(),
+            action: "write".to_string(),
         });
         round_trip(BusPayload::AclSetResponse);
+    }
+
+    /// A pre-168 peer's `AclSetRequest`/`BusAclEntryWire` (no `action` field
+    /// on the wire) must decode to `'*'` — the only meaning either shape
+    /// ever had before this rung.
+    #[test]
+    fn acl_wire_shapes_without_action_field_default_to_wildcard() {
+        #[derive(SerdeSerialize)]
+        struct LegacyAclEntry {
+            subject_type: String,
+            subject_id: String,
+            access_level: String,
+        }
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            AclListResponse {
+                entries: Vec<LegacyAclEntry>,
+            },
+            AclSetRequest {
+                topic: String,
+                subject_type: String,
+                subject_id: String,
+                access_level: String,
+            },
+        }
+
+        let legacy_list = LegacyBusPayload::AclListResponse {
+            entries: vec![LegacyAclEntry {
+                subject_type: "user".to_string(),
+                subject_id: "u-1".to_string(),
+                access_level: "allow".to_string(),
+            }],
+        };
+        let bytes = crate::cbor::encode(&legacy_list).expect("encode");
+        let decoded = crate::cbor::decode::<BusPayload>(&bytes).expect("decode");
+        assert_eq!(
+            decoded,
+            BusPayload::AclListResponse {
+                entries: vec![BusAclEntryWire {
+                    subject_type: "user".to_string(),
+                    subject_id: "u-1".to_string(),
+                    access_level: "allow".to_string(),
+                    action: "*".to_string(),
+                }],
+            }
+        );
+
+        let legacy_set = LegacyBusPayload::AclSetRequest {
+            topic: "pacs.badania.nowe".to_string(),
+            subject_type: "user".to_string(),
+            subject_id: "u-1".to_string(),
+            access_level: "deny".to_string(),
+        };
+        let bytes = crate::cbor::encode(&legacy_set).expect("encode");
+        let decoded = crate::cbor::decode::<BusPayload>(&bytes).expect("decode");
+        assert_eq!(
+            decoded,
+            BusPayload::AclSetRequest {
+                topic: "pacs.badania.nowe".to_string(),
+                subject_type: "user".to_string(),
+                subject_id: "u-1".to_string(),
+                access_level: "deny".to_string(),
+                action: "*".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -450,6 +450,7 @@ fn leader_config() -> LeaderConfig {
         replica_lag_max_bytes: 64 * 1024 * 1024,
         replica_lag_max_ms: 5_000,
         batch_fetch_max_bytes: 1024 * 1024,
+        ..LeaderConfig::default()
     }
 }
 

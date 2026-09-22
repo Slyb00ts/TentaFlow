@@ -34,3 +34,5 @@ pub mod leader;
 pub mod manager;
 pub mod metrics;
 pub mod router;
+#[cfg(test)]
+pub(crate) mod test_support;

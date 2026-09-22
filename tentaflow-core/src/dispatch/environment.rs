@@ -120,17 +120,13 @@ fn insert_pending_pull(pull_id: String, pending: PendingPull) {
 /// consume (a stale cached identity must not keep serving decisions for an
 /// environment the node no longer declares), here applied to replication.
 ///
-/// `coordinator` is threaded in rather than read from `bus::global()`
-/// directly: `BusService` (`bus/mod.rs`) has no public getter for its
-/// private `replication` field yet (`set_replication`'s own doc: "nothing
-/// in this file's publish/open_consumer/fetch/commit reads `self.
-/// replication` yet — that wiring is wave-2, agent S"), and `bus/mod.rs` is
-/// PLAN-M2 §3's "jedyny właściciel" file for that wave — out of scope
-/// here. The call site below passes `None` until that getter lands, at
-/// which point it becomes
-/// `crate::bus::global().and_then(|s| s.replication_coordinator())`; this
-/// function's own logic (eviction + one audit entry) is complete and
-/// tested independently of that missing wire.
+/// `coordinator` is threaded in by the caller rather than resolved here:
+/// there is no `bus::global()` singleton anymore (per-instance registry,
+/// `bus::running_instances()`), so a single coordinator parameter would not
+/// make sense — the call site below iterates every running instance and
+/// passes each one's own `BusService::replication()` (the public getter on
+/// `bus/mod.rs`) in turn. This function's own logic (eviction + one audit
+/// entry) stays independent of how the caller obtained the coordinator.
 ///
 /// `None` (no coordinator wired — M1 behavior, or wave-2 wiring not landed
 /// yet) is a no-op, matching every `ReplicationCoordinator` call site's

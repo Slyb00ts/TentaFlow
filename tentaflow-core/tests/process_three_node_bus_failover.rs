@@ -98,9 +98,28 @@
 // `chaos: 6000 records acked before kill` — the first `acks=quorum` traffic
 // this three-process harness has ever ACKed.
 //
-// (3) OPEN, and it is what keeps the `#[ignore]`d chaos test from producing a
-// P8 number. After `child.kill()` (SIGKILL) of the leader, NEITHER survivor
-// became a working leader within 20 s (measured 30.08 18:15:54 -> 18:16:14).
+// (3) CLOSED by `1e99dcea1` (06.09.2026) — this was a test-harness defect,
+// not a replication defect: the child served stdin SERIALLY at the 30 s
+// production `publish_ack_timeout`, so one publish blocking on a quorum
+// that never (yet) formed wedged the whole child for up to 30 s — it
+// stopped answering ROLE/ISR/every later PUBLISH_BATCH — while the parent's
+// 700 ms probe budget gave up long before that and left the reply sitting
+// in the pipe, blocking the parent's next write once the child's stdin
+// filled. That looked exactly like "neither survivor promotes", below, but
+// was the harness discarding real (slow) replies, not a stuck election.
+// With `publish_ack_timeout` lowered to 1,5 s (still comfortably above a
+// healthy quorum's real ack latency) and the parent's probe budget raised
+// above it (2 s), the SAME tree measures a real P8 of 3,59-6,21 s against
+// the PLAN <=8 s gate, zero-loss check passing — this chaos test now
+// produces a valid, passing P8 number when run explicitly (`--ignored`).
+// The investigation below is kept as a historical record of what the
+// wedged-harness symptom looked like; none of it should be read as a live
+// defect in `src/bus/replication/**` unless reproduced again under the
+// fixed harness.
+//
+// (3) [historical, see correction above] After `child.kill()` (SIGKILL) of
+// the leader, NEITHER survivor became a working leader within 20 s
+// (measured 30.08 18:15:54 -> 18:16:14).
 // The 20 s split into two distinct phases, and only the first one is the
 // "detection is slow" story this paragraph used to tell:
 //   * 16:15:54,30 -> ~16:15:57 both followers answer `not the leader for this
@@ -140,11 +159,11 @@
 // Reported rather than fixed: `src/bus/replication/**` (incl. `election.rs`)
 // and `src/sync/**` are not this file's grant.
 //
-// P8 consequence for the next wave: the harness cannot be blamed for the
-// missing number. `first_ack_at` never fires because there is no leader to
-// ACK, not because the probe window is too short (it now probes 60 s while
-// asserting the 20 s budget, so an 8-20 s failover reads as a clean FAIL).
-// Re-run this scenario only after the epoch-conflict resolution lands.
+// [historical] P8 consequence noted at the time: the harness could not be
+// blamed for the missing number, since `first_ack_at` never fired because
+// there was no leader to ACK. That framing turned out to be the bug itself
+// — `1e99dcea1` (see the correction above) found the wedged-harness cause,
+// and the fixed harness now produces a passing P8 number on the first try.
 //
 // Second reproduction (run started 19:19 local, kill at 17:19:50,403Z, exe built
 // 19:15:09) with the 60 s window shows the same stable epoch-2 draw for ~43 s and
@@ -157,10 +176,14 @@
 // survivors reach Leader and neither can form an ISR, while both sit in a
 // symmetric `leader follower-stream ended, reconnecting` loop whose Hello the
 // peer refuses with `NotAReplica` — each dials the other as leader while
-// rejecting the other's dial as a follower. Consequence for whoever picks this
-// up: a same-epoch tie-break alone cannot produce a P8 pass, because the node it
-// promotes still has to (re)form the ISR, and the `NotAReplica` refusal is where
-// that dies. Reported, not fixed: `src/bus/replication/**`.
+// rejecting the other's dial as a follower. [historical] At the time this was
+// read as: a same-epoch tie-break alone cannot produce a P8 pass, because the
+// node it promotes still has to (re)form the ISR, and the `NotAReplica`
+// refusal is where that dies. `1e99dcea1`'s fix (see the correction at the
+// top of this block) makes phase 4 wait for the survivors' live ISR to
+// reform BEFORE producing through the new leader — exactly the gap this
+// paragraph describes — and the chaos test now passes end to end, so this
+// symmetric-refusal window is no longer reachable from a normal run.
 //
 // Timing provenance for any future P8 number from this file: until 30.08 19:45
 // the parent-side probe consulted its deadline only BETWEEN blocking `read_line`

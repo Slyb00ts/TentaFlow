@@ -3346,6 +3346,7 @@
       "spawn": "Uruchom subagenta",
       "await_subagents": "Czekaj na subagentów",
       "subagent_status": "Status subagentów",
+      "on_subagent_complete": "Po zakończeniu subagenta",
       "interval": "Bramka czasowa",
       "workspace_context": "Kontekst workspace",
       "patch_review": "Przegląd zmian",
@@ -3387,6 +3388,7 @@
       "spawn": "Deterministyczne uruchomienie subagenta w tle (zwraca run_ids)",
       "await_subagents": "Blokuje aż wskazane subagenty się zakończą (z timeoutem)",
       "subagent_status": "Snapshot statusów subagentów do zmiennej flow",
+      "on_subagent_complete": "Reaktywny punkt startu: flow uruchamia się, gdy przebieg subagenta się kończy. Filtr może zawęzić to do jednego agenta i/lub jednego statusu.",
       "interval": "Bramka czasowa (sleep) do okresowego pollingu w regionie pętli",
       "workspace_context": "Wiąże turę z sesją Code Studio: stan repozytorium z brokera, gałąź, zmienione pliki, toolchain oraz AGENTS.md / CLAUDE.md wstawione jako dane w ogrodzeniu anty-wstrzyknięciowym. Publikuje listę narzędzi Code Studio dostępnych agentowi.",
       "patch_review": "Domyka zestaw zmian, pokazuje diff i blokuje przebieg do decyzji człowieka. Zapisuje decyzje per plik lub per hunk, odtwarza plik z zaakceptowanych fragmentów i wykrywa konflikt równoległej edycji. Ta sama implementacja obsługuje bramkę przy core.git_commit.",
@@ -5673,7 +5675,8 @@
       "tentanas_nfs_conf": "Wpis konfiguracji serwera NFS włączający transport RDMA (nasłuch zostaje zamknięty)",
       "tentanas_arc_limit": "Wpis modprobe z limitem ARC (działający limit trwa do restartu)",
       "tentanas_keystore": "Klucze szyfrowania datasetów ZFS (zostają: datasety przeżywają odinstalowanie)",
-      "tentaquant_data_dir": "Katalog danych laboratorium (tentaquant.db: projekty, notatniki, runy — oraz magazyn plików files/)"
+      "tentaquant_data_dir": "Katalog danych laboratorium (tentaquant.db: projekty, notatniki, runy — oraz magazyn plików files/)",
+      "tentabus_data_dir": "Katalog danych instancji: log/ (topiki, partycje i segmenty) oraz tentabus.db (grupy konsumentów: {groups} {groups|grupa konsumentów|grupy konsumentów|grup konsumentów}, stan pauzy). Wiersze podstawowe są śledzone osobno w bazie platformy: {topics} {topics|topik|topiki|topików}, {assignments} {assignments|przypisanie partycji|przypisania partycji|przypisań partycji}, {field_policies} {field_policies|polityka pól|polityki pól|polityk pól}, {schema_subjects} {schema_subjects|temat schematu|tematy schematu|tematów schematu}, {schema_versions} {schema_versions|wersja schematu|wersje schematu|wersji schematu}, {acl_rows} {acl_rows|wpis ACL|wpisy ACL|wpisów ACL}, {org_quotas} {org_quotas|limit organizacji|limity organizacji|limitów organizacji}."
     }
   },
   "addon_reload": {
@@ -5943,7 +5946,7 @@
     },
     "tentabus": {
       "name": "TentaBus",
-      "desc": "Trwała szyna komunikatów: topiki, grupy konsumentów, DLQ"
+      "desc": "Trwała szyna komunikatów: topiki, partycje, grupy konsumentów, DLQ, rejestr schematów"
     }
   },
   "coming_soon": {
@@ -9817,6 +9820,7 @@
     "kpi_msgs_in": "Wiadomości/s (in)",
     "kpi_lag": "Lag sumaryczny",
     "kpi_dlq_depth": "Głębokość DLQ",
+    "head_dlq_badge_title": "{count} {count|wiadomość w kolejce DLQ|wiadomości w kolejce DLQ|wiadomości w kolejce DLQ}",
     "kpi_disk": "Log na dysku",
     "kpi_partitions": "Partycje razem",
     "kpi_groups": "Grupy konsumentów",
@@ -10125,7 +10129,9 @@
       "schema_type_unsupported": "Ten typ schematu nie obsługuje żądanej operacji.",
       "schema_ref_id_collision": "Kolizja identyfikatora referencyjnego schematu — zarejestruj schemat ponownie.",
       "instance_mismatch": "Żądanie było zaadresowane do innej instancji TentaBus niż ta, która je obsłużyła — błąd konfiguracji po stronie serwera.",
-      "authorizer_instance_mismatch": "Kontrola uprawnień jest podpięta do innej instancji TentaBus niż silnik — błąd konfiguracji po stronie serwera."
+      "authorizer_instance_mismatch": "Kontrola uprawnień jest podpięta do innej instancji TentaBus niż silnik — błąd konfiguracji po stronie serwera.",
+      "invalid_instance_id": "Nieprawidłowy identyfikator instancji TentaBus.",
+      "replication_internal_error": "Wewnętrzny błąd replikacji na serwerze."
     },
     "tab_replication": "Replikacja",
     "wizard_field_nodes": "Nody repliki",

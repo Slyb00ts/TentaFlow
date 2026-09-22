@@ -19,9 +19,14 @@ const t = (key, vars) => I18n.t(`addon_uninstall.${key}`, vars);
 
 // Localized label for a plan entry; a kind without a translation shows the
 // backend's English description so a new hook never renders an empty row.
+// `countVars` (W6-i18n-teardown) carries named per-instance counts for a
+// `kind` whose translation template uses `{name}`/`{name|a|b|c}`
+// placeholders (e.g. TentaBus's `tentabus_data_dir`) — `undefined` for every
+// other kind, which `I18n.t` treats as "no vars" and leaves any placeholder
+// untouched, so a kind without counts still renders its plain static label.
 function entryLabel(entry) {
   const key = `addon_uninstall.entries.${entry.kind}`;
-  const label = I18n.t(key);
+  const label = I18n.t(key, entry.countVars);
   return label === key ? entry.description : label;
 }
 

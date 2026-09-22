@@ -60,6 +60,24 @@ pub fn scoped_explicit_share_resource_id(
     ])
 }
 
+/// Decodes exactly the FIRST `len<US>content` segment `composite_resource_id`
+/// wrote and returns it, leaving the rest of `id` unparsed. Used by
+/// `R4-9e-ledger-leak` to read a bus resource's leading `instance_id`
+/// segment back out of its `resource_id` without needing a second copy of
+/// that id threaded through `CoreWriteCapture`. `None` on anything that is
+/// not a well-formed composite id (empty input, a length prefix that is not
+/// a decimal number, or fewer bytes left than the declared length) — a
+/// caller that gets `None` must fail the same way as "field genuinely
+/// absent", never fall back to a zero-length or truncated segment.
+pub fn decode_first_segment(id: &str) -> Option<&str> {
+    let sep_byte_pos = id.find(RESOURCE_ID_SEP)?;
+    let len: usize = id[..sep_byte_pos].parse().ok()?;
+    let content_start = sep_byte_pos + RESOURCE_ID_SEP.len_utf8();
+    let content_end = content_start.checked_add(len)?;
+    let segment = id.get(content_start..content_end)?;
+    Some(segment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +109,30 @@ mod tests {
         assert_ne!(
             composite_resource_id(&["ab", "c"]),
             composite_resource_id(&["a", "bc"])
+        );
+    }
+
+    #[test]
+    fn decode_first_segment_reads_back_the_leading_part() {
+        let id = composite_resource_id(&["tentabus-aaaaaaaa", "org-1", "orders.created"]);
+        assert_eq!(decode_first_segment(&id), Some("tentabus-aaaaaaaa"));
+    }
+
+    #[test]
+    fn decode_first_segment_handles_a_multibyte_leading_segment() {
+        let id = composite_resource_id(&["zażółć-gęślą", "org-1", "topic"]);
+        assert_eq!(decode_first_segment(&id), Some("zażółć-gęślą"));
+    }
+
+    #[test]
+    fn decode_first_segment_rejects_malformed_input() {
+        assert_eq!(decode_first_segment(""), None);
+        assert_eq!(decode_first_segment("no-separator-here"), None);
+        assert_eq!(decode_first_segment("999"), None);
+        // Declared length longer than what is actually left.
+        assert_eq!(
+            decode_first_segment(&format!("50{RESOURCE_ID_SEP}short")),
+            None
         );
     }
 

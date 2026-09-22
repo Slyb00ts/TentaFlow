@@ -510,18 +510,19 @@ fn instance_budget_warning(running: usize) -> Option<String> {
 /// missing `REPLICATION_MANAGERS` entry are all documented no-ops when
 /// there is nothing left to do.
 ///
-/// Does NOT touch the bus reactor (`bus::reactor`): pre-W8, the reactor is
-/// a single PROCESS-GLOBAL subscriber against the `bus::global()`
-/// single-instance shim, not yet instance-scoped (flow-node/reactor
-/// instance threading is W8's own scope, §7's work-package table). §1.8's
-/// own "disable" row lists exactly `bus::stop_instance` + `replication::
-/// stop` + `router::unregister` — no reactor call — because `stop_instance`
-/// already clears that shim when the stopped instance was the one engine it
-/// pointed at, and the reactor's `subscription_loop` already tolerates
-/// `bus::global()` returning `None` on its next poll tick (its own doc).
-/// There is no reachable `reactor::stop_for_instance` (or equivalent) to
-/// call today; inventing one here would be exactly the kind of workaround
-/// this wave was told not to build for a gap that belongs to a later wave.
+/// Does NOT touch the bus reactor (`bus::reactor`) directly, and does not
+/// need to: `reactor::build_subscriptions` tracks enabled state PER
+/// `instance_id` (via `app_gate::instance_enabled`) and reconciles it on
+/// every cycle, dropping any subscription whose instance is no longer
+/// enabled — so a disabled instance's subscriptions age out on the
+/// reactor's own next reconcile pass without this function calling
+/// anything reactor-side. `subscription_loop` resolves the specific engine
+/// through `bus::instance(&config.instance_id)`, never a global/singleton
+/// lookup, so it naturally stops finding an engine once `bus::stop_instance`
+/// has removed it from the registry. §1.8's "disable" row lists exactly
+/// `bus::stop_instance` + `replication::stop` + `router::unregister` — no
+/// explicit reactor call — because the reactor's own reconcile loop is
+/// what makes that sufficient.
 pub fn native_on_disable(ctx: &NativeAppContext) {
     let _guard = ENABLE_DISABLE_LOCK.lock();
     let Ok(instance_id) = BusInstanceId::parse(ctx.addon_id) else {
@@ -678,11 +679,27 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
          {schema_versions} schema versions, {acl_rows} topic ACL rows, \
          {org_quotas} org quotas"
     );
+    // W6-i18n-teardown: same counts as `description` above, named for the
+    // dashboard's `addon_uninstall.entries.tentabus_data_dir` i18n template
+    // (`{name}`/`{name|a|b|c}` placeholders) so the uninstall dialog can show
+    // a real localized, correctly-pluralized sentence instead of falling
+    // back to the raw English `description`.
+    let count_vars = std::collections::BTreeMap::from([
+        ("groups".to_string(), groups as i64),
+        ("topics".to_string(), topics as i64),
+        ("assignments".to_string(), assignments as i64),
+        ("field_policies".to_string(), field_policies as i64),
+        ("schema_subjects".to_string(), schema_subjects as i64),
+        ("schema_versions".to_string(), schema_versions as i64),
+        ("acl_rows".to_string(), acl_rows as i64),
+        ("org_quotas".to_string(), org_quotas as i64),
+    ]);
     Ok(vec![TeardownEntry {
         path: ctx.data_dir.clone(),
         kind: "tentabus_data_dir",
         description: description.into(),
         removed: true,
+        count_vars,
     }])
 }
 
@@ -1228,64 +1245,13 @@ mod tests {
         native_on_disable(&c);
     }
 
-    /// Loopback, discovery-disabled `IrohMeshManager` — every test below
-    /// only ever needs `router::set_mesh_manager`/`replication::init` to
-    /// see a live mesh handle, never an actual peer dial. Same pattern as
-    /// `router.rs`'s and `replication::init`'s own copies (private to each
-    /// file's own test module, duplicated rather than shared — same
-    /// reasoning those two document for their own source).
-    async fn make_test_mesh_manager() -> Arc<crate::mesh::iroh_manager::IrohMeshManager> {
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS trusted_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL UNIQUE,
-                public_key TEXT NOT NULL,
-                hostname TEXT DEFAULT '',
-                approved_by TEXT DEFAULT '',
-                approved_at TEXT NOT NULL DEFAULT (datetime('now')),
-                is_active INTEGER NOT NULL DEFAULT 1,
-                last_addresses TEXT NOT NULL DEFAULT '',
-                environment TEXT
-            );
-            CREATE TABLE IF NOT EXISTS pending_pairings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                remote_node_id TEXT NOT NULL,
-                pin_code TEXT NOT NULL,
-                direction TEXT NOT NULL CHECK(direction IN ('outgoing','incoming')),
-                expires_at TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS revoked_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL UNIQUE,
-                revoked_by TEXT,
-                revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
-        )
-        .expect("create tables");
-        let mesh_db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
-        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]));
-        let security = std::sync::Arc::new(
-            crate::mesh::security::MeshSecurity::new(mesh_db, cipher).expect("security new"),
-        );
-        let cfg = crate::mesh::iroh_manager::IrohMeshConfig {
-            node_id: String::new(),
-            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-            relay_url: None,
-            enable_lan_discovery: false,
-            enable_dht_discovery: false,
-            ..Default::default()
-        };
-        crate::mesh::iroh_manager::IrohMeshManager::new(cfg, security)
-            .await
-            .expect("mesh manager new")
-    }
+    // `make_test_mesh_manager` now lives in
+    // `bus::replication::test_support` (shared with `router.rs`'s and
+    // `replication::init`'s test modules — it used to be copy-pasted three
+    // times, see that module's doc). Every test below only ever needs
+    // `router::set_mesh_manager`/`replication::init` to see a live mesh
+    // handle, never an actual peer dial.
+    use crate::bus::replication::test_support::make_test_mesh_manager;
 
     /// Review finding F1 (BLOCKER): proves the `BusService` <->
     /// `ReplicationManager` reference cycle is actually gone, not merely

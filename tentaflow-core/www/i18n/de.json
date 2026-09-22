@@ -3175,6 +3175,7 @@
       "spawn": "Spawn subagent",
       "await_subagents": "Await subagents",
       "subagent_status": "Subagent status",
+      "on_subagent_complete": "Nach Abschluss des Subagenten",
       "interval": "Time gate",
       "workspace_context": "Workspace-Kontext",
       "patch_review": "Änderungsprüfung",
@@ -3215,6 +3216,7 @@
       "spawn": "Deterministically launch a subagent in the background (returns run_ids)",
       "await_subagents": "Block until named subagents finish (with timeout)",
       "subagent_status": "Snapshot of subagent statuses into a flow variable",
+      "on_subagent_complete": "Reaktiver Einstiegspunkt: Der Flow startet, wenn ein Subagenten-Lauf einen Endzustand erreicht. Ein Filter kann dies auf einen Agenten und/oder einen Status eingrenzen.",
       "interval": "Time gate (sleep) for periodic polling inside a loop region",
       "workspace_context": "Bindet den Zug an eine Code-Studio-Sitzung: Repository-Status vom Broker, Branch, geänderte Dateien, Toolchain sowie AGENTS.md / CLAUDE.md als Daten hinter einer Anti-Injection-Umzäunung. Veröffentlicht die für den Agenten freigegebenen Code-Studio-Werkzeuge.",
       "patch_review": "Schließt den Änderungssatz ab, zeigt das Diff und hält den Lauf bis zur Entscheidung eines Menschen an. Hält Urteile pro Datei oder pro Hunk fest, baut eine Datei aus den akzeptierten Hunks neu auf und erkennt einen Konflikt durch parallele Bearbeitung. Dieselbe Implementierung trägt auch das Tor vor core.git_commit.",
@@ -3516,7 +3518,8 @@
       "tentanas_nfs_conf": "App-eigene NFS-Server-Konfigurationsdatei für den RDMA-Transport (der Listener wird mit geschlossen)",
       "tentanas_arc_limit": "App-eigene modprobe-Datei mit dem ARC-Limit (das laufende Limit bleibt bis zum Neustart)",
       "tentanas_keystore": "Verschlüsselungsschlüssel der ZFS-Datasets (bleiben: die Datasets überleben die Deinstallation)",
-      "tentaquant_data_dir": "Datenverzeichnis des Labors (tentaquant.db: Projekte, Notizbücher, Läufe — und der Inhaltsspeicher files/)"
+      "tentaquant_data_dir": "Datenverzeichnis des Labors (tentaquant.db: Projekte, Notizbücher, Läufe — und der Inhaltsspeicher files/)",
+      "tentabus_data_dir": "Instanzdatenverzeichnis: log/ (Themen, Partitionen und Segmente) sowie tentabus.db (Konsumentengruppen: {groups} {groups|Konsumentengruppe|Konsumentengruppen}, Pausenstatus). Kernzeilen werden separat in der Plattformdatenbank geführt: {topics} {topics|Thema|Themen}, {assignments} {assignments|Partitionszuweisung|Partitionszuweisungen}, {field_policies} {field_policies|Feldrichtlinie|Feldrichtlinien}, {schema_subjects} {schema_subjects|Schema-Subjekt|Schema-Subjekte}, {schema_versions} {schema_versions|Schemaversion|Schemaversionen}, {acl_rows} {acl_rows|Themen-ACL-Zeile|Themen-ACL-Zeilen}, {org_quotas} {org_quotas|Organisationskontingent|Organisationskontingente}."
     }
   },
   "addon_reload": {
@@ -4825,7 +4828,7 @@
     },
     "tentabus": {
       "name": "TentaBus",
-      "desc": "Persistenter Nachrichtenbus: Themen, Konsumentengruppen, DLQ"
+      "desc": "Persistenter Nachrichtenbus: Themen, Partitionen, Konsumentengruppen, DLQ, Schema-Registry"
     }
   },
   "coming_soon": {
@@ -8582,6 +8585,7 @@
     "kpi_msgs_in": "Nachr./s (ein)",
     "kpi_lag": "Gesamt-Lag",
     "kpi_dlq_depth": "DLQ-Tiefe",
+    "head_dlq_badge_title": "{count} {count|Nachricht|Nachrichten} in der Dead-Letter-Queue",
     "kpi_disk": "Speicherbelegung",
     "kpi_partitions": "Partitionen gesamt",
     "kpi_groups": "Konsumentengruppen",
@@ -8890,7 +8894,9 @@
       "schema_type_unsupported": "Dieser Schematyp unterstützt den angeforderten Vorgang nicht.",
       "schema_ref_id_collision": "Kollision der Schema-Referenz-ID — registrieren Sie das Schema erneut.",
       "instance_mismatch": "Die Anfrage war an eine andere TentaBus-Instanz gerichtet als an die, die sie bearbeitet hat — ein Konfigurationsfehler auf dem Server.",
-      "authorizer_instance_mismatch": "Die Berechtigungsprüfung ist mit einer anderen TentaBus-Instanz verbunden als die Engine — ein Konfigurationsfehler auf dem Server."
+      "authorizer_instance_mismatch": "Die Berechtigungsprüfung ist mit einer anderen TentaBus-Instanz verbunden als die Engine — ein Konfigurationsfehler auf dem Server.",
+      "invalid_instance_id": "Ungültige TentaBus-Instanz-ID.",
+      "replication_internal_error": "Interner Replikationsfehler auf dem Server."
     },
     "tab_replication": "Replikation",
     "wizard_field_nodes": "Replik-Knoten",

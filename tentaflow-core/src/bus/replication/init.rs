@@ -598,64 +598,13 @@ mod tests {
         }
     }
 
-    /// Loopback, discovery-disabled `IrohMeshManager` — `cfg.mesh` is a
-    /// required `Arc<IrohMeshManager>` field, but neither test below ever
-    /// reaches the code that dials or accepts on it (both guards fire
-    /// before `router::register` even sees `cfg.mesh`). Same pattern as
-    /// `router.rs`'s own `make_test_mesh_manager` (private to that file's
-    /// test module, so duplicated here rather than shared — same
-    /// reasoning `router.rs`'s own copy documents for its source,
-    /// `mesh::iroh_manager::tie_break_tests::make_manager`).
-    async fn make_test_mesh_manager() -> Arc<IrohMeshManager> {
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS trusted_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL UNIQUE,
-                public_key TEXT NOT NULL,
-                hostname TEXT DEFAULT '',
-                approved_by TEXT DEFAULT '',
-                approved_at TEXT NOT NULL DEFAULT (datetime('now')),
-                is_active INTEGER NOT NULL DEFAULT 1,
-                last_addresses TEXT NOT NULL DEFAULT '',
-                environment TEXT
-            );
-            CREATE TABLE IF NOT EXISTS pending_pairings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                remote_node_id TEXT NOT NULL,
-                pin_code TEXT NOT NULL,
-                direction TEXT NOT NULL CHECK(direction IN ('outgoing','incoming')),
-                expires_at TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS revoked_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL UNIQUE,
-                revoked_by TEXT,
-                revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
-        )
-        .expect("create tables");
-        let db: DbPool = Arc::new(Db::from_connection(conn));
-        let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
-        let security = Arc::new(MeshSecurity::new(db, cipher).expect("security new"));
-        let cfg = IrohMeshConfig {
-            node_id: String::new(),
-            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-            relay_url: None,
-            enable_lan_discovery: false,
-            enable_dht_discovery: false,
-            ..Default::default()
-        };
-        IrohMeshManager::new(cfg, security)
-            .await
-            .expect("manager new")
-    }
+    // `make_test_mesh_manager` now lives in `super::test_support` (shared
+    // with `router.rs`'s and `bus::native`'s test modules — it used to be
+    // copy-pasted three times, see that module's doc). `cfg.mesh` is a
+    // required `Arc<IrohMeshManager>` field, but neither test below ever
+    // reaches the code that dials or accepts on it (both guards fire
+    // before `router::register` even sees `cfg.mesh`).
+    use super::super::test_support::make_test_mesh_manager;
 
     fn empty_db() -> DbPool {
         Arc::new(Db::from_connection(

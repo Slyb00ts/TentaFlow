@@ -577,6 +577,13 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "patch_review",
     "exec_command",
     "delegate_cli",
+    // TentaBus blocks move records between a topic and the flow: consume is an
+    // entry like `trigger`, publish a side effect, transform rewrites the
+    // record in place. The payload is whatever the topic carries, so none of
+    // them declares a media modality.
+    "bus_consume",
+    "bus_publish",
+    "bus_transform",
 ];
 
 /// Best-effort capability inference from a stored flow graph. Walks

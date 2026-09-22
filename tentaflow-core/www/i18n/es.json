@@ -3175,6 +3175,7 @@
       "spawn": "Spawn subagent",
       "await_subagents": "Await subagents",
       "subagent_status": "Subagent status",
+      "on_subagent_complete": "Al finalizar el subagente",
       "interval": "Time gate",
       "workspace_context": "Contexto del workspace",
       "patch_review": "Revisión de cambios",
@@ -3215,6 +3216,7 @@
       "spawn": "Deterministically launch a subagent in the background (returns run_ids)",
       "await_subagents": "Block until named subagents finish (with timeout)",
       "subagent_status": "Snapshot of subagent statuses into a flow variable",
+      "on_subagent_complete": "Punto de entrada reactivo: el flow se inicia cuando una ejecución de subagente alcanza un estado final. Un filtro puede limitarlo a un agente y/o un estado.",
       "interval": "Time gate (sleep) for periodic polling inside a loop region",
       "workspace_context": "Vincula el turno a una sesión de Code Studio: estado del repositorio desde el broker, rama, archivos modificados, toolchain y AGENTS.md / CLAUDE.md insertados como datos tras una valla anti-inyección. Publica las herramientas de Code Studio que el agente puede usar.",
       "patch_review": "Cierra el conjunto de cambios, muestra el diff y detiene la ejecución hasta que una persona decida. Registra los veredictos por archivo o por hunk, reconstruye un archivo a partir de los hunks aceptados y detecta un conflicto por edición concurrente. La misma implementación sostiene la puerta de core.git_commit.",
@@ -3516,7 +3518,8 @@
       "tentanas_nfs_conf": "Fragmento de configuración del servidor NFS que habilita el transporte RDMA (el listener se cierra con él)",
       "tentanas_arc_limit": "Fragmento modprobe con el límite de ARC (el límite en ejecución dura hasta el reinicio)",
       "tentanas_keystore": "Claves de cifrado de los datasets ZFS (se conservan: los datasets sobreviven a la desinstalación)",
-      "tentaquant_data_dir": "Directorio de datos del laboratorio (tentaquant.db: proyectos, cuadernos, ejecuciones — y el almacén de archivos files/)"
+      "tentaquant_data_dir": "Directorio de datos del laboratorio (tentaquant.db: proyectos, cuadernos, ejecuciones — y el almacén de archivos files/)",
+      "tentabus_data_dir": "Directorio de datos de la instancia: log/ (temas, particiones y segmentos) más tentabus.db (grupos de consumidores: {groups} {groups|grupo de consumidores|grupos de consumidores}, estado de pausa). Las filas principales se rastrean por separado en la base de datos de la plataforma: {topics} {topics|tema|temas}, {assignments} {assignments|asignación de partición|asignaciones de partición}, {field_policies} {field_policies|política de campo|políticas de campo}, {schema_subjects} {schema_subjects|asunto de esquema|asuntos de esquema}, {schema_versions} {schema_versions|versión de esquema|versiones de esquema}, {acl_rows} {acl_rows|fila ACL de tema|filas ACL de tema}, {org_quotas} {org_quotas|cuota de organización|cuotas de organización}."
     }
   },
   "addon_reload": {
@@ -4825,7 +4828,7 @@
     },
     "tentabus": {
       "name": "TentaBus",
-      "desc": "Bus de mensajes duradero: temas, grupos de consumidores, DLQ"
+      "desc": "Bus de mensajes duradero: temas, particiones, grupos de consumidores, DLQ, registro de esquemas"
     }
   },
   "coming_soon": {
@@ -8582,6 +8585,7 @@
     "kpi_msgs_in": "Msg/s (entrada)",
     "kpi_lag": "Lag total",
     "kpi_dlq_depth": "Profundidad DLQ",
+    "head_dlq_badge_title": "{count} {count|mensaje|mensajes} en la cola de mensajes fallidos",
     "kpi_disk": "Uso de disco",
     "kpi_partitions": "Particiones totales",
     "kpi_groups": "Grupos de consumidores",
@@ -8890,7 +8894,9 @@
       "schema_type_unsupported": "Este tipo de esquema no admite la operación solicitada.",
       "schema_ref_id_collision": "Colisión del identificador de referencia del esquema — registre el esquema de nuevo.",
       "instance_mismatch": "La solicitud se dirigió a una instancia de TentaBus distinta de la que la atendió — error de configuración en el servidor.",
-      "authorizer_instance_mismatch": "La comprobación de permisos está conectada a una instancia de TentaBus distinta del motor — error de configuración en el servidor."
+      "authorizer_instance_mismatch": "La comprobación de permisos está conectada a una instancia de TentaBus distinta del motor — error de configuración en el servidor.",
+      "invalid_instance_id": "Identificador de instancia de TentaBus no válido.",
+      "replication_internal_error": "Error interno de replicación en el servidor."
     },
     "tab_replication": "Replicación",
     "wizard_field_nodes": "Nodos de réplica",

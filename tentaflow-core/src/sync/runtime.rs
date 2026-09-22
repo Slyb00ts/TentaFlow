@@ -671,8 +671,7 @@ pub fn apply_core_operation_locally(
         return Ok(None);
     };
     let operation = runtime.ledger.get_operation(op_id)?;
-    crate::sync::core_materializer::apply_core_operation(pool, &operation)
-        .map(Some)
+    crate::sync::core_materializer::apply_core_operation(pool, &operation).map(Some)
 }
 
 /// Local node id of the running sync runtime, if started. Used by callers that
@@ -967,9 +966,8 @@ impl SyncRuntime {
         // row; draining records them under the just-bumped epoch. Because the
         // outbox was wiped by `reset_core_partitions`, this is repeatable: a
         // crash-and-retry re-emits the same snapshot into an empty outbox.
-        let emitted =
-            repository::reseed_core_state_from_current_rows(&self.db)
-                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        let emitted = repository::reseed_core_state_from_current_rows(&self.db)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         crate::sync::core_capture::drain_pending_core_captures_with(
             &self.db,
             usize::MAX,
@@ -3184,13 +3182,31 @@ impl SyncRuntime {
             "capture_id".to_string(),
             FieldValue::String(capture.capture_id.clone()),
         );
-        Ok(NewSyncOperation {
-            org_id: capture.org_id.clone(),
-            partition_id: descriptor.partition_id(
+        let environment = self.ledger.current_environment()?;
+        // R4-9e-ledger-leak: a bus resource's own `resource_id` leads with
+        // the hosting TentaBus instance id (this crate's composite-id
+        // convention for every `Bus*` kind), so it keys its OWN ledger
+        // partition instead of sharing one with every other instance in the
+        // org — see `bus_instance_partition_id`'s doc. Every other resource
+        // kind is untouched: `bus_instance_id_from_resource_id` returns
+        // `None` for anything that is not `is_bus_instance_scoped`, falling
+        // straight through to the shared `partition_id` call unchanged.
+        let partition_id = match crate::sync::core_registry::bus_instance_id_from_resource_id(
+            descriptor.kind,
+            &capture.resource_id,
+        ) {
+            Some(instance_id) => {
+                descriptor.bus_instance_partition_id(&capture.org_id, environment, instance_id)?
+            }
+            None => descriptor.partition_id(
                 &capture.org_id,
                 capture.actor_user_id.as_deref(),
-                self.ledger.current_environment()?,
+                environment,
             )?,
+        };
+        Ok(NewSyncOperation {
+            org_id: capture.org_id.clone(),
+            partition_id,
             addon_id: crate::sync::core_registry::CORE_SYNC_ADDON_ID.to_string(),
             resource_type: capture.resource_type.clone(),
             resource_id: capture.resource_id.clone(),
@@ -3216,7 +3232,7 @@ impl SyncRuntime {
             // the local node is the single writer of this chain.
             hlc_timestamp: self.local_hlc_from(&capture.hlc),
             epoch: self.ledger.current_epoch()?,
-            environment: self.ledger.current_environment()?,
+            environment,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!(
@@ -3639,8 +3655,7 @@ fn chain_entry_prev_hash(entry: &NodeChainEntry) -> Option<[u8; 32]> {
 /// chain position — it keeps the author's chain contiguous, and its body is
 /// neither stored, served nor materialized.
 fn carries_shared_secret(operation: &SyncOperation) -> bool {
-    operation.body.resource_type
-        == crate::sync::core_registry::SHARED_SETTING_RESOURCE_TYPE
+    operation.body.resource_type == crate::sync::core_registry::SHARED_SETTING_RESOURCE_TYPE
         && crate::db::repository::is_shared_secret_setting_key(&operation.body.resource_id)
 }
 
@@ -5005,6 +5020,97 @@ mod tests {
         });
     }
 
+    fn core_bus_topic_capture(
+        instance_id: &str,
+        org_id: &str,
+        topic: &str,
+    ) -> crate::sync::core_capture::CoreWriteCapture {
+        let resource_id =
+            crate::sync::resource_id::composite_resource_id(&[instance_id, org_id, topic]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "row_json".to_string(),
+            FieldValue::String(format!(
+                r#"{{"instance_id":"{instance_id}","org_id":"{org_id}","name":"{topic}"}}"#
+            )),
+        );
+        crate::sync::core_capture::CoreWriteCapture::new(
+            crate::sync::core_registry::CoreSyncResourceKind::BusTopic,
+            org_id,
+            resource_id,
+            SqlWriteAction::Insert,
+            fields,
+            Some("test-actor".to_string()),
+            test_hlc(),
+            test_epoch(),
+        )
+    }
+
+    /// SUM/tentabus/DECYZJE-2026-09-22.md, `R4-9e-ledger-leak`, exercised at
+    /// the SAME integration point `core_capture_records_binary_operation_and_
+    /// outbox` proves for `Flow`: a bus topic's minted operation lands in a
+    /// partition keyed by its OWN instance id, two different instances of
+    /// the same org get two DIFFERENT partitions, and an ordinary
+    /// (non-bus) capture in the SAME run is completely unaffected — still
+    /// the shared `.../flows` shape.
+    #[test]
+    fn core_bus_topic_capture_partitions_by_instance_and_leaves_other_resources_unaffected() {
+        with_tmp_home(|| {
+            let source = make_runtime(31);
+
+            let result_a = source
+                .runtime
+                .record_core_capture(core_bus_topic_capture(
+                    "tentabus-aaaaaaaa",
+                    "org-default",
+                    "orders.created",
+                ))
+                .expect("record instance A capture");
+            let op_a = source
+                .runtime
+                .ledger
+                .get_operation(result_a.op_id)
+                .expect("operation A");
+            assert_eq!(
+                op_a.body.partition_id.as_str(),
+                "core/env/prod/org/org-default/bus/instance/tentabus-aaaaaaaa"
+            );
+
+            let result_b = source
+                .runtime
+                .record_core_capture(core_bus_topic_capture(
+                    "tentabus-bbbbbbbb",
+                    "org-default",
+                    "shipments.created",
+                ))
+                .expect("record instance B capture");
+            let op_b = source
+                .runtime
+                .ledger
+                .get_operation(result_b.op_id)
+                .expect("operation B");
+            assert_eq!(
+                op_b.body.partition_id.as_str(),
+                "core/env/prod/org/org-default/bus/instance/tentabus-bbbbbbbb"
+            );
+            assert_ne!(op_a.body.partition_id, op_b.body.partition_id);
+
+            let result_flow = source
+                .runtime
+                .record_core_capture(core_flow_capture("flow-alongside-bus", "Flow"))
+                .expect("record flow capture");
+            let op_flow = source
+                .runtime
+                .ledger
+                .get_operation(result_flow.op_id)
+                .expect("operation flow");
+            assert_eq!(
+                op_flow.body.partition_id.as_str(),
+                "core/env/prod/org/org-default/flows"
+            );
+        });
+    }
+
     #[test]
     fn core_flow_capture_queues_for_trusted_mesh_node_with_default_policy() {
         with_tmp_home(|| {
@@ -5142,11 +5248,8 @@ mod tests {
                 .get_operation(result.op_id)
                 .expect("operation");
 
-            crate::sync::core_materializer::apply_core_operation(
-                &receiver.runtime.db,
-                &operation,
-            )
-            .expect("apply core operation");
+            crate::sync::core_materializer::apply_core_operation(&receiver.runtime.db, &operation)
+                .expect("apply core operation");
             let flow = repository::get_flow(&receiver.runtime.db, "41")
                 .expect("get flow")
                 .expect("flow");
@@ -5193,11 +5296,8 @@ mod tests {
                 .get_operation(result.op_id)
                 .expect("operation");
 
-            crate::sync::core_materializer::apply_core_operation(
-                &receiver.runtime.db,
-                &operation,
-            )
-            .expect("merge core operation");
+            crate::sync::core_materializer::apply_core_operation(&receiver.runtime.db, &operation)
+                .expect("merge core operation");
             let flow = repository::get_flow(&receiver.runtime.db, "43")
                 .expect("get flow")
                 .expect("flow");
@@ -5419,16 +5519,10 @@ mod tests {
                 "expected a retryable ordering gap, got {deferred:?}"
             );
 
-            crate::sync::core_materializer::apply_core_operation(
-                &receiver.runtime.db,
-                host_op,
-            )
-            .expect("the host lands");
-            crate::sync::core_materializer::apply_core_operation(
-                &receiver.runtime.db,
-                guest_op,
-            )
-            .expect("and then the machine does");
+            crate::sync::core_materializer::apply_core_operation(&receiver.runtime.db, host_op)
+                .expect("the host lands");
+            crate::sync::core_materializer::apply_core_operation(&receiver.runtime.db, guest_op)
+                .expect("and then the machine does");
 
             let (name, owner_node, cores, ram, storage): (
                 String,
@@ -5648,7 +5742,10 @@ mod tests {
             .expect("versions");
             assert_eq!(versions.len(), 1);
             assert_eq!(versions[0].value, "hf_test_secret");
-            assert!(versions[0].hlc.wall_time_ms > 0, "the write must be versioned");
+            assert!(
+                versions[0].hlc.wall_time_ms > 0,
+                "the write must be versioned"
+            );
         });
     }
 
@@ -5671,7 +5768,10 @@ mod tests {
                 &receiver.runtime.local_node_id,
             );
             let mut fields = BTreeMap::new();
-            fields.insert("key".to_string(), FieldValue::String("hf_token".to_string()));
+            fields.insert(
+                "key".to_string(),
+                FieldValue::String("hf_token".to_string()),
+            );
             fields.insert(
                 "value".to_string(),
                 FieldValue::String("hf_plaintext_from_old_peer".to_string()),
@@ -5724,7 +5824,11 @@ mod tests {
                 )
                 .expect("handle push");
             assert!(
-                receiver.runtime.ledger.get_operation(recorded.op_id).is_err(),
+                receiver
+                    .runtime
+                    .ledger
+                    .get_operation(recorded.op_id)
+                    .is_err(),
                 "the body must not be stored"
             );
             assert!(receiver
@@ -6030,7 +6134,9 @@ mod tests {
                 .expect("core reset");
 
             let joiner_id = joiner.runtime.local_node_id.clone();
-            joiner.runtime.queue_repair_request(&relay_id, &author_id, 1);
+            joiner
+                .runtime
+                .queue_repair_request(&relay_id, &author_id, 1);
             let MeshSyncPullResult::Operations(response) = relay
                 .runtime
                 .handle_pull_payload(
@@ -11501,13 +11607,9 @@ mod tests {
             assert!(reseeded_settings.contains(&"jwt_expiry_hours".to_string()));
             assert!(!reseeded_settings.contains(&"hf_token".to_string()));
             assert_eq!(
-                repository::get_setting_secure(
-                    &node.runtime.db,
-                    "hf_token",
-                    &node.settings_cipher
-                )
-                .expect("get secret")
-                .as_deref(),
+                repository::get_setting_secure(&node.runtime.db, "hf_token", &node.settings_cipher)
+                    .expect("get secret")
+                    .as_deref(),
                 Some("hf_baseline_secret"),
                 "the cutover must leave the stored secret in place"
             );
@@ -11675,9 +11777,8 @@ mod tests {
                 .expect("db2 newer");
             // The older op arriving last must be DROPPED by the LWW gate (applies
             // 0 rows), not clobber the newer value.
-            let stale_rows =
-                crate::sync::core_materializer::apply_core_operation(&db2, &op_older)
-                    .expect("db2 older");
+            let stale_rows = crate::sync::core_materializer::apply_core_operation(&db2, &op_older)
+                .expect("db2 older");
             assert_eq!(stale_rows, 0, "stale older op must be dropped by LWW");
 
             // Both databases converge to the newer-HLC value.
@@ -11722,9 +11823,8 @@ mod tests {
 
             crate::sync::core_materializer::apply_core_operation(&db2, &op_higher)
                 .expect("db2 higher");
-            let stale =
-                crate::sync::core_materializer::apply_core_operation(&db2, &op_lower)
-                    .expect("db2 lower");
+            let stale = crate::sync::core_materializer::apply_core_operation(&db2, &op_lower)
+                .expect("db2 lower");
             assert_eq!(stale, 0, "lower node_id loses the tie-break and is dropped");
 
             assert_eq!(flow_name(&db1, "1").as_deref(), Some("from-z"));
@@ -11900,8 +12000,7 @@ mod tests {
                 &node_a,
                 api_key_capture("uid-2", "v1", true, hlc_at(1_000, 0, "node-a")),
             );
-            crate::sync::core_materializer::apply_core_operation(&db_b, &op1)
-                .expect("first apply");
+            crate::sync::core_materializer::apply_core_operation(&db_b, &op1).expect("first apply");
 
             // B stamps last_used_at locally (simulating a verify on B).
             db_b.write()
@@ -11973,9 +12072,8 @@ mod tests {
             let db2 = make_db();
             crate::sync::core_materializer::apply_core_operation(&db2, &clear_op)
                 .expect("db2 clear");
-            let stale =
-                crate::sync::core_materializer::apply_core_operation(&db2, &allow_op)
-                    .expect("db2 stale allow");
+            let stale = crate::sync::core_materializer::apply_core_operation(&db2, &allow_op)
+                .expect("db2 stale allow");
             assert_eq!(stale, 0, "older allow loses LWW against newer clear");
             assert_eq!(
                 perm_level(&db2),
@@ -12008,8 +12106,7 @@ mod tests {
 
             let db2 = make_db();
             crate::sync::core_materializer::apply_core_operation(&db2, &newer).unwrap();
-            let stale = crate::sync::core_materializer::apply_core_operation(&db2, &older)
-                .unwrap();
+            let stale = crate::sync::core_materializer::apply_core_operation(&db2, &older).unwrap();
             assert_eq!(stale, 0, "older active=true dropped by LWW");
 
             assert_eq!(api_key_active(&db1, "uid-3"), Some(false));
@@ -12950,8 +13047,12 @@ mod tests {
             let base = now_ms();
             let op_a =
                 author_shared_setting(&node_a, "jwt_expiry_hours", "12", hlc_at(base, 0, &a_id));
-            let op_b =
-                author_shared_setting(&node_b, "jwt_expiry_hours", "48", hlc_at(base + 1, 0, &b_id));
+            let op_b = author_shared_setting(
+                &node_b,
+                "jwt_expiry_hours",
+                "48",
+                hlc_at(base + 1, 0, &b_id),
+            );
 
             // Exchange both directions. Delivering a legal concurrent write must
             // succeed — these calls would Err with HashChainMismatch if the old
@@ -12964,9 +13065,9 @@ mod tests {
             deliver(&node_b, &a_id, std::slice::from_ref(&op_a)).expect("A->B redeliver");
 
             let value_a = repository::get_setting(&node_a.runtime.db, "jwt_expiry_hours")
-            .expect("read setting on A");
+                .expect("read setting on A");
             let value_b = repository::get_setting(&node_b.runtime.db, "jwt_expiry_hours")
-            .expect("read setting on B");
+                .expect("read setting on B");
 
             assert_eq!(
                 value_a.as_deref(),
@@ -13249,11 +13350,8 @@ mod tests {
         // resource's HLC in `core_resource_versions`. Without this, the local
         // write would carry no version and a stale concurrent op from a peer would
         // wrongly win the LWW gate (which compares against the version table).
-        crate::sync::core_materializer::apply_core_operation(
-            &node.runtime.db,
-            &operation,
-        )
-        .expect("materialize own shared setting");
+        crate::sync::core_materializer::apply_core_operation(&node.runtime.db, &operation)
+            .expect("materialize own shared setting");
         operation
     }
 

@@ -1,30 +1,84 @@
 //! Temporary, ignored-by-default seed/wipe harness for TentaBus's
-//! consumer-group and DLQ UI screens (M04). Not part of the test suite run
-//! by CI — both tests are `#[ignore]`d and must be invoked by name.
+//! consumer-group and DLQ UI screens (M04), rewritten for the multi-instance
+//! TentaBus platform (SUM/tentabus/PLAN-APP-PLATFORM.md). Not part of the
+//! test suite run by CI — both tests are `#[ignore]`d and must be invoked
+//! by name.
 //!
-//! This file exists purely so a UI critic can click through real
-//! consumer-group lag and DLQ screens; delete it once that review is done.
+//! This file exists purely so a UI critic (or a Playwright suite) can click
+//! through real consumer-group lag and DLQ screens across TWO real TentaBus
+//! instances; delete it once the TentaBus UI review that motivated it is
+//! done.
+//!
+//! ## Why two real instances, on real disk paths
+//! Earlier versions of this harness seeded exactly ONE instance under a
+//! hardcoded id (`tentabus-00000001`), against an in-memory per-instance
+//! `local_db`, and derived its bus log root as `<home>/bus` — none of which
+//! matches how a real TentaBus instance is provisioned
+//! (`bus::native::native_on_enable`: a real, per-instance on-disk SQLite db
+//! opened via `bus::native::open_db`, and a log root at
+//! `<data dir>/log/` = `fs_sandbox::addon_data_dir(org, addon_id).join("log")`).
+//! This version goes through the SAME lifecycle a real install+enable takes
+//! (`addon::lifecycle::install_instance` + `db::repository::
+//! set_addon_enabled`) to mint two REAL, distinct instance ids and real
+//! on-disk state, then starts each instance's engine (`bus::init_instance`)
+//! against exactly those real paths — matching the conventions
+//! `tests/tentabus_two_instances.rs` (the W10 acceptance test) established.
+//! `AllowAllAuthorizer` is still used for the harness's OWN writes below (it
+//! is not driving the dashboard, so RBAC is irrelevant to what it does) —
+//! but `grant_full_access` also grants the `admin` actor real `bus.read`/
+//! `bus.write`/`bus.admin` permissions on both instances, since every bus
+//! permission defaults to deny and a LATER real server process (e.g. one a
+//! Playwright suite spawns against this seeded state) enforces that for
+//! real, through its own freshly-booted `PermissionChecker`.
 //!
 //! ## STOP THE APP FIRST
 //! Bus partition directories are `flock`-ed by the running process and the
-//! SQLite DB is opened WAL/exclusive by it — this harness must run against
-//! a stopped app's `.runtime/`, never a live one.
+//! per-instance SQLite dbs are opened WAL/exclusive by it — this harness
+//! must run against a stopped app's `.runtime/` (or scratch home), never a
+//! live one. It stops its own two engines (`bus::stop_instance`) before
+//! `seed_demo_data`/`wipe_demo_data` return, releasing every flock it took,
+//! so a server started against the same home right after this harness exits
+//! sees a clean handoff.
 //!
 //! ## Usage
 //! ```text
-//! TENTABUS_SEED_DB=/path/to/.runtime/data/tentaflow.db \
+//! TENTABUS_SEED_DB=/path/to/tentaflow.db \
+//! TENTABUS_SEED_HOME=/path/to/tentaflow_home \
 //!   cargo test --test bus_demo_seed -- --ignored seed_demo_data --nocapture
 //!
-//! TENTABUS_SEED_DB=/path/to/.runtime/data/tentaflow.db \
+//! TENTABUS_SEED_DB=/path/to/tentaflow.db \
+//! TENTABUS_SEED_HOME=/path/to/tentaflow_home \
 //!   cargo test --test bus_demo_seed -- --ignored wipe_demo_data --nocapture
 //! ```
-//! `TENTABUS_SEED_BUS_DIR` overrides the bus directory; by default it is
-//! derived from `TENTABUS_SEED_DB` as `<db's grandparent>/bus` (mirrors
-//! `paths::tentaflow_home().join("bus")` next to `.runtime/data/`).
+//! `TENTABUS_SEED_DB` is the main sqlite database file (may be a fresh,
+//! already-migrated db, e.g. one produced by booting the real binary once
+//! and stopping it — see `tests/e2e/analytics.spec.js`'s own two-phase
+//! "boot once to migrate, seed offline, boot again" pattern, which a
+//! TentaBus Playwright fixture follows the same way). `TENTABUS_SEED_HOME`
+//! is the `TENTAFLOW_HOME` the harness (and later the real server reading
+//! this same state) uses to resolve per-instance data directories
+//! (`orgs/<org>/addons/<addon_id>/`); it defaults to `TENTABUS_SEED_DB`'s
+//! grandparent directory (matching `<home>/data/tentaflow.db`) when unset.
 //!
 //! Run `seed_demo_data` and `wipe_demo_data` ONE AT A TIME (`cargo test`
 //! runs `#[ignore]`d tests selected together in the same process/threads;
 //! this harness was only exercised with one test name per invocation).
+//!
+//! ## Playwright fixture usage
+//! A TentaBus e2e spec follows the exact two-phase shape
+//! `tests/e2e/analytics.spec.js` and `tests/e2e/tentaquant.spec.js` already
+//! use for their own fixtures:
+//!   1. `startBinary({ port, db, home })` once, to create + migrate the
+//!      main db and the native package catalog; `waitForServer`; stop it.
+//!   2. Run this harness's `seed_demo_data` (via `execFileSync('cargo', […],
+//!      { env: { TENTABUS_SEED_DB: db, TENTABUS_SEED_HOME: home, … } })`)
+//!      against that SAME `db`/`home` pair.
+//!   3. `startBinary({ port, db, home, keepDb: true })` again — the two
+//!      seeded instances are `is_enabled = true` in the db this harness
+//!      just wrote, so the real server's own boot-time native-instance pass
+//!      (`AddonManager::start_installed_native_instances`) starts their
+//!      engines against the exact on-disk state this harness produced.
+//!   4. Drive the dashboard (`#/tentabus`) with Playwright as usual.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -34,12 +88,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
+use tentaflow_core::addon::{bundled, fs_sandbox, lifecycle};
+use tentaflow_core::bus::instance::BusInstanceId;
 use tentaflow_core::bus::{
-    self, dlq, groups, topics, BusAction, BusCallContext, BusInitConfig, BusService,
-    BusServiceError, ConsumerConfig, FetchedRecordMeta, PublishBatch, PublishRecord,
+    self, dlq, groups, native as bus_native, topics, BusAction, BusCallContext, BusInitConfig,
+    BusService, BusServiceError, ConsumerConfig, FetchedRecordMeta, PublishBatch, PublishRecord,
     TopicPartition,
 };
-use tentaflow_core::db::DbPool;
+use tentaflow_core::db::{self, repository, DbPool};
 use tentaflow_core::services::org::DEFAULT_ORG_ID;
 
 const ACTOR: &str = "admin";
@@ -50,21 +106,58 @@ const ORDERS_TOPIC: &str = "orders.created";
 const BILLING_GROUP: &str = "billing";
 const NOTIFIER_GROUP: &str = "notifier";
 
-const LAB_PARTITIONS: u32 = 8;
-const ORDERS_PARTITIONS: u32 = 3;
-const LAB_RECORDS_PER_KEY: usize = 20;
-const LAB_KEY_COUNT: usize = 100; // -> 2000 records total
-const ORDERS_RECORD_COUNT: usize = 500;
-
 const BILLING_COMMIT_FRACTION: f64 = 0.4;
 const DLQ_RECORD_COUNT: u64 = 15;
 const ATTEMPTS_ONLY_RECORD_COUNT: u64 = 3;
 const SCHEMA_ERROR_MESSAGE: &str = "schema validation failed: missing field 'unit'";
 
-/// Allow-all authorizer: the app's real RBAC re-applies once it restarts
-/// and reopens the bus against the same on-disk state this harness writes
-/// — only the data on disk matters here, not who is allowed to touch it
-/// while this harness runs.
+/// The package this harness provisions instances of, and the version its
+/// bundled manifest ships (`bus/app-manifest.toml`) — matches the literal
+/// `bundled::install_native_packages` reads into the catalog, same as
+/// `tests/tentabus_two_instances.rs`'s own `"1.0.0"`.
+const PACKAGE_VERSION: &str = "1.0.0";
+
+/// Two real TentaBus instances, each with its own topics/records/consumer
+/// groups/DLQ — genuinely separate on-disk state (own per-instance db, own
+/// `<data dir>/log/` segments), not one instance's data seeded twice.
+/// `lab.results`/`orders.created` are deliberately the SAME topic names in
+/// both instances: that is exactly the multi-instance isolation the wider
+/// platform promises (`tests/tentabus_two_instances.rs`'s own acceptance
+/// scenario), and a UI critic switching between the two in the dashboard's
+/// instance gate should see two independently believable environments
+/// under identical topic names, not a naming coincidence to explain away.
+struct InstanceSpec {
+    display_name: &'static str,
+    lab_partitions: u32,
+    orders_partitions: u32,
+    lab_key_count: usize,
+    lab_records_per_key: usize,
+    orders_record_count: usize,
+}
+
+const INSTANCE_SPECS: [InstanceSpec; 2] = [
+    InstanceSpec {
+        display_name: "seed-primary",
+        lab_partitions: 8,
+        orders_partitions: 3,
+        lab_key_count: 100,
+        lab_records_per_key: 20,
+        orders_record_count: 500,
+    },
+    InstanceSpec {
+        display_name: "seed-secondary",
+        lab_partitions: 4,
+        orders_partitions: 2,
+        lab_key_count: 40,
+        lab_records_per_key: 15,
+        orders_record_count: 200,
+    },
+];
+
+/// Allow-all authorizer for the harness's OWN writes below: the app's real
+/// RBAC re-applies once a real server restarts and reopens the bus against
+/// the same on-disk state this harness writes — only the data on disk
+/// matters here, not who is allowed to touch it while this harness runs.
 struct AllowAllAuthorizer;
 
 impl bus::BusAuthorizer for AllowAllAuthorizer {
@@ -95,32 +188,33 @@ impl bus::BusAuthorizer for AllowAllAuthorizer {
 fn seed_db_path() -> PathBuf {
     PathBuf::from(env::var("TENTABUS_SEED_DB").expect(
         "TENTABUS_SEED_DB must point at the target tentaflow.db \
-         (e.g. <repo>/.runtime/data/tentaflow.db) — see this file's header for usage",
+         (e.g. <repo>/.runtime/data/tentaflow.db, or a scratch db a Playwright \
+         fixture created) — see this file's header for usage",
     ))
 }
 
-/// Defaults to `<db's grandparent>/bus`, i.e. `<tentaflow_home>/bus`
-/// alongside `<tentaflow_home>/data/tentaflow.db` — matches the app's
-/// default per-instance bus data layout without this crate needing to
-/// depend on `paths` itself.
-fn seed_bus_dir(db_path: &Path) -> PathBuf {
-    if let Ok(v) = env::var("TENTABUS_SEED_BUS_DIR") {
+/// `TENTAFLOW_HOME` this harness (and, later, the real server reading the
+/// same state) resolves every per-instance data directory under. Defaults
+/// to `<db's grandparent>`, i.e. `<home>` for `<home>/data/tentaflow.db` —
+/// matches the app's default layout (`paths.rs`'s own module doc) without
+/// this crate needing to depend on `paths` itself.
+fn seed_home(db_path: &Path) -> PathBuf {
+    if let Ok(v) = env::var("TENTABUS_SEED_HOME") {
         return PathBuf::from(v);
     }
     db_path
         .parent()
         .and_then(Path::parent)
-        .map(|home| home.join("bus"))
+        .map(|home| home.to_path_buf())
         .expect(
             "TENTABUS_SEED_DB must have at least two parent components \
-             (<home>/data/tentaflow.db) or TENTABUS_SEED_BUS_DIR must be set explicitly",
+             (<home>/data/tentaflow.db) or TENTABUS_SEED_HOME must be set explicitly",
         )
 }
 
-fn call_ctx() -> BusCallContext {
+fn call_ctx(instance_id: &BusInstanceId) -> BusCallContext {
     BusCallContext {
-        instance_id: tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
-            .expect("valid instance id"),
+        instance_id: instance_id.clone(),
         org_id: DEFAULT_ORG_ID.to_string(),
         actor: Some(ACTOR.to_string()),
         correlation_id: Some("bus-demo-seed".to_string()),
@@ -128,38 +222,102 @@ fn call_ctx() -> BusCallContext {
     }
 }
 
-/// Opens the target DB (runs the crate's normal migrations — a no-op on an
-/// already-migrated app DB) and the bus service against it, using an
-/// allow-all authorizer. Returns a DB handle too so callers can query
-/// `bus::topics::get_topic` directly without going through `BusService`
-/// (which does not expose its own DB handle).
-fn open_service() -> (Arc<BusService>, DbPool) {
+/// Opens the target main db (runs the crate's normal migrations — a no-op
+/// on an already-migrated db) and points every `fs_sandbox`/`paths` call
+/// this process makes at `TENTABUS_SEED_HOME` — same mechanism
+/// `tests/tentabus_two_instances.rs` uses (`std::env::set_var`) to make a
+/// single process address one specific home instead of the developer's
+/// real `.runtime/`. Also reconciles the native package catalog
+/// (`bundled::install_native_packages`) so `tentabus` v1.0.0 exists to
+/// install instances of — a no-op if a prior run (or a real server boot)
+/// already did this against the same db.
+fn open_platform() -> DbPool {
     let db_path = seed_db_path();
-    let bus_dir = seed_bus_dir(&db_path);
+    let home = seed_home(&db_path);
     println!(
-        "bus_demo_seed: db={} bus_dir={}",
+        "bus_demo_seed: db={} home={}",
         db_path.display(),
-        bus_dir.display()
+        home.display()
     );
-    let db = tentaflow_core::db::init(&db_path).expect("open/migrate target db");
-    let db_for_checks = db.clone();
-    let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
-    tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
-    let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
-    let svc = bus::init(BusInitConfig {
-        instance_id: tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
-            .expect("valid instance id"),
+    std::env::set_var("TENTAFLOW_HOME", &home);
+    std::env::set_var("HOME", &home);
+
+    let db = db::init(&db_path).expect("open/migrate target db");
+    bundled::install_native_packages(&db).expect("reconcile native package catalog");
+    db
+}
+
+/// Installs (or reuses an already-installed) instance named `display_name`,
+/// enabling it (`is_enabled = true`) if it was not already. Idempotent: a
+/// second `seed_demo_data` run against the same db recognizes its own prior
+/// instances by display name and reuses their (already real, already
+/// on-disk) ids instead of minting duplicates.
+fn ensure_instance(db: &DbPool, display_name: &str) -> BusInstanceId {
+    let existing =
+        repository::list_package_instances(db, BusInstanceId::PACKAGE_ID).unwrap_or_default();
+    if let Some((addon_id, enabled, _)) = existing
+        .iter()
+        .find(|(_, _, name)| name == display_name)
+    {
+        if !*enabled {
+            repository::set_addon_enabled(db, addon_id, true)
+                .expect("re-enable existing seeded instance");
+        }
+        println!("seed: reusing existing instance '{display_name}' -> {addon_id}");
+        return BusInstanceId::parse(addon_id).expect("valid instance id");
+    }
+    let addon_id = lifecycle::install_instance(
+        db,
+        BusInstanceId::PACKAGE_ID,
+        PACKAGE_VERSION,
+        display_name,
+        &BTreeMap::new(),
+    )
+    .unwrap_or_else(|e| panic!("install_instance('{display_name}') failed: {e}"));
+    repository::set_addon_enabled(db, &addon_id, true)
+        .expect("enable freshly installed instance");
+    println!("seed: installed instance '{display_name}' -> {addon_id}");
+    BusInstanceId::parse(&addon_id).expect("valid instance id")
+}
+
+/// Grants `bus.read`/`bus.write`/`bus.admin` to `ACTOR` on one instance —
+/// every bus permission defaults to `deny` (`bus/app-manifest.toml`, owner
+/// decision 03.09.2026), so a later real server's dashboard session needs
+/// this row to actually see what this harness seeded (the harness's own
+/// writes below go through `AllowAllAuthorizer` and never consult this
+/// table themselves).
+fn grant_full_access(db: &DbPool, addon_id: &str) {
+    for perm in ["bus.read", "bus.write", "bus.admin"] {
+        repository::upsert_permission(db, addon_id, "user", ACTOR, perm, "allow", None)
+            .expect("grant permission");
+    }
+}
+
+/// Starts (or reattaches to) `instance_id`'s engine against its REAL
+/// on-disk state: the per-instance SQLite db `bus::native::open_db` opens
+/// (same call `native_on_enable` makes) and the real `<data dir>/log/`
+/// bus directory (`fs_sandbox::addon_data_dir(...).join("log")`) — the
+/// same two paths a real `native_on_enable` uses, so a real server booting
+/// later against this same home finds exactly the state this harness left.
+fn start_engine(db: &DbPool, instance_id: &BusInstanceId) -> Arc<BusService> {
+    let org_id = DEFAULT_ORG_ID;
+    let local_db = bus_native::open_db(db, org_id, instance_id.as_str())
+        .expect("open per-instance on-disk local db");
+    let bus_dir = fs_sandbox::addon_data_dir(org_id, instance_id.as_str())
+        .unwrap_or_else(|e| panic!("instance data dir for '{instance_id}': {e:?}"))
+        .join("log");
+    bus::init_instance(BusInitConfig {
+        instance_id: instance_id.clone(),
         local_db,
         bus_dir,
-        db,
+        db: db.clone(),
         authorizer: Arc::new(AllowAllAuthorizer),
         retention_interval: None,
         dedup_expected_rate_per_sec: 10_000,
         partition_handle_lru: None,
         publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
     })
-    .expect("bus::init");
-    (svc, db_for_checks)
+    .expect("bus::init_instance")
 }
 
 fn lab_payload(seq: usize, patient_key: &str) -> Bytes {
@@ -219,12 +377,12 @@ fn ensure_topic(
         .expect("get_topic")
         .is_some()
     {
-        println!("seed: topic '{name}' already exists — skipping creation/seed");
+        println!("seed: topic '{name}' already exists on '{}' — skipping", svc.instance_id());
         return false;
     }
     svc.create_topic(ctx, name, opts)
-        .unwrap_or_else(|e| panic!("create_topic('{name}') failed: {e}"));
-    println!("seed: created topic '{name}'");
+        .unwrap_or_else(|e| panic!("create_topic('{name}') on '{}' failed: {e}", svc.instance_id()));
+    println!("seed: created topic '{name}' on '{}'", svc.instance_id());
     true
 }
 
@@ -279,7 +437,10 @@ fn partition_high_watermark(
 /// Read-only per-partition lag for `group` on `topic` — `open_consumer` is
 /// idempotent (reconnects to the existing `bus_groups` row rather than
 /// resetting it) and `lag()` touches no durable state, so this is safe to
-/// call on every run, seeded or not, purely for the summary.
+/// call on every run, seeded or not, purely for the summary. Resolves
+/// through the free-function `bus::open_consumer`, which looks its engine
+/// up by `ctx.instance_id` in the real multi-instance registry — the same
+/// registry `start_engine` above registered this instance's engine into.
 fn group_lag(ctx: &BusCallContext, group: &str, topic: &str) -> Vec<(TopicPartition, u64)> {
     let handle = bus::open_consumer(
         ctx,
@@ -295,29 +456,27 @@ fn group_lag(ctx: &BusCallContext, group: &str, topic: &str) -> Vec<(TopicPartit
         .unwrap_or_else(|e| panic!("lag('{group}') failed: {e}"))
 }
 
-#[test]
-#[ignore]
-fn seed_demo_data() {
-    let (svc, db) = open_service();
-    let ctx = call_ctx();
-
-    // ---- lab.results (8 partitions, ~2000 keyed records) ----------------
+/// Seeds one instance's full demo scenario (lab.results + DLQ, orders.created
+/// + a caught-up notifier group) — the per-instance body of `seed_demo_data`,
+/// run once per `InstanceSpec`.
+fn seed_instance(svc: &BusService, db: &DbPool, ctx: &BusCallContext, spec: &InstanceSpec) {
+    // ---- lab.results (keyed records, ~LAB_KEY_COUNT * LAB_RECORDS_PER_KEY) --
     let lab_created = ensure_topic(
-        &svc,
-        &db,
-        &ctx,
+        svc,
+        db,
+        ctx,
         LAB_TOPIC,
         topics::TopicOptions {
-            partitions: Some(LAB_PARTITIONS),
+            partitions: Some(spec.lab_partitions),
             ..Default::default()
         },
     );
     if lab_created {
-        let mut records = Vec::with_capacity(LAB_KEY_COUNT * LAB_RECORDS_PER_KEY);
+        let mut records = Vec::with_capacity(spec.lab_key_count * spec.lab_records_per_key);
         let mut seq = 0usize;
-        for key_idx in 1..=LAB_KEY_COUNT {
+        for key_idx in 1..=spec.lab_key_count {
             let key = format!("P-{key_idx:04}");
-            for _ in 0..LAB_RECORDS_PER_KEY {
+            for _ in 0..spec.lab_records_per_key {
                 records.push(PublishRecord {
                     key: Some(Bytes::from(key.clone())),
                     headers: seed_headers(),
@@ -329,25 +488,27 @@ fn seed_demo_data() {
             }
         }
         println!(
-            "seed: publishing {} records to '{LAB_TOPIC}'",
+            "seed[{}]: publishing {} records to '{LAB_TOPIC}'",
+            svc.instance_id(),
             records.len()
         );
-        publish_chunked(&svc, &ctx, LAB_TOPIC, records);
+        publish_chunked(svc, ctx, LAB_TOPIC, records);
     }
 
-    // ---- orders.created (3 partitions, ~500 records) ---------------------
+    // ---- orders.created (~orders_record_count records) --------------------
     let orders_created = ensure_topic(
-        &svc,
-        &db,
-        &ctx,
+        svc,
+        db,
+        ctx,
         ORDERS_TOPIC,
         topics::TopicOptions {
-            partitions: Some(ORDERS_PARTITIONS),
+            partitions: Some(spec.orders_partitions),
+            content_type: Some("application/json".to_string()),
             ..Default::default()
         },
     );
     if orders_created {
-        let records: Vec<PublishRecord> = (0..ORDERS_RECORD_COUNT)
+        let records: Vec<PublishRecord> = (0..spec.orders_record_count)
             .map(|seq| PublishRecord {
                 key: None,
                 headers: seed_headers(),
@@ -357,28 +518,29 @@ fn seed_demo_data() {
             })
             .collect();
         println!(
-            "seed: publishing {} records to '{ORDERS_TOPIC}'",
+            "seed[{}]: publishing {} records to '{ORDERS_TOPIC}'",
+            svc.instance_id(),
             records.len()
         );
-        publish_chunked(&svc, &ctx, ORDERS_TOPIC, records);
+        publish_chunked(svc, ctx, ORDERS_TOPIC, records);
     }
 
-    let lab_cfg = topics::get_topic(&db, svc.instance_id(), &ctx.org_id, LAB_TOPIC)
+    let lab_cfg = topics::get_topic(db, svc.instance_id(), &ctx.org_id, LAB_TOPIC)
         .expect("get_topic")
         .expect("lab.results must exist by now");
-    let orders_cfg = topics::get_topic(&db, svc.instance_id(), &ctx.org_id, ORDERS_TOPIC)
+    let orders_cfg = topics::get_topic(db, svc.instance_id(), &ctx.org_id, ORDERS_TOPIC)
         .expect("get_topic")
         .expect("orders.created must exist by now");
 
-    // ---- billing group on lab.results: partial commit -> visible lag ----
-    // Only runs the FIRST time lab.results is seeded: re-deriving fresh 40%
-    // targets and re-injecting DLQ failures on a re-run would try to commit
-    // BACKWARDS past what a prior run's DLQ processing already advanced the
-    // offset to (`BusServiceError::OffsetRegression`) — `ensure_topic`'s
-    // skip is exactly what keeps a second `seed_demo_data` run a no-op here.
+    // ---- billing group on lab.results: partial commit -> visible lag ------
+    // Only runs the FIRST time lab.results is seeded on THIS instance: a
+    // re-run's `ensure_topic` skip is what keeps a second `seed_demo_data`
+    // pass a no-op here (re-deriving fresh commit targets and re-injecting
+    // DLQ failures on a re-run would try to commit BACKWARDS past what a
+    // prior run's DLQ processing already advanced the offset to).
     if lab_created {
         let billing_handle = bus::open_consumer(
-            &ctx,
+            ctx,
             BILLING_GROUP,
             &[LAB_TOPIC.to_string()],
             ConsumerConfig {
@@ -386,9 +548,6 @@ fn seed_demo_data() {
             },
         )
         .expect("open_consumer(billing)");
-        // A real fetch (not just peek) so the group genuinely "consumed"
-        // the records it is about to partially commit, matching a real
-        // client's fetch-then-commit flow.
         let fetched = billing_handle
             .fetch(64 * 1024 * 1024, 500)
             .expect("billing fetch");
@@ -411,7 +570,8 @@ fn seed_demo_data() {
             .commit(&commit_targets)
             .expect("billing partial commit");
         println!(
-            "seed: billing group committed {}% of every lab.results partition",
+            "seed[{}]: billing group committed {}% of every lab.results partition",
+            svc.instance_id(),
             (BILLING_COMMIT_FRACTION * 100.0) as u32
         );
 
@@ -428,8 +588,7 @@ fn seed_demo_data() {
         assert!(
             headroom >= needed,
             "partition {dlq_partition} only has {headroom} uncommitted records, need \
-             {needed} for the DLQ/attempts scenario — rerun with more lab.results records \
-             or fewer keys"
+             {needed} for the DLQ/attempts scenario — grow the spec's lab record count"
         );
 
         let mut offset = committed;
@@ -439,7 +598,7 @@ fn seed_demo_data() {
             for _ in 0..lab_cfg.max_delivery_attempts {
                 outcome = Some(
                     svc.note_delivery_failure(
-                        &ctx,
+                        ctx,
                         BILLING_GROUP,
                         LAB_TOPIC,
                         dlq_partition,
@@ -463,8 +622,9 @@ fn seed_demo_data() {
             offset += 1;
         }
         println!(
-            "seed: sent {DLQ_RECORD_COUNT} records from partition {dlq_partition} to \
-             '__dlq.{LAB_TOPIC}' (billing group committed offset now {offset})"
+            "seed[{}]: sent {DLQ_RECORD_COUNT} records from partition {dlq_partition} to \
+             '__dlq.{LAB_TOPIC}' (billing group committed offset now {offset})",
+            svc.instance_id()
         );
 
         // 3 more records with attempts > 0 but under the DLQ threshold.
@@ -475,7 +635,7 @@ fn seed_demo_data() {
             for _ in 0..attempts_only {
                 outcome = Some(
                     svc.note_delivery_failure(
-                        &ctx,
+                        ctx,
                         BILLING_GROUP,
                         LAB_TOPIC,
                         dlq_partition,
@@ -496,19 +656,21 @@ fn seed_demo_data() {
             offset += 1;
         }
         println!(
-            "seed: left {ATTEMPTS_ONLY_RECORD_COUNT} records in billing/lab.results with \
-             attempts={attempts_only} (not yet in DLQ)"
+            "seed[{}]: left {ATTEMPTS_ONLY_RECORD_COUNT} records in billing/lab.results with \
+             attempts={attempts_only} (not yet in DLQ)",
+            svc.instance_id()
         );
     } else {
         println!(
-            "seed: 'lab.results' already existed — skipping billing/DLQ scenario (already seeded)"
+            "seed[{}]: 'lab.results' already existed — skipping billing/DLQ scenario",
+            svc.instance_id()
         );
     }
 
-    // ---- notifier group on orders.created: fully caught up --------------
+    // ---- notifier group on orders.created: fully caught up ----------------
     if orders_created {
         let notifier_handle = bus::open_consumer(
-            &ctx,
+            ctx,
             NOTIFIER_GROUP,
             &[ORDERS_TOPIC.to_string()],
             ConsumerConfig {
@@ -535,21 +697,25 @@ fn seed_demo_data() {
         notifier_handle
             .commit(&notifier_commit)
             .expect("notifier full commit");
-        println!("seed: notifier group fully caught up on orders.created");
+        println!(
+            "seed[{}]: notifier group fully caught up on orders.created",
+            svc.instance_id()
+        );
     } else {
         println!(
-            "seed: 'orders.created' already existed — skipping notifier scenario (already seeded)"
+            "seed[{}]: 'orders.created' already existed — skipping notifier scenario",
+            svc.instance_id()
         );
     }
 
-    // ---- summary (read-only: safe whether this run seeded or skipped) ---
+    // ---- summary (read-only: safe whether this run seeded or skipped) -----
     let dlq_topic = dlq::dlq_topic_name(LAB_TOPIC);
-    println!("\n=== bus_demo_seed summary ===");
+    println!("\n=== bus_demo_seed summary: instance '{}' ===", svc.instance_id());
     println!("topic '{LAB_TOPIC}': {} partitions", lab_cfg.partitions);
-    let billing_lag = group_lag(&ctx, BILLING_GROUP, LAB_TOPIC);
+    let billing_lag = group_lag(ctx, BILLING_GROUP, LAB_TOPIC);
     let mut lab_total = 0u64;
     for (tp, lag) in &billing_lag {
-        let hw = partition_high_watermark(&svc, &ctx, LAB_TOPIC, tp.partition);
+        let hw = partition_high_watermark(svc, ctx, LAB_TOPIC, tp.partition);
         lab_total += hw;
         println!(
             "  partition {}: {hw} records, billing committed={}, lag={lag}",
@@ -559,9 +725,9 @@ fn seed_demo_data() {
     }
     println!("  total records published: {lab_total}");
 
-    let notifier_lag = group_lag(&ctx, NOTIFIER_GROUP, ORDERS_TOPIC);
+    let notifier_lag = group_lag(ctx, NOTIFIER_GROUP, ORDERS_TOPIC);
     let orders_total: u64 = (0..orders_cfg.partitions)
-        .map(|p| partition_high_watermark(&svc, &ctx, ORDERS_TOPIC, p))
+        .map(|p| partition_high_watermark(svc, ctx, ORDERS_TOPIC, p))
         .sum();
     let notifier_lag_total: u64 = notifier_lag.iter().map(|(_, lag)| lag).sum();
     println!(
@@ -571,34 +737,74 @@ fn seed_demo_data() {
     );
 
     let dlq_count: u64 = (0..lab_cfg.partitions)
-        .map(|p| partition_high_watermark(&svc, &ctx, &dlq_topic, p))
+        .map(|p| partition_high_watermark(svc, ctx, &dlq_topic, p))
         .sum();
-    println!("DLQ topic '{dlq_topic}': {dlq_count} records (expected >= {DLQ_RECORD_COUNT})");
+    println!(
+        "DLQ topic '{dlq_topic}': {dlq_count} records (expected >= {DLQ_RECORD_COUNT})"
+    );
     assert!(
         dlq_count >= DLQ_RECORD_COUNT,
-        "expected at least {DLQ_RECORD_COUNT} records in '{dlq_topic}', found {dlq_count}"
+        "expected at least {DLQ_RECORD_COUNT} records in '{dlq_topic}' on instance '{}', \
+         found {dlq_count}",
+        svc.instance_id()
     );
-    println!("=== end summary ===\n");
+    println!("=== end summary: instance '{}' ===\n", svc.instance_id());
+}
+
+#[test]
+#[ignore]
+fn seed_demo_data() {
+    let db = open_platform();
+
+    for spec in &INSTANCE_SPECS {
+        let instance_id = ensure_instance(&db, spec.display_name);
+        grant_full_access(&db, instance_id.as_str());
+        let svc = start_engine(&db, &instance_id);
+        let ctx = call_ctx(&instance_id);
+        seed_instance(&svc, &db, &ctx, spec);
+        bus::stop_instance(&instance_id);
+    }
+
+    println!(
+        "bus_demo_seed: seeded {} instance(s): {}",
+        INSTANCE_SPECS.len(),
+        INSTANCE_SPECS
+            .iter()
+            .map(|s| s.display_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 #[test]
 #[ignore]
 fn wipe_demo_data() {
-    let (svc, _db) = open_service();
-    let ctx = call_ctx();
+    let db = open_platform();
 
-    for topic in [
-        dlq::dlq_topic_name(LAB_TOPIC),
-        dlq::dlq_topic_name(ORDERS_TOPIC),
-        LAB_TOPIC.to_string(),
-        ORDERS_TOPIC.to_string(),
-    ] {
-        match svc.delete_topic(&ctx, &topic) {
-            Ok(()) => println!("wipe: deleted topic '{topic}' (and its group state)"),
-            Err(BusServiceError::TopicNotFound { .. }) => {
-                println!("wipe: topic '{topic}' does not exist — nothing to delete")
-            }
-            Err(e) => panic!("delete_topic('{topic}') failed: {e}"),
+    for spec in &INSTANCE_SPECS {
+        let existing =
+            repository::list_package_instances(&db, BusInstanceId::PACKAGE_ID).unwrap_or_default();
+        let Some((addon_id, _, _)) = existing
+            .into_iter()
+            .find(|(_, _, name)| name == spec.display_name)
+        else {
+            println!(
+                "wipe: instance '{}' is not installed — nothing to wipe",
+                spec.display_name
+            );
+            continue;
+        };
+        // Release this process's own flock/handles first (a no-op if this
+        // process never started this instance's engine, e.g. a wipe run
+        // right after a separate seed process already exited).
+        if let Ok(instance_id) = BusInstanceId::parse(&addon_id) {
+            bus::stop_instance(&instance_id);
         }
+        lifecycle::uninstall_instance(&addon_id, &db)
+            .unwrap_or_else(|e| panic!("uninstall_instance('{addon_id}') failed: {e}"));
+        println!(
+            "wipe: uninstalled instance '{}' ({addon_id}) — data dir and all rows removed",
+            spec.display_name
+        );
     }
 }

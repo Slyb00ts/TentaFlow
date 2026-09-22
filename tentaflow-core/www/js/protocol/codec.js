@@ -3285,6 +3285,139 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  // ----- Field policies (SUM/tentabus/POLITYKI-POL.md — F0; JS-codec) -----
+
+  /** BusPayload::FieldPolicyListRequest — every field policy configured on `topic`. payload: { instanceId, topic }. */
+  busFieldPolicyListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusFieldPolicyListRequest(encode._busInstanceId(payload), String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::FieldPolicySetRequest. payload: { topic, subjectType, subjectId, direction:
+   * 'write'|'read', fields: string[], requiredFields: string[] }. `requiredFields` must be a
+   * subset of `fields` (validated server-side).
+   */
+  busFieldPolicySetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusFieldPolicySetRequest(
+      encode._busInstanceId(payload),
+      String(payload.topic ?? ''),
+      String(payload.subjectType ?? payload.subject_type ?? 'user'),
+      String(payload.subjectId ?? payload.subject_id ?? ''),
+      String(payload.direction ?? 'write'),
+      (payload.fields ?? []).map(String),
+      (payload.requiredFields ?? payload.required_fields ?? []).map(String),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::FieldPolicyDeleteRequest. payload: { topic, subjectType, subjectId, direction: 'write'|'read' }. */
+  busFieldPolicyDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusFieldPolicyDeleteRequest(
+      encode._busInstanceId(payload),
+      String(payload.topic ?? ''),
+      String(payload.subjectType ?? payload.subject_type ?? 'user'),
+      String(payload.subjectId ?? payload.subject_id ?? ''),
+      String(payload.direction ?? 'write'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // ----- Schema registry (SUM/tentabus/PLAN-F3.md §6; JS-codec) -----
+
+  /** BusPayload::SchemaSubjectListRequest — every schema subject registered in the caller's org. payload: { instanceId }. */
+  busSchemaSubjectListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusSchemaSubjectListRequest(encode._busInstanceId(payload));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::SchemaVersionListRequest — every immutable version registered under `subject`. payload: { instanceId, subject }. */
+  busSchemaVersionListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusSchemaVersionListRequest(encode._busInstanceId(payload), String(payload.subject ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::SchemaGetRequest. payload: { subject, version? }. `version` omitted/null resolves to `subject`'s latest version. */
+  busSchemaGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusSchemaGetRequest(
+      encode._busInstanceId(payload),
+      String(payload.subject ?? ''),
+      payload.version == null ? undefined : Number(payload.version),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::SchemaDerivedGetRequest — derives a read-projected sub-schema from a stored
+   * field policy (PLAN-F3 §5.4). payload: { subject, version?, topic, subjectType, subjectId,
+   * direction: 'write'|'read' }. `version` omitted/null resolves to `subject`'s latest version.
+   */
+  busSchemaDerivedGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusSchemaDerivedGetRequest(
+      encode._busInstanceId(payload),
+      String(payload.subject ?? ''),
+      payload.version == null ? undefined : Number(payload.version),
+      String(payload.topic ?? ''),
+      String(payload.subjectType ?? payload.subject_type ?? 'user'),
+      String(payload.subjectId ?? payload.subject_id ?? ''),
+      String(payload.direction ?? 'write'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::SchemaRegisterRequest. payload: { subject, schemaType: 'json_schema'|'avro'|
+   * 'protobuf'|'thrift', schemaText, compatibility?: 'none'|'backward'|'forward'|'full' }.
+   * `compatibility` omitted/null leaves/defaults to the subject's existing (or 'none' on
+   * first registration) compatibility mode.
+   */
+  busSchemaRegisterRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const compatibility = payload.compatibility;
+    const body = _wasm.encodeBusSchemaRegisterRequest(
+      encode._busInstanceId(payload),
+      String(payload.subject ?? ''),
+      String(payload.schemaType ?? payload.schema_type ?? 'json_schema'),
+      String(payload.schemaText ?? payload.schema_text ?? ''),
+      compatibility == null ? undefined : String(compatibility),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::SchemaCompatibilitySetRequest. payload: { subject, compatibility: 'none'|'backward'|'forward'|'full' }. */
+  busSchemaCompatibilitySetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusSchemaCompatibilitySetRequest(
+      encode._busInstanceId(payload),
+      String(payload.subject ?? ''),
+      String(payload.compatibility ?? 'none'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::SchemaDeleteRequest. payload: { subject, version?, deprecateOnly }. `version`
+   * omitted/null deletes every version of `subject`; `deprecateOnly` marks it deprecated
+   * instead of a hard delete.
+   */
+  busSchemaDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusSchemaDeleteRequest(
+      encode._busInstanceId(payload),
+      String(payload.subject ?? ''),
+      payload.version == null ? undefined : Number(payload.version),
+      Boolean(payload.deprecateOnly ?? payload.deprecate_only ?? false),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::MlStudioBody(ProjectsListRequest) — ML Studio projects list. */
   mlStudioProjectsListRequest(correlationId, sequence = 1) {
     assertReady();

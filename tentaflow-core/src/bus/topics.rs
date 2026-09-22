@@ -306,21 +306,26 @@ fn validate_ranges(cfg: &TopicConfig) -> Result<(), BusServiceError> {
     Ok(())
 }
 
-/// Fail-closed rejection of `idempotency_key`: the field
-/// is a CEL expression per PLAN §3.1, evaluated against a record body —
-/// that evaluator (`flow_engine/expr.rs` integration) does not exist yet.
-/// M1 initially substituted the record's routing `key` bytes for it
-/// instead, which is a silent semantics change: a topic keyed by e.g.
-/// `patient_id` (a reasonable partitioning choice) with `idempotency_key`
-/// enabled would silently drop every record after the first one for that
-/// patient within the dedup window. Rejecting outright until the real CEL
-/// evaluator lands is the safe direction — a caller gets a loud error
-/// instead of silent data loss.
+/// Validates `idempotency_key`: the field is a CEL expression per PLAN
+/// §3.1, evaluated against each record's body on the publish path
+/// (`BusService::publish`'s layer-2 dedup block —
+/// `idempotency-key-cel`/`C9`, SUM/tentabus/DECYZJE-2026-09-22.md). Only
+/// SYNTAX is checked here, via `flow_engine::expr::validate_syntax` (parse
+/// only, no scope) — the same guard `evaluate`/`evaluate_bool` run before
+/// executing an expression, so a malformed CEL string is rejected at BIND
+/// time instead of failing every publish later. A syntactically valid
+/// expression that references a field absent from a given record, or
+/// evaluates to something that cannot be used as a key (null, an object, an
+/// array), is a per-record RUNTIME failure the publish path reports as
+/// `BusServiceError::DedupKeyRequired` — CEL is dynamically typed, so that
+/// class of error is unavoidably runtime-only and cannot be caught here.
 fn reject_idempotency_key(opts: &TopicOptions) -> Result<(), BusServiceError> {
-    if opts.idempotency_key.is_some() {
-        return Err(BusServiceError::InvalidTopicConfig {
-            reason: "idempotency_key requires the CEL evaluator, not available yet".to_string(),
-        });
+    if let Some(expr) = &opts.idempotency_key {
+        crate::flow_engine::expr::validate_syntax(expr, None).map_err(|e| {
+            BusServiceError::InvalidTopicConfig {
+                reason: format!("idempotency_key is not a valid CEL expression: {}", e.cause),
+            }
+        })?;
     }
     Ok(())
 }
@@ -382,11 +387,37 @@ impl DeliveryMode {
     }
 }
 
+/// Fail-closed rejection of `cleanup_policy = compact`
+/// (`C9-cleanup-policy-compact`, SUM/tentabus/DECYZJE-2026-09-22.md): real
+/// per-key compaction is a distinct M5 engine (`CleanupPolicy::Compact`'s own
+/// doc) that `retention.rs::sweep_partition` does not implement — it deletes
+/// whole sealed segments regardless of the stored policy, so a topic
+/// configured with `compact` silently behaves like `delete`. Until the M5
+/// engine exists, accepting the value only lets an operator configure a
+/// guarantee (no-loss compaction by key) the broker never gives — the same
+/// class of trap `reject_idempotency_key`/`reject_fire_and_forget` close
+/// above. Deserialization is deliberately untouched: a row persisted before
+/// this rejection (or migrated by v167's rewrite-to-`delete`, for any row a
+/// peer on an older build still replicates in) still loads.
+fn reject_cleanup_compact(opts: &TopicOptions) -> Result<(), BusServiceError> {
+    if matches!(opts.cleanup_policy, Some(CleanupPolicy::Compact)) {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: "cleanup_policy=compact is not implemented in this build (per-key \
+                     compaction is planned for M5); every topic is swept by deleting whole \
+                     sealed segments (cleanup_policy=delete)"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupPolicy {
     Delete,
-    /// M5 per PLAN §2.5 — accepted as a config value now (so a topic never
-    /// needs a config migration to opt in later) but not implemented by
+    /// M5 per PLAN §2.5 — the variant and its `parse`/`as_str` stay so a row
+    /// written before `reject_cleanup_compact` existed still deserializes,
+    /// but `create_topic`/`update_topic` refuse to accept it from a caller
+    /// (`C9-cleanup-policy-compact`): it is not implemented by
     /// `retention.rs`, which only ever deletes whole segments.
     Compact,
 }
@@ -683,9 +714,14 @@ pub struct TopicConfig {
     /// `schema_id` subject's compiled validator (`bus::schema_registry`,
     /// `publish`'s schema-validation block). `Off` (the default, and every
     /// pre-F3 row's value) is not evaluated at all — zero cost beyond the
-    /// enum comparison. A binary schema type (`avro`/`protobuf`/`thrift`,
-    /// no validator until F4) FORCES this back to `Off` regardless of what
-    /// was requested when its subject is bound (`apply_schema_binding_guard`).
+    /// enum comparison. Binding a binary schema type (`avro`/`protobuf`/
+    /// `thrift`, no validator until F4) depends on what this call asked for
+    /// (`apply_schema_binding_guard`): if the call EXPLICITLY requested a
+    /// non-`Off` mode, the bind is REJECTED outright (enforcement that can
+    /// never fire is refused, not silently downgraded); if `validation` was
+    /// left untouched (or already `Off`), it is silently forced to `Off`,
+    /// so a stale non-`Off` value from a previous binding cannot linger
+    /// unenforceable.
     pub validation: ValidationMode,
     pub content_type: String,
     /// PLAN §7.1 default is `min(3, healthy nodes in the same environment)`
@@ -1241,6 +1277,7 @@ pub fn create_topic(
     validate_user_topic_name(name)?;
     reject_idempotency_key(&opts)?;
     reject_fire_and_forget(&opts)?;
+    reject_cleanup_compact(&opts)?;
     if repository::bus_topic_get(db, instance_id, org_id, name)?.is_some() {
         return Err(BusServiceError::TopicAlreadyExists {
             name: name.to_string(),
@@ -1303,6 +1340,7 @@ pub fn update_topic(
 ) -> Result<TopicConfig, BusServiceError> {
     reject_idempotency_key(&opts)?;
     reject_fire_and_forget(&opts)?;
+    reject_cleanup_compact(&opts)?;
     let row = repository::bus_topic_get(db, instance_id, org_id, name)?.ok_or_else(|| {
         BusServiceError::TopicNotFound {
             name: name.to_string(),
@@ -1399,18 +1437,23 @@ pub fn list_topics(
         .collect()
 }
 
-/// TEST-ONLY escape hatch: builds and persists a `TopicConfig` carrying
-/// `idempotency_key`, bypassing `create_topic`'s fail-closed rejection of
-/// that field . `bus::mod`'s publish() dedup path (layer
-/// 2, `dedup.rs`) is real and load-bearing even though no production admin
-/// call can reach it yet — this is how `bus::mod`'s tests get a topic
-/// config into that state to exercise it, standing in for the eventual
-/// CEL-backed caller. plan-app-platform §7 W4: takes `instance_id` as a
-/// parameter rather than stamping the shared placeholder, so a caller
-/// exercising a specific `BusService` instance gets a topic that actually
-/// belongs to it.
+/// TEST-ONLY escape hatch: builds and persists a `TopicConfig` directly,
+/// skipping every guard `create_topic` runs (`reject_idempotency_key`,
+/// `reject_fire_and_forget`, `reject_cleanup_compact`,
+/// `apply_schema_binding_guard`). Originally built to get a topic into an
+/// `idempotency_key`-carrying state before that field had any caller
+/// (`idempotency-key-cel`); `create_topic` accepts a syntactically valid
+/// CEL `idempotency_key` for real now, so every idempotency-key test calls
+/// it directly instead. What still needs this escape hatch is
+/// `apply_schema_binding_guard`, specifically: a topic shaped like a
+/// pre-F3 row, carrying a free-text `schema_id` that was never validated
+/// against the registry (that guard did not exist yet) — `create_topic`
+/// itself has no way to produce that shape, since the guard runs on every
+/// call. plan-app-platform §7 W4: takes `instance_id` as a parameter rather
+/// than stamping the shared placeholder, so a caller exercising a specific
+/// `BusService` instance gets a topic that actually belongs to it.
 #[cfg(test)]
-pub(crate) fn create_topic_for_dedup_test(
+pub(crate) fn create_topic_bypassing_guards(
     db: &DbPool,
     instance_id: &str,
     org_id: &str,
@@ -2183,12 +2226,21 @@ mod tests {
         assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
     }
 
-    // ---- idempotency_key fail-closed ------------------
+    // ---- idempotency_key CEL syntax validation (idempotency-key-cel) ----
 
     #[test]
-    fn create_topic_rejects_idempotency_key() {
+    fn reject_idempotency_key_accepts_a_syntactically_valid_cel_expression() {
+        assert!(reject_idempotency_key(&TopicOptions {
+            idempotency_key: Some("payload.patient_id".to_string()),
+            ..Default::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn reject_idempotency_key_rejects_a_malformed_cel_expression() {
         let err = reject_idempotency_key(&TopicOptions {
-            idempotency_key: Some("msg.run_id".to_string()),
+            idempotency_key: Some("payload.(((".to_string()),
             ..Default::default()
         })
         .unwrap_err();
@@ -2196,13 +2248,9 @@ mod tests {
     }
 
     #[test]
-    fn update_topic_rejects_idempotency_key_but_none_is_a_no_op() {
-        assert!(reject_idempotency_key(&TopicOptions {
-            idempotency_key: Some("msg.run_id".to_string()),
-            ..Default::default()
-        })
-        .is_err());
-        // `None` means "leave unchanged" on update — must NOT be rejected.
+    fn update_topic_idempotency_key_none_is_a_no_op() {
+        // `None` means "leave unchanged" on update — must NOT be rejected,
+        // regardless of the expression's validity.
         assert!(reject_idempotency_key(&TopicOptions::default()).is_ok());
     }
 
@@ -2362,6 +2410,142 @@ mod tests {
             updated.delivery,
             DeliveryMode::FireAndForget,
             "delivery left unset keeps whatever the row already stored"
+        );
+    }
+
+    // ---- cleanup_policy=compact fail-closed (C9-cleanup-policy-compact) ---
+
+    /// Drives the real `create_topic` entry point, not the helper it calls:
+    /// deleting `reject_cleanup_compact(&opts)?` from `create_topic` must
+    /// make this test fail.
+    #[test]
+    fn create_topic_rejects_cleanup_policy_compact_and_persists_no_row() {
+        let db = delivery_test_db();
+        let err = create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.compact",
+            TopicOptions {
+                cleanup_policy: Some(CleanupPolicy::Compact),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect_err("create_topic must refuse a cleanup policy the broker does not implement");
+        match err {
+            BusServiceError::InvalidTopicConfig { reason } => {
+                assert!(reason.contains("compact"), "{reason}");
+                assert!(reason.contains("M5"), "{reason}");
+            }
+            other => panic!("expected InvalidTopicConfig, got {other:?}"),
+        }
+        assert!(
+            get_topic(&db, "tentabus-00000001", "org-1", "orders.compact")
+                .expect("get_topic")
+                .is_none(),
+            "a rejected create must not have written a row"
+        );
+
+        // The one policy this build actually implements stays accepted.
+        let cfg = create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.compact",
+            TopicOptions {
+                cleanup_policy: Some(CleanupPolicy::Delete),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("delete must stay accepted");
+        assert_eq!(cfg.cleanup_policy, CleanupPolicy::Delete);
+    }
+
+    #[test]
+    fn update_topic_rejects_cleanup_policy_compact_and_leaves_the_row_untouched() {
+        let db = delivery_test_db();
+        let created = create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.compact-upd",
+            TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+
+        let err = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.compact-upd",
+            TopicOptions {
+                cleanup_policy: Some(CleanupPolicy::Compact),
+                partitions: Some(created.partitions + 1),
+                ..Default::default()
+            },
+            2_000,
+        )
+        .expect_err("update_topic must refuse a cleanup policy the broker does not implement");
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+
+        let stored = get_topic(&db, "tentabus-00000001", "org-1", "orders.compact-upd")
+            .expect("get_topic")
+            .expect("topic still exists");
+        assert_eq!(
+            stored.partitions, created.partitions,
+            "a rejected update must not have applied its other fields either"
+        );
+        assert_eq!(stored.cleanup_policy, CleanupPolicy::Delete);
+    }
+
+    /// The rejection is a write-boundary check only. A row persisted before
+    /// it (or migrated by v167's rewrite for a peer still replicating one
+    /// in) must still LOAD, and an edit that does not touch `cleanup_policy`
+    /// must still go through.
+    #[test]
+    fn a_persisted_compact_row_still_loads_and_stays_editable() {
+        let db = delivery_test_db();
+        let cfg = TopicConfig::from_options(
+            "tentabus-00000001",
+            "org-1",
+            "orders.compact-legacy",
+            TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("build config");
+        let mut row = DbBusTopic::from(&cfg);
+        row.cleanup_policy = CleanupPolicy::Compact.as_str().to_string();
+        repository::bus_topic_create(&db, &row).expect("persist a pre-rejection row");
+
+        let loaded = get_topic(&db, "tentabus-00000001", "org-1", "orders.compact-legacy")
+            .expect("get_topic")
+            .expect("legacy row present");
+        assert_eq!(loaded.cleanup_policy, CleanupPolicy::Compact);
+
+        let updated = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.compact-legacy",
+            TopicOptions {
+                partitions: Some(cfg.partitions + 1),
+                ..Default::default()
+            },
+            2_000,
+        )
+        .expect("an unrelated edit of a legacy row must still be accepted");
+        assert_eq!(updated.partitions, cfg.partitions + 1);
+        assert_eq!(
+            updated.cleanup_policy,
+            CleanupPolicy::Compact,
+            "cleanup_policy left unset keeps whatever the row already stored"
         );
     }
 

@@ -3717,6 +3717,34 @@ tf-key-value {
 }
 
 /* =============================================================================
+   tf-keyvalue-editor
+   ============================================================================= */
+
+tf-keyvalue-editor {
+  display: block;
+}
+.tf-kve {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+}
+.tf-kve-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+}
+.tf-kve-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: var(--tf-space-xs);
+  align-items: start;
+}
+.tf-kve-key,
+.tf-kve-value {
+  min-width: 0;
+}
+
+/* =============================================================================
    tf-detail-header
    ============================================================================= */
 
