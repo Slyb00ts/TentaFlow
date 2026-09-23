@@ -189,6 +189,7 @@ fn config_teardown_entries(present: &dyn Fn(&str) -> bool) -> Vec<TeardownEntry>
             kind,
             description: description.into(),
             removed: true,
+            ..Default::default()
         })
         .collect()
 }
@@ -221,18 +222,21 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
         kind: "tentanas_pools",
         description: "ZFS pools are exported cleanly, never destroyed: the data stays on the disks".into(),
         removed: false,
+        ..Default::default()
     });
     entries.push(TeardownEntry {
         path: crate::paths::tentaflow_home().join("app-backups"),
         kind: "tentanas_config_backup",
         description: "configuration export written before the wipe (kept)".into(),
         removed: false,
+        ..Default::default()
     });
     entries.push(TeardownEntry {
         path: ctx.data_dir.clone(),
         kind: "tentanas_data_dir",
         description: "instance data directory (tentanas.db: disk history, alerts, jobs, shares)".into(),
         removed: true,
+        ..Default::default()
     });
     // The keystore lives outside the data dir precisely so this wipe cannot
     // reach it: the encrypted datasets stay on the pools, so their keys must
@@ -244,6 +248,7 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
             kind: "tentanas_keystore",
             description: "ZFS dataset encryption keys (kept: the datasets survive uninstall)".into(),
             removed: false,
+            ..Default::default()
         });
     }
     if std::path::Path::new(tentanas_helper::HELPER_INSTALL_PATH).exists() {
@@ -252,6 +257,7 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
             kind: "tentanas_helper",
             description: "privilege helper (remove with a sudo password from the Environment tab)".into(),
             removed: false,
+            ..Default::default()
         });
     }
     if std::path::Path::new(tentanas_helper::SUDOERS_INSTALL_PATH).exists() {
@@ -260,6 +266,7 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
             kind: "tentanas_sudoers",
             description: "sudoers rule for the privilege helper".into(),
             removed: false,
+            ..Default::default()
         });
     }
     Ok(entries)

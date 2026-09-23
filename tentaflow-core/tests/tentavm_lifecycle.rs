@@ -50,7 +50,7 @@ fn booted_node() -> (db::DbPool, String) {
                 .expect("mesh identity"),
         );
         let node_id = security.ed25519_public_key_hex();
-        tentaflow_core::sync::runtime::init(pool.clone(), security, cipher).expect("sync runtime");
+        tentaflow_core::sync::runtime::init(pool.clone(), security).expect("sync runtime");
         (pool, node_id)
     })
     .clone()

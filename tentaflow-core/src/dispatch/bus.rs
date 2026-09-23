@@ -1034,6 +1034,7 @@ pub async fn bus_dispatch(
             subject_type,
             subject_id,
             access_level,
+            action,
         } => {
             acl_set_v1(
                 ctx,
@@ -1042,6 +1043,7 @@ pub async fn bus_dispatch(
                 subject_type.clone(),
                 subject_id.clone(),
                 access_level.clone(),
+                action.clone(),
             )
             .await?
         }
@@ -2061,6 +2063,7 @@ async fn acl_list_v1(
             subject_type: r.subject_type,
             subject_id: r.subject_id,
             access_level: r.access_level,
+            action: r.action,
         })
         .collect();
     Ok(BusPayload::AclListResponse { entries })
@@ -2073,6 +2076,7 @@ async fn acl_set_v1(
     subject_type: String,
     subject_id: String,
     access_level: String,
+    action: String,
 ) -> Result<BusPayload, ProtocolError> {
     // §4.3: authorization surface — admin tier.
     let g = gate_admin(ctx, instance_id)?;
@@ -2085,42 +2089,53 @@ async fn acl_set_v1(
     if access_level != "clear" {
         crate::bus::topics::validate_user_topic_name(&topic).map_err(map_bus_error)?;
     }
+    // migration 168: `action` is independently keyed, so `clear` removes
+    // only the row for THIS action — clearing a `write` deny must never
+    // also drop a subject's separately-granted `read`/`admin` rows.
+    if !matches!(action.as_str(), "read" | "write" | "admin" | "*") {
+        return Err(ProtocolError::bad_request(
+            "bus.invalid_argument: action must be 'read', 'write', 'admin' or '*'",
+        ));
+    }
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
-    let (org_id, topic2, subject_type2, subject_id2, access_level2) = (
+    let (org_id, topic2, subject_type2, subject_id2, access_level2, action2) = (
         g.org_id.clone(),
         topic.clone(),
         subject_type.clone(),
         subject_id.clone(),
         access_level.clone(),
+        action.clone(),
     );
     run_blocking(move || {
         let resource_id =
             crate::services::bus_authorizer::topic_acl_resource_id(&instance, &org_id, &topic2);
         if access_level2 == "clear" {
-            repository::resource_permissions::clear(
+            repository::resource_permissions::clear_with_action(
                 &db,
                 "topic",
                 &resource_id,
                 &subject_type2,
                 &subject_id2,
+                &action2,
             )
-            .map_err(|e| db_err("resource_permissions::clear", e))
+            .map_err(|e| db_err("resource_permissions::clear_with_action", e))
         } else {
             if !matches!(access_level2.as_str(), "allow" | "deny") {
                 return Err(ProtocolError::bad_request(
                     "bus.invalid_argument: access_level must be 'allow', 'deny' or 'clear'",
                 ));
             }
-            repository::resource_permissions::set(
+            repository::resource_permissions::set_with_action(
                 &db,
                 "topic",
                 &resource_id,
                 &subject_type2,
                 &subject_id2,
+                &action2,
                 &access_level2,
             )
-            .map_err(|e| db_err("resource_permissions::set", e))
+            .map_err(|e| db_err("resource_permissions::set_with_action", e))
         }
     })
     .await?;
@@ -2136,7 +2151,7 @@ async fn acl_set_v1(
         "bus.acl.set",
         Some(&topic),
         Some(&format!(
-            "subject_type={subject_type} subject_id={subject_id} access_level={access_level}"
+            "subject_type={subject_type} subject_id={subject_id} action={action} access_level={access_level}"
         )),
         None,
         Some(&ctx.state.local_node_id),
@@ -5275,6 +5290,118 @@ mod tests {
         .await
         .expect_err("must be denied without any bus grant");
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    // ---- SUM/tentabus/DECYZJE-2026-09-22.md, `topic-acl-actions` ----
+
+    /// migration 168: `acl_set_v1` writes an action-scoped row, `acl_list_v1`
+    /// echoes it back, and clearing that ONE action does not disturb a
+    /// separately-set action for the same subject.
+    #[tokio::test]
+    async fn acl_set_is_action_scoped_and_clear_touches_only_that_action() {
+        let (_guard, db) = bus_fixture();
+        let user_id = "u-acl-admin".to_string();
+        let org_id = seed_membership(&db, &user_id, "org.admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db, org);
+        let instance = fixture_instance_id();
+        let topic = "acl.actions.topic".to_string();
+
+        acl_set_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            "u-target".to_string(),
+            "deny".to_string(),
+            "write".to_string(),
+        )
+        .await
+        .expect("set write deny");
+        acl_set_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            "u-target".to_string(),
+            "allow".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("set read allow");
+
+        let entries = match acl_list_v1(&ctx, instance.as_str(), topic.clone())
+            .await
+            .expect("list")
+        {
+            BusPayload::AclListResponse { entries } => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(entries.len(), 2, "one row per action: {entries:?}");
+        assert!(entries.contains(&BusAclEntryWire {
+            subject_type: "user".to_string(),
+            subject_id: "u-target".to_string(),
+            access_level: "deny".to_string(),
+            action: "write".to_string(),
+        }));
+        assert!(entries.contains(&BusAclEntryWire {
+            subject_type: "user".to_string(),
+            subject_id: "u-target".to_string(),
+            access_level: "allow".to_string(),
+            action: "read".to_string(),
+        }));
+
+        // Clearing the `write` row must leave the `read` row untouched.
+        acl_set_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            "u-target".to_string(),
+            "clear".to_string(),
+            "write".to_string(),
+        )
+        .await
+        .expect("clear write");
+        let entries = match acl_list_v1(&ctx, instance.as_str(), topic.clone())
+            .await
+            .expect("list after clear")
+        {
+            BusPayload::AclListResponse { entries } => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(
+            entries,
+            vec![BusAclEntryWire {
+                subject_type: "user".to_string(),
+                subject_id: "u-target".to_string(),
+                access_level: "allow".to_string(),
+                action: "read".to_string(),
+            }],
+            "clearing 'write' must not remove the separately-set 'read' row"
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_set_rejects_an_invalid_action() {
+        let (_guard, db) = bus_fixture();
+        let user_id = "u-acl-admin2".to_string();
+        let org_id = seed_membership(&db, &user_id, "org.admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db, org);
+        let instance = fixture_instance_id();
+        let err = acl_set_v1(
+            &ctx,
+            instance.as_str(),
+            "acl.actions.topic2".to_string(),
+            "user".to_string(),
+            "u-target".to_string(),
+            "deny".to_string(),
+            "execute".to_string(),
+        )
+        .await
+        .expect_err("an unknown action must be rejected");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     }
 
     #[tokio::test]

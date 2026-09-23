@@ -7,6 +7,7 @@
 
 import { I18n } from '/js/i18n.js';
 import { escapeAttr } from '/js/utils.js';
+import { isOpaqueId } from '/js/modules/tentanas/machine-id.js';
 
 export const T = (k, p) => I18n.t('tentanas.' + k, p);
 
@@ -18,6 +19,43 @@ export const T = (k, p) => I18n.t('tentanas.' + k, p);
 // spelling from here on — the i18n keys keep theirs.
 export const channelMode = (mode) => (!mode || mode === 'unset' ? 'unarmed' : mode);
 export const sprite = (id) => `<svg class="icon"><use href="#i-${id}"/></svg>`;
+
+// ----- Names, never identifiers ---------------------------------------------
+//
+// The owner's rule: the screen names a user by display name, a node by
+// hostname and a disk by its kernel name, and a machine id (UUID, 64-hex node
+// id, `wwn-…`) is never visible text — a tooltip at most. Every surface that
+// names a node or a job's author goes through these, so the fallback reads
+// the same wherever the name is missing.
+
+// A node's hostname, or "Węzeł bez nazwy". The node sends an EMPTY name when
+// neither the peer store nor the sync registry knows one (`fleet.rs`
+// `node_name`); it used to send its 64-hex id, and every fleet surface printed
+// that as the name. The id stays available as `node.nodeId` for a tooltip.
+export const nodeLabel = (node) => String(node?.nodeName || '').trim() || T('node.unnamed');
+
+// The node view's header subline is `nodeT` from node-phrase.js — see that
+// file for why a nameless node needs a whole sentence instead of the
+// template with `nodeLabel`'s fallback dropped in.
+
+// The two authors a job can have that are not a person: the node restoring
+// its arrays at boot, and the scheduler. They reach the wire as the raw
+// tokens `startup` / `scheduler` (`scheduler.rs` `STARTED_BY`).
+const SYSTEM_AUTHORS = new Set(['startup', 'scheduler']);
+
+// Who started a job, as `{ label, title }`. The node resolves a user id to the
+// account's display name (`dispatch::tentanas::display_names`) and passes an
+// id with no account behind it through unchanged — a deleted account, or one
+// that exists only on the node that forwarded the request. That UUID is not a
+// name: the label says the account is unknown here and the id becomes the
+// tooltip. An author is always a user id or a system token, never a name
+// that could collide with a disk-id prefix, so the opaque rule alone applies.
+export function jobAuthor(startedBy) {
+  const by = String(startedBy || '').trim();
+  if (SYSTEM_AUTHORS.has(by)) return { label: T('jobs.by_' + by), title: '' };
+  if (isOpaqueId(by)) return { label: T('jobs.by_unknown_account'), title: by };
+  return { label: by || '—', title: '' };
+}
 
 export const POLL_DISKS_MS = 5000;
 export const POLL_JOBS_MS = 3000;
@@ -147,6 +185,13 @@ export function stateChipHtml(state) {
   return `<tf-chip status="${stateTone(state)}" dot label="${escapeAttr(stateLabel(state))}"></tf-chip>`;
 }
 
+// The media-kind badge shown next to a disk name — n06's topology cells and
+// n11's member rows both paint the same badge from the same wire spelling
+// ('hdd', 'ssd', 'nvme'), so they share one mapping instead of keeping two
+// copies in sync by hand. `[cssClass, label]`; an unknown kind renders no
+// badge (the caller treats a missing entry as "no badge").
+export const KIND_BADGE = { hdd: ['', 'HDD'], ssd: ['', 'SSD'], nvme: ['nvme', 'NVMe'] };
+
 // Layout names are wire spellings ('raidz2', 'mirror'); the labels are the
 // admin-facing forms ("RAIDZ2", "Mirror"). An unknown spelling shows as-is.
 export function layoutLabel(layout) {
@@ -171,6 +216,62 @@ export function transportChipHtml(transport) {
 
 export function errMessage(e) {
   return (e && e.message) ? e.message : String(e);
+}
+
+// ----- Per-disk batches (SMART "all disks" / SMART "selected") -------------
+//
+// Both batches send the same request once per disk with one sudo password
+// for the whole run. Two very different things can make one of those
+// requests fail, and they need OPPOSITE handling:
+//   - a refusal specific to THIS disk (busy, a test already runs, the disk
+//     rejects the command) — record it, try the next disk.
+//   - a privilege/credential failure (a rejected or expired sudo password,
+//     an unarmed privilege channel, a helper/core version mismatch) — this
+//     will fail identically for every remaining disk, so retrying it per
+//     disk only replays the same password (or the same unarmed channel)
+//     against sudo once per disk. On a distro with `pam_faillock` that can
+//     lock the account the core runs as.
+//
+// The server tells the two apart with one stable code: `broker_error` in
+// dispatch/tentanas.rs maps `BrokerError::Unarmed` (rejected/expired
+// password, unarmed channel), `BrokerError::HelperVersion` (helper/core
+// version mismatch, `HELPER_VERSION_MARKER`) and `BrokerError::ToolMissing`
+// all to `ProtocolErrorCode::NotAvailable` — never left to a guess from the
+// (partly Polish, partly English) error text. `api-binary-shim.js` copies
+// that code onto the thrown `Error` as `.code`.
+const BATCH_HALT_CODE = 'NotAvailable';
+
+/** True for the one error shape that must stop a whole per-disk batch. */
+export function isBatchHaltError(e) {
+  return Boolean(e) && e.code === BATCH_HALT_CODE;
+}
+
+/**
+ * Runs `request(disk)` once per disk in `disks`, in order, with one shared
+ * sudo password closed over by the caller. A per-disk refusal is recorded in
+ * `refused` and the loop continues; a privilege/credential error
+ * (`isBatchHaltError`) is rethrown immediately, so the caller's `withSudo`
+ * stops the batch and surfaces that one error instead of every disk's copy
+ * of it.
+ */
+export async function runDiskBatch(disks, request) {
+  const started = [];
+  const refused = [];
+  for (const disk of disks) {
+    try {
+      await request(disk);
+      started.push(disk);
+    } catch (e) {
+      if (isBatchHaltError(e)) throw e;
+      refused.push({ disk, error: e });
+    }
+  }
+  return { started, refused };
+}
+
+/** The disks a batch refused, named — never a disk id — for one toast. */
+export function refusedBatchNames(refused) {
+  return refused.map((r) => `${r.disk.name}: ${errMessage(r.error)}`).join(' · ');
 }
 
 export function jobTone(status) {

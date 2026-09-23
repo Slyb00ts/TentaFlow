@@ -6,6 +6,7 @@
 // Przyklad: enumerate_roce_interfaces() -> Vec<RoceInterfaceInfo>
 // =============================================================================
 
+#[cfg(target_os = "linux")]
 use std::net::IpAddr;
 
 use tentaflow_protocol::mesh::RoceInterfaceInfo;

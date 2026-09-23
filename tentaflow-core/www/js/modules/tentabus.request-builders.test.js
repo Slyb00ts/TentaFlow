@@ -1289,7 +1289,7 @@ test('extractNotLeaderHint returns null when the message does not carry a recogn
 // need `pl.json` to already carry the not-yet-pasted M2 keys.
 function makeNotLeaderTranslate({ withHint } = {}) {
   return (path, params) => {
-    if (path === 'errors.not_leader') return 'Ten węzeł nie jest liderem tej partycji.';
+    if (path === 'errors.not_leader') return 'Ten node nie jest liderem tej partycji.';
     if (path === 'errors.not_leader_hint' && withHint) return `Aktualny lider: ${params.node}.`;
     return `tentabus.${path}`;
   };
@@ -1300,7 +1300,7 @@ test('mapBusErrorMessage appends the not_leader hint when the translator resolve
     'protocol error BadRequest: bus.not_leader: current leader is gcm-core-01',
     makeNotLeaderTranslate({ withHint: true }),
   );
-  assert.equal(msg, 'Ten węzeł nie jest liderem tej partycji. Aktualny lider: gcm-core-01.');
+  assert.equal(msg, 'Ten node nie jest liderem tej partycji. Aktualny lider: gcm-core-01.');
 });
 
 test('mapBusErrorMessage falls back to the plain translated message when no hint node is extractable', () => {
@@ -1308,7 +1308,7 @@ test('mapBusErrorMessage falls back to the plain translated message when no hint
     'protocol error BadRequest: bus.not_leader',
     makeNotLeaderTranslate({ withHint: true }),
   );
-  assert.equal(msg, 'Ten węzeł nie jest liderem tej partycji.');
+  assert.equal(msg, 'Ten node nie jest liderem tej partycji.');
 });
 
 test('mapBusErrorMessage falls back to the plain translated message when errors.not_leader_hint itself is missing (coordinator has not pasted the M2 i18n block yet)', () => {
@@ -1316,7 +1316,7 @@ test('mapBusErrorMessage falls back to the plain translated message when errors.
     'protocol error BadRequest: bus.not_leader: current leader is gcm-core-01',
     makeNotLeaderTranslate({ withHint: false }),
   );
-  assert.equal(msg, 'Ten węzeł nie jest liderem tej partycji.');
+  assert.equal(msg, 'Ten node nie jest liderem tej partycji.');
 });
 
 // ---------------------------------------------------------------------------

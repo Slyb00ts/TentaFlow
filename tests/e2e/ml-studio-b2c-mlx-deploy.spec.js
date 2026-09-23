@@ -66,7 +66,7 @@ async function shot(page, f) { await page.screenshot({ path: `${SHOT}/${f}`, ful
         sel.dispatchEvent(new CustomEvent('change', { detail: { value: nodeC } }));
         return 'ok';
       }, NODE_C);
-      if (set !== 'ok') throw new Error('nie ustawiono węzła C: ' + set);
+      if (set !== 'ok') throw new Error('nie ustawiono noda C: ' + set);
       await shot(page, '02-deploy-modal.png');
       await page.locator('#ml-studio-deploy-go').click();
       // Transfer ~1 GB B→C + deploy + rejestracja — czekamy aż pojawi się „Zapytaj".

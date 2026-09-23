@@ -12,8 +12,8 @@ Status: PLAN v2 (po recenzji). Zastępuje obecny model „jedna scena na robota,
 
 ## Stan wykonania (2026-09-23)
 
-**P0 zrobione** (backend + UI lokalizacji/map): migracje 165 (`map_sites`, `map_scenes`,
-`map_device_placements`, `map_chunks`, `map_device_sessions`) i 166 (`map.read`/`map.write`/
+**P0 zrobione** (backend + UI lokalizacji/map): migracje 169 (`map_sites`, `map_scenes`,
+`map_device_placements`, `map_chunks`, `map_device_sessions`) i 170 (`map.read`/`map.write`/
 `map.admin`), `MapPayload` w trzech miejscach (`tentaflow-protocol/src/map.rs`,
 `tentaflow-protocol-wasm`, `www/js/protocol/codec.js`), `dispatch/maps.rs` z bramką RBAC,
 `paths::maps_dir()`, deskryptory sync + materializer + capture (site/scene/placement),
@@ -57,7 +57,7 @@ Zasada nadrzędna: **mapa jest własnością serwera (węzeł-właściciel sceny
 
 ## 1. Model danych
 
-### 1.1 SQLite (metadane; migracja 165 `shared_maps`, 166 `shared_maps_permissions`)
+### 1.1 SQLite (metadane; migracja 169 `shared_maps`, 170 `shared_maps_permissions` — numery 165–168 zajął równoległy upstream)
 
 Tabele (wszystkie z `org_id`, `created_at_ms`, `updated_at_ms`, `deleted_at_ms NULL` — soft delete jest konieczny dla LWW w Sync Ledger):
 

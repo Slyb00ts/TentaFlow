@@ -457,6 +457,9 @@ function renderEngineCard(service, targetOs, host) {
     ? `<span class="platform-badge infra">${escapeHtml(I18n.t('catalog.badge_infra'))}</span>`
     : `<span class="platform-badge ai">${escapeHtml(I18n.t('catalog.badge_ai'))}</span>`;
 
+  // A CLI agent is not deployed here at all, so its card neither lists deploy
+  // methods nor promises a deploy — it leads to the account screen.
+  const managedCli = Manifest.isManagedCliAgent(service);
   return `
     <div class="catalog-card" data-engine-id="${escapeAttr(e.id || '')}">
       <div class="catalog-card-head">
@@ -468,11 +471,11 @@ function renderEngineCard(service, targetOs, host) {
       </div>
       <div class="catalog-card-meta">
         <div class="meta-row">${resourceBadge}</div>
-        <div class="meta-row methods">${escapeHtml(I18n.t('catalog.deploy_as'))}: ${methodsLabel}</div>
+        ${managedCli ? '' : `<div class="meta-row methods">${escapeHtml(I18n.t('catalog.deploy_as'))}: ${methodsLabel}</div>`}
       </div>
       <div class="catalog-card-foot">
-        <tf-button variant="primary" size="sm" icon="plus" data-engine-deploy="${escapeAttr(e.id || '')}">
-          ${escapeHtml(I18n.t('catalog.deploy'))}
+        <tf-button variant="primary" size="sm" icon="${managedCli ? 'users' : 'plus'}" data-engine-deploy="${escapeAttr(e.id || '')}">
+          ${escapeHtml(I18n.t(managedCli ? 'catalog.open_agent_accounts' : 'catalog.deploy'))}
         </tf-button>
       </div>
     </div>
@@ -519,6 +522,14 @@ function bindCards(host) {
     const engineId = btn?.dataset.engineDeploy || card?.dataset.engineId;
     const presetId = btn?.dataset.presetId || card?.dataset.presetId || null;
     if (!engineId || !target) return;
+    // A managed-CLI coding agent is never a `services` row — it runs through a
+    // provider account and an on-demand bridge instead, so its tile opens the
+    // account screen rather than a deploy wizard the server would refuse anyway.
+    if (Manifest.isManagedCliAgent(Manifest.byId(engineId))) {
+      toast(I18n.t('catalog.managed_cli_agent_hint'), 'info');
+      Router.navigate('services', { tab: 'accounts' });
+      return;
+    }
     if (target.kind === 'cluster') {
       const service = Manifest.byId(engineId);
       if (!Manifest.isClusterCapable(service)) {

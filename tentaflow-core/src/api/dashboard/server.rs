@@ -2845,14 +2845,10 @@ pub async fn handle_request(
         }
     }
 
-    // Pobierz body dla POST/PUT
-    let body_bytes = if method == Method::POST || method == Method::PUT {
-        req.collect().await?.to_bytes()
-    } else {
-        // Musimy skonsumowac body nawet dla GET/DELETE
-        let _ = req.collect().await?;
-        Bytes::new()
-    };
+    // Musimy skonsumowac body niezaleznie od metody — zaden route ponizej go
+    // nie czyta (POST/PUT trafiajace tutaj koncza na 404), a nieodebrane body
+    // przy odpowiedzi jest bledem protokolu HTTP.
+    let _ = req.collect().await?;
 
     // Addon OAuth login (wymaga auth — musimy znac user_id)
     if method == Method::GET && path.starts_with("/api/addons/") && path.ends_with("/oauth/login") {

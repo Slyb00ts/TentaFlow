@@ -688,18 +688,6 @@ pub fn delete(
         ));
     }
 
-    let bound_topics: Vec<String> = repository::bus_topic_list(db, instance_id, org_id)?
-        .into_iter()
-        .filter(|t| t.schema_id.as_deref() == Some(subject))
-        .map(|t| t.name)
-        .collect();
-    if !bound_topics.is_empty() {
-        return Err(BusServiceError::InvalidArgument(format!(
-            "schema subject '{subject}' is bound by topics: {}",
-            bound_topics.join(", ")
-        )));
-    }
-
     if deprecate_only {
         let versions: Vec<u32> =
             repository::bus_schema_version_list(db, instance_id, org_id, subject)?
@@ -717,6 +705,25 @@ pub fn delete(
             bump_generation();
         }
         return Ok(versions);
+    }
+
+    // Hard delete only (whole subject or a single version) — the binding
+    // guard never applies to `deprecate_only`, which always succeeds
+    // (`F3-deprecate-only`, SUM/tentabus/DECYZJE-2026-09-22.md: "Oznaczenie
+    // wersji schematu jako wycofanej działa zawsze; twarde usunięcie
+    // blokowane, dopóki topik używa schematu"). Checked here, after the
+    // `deprecate_only` branch has already returned, so a bound subject can
+    // still be soft-deprecated at any time.
+    let bound_topics: Vec<String> = repository::bus_topic_list(db, instance_id, org_id)?
+        .into_iter()
+        .filter(|t| t.schema_id.as_deref() == Some(subject))
+        .map(|t| t.name)
+        .collect();
+    if !bound_topics.is_empty() {
+        return Err(BusServiceError::InvalidArgument(format!(
+            "schema subject '{subject}' is bound by topics: {}",
+            bound_topics.join(", ")
+        )));
     }
 
     match version {
@@ -1100,6 +1107,66 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// `F3-deprecate-only` (SUM/tentabus/DECYZJE-2026-09-22.md): marking a
+    /// subject deprecated must ALWAYS succeed, even while a topic still
+    /// binds it — only a HARD delete stays blocked in that case. The
+    /// original bug ran the bound-topics guard before the `deprecate_only`
+    /// branch could ever return, so this reproduces the exact shape of the
+    /// test right above it (a topic bound to the subject) but asserts the
+    /// opposite outcome for `deprecate_only: true`.
+    #[test]
+    fn deprecate_only_succeeds_while_a_topic_still_binds_the_subject() {
+        let db = fresh_db();
+        register(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            SchemaType::JsonSchema,
+            V1,
+            None,
+            None,
+        )
+        .unwrap();
+        crate::bus::topics::create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.events",
+            crate::bus::topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                ..Default::default()
+            },
+            tentaflow_protocol::environment::NodeEnvironment::Test,
+            1_000,
+        )
+        .unwrap();
+
+        let removed = delete(&db, "tentabus-00000001", "org-1", "orders", None, true)
+            .expect("deprecate_only must succeed even while orders.events still binds it");
+        assert_eq!(removed, vec![1]);
+        assert!(
+            resolve_effective(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .is_none(),
+            "a deprecated subject must no longer resolve for validation"
+        );
+        // The binding itself is untouched — the bound topic keeps reading,
+        // only NEW bindings/versions are refused from here on.
+        assert_eq!(
+            crate::bus::topics::get_topic(&db, "tentabus-00000001", "org-1", "orders.events")
+                .unwrap()
+                .unwrap()
+                .schema_id
+                .as_deref(),
+            Some("orders")
+        );
+
+        // A subsequent HARD delete must still be refused while bound.
+        let err = delete(&db, "tentabus-00000001", "org-1", "orders", None, false).unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidArgument(_)));
     }
 
     #[test]

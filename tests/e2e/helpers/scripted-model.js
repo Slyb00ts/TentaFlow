@@ -313,7 +313,13 @@ function startScriptedModel({ script, scripts, modelId = 'harness-test', port = 
         const step = at < steps.length
           ? steps[at]
           : (route.repeat ? steps[steps.length - 1] : say('Skrypt testowy się skończył.'));
-        cursors.set(idx, at + 1);
+        // A `cycle` route wraps instead of stopping, so a SECOND turn on the same
+        // node replays the same script. Without it a route is exhausted by the
+        // first turn and every later one gets the "script over" line — which for
+        // an agent whose prompt makes it act only on a tool call means the turn
+        // does nothing at all. The cursor is what wraps, not the fallback above,
+        // so `at` stays inside the script and the two options do not interact.
+        cursors.set(idx, route.cycle ? (at + 1) % steps.length : at + 1);
         cursor += 1;
 
         const id = `cmpl-${cursor}`;

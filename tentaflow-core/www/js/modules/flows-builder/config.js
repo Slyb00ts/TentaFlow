@@ -14,6 +14,7 @@ import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-select.js';
+import '/js/components/tf-keyvalue-editor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
@@ -516,6 +517,23 @@ export class FlowConfig {
         </div>`;
     }
 
+    if (type === 'object') {
+      // Scalar-valued map (JSON-schema `additionalProperties` of a simple
+      // type, e.g. bus_publish's `headers`). The editor's own initial
+      // `.value` is set in `_bindConfigInputs` (an object cannot round-trip
+      // through an HTML attribute), so this arm only lays out the tag.
+      return `
+        <div class="fb-field">
+          <label class="fb-label">${escapeHtml(title)}${reqMark}</label>
+          ${hint ? `<div class="fb-field-hint">${escapeHtml(hint)}</div>` : ''}
+          <tf-keyvalue-editor data-bind="${escapeAttr(key)}" data-type="object"
+            key-placeholder="${escapeAttr(I18n.t('settings.key'))}"
+            value-placeholder="${escapeAttr(I18n.t('settings.value'))}"
+            add-label="${escapeAttr(I18n.t('flows_config.map_add'))}"
+            remove-label="${escapeAttr(I18n.t('flows_config.map_remove'))}"></tf-keyvalue-editor>
+        </div>`;
+    }
+
     if (def.format === 'textarea' || (typeof curVal === 'string' && curVal.length > 80)) {
       return `
         <div class="fb-field">
@@ -578,12 +596,21 @@ export class FlowConfig {
   }
 
   _bindConfigInputs(body) {
+    // Captured ONCE per render, at bind time — not re-read as `this.node`
+    // inside the listeners below. `this.node` is reassigned synchronously by
+    // `show()` the moment a different node is selected, and switching
+    // selection while a field here still has focus tears this body out of the
+    // DOM, which fires that field's own `blur`/`change` on the way out. A
+    // listener reading `this.node.id` at that point would commit the pending
+    // edit onto the NEWLY selected node instead of the one this panel was
+    // opened for.
+    const node = this.node;
     body.querySelectorAll('[data-bind]').forEach((el) => {
       const key = el.dataset.bind;
       if (key === 'label') {
         // tf-input emits `change` with detail.value; read .value for both.
         el.addEventListener('change', () => {
-          this.opts.onLabelChange?.(this.node.id, el.value);
+          this.opts.onLabelChange?.(node.id, el.value);
         });
         return;
       }
@@ -591,7 +618,19 @@ export class FlowConfig {
       if (el.tagName === 'TF-TOGGLE') {
         el.addEventListener('change', (e) => {
           const on = e.detail?.checked ?? el.checked;
-          this.opts.onConfigChange?.(this.node.id, { [key]: on });
+          this.opts.onConfigChange?.(node.id, { [key]: on });
+          this._refreshPreview();
+        });
+        return;
+      }
+      // tf-keyvalue-editor exposes `.value` as a plain object, not a string —
+      // its initial value comes from node.config (an object cannot round-trip
+      // through an HTML attribute the way `_renderField` writes the rest).
+      if (el.tagName === 'TF-KEYVALUE-EDITOR') {
+        const current = node.config?.[key];
+        el.value = current && typeof current === 'object' ? current : {};
+        el.addEventListener('change', (e) => {
+          this.opts.onConfigChange?.(node.id, { [key]: e.detail?.value ?? el.value });
           this._refreshPreview();
         });
         return;
@@ -601,7 +640,7 @@ export class FlowConfig {
       el.addEventListener('change', () => {
         let v = el.value;
         if (type === 'number') v = v === '' ? undefined : parseFloat(v);
-        this.opts.onConfigChange?.(this.node.id, { [key]: v });
+        this.opts.onConfigChange?.(node.id, { [key]: v });
         this._refreshPreview();
       });
     });
@@ -963,11 +1002,16 @@ export class FlowConfig {
   }
 
   _bindAdvancedInputs(body) {
+    // The node is captured once, as in `_bindConfigInputs`: selecting another
+    // node reassigns `this.node` before the panel is re-rendered, and tearing a
+    // focused field out fires its `change` on the way — which would write this
+    // node's position, or its pasted JSON, onto the node just selected.
+    const node = this.node;
     body.querySelectorAll('[data-bind-pos]').forEach((el) => {
       el.addEventListener('change', () => {
         const axis = el.dataset.bindPos;
         const v = parseInt(el.value, 10) || 0;
-        this.opts.onPositionChange?.(this.node.id, { [axis]: v });
+        this.opts.onPositionChange?.(node.id, { [axis]: v });
       });
     });
     const raw = body.querySelector('[data-bind-raw="config"]');
@@ -975,7 +1019,7 @@ export class FlowConfig {
       raw.addEventListener('change', () => {
         try {
           const parsed = JSON.parse(raw.value);
-          this.opts.onRawConfigChange?.(this.node.id, parsed);
+          this.opts.onRawConfigChange?.(node.id, parsed);
         } catch (_) { /* czekamy aż użytkownik naprawi */ }
       });
     }

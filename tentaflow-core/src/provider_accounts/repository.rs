@@ -105,11 +105,11 @@ fn local_node_id_tx(tx: &rusqlite::Transaction<'_>) -> Result<Option<String>> {
 /// never calls this.
 ///
 /// Claiming also CLEARS `home_lost_node_id`: the account has a home again, so the
-/// record of the one it lost stops being true. The only writer that SETS the
-/// marker on this node is `forget_node_tx`, which NULLs the home in the same
-/// UPDATE — a peer's copy receives it with the row through the materializer — so
-/// a non-NULL marker here always means this node recorded a loss and never means
-/// a home exists.
+/// record of the one it lost stops being true. The marker is SET by
+/// `forget_node_tx`, which NULLs the home in the same UPDATE, and it travels with
+/// the row through the materializer — a copy can therefore arrive carrying a loss
+/// this node never recorded — so the marker goes on every path that leaves this
+/// node as the home, the home-already-here return below included.
 fn claim_home_tx(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
@@ -126,6 +126,17 @@ fn claim_home_tx(
         )
         .map_err(read_err)?;
     if previous.as_deref() == Some(local_node.as_str()) {
+        // A home that is already here still has to drop the marker: it travels
+        // with the row, so a copy synced from a peer can bring it back onto a
+        // row this node is the home of, and a claim that returned early would
+        // leave the account reading as one that lost a home it plainly has.
+        tx.execute(
+            "UPDATE provider_accounts SET home_lost_node_id = NULL, \
+               updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
+               WHERE account_id = ?1 AND home_lost_node_id IS NOT NULL",
+            params![account_id],
+        )
+        .map_err(write_err)?;
         return Ok(());
     }
     tx.execute(
@@ -422,6 +433,10 @@ pub fn update_account(
     }
     let mut conn = db.write().map_err(write_err)?;
     let tx = conn.transaction().map_err(write_err)?;
+    // Writing a home CLEARS the record of a lost one in the same statement. The
+    // two columns cannot both be set — `forget_node_tx` NULLs the home exactly
+    // when it sets the marker — so a caller that homes an account here must not
+    // be able to leave "homed at X, X was lost" on the row for the card to show.
     let changed = tx
         .execute(
             "UPDATE provider_accounts SET \
@@ -429,6 +444,8 @@ pub fn update_account(
                status = COALESCE(?3, status), \
                plan_label = COALESCE(?4, plan_label), \
                home_node_id = COALESCE(?5, home_node_id), \
+               home_lost_node_id = CASE WHEN ?5 IS NOT NULL THEN NULL \
+                                        ELSE home_lost_node_id END, \
                max_sessions = COALESCE(?6, max_sessions), \
                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
              WHERE account_id = ?1",
@@ -1436,12 +1453,13 @@ const IDENTITY_REJECTIONS: &[&str] = &["identity_mismatch", "identity_unverifiab
 ///   is not this account's. One of those is what this account's runs are
 ///   attributed to, and nobody can tell which except by signing in, so ONE is
 ///   enough to ask for a new sign-in;
-/// * `identity_unverifiable` is a comparison that could not be made at all (the
-///   format carries no stable subject, or the account holds no credential to
-///   compare against). A single one of those is ordinary — it is the normal
-///   answer for muse and grok — so it takes a SECOND one within a day, which is
-///   the shape of a credential that keeps failing rather than a format that
-///   never had a subject.
+/// * `identity_unverifiable` is a comparison that could not be made the second
+///   time: material that named an account was replaced by material that names
+///   nobody. Only Codex can produce it — its format is the only one that
+///   announces a subject at all — and one of those says nothing about the
+///   credential, since the file may simply be caught between two writes, so it
+///   takes a SECOND one within a day. That is the shape of a credential that
+///   keeps failing rather than of one read mid-write.
 pub fn record_credential_rejection(
     db: &DbPool,
     account_id: &str,
@@ -1674,16 +1692,23 @@ pub fn publishable_credentials(
 ///
 /// It is an audit row rather than a log line because every reason is somebody's
 /// decision colliding with somebody else's: a node that is not the home trying
-/// to rotate, material for a revision an operator revoked, or a peer handing a
-/// credential to a node that was taken out of the account fleet. None of those
-/// is visible in the resulting state — nothing changes — so the refusal IS the
-/// record.
+/// to rotate, material for a revision an operator revoked, a peer handing a
+/// credential to a node that was taken out of the account fleet, or a satellite
+/// whose copy trails the home and therefore submits a lower revision than the one
+/// the home already holds. None of those is visible in the resulting state —
+/// nothing changes — so the refusal IS the record.
+///
+/// `revision` is what the sender offered; `held_revision` is what this node had
+/// when it refused, and is `None` for a refusal decided before the store was
+/// consulted. A refusal that DOES change the state (a conflict) is audited by
+/// `write_credential` itself, so it never reaches here.
 pub fn record_credential_refusal(
     db: &DbPool,
     account_id: &str,
     peer_node_id: &str,
     reason: &str,
     revision: i64,
+    held_revision: Option<i64>,
 ) -> Result<()> {
     let mut conn = db.write().map_err(write_err)?;
     let tx = conn.transaction().map_err(write_err)?;
@@ -1696,6 +1721,7 @@ pub fn record_credential_refusal(
             "peer_node_id": peer_node_id,
             "reason": reason,
             "revision": revision,
+            "held_revision": held_revision,
         }),
     )?;
     tx.commit().map_err(write_err)?;
@@ -1851,6 +1877,17 @@ pub fn session_counts(db: &DbPool, account_ids: &[String]) -> Result<HashMap<Str
         &conn,
         account_ids,
         "SELECT account_id, COUNT(*) FROM provider_account_sessions",
+    )
+}
+
+/// `account_id -> distinct people with an open session` for the accounts asked
+/// about. Only accounts with at least one session appear.
+pub fn session_user_counts(db: &DbPool, account_ids: &[String]) -> Result<HashMap<String, u32>> {
+    let conn = db.read().map_err(read_err)?;
+    count_by_account(
+        &conn,
+        account_ids,
+        "SELECT account_id, COUNT(DISTINCT user_id) FROM provider_account_sessions",
     )
 }
 
@@ -3581,6 +3618,133 @@ mod tests {
             captured_text(&fields, "home_node_id").as_deref(),
             Some("helios")
         );
+    }
+
+    /// The claim's promise holds even when it moves no home: a row already
+    /// homed here still loses the marker.
+    ///
+    /// Returning early for a home that is already this node is right about the
+    /// HOME and silent about the record. The marker is account metadata that
+    /// travels with the row, so a copy can arrive homed here and still carrying
+    /// a loss another node recorded; a claim that only moved homes would leave
+    /// that record standing and the card would name a lost home next to the node
+    /// that holds it.
+    #[test]
+    fn a_claim_that_moves_no_home_still_drops_the_record_of_a_lost_one() {
+        let db = pool();
+        let cipher = cipher();
+        seed_local_node(&db, "helios");
+        global_account(&db, "shared");
+        // What a synced copy can leave on this node: the home IS here and the
+        // marker says a home was lost.
+        db.write()
+            .expect("db")
+            .execute(
+                "UPDATE provider_accounts SET home_node_id = 'helios', \
+                   home_lost_node_id = 'rig26' WHERE account_id = 'shared'",
+                [],
+            )
+            .expect("seed the stale marker");
+
+        // A pasted key is a placement, and the placement is the claim.
+        mint_credential(
+            &db,
+            &cipher,
+            "shared",
+            "key-one",
+            &CredentialMeta {
+                actor: Some("admin".into()),
+                ..CredentialMeta::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(home_of(&db, "shared").as_deref(), Some("helios"));
+        assert_eq!(
+            home_lost_of(&db, "shared"),
+            None,
+            "a claim that moved no home still has to drop the record of a lost one"
+        );
+        let (_, fields) = latest_account_capture(&db, "shared");
+        assert_eq!(
+            captured_text(&fields, "home_lost_node_id"),
+            None,
+            "and the peers holding that record have to be told it is gone"
+        );
+        assert_eq!(
+            captured_text(&fields, "home_node_id").as_deref(),
+            Some("helios")
+        );
+    }
+
+    /// The same invariant on the OTHER writer of `home_node_id`: an edit that
+    /// names a home must not leave the record of a lost one beside it. Today's
+    /// callers are safe by the order they happen to follow — a sign-in claims the
+    /// home through `mint_credential` before it names one — but the invariant
+    /// belongs to the store, not to that order.
+    #[test]
+    fn an_edit_that_names_a_home_drops_the_record_of_a_lost_one() {
+        let db = pool();
+        seed_local_node(&db, "helios");
+        global_account(&db, "shared");
+        db.write()
+            .expect("db")
+            .execute(
+                "UPDATE provider_accounts SET home_node_id = NULL, \
+                   home_lost_node_id = 'rig26' WHERE account_id = 'shared'",
+                [],
+            )
+            .expect("seed the loss");
+
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                home_node_id: Some("rig26".into()),
+                ..AccountUpdate::default()
+            },
+            Some("admin"),
+        )
+        .unwrap();
+
+        assert_eq!(home_of(&db, "shared").as_deref(), Some("rig26"));
+        assert_eq!(
+            home_lost_of(&db, "shared"),
+            None,
+            "a row cannot be homed at the node it records as lost"
+        );
+
+        // An edit that names no home leaves the record alone: it is the account's
+        // history, and a rename must not erase it.
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                display_name: Some("Renamed".into()),
+                ..AccountUpdate::default()
+            },
+            Some("admin"),
+        )
+        .unwrap();
+        db.write()
+            .expect("db")
+            .execute(
+                "UPDATE provider_accounts SET home_node_id = NULL, \
+                   home_lost_node_id = 'rig26' WHERE account_id = 'shared'",
+                [],
+            )
+            .expect("seed the loss again");
+        update_account(
+            &db,
+            "shared",
+            &AccountUpdate {
+                max_sessions: Some(3),
+                ..AccountUpdate::default()
+            },
+            Some("admin"),
+        )
+        .unwrap();
+        assert_eq!(home_lost_of(&db, "shared").as_deref(), Some("rig26"));
     }
 
     /// The distinction the marker exists for: an account with no recorded home

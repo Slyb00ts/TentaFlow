@@ -11,7 +11,7 @@
 // Every handler is org-scoped and answers `NotFound` for a row of another
 // organization, so error codes cannot be used to probe what else exists. The
 // wire tier is `UserSession`; the actual gate is the RBAC permission each
-// handler checks (`map.read` / `map.write` / `map.admin`, migration 166),
+// handler checks (`map.read` / `map.write` / `map.admin`, migration 170),
 // because a viewer and an administrator use the same socket.
 
 use tentaflow_macros::{handler, observed, policy};

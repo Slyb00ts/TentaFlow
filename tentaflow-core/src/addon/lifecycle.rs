@@ -362,6 +362,7 @@ pub fn teardown_plan(addon_id: &str, db: &DbPool) -> Result<Vec<PlannedTeardown>
             kind: "data_dir",
             description: std::borrow::Cow::Borrowed("instance data directory"),
             removed: true,
+            ..Default::default()
         }],
     };
     Ok(entries

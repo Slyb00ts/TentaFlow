@@ -760,7 +760,13 @@ pub fn fleet_mounts(ctx: &HandlerContext, addon_id: &str) -> Vec<NasFleetMount> 
             NasFleetMount {
                 share_name: row.name.clone(),
                 protocol: row.protocol,
-                source_node_name: names.get(&source).cloned().unwrap_or_else(|| source.clone()),
+                // Never the source's id as its name: a source outside the
+                // fleet list gets the same fallback chain as a fleet node,
+                // which ends in an empty name the screen labels itself.
+                source_node_name: names
+                    .get(&source)
+                    .cloned()
+                    .unwrap_or_else(|| super::fleet::node_name(ctx, &source)),
                 mountpoint: status
                     .map(|s| s.mountpoint.clone())
                     .unwrap_or_else(|| mountpoint_of(&row.name)),

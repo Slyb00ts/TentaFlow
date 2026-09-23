@@ -2221,6 +2221,7 @@ async function enterSession(workspaceId, sessionId) {
       sessionId,
       workspace: state.workspace,
       session,
+      isAdmin: state.isAdmin,
       onExit: () => goto(workspaceId, 'settings'),
       onNewSession: () => openSessionDialog(),
     });

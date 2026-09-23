@@ -549,6 +549,14 @@ harness = false
 name = "bus_replication"
 harness = false
 
+# TentaBus 1C (SUM/tentabus/OTWARTE-POZYCJE.md `dedup-300k-gate-unbenchmarked`):
+# the >=300k ops/s layer-2 per-record dedup gate against the REAL production
+# store, `bus::dedup::MmapDedupStore` — not the abandoned fjall path that
+# `tentaflow-bus/benches/meta_perf.rs` used to benchmark for this workload.
+[[bench]]
+name = "bus_dedup_perf"
+harness = false
+
 [[example]]
 name = "cv_bench"
 required-features = ["inference-vision-gpu"]

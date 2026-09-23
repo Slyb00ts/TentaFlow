@@ -277,13 +277,7 @@ impl AliasResolver {
                 }
                 let before = out.len();
                 let cross_env_before = *dropped_cross_env;
-                self.emit_service_model(
-                    req.required_surface,
-                    &entry.id,
-                    instances,
-                    out,
-                    dropped_cross_env,
-                );
+                self.emit_service_model(&entry.id, instances, out, dropped_cross_env);
                 // Nothing emitted for this entry. If the cross-env flag did
                 // NOT change during this call, the emptiness has nothing to
                 // do with environment fencing (e.g. a deploy-in-flight local
@@ -409,10 +403,10 @@ impl AliasResolver {
     /// in-process przez MLXBridge, więc embedded handle rerankera JEST poprawnym
     /// kandydatem Local{Embedded} — dispatch (rerank_forward / executor) kieruje
     /// go do `mlx_swift_bridge::rerank`. Mesh/HTTP/QUIC (zewnętrzny cross-encoder)
-    /// bez zmian.
+    /// bez zmian. Surface compatibility is already checked by `satisfies()` at
+    /// the entry level before this is called, so no per-surface filtering here.
     fn emit_service_model(
         &self,
-        surface: ServiceSurface,
         model_name: &str,
         instances: &[ModelInstance],
         out: &mut Vec<ResolvedExecutionTarget>,
@@ -844,7 +838,7 @@ mod tests {
             // in the test binary (`dispatch/environment.rs`, `dispatch/mod.rs`).
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                match crate::sync::runtime::init(db.clone(), security.clone(), cipher.clone()) {
+                match crate::sync::runtime::init(db.clone(), security.clone()) {
                     Ok(_) => break,
                     Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
                         if std::time::Instant::now() < deadline =>

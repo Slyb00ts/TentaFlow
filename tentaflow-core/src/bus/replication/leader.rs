@@ -41,6 +41,7 @@
 // what the feeder already tracks per batch sent.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,7 +66,20 @@ use crate::bus::AckOutcome;
 /// test wanting faster cadences constructs its own value instead of
 /// mutating shared constants (same pattern `follower.rs`'s
 /// `FollowerConfig` uses).
-#[derive(Debug, Clone, Copy)]
+/// Diagnostic hook invoked synchronously from `reconcile_follower` whenever
+/// it emits an `IsrEvent` (TentaBus 1C, OTWARTE-POZYCJE.md
+/// `P7-pipeline-flake-open`, added 2026-09-22): before this, no ISR
+/// shrink/expand instrumentation existed anywhere reachable from a bench or
+/// test, which is exactly why the leading hypothesis for `bus_replication`'s
+/// P7 flake — a spurious ISR eviction under scheduler contention on a
+/// shared host — had never been investigated. `LeaderConfig::isr_event_hook`
+/// defaulting to `None` costs nothing beyond one branch per
+/// `reconcile_follower` call; a caller (e.g. `benches/bus_replication.rs`'s
+/// `gate_p7`) installs one to `eprintln!` every transition with its reason
+/// during a measurement window.
+pub type IsrEventHook = Arc<dyn Fn(&IsrEvent) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct LeaderConfig {
     /// A follower stream sends a bare `Heartbeat` once this much wall time
     /// has passed since its last frame of any kind (PLAN-M2 §1b: "co
@@ -88,6 +102,22 @@ pub struct LeaderConfig {
     /// resyncing after a long gap never forces one fetch to buffer an
     /// unbounded slice of the log in memory.
     pub batch_fetch_max_bytes: usize,
+    /// See `IsrEventHook`'s doc. `None` in every production path (wired
+    /// only by benches/tests that need live visibility into ISR churn).
+    pub isr_event_hook: Option<IsrEventHook>,
+}
+
+impl fmt::Debug for LeaderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LeaderConfig")
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("offsets_coalesce_interval", &self.offsets_coalesce_interval)
+            .field("replica_lag_max_bytes", &self.replica_lag_max_bytes)
+            .field("replica_lag_max_ms", &self.replica_lag_max_ms)
+            .field("batch_fetch_max_bytes", &self.batch_fetch_max_bytes)
+            .field("isr_event_hook", &self.isr_event_hook.is_some())
+            .finish()
+    }
 }
 
 impl Default for LeaderConfig {
@@ -98,6 +128,7 @@ impl Default for LeaderConfig {
             replica_lag_max_bytes: 64 * 1024 * 1024,
             replica_lag_max_ms: 5_000,
             batch_fetch_max_bytes: 1024 * 1024,
+            isr_event_hook: None,
         }
     }
 }
@@ -501,12 +532,16 @@ impl PartitionLeader {
             let isr_size = self.isr_size();
             self.metrics.record_isr_shrink();
             self.metrics.record_isr_size(isr_size);
-            let _ = self.events_tx.send(IsrEvent::Shrink {
+            let event = IsrEvent::Shrink {
                 node_id: node_id.to_string(),
                 reason,
                 isr_size,
                 min_isr: self.min_isr,
-            });
+            };
+            if let Some(hook) = &self.config.isr_event_hook {
+                hook(&event);
+            }
+            let _ = self.events_tx.send(event);
             self.recompute_hw();
         } else if !snapshot.in_isr && !lag_too_high && !ack_stale {
             if let Some(mut fs) = self.followers.get_mut(node_id) {
@@ -514,10 +549,14 @@ impl PartitionLeader {
             }
             let isr_size = self.isr_size();
             self.metrics.record_isr_size(isr_size);
-            let _ = self.events_tx.send(IsrEvent::Expand {
+            let event = IsrEvent::Expand {
                 node_id: node_id.to_string(),
                 isr_size,
-            });
+            };
+            if let Some(hook) = &self.config.isr_event_hook {
+                hook(&event);
+            }
+            let _ = self.events_tx.send(event);
             self.recompute_hw();
         } else {
             self.metrics.record_isr_size(self.isr_size());
@@ -1186,6 +1225,7 @@ mod tests {
             replica_lag_max_bytes: 64 * 1024 * 1024,
             replica_lag_max_ms: 5_000,
             batch_fetch_max_bytes: 1024 * 1024,
+            ..LeaderConfig::default()
         }
     }
 
@@ -1716,6 +1756,66 @@ mod tests {
 
         let fs = leader.follower_state("f1").unwrap();
         assert!(!fs.in_isr);
+    }
+
+    /// `LeaderConfig::isr_event_hook` must observe BOTH transitions, with
+    /// the shrink's real reason. This is the mechanism `benches/
+    /// bus_replication.rs`'s `gate_p7` installs to make an ISR eviction
+    /// visible during a measurement window (TentaBus 1C
+    /// `P7-pipeline-flake-open`) — without this test, "the hook logged
+    /// nothing" could equally mean "no shrink happened" or "the hook never
+    /// fires", and those two readings point at opposite root causes.
+    #[test]
+    fn isr_event_hook_observes_both_shrink_and_expand() {
+        let seen: Arc<std::sync::Mutex<Vec<IsrEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mut config = fast_config();
+        config.isr_event_hook = Some(Arc::new(move |event: &IsrEvent| {
+            sink.lock().unwrap().push(event.clone());
+        }));
+
+        let part = temp_partition("isr-hook");
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, config);
+        // `register_follower` admits a follower to the ISR directly (no
+        // event), so the hook must be silent until a real transition.
+        leader.register_follower("f1", 0, 0);
+        assert!(seen.lock().unwrap().is_empty());
+
+        leader.set_follower_lag_bytes("f1", 65 * 1024 * 1024);
+        leader.record_ack(
+            "f1",
+            &ReplAck {
+                leader_epoch: TEST_EPOCH,
+                follower_leo: 0,
+                follower_hw: 0,
+            },
+            0, // caught up again
+        );
+
+        let events = seen.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "expected one shrink + one expand: {events:?}"
+        );
+        assert!(
+            matches!(
+                &events[0],
+                IsrEvent::Shrink {
+                    node_id,
+                    reason: IsrShrinkReason::LagBytes { .. },
+                    ..
+                } if node_id == "f1"
+            ),
+            "first event must be the lag-bytes shrink: {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], IsrEvent::Expand { node_id, .. } if node_id == "f1"),
+            "second event must be the expand: {:?}",
+            events[1]
+        );
     }
 
     #[test]

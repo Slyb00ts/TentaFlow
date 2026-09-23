@@ -131,7 +131,7 @@ pub enum CoreSyncResourceKind {
     /// only by the node it describes (enforced in the handler, where the
     /// node's identity is known); it replicates so N01 is a fleet view.
     AgentRuntimeEngine,
-    /// A place the organization manages (migration 165). The building exists
+    /// A place the organization manages (migration 169). The building exists
     /// for everyone, so every node has to be able to name it — a site known to
     /// one node only would make the scene under it unaddressable elsewhere.
     MapSite,
@@ -199,6 +199,69 @@ impl CoreSyncDescriptor {
             }
         }
     }
+
+    /// SUM/tentabus/DECYZJE-2026-09-22.md, `R4-9e-ledger-leak`: the
+    /// instance-scoped variant of `partition_id`, for the five `Bus*` kinds
+    /// only (`is_bus_instance_scoped`). Same `"core/env/{env}/org/{org}/
+    /// {suffix}"` shape as the shared-partition case above, with the hosting
+    /// TentaBus instance appended as its own trailing segment
+    /// (`.../bus/instance/{instance_id}`) — so instance A's topics/schema/
+    /// assignments live in a DIFFERENT ledger partition than instance B's,
+    /// where a node's replication layer can subscribe to one without the
+    /// other. This reverses the doc note above `BusTopic`'s own descriptor
+    /// ("partition_suffix deliberately stays the single shared 'bus'
+    /// string") — the owner decided the instance dimension is worth the
+    /// signature change THIS method is, rather than widening `partition_id`
+    /// itself for every resource kind that never needed it.
+    ///
+    /// Every non-bus resource keeps calling the 3-arg `partition_id` above,
+    /// completely unchanged — this method exists purely alongside it.
+    pub fn bus_instance_partition_id(
+        &self,
+        org_id: &str,
+        environment: NodeEnvironment,
+        instance_id: &str,
+    ) -> LedgerResult<PartitionId> {
+        PartitionId::new(format!(
+            "core/env/{}/org/{org_id}/{}/instance/{instance_id}",
+            environment.as_str(),
+            self.partition_suffix
+        ))
+    }
+}
+
+/// Whether `kind` is one of the five bus resources that key their ledger
+/// partition by TentaBus instance (`bus_instance_partition_id`) rather than
+/// sharing one partition for the whole org (`R4-9e-ledger-leak`). Every one
+/// of these kinds' `primary_key_column` leads with `instance_id` (this
+/// file's own doc above the `BusTopic` descriptor), which is also what makes
+/// `bus_instance_id_from_resource_id` below able to recover it losslessly
+/// from `resource_id`'s own first composite segment.
+pub fn is_bus_instance_scoped(kind: CoreSyncResourceKind) -> bool {
+    matches!(
+        kind,
+        CoreSyncResourceKind::BusTopic
+            | CoreSyncResourceKind::BusPartitionAssignment
+            | CoreSyncResourceKind::BusFieldPolicy
+            | CoreSyncResourceKind::BusSchemaSubject
+            | CoreSyncResourceKind::BusSchemaVersion
+    )
+}
+
+/// Recovers the hosting TentaBus instance id from a bus resource's own
+/// `resource_id`, for `kind`s `is_bus_instance_scoped` accepts — `None` for
+/// every other kind (the caller falls back to the shared `partition_id`) and
+/// `None` on a malformed composite id (`decode_first_segment`'s own doc: a
+/// caller that gets `None` here must never guess a partition, only fall
+/// through to code that errors loudly instead).
+pub fn bus_instance_id_from_resource_id(
+    kind: CoreSyncResourceKind,
+    resource_id: &str,
+) -> Option<&str> {
+    if !is_bus_instance_scoped(kind) {
+        return None;
+    }
+    crate::sync::resource_id::decode_first_segment(resource_id)
 }
 
 pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
@@ -1582,6 +1645,64 @@ mod tests {
                 descriptor.primary_key_column
             );
         }
+    }
+
+    /// SUM/tentabus/DECYZJE-2026-09-22.md, `R4-9e-ledger-leak`: two
+    /// TentaBus instances of the SAME org/environment must land in
+    /// DIFFERENT ledger partitions, so a node's replication layer can
+    /// subscribe to one without pulling the other's metadata at all.
+    #[test]
+    fn bus_instance_partition_id_differs_per_instance() {
+        let topic = descriptor_for_kind(CoreSyncResourceKind::BusTopic);
+        let a = topic
+            .bus_instance_partition_id("org-1", NodeEnvironment::Prod, "tentabus-aaaaaaaa")
+            .unwrap();
+        let b = topic
+            .bus_instance_partition_id("org-1", NodeEnvironment::Prod, "tentabus-bbbbbbbb")
+            .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(
+            a.as_str(),
+            "core/env/prod/org/org-1/bus/instance/tentabus-aaaaaaaa"
+        );
+        assert!(
+            a.as_str().starts_with("core/"),
+            "must stay under the reset prefix"
+        );
+    }
+
+    /// Every `is_bus_instance_scoped` kind recovers the SAME instance id it
+    /// was encoded with; a non-bus kind (whose `resource_id` never follows
+    /// the bus composite-id convention) must never be misread as one, even
+    /// when its `resource_id` happens to start with a decimal digit and a
+    /// `US` separator by coincidence.
+    #[test]
+    fn bus_instance_id_from_resource_id_is_scoped_to_bus_kinds_only() {
+        let resource_id = crate::sync::resource_id::composite_resource_id(&[
+            "tentabus-cccccccc",
+            "org-1",
+            "orders.created",
+        ]);
+        for kind in [
+            CoreSyncResourceKind::BusTopic,
+            CoreSyncResourceKind::BusPartitionAssignment,
+            CoreSyncResourceKind::BusFieldPolicy,
+            CoreSyncResourceKind::BusSchemaSubject,
+            CoreSyncResourceKind::BusSchemaVersion,
+        ] {
+            assert_eq!(
+                bus_instance_id_from_resource_id(kind, &resource_id),
+                Some("tentabus-cccccccc"),
+                "{kind:?} must recover its leading instance_id segment"
+            );
+        }
+        // A coincidentally bus-shaped resource_id on a NON-bus kind must
+        // still fall through to the shared partition — `is_bus_instance_
+        // scoped` gates on `kind`, never on what the string looks like.
+        assert_eq!(
+            bus_instance_id_from_resource_id(CoreSyncResourceKind::Flow, &resource_id),
+            None
+        );
     }
 
     /// PLAN-F3 §7: both schema-registry resources share the "bus" partition

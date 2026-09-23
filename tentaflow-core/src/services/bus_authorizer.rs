@@ -18,21 +18,23 @@
 //      unchanged from W3 except its `resource_id`'s composite encoding (see
 //      `topic_acl_resource_id`'s own doc).
 //
-// WHAT THIS DOES NOT MODEL (read before extending): PLAN §8.1 decision D6
-// describes per-topic ACL as three distinct actions (`produce`/`consume`/
-// `admin`). The underlying `resource_permissions` table (shared with
-// model/flow/alias ACLs) has no action column — one row is
-// `(resource_type, resource_id, subject_type, subject_id, access_level)`
-// with `access_level` only ever `"allow"`/`"deny"`, i.e. "can this subject
-// touch this resource AT ALL", not "can this subject produce vs. consume vs.
-// admin it". Adding an action dimension would mean widening a table shared
-// by every OTHER resource-scoped ACL in this codebase — out of scope for a
-// single-file authorizer. Consequently: the ACL layer here is a single
-// per-topic allow/deny gate applied to EVERY action alike; the
-// produce/consume/admin split is enforced ONLY at the matrix layer above
-// (`bus.write`/`bus.read`/`bus.admin`). The M03 mockup's three ACL columns
-// will need to collapse to one until `resource_permissions` (or a
-// TentaBus-specific successor table) grows an action column.
+// PER-TOPIC ACTIONS AND GROUPS (SUM/tentabus/DECYZJE-2026-09-22.md,
+// `topic-acl-actions`): PLAN §8.1 decision D6 describes per-topic ACL as
+// three distinct actions (`produce`/`consume`/`admin`). Migration 168 widened
+// `resource_permissions` (shared with model/flow/alias/model_bundle/api_key
+// ACLs) with an `action` column ("read"/"write"/"admin"/"*") and its UNIQUE
+// key to include it, so a topic can now carry independent read/write/admin
+// rows per subject instead of one shared allow/deny gate. Every row recorded
+// before that migration was pinned to `action = '*'`, which the lookup
+// (`db::repository::resource_permissions::check_action`) treats as matching
+// every action asked about — an old deny still denies produce/consume/admin
+// alike, so existing grants keep their exact prior meaning. `subject_type =
+// 'group'` rows are now consulted too, via `check_action`'s group_members
+// join — previously a documented gap, group grants were silently ignored.
+// Priority (same as every other resource type's `check_inner`, but with no
+// admin-role bypass — the matrix layer above already gates admin access):
+// user_deny > user_allow > group_deny > group_allow > default_allow, each
+// level summing rows for the exact action plus `'*'` rows.
 //
 // DLQ rule (PLAN §3.3 + this task's brief): `__dlq.<topic>` is never ACL'd
 // on its own — both consuming FROM `__dlq.<topic>` and the broker's own
@@ -96,6 +98,19 @@ fn required_permission(action: BusAction) -> &'static str {
     }
 }
 
+/// The `resource_permissions.action` value a `BusAction` maps to (migration
+/// 168) — the same produce→write/consume→read/admin→admin mapping as
+/// `required_permission`'s matrix permission, minus the `"bus."` prefix, so a
+/// per-topic ACL row and its matrix counterpart read the same way to an
+/// operator setting either one.
+fn acl_action(action: BusAction) -> &'static str {
+    match action {
+        BusAction::Produce => "write",
+        BusAction::Consume => "read",
+        BusAction::Admin => "admin",
+    }
+}
+
 /// Resolves the (topic, action) pair actually checked against the matrix/ACL
 /// — the identity mapping for a normal topic, and the DLQ redirect (this
 /// file's module doc) for a `__dlq.<source>` topic.
@@ -133,37 +148,41 @@ pub fn topic_acl_resource_id(instance_id: &str, org_id: &str, topic: &str) -> St
     crate::sync::resource_id::composite_resource_id(&[instance_id, org_id, topic])
 }
 
-/// `true` unless a `"deny"` row exists for this exact `(user, topic)` pair
-/// (PLAN §8.1's ACL priority list starts "user_deny > user_allow > ... >
-/// default_allow" — this file implements the two ends of that list: an
-/// explicit user-level deny, and the default when no row at all exists.
-/// Group-scoped rows are not consulted: group membership is a directory
-/// concept this file has no lookup for yet, left as a documented gap
-/// rather than a silent no-op).
+/// Full priority-chain ACL check for `(topic, action, actor)` — PLAN §8.1's
+/// list, `user_deny > user_allow > group_deny > group_allow > default_allow`,
+/// via `resource_permissions::check_action` (migration 168). Each level sums
+/// rows matching `action` exactly plus `'*'` rows (every row recorded before
+/// the migration, still meaning "every action"), and group rows are resolved
+/// through `actor`'s `group_members` rows — the gap this file's doc used to
+/// name is closed.
 fn topic_acl_allows(
     db: &DbPool,
     instance_id: &str,
     org_id: &str,
     topic: &str,
     actor: &str,
+    action: &str,
 ) -> bool {
     let resource_id = topic_acl_resource_id(instance_id, org_id, topic);
-    let rows = match repository::resource_permissions::list_for_resource(db, "topic", &resource_id)
-    {
-        Ok(rows) => rows,
+    match repository::resource_permissions::check_action(
+        db,
+        "topic",
+        &resource_id,
+        action,
+        actor,
+        true, // default_allow: unchanged from the pre-168 "allow unless denied" shape.
+    ) {
+        Ok(allowed) => allowed,
         Err(e) => {
             // Fail CLOSED: an ACL read error must never be silently
             // treated as "no rule, so allow".
             tracing::warn!(
-                resource_id, error = %e,
+                resource_id, action, error = %e,
                 "bus ACL lookup failed, denying"
             );
-            return false;
+            false
         }
-    };
-    !rows
-        .iter()
-        .any(|r| r.subject_type == "user" && r.subject_id == actor && r.access_level == "deny")
+    }
 }
 
 /// Production `bus::BusAuthorizer` wired at `bus::init_instance` time —
@@ -217,6 +236,7 @@ impl crate::bus::BusAuthorizer for InstanceBusAuthorizer {
             &ctx.org_id,
             acl_topic,
             actor,
+            acl_action(base_action),
         ) {
             return Err(denied(action, topic));
         }
@@ -517,5 +537,144 @@ mod tests {
         bump_acl_generation();
         let g2 = auth.generation();
         assert_ne!(g1, g2, "ACL set/clear must bump generation");
+    }
+
+    /// migration 168, `topic-acl-actions`: a `subject_type = 'group'` deny
+    /// row must be honored even though the actor never has a `subject_type
+    /// = 'user'` row of their own — the documented gap this rung closes.
+    #[test]
+    fn group_deny_row_denies_a_member_with_full_matrix_grants() {
+        let (_d, pool) = open_pool();
+        let checker = checker(&pool);
+        let user_id =
+            repository::create_user_account(&pool, "grp-user", "hash", "Grp User", "g@x").unwrap();
+        grant(&pool, &checker, &instance_a(), &user_id, "bus.read");
+        grant(&pool, &checker, &instance_a(), &user_id, "bus.write");
+        grant(&pool, &checker, &instance_a(), &user_id, "bus.admin");
+        let group_id = repository::create_group(&pool, "readers", "").unwrap();
+        repository::add_user_to_group(&pool, &group_id, &user_id).unwrap();
+        repository::resource_permissions::set(
+            &pool,
+            "topic",
+            &topic_acl_resource_id(instance_a().as_str(), "org-1", "orders.created"),
+            "group",
+            &group_id,
+            "deny",
+        )
+        .unwrap();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", &user_id);
+        assert!(auth
+            .authorize(&c, BusAction::Consume, "orders.created")
+            .is_err());
+        // A different topic with no ACL row at all still defaults to allow.
+        assert!(auth
+            .authorize(&c, BusAction::Consume, "other.topic")
+            .is_ok());
+    }
+
+    /// A user-level allow overrides a group-level deny for the SAME actor —
+    /// same priority order (`user_deny > user_allow > group_deny >
+    /// group_allow > default_allow`) every other resource type's ACL check
+    /// already applies.
+    #[test]
+    fn user_level_allow_overrides_group_level_deny() {
+        let (_d, pool) = open_pool();
+        let checker = checker(&pool);
+        let user_id =
+            repository::create_user_account(&pool, "grp-user2", "hash", "U", "u@x").unwrap();
+        grant(&pool, &checker, &instance_a(), &user_id, "bus.read");
+        let group_id = repository::create_group(&pool, "denied", "").unwrap();
+        repository::add_user_to_group(&pool, &group_id, &user_id).unwrap();
+        let resource_id = topic_acl_resource_id(instance_a().as_str(), "org-1", "orders.created");
+        repository::resource_permissions::set(
+            &pool,
+            "topic",
+            &resource_id,
+            "group",
+            &group_id,
+            "deny",
+        )
+        .unwrap();
+        repository::resource_permissions::set(
+            &pool,
+            "topic",
+            &resource_id,
+            "user",
+            &user_id,
+            "allow",
+        )
+        .unwrap();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", &user_id);
+        assert!(auth
+            .authorize(&c, BusAction::Consume, "orders.created")
+            .is_ok());
+    }
+
+    /// migration 168: an action-scoped deny row blocks ONLY that action —
+    /// a `write` deny must not touch `read`/`admin` on the same topic.
+    #[test]
+    fn action_specific_deny_row_only_blocks_that_action() {
+        let (_d, pool) = open_pool();
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-scoped", "bus.read");
+        grant(&pool, &checker, &instance_a(), "u-scoped", "bus.write");
+        let resource_id = topic_acl_resource_id(instance_a().as_str(), "org-1", "orders.created");
+        repository::resource_permissions::set_with_action(
+            &pool,
+            "topic",
+            &resource_id,
+            "user",
+            "u-scoped",
+            "write",
+            "deny",
+        )
+        .unwrap();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", "u-scoped");
+        assert!(
+            auth.authorize(&c, BusAction::Produce, "orders.created")
+                .is_err(),
+            "write-scoped deny must block Produce"
+        );
+        assert!(
+            auth.authorize(&c, BusAction::Consume, "orders.created")
+                .is_ok(),
+            "write-scoped deny must not block Consume"
+        );
+    }
+
+    /// A `'*'` row (the shape every pre-168 row has, per the migration's
+    /// mapping) still denies every action alike.
+    #[test]
+    fn wildcard_action_row_denies_every_action() {
+        let (_d, pool) = open_pool();
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-wild", "bus.read");
+        grant(&pool, &checker, &instance_a(), "u-wild", "bus.write");
+        grant(&pool, &checker, &instance_a(), "u-wild", "bus.admin");
+        let resource_id = topic_acl_resource_id(instance_a().as_str(), "org-1", "orders.created");
+        repository::resource_permissions::set_with_action(
+            &pool,
+            "topic",
+            &resource_id,
+            "user",
+            "u-wild",
+            "*",
+            "deny",
+        )
+        .unwrap();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", "u-wild");
+        assert!(auth
+            .authorize(&c, BusAction::Produce, "orders.created")
+            .is_err());
+        assert!(auth
+            .authorize(&c, BusAction::Consume, "orders.created")
+            .is_err());
+        assert!(auth
+            .authorize(&c, BusAction::Admin, "orders.created")
+            .is_err());
     }
 }

@@ -204,7 +204,7 @@ function renderKeysTab(body) {
   body.innerHTML = `
     <div class="tf-section-card">
       <div class="ak-toolbar">
-        <div class="ak-info">${escapeHtml(t('access_keys.deny_hint', 'Default-DENY: klucz widzi i wywołuje tylko jawnie nadane zasoby. Synchronizowane na wszystkie węzły.'))}</div>
+        <div class="ak-info">${escapeHtml(t('access_keys.deny_hint', 'Default-DENY: klucz widzi i wywołuje tylko jawnie nadane zasoby. Synchronizowane na wszystkie nody.'))}</div>
         <tf-button variant="ghost" size="sm" icon="refresh" id="ak-refresh">${escapeHtml(t('access_keys.refresh', 'Odśwież'))}</tf-button>
         <tf-button variant="primary" size="sm" icon="plus" id="ak-create">${escapeHtml(t('access_keys.new_key', 'Nowy klucz'))}</tf-button>
       </div>

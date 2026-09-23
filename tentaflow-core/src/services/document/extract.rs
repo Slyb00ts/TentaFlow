@@ -350,7 +350,10 @@ pub fn docx_to_markdown(bytes: &[u8]) -> Result<String, String> {
     fn heading_from_pstyle(e: &quick_xml::events::BytesStart) -> Option<u8> {
         for attr in e.attributes().flatten() {
             if local_name(attr.key.as_ref()) == b"val" {
-                if let Ok(val) = attr.unescape_value() {
+                // `normalized_value` is `unescape_value`'s replacement — same
+                // recursion depth (1) and predefined-entity resolver, just an
+                // explicit XML version instead of an implicit one.
+                if let Ok(val) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
                     if let Some(rest) = val
                         .strip_prefix("Heading")
                         .or_else(|| val.strip_prefix("heading"))

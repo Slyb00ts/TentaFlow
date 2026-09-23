@@ -231,7 +231,7 @@ mod tests {
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_FORWARD_STREAM_REQ as u16)).is_none());
         // Camera live relay subscribe is also a bi-stream-only discriminator.
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_CAMERA_STREAM_SUBSCRIBE as u16)).is_none());
-        // Holes in the 0x10..=0x4C range — not even legacy.
+        // Holes in the 0x10..=0x51 Mesh range — not even legacy.
         assert!(legacy_from_kind(Kind(0x0017)).is_none());
         assert!(legacy_from_kind(Kind(0x0036)).is_none());
     }
@@ -314,12 +314,30 @@ mod tests {
         assert_eq!(kinds::COMMAND.0, legacy::MESH_MSG_COMMAND as u16);
     }
 
+    /// Every kind this catalog publishes on the Mesh channel has to be inside
+    /// the Mesh channel's own range, and the bound is READ FROM the spec rather
+    /// than restated here — a hardcoded copy is exactly what let
+    /// `PROVIDER_CREDENTIALS_SYNC` be allocated at 0x54, past the bound, where
+    /// `validate_channel_kind` dropped every frame before dispatch and the
+    /// sender saw a fan-out that silently delivered nothing. A new mesh message
+    /// that travels as a UFP/2 envelope belongs in a FREE slot of `0x04`'s
+    /// range; the raw bi-stream discriminators (0x52/0x53) are not in `kinds`
+    /// precisely because they are not envelope kinds.
     #[test]
-    fn named_constants_within_mesh_channel_range() {
-        // §4: Mesh channel kind range is 0x0010..=0x004C.
-        for &k in &[
+    fn every_named_mesh_kind_is_inside_the_mesh_channel_range() {
+        let range = channels::valid_kind_range(channels::MESH).expect("0x04 is allocated");
+        let mesh_kinds = [
             kinds::HEARTBEAT,
+            kinds::FORWARD_REQ,
+            kinds::MODEL_LIST,
             kinds::NODE_INFO,
+            kinds::ALIAS_SYNC,
+            kinds::ROUTING_SYNC,
+            kinds::ROBOTS_ANNOUNCE,
+            kinds::ROBOTS_GET,
+            kinds::ROBOTS_GET_RESPONSE,
+            kinds::ROBOTS_UPDATE,
+            kinds::NODE_LEAVING,
             kinds::HELLO,
             kinds::TOPOLOGY_ANNOUNCE,
             kinds::KNOWN_PEERS,
@@ -332,13 +350,22 @@ mod tests {
             kinds::COMMAND_RESPONSE,
             kinds::DEPLOY_PROGRESS,
             kinds::LOG_CHUNK,
+            kinds::HMAC_KEYS_SYNC,
+            kinds::SHARED_SECRETS_SYNC,
+            kinds::PROVIDER_CREDENTIALS_SYNC,
+            kinds::FRAME_PROXY_REQUEST,
+            kinds::FRAME_PROXY_RESPONSE,
             kinds::STORAGE_PROXY_REQUEST,
             kinds::STORAGE_PROXY_RESPONSE,
-        ] {
+        ];
+        for kind in mesh_kinds {
             assert!(
-                k.0 >= 0x0010 && k.0 <= 0x004C,
-                "kind 0x{:04X} outside Mesh channel range 0x0010..=0x004C",
-                k.0
+                range.contains(&kind.0),
+                "kind 0x{:04X} is outside the Mesh channel range 0x{:04X}..=0x{:04X}: \
+                 its frames would be dropped as UnknownKind before dispatch",
+                kind.0,
+                range.start(),
+                range.end()
             );
         }
     }

@@ -1101,7 +1101,7 @@ function shellHtml() {
   return `
     <div class="tb-head">
       <div>
-        <h1 class="tb-title">${escapeHtml(state.instanceLabel || T('title'))} <tf-chip status="info" title="${escapeAttr(T('instance_label'))}">${escapeHtml(state.instanceId || '')}</tf-chip></h1>
+        <h1 class="tb-title">${escapeHtml(state.instanceLabel || T('title'))} <tf-chip status="info" title="${escapeAttr(T('instance_label'))}">${escapeHtml(state.instanceId || '')}</tf-chip><tf-chip id="tb-dlq-badge" status="err" hidden></tf-chip></h1>
         <div class="tb-sub">${escapeHtml(T('subtitle'))}</div>
       </div>
       <div class="tb-head-actions" id="tb-head-actions"></div>
@@ -1137,6 +1137,24 @@ function paintHeadActions() {
     byId('tb-new-topic')?.addEventListener('click', () => openTopicWizard(null));
   } else {
     host.innerHTML = '';
+  }
+}
+
+// 6.1: cross-tab DLQ-depth badge next to the instance chip in the screen
+// header (W9, PLAN-APP-PLATFORM.md §3.6) — same `state.stats.totalDlqDepth`
+// the Topics-tab KPI card reads, painted on every stats poll so it stays
+// current no matter which tab/view is open, and hidden entirely at 0 (a
+// healthy DLQ has nothing to flag here).
+function paintDlqBadge() {
+  const el = byId('tb-dlq-badge');
+  if (!el) return;
+  const depth = Number(state.stats?.totalDlqDepth) || 0;
+  if (depth > 0) {
+    el.textContent = fmtCompact(depth);
+    el.setAttribute('title', T('head_dlq_badge_title', { count: depth }));
+    el.removeAttribute('hidden');
+  } else {
+    el.setAttribute('hidden', '');
   }
 }
 
@@ -1223,6 +1241,11 @@ async function refreshStats() {
   // back to a tab/topic shows an already-up-to-date, already-scrolled chart
   // instead of a gap or a reset-to-empty series.
   pushChartSample(state.chartSeries, state.stats);
+  // The DLQ-depth badge lives in the screen HEADER (`shellHtml`), which is
+  // never rebuilt while a tab/topic-detail view is showing (unlike the KPI
+  // strip, which only exists inside the Topics view DOM) — so it is always
+  // safe to patch on every poll, regardless of `state.tab`/`state.view`.
+  paintDlqBadge();
   // M01: KPI strip + chart + topics table only exist inside the Topics view
   // — never touch that DOM while a different tab/topic-detail is showing
   // (task requirement: "polling must not touch panels that are not
@@ -1966,8 +1989,8 @@ function openTopicWizard(existing) {
   modal.setAttribute('open', '');
   trapModalFocus(modal);
 
-  const { setRf } = wireWizardBehavior(body, form);
-  loadWizardNodePicker(body, form, setRf);
+  const { setRf, isRfTouchedByUser, markRfTouchedByUser } = wireWizardBehavior(body, form);
+  loadWizardNodePicker(body, form, setRf, isEdit, isRfTouchedByUser, markRfTouchedByUser);
   modal.addEventListener('close', () => closeModal(modal), { once: true });
 }
 
@@ -1989,17 +2012,25 @@ function wireWizardBehavior(body, form) {
 
   const rfValue = body.querySelector('#tb-w-rf-value');
   const rfWarning = body.querySelector('#tb-w-rf-warning');
+  // 9l-a (owner decision 22.09): "Domyślny RF = min(3, liczba nodów w
+  // środowisku), bez ostrzeżenia, gdy więcej się nie da" — the warning chip
+  // now only shows when RF=1 was picked WHILE a higher RF was actually
+  // available. `form.maxPossibleRf` starts fail-closed at 1 (no warning
+  // until the same-env node roster is known) and `loadWizardNodePicker`
+  // corrects it to the real healthy-node count once its fetch resolves,
+  // re-running `setRf` so the chip reflects the real ceiling.
+  let rfTouchedByUser = false;
   const setRf = (rf) => {
     form.replicationFactor = clampReplicationFactor(rf);
     if (rfValue) rfValue.textContent = String(form.replicationFactor);
-    rfWarning?.classList.toggle('show', form.replicationFactor === 1);
+    rfWarning?.classList.toggle('show', form.replicationFactor === 1 && (form.maxPossibleRf ?? 1) > 1);
     const decBtn = body.querySelector('#tb-w-rf-dec');
     const incBtn = body.querySelector('#tb-w-rf-inc');
     if (decBtn) decBtn.disabled = form.replicationFactor <= 1;
     if (incBtn) incBtn.disabled = form.replicationFactor >= 7;
   };
-  body.querySelector('#tb-w-rf-dec')?.addEventListener('click', () => setRf(form.replicationFactor - 1));
-  body.querySelector('#tb-w-rf-inc')?.addEventListener('click', () => setRf(form.replicationFactor + 1));
+  body.querySelector('#tb-w-rf-dec')?.addEventListener('click', () => { rfTouchedByUser = true; setRf(form.replicationFactor - 1); });
+  body.querySelector('#tb-w-rf-inc')?.addEventListener('click', () => { rfTouchedByUser = true; setRf(form.replicationFactor + 1); });
   setRf(form.replicationFactor);
 
   // R5-2/P2 (KRYTYK-M1-R5.md b.2/b.4's fix set): the advanced "Trwałość
@@ -2018,7 +2049,11 @@ function wireWizardBehavior(body, form) {
     explicitWarn?.classList.toggle('show', value !== 'auto');
   });
 
-  return { setRf };
+  return {
+    setRf,
+    isRfTouchedByUser: () => rfTouchedByUser,
+    markRfTouchedByUser: () => { rfTouchedByUser = true; },
+  };
 }
 
 // M2's node picker (module-doc gap #3): fetches `ReplicaListResponse.nodes`
@@ -2031,7 +2066,7 @@ function wireWizardBehavior(body, form) {
 // submit payload directly: checking/unchecking nodes only calls `setRf`
 // with the same-env checked count, keeping the (real, wired) RF stepper
 // and this (informational) picker in lockstep in BOTH directions.
-async function loadWizardNodePicker(body, form, setRf) {
+async function loadWizardNodePicker(body, form, setRf, isEdit, isRfTouchedByUser, markRfTouchedByUser) {
   const loadingEl = body.querySelector('#tb-w-node-picker-loading');
   const fieldset = body.querySelector('#tb-w-node-picker');
   if (!fieldset) return;
@@ -2052,6 +2087,19 @@ async function loadWizardNodePicker(body, form, setRf) {
   // listeners on it would leak nothing (no more events fire on a detached
   // node), so this is a plain best-effort guard, not a correctness one.
   if (loadingEl) loadingEl.hidden = true;
+  // 9l-a: now that the real same-env node roster is known, correct
+  // `form.maxPossibleRf` (used by `setRf`'s warning-chip condition) from
+  // its fail-closed 1, and — for a brand-new topic the operator has not
+  // touched the stepper on yet — replace the wizard's provisional RF with
+  // the real `min(3, healthy same-env nodes)` default instead of the
+  // hardcoded 3 it opened with.
+  const healthySameEnv = filterSameEnvNodes(nodes, localEnv).filter((n) => n.reachable !== false).length;
+  form.maxPossibleRf = Math.max(1, healthySameEnv);
+  if (!isEdit && !isRfTouchedByUser()) {
+    setRf(autoReplicationFactor(nodes, localEnv));
+  } else {
+    setRf(form.replicationFactor); // Re-paint the warning chip against the now-known ceiling.
+  }
   if (!nodes.length) {
     fieldset.hidden = true;
     return;
@@ -2067,7 +2115,7 @@ async function loadWizardNodePicker(body, form, setRf) {
       </label>
     `;
   }).join('');
-  wireNodePicker(body, fieldset, form, setRf);
+  wireNodePicker(body, fieldset, form, setRf, markRfTouchedByUser);
 }
 
 // Bidirectional sync (checkboxes <-> the stepper's number) so the two
@@ -2076,13 +2124,13 @@ async function loadWizardNodePicker(body, form, setRf) {
 // function's caller's doc). Selection order is simply DOM/array order —
 // there is no ranking signal from the server to prefer one healthy node
 // over another.
-function wireNodePicker(body, fieldset, form, setRf) {
+function wireNodePicker(body, fieldset, form, setRf, markRfTouchedByUser) {
   const checkboxes = Array.from(fieldset.querySelectorAll('input[type="checkbox"]'));
   const selectable = checkboxes.filter((c) => !c.disabled);
   const checkedCount = () => selectable.filter((c) => c.checked).length;
 
   checkboxes.forEach((cb) => {
-    cb.addEventListener('change', () => setRf(checkedCount()));
+    cb.addEventListener('change', () => { markRfTouchedByUser?.(); setRf(checkedCount()); });
   });
 
   const syncPickerToRf = () => {

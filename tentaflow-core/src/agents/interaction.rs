@@ -142,15 +142,13 @@ pub struct PendingInteraction {
     /// for N s" display); the authoritative timeout is enforced by the awaiter.
     pub raised_at_ms: i64,
     /// AccountLogin kind only (§D.5): which engine's account the run is missing,
-    /// the account that exists but has no usable credential (when one does), and
-    /// the accounts the person could switch to instead. Carried on the
-    /// interaction — not on the wire — because the sign-in that settles the ask
-    /// has to find it: an ask registered for `codex` must not be woken by a
-    /// successful `claude-code` sign-in, and a person's own sign-in must not
-    /// settle somebody else's run.
+    /// and the account that exists but has no usable credential (when one does).
+    /// Carried on the interaction — not on the wire — because the sign-in that
+    /// settles the ask has to find it: an ask registered for `codex` must not be
+    /// woken by a successful `claude-code` sign-in, and a person's own sign-in
+    /// must not settle somebody else's run.
     pub engine_id: Option<String>,
     pub account_id: Option<String>,
-    pub candidate_accounts: Vec<String>,
     /// Principal the asking run acts for. The wake-up key alongside
     /// `engine_id`: a sign-in is a fact about ONE user + engine pair.
     pub user_id: Option<String>,
@@ -442,7 +440,6 @@ pub async fn run_ask_user(
         // A question is answered by the model's caller, not by a sign-in.
         engine_id: None,
         account_id: None,
-        candidate_accounts: Vec::new(),
         user_id: None,
     };
     let rx = registry.register(info);
@@ -530,7 +527,6 @@ pub async fn run_permission_request(
         // A permission grant is a decision, not a missing account.
         engine_id: None,
         account_id: None,
-        candidate_accounts: Vec::new(),
         user_id: None,
     };
     let rx = registry.register(info);
@@ -595,7 +591,6 @@ mod tests {
             raised_at_ms: now_ms(),
             engine_id: None,
             account_id: None,
-            candidate_accounts: Vec::new(),
             user_id: None,
         }
     }
@@ -679,7 +674,6 @@ mod tests {
         let mut info = pending(id, run_id, InteractionKind::AccountLogin);
         info.engine_id = Some(engine.into());
         info.account_id = None;
-        info.candidate_accounts = vec!["Claude Code — firma".into()];
         info.user_id = Some(user.into());
         info
     }

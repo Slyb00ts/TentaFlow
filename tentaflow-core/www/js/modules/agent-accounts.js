@@ -11,7 +11,7 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
-import { escapeAttr, escapeHtml } from '/js/utils.js';
+import { escapeAttr, escapeHtml, toast } from '/js/utils.js';
 
 /** i18n shorthand for the `agent_accounts.*` namespace. */
 export function T(key, vars) {
@@ -137,6 +137,50 @@ export const AgentAccounts = {
 };
 
 // =============================================================================
+// Acknowledgements
+// =============================================================================
+
+/**
+ * Renders what the node answered for a write that has nothing to return.
+ *
+ * `AccountOpAck` carries two fields and only one outcome each: `ok` with a
+ * `message_key`, which is an i18n key rather than a sentence
+ * (`tentaflow-protocol/src/provider_account.rs`). The node sets `ok: false` for
+ * the ONE partial outcome this family has — the change the person asked for
+ * landed in the store, but a plaintext provider credential could not be removed
+ * from the node's disk (`dispatch/provider_account.rs`, key
+ * `agent_accounts.purge_incomplete`). Printing the success message over that
+ * would tell the operator the token is gone while it is still readable, and
+ * nothing left in the store names the file for any later screen to find.
+ *
+ * A key with `ok: true` is the other half of the same field, and it is not the
+ * caller's success string either: the node answers `credential_absent` when
+ * there was nothing to clear and `credential_unchanged` when the same key was
+ * pasted twice, so a screen that printed "cleared" over the first would tell the
+ * operator a credential was removed from an account that never had one. The
+ * caller's sentence is the fallback for an ack that carries no key at all.
+ *
+ * The path itself is not on the wire: it reaches the operator through the
+ * warning Core logs at the same moment, which for a failure on the bridge's arm
+ * carries the trees the bridge named in its own error.
+ */
+export function reportWriteOutcome(ack, successMessage) {
+  if (ack?.ok === false) {
+    // An ack that says "not clean" without saying why is still a failure: the
+    // one thing it must never do is print the caller's success sentence over it.
+    // `I18n.t(undefined)` throws, which would lose the refusal entirely, so a
+    // missing key renders as the unknown-error line this module already uses.
+    toast(ack.message_key ? I18n.t(ack.message_key) : T('error_unknown'), 'error');
+    return;
+  }
+  if (ack?.message_key) {
+    toast(I18n.t(ack.message_key), 'success');
+    return;
+  }
+  toast(successMessage, 'success');
+}
+
+// =============================================================================
 // Refusals
 // =============================================================================
 
@@ -154,14 +198,10 @@ export const AgentAccounts = {
 // chain prefixes each with the operation that hit it, and the `code` narrows
 // the match so an unrelated sentence cannot borrow a translation.
 //
-// One entry carries `appendDetail`: its translation is deliberately incomplete,
-// so the node's own sentence has to travel next to it. `receives_home_refused`
-// covers a node still homing some account, and the remedy inside that sentence
-// is GENERIC — "sign those accounts in" for the provider logins, "paste their
-// API key" for the pasted keys (`repository.rs:set_receives_accounts`), joined
-// into one phrase when a node homes both kinds at once. No single translation
-// can carry that, so this is the one key whose sentence a caller must append.
-// Every other key is a complete translation; its node sentence is diagnostics.
+// Every key is a complete translation, and the node's sentence is diagnostics.
+// `receives_home_refused` names both remedies the store can ask for (sign the
+// accounts in elsewhere, or paste their API key there), so the English line —
+// with its 64-hex node id — never has to reach the operator.
 //
 // The last entry is the BROWSER's own deadline (`api-binary-shim.js`), which
 // arrives with no protocol prefix at all.
@@ -179,7 +219,7 @@ const REFUSALS = [
   // N01 — the receives-accounts toggle. The store refuses to take a node out of
   // the fleet while it is some account's home, because that copy is the one
   // every other node's credential is fanned out from.
-  { code: 'BadRequest', marker: 'is the home of', key: 'receives_home_refused', appendDetail: true },
+  { code: 'BadRequest', marker: 'is the home of', key: 'receives_home_refused' },
   { code: '', marker: 'timed out after', key: 'error_timeout' },
 ];
 
@@ -192,11 +232,6 @@ const REFUSALS = [
  * translation — a mapped message must not be the only thing left of what the
  * node said. `code` is the wire enum the caller reacts to (`NotFound` while
  * polling).
- *
- * `appendDetail` says whether that sentence is load-bearing or diagnostics. It
- * is true only for `receives_home_refused`, whose translation cannot spell out
- * the remedy the node names (see `REFUSALS`); every other detail is kept for a
- * window's `title` and stays out of the line the operator reads.
  *
  * The `protocol error <Code>: ` prefix is added by `binary-ws-client.js` when
  * it rejects a call; it names a wire enum variant and belongs in a log, not in
@@ -211,26 +246,17 @@ export function describeError(error) {
     (entry) => (entry.code === '' || entry.code === code) && message.includes(entry.marker),
   );
   if (known) {
-    return { code, message: T(known.key), detail: message, appendDetail: known.appendDetail === true };
+    return { code, message: T(known.key), detail: message };
   }
-  return { code, message: message || T('error_unknown'), detail: '', appendDetail: false };
+  return { code, message: message || T('error_unknown'), detail: '' };
 }
 
 /**
- * The same refusal as one string, for a toast — two lines only when the entry
- * declares `appendDetail`.
- *
- * The node's own words say WHICH remedy applies: `set_receives_accounts` names
- * the one the account's kind actually has ("sign those accounts in" for a
- * provider login, "paste their API key" for a pasted key), and no single
- * translation can carry that for a node that homes both kinds at once. That is
- * the ONE entry whose sentence this appends; for every other refusal the
- * translation is complete and the node's English line would be noise in the
- * operator's language.
+ * The same refusal as one string, for a toast: the operator's language only.
+ * The node's English sentence stays in `describeError().detail` for a `title`.
  */
 export function errorText(error) {
-  const { message, detail, appendDetail } = describeError(error);
-  return appendDetail && detail ? `${message}\n${detail}` : message;
+  return describeError(error).message;
 }
 
 // =============================================================================

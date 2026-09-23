@@ -274,7 +274,21 @@ mod serde_array64 {
 // node is rebuilt together on a bump. The relocation this command drove is gone
 // — an account's credential is refreshed by its `home_node_id` and reaches
 // other nodes as fanned-out revisions — so nothing replaces the variant.
-pub const SCHEMA_VERSION: u16 = 31;
+//
+// v32 removes the entire old "agent account = services row" path: the
+// `ServicePayload::ReqAgent`/`ResAgent` variants (and the
+// `ServiceAgentRequest`/`ServiceAgentResponse` structs they carried) and the
+// dead `MeshCommandResponsePayload::AgentRpcResult`. Like v30/v31 these are
+// variant removals on externally-tagged enums, not shape changes, so a peer
+// still on v31 would fail to decode rather than misread — but only once it
+// actually sent one, mid-request. The bump turns that into a handshake
+// refusal at connect instead. A coding agent (codex/claude-code/grok-build/
+// muse-code) is never deployed as a `services` row any more: it runs through
+// a provider account and an on-demand bridge (`services::agent_runtime`),
+// addressed by account id, not by service id — nothing replaces these
+// variants because nothing on the new path ever named a service row to
+// begin with.
+pub const SCHEMA_VERSION: u16 = 32;
 
 // =============================================================================
 // Message kind discriminants

@@ -60,6 +60,18 @@ test('fleet summary folds the per-node mount states into one chip', () => {
   assert.equal(mountStateTone('unsupported'), 'neutral');
 });
 
+// A node the source cannot name arrives with an empty name; the chip names it
+// the way every other surface does instead of leaving a blank (or, before,
+// printing its 64-hex id).
+test('a mount on a nameless node is "Node bez nazwy" in the chip and its tooltip', () => {
+  const s = share({ mounts: [mount('node-helios', 'helios', 'source'), mount('node-x', '', 'error')] });
+  const summary = fleetSummary(s);
+  assert.equal(summary.tone, 'err');
+  assert.match(summary.label, /Node bez nazwy/);
+  assert.match(summary.title, /Node bez nazwy/);
+  assert.doesNotMatch(summary.title, /node-x/);
+});
+
 test('a mounted node names the transport it actually got', () => {
   assert.equal(mountStateLabel('mounted', 'rdma'), 'zamontowany · RDMA');
   assert.equal(mountStateLabel('mounted', 'tcp'), 'zamontowany · TCP');

@@ -75,7 +75,7 @@ use tentaflow_core::bus::replication::frames::{self, ReplFrame};
 use tentaflow_core::bus::replication::glue::{
     AuditLogReplAudit, GlueFollowerFactory, GlueLeaderFactory,
 };
-use tentaflow_core::bus::replication::leader::LeaderConfig;
+use tentaflow_core::bus::replication::leader::{IsrEvent, LeaderConfig};
 use tentaflow_core::bus::replication::manager::{
     AssignmentStore, BusRecv, BusSend, FollowerRunnerFactory, LedgerAdmission, ReplicationManager,
     ReplicationManagerConfig, Transport,
@@ -99,6 +99,13 @@ const DUPLEX_BUF: usize = 4 * 1024 * 1024;
 /// the leader's LIVE ISR. Generous (the exchange is two in-memory frame
 /// round trips) because the cost of guessing low is a spurious panic.
 const WAIT_ISR_BUDGET: Duration = Duration::from_secs(10);
+
+/// `gate_p7`'s pipelined-window depth (8 = exactly the production
+/// `ack_every_n_batches` coalescing threshold — see `gate_p7`'s doc).
+/// Hoisted to module scope (2026-09-22, TentaBus 1C `P7-pipeline-flake-open`)
+/// so `gate_p7`'s own tokio runtime can be sized relative to it BEFORE the
+/// async block that used to declare it locally.
+const P7_PIPELINE_DEPTH: usize = 8;
 
 // ===== Fakes for the two ledger-facing traits (never exercised: this bench
 // never runs an election — assignment is applied directly, once, up front)
@@ -371,9 +378,15 @@ struct ReplicatedTrio {
 
 /// `Err(detail)` when the leader never sees every replica enter its live ISR
 /// — the gates can measure nothing then, and `gate_blocked` says why.
+///
+/// `leader_config` lets a caller (see `gate_p7`) override `LeaderConfig`
+/// defaults — e.g. a more generous `replica_lag_max_ms` or an
+/// `isr_event_hook` — instead of every gate being hard-wired to
+/// `LeaderConfig::default()`.
 async fn build_replicated_trio(
     label: &str,
     follower_config: FollowerConfig,
+    leader_config: LeaderConfig,
 ) -> Result<ReplicatedTrio, String> {
     let leader = bench_world(&format!("{label}-a"));
     let follower_b = bench_world(&format!("{label}-b"));
@@ -440,7 +453,7 @@ async fn build_replicated_trio(
         NodeEnvironment::Prod,
         leader.svc.clone() as Arc<dyn tentaflow_core::bus::replication::glue::PartitionProvider>,
         transport.clone() as Arc<dyn Transport>,
-        LeaderConfig::default(),
+        leader_config,
         metrics,
     ));
     // Follower factory/audit are required `ReplicationManagerConfig` fields
@@ -513,6 +526,7 @@ fn gate_p6(_c: &mut Criterion) {
                 ack_interval: Duration::ZERO,
                 ..FollowerConfig::default()
             },
+            LeaderConfig::default(),
         )
         .await
         {
@@ -597,14 +611,71 @@ fn gate_p6(_c: &mut Criterion) {
 ///   500 ms timer; this window is a HARNESS-SHAPE lower bound (it measures
 ///   `1 / ack_interval`, not the replication path) and is kept only for
 ///   continuity with the banked 30.08 numbers.
-/// * "P7 pipelined" — `PIPELINE_DEPTH` batches in flight (8 = exactly the
+/// * "P7 pipelined" — `P7_PIPELINE_DEPTH` batches in flight (8 = exactly the
 ///   coalescing threshold, the smallest depth that lets the production ack
 ///   path fire on batch count rather than on the timer). This is the window
 ///   the gate's wording describes.
 fn gate_p7(_c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // INVESTIGATION 2026-09-22 (TentaBus 1C `P7-pipeline-flake-open`) —
+    // the standing hypothesis was MEASURED AND FALSIFIED; do not re-apply
+    // it without new evidence.
+    //
+    // The flake: the pipelined window below intermittently produces NO
+    // measurement, failing its first publish with `acked=1, required=2`
+    // after the 30 s `DEFAULT_PUBLISH_ACK_TIMEOUT` (`bus/mod.rs`). The
+    // long-standing hypothesis (OTWARTE-POZYCJE.md) was a SPURIOUS ISR
+    // EVICTION: `publish_async` wraps the sync `publish` in
+    // `block_in_place`, and that path's quorum wait
+    // (`PartitionLeaderGlue::await_acks`, `replication/glue.rs`) spawns a
+    // fresh OS thread + runtime PER CALL, so a `P7_PIPELINE_DEPTH`-deep
+    // window plus this runtime's own tasks could, on a loaded host, delay
+    // a follower's ack past `replica_lag_max_ms` (5 s) and make
+    // `reconcile_follower` drop it from the ISR — leaving `Acks::Quorum`
+    // (min_isr = 2) permanently unsatisfiable inside the ack wait.
+    //
+    // To test that, `LeaderConfig::isr_event_hook` was added
+    // (`replication/leader.rs`) and is installed below: it fires on EVERY
+    // ISR Shrink/Expand, with the reason. A run on 2026-09-22 reproduced
+    // the flake EXACTLY (`P7 pipelined: NO MEASUREMENT — ... acked=1,
+    // required=2`) and printed **ZERO** ISR events — the ISR never shrank
+    // at all, so an ISR eviction is NOT the cause. (`register_follower`
+    // admits a follower silently, so quiet startup is expected; that the
+    // hook really does fire on both transitions is pinned by
+    // `leader.rs::tests::isr_event_hook_observes_both_shrink_and_expand`,
+    // which is what makes "no events logged" readable as "no shrink
+    // happened" rather than "the hook is broken".)
+    //
+    // So the real cause is downstream of ISR membership: both followers
+    // stayed in-sync and simply never acked the offset the first pipelined
+    // publish was waiting on. That is a feed/ack-progress question
+    // (`leader::feed`, the follower ack loop, and the 4 MiB in-memory
+    // `DuplexTransport` between them), NOT an ISR-membership one, and it
+    // remains OPEN — deliberately not "fixed" here by widening a timeout,
+    // which would only hide it.
+    //
+    // What IS kept from this pass: an explicitly sized multi-thread
+    // runtime (so the harness's own worker pool is never the variable
+    // under test — `Runtime::new()` ties worker count to visible CPUs,
+    // which on a shared host is whatever the other agents left) and the
+    // diagnostic hook itself, so the next occurrence is readable instead
+    // of mute. `replica_lag_max_ms` is deliberately left at its PRODUCTION
+    // default: the measurement above shows there is nothing here for a
+    // laxer ISR window to fix.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(P7_PIPELINE_DEPTH + 4)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     rt.block_on(async {
-        let trio = match build_replicated_trio("p7", FollowerConfig::default()).await {
+        let p7_leader_config = LeaderConfig {
+            isr_event_hook: Some(Arc::new(|event: &IsrEvent| {
+                eprintln!("[P7] ISR event: {event:?}");
+            })),
+            ..LeaderConfig::default()
+        };
+        let trio = match build_replicated_trio("p7", FollowerConfig::default(), p7_leader_config)
+            .await
+        {
             Ok(trio) => trio,
             Err(e) => {
                 gate_blocked("P7", "trio never reached a quorum-ready ISR", &e);
@@ -690,7 +761,6 @@ fn gate_p7(_c: &mut Criterion) {
         // producer tasks, one publish in flight each, disjoint seeds per
         // slot. `publish_async` is `block_in_place`-wrapped, so the
         // multi-thread runtime runs the slots concurrently.
-        const PIPELINE_DEPTH: usize = 8;
         const PIPELINE_WARMUP_BATCHES: usize = 8;
         for _ in 0..PIPELINE_WARMUP_BATCHES {
             seed += 1;
@@ -704,19 +774,19 @@ fn gate_p7(_c: &mut Criterion) {
         }
         let pipeline_deadline = Instant::now() + Duration::from_secs(MEASURE_SECS);
         let pipeline_started = Instant::now();
-        let mut slots = Vec::with_capacity(PIPELINE_DEPTH);
-        for slot in 0..PIPELINE_DEPTH {
+        let mut slots = Vec::with_capacity(P7_PIPELINE_DEPTH);
+        for slot in 0..P7_PIPELINE_DEPTH {
             let slot_svc = svc.clone();
             let slot_ctx = ctx.clone();
             slots.push(tokio::spawn(async move {
                 // Disjoint seed streams: slot s publishes seeds
-                // 1_000_000 + s + k * PIPELINE_DEPTH, never colliding with
+                // 1_000_000 + s + k * P7_PIPELINE_DEPTH, never colliding with
                 // the sequential window's seeds or with another slot's.
                 let mut slot_seed = 1_000_000u64 + slot as u64;
                 let mut slot_records = 0u64;
                 let mut slot_bytes = 0u64;
                 while Instant::now() < pipeline_deadline {
-                    slot_seed += PIPELINE_DEPTH as u64;
+                    slot_seed += P7_PIPELINE_DEPTH as u64;
                     let result = slot_svc
                         .publish_async(&slot_ctx, TOPIC, publish_batch(slot_seed))
                         .await
@@ -761,7 +831,7 @@ fn gate_p7(_c: &mut Criterion) {
 
         eprintln!(
             "P7 pipelined (RF=3, acks=quorum, class standard, {} in flight, {:.1}s window): {:.1}k msg/s, {:.1} MiB/s",
-            PIPELINE_DEPTH,
+            P7_PIPELINE_DEPTH,
             pipeline_elapsed.as_secs_f64(),
             p_msg_per_s / 1000.0,
             p_mib_per_s

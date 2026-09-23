@@ -469,24 +469,6 @@ pub struct ServiceOauthPollResponse {
     pub error: Option<String>,
 }
 
-/// Request routed to a deployed Codex or Claude Code CLI bridge.
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct ServiceAgentRequest {
-    pub service_id: i64,
-    pub node_id: Option<String>,
-    /// Stable bridge operation name, for example `auth.status` or `session.turn`.
-    pub operation: String,
-    /// Operation-specific JSON. The owner validates it before contacting the bridge.
-    pub payload_json: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct ServiceAgentResponse {
-    pub success: bool,
-    pub result_json: String,
-    pub error: Option<String>,
-}
-
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -515,8 +497,6 @@ pub enum ServicePayload {
     ResOauthStart(ServiceOauthStartResponse),
     ReqOauthPoll(ServiceOauthPollRequest),
     ResOauthPoll(ServiceOauthPollResponse),
-    ReqAgent(ServiceAgentRequest),
-    ResAgent(ServiceAgentResponse),
 }
 
 // =============================================================================
@@ -6363,6 +6343,13 @@ pub struct AddonTeardownEntry {
     pub description: String,
     pub removed: bool,
     pub size_bytes: u64,
+    /// Named counts for the dashboard's `addon_uninstall.entries.<kind>` i18n
+    /// template (W6-i18n-teardown). `#[serde(default)]` so an older peer
+    /// omitting this field still decodes — appended, not inserted, per
+    /// `MessageBody`'s append-only struct-field contract. Empty for every
+    /// `kind` that has no per-instance counts to render.
+    #[serde(default)]
+    pub count_vars: std::collections::BTreeMap<String, i64>,
 }
 
 /// Another installed instance that declares `[[uses_app]]` on the package

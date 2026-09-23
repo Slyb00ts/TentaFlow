@@ -162,15 +162,99 @@ pub fn write(root: &Path, provider: Provider, material: &[u8]) -> Result<()> {
 }
 
 /// Removes the credential of `provider` under `root`, and answers whether there
-/// was one. Used when the account's credential is revoked: the bridge owns this
-/// file, so nothing else may unlink it, and leaving it behind would keep a token
-/// the organisation has retired in front of the next session.
+/// was one.
+///
+/// The caller is `materialize`: a login home that holds a copy of an account
+/// credential which is no longer canonical has to lose it, and that names one
+/// file — the engine running now. A REVOCATION removes whole trees instead
+/// (`remove_account_credentials`), because it must not leave the file of an
+/// engine the account has moved away from.
 ///
 /// A path component that is a link is refused rather than followed, exactly as
 /// on the read and write paths — a revocation must not become a way to delete an
 /// arbitrary file a link points at.
 pub fn remove(root: &Path, provider: Provider) -> Result<bool> {
     remove_within(root, &relative(provider))
+}
+
+/// Removes EVERY credential this bridge holds for the account: both of its
+/// trees, and each of them whole.
+///
+/// `remove` above names the engine this bridge runs, and that is not enough for
+/// a revocation. The engine is a property of the account row, and the row can
+/// move under a live account while the files of the previous engine stay where
+/// they are (`sync/core_materializer.rs` writes `engine_id` from the incoming
+/// row), so a purge that named a path would leave exactly the copies it was
+/// written to remove. Core's half of this purge removes both trees whole for the
+/// same reason (`services/coding_agent.rs::purge_account_credentials`), and the
+/// two arms must empty the same thing: whichever arm runs, the file the other
+/// one would have taken is a plaintext provider credential with no store row
+/// left to name it.
+///
+/// Everything under these two roots is a credential by construction. `prepare`
+/// creates the per-engine directories before any engine uses them, the bridge
+/// writes only a provider credential into them, and a session's own home is a
+/// different root (`session_profile_root`) — so what goes with the trees is the
+/// credential of every engine, never a file a running CLI needs. The login home
+/// also holds whatever a sign-in, a probe or a discovery run left in the CLI's
+/// own home: scratch of a run that has ended, re-materialized from the canonical
+/// file by the next lease, and read back only as the credential.
+///
+/// The walk never follows a link: a symlink reports itself, so it is removed as
+/// the link it is and whatever it points at is left alone. That protects the two
+/// roots, not the path they are addressed by: `root` and `login_root` join the
+/// account id onto the data directory, so an account directory that is ITSELF a
+/// symlink is followed by the kernel, and what is removed is the two literal
+/// names inside whatever it points at. Nothing in the product creates one
+/// (`prepare` makes the account root a directory), and the blast radius is only
+/// those two names.
+///
+/// BOTH trees are attempted even when one of them fails, and every failure is
+/// reported. The two hold the same plaintext credential, so a `?` on the first
+/// made the second one's survival depend on it: a `uchg` file on macOS, an
+/// unreadable subtree or a permission the kernel refuses returned after
+/// `credentials/` and never looked at `login/`, while Core was told the purge
+/// was done. Nothing repairs that afterwards — Core drops the store row in the
+/// same operation, and every reconcile addresses accounts the store still names.
+///
+/// The error carries the path of every tree that could not be emptied, because
+/// Core's warning is the only report an operator gets: `AccountOpAck` has no
+/// field for them.
+pub fn remove_account_credentials(data_dir: &Path) -> Result<bool> {
+    let mut removed = false;
+    let mut failures = Vec::new();
+    for tree in [root(data_dir), login_root(data_dir)] {
+        match remove_tree(&tree) {
+            Ok(existed) => removed |= existed,
+            Err(error) => failures.push(format!("remove {}: {error}", tree.display())),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(removed);
+    }
+    Err(anyhow!(failures.join("; ")))
+}
+
+/// Removes one of the account's trees, with everything in it, and answers
+/// whether it was there at all.
+fn remove_tree(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        // Nothing to remove is the state a second purge finds, and that is the
+        // same outcome as the first one.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    // A symlink reports itself here, never its target.
+    if !metadata.is_dir() {
+        std::fs::remove_file(path)?;
+        return Ok(true);
+    }
+    for entry in std::fs::read_dir(path)? {
+        remove_tree(&entry?.path())?;
+    }
+    std::fs::remove_dir(path)?;
+    Ok(true)
 }
 
 /// Writes a JSON document that must not be readable by anyone but its owner,
@@ -485,8 +569,12 @@ fn verify_regular(metadata: &std::fs::Metadata) -> Result<()> {
 /// Open item: verify the `id_token` signature against the provider's published
 /// JWKS, which would turn this from a containment check into authentication.
 ///
-/// `None` means "this format gives us nothing stable to compare", and a `None`
-/// is fail-closed: the session's change is refused rather than published.
+/// `None` means "this format gives us nothing stable to compare", and it
+/// suspends the COMPARISON only — never the publication. `observe` announces
+/// such a change as `Moved` with no identity, so the material does reach Core
+/// and becomes the account's next revision; what a `None` cannot do is tell a
+/// rotation from a session filing a foreign credential, because there is no
+/// subject on either side to draw that line with.
 pub fn identity(provider: Provider, material: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(material).ok()?;
     match provider {
@@ -495,7 +583,9 @@ pub fn identity(provider: Provider, material: &[u8]) -> Option<String> {
         // in the process environment), so nothing is ever published from one.
         // Muse and Grok write an `auth.json` whose fields no vendor document we
         // have describes, so there is no stable subject to compare: their
-        // session-side changes stay in the session.
+        // rotations ARE announced (as `Moved`), but neither `Foreign` nor
+        // `Unverifiable` is reachable for them — both need an identity this
+        // function has already given up on.
         Provider::ClaudeCode | Provider::MuseCode | Provider::GrokBuild => None,
     }
 }
@@ -772,6 +862,15 @@ pub fn publish_from_login(
 /// writing a copy is exactly what keeps the account's credential out of an
 /// operation that has no session to isolate it.
 ///
+/// An account with no canonical credential leaves the login home with none
+/// either: the copy is a working copy of the account's ONE file, never a second
+/// source of truth. A copy that outlives the file it was made from is what a
+/// removed credential comes back from — the next probe reads it, the vendor CLI
+/// answers that the account is signed in, and the publication that follows puts
+/// the retired material back in front of every session on this node. A sign-in
+/// is not touched by this: it materializes BEFORE its CLI writes anything, so
+/// the removal can only reach a copy of an earlier run.
+///
 /// A session never calls this. Its engine reads the account's one file directly
 /// (`observe` above, and the exposure main.rs builds into the sandbox policy).
 pub fn materialize(
@@ -780,6 +879,7 @@ pub fn materialize(
     destination_root: &Path,
 ) -> Result<Option<String>> {
     let Some(material) = read(canonical_root, provider)? else {
+        remove(destination_root, provider)?;
         return Ok(None);
     };
     write(destination_root, provider, &material)?;
@@ -896,16 +996,36 @@ mod tests {
 
         // An account whose format names nobody is observed as a change: there is
         // nothing to hold it to, and inventing a refusal from silence would
-        // disable accounts whose engine this bridge simply cannot read.
-        let mut nameless = Watch::default();
-        write(&canonical, Provider::Codex, &opaque).unwrap();
-        assert_eq!(
-            observe(&canonical, Provider::Codex, &mut nameless).unwrap(),
-            Observation::Moved {
-                sha256: digest(&opaque),
-                identity: None,
-            }
-        );
+        // disable accounts whose engine this bridge simply cannot read. Muse and
+        // Grok are this case in the field — `identity` answers `None` for both —
+        // so a rotation their CLI makes IS announced, and `Unverifiable` (which
+        // needs an announced identity to lose) is unreachable for them.
+        for provider in [Provider::Codex, Provider::MuseCode, Provider::GrokBuild] {
+            let first = if provider == Provider::Codex {
+                opaque.clone()
+            } else {
+                br#"{"session":"one"}"#.to_vec()
+            };
+            let rotated = br#"{"session":"two"}"#.to_vec();
+            let mut nameless = Watch::default();
+            write(&canonical, provider, &first).unwrap();
+            assert_eq!(
+                observe(&canonical, provider, &mut nameless).unwrap(),
+                Observation::Moved {
+                    sha256: digest(&first),
+                    identity: None,
+                }
+            );
+            write(&canonical, provider, &rotated).unwrap();
+            assert_eq!(
+                observe(&canonical, provider, &mut nameless).unwrap(),
+                Observation::Moved {
+                    sha256: digest(&rotated),
+                    identity: None,
+                },
+                "{provider:?} rotation must be announced, not held in the session"
+            );
+        }
     }
 
     /// Everything that could be left in place of the account's credential to
@@ -1084,6 +1204,49 @@ mod tests {
             read(&canonical, Provider::Codex).unwrap().unwrap(),
             refreshed
         );
+    }
+
+    /// A copy of the account's credential sitting in the login home cannot bring
+    /// the credential back once the account's own file is gone.
+    ///
+    /// This is the sequence a removed credential returned from: a copy left by
+    /// an earlier run, a canonical file that was dropped — by an owner clearing
+    /// the key, by a revocation reaching this node, or by the purge route — and
+    /// a probe that reads the copy, is told the sign-in is healthy and publishes
+    /// it back as the account's credential. The lease the probe runs under is
+    /// what closes it: the home is emptied of anything that is not a copy of the
+    /// account's CURRENT file, so there is nothing left to read or publish.
+    #[test]
+    fn a_login_home_cannot_republish_a_credential_the_account_no_longer_has() {
+        let account = tempfile::tempdir().unwrap();
+        let canonical = root(account.path());
+        let login = login_root(account.path());
+        prepare(account.path()).unwrap();
+
+        write(&login, Provider::Codex, &codex_material("acct-1")).unwrap();
+        assert_eq!(
+            materialize(Provider::Codex, &canonical, &login).unwrap(),
+            None
+        );
+        assert_eq!(
+            read(&login, Provider::Codex).unwrap(),
+            None,
+            "a copy of a credential that is gone must not survive the lease"
+        );
+
+        // What the probe's publication is left with, and what the account keeps.
+        assert_eq!(
+            publish_from_login(
+                Provider::Codex,
+                &canonical,
+                &login,
+                None,
+                LoginOrigin::Probe,
+            )
+            .unwrap(),
+            Publication::Unchanged
+        );
+        assert_eq!(read(&canonical, Provider::Codex).unwrap(), None);
     }
 
     /// A publication carries the material, so its `Debug` must not.

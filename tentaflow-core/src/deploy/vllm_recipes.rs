@@ -81,17 +81,51 @@ pub struct RecipeEntry {
     pub base_argv: Vec<String>,
     #[serde(default)]
     pub base_env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "object_overrides")]
     pub hardware_overrides: HashMap<String, HwOverride>,
     /// Extra env when the resolved id is a model variant (e.g. an FP4 repo).
     #[serde(default, rename = "_variant_env")]
     pub variant_env: HashMap<String, String>,
 }
 
+/// Upstream puts a status string where an override object belongs now and then
+/// (`"dgx_spark_gb10": "verified"`). Such a value is not an override, and one of
+/// them must not cost the recipe — let alone the whole snapshot — its flags.
+fn object_overrides<'de, D>(deserializer: D) -> Result<HashMap<String, HwOverride>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(gpu, value)| {
+            serde_json::from_value(value)
+                .ok()
+                .map(|found| (gpu, found))
+        })
+        .collect())
+}
+
+/// Entries are decoded one by one, so a single malformed upstream recipe is
+/// dropped on its own instead of emptying the table for every model.
 #[derive(Debug, Deserialize)]
 struct Snapshot {
     #[serde(default)]
-    recipes: HashMap<String, RecipeEntry>,
+    recipes: HashMap<String, serde_json::Value>,
+}
+
+impl Snapshot {
+    fn entries(self) -> impl Iterator<Item = (String, RecipeEntry)> {
+        self.recipes.into_iter().filter_map(|(id, value)| {
+            match serde_json::from_value::<RecipeEntry>(value) {
+                Ok(entry) => Some((id, entry)),
+                Err(error) => {
+                    tracing::warn!(%id, %error, "skipping a vLLM recipe that does not decode");
+                    None
+                }
+            }
+        })
+    }
 }
 
 fn embedded() -> &'static HashMap<String, RecipeEntry> {
@@ -103,13 +137,17 @@ fn embedded() -> &'static HashMap<String, RecipeEntry> {
         if GzDecoder::new(EMBEDDED_GZ).read_to_string(&mut s).is_err() {
             return HashMap::new();
         }
-        let mut recipes = serde_json::from_str::<Snapshot>(&s)
-            .map(|x| x.recipes)
-            .unwrap_or_default();
+        let mut recipes: HashMap<String, RecipeEntry> = match serde_json::from_str::<Snapshot>(&s) {
+            Ok(snapshot) => snapshot.entries().collect(),
+            Err(error) => {
+                tracing::warn!(%error, "the embedded vLLM recipe snapshot does not decode");
+                HashMap::new()
+            }
+        };
         // Curated entries only fill gaps: a refreshed upstream snapshot that
         // gained the model keeps its own (more current) recipe.
         if let Ok(extra) = serde_json::from_str::<Snapshot>(SUPPLEMENT_JSON) {
-            for (k, v) in extra.recipes {
+            for (k, v) in extra.entries() {
                 recipes.entry(k.to_lowercase()).or_insert(v);
             }
         }
@@ -520,8 +558,34 @@ mod tests {
 
     #[test]
     fn embedded_snapshot_loads() {
-        let m = embedded();
-        assert!(!m.is_empty(), "embedded recipe snapshot should decode");
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut raw = String::new();
+        GzDecoder::new(EMBEDDED_GZ).read_to_string(&mut raw).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = snapshot["recipes"].as_object().expect("a recipes object");
+        // Every upstream recipe decodes. The supplement alone would keep the
+        // table non-empty, so "not empty" proved nothing: one malformed upstream
+        // entry used to empty it down to the handful of curated ones.
+        let table = embedded();
+        let missing: Vec<&String> = ids.keys().filter(|id| !table.contains_key(*id)).collect();
+        assert!(missing.is_empty(), "recipes that did not decode: {missing:?}");
+    }
+
+    #[test]
+    fn a_status_string_among_the_overrides_is_not_an_override() {
+        let entry: RecipeEntry = serde_json::from_value(serde_json::json!({
+            "hf_id": "x/y",
+            "base_argv": ["--foo"],
+            "hardware_overrides": {
+                "dgx_spark_gb10": "verified",
+                "h100": {"extra_args": ["--bar"]}
+            }
+        }))
+        .unwrap();
+        assert_eq!(entry.base_argv, vec!["--foo"]);
+        assert_eq!(entry.hardware_overrides.len(), 1);
+        assert_eq!(entry.hardware_overrides["h100"].extra_args, vec!["--bar"]);
     }
 
     /// A parser without auto-tool-choice is inert in vLLM, so the pair is
@@ -618,16 +682,17 @@ mod tests {
         assert_eq!(level, RecipeMatch::NormalizedSameOrg);
         assert_eq!(e.hf_id, "Qwen/Qwen3.5-27B");
 
-        // Community repack → canonical org wins. The id has to be one the
-        // snapshot does not carry itself, otherwise this asserts an exact hit:
-        // upstream publishes some repacks (e.g. `Inferact/Qwen3.8-27B-NVFP4`)
-        // as recipes of their own. The parser flag proves a REAL recipe was
-        // picked up, without pinning the test to the parser upstream currently
-        // names for this family.
+        // Community repack → canonical org wins. The repo is one no snapshot
+        // lists: upstream publishes the well-known repacks as exact variants.
+        let (e, level) = resolve_embedded("acme-labs/Qwen3.8-27B-NVFP4").expect("any org");
+        assert_eq!(level, RecipeMatch::NormalizedAnyOrg);
+        assert_eq!(e.hf_id, "Qwen/Qwen3.8-27B");
+        // Which parser is upstream's call (it wins over the supplement); that
+        // the resolved recipe carries one is what the cascade must preserve.
+        assert!(e.base_argv.iter().any(|a| a == "--tool-call-parser"));
         let (e, level) = resolve_embedded("unsloth/Qwen3.8-27B-FP8-Dynamic").expect("any org");
         assert_eq!(level, RecipeMatch::NormalizedAnyOrg);
         assert_eq!(e.hf_id, "Qwen/Qwen3.8-27B");
-        assert!(e.base_argv.iter().any(|a| a == "--tool-call-parser"));
 
         // Supplement entries are exact hits and mirror the 3.6 recipe.
         let (fp8, level) = resolve_embedded("Qwen/Qwen3.8-27B-FP8").expect("supplement");

@@ -44,6 +44,12 @@ function cutFn(name) {
   return cutBalanced(source, start, '{', '}');
 }
 
+function cutSet(name) {
+  const start = source.indexOf(`const ${name} = new Set(`);
+  if (start < 0) throw new Error(`no set: ${name}`);
+  return `${cutBalanced(source, start, '(', ')')};`;
+}
+
 function cutConst(name) {
   const start = source.indexOf(`const ${name} = `);
   if (start < 0) throw new Error(`no constant: ${name}`);
@@ -67,13 +73,13 @@ function fill(text, vars) {
 
 /// The shipped functions, bound to one locale's dictionary. A key the module
 /// asks for and the locale does not have is a failure, not an empty string.
-function ship(root) {
+function ship(root, { isAdmin = false } = {}) {
   const T = (key, vars) => {
     const text = lookup(root, key);
     assert.ok(typeof text === 'string', `missing translation: ${key}`);
     return fill(text, vars);
   };
-  return new Function('T', `
+  return new Function('T', 'APPROVALS', `
     ${cutConst('ACCOUNT_LOGIN_CAPABILITY')}
     const APPROVAL_SCOPES = ['allow_once', 'allow_for_run', 'allow_for_session', 'always'];
     const t = (key, vars) => T('code_studio.' + key, vars);
@@ -84,15 +90,22 @@ function ship(root) {
     const sprite = (id) => '<svg data-icon="' + id + '"></svg>';
     const escapeHtml = (value) => String(value ?? '');
     const escapeAttr = (value) => String(value ?? '');
+    const ctx = { isAdmin: ${isAdmin} };
+    // The anchor reads the pending approval the poll holds, as the page does.
+    const state = { get approvals() { return APPROVALS(); }, runs: [] };
+    ${cutSet('CAPABILITY_SLUGS')}
+    ${cutFn('capabilityQuestion')}
+    ${cutFn('accountAskBody')}
     ${cutFn('accountAskFromApproval')}
     ${cutFn('askOptions')}
     ${cutFn('askMarkNode')}
     ${cutFn('accountChipLabel')}
     return { accountAskFromApproval, askOptions, askMarkNode, accountChipLabel };
-  `)(T);
+  `)(T, () => [SERVER_APPROVAL]);
 }
 
 const MODULES = new Map(LOCALES.map(([lang, root]) => [lang, ship(root)]));
+const ADMIN_MODULES = new Map(LOCALES.map(([lang, root]) => [lang, ship(root, { isAdmin: true })]));
 
 // The row the server parks the run on: `suspend_for_account` writes the snapshot
 // (`approval.account`) when it asks, so nothing here is read from the agent.
@@ -104,7 +117,7 @@ const SERVER_APPROVAL = {
   account: {
     engine_id: 'codex',
     engine_name: 'Codex',
-    mode: 'global',
+    mode: 'user',
     agent_name: 'code-implementer',
     account_id: null,
     account_name: '',
@@ -125,8 +138,8 @@ test('the card names the application, the agent and the mode in the account scre
     assert.equal(ask.approvalId, 'ap-9', `${lang} approval id`);
     assert.equal(ask.runId, 'run-7', `${lang} run id`);
     assert.equal(ask.account.engineId, 'codex');
-    assert.equal(ask.account.mode, 'global');
-    const mode = lookup(root, 'agent_accounts.subtitle_global');
+    assert.equal(ask.account.mode, 'user');
+    const mode = lookup(root, 'agent_accounts.subtitle_user');
     assert.equal(ask.who, `code-implementer · Codex · ${mode}`, `${lang} card head`);
     assert.equal(
       ask.question,
@@ -152,6 +165,35 @@ test('an account that lost its credential asks for a new sign-in, not for a new 
       `${lang} relogin question`,
     );
     assert.notEqual(create.question, again.question, `${lang}: the two situations read alike`);
+  }
+});
+
+// A shared account is signed in by an administrator only (the server refuses
+// anyone else), so offering its sign-in to anybody else sends them into an
+// error they cannot act on.
+test('a shared account that lost its sign-in sends a non-administrator to one, and lets an administrator fix it', () => {
+  const shared = {
+    ...SERVER_APPROVAL,
+    account: { ...SERVER_APPROVAL.account, mode: 'global', account_id: 'acc-9', account_name: 'Codex — firma' },
+  };
+  for (const [lang, root] of LOCALES) {
+    const member = MODULES.get(lang);
+    const ask = member.accountAskFromApproval(shared);
+    assert.equal(
+      ask.question,
+      fill(lookup(root, 'code_studio.ask.account.body_global'), { engine: 'Codex', account: 'Codex — firma' }),
+      `${lang} shared-account question`,
+    );
+    assert.deepEqual(member.askOptions(ask).map((o) => o.action), ['answer-deny'], `${lang}: a sign-in only an administrator may start`);
+
+    const admin = ADMIN_MODULES.get(lang);
+    const adminAsk = admin.accountAskFromApproval(shared);
+    assert.equal(
+      adminAsk.question,
+      fill(lookup(root, 'code_studio.ask.account.body_global_admin'), { engine: 'Codex', account: 'Codex — firma' }),
+      `${lang} administrator question`,
+    );
+    assert.deepEqual(admin.askOptions(adminAsk).map((o) => o.action), ['answer-login', 'answer-deny'], `${lang} administrator options`);
   }
 });
 
@@ -204,6 +246,16 @@ test('the line in the stream says an account is missing, not that a permission i
       !permission.includes(lookup(root, 'code_studio.ask.account.anchor')),
       `${lang}: a permission reads as an account question`,
     );
+
+    // What the line says is in the reader's language: the server's English
+    // summary and the capability's slug never reach it.
+    const sentence = fill(lookup(root, 'code_studio.ask.permission'), {
+      what: lookup(root, 'code_studio.capability.git_push'),
+    });
+    assert.ok(permission.includes(sentence), `${lang}: the permission line is not localized`);
+    assert.ok(!permission.includes('git push') && !permission.includes('git_push'), `${lang}: raw server text`);
+    assert.ok(!account.includes('busy'), `${lang}: the server's summary reached the account line`);
+    assert.ok(account.includes('code-implementer'), `${lang}: the account line names the agent`);
   }
 });
 
@@ -320,6 +372,7 @@ function ingestWorld(locale, runs) {
     ${cutFn('accountChipLabel')}
     ${cutFn('normalizeEvent')}
     ${cutFn('classifyRun')}
+    ${cutFn('runName')}
     ${cutFn('runStartedNode')}
     function buildEventNode(ev, scope) {
       return ev.kind === 'run_started' ? runStartedNode(ev, scope) : scope + ':' + ev.kind;
@@ -342,9 +395,14 @@ function evt(seq, kind, runId, payload, agentId = '') {
   };
 }
 
+// The event carries the agent's uuid, as the server sends it; the NAME comes
+// from the run row, which the server resolves.
+const AGENT_UUID = '00000000-0000-4000-8000-000000000031';
 const SPAWNED_RUN = {
   run_id: 'run-sub',
   kind: 'subagent',
+  agent_id: AGENT_UUID,
+  agent_name: 'code-planner',
   account: { engine_name: 'Codex', account_name: 'Codex — firma', mode: 'global' },
 };
 
@@ -353,7 +411,7 @@ test('a sub-agent spawn is announced once in the console and its later events ar
   for (const kind of ['subagent', 'cli']) {
     const w = ingestWorld(root, [{ ...SPAWNED_RUN, kind }]);
     w.ingestEvents([
-      evt(1, 'run_started', 'run-sub', { kind, trigger: 'user' }, 'code-planner'),
+      evt(1, 'run_started', 'run-sub', { kind, trigger: 'user' }, AGENT_UUID),
       evt(2, 'agent_message', 'run-sub', { role: 'assistant', text: 'planning' }),
       evt(3, 'run_finished', 'run-sub', { status: 'done' }),
     ]);
@@ -361,6 +419,7 @@ test('a sub-agent spawn is announced once in the console and its later events ar
     assert.equal(rows.length, 1, `${kind}: the console got more than the one announcement`);
     assert.ok(rows[0].node.includes('ev-spawn'), `${kind}: the console row is not the spawn line`);
     assert.ok(rows[0].node.includes('code-planner'), `${kind}: the spawn line does not name the agent`);
+    assert.ok(!rows[0].node.includes(AGENT_UUID), `${kind}: the spawn line prints the agent's uuid`);
     assert.ok(rows[0].node.includes('tf-chip'), `${kind}: the account chip is missing`);
     assert.ok(rows[0].node.includes('Codex — firma'), `${kind}: the chip does not name the account`);
   }
@@ -372,7 +431,7 @@ test('a run the page already knows about still announces itself when the timelin
   // `bootstrap()` loads the runs BEFORE the timeline, so on a reload the set
   // already holds the run by the time its `run_started` is replayed.
   w.state.subagentRuns.add('run-sub');
-  w.ingestEvents([evt(1, 'run_started', 'run-sub', { kind: 'subagent', trigger: 'user' }, 'code-planner')]);
+  w.ingestEvents([evt(1, 'run_started', 'run-sub', { kind: 'subagent', trigger: 'user' }, AGENT_UUID)]);
   const rows = w.appends.filter((a) => a.stream === 'console');
   assert.equal(rows.length, 1, 'a known run lost its announcement');
   assert.ok(rows[0].node.includes('ev-spawn'), 'the replayed row is not the spawn line');
@@ -382,7 +441,7 @@ test('a run the page already knows about still announces itself when the timelin
 test('the announcement is not doubled when its pane is open or the poll repeats the event', () => {
   const [, root] = LOCALES.find(([lang]) => lang === 'en');
   const w = ingestWorld(root, [SPAWNED_RUN]);
-  const spawn = evt(1, 'run_started', 'run-sub', { kind: 'subagent', trigger: 'user' }, 'code-planner');
+  const spawn = evt(1, 'run_started', 'run-sub', { kind: 'subagent', trigger: 'user' }, AGENT_UUID);
   w.state.openRunId = 'run-sub';
   w.ingestEvents([spawn]);
   w.ingestEvents([spawn]);
@@ -407,7 +466,7 @@ test('the line announces itself before the run row is polled in, and then carrie
   // `loadRuns` may not have reported the run yet when its `run_started` arrives;
   // the account is a fact about the run row, so the line waits for it.
   const w = ingestWorld(root, []);
-  w.ingestEvents([evt(1, 'run_started', 'run-sub', { kind: 'subagent', trigger: 'user' }, 'code-planner')]);
+  w.ingestEvents([evt(1, 'run_started', 'run-sub', { kind: 'subagent', trigger: 'user' }, AGENT_UUID)]);
   const rows = w.appends.filter((a) => a.stream === 'console');
   assert.equal(rows.length, 1, 'the announcement was swallowed without a run row');
   assert.ok(rows[0].node.includes('ev-spawn'), 'the row is not the spawn line');

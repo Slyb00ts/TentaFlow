@@ -66,12 +66,13 @@ pub struct MeshPeerInfo {
     pub swap_used_mb: u64,
     /// Whether a container runtime answers on this node. A peer row holds what
     /// that peer ADVERTISED in its `NodeInfo`, copied as received; the local row
-    /// keeps the CLI-driven `docker info` signal (`seed_local` /
-    /// `update_local_extras`) it has always carried, which is display data
-    /// nothing gates on — this node's own answer reaches its picker from the
-    /// live predicate, exactly as the process-sandbox fields do. `None` means
-    /// "nothing reported" — a peer built before the field, or one that has not
-    /// probed — and nothing reported is never read as support.
+    /// reports NOTHING about containers, exactly as it does for the
+    /// process-sandbox fields — this node's own answer reaches its picker from
+    /// the live predicate (`container_runtime_available`), which is also what the
+    /// wire carries, so a `docker info` signal written here could only ever make
+    /// the same node read as two different answers. `None` means "nothing
+    /// reported" — a peer built before the field, or one that has not probed —
+    /// and nothing reported is never read as support.
     #[serde(default)]
     pub docker_available: Option<bool>,
     /// Wersja Docker serwera (np. "27.5.1")
@@ -1105,7 +1106,6 @@ impl MeshPeerStore {
         ram_total_mb: u64,
         gpu_info: Vec<PeerGpuInfo>,
         addresses: Vec<IpAddr>,
-        docker_available: bool,
         docker_version: String,
     ) {
         let (
@@ -1127,7 +1127,8 @@ impl MeshPeerStore {
             entry.ram_total_mb = ram_total_mb;
             entry.gpu_info = gpu_info;
             entry.addresses = addresses;
-            entry.docker_available = Some(docker_available);
+            // The local row says nothing about containers — see the field's own doc.
+            entry.docker_available = None;
             entry.docker_version = docker_version;
             if entry.role.is_empty() {
                 entry.role = "router".to_string();
@@ -1213,13 +1214,12 @@ impl MeshPeerStore {
         self.shadow_consistency_check(node_id, "update_models");
     }
 
-    /// Aktualizuje wolno-zmienne dane lokalnego noda (adresy IP, Docker, OS info).
-    /// Wywolywane co 60s przez background task w pipeline.
+    /// Aktualizuje wolno-zmienne dane lokalnego noda (adresy IP, wersja Docker,
+    /// OS info). Wywolywane co 60s przez background task w pipeline.
     pub fn update_local_extras(
         &self,
         node_id: &str,
         addresses: Vec<IpAddr>,
-        docker_available: bool,
         docker_version: String,
         os_info: String,
     ) {
@@ -1229,7 +1229,8 @@ impl MeshPeerStore {
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
             entry.addresses = addresses;
-            entry.docker_available = Some(docker_available);
+            // The local row says nothing about containers — see the field's own doc.
+            entry.docker_available = None;
             entry.docker_version = docker_version;
             if !os_info.is_empty() {
                 entry.os_info = os_info;
@@ -1587,7 +1588,10 @@ mod tests {
     /// it across the wire.
     fn node_info_with_isolation(
         node_id: &str,
-        sandbox: (Option<bool>, Option<tentaflow_protocol::code_studio::ProcessSandboxCause>),
+        sandbox: (
+            Option<bool>,
+            Option<tentaflow_protocol::code_studio::ProcessSandboxCause>,
+        ),
         docker_available: Option<bool>,
     ) -> NodeInfo {
         NodeInfo {
@@ -1627,7 +1631,10 @@ mod tests {
 
             store.update_node_info(&node, &decoded);
             assert_eq!(
-                store.get(&node).expect("the peer row").supports_process_sandbox,
+                store
+                    .get(&node)
+                    .expect("the peer row")
+                    .supports_process_sandbox,
                 expected,
                 "the row the picker reads must carry what the peer advertised",
             );
@@ -1645,7 +1652,10 @@ mod tests {
             assert_eq!(decoded.process_sandbox_cause, Some(cause));
             store.update_node_info(&node, &decoded);
             assert_eq!(
-                store.get(&node).expect("the peer row").process_sandbox_cause,
+                store
+                    .get(&node)
+                    .expect("the peer row")
+                    .process_sandbox_cause,
                 Some(cause)
             );
         }
@@ -1711,6 +1721,36 @@ mod tests {
         assert_eq!(row.supports_process_sandbox, None);
         assert_eq!(row.process_sandbox_cause, None);
         assert_eq!(row.docker_available, None);
+    }
+
+    /// A peer row carries what that peer advertised, but the LOCAL row carries
+    /// nothing about containers — the picker asks the live predicate instead, so
+    /// a CLI-derived answer sitting here could only read as a second, disagreeing
+    /// one. Both writers have to leave it alone.
+    #[test]
+    fn the_local_row_reports_nothing_about_containers() {
+        let node = hex::encode([9; 32]);
+        let store = MeshPeerStore::new();
+
+        store.seed_local(
+            &node,
+            "helios".to_string(),
+            "Debian".to_string(),
+            "linux".to_string(),
+            8,
+            16_384,
+            Vec::new(),
+            Vec::new(),
+            "27.5.1".to_string(),
+        );
+        let row = store.get(&node).expect("the local row");
+        assert_eq!(row.docker_available, None);
+        assert_eq!(row.docker_version, "27.5.1");
+
+        store.update_local_extras(&node, Vec::new(), "28.0.0".to_string(), String::new());
+        let row = store.get(&node).expect("the local row");
+        assert_eq!(row.docker_available, None);
+        assert_eq!(row.docker_version, "28.0.0");
     }
 
     /// Heartbeat trigger for an Offline/Disconnected peer in the shadow

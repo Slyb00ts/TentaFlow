@@ -58,6 +58,11 @@ const MARKER_LINKS = INDEX_HTML.match(/<link[^>]*data-shadow-scope[^>]*>/g) || [
 document.head.innerHTML += MARKER_LINKS.join('\n');
 
 await import('./tf-table.js');
+// tf-chip renders into its OWN light DOM (`this.innerHTML = ''; this.appendChild(span)`
+// in tf-chip.js), which is exactly the shape of markup that breaks a naive
+// `td.innerHTML !== next` comparison — needed registered here so an html-cell
+// value containing a bare `<tf-chip>` tag actually upgrades.
+await import('./tf-chip.js');
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -486,4 +491,496 @@ test('rows arriving drop the empty row instead of being written into it', () => 
 
   table.rows = [];
   assert.equal(emptyCell(table).textContent, 'Brak dysków', 'and the sentence comes back when the rows go');
+});
+
+// ---- write-skipping: compare against the SOURCE string, not td.innerHTML ---
+//
+// `_writeCell`'s html branch used to gate the write on `td.innerHTML !== next`.
+// Once the browser has parsed a cell, `td.innerHTML` is a RE-SERIALIZATION, not
+// the string this component wrote: a custom element such as <tf-chip> renders
+// into its own light DOM and replaces the markup it was given, and a
+// self-closing `<use/>` comes back as `<use></use>`. The comparison was
+// therefore true on almost every poll even when nothing changed, and every
+// html cell of every table in the product was rewritten on every refresh
+// (critic 2026-09-21: mockups n01-n10 M11, n11-n19 MAJOR 9) — tearing down live
+// subtrees the owner's hard rule says must only be patched when data changes.
+// The tests below pin the fix: compare against `td.__tfHtml`, the source
+// string this component itself last wrote into that cell.
+
+function mountHtmlTable(rows) {
+  document.body.innerHTML = '';
+  const table = document.createElement('tf-table');
+  table.innerHTML = '<tf-column key="cell" label="Komorka" renderer="html"></tf-column>'
+    + '<tf-column key="name" label="Nazwa"></tf-column>';
+  document.body.appendChild(table);
+  table.rows = rows;
+  return table;
+}
+
+function htmlCell(t, rowIdx = 0) {
+  return t.shadowRoot.querySelectorAll('tbody tr')[rowIdx].children[0];
+}
+
+const CHIP_HTML = '<tf-chip status="ok" dot>Zdrowy</tf-chip>';
+const CHIP_HTML_2 = '<svg viewBox="0 0 10 10"><use href="#i-x"/></svg>';
+
+test('an unchanged tf-chip html cell is not rewritten across two assignments of .rows', () => {
+  const table = mountHtmlTable([{ cell: CHIP_HTML, name: 'a' }]);
+  const td = htmlCell(table);
+  const chip = td.firstElementChild;
+  assert.equal(chip.tagName.toLowerCase(), 'tf-chip', 'the chip upgraded in the cell');
+
+  // A poll hands in a BRAND NEW row object (never `===` the previous one) with
+  // the exact same source string. Naively comparing `td.innerHTML` (which now
+  // reads back as the chip's own light-DOM span, not "<tf-chip ...>") would see
+  // this as "changed" and rebuild — destroying the very node under test.
+  table.rows = [{ cell: CHIP_HTML, name: 'a' }];
+
+  // Compared as a boolean, not `assert.equal(nodeA, nodeB)` directly: on
+  // failure `assert.equal` inspects both operands to build its diff, and
+  // inspecting a live (happy-dom) element graph for a failure message is
+  // dramatically slower than the DOM operation under test — turning a fast,
+  // correct "test fails" into an apparent hang. Comparing the boolean
+  // keeps the failure message cheap regardless of what the nodes look like.
+  assert.equal(htmlCell(table).firstElementChild === chip, true, 'the same <tf-chip> node survives an unchanged poll');
+});
+
+test('an unchanged svg/<use/> html cell is not rewritten across two assignments of .rows', () => {
+  const table = mountHtmlTable([{ cell: CHIP_HTML_2, name: 'a' }]);
+  const td = htmlCell(table);
+  const useEl = td.querySelector('use');
+  assert.ok(useEl, 'the <use> element is in the cell');
+
+  // `<use/>` (self-closing) always serializes back as `<use></use>` — a
+  // mismatch against the source string on every single poll if the guard
+  // compares `td.innerHTML` instead of the cached source.
+  assert.notEqual(td.innerHTML, CHIP_HTML_2, 'sanity: the browser DOES re-serialize the markup differently');
+
+  table.rows = [{ cell: CHIP_HTML_2, name: 'a' }];
+
+  // See the comment on the tf-chip test above for why this compares a boolean
+  // rather than the two live nodes directly.
+  assert.equal(td.querySelector('use') === useEl, true, 'the same <use> node survives an unchanged poll');
+});
+
+test('a changed html cell value IS written', () => {
+  const table = mountHtmlTable([{ cell: CHIP_HTML, name: 'a' }]);
+  const td = htmlCell(table);
+  const chip = td.firstElementChild;
+
+  const CHANGED = '<tf-chip status="warn" dot>Ostrzezenie</tf-chip>';
+  table.rows = [{ cell: CHANGED, name: 'a' }];
+
+  const newChip = htmlCell(table).firstElementChild;
+  // Boolean comparison again (see above) — `assert.notEqual` on two live
+  // nodes pays the same inspection cost when it fails.
+  assert.equal(newChip === chip, false, 'the cell was rebuilt for the new value');
+  assert.equal(newChip.getAttribute('status'), 'warn');
+  assert.equal(newChip.textContent, 'Ostrzezenie');
+});
+
+test('row recycling: reordering, removing and adding rows leaves every visible cell showing the right data', () => {
+  const table = mountHtmlTable([
+    { cell: '<tf-chip status="ok" dot>A</tf-chip>', name: 'row-a' },
+    { cell: '<tf-chip status="ok" dot>B</tf-chip>', name: 'row-b' },
+    { cell: '<tf-chip status="ok" dot>C</tf-chip>', name: 'row-c' },
+  ]);
+  const rowsText = () => [...table.shadowRoot.querySelectorAll('tbody tr')]
+    .map((tr) => [...tr.children].map((td) => td.textContent).join('|'));
+  assert.deepEqual(rowsText(), ['A|row-a', 'B|row-b', 'C|row-c']);
+
+  // Reorder + remove b + add a new row d. tf-table recycles <tr>/<td> by
+  // INDEX, so this exercises the exact scenario the fix has to get right: a
+  // recycled cell now shows a DIFFERENT logical row, and a stale cache must
+  // never make it skip that write.
+  table.rows = [
+    { cell: '<tf-chip status="ok" dot>C</tf-chip>', name: 'row-c' },
+    { cell: '<tf-chip status="ok" dot>A</tf-chip>', name: 'row-a' },
+    { cell: '<tf-chip status="ok" dot>D</tf-chip>', name: 'row-d' },
+    { cell: '<tf-chip status="ok" dot>E</tf-chip>', name: 'row-e' },
+  ];
+  assert.deepEqual(rowsText(), ['C|row-c', 'A|row-a', 'D|row-d', 'E|row-e']);
+
+  // Shrink back down — the removed trailing <tr>s must not leave stale content
+  // behind if rows grow again afterwards.
+  table.rows = [
+    { cell: '<tf-chip status="ok" dot>F</tf-chip>', name: 'row-f' },
+  ];
+  assert.deepEqual(rowsText(), ['F|row-f']);
+
+  table.rows = [
+    { cell: '<tf-chip status="ok" dot>F</tf-chip>', name: 'row-f' },
+    { cell: '<tf-chip status="ok" dot>G</tf-chip>', name: 'row-g' },
+  ];
+  assert.deepEqual(rowsText(), ['F|row-f', 'G|row-g']);
+});
+
+test('a cell another renderer wrote in between is rewritten when its old renderer returns with the old value', () => {
+  // Cells are recycled by index and a column change rebuilds only the head,
+  // so one <td> can be written by html, then chip, then html again with the
+  // very string it held before. A cache left over from the first html write
+  // would call that "unchanged" and leave the chip on screen.
+  const value = '<span class="probe">A</span>';
+  const table = mountHtmlTable([{ cell: value, name: 'r' }]);
+  const column = table.querySelector('tf-column[key="cell"]');
+  assert.ok(htmlCell(table).querySelector('.probe'));
+
+  column.setAttribute('renderer', 'chip');
+  table.rows = [{ cell: { status: 'ok', label: 'B' }, name: 'r' }];
+  assert.equal(htmlCell(table).querySelector('.probe'), null, 'the chip replaced the html');
+
+  column.setAttribute('renderer', 'html');
+  table.rows = [{ cell: value, name: 'r' }];
+  assert.ok(htmlCell(table).querySelector('.probe'), 'the html is written again, not skipped on a stale cache');
+});
+
+// ---- multi-select cell 0: the value write must never delete the checkbox --
+//
+// A `selectable="multi"` row's first cell holds the row <tf-checkbox> PLUS the
+// value, built via `_writeCell`'s `keepExisting` path (value goes into a
+// holder <span>, checkbox untouched). `_updateRowCells` used to call
+// `_writeCell` on the very same td with no `keepExisting`, so a recycled poll
+// wrote `td.textContent =` / `td.innerHTML =` straight onto the td — deleting
+// the checkbox (critic 2026-09-21 B1: text was a new regression from the
+// source-cache change, html was already broken before it). The fix routes the
+// update through the same `keepExisting` path the build uses, reusing the
+// holder span instead of recreating it, so the checkbox node is never even
+// visited.
+
+function mountMultiSelectTable(renderer, rows) {
+  document.body.innerHTML = '';
+  const table = document.createElement('tf-table');
+  table.setAttribute('selectable', 'multi');
+  table.innerHTML = `<tf-column key="name" label="Nazwa" renderer="${renderer}"></tf-column>`
+    + '<tf-column key="size" label="Rozmiar"></tf-column>';
+  document.body.appendChild(table);
+  table.rows = rows;
+  return table;
+}
+
+function rowCheckbox(t, rowIdx = 0) {
+  const td = t.shadowRoot.querySelectorAll('tbody tr')[rowIdx].children[0];
+  return td.querySelector('tf-checkbox');
+}
+
+function rowFirstCell(t, rowIdx = 0) {
+  return t.shadowRoot.querySelectorAll('tbody tr')[rowIdx].children[0];
+}
+
+test('multi-select TEXT first column: the row checkbox is the same node across an unchanged poll and its checked state survives', () => {
+  const table = mountMultiSelectTable('text', [{ name: 'sdc', size: '7.3 TiB' }]);
+  const cb = rowCheckbox(table);
+  assert.ok(cb, 'the row checkbox was built into cell 0');
+  cb.setAttribute('checked', '');
+
+  // A poll hands in a brand-new row object with the same values.
+  table.rows = [{ name: 'sdc', size: '7.3 TiB' }];
+
+  const cbAfter = rowCheckbox(table);
+  // Compared as a boolean, never `assert.equal(nodeA, nodeB)` directly — a
+  // failing node-identity assert inspects the whole (happy-dom) element graph
+  // to build its diff, which reads as a hang rather than a fast failure.
+  const sameNode = cbAfter === cb;
+  assert.equal(sameNode, true, 'the same <tf-checkbox> node survives an unchanged poll');
+  const stillChecked = cbAfter.hasAttribute('checked');
+  assert.equal(stillChecked, true, 'the checked state survives the poll');
+  assert.match(rowFirstCell(table).textContent, /sdc/, 'the value is still rendered');
+});
+
+test('multi-select HTML first column: the row checkbox is the same node across an unchanged poll and its checked state survives', () => {
+  const html = '<span class="mono">sdc</span>';
+  const table = mountMultiSelectTable('html', [{ name: html, size: '7.3 TiB' }]);
+  const cb = rowCheckbox(table);
+  assert.ok(cb, 'the row checkbox was built into cell 0');
+  cb.setAttribute('checked', '');
+
+  table.rows = [{ name: html, size: '7.3 TiB' }];
+
+  const cbAfter = rowCheckbox(table);
+  const sameNode = cbAfter === cb;
+  assert.equal(sameNode, true, 'the same <tf-checkbox> node survives an unchanged poll');
+  const stillChecked = cbAfter.hasAttribute('checked');
+  assert.equal(stillChecked, true, 'the checked state survives the poll');
+  assert.ok(rowFirstCell(table).querySelector('.mono'), 'the html value is still rendered');
+});
+
+test('multi-select first column: a changed value IS written and the checkbox still survives', () => {
+  const table = mountMultiSelectTable('text', [{ name: 'sdc', size: '7.3 TiB' }]);
+  const cb = rowCheckbox(table);
+
+  table.rows = [{ name: 'sdd', size: '7.3 TiB' }];
+
+  const text = rowFirstCell(table).textContent;
+  assert.match(text, /sdd/, 'the new value was written');
+  assert.equal(text.includes('sdc'), false, 'the old value is gone');
+  const sameNode = rowCheckbox(table) === cb;
+  assert.equal(sameNode, true, 'the checkbox still survives a value change');
+});
+
+test('a multi-select first cell that was written plainly in between gets a live value holder back', () => {
+  // Leaving multi-select writes cell 0 plainly and detaches the cached value
+  // holder; coming back must not write the value into that detached span.
+  document.body.innerHTML = '';
+  const table = document.createElement('tf-table');
+  table.setAttribute('selectable', 'multi');
+  table.innerHTML = '<tf-column key="name" label="Nazwa"></tf-column>';
+  document.body.appendChild(table);
+  table.rows = [{ name: 'sda' }];
+  table.removeAttribute('selectable');
+  table.rows = [{ name: 'sdb' }];
+  table.setAttribute('selectable', 'multi');
+  table.rows = [{ name: 'sdc' }];
+  const cell = table.shadowRoot.querySelector('tbody tr').children[0];
+  assert.equal(cell.textContent, 'sdc', 'the value is on screen exactly once, not in a detached holder beside stale text');
+});
+
+// ---- multi-select cell 0: the checkbox STATE must follow the row ----------
+//
+// The checkbox node surviving a poll (above) is not enough: `_updateRowCells`
+// used to leave `checked` and the `<tr>.selected` class exactly as they were
+// on the DOM slot, never re-deriving them from `row._selected` on the recycle
+// path (critic 2026-09-22, B1/BLOCKER 1, probes P1-P4). `_buildRow` was the
+// only place reading `row._selected`, so:
+//   - select-all (P1) updated the data and the count but no box looked checked;
+//   - a bulk action clearing the selection (P2) left every box ticked;
+//   - a filter/sort (P3) left the tick on whatever row now sits in that slot,
+//     not on the row the host still considers selected — the TentaNas bulk
+//     SMART run (tentanas.js ~1755/~1833) then tests the wrong disk;
+//   - turning `selectable="multi"` on for rows that already exist (P4) never
+//     added the checkboxes at all.
+// `row._selected` is the single source of truth (the same field `_buildRow`,
+// select-all and the host's diskSelection all key off), applied only when the
+// row carries the field as ITS OWN key (`tentanas.js` sets it on every row,
+// true or false) so a row shape that never uses selection is left alone.
+
+test('P1 select-all: reassigning rows with _selected: true checks every visible box', () => {
+  const table = mountMultiSelectTable('text', [
+    { name: 'sda', size: '1 TiB', _selected: false },
+    { name: 'sdb', size: '2 TiB', _selected: false },
+  ]);
+  assert.equal(rowCheckbox(table, 0).hasAttribute('checked'), false, 'sanity: starts unchecked');
+  assert.equal(rowCheckbox(table, 1).hasAttribute('checked'), false, 'sanity: starts unchecked');
+
+  // Select-all reassigns .rows with _selected: true on every row, exactly as
+  // the host does after emitting "select-all" (tentanas.js ~1755-1761).
+  table.rows = [
+    { name: 'sda', size: '1 TiB', _selected: true },
+    { name: 'sdb', size: '2 TiB', _selected: true },
+  ];
+
+  assert.equal(rowCheckbox(table, 0).hasAttribute('checked'), true, 'row 0 box is checked');
+  assert.equal(rowCheckbox(table, 1).hasAttribute('checked'), true, 'row 1 box is checked');
+  assert.equal(
+    table.shadowRoot.querySelectorAll('tbody tr.selected').length,
+    2,
+    'both rows carry the selected class',
+  );
+});
+
+test('P2 clearing the selection unchecks every box', () => {
+  const table = mountMultiSelectTable('text', [
+    { name: 'sda', size: '1 TiB', _selected: true },
+    { name: 'sdb', size: '2 TiB', _selected: true },
+  ]);
+  assert.equal(rowCheckbox(table, 0).hasAttribute('checked'), true, 'sanity: starts checked');
+  assert.equal(rowCheckbox(table, 1).hasAttribute('checked'), true, 'sanity: starts checked');
+  assert.equal(table.shadowRoot.querySelectorAll('tbody tr.selected').length, 2, 'sanity: both selected');
+
+  // A bulk action clears diskSelection then reassigns .rows with
+  // _selected: false on every row (tentanas.js ~1833-1834).
+  table.rows = [
+    { name: 'sda', size: '1 TiB', _selected: false },
+    { name: 'sdb', size: '2 TiB', _selected: false },
+  ];
+
+  assert.equal(rowCheckbox(table, 0).hasAttribute('checked'), false, 'row 0 box is unchecked');
+  assert.equal(rowCheckbox(table, 1).hasAttribute('checked'), false, 'row 1 box is unchecked');
+  assert.equal(
+    table.shadowRoot.querySelectorAll('tbody tr.selected').length,
+    0,
+    'no row carries the selected class',
+  );
+});
+
+test('P3 a filter/reorder keeps the tick on the selected DATA row, not the DOM slot', () => {
+  const table = mountMultiSelectTable('text', [
+    { name: 'sda', size: '1 TiB', _selected: true },
+    { name: 'sdb', size: '2 TiB', _selected: false },
+  ]);
+  assert.equal(rowCheckbox(table, 0).hasAttribute('checked'), true, 'sanity: sda starts checked in slot 0');
+  assert.equal(rowCheckbox(table, 1).hasAttribute('checked'), false, 'sanity: sdb starts unchecked in slot 1');
+
+  // Filter/sort puts sdb in slot 0 and sda in slot 1 — rows are recycled by
+  // INDEX, so slot 0's <tr>/<td> now belong to a different logical disk.
+  // Selection (kept by the host, keyed on disk identity) still marks sda.
+  table.rows = [
+    { name: 'sdb', size: '2 TiB', _selected: false },
+    { name: 'sda', size: '1 TiB', _selected: true },
+  ];
+
+  assert.equal(rowCheckbox(table, 0).hasAttribute('checked'), false, 'slot 0 (now sdb) is unchecked');
+  assert.equal(rowCheckbox(table, 1).hasAttribute('checked'), true, 'slot 1 (now sda) is checked');
+  assert.match(rowFirstCell(table, 1).textContent, /sda/, 'the checked box really is on the sda row');
+  assert.equal(
+    table.shadowRoot.querySelectorAll('tbody tr.selected').length,
+    1,
+    'exactly one row carries the selected class',
+  );
+});
+
+test('P4 turning selectable="multi" on after rows exist adds a checkbox to every row', () => {
+  document.body.innerHTML = '';
+  const table = document.createElement('tf-table');
+  table.innerHTML = '<tf-column key="name" label="Nazwa"></tf-column>'
+    + '<tf-column key="size" label="Rozmiar"></tf-column>';
+  document.body.appendChild(table);
+  table.rows = [
+    { name: 'sda', size: '1 TiB' },
+    { name: 'sdb', size: '2 TiB' },
+  ];
+  assert.equal(rowCheckbox(table, 0), null, 'sanity: no checkbox before selectable is set');
+  assert.equal(rowCheckbox(table, 1), null, 'sanity: no checkbox before selectable is set');
+
+  table.setAttribute('selectable', 'multi');
+
+  assert.ok(rowCheckbox(table, 0), 'row 0 got a checkbox');
+  assert.ok(rowCheckbox(table, 1), 'row 1 got a checkbox');
+  assert.match(rowFirstCell(table, 0).textContent, /sda/, 'the value is still there beside the new box');
+  assert.match(rowFirstCell(table, 1).textContent, /sdb/, 'the value is still there beside the new box');
+});
+
+test('the row checkbox node survives an unchanged poll even with a matching _selected field', () => {
+  // The node-identity guarantee already pinned above must keep holding once
+  // the checkbox's checked state is actively re-derived every render, not
+  // just when the row happens to carry no _selected field at all.
+  const table = mountMultiSelectTable('text', [{ name: 'sdc', size: '7.3 TiB', _selected: true }]);
+  const cb = rowCheckbox(table);
+  assert.equal(cb.hasAttribute('checked'), true, 'sanity: starts checked');
+
+  // A poll hands in a brand-new row object with the same _selected value.
+  table.rows = [{ name: 'sdc', size: '7.3 TiB', _selected: true }];
+
+  const cbAfter = rowCheckbox(table);
+  // Boolean comparison, never `assert.equal(nodeA, nodeB)` (see the comment
+  // on the earlier same-node tests for why).
+  assert.equal(cbAfter === cb, true, 'the same <tf-checkbox> node survives an unchanged poll');
+  assert.equal(cbAfter.hasAttribute('checked'), true, 'still checked');
+});
+
+// ---- header select-all: synced FROM the rows on every render (MINOR D) ----
+//
+// The header select-all box was built once in `_renderThead` and never
+// touched again after that, so it kept whatever `checked` a click had last
+// left it at. Probe S3 (critic 2026-09-22): after the host cleared the
+// selection (a bulk action, a filter change) the header box stayed ticked
+// while every row underneath it was unticked. The fix re-derives the box's
+// state from the rows on screen on every render: all selected -> checked,
+// none -> unchecked, a mix -> indeterminate.
+
+test('MINOR D: header select-all checks when every row is selected and unchecks once the host clears the selection', () => {
+  const table = mountMultiSelectTable('text', [
+    { name: 'sda', size: '1 TiB', _selected: false },
+    { name: 'sdb', size: '2 TiB', _selected: false },
+  ]);
+  const headerBox = table.shadowRoot.querySelector('.tf-table__select-all');
+  assert.ok(headerBox, 'header select-all box exists');
+  assert.equal(headerBox.hasAttribute('checked'), false, 'sanity: starts unchecked');
+
+  table.rows = [
+    { name: 'sda', size: '1 TiB', _selected: true },
+    { name: 'sdb', size: '2 TiB', _selected: true },
+  ];
+  assert.equal(headerBox.hasAttribute('checked'), true, 'every row selected -> header checked');
+  assert.equal(headerBox.hasAttribute('indeterminate'), false);
+
+  table.rows = [
+    { name: 'sda', size: '1 TiB', _selected: true },
+    { name: 'sdb', size: '2 TiB', _selected: false },
+  ];
+  assert.equal(headerBox.hasAttribute('checked'), false, 'a mixed selection is not shown fully checked');
+  assert.equal(headerBox.hasAttribute('indeterminate'), true, 'a mixed selection shows indeterminate');
+
+  // Host clears the selection entirely (a bulk action, a filter change) and
+  // reassigns rows, exactly as tentanas.js / project-studio.js do.
+  table.rows = [
+    { name: 'sda', size: '1 TiB', _selected: false },
+    { name: 'sdb', size: '2 TiB', _selected: false },
+  ];
+  assert.equal(headerBox.hasAttribute('checked'), false, 'header unchecks after the host clears the selection');
+  assert.equal(headerBox.hasAttribute('indeterminate'), false);
+});
+
+test('MINOR D: clicking select-all then having the host clear the selection unchecks the header box', () => {
+  const table = mountMultiSelectTable('text', [
+    { name: 'sda', size: '1 TiB', _selected: false },
+    { name: 'sdb', size: '2 TiB', _selected: false },
+  ]);
+  const headerBox = table.shadowRoot.querySelector('.tf-table__select-all');
+  // Simulate what a real <tf-checkbox> does on click: it self-toggles its own
+  // `checked` attribute/property BEFORE emitting "change" (tf-checkbox.js is
+  // not registered in this harness, so the reflection is done by hand here).
+  headerBox.setAttribute('checked', '');
+  headerBox.checked = true;
+  headerBox.dispatchEvent(new window.Event('change', { bubbles: true, composed: true }));
+  assert.ok(headerBox.hasAttribute('checked'), 'sanity: the header shows ticked after select-all');
+
+  // Host reacts to "select-all" by clearing selection right back (e.g. a
+  // guard rejected the bulk action) and reassigns rows with _selected: false.
+  table.rows = [
+    { name: 'sda', size: '1 TiB', _selected: false },
+    { name: 'sdb', size: '2 TiB', _selected: false },
+  ];
+  assert.equal(headerBox.hasAttribute('checked'), false, 'header unchecks once the host clears the selection');
+});
+
+// ---- turning `selectable` off removes the row checkbox for good (MINOR E) -
+//
+// `td.__tfText`/`__tfHtml` describe what a PLAIN write last put directly on
+// the td. Multi-select's `keepExisting` path moves the value into a holder
+// <span> instead but never invalidated the td's own cache, so it kept the
+// value the td held from BEFORE multi-select turned on. Once `selectable`
+// turns off again with an unchanged value, that stale cache falsely matched
+// and the plain write that must remove the checkbox+holder from the td was
+// skipped outright (critic 2026-09-22).
+
+test('MINOR E: turning selectable off after it was on removes the checkbox and shows the value exactly once', () => {
+  document.body.innerHTML = '';
+  const table = document.createElement('tf-table');
+  table.innerHTML = '<tf-column key="name" label="Nazwa"></tf-column>'
+    + '<tf-column key="size" label="Rozmiar"></tf-column>';
+  document.body.appendChild(table);
+  table.rows = [{ name: 'sda', size: '1 TiB' }];
+
+  table.setAttribute('selectable', 'multi');
+  table.rows = [{ name: 'sda', size: '1 TiB' }];
+  assert.ok(rowCheckbox(table), 'sanity: checkbox present while multi-select is on');
+
+  table.removeAttribute('selectable');
+  table.rows = [{ name: 'sda', size: '1 TiB' }];
+
+  assert.equal(rowCheckbox(table), null, 'the checkbox is gone once multi-select is off again');
+  const cell = rowFirstCell(table);
+  assert.equal(cell.textContent, 'sda', 'the value shows exactly once');
+  assert.equal(cell.children.length, 0, 'no leftover holder/checkbox element remains in the cell');
+});
+
+test('a ticked row keeps its tick through a render that happens before the host reassigns rows', () => {
+  // Every render syncs the box from `row._selected`; a click that did not
+  // write it into the row would be undone by the next render — here a
+  // client-side sort — and the tick would vanish.
+  document.body.innerHTML = '';
+  const table = document.createElement('tf-table');
+  table.setAttribute('selectable', 'multi');
+  table.setAttribute('sortable', '');
+  table.innerHTML = '<tf-column key="name" label="Nazwa" sortable></tf-column>';
+  document.body.appendChild(table);
+  table.rows = [{ name: 'sdb', _selected: false }, { name: 'sda', _selected: false }];
+  const boxOf = (name) => [...table.shadowRoot.querySelectorAll('tbody tr')]
+    .find((tr) => tr.textContent.includes(name)).querySelector('.tf-table__row-select');
+  const box = boxOf('sdb');
+  box.checked = true;
+  box.dispatchEvent(new window.Event('change', { bubbles: true, composed: true }));
+  table._render();
+  assert.ok(boxOf('sdb').hasAttribute('checked'), 'sdb is still ticked after the render');
+  assert.ok(!boxOf('sda').hasAttribute('checked'), 'and the tick did not move to sda');
 });

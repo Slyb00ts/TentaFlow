@@ -97,7 +97,14 @@ function markUnsupported(node, ports, side) {
 }
 
 function portsForNode(node, template) {
-  const isTrigger = node.type === 'trigger' || node.type === 'start';
+  // `start` has no seeded `flow_node_templates` row (legacy in-memory type),
+  // so it needs the literal fallback; every other entry-style node — trigger,
+  // `bus_consume`, `on_subagent_complete`, and any future one — is tagged
+  // `category: "trigger"` server-side (db/seed.rs) from the SAME signal the
+  // adapter registry uses for its real, possibly-empty `input_ports()`. Keying
+  // off that category instead of an ever-growing type-name list is what lets a
+  // node with zero real inputs suppress the synthesized phantom `in` port below.
+  const isTrigger = node.type === 'trigger' || node.type === 'start' || template?.category === 'trigger';
   const isOutput = node.type === 'output' || node.type === 'end';
 
   const readList = (raw, types) => {

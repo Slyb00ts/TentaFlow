@@ -1984,7 +1984,7 @@
     "cli_account_global": "Shared account",
     "cli_account_global_desc": "Always the same, named organisation account — whoever runs the session.",
     "cli_account_user": "Runner’s account",
-    "cli_account_user_desc": "Always the account of the person running the session. Sub-agents inherit that person. No account means a request to connect one in the chat (C01), never a shared account.",
+    "cli_account_user_desc": "Always the account of the person who started the task — also for the agents this agent hands work to. If that person has no account yet, they are asked in the conversation to connect one. The company's shared account is never used instead.",
     "cli_account_hint": "The shared-account list shows only accounts of the selected application (Services → Agent accounts).",
     "cli_account_pick": "Choose an account",
     "cli_account_none": "No shared account for this application",
@@ -2805,6 +2805,8 @@
     "noCompatible_hint": "No engines in manifest support {os}",
     "cluster_not_supported": "Cluster deployment requires selecting a specific node",
     "cluster_nim_not_supported": "NVIDIA NIM requires a specific node target (not a cluster)",
+    "managed_cli_agent_hint": "This app is added on the Agent accounts screen — that is where you sign in to your account.",
+    "open_agent_accounts": "Go to agent accounts",
     "deploy": "Deploy",
     "configure_deploy": "Configure & Deploy",
     "back_to_mesh": "Back to mesh",
@@ -3450,6 +3452,7 @@
       "spawn": "Spawn subagent",
       "await_subagents": "Await subagents",
       "subagent_status": "Subagent status",
+      "on_subagent_complete": "On subagent complete",
       "interval": "Time gate",
       "workspace_context": "Workspace context",
       "patch_review": "Change review",
@@ -3491,6 +3494,7 @@
       "spawn": "Deterministically launch a subagent in the background (returns run_ids)",
       "await_subagents": "Block until named subagents finish (with timeout)",
       "subagent_status": "Snapshot of subagent statuses into a flow variable",
+      "on_subagent_complete": "Reactive entry point: the flow starts when a subagent run reaches a final state. A filter can narrow this to one agent's children and/or one status.",
       "interval": "Time gate (sleep) for periodic polling inside a loop region",
       "workspace_context": "Binds the turn to a Code Studio session: repository state from the broker, branch, changed files, toolchain, and AGENTS.md / CLAUDE.md inserted as data behind an anti-injection fence. Publishes the Code Studio tools the agent may call.",
       "patch_review": "Closes the change set, shows the diff and blocks the run until a person decides. Records per-file or per-hunk verdicts, rebuilds a file from the accepted hunks and detects a concurrent-edit conflict. The same implementation backs the gate on core.git_commit.",
@@ -5764,7 +5768,8 @@
       "tentanas_nfs_conf": "App-owned NFS server drop-in enabling the RDMA transport (the listener is closed with it)",
       "tentanas_arc_limit": "App-owned modprobe drop-in holding the ARC limit (the running cap stays until reboot)",
       "tentanas_keystore": "ZFS dataset encryption keys (kept: the datasets survive uninstall)",
-      "tentaquant_data_dir": "Laboratory data directory (tentaquant.db: projects, notebooks, runs — and the files/ content store)"
+      "tentaquant_data_dir": "Laboratory data directory (tentaquant.db: projects, notebooks, runs — and the files/ content store)",
+      "tentabus_data_dir": "Instance data directory: log/ (topics, partitions and segments) plus tentabus.db (consumer groups: {groups} {groups|consumer group|consumer groups}, pause state). Core rows are tracked separately in the platform database: {topics} {topics|topic|topics}, {assignments} {assignments|partition assignment|partition assignments}, {field_policies} {field_policies|field policy|field policies}, {schema_subjects} {schema_subjects|schema subject|schema subjects}, {schema_versions} {schema_versions|schema version|schema versions}, {acl_rows} {acl_rows|topic ACL row|topic ACL rows}, {org_quotas} {org_quotas|org quota|org quotas}."
     }
   },
   "addon_reload": {
@@ -5949,7 +5954,7 @@
   "my_accounts": {
     "title": "My connected accounts",
     "page_title": "My connected accounts",
-    "subtitle": "External accounts you use in add-ons · {n} active connections",
+    "subtitle": "Accounts you use in add-ons and agent apps · {n} {n|working connection|working connections}",
     "refresh_all": "Refresh tokens",
     "alert_explainer": "<strong>What are connected accounts?</strong> Some add-ons (e.g. Teams, Google Calendar) act on your behalf — they need your personal OAuth token. Manage these connections here. You can disconnect any of them at any time.",
     "empty": "No connected accounts",
@@ -6034,7 +6039,7 @@
     },
     "tentabus": {
       "name": "TentaBus",
-      "desc": "Durable message bus: topics, consumer groups, DLQ"
+      "desc": "Durable message bus: topics, partitions, consumer groups, DLQ, schema registry"
     }
   },
   "coming_soon": {
@@ -6535,7 +6540,8 @@
         "target": "target",
         "approval": "approval",
         "elevation": "privilege channel",
-        "node": "node"
+        "node": "node",
+        "elastic-array": "Elastic Array"
       },
       "history": "Alert history"
     },
@@ -6553,6 +6559,7 @@
       "array_data": "Data",
       "array_cache": "Cache",
       "array_parity": "Parity",
+      "other_org_array": "In another organisation's array",
       "mounted": "Mounted"
     },
     "disks": {
@@ -6725,7 +6732,12 @@
       "kind_snapshot_release": "Lifting a snapshot's protection",
       "kind_target_create": "Creating a target",
       "kind_target_update": "Saving a target",
-      "kind_target_delete": "Deleting a target"
+      "kind_target_delete": "Deleting a target",
+      "by_startup": "node startup",
+      "by_scheduler": "scheduler",
+      "by_unknown_account": "unknown account",
+      "subject_last_known": "last seen as {name}",
+      "smart_batch_refused": "SMART test not started on {n} {n|disk|disks|disks}: {disks}"
     },
     "elevation": {
       "title": "System privilege channel",
@@ -6810,7 +6822,8 @@
       "other_nodes_hint": "Permission-channel and feature state on the remaining nodes",
       "arm_node": "Arm…",
       "arm_node_title": "Arm the permission channel — {node} (mode B)",
-      "armed_node": "Channel on {node} armed"
+      "armed_node": "Channel on {node} armed",
+      "armed_node_unnamed": "Channel on the unnamed node armed"
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -6851,7 +6864,9 @@
       "remember_sub": "The node keeps the password in RAM for {ttl}, then zeroes it.",
       "confirm": "Run",
       "arm_confirm": "Arm the channel",
-      "ttl_info": "After {ttl} (or on logout / restart) the password is cleared from memory and has to be entered again."
+      "ttl_info": "After {ttl} (or on logout / restart) the password is cleared from memory and has to be entered again.",
+      "explain_remote_unnamed": "The password travels to this unnamed node over the encrypted mesh. On both sides it lives only in RAM and is zeroed after use — it is never synced or logged.",
+      "password_label_unnamed": "Sudo password of {user} on the unnamed node"
     },
     "setup": {
       "title": "The system privilege channel is not configured",
@@ -6878,7 +6893,8 @@
       "probe_failed_title": "Could not read the state of this node",
       "probe_failed_msg": "The environment probe did not answer: {error}",
       "probe_failed_hint": "Until the node answers, the panel does not know whether the privilege channel works — so it does not show tiles that would all report this same failure.",
-      "probe_retry": "Try again"
+      "probe_retry": "Try again",
+      "node_scope_unnamed": "You are configuring the channel for this unnamed node — and only for it. Installing TentaNas covered the whole fleet, but system privileges are set up separately on every node."
     },
     "wizard": {
       "title": "System privilege channel — {node}",
@@ -7071,7 +7087,7 @@
       "back": "Back to pools",
       "refresh": "Refresh",
       "snapshot_only": "Parity describes the last sync. Later writes have no confirmed protection.",
-      "tolerance": "Checkpoint tolerance: {n} disks",
+      "tolerance": "Checkpoint tolerance: {n} {n|disk|disks|disks}",
       "disks": "Array disks",
       "independent_fs": "Each data disk has its own filesystem.",
       "data": "Data",
@@ -7192,7 +7208,13 @@
       "folders_pinned_note": "Folders marked „outside parity” stay on the cache only, and SnapRAID never covers the cache: their files stay outside parity for as long as the pin lasts.",
       "folder_cache_saved": "The folder's cache policy was saved.",
       "folder_cache_edit": "Change the cache policy",
-      "schedule_edit": "Edit schedule"
+      "schedule_edit": "Edit schedule",
+      "member_data": "data disk {n}",
+      "member_cache": "cache disk",
+      "member_parity": "parity disk {n}",
+      "disk_absent": "disk missing",
+      "last_seen_as": "last seen as {name}",
+      "parity_errors_window": "Parity errors ({n} {n|day|days|days})"
     },
     "wizard_pool": {
       "elastic_data": "Data disks",
@@ -7325,7 +7347,8 @@
       "scrub_now": "Scrub now",
       "spare_hint": "A hot-spare disk takes over automatically when a disk in {pool} fails.",
       "spare_title": "Hot-spare of pool {pool}",
-      "spare_sub": "{size} · hot-spare ({pool})"
+      "spare_sub": "{size} · hot-spare ({pool})",
+      "title_unnamed": "Pools on an unnamed node"
     },
     "pool": {
       "scrub_now": "Scrub now",
@@ -7458,10 +7481,11 @@
       "nothing": "This disk reports no signature at all — there is nothing to remove.",
       "bad_plan": "Incomplete or inconsistent plan response. Clearing blocked.",
       "refused": "The node refuses to clear this disk",
+      "refusal_journal_other_org": "{name} belongs to an Elastic Array of another organisation on this node. This organisation can neither clear the disk nor adopt that array.",
       "explain": "Before writing anything the node opens the device exclusively. The kernel refuses that open whenever the disk, or any of its partitions, carries a filesystem mounted in any mount namespace — the Elastic Array branch namespace included, which is visible in neither lsblk nor /proc/mounts. That refusal cannot be forced: there is no override flag and no retry.",
       "journal_title": "Elastic Array journal claim",
       "journal_body": "This disk was part of array {name} as {role}. The array is dissolved, but the node kept its journal, so the array import brings it back whole — together with the {n} {n|disk|disks} the journal lists.",
-      "journal_foreign": "The journal belongs to another instance ({org} / {addon}).",
+      "journal_foreign": "Owner recorded in the journal: {owner}.",
       "journal_cost": "Clearing drops the journal of array {name}; the claim on its name and on its remaining disks goes with it.",
       "journal_ack": "I understand that array {name} will no longer be recoverable by import, and I release its journal claim.",
       "retype": "Retype the device name to confirm:",
@@ -7539,7 +7563,10 @@
       "retype": "Type the array name to confirm:",
       "confirm": "Adopt the array",
       "done": "Array {name} has been adopted",
-      "reown_warning": "The journal names {owner} as the owner. Adopting assigns the array to this instance, which manages it from then on."
+      "reown_warning": "The journal names {owner} as the owner. Adopting assigns the array to this instance, which manages it from then on.",
+      "unnamed": "unnamed array",
+      "own_journal": "The journal already names this instance as the owner. Adopting only adds the array to its database.",
+      "member_serial": "{part} (S/N {serial})"
     },
     "import": {
       "title": "Import pool",
@@ -8119,7 +8146,8 @@
       "role_unsupported": "share access through apps only",
       "severity_critical": "critical",
       "severity_warning": "warning",
-      "severity_info": "info"
+      "severity_info": "info",
+      "act_array": "Array"
     },
     "node": {
       "head_sub_node": "node {name}",
@@ -8127,7 +8155,8 @@
       "chip_ok": "Disks OK",
       "badge_zfs": "OpenZFS {v}",
       "badge_channel": "Permission channel: {mode}",
-      "badge_ram": "{v} RAM"
+      "badge_ram": "{v} RAM",
+      "unnamed": "Unnamed node"
     },
     "tiering": {
       "title": "Tiering and write cache",
@@ -8164,7 +8193,8 @@
       "warning": "A larger ARC means faster reads but less RAM for the node's other services (e.g. ML Studio). The change writes a module parameter through the permission channel.",
       "apply": "Apply",
       "applied": "ARC limit saved",
-      "l2arc_add": "add to {pool}"
+      "l2arc_add": "add to {pool}",
+      "settings_hint_unnamed": "ZFS module parameters on an unnamed node ({ram} RAM)"
     },
     "approvals": {
       "title": "Waiting for approval",
@@ -8470,7 +8500,14 @@
       "portal_moves": "The portal moves from {from} to {to}. Initiators logged in on the old address lose their path — the old portal stops listening.",
       "portal_interface_gone": "Interface {iface} no longer has an address on this node that a portal can bind. You can still save your changes; the portal stays where it was, and moving it means picking another interface.",
       "portal_drifted": "This target's portal is on {from}, and interface {iface} now has {to}. The target is frozen and waiting — you can save your changes without touching the portal, or move it here.",
-      "portal_move_confirm": "Move the portal to {to} — initiators logged in on the old address lose their path"
+      "portal_move_confirm": "Move the portal to {to} — initiators logged in on the old address lose their path",
+      "iqn_host_unknown": "‹node hostname›"
+    },
+    "journal_owner": {
+      "this_instance": "this TentaNas instance",
+      "this_org": "another TentaNas instance of this organisation",
+      "this_org_named": "the “{name}” instance of this organisation",
+      "other_installation": "another TentaNas installation"
     }
   },
   "agent_accounts": {
@@ -8520,7 +8557,6 @@
       "credential_not_stored": "The sign-in succeeded, but its credentials could not be stored. Start it again.",
       "node_not_receiving": "This node does not receive agent accounts. Enable them for this node or sign in on another one."
     },
-    "private_console": "Private account console. Open projects in Code Studio.",
     "tab": "Agent accounts",
     "title": "Agent account",
     "segment_accounts": "Accounts",
@@ -8564,8 +8600,8 @@
     "status_pending_api_key": "Waiting for a key",
     "status_disabled": "Disabled",
     "status_active_any": "Connected",
-    "status_needs_any": "Credential required",
-    "status_pending_any": "Awaiting credential",
+    "status_needs_any": "Sign-in required",
+    "status_pending_any": "Waiting for sign-in details",
     "status_unknown": "Unknown status",
     "create_title": "New agent account",
     "create_sub": "shared organisation account",
@@ -8593,7 +8629,7 @@
     "tab_agents": "Agents",
     "kv_provider_account": "Provider account",
     "kv_credential": "Sign-in",
-    "kv_revision": "stored {when} (revision {n})",
+    "kv_credential_stored": "sign-in details are stored",
     "kv_no_credential": "no credentials stored",
     "kv_status": "Status",
     "kv_needs_login_hint": "Sign in with the provider to make this account usable.",
@@ -8617,13 +8653,14 @@
     "sessions_hint_limited": "Sessions run in parallel, at most {n} at a time on this node; ending one leaves the others untouched.",
     "sessions_empty": "No active sessions.",
     "sessions_title_scope": "Active sessions on this node ({count})",
+    "sessions_people": "{count} {count|person|people}",
     "sessions_remote_empty": "This node runs no sessions for this account.",
-    "sessions_remote_home": "Sessions are not replicated between nodes, so only this node's sessions appear here. The account is homed on {node} — the rest, if any, run there and are not read from here.",
-    "sessions_remote_offline": "The account is homed on {node}; its sessions are not read from here, and whether any are running there is unknown.",
+    "sessions_remote_home": "Only this node's sessions are shown here. This account was signed in on node {node} — its other sessions, if any, run there.",
+    "sessions_remote_offline": "This account was signed in on node {node}, which is unavailable right now, so whether any sessions are running there is unknown.",
     "sessions_no_data": "No data.",
     "sessions_scope_unknown": "Scope unknown.",
-    "sessions_scope_unknown_note": "This node has no node matrix at hand, so it cannot tell whether {node} is this machine; it shows only the sessions it holds itself.",
-    "sessions_home_lost": "This account was homed on node {node}, which was deleted from the registry — its sessions may still be running there, and this node shows only its own. A new home is set by signing in with the provider or saving an API key on a node you choose.",
+    "sessions_scope_unknown_note": "This node cannot tell whether {node} is itself, so it shows only the sessions it runs.",
+    "sessions_home_lost": "This account was signed in on node {node}, which was removed from the node list. Its sessions may still run there, and only this node's sessions are shown here. Sign the account in again or save its API key on a node you choose.",
     "session_end_confirm_title": "End the session?",
     "session_end_confirm_body": "The session will be closed on the node. The agent can open a new one.",
     "session_ended": "Session ended.",
@@ -8657,7 +8694,7 @@
     "access_foot_org": "The whole organisation has access.",
     "access_whole_org": "Whole organisation",
     "access_whole_org_sub": "Every user of the organisation may use this account.",
-    "access_note": "Code run on this account can read its credentials. Revoking access stops the sessions in TentaFlow but does not revoke the tokens at the provider.",
+    "access_note": "A program running on this account can read its sign-in details. Removing access stops the sessions in TentaFlow but does not sign the account out at the provider.",
     "access_members": "{count} {count|member|members}",
     "col_who": "Who",
     "col_kind": "Kind",
@@ -8676,6 +8713,7 @@
     "delete_confirm_body": "Account “{name}” goes away together with its stored credentials.",
     "delete_confirm_hint": "Agents pointing at this account stop working until you point them somewhere else.",
     "deleted": "Account deleted.",
+    "purge_incomplete": "The change was saved, but the node could not delete the files with sign-in details. You will find the list in the node's log — delete them by hand.",
     "runtime_empty": "No nodes.",
     "runtime_os_linux": "Linux",
     "runtime_os_macos": "macOS",
@@ -8695,7 +8733,6 @@
     "install_installed": "Installed",
     "install_installing": "Installing",
     "install_error": "Error",
-    "install_absent": "absent",
     "runtime_actions": "Application actions",
     "runtime_install": "Install",
     "runtime_reinstall": "Reinstall",
@@ -8704,11 +8741,11 @@
     "runtime_uninstall_started": "Uninstalling “{engine}” from the node…",
     "runtime_installed": "Application “{engine}” installed.",
     "runtime_uninstalled": "Application “{engine}” uninstalled.",
-    "runtime_foot_install": "Install and uninstall sit in the menu inside each application column; the columns show what each node reports.",
+    "runtime_foot_install": "“Install” adds the app on the node; the “…” menu next to an installed one reinstalls or removes it. The columns show what the node itself reports.",
     "runtime_foot_receives": "“Receives accounts” decides whether account credentials reach this node.",
     "receives_on": "The node will receive accounts.",
     "receives_off": "The node stops receiving accounts.",
-    "receives_home_refused": "This node is the home of agent accounts — sign them in on another node, or paste their API key there, then it can stop receiving accounts.",
+    "receives_home_refused": "Agent accounts were signed in on this node, so it cannot stop receiving accounts. First sign those accounts in on another node, or paste their API key there.",
     "apps_section": "Agent applications",
     "apps_card_sub": "agent application",
     "apps_not_connected": "Not connected",
@@ -9120,6 +9157,7 @@
     "ask": {
       "head": "The agent is asking",
       "anchor": "Question:",
+      "permission": "The agent wants to {what}.",
       "go": "answer below ↓",
       "deny": "Deny",
       "mandatory": "This question cannot be switched off — push and merge always ask.",
@@ -9136,12 +9174,14 @@
         "head": "Account required",
         "anchor": "Account required:",
         "go": "connect below ↓",
-        "body": "This agent works on the {engine} account of the person running the session, and you have not connected one yet. Connect it once — it will work in every workspace and on every node. The organisation’s shared account will not be used in its place.",
-        "body_relogin": "This agent works on your {engine} account, but this node no longer holds its credentials. Sign in again — the paused turn resumes on its own.",
+        "body": "This agent works on your own {engine} account, and you have not connected one yet. Connect it once — after that it works in every project. The company's shared account will not be used instead of yours.",
+        "body_relogin": "This agent works on your {engine} account, but you need to sign in to it again. Sign in — the waiting task will continue on its own.",
+        "body_global": "This agent works on the shared {engine} account “{account}”, which needs to be signed in again. Only an administrator can do that — please ask one. The task will wait and continue on its own once the account works again.",
+        "body_global_admin": "This agent works on the shared {engine} account “{account}”, which needs to be signed in again. You are an administrator, so you can do it now — the waiting task will continue on its own.",
         "connect": "Connect the {engine} account",
-        "connect_detail": "Opens the sign-in window (A02): a link to open in a new window → a code pasted here. Once verified, the paused turn resumes on its own.",
+        "connect_detail": "A sign-in window opens. Open the link, sign in and paste the code here. The task then continues on its own.",
         "cancel": "Cancel this task",
-        "cancel_detail": "The sub-agent ends without doing any work; the orchestrator is told that no account was available."
+        "cancel_detail": "This agent stops without doing any work, and the main agent is told that an account was missing."
       }
     },
     "patch": {
@@ -9477,6 +9517,30 @@
       "title": "Session timeline",
       "dock_title": "Timeline",
       "dock_note": "Nothing to navigate here — the stage shows one plot of this session’s runs."
+    },
+    "capability": {
+      "fs_read": "read files",
+      "code_search": "search the code",
+      "fs_write": "write files",
+      "fs_delete": "delete files",
+      "exec": "run a command",
+      "terminal": "open a terminal",
+      "git_read": "read the Git history",
+      "git_branch": "create a Git branch",
+      "git_network": "connect to a Git server",
+      "git_stage": "stage changes in Git",
+      "git_commit": "save changes in Git (commit)",
+      "git_push": "send changes to the Git server",
+      "git_merge": "merge Git branches",
+      "git_merge_finalize": "finish merging Git branches",
+      "git_worktree": "create a separate working copy of the repository",
+      "net_egress": "connect to the internet",
+      "cli_delegate": "hand the work to an agent app (e.g. Claude Code)",
+      "review_decide": "approve the change review",
+      "secret_manage": "use stored passwords and keys",
+      "task_plan": "change the task plan",
+      "workspace_settings": "change the project settings",
+      "member_manage": "change the project members"
     }
   },
   "addon_bindings": {
@@ -9900,6 +9964,7 @@
     "kpi_msgs_in": "Msgs/s (in)",
     "kpi_lag": "Total lag",
     "kpi_dlq_depth": "DLQ depth",
+    "head_dlq_badge_title": "{count} {count|message|messages} in the dead-letter queue",
     "kpi_disk": "Disk usage",
     "kpi_partitions": "Total partitions",
     "kpi_groups": "Consumer groups",
@@ -10208,7 +10273,9 @@
       "schema_type_unsupported": "This schema type does not support the requested operation.",
       "schema_ref_id_collision": "Schema reference id collision — register the schema again.",
       "instance_mismatch": "The request was addressed to a different TentaBus instance than the one that served it — a server-side configuration error.",
-      "authorizer_instance_mismatch": "The permission check is wired to a different TentaBus instance than the engine — a server-side configuration error."
+      "authorizer_instance_mismatch": "The permission check is wired to a different TentaBus instance than the engine — a server-side configuration error.",
+      "invalid_instance_id": "Invalid TentaBus instance id.",
+      "replication_internal_error": "Internal server-side replication error."
     },
     "tab_replication": "Replication",
     "wizard_field_nodes": "Replica nodes",

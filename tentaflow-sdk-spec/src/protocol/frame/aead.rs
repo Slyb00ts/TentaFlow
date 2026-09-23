@@ -17,7 +17,9 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[cfg(test)]
 use super::address::NodeAddress;
+#[cfg(test)]
 use super::auth::Auth;
 use super::envelope::Envelope;
 use super::error::{FrameError, FrameErrorCode};

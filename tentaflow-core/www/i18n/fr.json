@@ -1984,7 +1984,7 @@
     "cli_account_global": "Compte partagé",
     "cli_account_global_desc": "Toujours le même compte de l’organisation, quelle que soit la personne qui mène la session.",
     "cli_account_user": "Compte de la personne qui exécute",
-    "cli_account_user_desc": "Toujours le compte de la personne qui mène la session. Les sous-agents héritent de cette personne. Sans compte, une demande de connexion est envoyée dans le chat (C01), jamais un compte partagé.",
+    "cli_account_user_desc": "Toujours le compte de la personne qui a lancé la tâche — aussi pour les agents à qui cet agent confie du travail. Si cette personne n’a pas encore de compte, on lui demande dans la conversation d’en connecter un. Le compte partagé de l’entreprise n’est jamais utilisé à la place.",
     "cli_account_hint": "La liste des comptes partagés n’affiche que ceux de l’application sélectionnée (Services → Comptes d’agent).",
     "cli_account_pick": "Choisissez un compte",
     "cli_account_none": "Aucun compte partagé pour cette application",
@@ -2635,6 +2635,8 @@
     "noCompatible_hint": "Aucun moteur dans le manifeste ne supporte {os}",
     "cluster_not_supported": "Le déploiement cluster nécessite un nœud spécifique",
     "cluster_nim_not_supported": "NVIDIA NIM nécessite un nœud spécifique (pas un cluster)",
+    "managed_cli_agent_hint": "Cette application s’ajoute sur l’écran « Comptes d’agent » — c’est là que vous vous connectez à votre compte.",
+    "open_agent_accounts": "Aller aux comptes d’agent",
     "deploy": "Déployer",
     "configure_deploy": "Configurer et déployer",
     "back_to_mesh": "Retour au mesh",
@@ -3280,6 +3282,7 @@
       "spawn": "Spawn subagent",
       "await_subagents": "Await subagents",
       "subagent_status": "Subagent status",
+      "on_subagent_complete": "À la fin du sous-agent",
       "interval": "Time gate",
       "workspace_context": "Contexte du workspace",
       "patch_review": "Revue des modifications",
@@ -3320,6 +3323,7 @@
       "spawn": "Deterministically launch a subagent in the background (returns run_ids)",
       "await_subagents": "Block until named subagents finish (with timeout)",
       "subagent_status": "Snapshot of subagent statuses into a flow variable",
+      "on_subagent_complete": "Point d'entrée réactif : le flow démarre lorsqu'une exécution de sous-agent atteint un état final. Un filtre peut restreindre cela à un agent et/ou un statut.",
       "interval": "Time gate (sleep) for periodic polling inside a loop region",
       "workspace_context": "Rattache le tour à une session Code Studio : état du dépôt via le broker, branche, fichiers modifiés, chaîne d'outils, et AGENTS.md / CLAUDE.md insérés comme données derrière une clôture anti-injection. Publie les outils Code Studio autorisés pour l'agent.",
       "patch_review": "Ferme le jeu de modifications, présente le diff et bloque l'exécution jusqu'à la décision d'une personne. Enregistre les verdicts par fichier ou par hunk, reconstruit un fichier à partir des hunks acceptés et détecte un conflit d'édition concurrente. La même implémentation sert de porte à core.git_commit.",
@@ -3658,7 +3662,8 @@
       "tentanas_nfs_conf": "Fragment de configuration du serveur NFS activant le transport RDMA (l'écoute est fermée avec lui)",
       "tentanas_arc_limit": "Fragment modprobe portant la limite ARC (la limite active dure jusqu'au redémarrage)",
       "tentanas_keystore": "Clés de chiffrement des datasets ZFS (conservées : les datasets survivent à la désinstallation)",
-      "tentaquant_data_dir": "Répertoire de données du laboratoire (tentaquant.db : projets, carnets, exécutions — et le magasin de fichiers files/)"
+      "tentaquant_data_dir": "Répertoire de données du laboratoire (tentaquant.db : projets, carnets, exécutions — et le magasin de fichiers files/)",
+      "tentabus_data_dir": "Répertoire de données de l'instance : log/ (sujets, partitions et segments) ainsi que tentabus.db (groupes de consommateurs : {groups} {groups|groupe de consommateurs|groupes de consommateurs}, état de pause). Les lignes essentielles sont suivies séparément dans la base de données de la plateforme : {topics} {topics|sujet|sujets}, {assignments} {assignments|affectation de partition|affectations de partition}, {field_policies} {field_policies|politique de champ|politiques de champ}, {schema_subjects} {schema_subjects|sujet de schéma|sujets de schéma}, {schema_versions} {schema_versions|version de schéma|versions de schéma}, {acl_rows} {acl_rows|ligne ACL de sujet|lignes ACL de sujet}, {org_quotas} {org_quotas|quota d'organisation|quotas d'organisation}."
     }
   },
   "addon_reload": {
@@ -4882,7 +4887,7 @@
   "my_accounts": {
     "title": "Mes comptes liés",
     "page_title": "Mes comptes liés",
-    "subtitle": "Comptes externes utilisés dans vos extensions · {n} connexions actives",
+    "subtitle": "Comptes que vous utilisez dans les extensions et les applications d’agent · {n} {n|connexion active|connexions actives}",
     "refresh_all": "Renouveler les jetons",
     "alert_explainer": "<strong>Que sont les comptes liés ?</strong> Certaines extensions (p. ex. Teams, Google Calendar) agissent en votre nom — elles ont besoin de votre jeton OAuth personnel. Gérez ces connexions ici. Vous pouvez les dissocier à tout moment.",
     "empty": "Aucun compte lié",
@@ -4967,7 +4972,7 @@
     },
     "tentabus": {
       "name": "TentaBus",
-      "desc": "Bus de messages durable : sujets, groupes de consommateurs, DLQ"
+      "desc": "Bus de messages durable : sujets, partitions, groupes de consommateurs, DLQ, registre de schémas"
     }
   },
   "coming_soon": {
@@ -5376,7 +5381,12 @@
       "kind_snapshot_release": "Levée de la protection d'un snapshot",
       "kind_target_create": "Creation d'une cible",
       "kind_target_update": "Enregistrement d'une cible",
-      "kind_target_delete": "Suppression d'une cible"
+      "kind_target_delete": "Suppression d'une cible",
+      "by_startup": "démarrage du nœud",
+      "by_scheduler": "planificateur",
+      "by_unknown_account": "compte inconnu",
+      "subject_last_known": "vu pour la dernière fois comme {name}",
+      "smart_batch_refused": "Test SMART non lancé sur {n} {n|disque|disques|disques} : {disks}"
     },
     "danger": {
       "retype": "Saisissez {name} pour confirmer :",
@@ -5462,7 +5472,7 @@
       "back": "Retour aux pools",
       "refresh": "Actualiser",
       "snapshot_only": "La parité décrit la dernière synchronisation. La protection des écritures ultérieures n’est pas confirmée.",
-      "tolerance": "Tolérance du point de contrôle : {n} disques",
+      "tolerance": "Tolérance du point de contrôle : {n} {n|disque|disques|disques}",
       "disks": "Disques de l’array",
       "independent_fs": "Chaque disque de données possède son propre système de fichiers.",
       "data": "Données",
@@ -5583,7 +5593,13 @@
       "folders_pinned_note": "Les dossiers marqués „hors parité” restent uniquement sur le cache, et SnapRAID ne couvre jamais le cache : leurs fichiers restent hors parité aussi longtemps que l'épinglage dure.",
       "folder_cache_saved": "La politique de cache du dossier a été enregistrée.",
       "folder_cache_edit": "Modifier la politique de cache",
-      "schedule_edit": "Modifier la planification"
+      "schedule_edit": "Modifier la planification",
+      "member_data": "disque de données {n}",
+      "member_cache": "disque de cache",
+      "member_parity": "disque de parité {n}",
+      "disk_absent": "disque absent",
+      "last_seen_as": "vu pour la dernière fois comme {name}",
+      "parity_errors_window": "Erreurs de parité ({n} {n|jour|jours|jours})"
     },
     "wizard_pool": {
       "elastic_data": "Disques de données",
@@ -5716,7 +5732,8 @@
       "scrub_now": "Scrub maintenant",
       "spare_hint": "Un disque hot-spare prend le relais automatiquement en cas de panne d’un disque de {pool}.",
       "spare_title": "Hot-spare du pool {pool}",
-      "spare_sub": "{size} · hot-spare ({pool})"
+      "spare_sub": "{size} · hot-spare ({pool})",
+      "title_unnamed": "Pools sur un nœud sans nom"
     },
     "pool": {
       "scrub_now": "Scrub maintenant",
@@ -5849,10 +5866,11 @@
       "nothing": "Ce disque ne signale aucune signature : il n'y a rien à supprimer.",
       "bad_plan": "Réponse du plan incomplète ou incohérente. Effacement bloqué.",
       "refused": "Le nœud refuse d'effacer ce disque",
+      "refusal_journal_other_org": "{name} appartient à une matrice Elastic d'une autre organisation de ce nœud. Cette organisation ne peut ni effacer le disque ni adopter cette matrice.",
       "explain": "Avant toute écriture, le nœud ouvre le périphérique en mode exclusif. Le noyau refuse cette ouverture dès que le disque, ou l'une de ses partitions, porte un système de fichiers monté dans n'importe quel espace de noms de montage — y compris l'espace privé des branches d'un Elastic Array, invisible dans lsblk comme dans /proc/mounts. Ce refus ne peut pas être forcé : il n'y a ni option de forçage ni nouvelle tentative.",
       "journal_title": "Réservation du journal d'un Elastic Array",
       "journal_body": "Ce disque faisait partie de la matrice {name} en tant que {role}. La matrice est dissoute, mais le nœud a conservé son journal : l'import de matrice la ramène entière, avec les {n} {n|disque|disques} que le journal recense.",
-      "journal_foreign": "Le journal appartient à une autre instance ({org} / {addon}).",
+      "journal_foreign": "Propriétaire enregistré dans le journal : {owner}.",
       "journal_cost": "L'effacement supprime le journal de la matrice {name} ; la réservation de son nom et de ses autres disques disparaît avec lui.",
       "journal_ack": "Je comprends que la matrice {name} ne sera plus récupérable par import, et je libère la réservation de son journal.",
       "retype": "Ressaisissez le nom du périphérique pour confirmer :",
@@ -5930,7 +5948,10 @@
       "retype": "Saisissez le nom de la matrice pour confirmer :",
       "confirm": "Adopter la matrice",
       "done": "La matrice {name} a été adoptée",
-      "reown_warning": "Le journal désigne {owner} comme propriétaire. L’adoption attribue la matrice à cette instance, qui la gère ensuite."
+      "reown_warning": "Le journal désigne {owner} comme propriétaire. L’adoption attribue la matrice à cette instance, qui la gère ensuite.",
+      "unnamed": "matrice sans nom",
+      "own_journal": "Le journal désigne déjà cette instance comme propriétaire. La reprise ajoute seulement la matrice à sa base de données.",
+      "member_serial": "{part} (N° de série {serial})"
     },
     "import": {
       "title": "Importer un pool",
@@ -6572,7 +6593,8 @@
         "target": "cible",
         "approval": "approbation",
         "elevation": "canal de privilèges",
-        "node": "nœud"
+        "node": "nœud",
+        "elastic-array": "matrice Elastic"
       },
       "history": "Historique des alertes"
     },
@@ -6590,6 +6612,7 @@
       "array_data": "Données",
       "array_cache": "Cache",
       "array_parity": "Parité",
+      "other_org_array": "Dans la matrice d'une autre organisation",
       "mounted": "Monté"
     },
     "disks": {
@@ -6781,7 +6804,8 @@
       "other_nodes_hint": "État du canal de privilèges et des fonctions sur les autres nœuds",
       "arm_node": "Armer…",
       "arm_node_title": "Armer le canal de privilèges — {node} (mode B)",
-      "armed_node": "Canal de {node} armé"
+      "armed_node": "Canal de {node} armé",
+      "armed_node_unnamed": "Canal du nœud sans nom armé"
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -6822,7 +6846,9 @@
       "remember_sub": "Le nœud garde le mot de passe en RAM pendant {ttl}, puis l'efface.",
       "confirm": "Exécuter",
       "arm_confirm": "Armer le canal",
-      "ttl_info": "Au bout de {ttl} (ou à la déconnexion / au redémarrage), le mot de passe est effacé de la mémoire et doit être saisi à nouveau."
+      "ttl_info": "Au bout de {ttl} (ou à la déconnexion / au redémarrage), le mot de passe est effacé de la mémoire et doit être saisi à nouveau.",
+      "explain_remote_unnamed": "Le mot de passe voyage vers ce nœud sans nom par le maillage chiffré. Des deux côtés il ne vit qu'en RAM et est effacé après usage — il n'est jamais synchronisé ni journalisé.",
+      "password_label_unnamed": "Mot de passe sudo de {user} sur le nœud sans nom"
     },
     "setup": {
       "title": "Le canal de privilèges système n'est pas configuré",
@@ -6849,7 +6875,8 @@
       "probe_failed_title": "Impossible de lire l'état de ce nœud",
       "probe_failed_msg": "La sonde d'environnement n'a pas répondu : {error}",
       "probe_failed_hint": "Tant que le nœud ne répond pas, le panneau ignore si le canal de privilèges fonctionne — il n'affiche donc pas de tuiles qui signaleraient toutes la même erreur.",
-      "probe_retry": "Réessayer"
+      "probe_retry": "Réessayer",
+      "node_scope_unnamed": "Vous configurez le canal pour ce nœud sans nom — et pour lui seul. L'installation de TentaNas a couvert toute la flotte, mais les privilèges système se configurent séparément sur chaque nœud."
     },
     "refreshed": "dernière actualisation {t}",
     "duration": {
@@ -6903,7 +6930,8 @@
       "role_unsupported": "accès aux partages via les applications uniquement",
       "severity_critical": "critique",
       "severity_warning": "avertissement",
-      "severity_info": "information"
+      "severity_info": "information",
+      "act_array": "Matrice"
     },
     "node": {
       "head_sub_node": "nœud {name}",
@@ -6911,7 +6939,8 @@
       "chip_ok": "Disques OK",
       "badge_zfs": "OpenZFS {v}",
       "badge_channel": "Canal de privilèges : {mode}",
-      "badge_ram": "{v} RAM"
+      "badge_ram": "{v} RAM",
+      "unnamed": "Nœud sans nom"
     },
     "tiering": {
       "title": "Tiering et cache d’écriture",
@@ -6948,7 +6977,8 @@
       "warning": "Un ARC plus grand accélère les lectures mais laisse moins de RAM aux autres services du nœud (p. ex. ML Studio). La modification écrit un paramètre du module via le canal de privilèges.",
       "apply": "Appliquer",
       "applied": "Limite ARC enregistrée",
-      "l2arc_add": "ajoutez-en à {pool}"
+      "l2arc_add": "ajoutez-en à {pool}",
+      "settings_hint_unnamed": "Paramètres du module ZFS sur un nœud sans nom ({ram} de RAM)"
     },
     "approvals": {
       "title": "En attente de validation",
@@ -7254,7 +7284,14 @@
       "portal_moves": "Le portail passe de {from} à {to}. Les initiateurs connectés sur l'ancienne adresse perdent leur chemin — l'ancien portail cesse d'écouter.",
       "portal_interface_gone": "L'interface {iface} n'a plus sur ce nœud d'adresse qu'un portail puisse lier. Tu peux quand même enregistrer tes modifications ; le portail reste où il était, et le déplacer suppose de choisir une autre interface.",
       "portal_drifted": "Le portail de cette cible est sur {from}, et l'interface {iface} a maintenant {to}. La cible est gelée et en attente : tu peux enregistrer tes modifications sans toucher au portail, ou le déplacer ici.",
-      "portal_move_confirm": "Déplacer le portail vers {to} — les initiateurs sur l'ancienne adresse perdent leur chemin"
+      "portal_move_confirm": "Déplacer le portail vers {to} — les initiateurs sur l'ancienne adresse perdent leur chemin",
+      "iqn_host_unknown": "‹nom d'hôte du nœud›"
+    },
+    "journal_owner": {
+      "this_instance": "cette instance TentaNas",
+      "this_org": "une autre instance TentaNas de cette organisation",
+      "this_org_named": "l'instance « {name} » de cette organisation",
+      "other_installation": "une autre installation TentaNas"
     }
   },
   "agent_accounts": {
@@ -7304,7 +7341,6 @@
       "credential_not_stored": "La connexion a réussi, mais ses identifiants n'ont pas pu être enregistrés. Recommencez-la.",
       "node_not_receiving": "Ce nœud ne reçoit pas de comptes d'agent. Activez-les pour ce nœud ou connectez-vous sur un autre."
     },
-    "private_console": "Console privée du compte. Ouvrez vos projets dans Code Studio.",
     "tab": "Comptes d’agent",
     "title": "Compte de l’agent",
     "segment_accounts": "Comptes",
@@ -7348,8 +7384,8 @@
     "status_pending_api_key": "En attente d’une clé",
     "status_disabled": "Désactivé",
     "status_active_any": "Connecté",
-    "status_needs_any": "Identifiants requis",
-    "status_pending_any": "En attente d’identifiants",
+    "status_needs_any": "Connexion requise",
+    "status_pending_any": "En attente des informations de connexion",
     "status_unknown": "État inconnu",
     "create_title": "Nouveau compte d’agent",
     "create_sub": "compte partagé de l’organisation",
@@ -7377,7 +7413,7 @@
     "tab_agents": "Agents",
     "kv_provider_account": "Compte du fournisseur",
     "kv_credential": "Connexion",
-    "kv_revision": "enregistré {when} (version {n})",
+    "kv_credential_stored": "les informations de connexion sont enregistrées",
     "kv_no_credential": "aucun identifiant enregistré",
     "kv_status": "État",
     "kv_needs_login_hint": "Connecte-toi chez le fournisseur pour rendre ce compte utilisable.",
@@ -7401,13 +7437,14 @@
     "sessions_hint_limited": "Les sessions s’exécutent en parallèle, au plus {n} à la fois sur ce nœud ; en terminer une ne touche pas les autres.",
     "sessions_empty": "Aucune session active.",
     "sessions_title_scope": "Sessions actives sur ce nœud ({count})",
+    "sessions_people": "{count} {count|personne|personnes}",
     "sessions_remote_empty": "Ce nœud n’exécute aucune session pour ce compte.",
-    "sessions_remote_home": "Les sessions ne sont pas répliquées entre les nœuds : seules celles de ce nœud apparaissent ici. Le compte est hébergé sur {node} — les autres, s'il y en a, y tournent et ne sont pas lues depuis ici.",
-    "sessions_remote_offline": "Le compte est hébergé sur {node} ; ses sessions ne sont pas lues depuis ici et l’on ignore s’il en tourne là-bas.",
+    "sessions_remote_home": "Seules les sessions de ce nœud sont affichées ici. Ce compte a été connecté sur le nœud {node} — ses autres sessions, s'il y en a, s’exécutent là-bas.",
+    "sessions_remote_offline": "Ce compte a été connecté sur le nœud {node}, indisponible pour le moment ; on ignore si des sessions y tournent.",
     "sessions_no_data": "Aucune donnée.",
     "sessions_scope_unknown": "Portée inconnue.",
-    "sessions_scope_unknown_note": "Ce nœud n’a pas la matrice des nœuds à portée, il ne peut donc pas dire si {node} est lui-même ; il n’affiche que les sessions qu’il héberge lui-même.",
-    "sessions_home_lost": "Ce compte était hébergé sur le nœud {node}, supprimé du registre : ses sessions peuvent y tourner encore, et ce nœud n’affiche que les siennes. Pour définir un nouvel hébergement, connectez-vous chez le fournisseur ou enregistrez une clé d’API sur le nœud de votre choix.",
+    "sessions_scope_unknown_note": "Ce nœud ne sait pas si {node} est lui-même ; il n’affiche donc que ses propres sessions.",
+    "sessions_home_lost": "Ce compte a été connecté sur le nœud {node}, retiré de la liste des nœuds. Ses sessions peuvent encore y tourner ; seules celles de ce nœud sont affichées ici. Reconnectez le compte ou enregistrez sa clé API sur le nœud de votre choix.",
     "session_end_confirm_title": "Terminer la session ?",
     "session_end_confirm_body": "La session sera fermée sur le nœud. L’agent peut en ouvrir une nouvelle.",
     "session_ended": "Session terminée.",
@@ -7441,7 +7478,7 @@
     "access_foot_org": "Toute l’organisation a accès.",
     "access_whole_org": "Toute l’organisation",
     "access_whole_org_sub": "Chaque utilisateur de l’organisation peut utiliser ce compte.",
-    "access_note": "Le code exécuté sur ce compte peut lire ses identifiants. Retirer l’accès arrête les sessions dans TentaFlow, mais ne révoque pas les jetons chez le fournisseur.",
+    "access_note": "Un programme qui tourne sur ce compte peut lire ses informations de connexion. Retirer l’accès arrête les sessions dans TentaFlow, mais ne déconnecte pas le compte chez le fournisseur.",
     "access_members": "{count} {count|membre|membres}",
     "col_who": "Qui",
     "col_kind": "Type",
@@ -7460,6 +7497,7 @@
     "delete_confirm_body": "Le compte « {name} » disparaîtra avec ses identifiants enregistrés.",
     "delete_confirm_hint": "Les agents qui pointent vers ce compte cesseront de fonctionner tant que vous ne leur en aurez pas indiqué un autre.",
     "deleted": "Compte supprimé.",
+    "purge_incomplete": "La modification est enregistrée, mais le nœud n’a pas pu supprimer les fichiers contenant les informations de connexion. Leur liste figure dans le journal du nœud — supprimez-les à la main.",
     "runtime_empty": "Aucun nœud.",
     "runtime_os_linux": "Linux",
     "runtime_os_macos": "macOS",
@@ -7479,7 +7517,6 @@
     "install_installed": "Installée",
     "install_installing": "Installation",
     "install_error": "Erreur",
-    "install_absent": "absente",
     "runtime_actions": "Actions de l’application",
     "runtime_install": "Installer",
     "runtime_reinstall": "Réinstaller",
@@ -7488,11 +7525,11 @@
     "runtime_uninstall_started": "Désinstallation de « {engine} » du nœud…",
     "runtime_installed": "Application « {engine} » installée.",
     "runtime_uninstalled": "Application « {engine} » désinstallée.",
-    "runtime_foot_install": "L’installation et la désinstallation se trouvent dans le menu de chaque colonne d’application ; les colonnes affichent ce que rapporte le nœud.",
+    "runtime_foot_install": "« Installer » ajoute l’application sur le nœud ; le menu « … » d’une application installée la réinstalle ou la supprime. Les colonnes montrent ce que le nœud lui-même signale.",
     "runtime_foot_receives": "« Reçoit les comptes » décide si les identifiants des comptes atteignent ce nœud.",
     "receives_on": "Le nœud recevra les comptes.",
     "receives_off": "Le nœud ne recevra plus de comptes.",
-    "receives_home_refused": "Ce nœud héberge des comptes d’agent — connectez-les sur un autre nœud ou collez-y leur clé d’API, ensuite il pourra cesser de recevoir des comptes.",
+    "receives_home_refused": "Des comptes d’agent ont été connectés sur ce nœud ; il ne peut donc pas arrêter de recevoir des comptes. Connectez d’abord ces comptes sur un autre nœud, ou collez-y leur clé API.",
     "apps_section": "Applications d’agent",
     "apps_card_sub": "application d’agent",
     "apps_not_connected": "Non connectée",
@@ -7904,6 +7941,7 @@
     "ask": {
       "head": "L’agent pose une question",
       "anchor": "Question :",
+      "permission": "L’agent veut {what}.",
       "go": "répondez plus bas ↓",
       "deny": "Refuser",
       "mandatory": "Cette question ne peut pas être désactivée — le push et le merge demandent toujours.",
@@ -7920,12 +7958,14 @@
         "head": "Compte requis",
         "anchor": "Compte requis :",
         "go": "connectez ci-dessous ↓",
-        "body": "Cet agent travaille avec le compte {engine} de la personne qui mène la session, et vous n’avez pas encore connecté de compte. Connectez-le une fois — il fonctionnera dans chaque espace de travail et sur chaque nœud. Le compte partagé de l’organisation ne sera pas utilisé à sa place.",
-        "body_relogin": "Cet agent travaille avec votre compte {engine}, mais ce nœud ne détient plus ses identifiants. Reconnectez-vous — le tour en pause reprend de lui-même.",
+        "body": "Cet agent travaille avec votre propre compte {engine}, et vous n’en avez pas encore connecté. Connectez-le une fois — ensuite il fonctionne dans tous les projets. Le compte partagé de l’entreprise ne sera pas utilisé à la place du vôtre.",
+        "body_relogin": "Cet agent travaille avec votre compte {engine}, mais vous devez vous y reconnecter. Connectez-vous — la tâche en attente reprendra d’elle-même.",
+        "body_global": "Cet agent travaille avec le compte partagé {engine} « {account} », auquel il faut se reconnecter. Seul un administrateur peut le faire — demandez-lui. La tâche attendra et reprendra d’elle-même quand le compte fonctionnera de nouveau.",
+        "body_global_admin": "Cet agent travaille avec le compte partagé {engine} « {account} », auquel il faut se reconnecter. Vous êtes administrateur, vous pouvez donc le faire maintenant — la tâche en attente reprendra d’elle-même.",
         "connect": "Connecter le compte {engine}",
-        "connect_detail": "Ouvre la fenêtre de connexion (A02) : un lien à ouvrir dans une nouvelle fenêtre → un code collé ici. Après vérification, le tour en pause reprend de lui-même.",
+        "connect_detail": "Une fenêtre de connexion s’ouvre. Ouvrez le lien, connectez-vous et collez le code ici. La tâche reprend ensuite d’elle-même.",
         "cancel": "Annuler cette tâche",
-        "cancel_detail": "Le sous-agent se termine sans travail ; l’orchestrateur est informé qu’aucun compte n’était disponible."
+        "cancel_detail": "Cet agent s’arrête sans rien faire, et l’agent principal apprend qu’il manquait un compte."
       }
     },
     "patch": {
@@ -8261,6 +8301,30 @@
       "title": "Chronologie de la session",
       "dock_title": "Chronologie",
       "dock_note": "Rien à parcourir ici — la scène affiche un seul tracé des exécutions de cette session."
+    },
+    "capability": {
+      "fs_read": "lire des fichiers",
+      "code_search": "rechercher dans le code",
+      "fs_write": "écrire des fichiers",
+      "fs_delete": "supprimer des fichiers",
+      "exec": "lancer une commande",
+      "terminal": "ouvrir un terminal",
+      "git_read": "lire l’historique Git",
+      "git_branch": "créer une branche Git",
+      "git_network": "se connecter à un serveur Git",
+      "git_stage": "préparer des modifications dans Git",
+      "git_commit": "enregistrer les modifications dans Git (commit)",
+      "git_push": "envoyer les modifications au serveur Git",
+      "git_merge": "fusionner des branches Git",
+      "git_merge_finalize": "terminer la fusion des branches Git",
+      "git_worktree": "créer une copie de travail séparée du dépôt",
+      "net_egress": "se connecter à Internet",
+      "cli_delegate": "confier le travail à une application d’agent (p. ex. Claude Code)",
+      "review_decide": "valider la revue des modifications",
+      "secret_manage": "utiliser des mots de passe et clés enregistrés",
+      "task_plan": "modifier le plan des tâches",
+      "workspace_settings": "modifier les paramètres du projet",
+      "member_manage": "modifier les membres du projet"
     }
   },
   "external": {
@@ -8665,6 +8729,7 @@
     "kpi_msgs_in": "Msg/s (entrée)",
     "kpi_lag": "Lag total",
     "kpi_dlq_depth": "Profondeur DLQ",
+    "head_dlq_badge_title": "{count} {count|message|messages} dans la file des lettres mortes",
     "kpi_disk": "Utilisation disque",
     "kpi_partitions": "Partitions totales",
     "kpi_groups": "Groupes de consommateurs",
@@ -8973,7 +9038,9 @@
       "schema_type_unsupported": "Ce type de schéma ne prend pas en charge l'opération demandée.",
       "schema_ref_id_collision": "Collision d'identifiant de référence de schéma — enregistrez à nouveau le schéma.",
       "instance_mismatch": "La requête visait une autre instance TentaBus que celle qui l'a traitée — erreur de configuration côté serveur.",
-      "authorizer_instance_mismatch": "La vérification des droits est rattachée à une autre instance TentaBus que le moteur — erreur de configuration côté serveur."
+      "authorizer_instance_mismatch": "La vérification des droits est rattachée à une autre instance TentaBus que le moteur — erreur de configuration côté serveur.",
+      "invalid_instance_id": "Identifiant d'instance TentaBus invalide.",
+      "replication_internal_error": "Erreur interne de réplication côté serveur."
     },
     "tab_replication": "Réplication",
     "wizard_field_nodes": "Nœuds de réplique",

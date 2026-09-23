@@ -217,6 +217,7 @@ mod tests {
             "codex",
             vec![(
                 "/account/credential",
+                200,
                 serde_json::json!({
                     "present": true,
                     "engine": "codex",

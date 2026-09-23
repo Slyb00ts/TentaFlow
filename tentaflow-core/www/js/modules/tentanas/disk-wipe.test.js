@@ -7,7 +7,7 @@
 // travels as the array's NAME. Runs under happy-dom.
 // =============================================================================
 
-import { fakeScreen, flush, typeInto, confirmWindow, click } from './_test-setup.js';
+import { fakeScreen, flush, typeInto, confirmWindow, click, I18n } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -44,12 +44,17 @@ const claim = {
   memberCount: 9,
   ownerOrgId: 'orgtentanas-rig11',
   ownerAddonId: 'addontentanas',
+  // The node's verdict and the node's words for the owner.
+  ownerForeign: true,
+  // Another instance of the asking organisation, the one kind the node names.
+  ownerKind: 'this_org',
+  ownerInstanceName: 'NAS Pracownia',
 };
 
 const confirmBtn = (win) => win.querySelector('[data-action="confirm"]');
 const armed = (win) => !confirmBtn(win).hasAttribute('disabled');
 
-test('the plan is read first and its removal list names the signature, the label and the UUID', async () => {
+test('the plan is read first and its removal list names the signature and the label, with the UUID as a tooltip', async () => {
   const screen = fakeScreen({
     tentaNasDiskWipePlanRequest: plan(),
     tentaNasDiskWipeRequest: { job: { jobId: 'j1', kind: 'disk_wipe', subject: 'sdc' } },
@@ -67,7 +72,10 @@ test('the plan is read first and its removal list names the signature, the label
   assert.match(win.shadowRoot.querySelector('.tf-window-subtitle-text')?.textContent || '', /S\/N K5/);
   assert.match(win.textContent, /System plików xfs/);
   assert.match(win.textContent, /Etykieta d1/);
-  assert.match(win.textContent, /33333333-3333-4333-8333-333333333333/);
+  // The UUID identifies the filesystem and names nothing: it is the line's
+  // tooltip, never text on the dialog.
+  assert.doesNotMatch(win.textContent, /33333333-3333-4333-8333-333333333333/);
+  assert.match(win.querySelector('.loss-list [title]').getAttribute('title'), /33333333-3333-4333-8333-333333333333/);
   // The dialog says WHY the node can refuse late, so a kernel EBUSY is not
   // read as a transient fault worth retrying.
   assert.match(win.textContent, /wyłączność/);
@@ -129,7 +137,10 @@ test('a dissolved array’s journal claim needs its own acknowledgement, sent as
   assert.match(win.textContent, /Rezerwacja dziennika/);
   assert.match(win.textContent, /produkt/);
   assert.match(win.textContent, /9 dyskami/, 'how much of the array is being given up');
-  assert.match(win.textContent, /orgtentanas-rig11/, 'whose array it is');
+  // Whose array it is — in words. The ids are the tooltip, never the text.
+  assert.match(win.textContent, /Właściciel zapisany w dzienniku: instancja „NAS Pracownia” tej organizacji/, 'whose array it is');
+  assert.doesNotMatch(win.textContent, /orgtentanas-rig11|addontentanas/);
+  assert.equal(win.querySelector('.wizard-warning [title]').getAttribute('title'), 'orgtentanas-rig11 / addontentanas');
   assert.match(win.textContent, /import/i, 'and that an import would otherwise recover it');
 
   // The retyped device name alone is NOT enough: the second victim is the
@@ -151,6 +162,56 @@ test('a dissolved array’s journal claim needs its own acknowledgement, sent as
   assert.equal(wipe.payload.confirmDevice, 'sdc');
 });
 
+// The owner ids are ALWAYS filled in, so reading their presence as "foreign"
+// called this instance's own dissolved arrays another instance's. Foreign is
+// the node's verdict.
+test('this instance’s own journal is not called another instance’s', async () => {
+  const screen = fakeScreen({
+    tentaNasDiskWipePlanRequest: plan({ journalClaim: { ...claim, ownerForeign: false, ownerKind: 'this_instance', ownerInstanceName: '' } }),
+  });
+  const win = await openDiskWipeDialog(screen, DISK, () => {});
+  await flush();
+  assert.match(win.textContent, /Rezerwacja dziennika/, 'the claim itself is still shown');
+  assert.doesNotMatch(win.textContent, /Właściciel zapisany w dzienniku/);
+  assert.doesNotMatch(win.textContent, /orgtentanas-rig11|addontentanas/);
+});
+
+// The node never sends another organisation's names, and the dialog must not
+// make one up either: whatever arrives next to `other_installation` is not
+// printed, and the sentence is composed here from the code — in every locale.
+test('another organisation’s journal is “another installation”, never named, and the sentence follows the locale', async () => {
+  const foreignClaim = { ...claim, ownerKind: 'other_installation', ownerInstanceName: 'Obca Firma NAS' };
+  const screen = fakeScreen({ tentaNasDiskWipePlanRequest: plan({ journalClaim: foreignClaim }) });
+  const win = await openDiskWipeDialog(screen, DISK, () => {});
+  await flush();
+  assert.match(win.textContent, /Właściciel zapisany w dzienniku: inna instalacja TentaNas\./);
+  assert.doesNotMatch(win.textContent, /Obca Firma/);
+  // Nor its ids: an older node may still send them, and the tooltip drops them.
+  assert.doesNotMatch(win.innerHTML, /orgtentanas-rig11|addontentanas/);
+  win.remove();
+
+  await I18n.setLanguage('en');
+  try {
+    const en = await openDiskWipeDialog(fakeScreen({ tentaNasDiskWipePlanRequest: plan({ journalClaim: claim }) }), DISK, () => {});
+    await flush();
+    assert.match(en.textContent, /the “NAS Pracownia” instance of this organisation/);
+    assert.doesNotMatch(en.textContent, /tej organizacji|instancja/, 'no Polish phrase in an English UI');
+    en.remove();
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});
+
+// A node from before the owner code sends only the flag: a foreign owner is
+// then the phrase that claims nothing it does not know.
+test('an owner without a code from an older node reads as another installation', async () => {
+  const older = { ...claim, ownerKind: undefined, ownerInstanceName: undefined };
+  const win = await openDiskWipeDialog(fakeScreen({ tentaNasDiskWipePlanRequest: plan({ journalClaim: older }) }), DISK, () => {});
+  await flush();
+  assert.match(win.textContent, /Właściciel zapisany w dzienniku: inna instalacja TentaNas\./);
+  win.remove();
+});
+
 test('a claim on a plan the node already refused is never offered for acknowledgement', async () => {
   const screen = fakeScreen({
     tentaNasDiskWipePlanRequest: plan({
@@ -164,6 +225,45 @@ test('a claim on a plan the node already refused is never offered for acknowledg
   assert.ok(!win.querySelector('#nas-wipe-ack'), 'nothing to acknowledge on a refused plan');
   typeInto(win.querySelector('#nas-retype'), 'sdc');
   assert.ok(!armed(win));
+});
+
+// Owner's rule, 2026-09-22: a disk of ANOTHER ORGANISATION on this node is
+// refused with the code `journal_other_org`, and nothing names its array. The
+// dialog words that refusal itself, in the admin's language, from the code —
+// not from the node's Polish sentence — and says no array name.
+test('another organisation’s disk on this node is refused in the admin’s language and names no array', async () => {
+  const refusal = { code: 'journal_other_org', detail: 'sdc: dysk należy do macierzy Elastic innej organizacji na tym nodzie — ta organizacja nie może go wyczyścić ani przejąć' };
+  const screen = fakeScreen({ tentaNasDiskWipePlanRequest: plan({ allowed: false, refusals: [refusal] }) });
+  const win = await openDiskWipeDialog(screen, DISK, () => {});
+  await flush();
+  assert.match(win.textContent, /sdc: dysk należy do macierzy Elastic innej organizacji na tym nodzie\. Ta organizacja nie może go wyczyścić ani przejąć tej macierzy\./);
+  assert.ok(!win.querySelector('#nas-wipe-ack'), 'nothing to acknowledge');
+  typeInto(win.querySelector('#nas-retype'), 'sdc');
+  assert.ok(!armed(win), 'refused, however carefully the name is typed');
+  win.remove();
+
+  await I18n.setLanguage('en');
+  try {
+    const en = await openDiskWipeDialog(fakeScreen({ tentaNasDiskWipePlanRequest: plan({ allowed: false, refusals: [refusal] }) }), DISK, () => {});
+    await flush();
+    assert.match(en.textContent, /sdc belongs to an Elastic Array of another organisation on this node/);
+    assert.doesNotMatch(en.textContent, /innej organizacji/, 'the node’s Polish sentence is not what an English admin reads');
+    en.remove();
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});
+
+// The node sends no claim for another tenant's journal. A claim of that kind
+// that arrived anyway (a node with a bug, a hand-built frame) must not print
+// that tenant's array name, nor offer to release its journal.
+test('a claim of another organisation on this node is never shown, even on a plan that arrives allowed', async () => {
+  const leaked = { ...claim, name: 'cudza-macierz', ownerKind: 'other_org_on_node' };
+  const win = await openDiskWipeDialog(fakeScreen({ tentaNasDiskWipePlanRequest: plan({ journalClaim: leaked }) }), DISK, () => {});
+  await flush();
+  assert.doesNotMatch(win.innerHTML, /cudza-macierz/);
+  assert.ok(!win.querySelector('#nas-wipe-ack'));
+  win.remove();
 });
 
 test('a cancelled sudo prompt reads nothing and opens nothing', async () => {

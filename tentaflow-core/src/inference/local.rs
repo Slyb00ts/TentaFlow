@@ -202,7 +202,8 @@ mod reasoning_tests {
 }
 
 /// Literal that opens a call. Prose before it is free; everything after it must
-/// be a valid call.
+/// be a valid call. Only consumed by the llama.cpp grammar builder below.
+#[cfg(feature = "inference-llamacpp")]
 const TOOL_CALL_TRIGGER: &str = "<tool_call>";
 
 /// Pattern that switches the grammar on. The CAPTURE GROUP matters: llama.cpp

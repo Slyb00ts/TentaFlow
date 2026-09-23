@@ -118,7 +118,6 @@ impl ApprovalGate for InteractionGate<'_> {
             raised_at_ms: interaction_now_ms(),
             engine_id: None,
             account_id: None,
-            candidate_accounts: Vec::new(),
             user_id: None,
         };
         let rx = self.registry.register(info);
@@ -173,7 +172,6 @@ impl ApprovalGate for InteractionGate<'_> {
             raised_at_ms: interaction_now_ms(),
             engine_id: Some(ask.engine_id.clone()),
             account_id: ask.account_id.clone(),
-            candidate_accounts: ask.candidate_accounts.clone(),
             user_id: Some(ask.user_id.clone()),
         };
         let rx = self.registry.register(info);
@@ -229,7 +227,6 @@ impl ApprovalGate for InteractionGate<'_> {
             raised_at_ms: interaction_now_ms(),
             engine_id: None,
             account_id: None,
-            candidate_accounts: Vec::new(),
             user_id: None,
         };
         let rx = self.registry.register(info);

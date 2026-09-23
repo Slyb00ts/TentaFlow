@@ -253,6 +253,16 @@ pub fn content_hash(schema_text: &str) -> String {
 /// and was moved here once this module existed, per the frozen contract:
 /// `bus::mod::BusService` and `registry` both need to reach it, and this
 /// module sits below both in the dependency graph.
+///
+/// R6 (accepted, `SUM/tentabus/PLAN-APP-PLATFORM.md`): this counter is
+/// PROCESS-GLOBAL, not per-instance, unlike `schema_ref_id_for`'s content
+/// hash above — a schema edit in instance A bumps the SAME counter instance
+/// B reads, so it invalidates instance B's compiled-schema cache too, even
+/// though instance B's schema tables were untouched. That is a deliberate
+/// over-invalidation, not a bug: adding an instance dimension here would
+/// only save a cache recompile on the next `publish`/`peek` after an
+/// unrelated instance's schema write, and a stale-generation compile is
+/// already the fallback path every cache miss takes.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Current value of [`GENERATION`] — a `BusService::schema_cache` entry is

@@ -107,7 +107,10 @@ fn classify(
 /// already locked. The cost of that guarantee is that an interrupted claim
 /// leaks one empty staging directory, which is the OS tmp cleanup's to reclaim;
 /// sweeping staging names is what would put the original defect back.
-#[cfg(unix)]
+///
+/// Only the Linux network relay claims one; other unix hosts compile it for its
+/// tests, which hold the sweep contract on every unix platform.
+#[cfg(all(unix, any(target_os = "linux", test)))]
 mod private_root {
     use anyhow::{Context, Result};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};

@@ -48,6 +48,7 @@ pub fn record_node_status(db: &crate::db::DbPool, addon_id: &str, status: &str, 
 
 /// One entry of the teardown manifest: what uninstall is about to remove (or
 /// consciously leave behind). Surfaced in the uninstall dialog and audit log.
+#[derive(Default)]
 pub struct TeardownEntry {
     pub path: PathBuf,
     /// Stable id the dashboard localizes (`addon_uninstall.entries.<kind>`).
@@ -63,6 +64,14 @@ pub struct TeardownEntry {
     pub description: std::borrow::Cow<'static, str>,
     /// false = listed as "consciously left behind" instead of deleted.
     pub removed: bool,
+    /// Named counts for the i18n template's `{name}`/`{name|a|b|c}`
+    /// placeholders at `addon_uninstall.entries.<kind>` (W6-i18n-teardown):
+    /// a kind whose description embeds per-instance counts (TentaBus's
+    /// `tentabus_data_dir`) fills this so the dashboard can render a real
+    /// localized, correctly-pluralized sentence instead of the raw English
+    /// `description`. Every other kind leaves it empty and the dashboard
+    /// falls back to a plain (non-templated) translation or `description`.
+    pub count_vars: std::collections::BTreeMap<String, i64>,
 }
 
 /// Lifecycle hooks a native app plugs into the platform. All run on the
@@ -185,6 +194,7 @@ fn data_dir_only_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
         kind: "data_dir",
         description: std::borrow::Cow::Borrowed("instance data directory"),
         removed: true,
+        ..Default::default()
     }])
 }
 

@@ -433,11 +433,7 @@ async fn run_server(args: Args) -> Result<()> {
         "Mesh identity: {}",
         &local_node_id_str[..16.min(local_node_id_str.len())]
     );
-    match tentaflow_core::sync::runtime::init(
-        db.clone(),
-        mesh_security.clone(),
-        settings_cipher.clone(),
-    ) {
+    match tentaflow_core::sync::runtime::init(db.clone(), mesh_security.clone()) {
         Ok(_) => {
             info!("Sync Ledger runtime initialized");
             match tentaflow_core::sync::runtime::run_pending_baseline_cutover() {
@@ -489,20 +485,22 @@ async fn run_server(args: Args) -> Result<()> {
         Err(e) => error!("Sync Ledger runtime init failed: {}", e),
     }
 
-    // TentaBus (plan-app-platform §7 W4/W5): no process-wide `bus::init` call
-    // here anymore — TentaBus is a per-instance native app now
+    // TentaBus (plan-app-platform §7 W4/W5/W6): no process-wide `bus::init`
+    // call here anymore — TentaBus is a per-instance native app
     // (`bus/app-manifest.toml`, `singleton = false`), and every instance's
     // `BusService` (plus, once the mesh exists, its own `replication::init`)
     // is brought up through `bus::init_instance` from the native app
-    // lifecycle hooks (`bus::native`) instead, the same way every other
-    // native app's per-instance state comes up. That lifecycle wiring is
-    // W6's job; until it lands, `bus::global()`/`bus::running_instances()`/
-    // `replication::router::running_managers()` stay empty in this
-    // production binary, which is the same "internal-only builds until W9"
-    // state plan-app-platform §7's own work-package table already
-    // describes. W5 stashes the mesh manager handle
+    // lifecycle hooks (`bus::native`), the same way every other native
+    // app's per-instance state comes up. That lifecycle wiring landed in W6:
+    // `addon_manager.start_installed_native_instances()` (further down this
+    // function) runs `native_on_enable` for every instance that was enabled
+    // before this restart, so `bus::running_instances()` is populated by the
+    // time boot finishes. W5 stashes the mesh manager handle
     // (`replication::router::set_mesh_manager`, below) so `native_on_enable`
-    // has something to start replication against once it exists.
+    // has something to start replication against once it exists; the
+    // one-time `start_replication_for_already_enabled_instances()` call in
+    // the mesh-startup block re-arms replication for instances that came up
+    // before the mesh manager was set.
 
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mut mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
@@ -554,7 +552,7 @@ async fn run_server(args: Args) -> Result<()> {
         let hostname = info.hostname.clone();
         let platform = node_info_collector::detect_platform();
         let os_info = node_info_collector::collect_os_distro();
-        let (docker_available, docker_version) = node_info_collector::collect_docker_info();
+        let docker_version = node_info_collector::docker_server_version();
         let addresses = node_info_collector::collect_local_addresses();
         mesh_peer_store.seed_local(
             &local_node_id_str,
@@ -569,7 +567,6 @@ async fn run_server(args: Args) -> Result<()> {
             info.ram_total_mb,
             info.gpu_info.clone(),
             addresses,
-            docker_available,
             docker_version,
         );
         info!(node_id = %local_node_id_str, "Local node seeded in peer_store");

@@ -1761,7 +1761,10 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             user_role: None,
             // Ścieżka agenta (nie-addon) — bez tożsamości instancji addona.
             addon_id: None,
-            org_id: None,
+            // The run acts inside its principal's organisation: a global
+            // account's grant is decided per organisation, and a flow that
+            // dropped it here refused every shared account as not granted.
+            org_id: principal.org_id.clone(),
             vector_home: None,
             graph_home: None,
             // §2.5 — a run inherits the principal's provenance verbatim, so a

@@ -406,8 +406,82 @@ pub fn delete_organization(pool: &DbPool, org_id: &str) -> Result<bool> {
         // membership write, but the gate-check cache is keyed on org_id in
         // the ctx hash so a wholesale flush is required here.
         crate::services::policy::GateCheckCache::global().invalidate_all();
+        // SUM/tentabus/DECYZJE-2026-09-22.md, `C2-purge-org-no-caller`:
+        // this status flip is the ONLY place in this codebase an org's
+        // erasure becomes irreversible today (see `bus::mod.rs`'s
+        // `purge_org` doc — no separate hard-delete/compliance-erasure
+        // flow exists yet). Hard-purging TentaBus data here, rather than
+        // leaving it under a retention window nothing currently enforces,
+        // is what actually gives `purge_org` a production caller.
+        purge_bus_data_for_org(pool, org_id)?;
     }
     Ok(n > 0)
+}
+
+/// GDPR/RODO erasure step of `delete_organization`: hard-deletes `org_id`'s
+/// data from every TentaBus instance currently running on this node
+/// (`bus::running_instances()` — every dashboard/REST/addon/flow/reactor
+/// entry point shares these engines, so nothing bus-side is left reachable
+/// once this returns `Ok`). Each instance's outcome is written to
+/// `audit_log` individually, success or failure, so a partial erasure is
+/// never silent; any failure is aggregated into ONE
+/// `OrgError::BusPurgeFailed` rather than being swallowed after the first.
+///
+/// Retry-safe: `BusService::purge_org` only deletes rows/keys/directories
+/// that still exist, so calling `delete_organization` again on an org whose
+/// status is already `'deleted'` does nothing (the `UPDATE ... WHERE status
+/// != 'deleted'` above matches zero rows and this function is never
+/// reached) — a failed purge must be retried by calling
+/// `purge_bus_data_for_org` directly, not by calling `delete_organization`
+/// a second time.
+fn purge_bus_data_for_org(pool: &DbPool, org_id: &str) -> Result<()> {
+    let mut failures = Vec::new();
+    for instance in crate::bus::running_instances() {
+        match instance.purge_org(org_id) {
+            Ok(report) => {
+                let _ = crate::db::repository::log_audit(
+                    pool,
+                    None,
+                    None,
+                    "bus.org.purge",
+                    Some(org_id),
+                    Some(&format!(
+                        "instance={} topics_deleted={} groups_deleted={} dir_removed={}",
+                        instance.instance_id(),
+                        report.topics_deleted,
+                        report.groups_deleted,
+                        report.dir_removed
+                    )),
+                    None,
+                    None,
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    org_id, instance = %instance.instance_id(), error = %e,
+                    "delete_organization: BusService::purge_org failed"
+                );
+                failures.push(format!("{}: {e}", instance.instance_id()));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        let _ = crate::db::repository::log_audit(
+            pool,
+            None,
+            None,
+            "bus.org.purge_failed",
+            Some(org_id),
+            Some(&failures.join("; ")),
+            None,
+            None,
+        );
+        return Err(OrgError::BusPurgeFailed {
+            org_id: org_id.to_string(),
+            failures,
+        });
+    }
+    Ok(())
 }
 
 pub fn add_membership(
@@ -786,8 +860,101 @@ mod tests {
         assert!(delete_organization(&pool, &org.org_id).unwrap());
         let got = get_organization(&pool, &org.org_id).unwrap().unwrap();
         assert_eq!(got.status, "deleted");
-        // Second delete is a no-op (status already 'deleted').
+        // Second delete is a no-op (status already 'deleted') — and must not
+        // attempt a second bus purge, since `purge_bus_data_for_org` is only
+        // reached from the branch that actually flips the row.
         assert!(!delete_organization(&pool, &org.org_id).unwrap());
+    }
+
+    /// SUM/tentabus/DECYZJE-2026-09-22.md, `C2-purge-org-no-caller`: a
+    /// running TentaBus instance's topic for this org must actually be gone
+    /// once `delete_organization` returns — proves `purge_org` now has a
+    /// real caller instead of the documented zero.
+    struct TestBusInstanceGuard(crate::bus::instance::BusInstanceId);
+    impl Drop for TestBusInstanceGuard {
+        fn drop(&mut self) {
+            crate::bus::stop_instance(&self.0);
+        }
+    }
+
+    struct AllowAllTestAuthorizer;
+    impl crate::bus::BusAuthorizer for AllowAllTestAuthorizer {
+        fn authorize(
+            &self,
+            _ctx: &crate::bus::BusCallContext,
+            _action: crate::bus::BusAction,
+            _topic: &str,
+        ) -> std::result::Result<(), crate::bus::BusServiceError> {
+            Ok(())
+        }
+        fn authorize_group(
+            &self,
+            _ctx: &crate::bus::BusCallContext,
+            _action: crate::bus::BusAction,
+            _topic: &str,
+            _group: &str,
+        ) -> std::result::Result<(), crate::bus::BusServiceError> {
+            Ok(())
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn delete_organization_purges_bus_data_on_every_running_instance() {
+        let (_d, pool) = open_pool();
+        let org = create_organization(&pool, "BusOrg", "busorg", None, None, None, None).unwrap();
+
+        let bus_tmp = TempDir::new().expect("bus tempdir");
+        let instance_id =
+            crate::bus::instance::BusInstanceId::parse("tentabus-eeeeeeee").expect("instance id");
+        let local_conn = rusqlite::Connection::open_in_memory().expect("local db");
+        crate::bus::db::migrate(&local_conn).expect("migrate local db");
+        let local_db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(local_conn));
+        let svc = crate::bus::init_instance(crate::bus::BusInitConfig {
+            instance_id: instance_id.clone(),
+            bus_dir: bus_tmp.path().join("bus"),
+            db: pool.clone(),
+            local_db,
+            authorizer: std::sync::Arc::new(AllowAllTestAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 1_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: std::time::Duration::from_secs(5),
+        })
+        .expect("start test bus instance");
+        let _guard = TestBusInstanceGuard(instance_id.clone());
+
+        let call_ctx = crate::bus::BusCallContext {
+            instance_id: instance_id.clone(),
+            org_id: org.org_id.clone(),
+            actor: Some("test-actor".to_string()),
+            correlation_id: None,
+            origin: "test".to_string(),
+        };
+        svc.create_topic(
+            &call_ctx,
+            "orders.created",
+            crate::bus::topics::TopicOptions::default(),
+        )
+        .expect("create topic");
+        assert_eq!(
+            crate::db::repository::bus_topic_list(&pool, instance_id.as_str(), &org.org_id)
+                .unwrap()
+                .len(),
+            1,
+            "topic must exist before the org is deleted"
+        );
+
+        assert!(delete_organization(&pool, &org.org_id).unwrap());
+
+        assert!(
+            crate::db::repository::bus_topic_list(&pool, instance_id.as_str(), &org.org_id)
+                .unwrap()
+                .is_empty(),
+            "delete_organization must purge this instance's topic rows for the org"
+        );
     }
 
     #[test]

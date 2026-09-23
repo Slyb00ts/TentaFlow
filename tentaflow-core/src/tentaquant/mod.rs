@@ -78,6 +78,7 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
         kind: "tentaquant_data_dir",
         description: "laboratory data directory (tentaquant.db: projects, notebooks, runs — and the files/ content store)".into(),
         removed: true,
+        ..Default::default()
     }])
 }
 

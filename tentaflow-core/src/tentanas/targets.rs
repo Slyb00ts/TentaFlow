@@ -478,6 +478,7 @@ pub fn capabilities(
         dhchap_detail,
         interfaces: interfaces(),
         volumes: volumes(datasets, targets),
+        wwn_host: wwn_host(&super::config_io::hostname()),
     }
 }
 
@@ -520,14 +521,29 @@ pub fn name_valid(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-.".contains(&b))
 }
 
-/// The IQN or NQN this node publishes for a target of the given name.
-pub fn wwn_for(protocol: &str, node: &str, name: &str) -> String {
-    let prefix = if protocol == "nvmet" { "nqn" } else { "iqn" };
-    let node = node
+/// The host segment of every IQN / NQN this node publishes: its kernel
+/// hostname, lowercased and filtered down to what an IQN's naming-authority
+/// string may hold.
+///
+/// ONE function for both uses — `wwn_for` names the real object with it, and
+/// `capabilities` sends it to the wizard as `wwn_host`, so the step-3 preview
+/// prints the segment the node will actually use instead of guessing one from
+/// a fleet display label (which an admin can edit) or from the node id. Empty
+/// when the hostname is empty or holds nothing an IQN may carry; a target
+/// cannot be created then (`target_create` refuses), because
+/// `iqn.…:.name` is not a valid IQN.
+pub fn wwn_host(hostname: &str) -> String {
+    hostname
         .to_ascii_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect::<String>();
+        .collect::<String>()
+}
+
+/// The IQN or NQN this node publishes for a target of the given name.
+pub fn wwn_for(protocol: &str, node: &str, name: &str) -> String {
+    let prefix = if protocol == "nvmet" { "nqn" } else { "iqn" };
+    let node = wwn_host(node);
     format!("{prefix}.{WWN_AUTHORITY}:{node}.{name}")
 }
 
@@ -3847,22 +3863,56 @@ mod tests {
             js.contains("`${prefix}.${WWN_AUTHORITY}:${host}.${state.name}`"),
             "the preview must be built from that constant, not from a literal"
         );
-
-        // The DERIVATION, not just the constant. The node name is sanitised on
-        // both sides and the two do it differently — `to_ascii_lowercase` plus
-        // an ASCII filter here, `.toLowerCase()` plus a regex there — so a
-        // shared constant proves nothing about a name with an underscore, a
-        // dot or a capital in it. This asserts the whole string against a
-        // literal, and `the step-3 IQN preview derives the same WWN the node
-        // would create` in target-wizard.test.js drives the real wizard to THE
-        // SAME literal. Either side drifting fails one of the two.
+        // The HOST segment is not derived in the browser at all: the preview
+        // prints the node's own `wwn_host` (sent in the block capabilities),
+        // so the one sanitiser below is the only one there is.
+        assert!(
+            js.contains("caps?.wwnHost"),
+            "the preview must read the node's own wwnHost, not derive a host segment"
+        );
         assert_eq!(
             wwn_for("iscsi", "Helios_02.lan", "vm-store"),
-            "iqn.2026-09.local.tentaflow:helios02lan.vm-store"
+            format!("iqn.{WWN_AUTHORITY}:{}.vm-store", wwn_host("Helios_02.lan"))
         );
         assert_eq!(
             wwn_for("nvmet", "Helios_02.lan", "vm-store"),
-            "nqn.2026-09.local.tentaflow:helios02lan.vm-store"
+            format!("nqn.{WWN_AUTHORITY}:{}.vm-store", wwn_host("Helios_02.lan"))
+        );
+    }
+
+    #[test]
+    fn the_wwn_host_the_wizard_previews_is_the_segment_wwn_for_uses() {
+        assert_eq!(wwn_host("Helios_02.lan"), "helios02lan");
+        assert_eq!(wwn_host("orion"), "orion");
+        // Nothing an IQN may carry: empty, which `target_create` refuses and
+        // the wizard shows as a placeholder — never `iqn.…:.name`.
+        assert_eq!(wwn_host(""), "");
+        assert_eq!(wwn_host("___..."), "");
+        // The hyphen and digits survive; anything outside ASCII does not,
+        // because an IQN naming authority may not carry it.
+        assert_eq!(wwn_host("NAS-07"), "nas-07");
+        assert_eq!(wwn_host("Łódź-nas"), "d-nas");
+        // Whatever the hostname, the segment `wwn_for` publishes is exactly
+        // the one the wizard is sent — so the preview cannot disagree with
+        // the object the node creates.
+        for host in ["Helios_02.lan", "orion", "NAS-07", "Łódź-nas", "a.b.c"] {
+            let segment = wwn_host(host);
+            assert_eq!(wwn_for("iscsi", host, "vm"), format!("iqn.{WWN_AUTHORITY}:{segment}.vm"));
+            assert_eq!(wwn_for("nvmet", host, "vm"), format!("nqn.{WWN_AUTHORITY}:{segment}.vm"));
+        }
+        // And the capability set fills `wwn_host` through this same function
+        // from the node's hostname. Read from the source rather than by
+        // calling `capabilities`, which probes /sys, /proc and the network of
+        // whatever machine runs the tests.
+        let source = include_str!("targets.rs");
+        let body = source
+            .split("pub fn capabilities(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("capabilities is defined in this file");
+        assert!(
+            body.contains("wwn_host: wwn_host(&super::config_io::hostname()),"),
+            "capabilities must send the segment wwn_for uses, computed by wwn_host"
         );
     }
 

@@ -94,6 +94,11 @@ pub struct ProviderAccountInfo {
     /// sessions it is compared against do not, so each node counts its own.
     #[serde(default)]
     pub max_sessions: i64,
+    /// How many different people hold `session_count` sessions on the answering
+    /// node — A01's "5 · 3 osoby". Measured where the sessions are counted, and
+    /// for the same reason local to the answering node.
+    #[serde(default)]
+    pub session_user_count: u32,
 }
 
 /// One row of the Dostęp tab (A04). `subject_type` is 'user' | 'group' | 'org';
@@ -498,7 +503,7 @@ mod tests {
 
         // (struct, field count, digest of its attributes + "name: Type" fields)
         let pinned: &[(&str, usize, u64)] = &[
-            ("ProviderAccountInfo", 21, 0x8c7a_396f_e84b_d8d3),
+            ("ProviderAccountInfo", 22, 0xb807_8aac_1777_338f),
             ("GrantEntry", 6, 0x6c64_44d1_5f29_be89),
             ("AccountSessionInfo", 11, 0x3227_205e_b73c_ec8d),
             ("AccountNodeInfo", 6, 0x2d0a_7b9e_3aa3_acb6),

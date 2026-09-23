@@ -7,7 +7,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml } from '/js/modules/tentanas/format.js';
+import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml, nodeLabel } from '/js/modules/tentanas/format.js';
 import { setAttr, patchHtml } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openShareWizard } from '/js/modules/tentanas/share-wizard.js';
@@ -54,13 +54,13 @@ export const smbDirectChipHtml = (share) => (share.smb?.smbDirect
  */
 export function fleetSummary(share) {
   const mounts = share.mounts || [];
-  const title = mounts.map((m) => `${m.nodeName} ${mountGlyph(m.state)}${m.state === 'mounted' && m.transport ? ` ${transportLabel(m.transport === 'rdma')}` : ''}${m.detail ? ` ${m.detail}` : ''}`).join(' · ');
+  const title = mounts.map((m) => `${nodeLabel(m)} ${mountGlyph(m.state)}${m.state === 'mounted' && m.transport ? ` ${transportLabel(m.transport === 'rdma')}` : ''}${m.detail ? ` ${m.detail}` : ''}`).join(' · ');
   if (!share.fleetMount) return { tone: 'neutral', label: T('shares.fleet_off'), title };
   const errors = mounts.filter((m) => m.state === 'error');
   const pending = mounts.filter((m) => m.state === 'pending');
   const mounted = mounts.filter((m) => m.state === 'mounted');
-  if (errors.length) return { tone: 'err', label: errors.length === 1 ? T('shares.fleet_error_one', { node: errors[0].nodeName }) : T('shares.fleet_error_many', { n: errors.length }), title };
-  if (pending.length) return { tone: 'warn', label: pending.length === 1 ? T('shares.fleet_pending_one', { node: pending[0].nodeName }) : T('shares.fleet_pending_many', { n: pending.length }), title };
+  if (errors.length) return { tone: 'err', label: errors.length === 1 ? T('shares.fleet_error_one', { node: nodeLabel(errors[0]) }) : T('shares.fleet_error_many', { n: errors.length }), title };
+  if (pending.length) return { tone: 'warn', label: pending.length === 1 ? T('shares.fleet_pending_one', { node: nodeLabel(pending[0]) }) : T('shares.fleet_pending_many', { n: pending.length }), title };
   if (mounted.length) return { tone: 'ok', label: T('shares.fleet_mounted', { n: mounted.length }), title };
   return { tone: 'info', label: T('shares.fleet_source_only'), title };
 }
@@ -381,7 +381,7 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
           ${screen.isAdmin ? `<div class="actions"><tf-button size="sm" variant="ghost" icon="refresh" data-act="refresh-mounts">${escapeHtml(T('shares.refresh_mounts'))}</tf-button></div>` : ''}
         </div>
         ${mounts.length ? `<div class="stat-rows" id="nas-sd-mounts">${mounts.map((m) => `
-          <div class="sr" data-node="${escapeAttr(m.nodeId)}"><span class="k mono">${escapeHtml(m.nodeName)}</span><span class="v">${mountChipHtml(m.state, m.transport)}${m.mountpoint ? `<span class="mono text-3">${escapeHtml(m.mountpoint)}</span>` : ''}${m.detail ? `<span class="text-3">${escapeHtml(m.detail)}</span>` : ''}${
+          <div class="sr" data-node="${escapeAttr(m.nodeId)}"><span class="k mono" title="${escapeAttr(m.nodeId)}">${escapeHtml(nodeLabel(m))}</span><span class="v">${mountChipHtml(m.state, m.transport)}${m.mountpoint ? `<span class="mono text-3">${escapeHtml(m.mountpoint)}</span>` : ''}${m.detail ? `<span class="text-3">${escapeHtml(m.detail)}</span>` : ''}${
             screen.isAdmin && m.nodeId === localNodeId && (m.state === 'pending' || m.state === 'error') ? `<tf-button size="sm" variant="ghost" icon="refresh" data-act="retry-mount">${escapeHtml(T('shares.retry_mount'))}</tf-button>` : ''}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('shares.fleet_none'))}</div>`}
         <div class="section-card-head"><div class="title">${sprite('users')} ${escapeHtml(T('shares.sessions_title'))} <tf-chip size="sm" status="neutral" label="${state.sessions.length}"></tf-chip></div></div>
@@ -509,7 +509,7 @@ export function openShareDeleteDialog(screen, share, onDone) {
     ${warningHtml('danger', T('shares.delete_warning', { name: share.name, proto: protocolLabel(share.protocol) }))}
     <ul class="loss-list">
       <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('shares.delete_loss_export', { proto: protocolLabel(share.protocol) }))}</span></li>
-      ${mounted.length ? `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('shares.delete_loss_mounts', { n: mounted.length, nodes: mounted.map((m) => m.nodeName).join(', ') }))}</span></li>` : ''}
+      ${mounted.length ? `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('shares.delete_loss_mounts', { n: mounted.length, nodes: mounted.map(nodeLabel).join(', ') }))}</span></li>` : ''}
       <li class="ll good">${sprite('check')}<span>${escapeHtml(T('shares.delete_keep_data', { path: share.sourcePath }))}</span></li>
     </ul>`;
   return openRetypeDialog({

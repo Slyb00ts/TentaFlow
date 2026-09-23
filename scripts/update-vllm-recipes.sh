@@ -52,16 +52,6 @@ def strip_serve_prefix(argv):
         out = out[3:] if len(out) >= 3 else out[2:]
     return out
 
-def clean_overrides(raw):
-    # Upstream occasionally carries a bare marker (e.g. "verified") where Core's
-    # schema expects an {extra_args, extra_env} object. Core parses the snapshot
-    # as ONE document, so a single stray value fails the whole parse and leaves
-    # the embedded catalog empty — silently, at runtime. Normalize here, where
-    # the upstream shape is known, rather than loosening the consumer.
-    return {
-        family: ov for family, ov in (raw or {}).items() if isinstance(ov, dict)
-    }
-
 def fetch_one(entry):
     hf_id = entry.get("hf_id")
     jpath = entry.get("json")
@@ -77,7 +67,11 @@ def fetch_one(entry):
         "hf_id": hf_id,
         "base_argv": strip_serve_prefix(rc.get("argv")),
         "base_env": rc.get("env") or {},
-        "hardware_overrides": clean_overrides(d.get("hardware_overrides")),
+        # Upstream sometimes puts a status string where an override object
+        # belongs (`"dgx_spark_gb10": "verified"`); only objects are overrides.
+        "hardware_overrides": {
+            k: v for k, v in (d.get("hardware_overrides") or {}).items() if isinstance(v, dict)
+        },
         "variants": {},
     }
     # Variants carry an alternative model_id (different weights/precision) plus

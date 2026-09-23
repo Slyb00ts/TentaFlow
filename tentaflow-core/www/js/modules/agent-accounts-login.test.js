@@ -270,7 +270,6 @@ test('a transport rejection without a message key falls back to the generic erro
     code: 'PolicyDenied',
     message: 'not your account',
     detail: '',
-    appendDetail: false,
   });
   assert.equal(describeError(new Error('the socket is gone')).code, '');
   assert.equal(describeError(new Error('the socket is gone')).message, 'the socket is gone');
@@ -283,7 +282,6 @@ test('the fleet refusal is translated and the node\'s own sentence is kept under
     code: 'BadRequest',
     message: pl.receives_home_refused,
     detail: sentence,
-    appendDetail: true,
   });
   // The node's sentence names the remedy for the kinds homed there, so the same
   // translated line has to carry it whether the store said "sign those accounts
@@ -294,7 +292,6 @@ test('the fleet refusal is translated and the node\'s own sentence is kept under
     code: 'BadRequest',
     message: pl.receives_home_refused,
     detail: keyOnly,
-    appendDetail: true,
   });
   // The marker is only the fleet toggle's when the code agrees: an unrelated
   // refusal that happens to contain the same words must not borrow the text.
@@ -304,17 +301,13 @@ test('the fleet refusal is translated and the node\'s own sentence is kept under
   );
 });
 
-// `errorText` is the toast string. Only the fleet refusal declares
-// `appendDetail`, so its generic remedy reaches the operator and every other
-// translation stays a single line — the node's English sentence is what a window
-// keeps for its `title`, not what an operator reads in their own language.
-test('only the fleet refusal carries the node\'s sentence into a toast', () => {
+// `errorText` is the toast string: the translation alone. The node's English
+// sentence — with a 64-hex node id in it — is what a window keeps for its
+// `title`, never what an operator reads in their own language.
+test('a toast carries the translation and never the node\'s English sentence', () => {
   const fleet = "node '6b09c33d' is the home of 2 agent account(s); paste their API key "
     + 'on another node before taking it out of the account fleet';
-  assert.equal(
-    errorText(new Error(`protocol error BadRequest: ${fleet}`)),
-    `${pl.receives_home_refused}\n${fleet}`,
-  );
+  assert.equal(errorText(new Error(`protocol error BadRequest: ${fleet}`)), pl.receives_home_refused);
 
   const disabled = 'protocol error PolicyDenied: this account is disabled';
   assert.equal(errorText(new Error(disabled)), pl.login.account_disabled);

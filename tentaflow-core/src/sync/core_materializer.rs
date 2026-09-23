@@ -141,10 +141,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
     )
 }
 
-pub fn apply_core_operation(
-    pool: &DbPool,
-    operation: &SyncOperation,
-) -> LedgerResult<usize> {
+pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerResult<usize> {
     if operation.body.addon_id != CORE_SYNC_ADDON_ID {
         return Err(SyncLedgerError::Runtime(format!(
             "operation is not core sync: {}",
@@ -213,9 +210,7 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::SyncPolicy => apply_sync_policy(&tx, operation)?,
         CoreSyncResourceKind::SyncResourceAcl => apply_sync_resource_acl(&tx, operation)?,
         CoreSyncResourceKind::SyncExplicitShare => apply_sync_explicit_share(&tx, operation)?,
-        CoreSyncResourceKind::SharedSettingSecret => {
-            apply_shared_setting_secret(&tx, operation)?
-        }
+        CoreSyncResourceKind::SharedSettingSecret => apply_shared_setting_secret(&tx, operation)?,
         CoreSyncResourceKind::AddonInstance => apply_addon_instance(&tx, operation)?,
         CoreSyncResourceKind::AddonConfig => apply_addon_config(&tx, operation)?,
         CoreSyncResourceKind::AddonPermission => apply_addon_permission(&tx, operation)?,
@@ -296,9 +291,7 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::Cluster => apply_cluster(&tx, operation)?,
         CoreSyncResourceKind::ClusterMember => apply_cluster_member(&tx, operation)?,
         CoreSyncResourceKind::ProviderAccount => apply_provider_account(&tx, operation)?,
-        CoreSyncResourceKind::ProviderAccountGrant => {
-            apply_provider_account_grant(&tx, operation)?
-        }
+        CoreSyncResourceKind::ProviderAccountGrant => apply_provider_account_grant(&tx, operation)?,
         CoreSyncResourceKind::AgentRuntimeNode => apply_agent_runtime_node(&tx, operation)?,
         CoreSyncResourceKind::AgentRuntimeEngine => apply_agent_runtime_engine(&tx, operation)?,
         CoreSyncResourceKind::MapSite => apply_map_site(&tx, operation)?,
@@ -658,12 +651,21 @@ fn apply_api_key(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> L
 }
 
 /// Apply a replicated resource ACL rule. The four key components travel in the
-/// fields (`resource_type`, `resource_id`, `subject_type`, `subject_id`); the
-/// resource_id is the length-prefixed composite for per-rule LWW. A `clear` on
-/// the origin replicates as Delete (tombstone): the LWW gate in
-/// `apply_core_operation` records the clear's HLC in `core_resource_versions`, so
-/// a later-arriving but OLDER `allow` for the same rule loses the comparison and
-/// is dropped — the cleared rule is never resurrected.
+/// fields (`resource_type`, `resource_id`, `subject_type`, `subject_id`), plus
+/// `action` (migration 168, `topic-acl-actions`) defaulting to `"*"` for a
+/// pre-168 op that never carried the field. A `clear` on the origin replicates
+/// as Delete (tombstone): the LWW gate in `apply_core_operation` records the
+/// clear's HLC in `core_resource_versions`, so a later-arriving but OLDER
+/// `allow` for the same rule loses the comparison and is dropped — the
+/// cleared rule is never resurrected.
+///
+/// The composite id's shape depends on `action` the SAME way
+/// `db::repository::resource_permission_resource_id_for_action` computes it
+/// on the capture side: `action = "*"` (every pre-168 op, and every non-bus
+/// resource type) is the plain 4-segment id, so an already-replicated op's
+/// LWW slot never moves; a genuinely action-scoped op gets its own 5-segment
+/// id, so independent read/write/admin grants for the same (resource,
+/// subject) pair never contend for one LWW slot.
 fn apply_resource_permission(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
@@ -672,17 +674,28 @@ fn apply_resource_permission(
     let resource_id = field_string(operation, "resource_id")?;
     let subject_type = field_string(operation, "subject_type")?;
     let subject_id = field_string(operation, "subject_id")?;
+    let action = field_string_or(operation, "action", "*")?;
     // Bind the LWW slot to the rule we actually write: the gate in
     // `apply_core_operation` keys on `operation.body.resource_id`, so a stale op
     // whose composite id points at rule C but whose fields encode rule B would
     // pass C's freshness check and then resurrect B. Reject any op whose fields
     // do not recompute to the composite id it claims.
-    let expected_id = crate::sync::resource_id::composite_resource_id(&[
-        &resource_type,
-        &resource_id,
-        &subject_type,
-        &subject_id,
-    ]);
+    let expected_id = if action == "*" {
+        crate::sync::resource_id::composite_resource_id(&[
+            &resource_type,
+            &resource_id,
+            &subject_type,
+            &subject_id,
+        ])
+    } else {
+        crate::sync::resource_id::composite_resource_id(&[
+            &resource_type,
+            &resource_id,
+            &subject_type,
+            &subject_id,
+            &action,
+        ])
+    };
     if expected_id != operation.body.resource_id {
         return Err(SyncLedgerError::Runtime(format!(
             "resource_permission composite id mismatch: body={}, fields={}",
@@ -693,15 +706,16 @@ fn apply_resource_permission(
         ActionType::Insert | ActionType::Update => tx
             .execute(
                 "INSERT INTO resource_permissions \
-                 (resource_type, resource_id, subject_type, subject_id, access_level) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(resource_type, resource_id, subject_type, subject_id) \
+                 (resource_type, resource_id, subject_type, subject_id, action, access_level) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(resource_type, resource_id, subject_type, subject_id, action) \
                  DO UPDATE SET access_level = excluded.access_level",
                 rusqlite::params![
                     resource_type,
                     resource_id,
                     subject_type,
                     subject_id,
+                    action,
                     field_string(operation, "access_level")?,
                 ],
             )
@@ -710,8 +724,8 @@ fn apply_resource_permission(
             .execute(
                 "DELETE FROM resource_permissions \
                  WHERE resource_type = ?1 AND resource_id = ?2 \
-                   AND subject_type = ?3 AND subject_id = ?4",
-                rusqlite::params![resource_type, resource_id, subject_type, subject_id],
+                   AND subject_type = ?3 AND subject_id = ?4 AND action = ?5",
+                rusqlite::params![resource_type, resource_id, subject_type, subject_id, action],
             )
             .map_err(sql_error),
     }
@@ -1203,7 +1217,13 @@ fn check_node_row_enums(operation: &SyncOperation) -> LedgerResult<()> {
         ),
         (
             "sync_profile",
-            &["standard", "limited", "authority", "storage_only", "ephemeral"][..],
+            &[
+                "standard",
+                "limited",
+                "authority",
+                "storage_only",
+                "ephemeral",
+            ][..],
         ),
         ("public_key_type", &["ed25519", "secp256k1"][..]),
     ] {
@@ -1217,7 +1237,10 @@ fn check_node_row_enums(operation: &SyncOperation) -> LedgerResult<()> {
 /// Is `node_id` on the organization's operator list, as THIS node currently
 /// knows it? Read inside the apply transaction, so it sees every operation
 /// already materialized ahead of this one.
-pub(crate) fn node_is_operator(tx: &rusqlite::Transaction<'_>, node_id: &str) -> LedgerResult<bool> {
+pub(crate) fn node_is_operator(
+    tx: &rusqlite::Transaction<'_>,
+    node_id: &str,
+) -> LedgerResult<bool> {
     let flag: Option<i64> = tx
         .query_row(
             "SELECT operator FROM sync_nodes WHERE node_id = ?1",
@@ -1576,7 +1599,26 @@ fn apply_peer_node_row(
                 "DELETE FROM sync_nodes WHERE node_id = ?1",
                 rusqlite::params![operation.body.resource_id],
             )
-            .map_err(sql_error),
+            .map_err(sql_error)
+            .and_then(|removed| {
+                // The same cleanup the LOCAL removal runs
+                // (`db::repository::delete_sync_node`), in the same transaction
+                // and for the same reason: `agent_runtime_nodes` and the accounts
+                // homed on this node have no FK to `sync_nodes` (migration 156),
+                // so a bare DELETE leaves a row in the fleet view and — worse —
+                // leaves `home_node_id` pointing at a node that is gone from the
+                // registry, with no lost-home state on the account card. The
+                // invariant has to hold no matter WHICH node applied the removal,
+                // so this is the store's own call rather than a second copy of it.
+                if removed > 0 {
+                    crate::provider_accounts::repository::forget_node_tx(
+                        tx,
+                        operation.body.resource_id.as_str(),
+                    )
+                    .map_err(|error| SyncLedgerError::Runtime(format!("{error:#}")))?;
+                }
+                Ok(removed)
+            }),
     }
 }
 
@@ -3454,6 +3496,61 @@ fn apply_code_workspace_allowlist(
     }
 }
 
+/// SUM/tentabus/DECYZJE-2026-09-22.md, `R4-9e-ledger-leak`: "full isolation —
+/// a node materializes only the metadata of the TentaBus instances it
+/// hosts." Every `apply_bus_*` function below calls this FIRST, on the
+/// `row.instance_id`/`incoming.instance_id` its own payload names, and
+/// returns `Ok(0)` (the same "accept the op, write nothing" shape
+/// `apply_core_operation`'s own stale-HLC skip above already uses) when it
+/// is `false` — the op is still acked/consumed normally, so replication
+/// bookkeeping never retries it forever, but no row for a SIBLING node's
+/// instance is ever written here.
+///
+/// SELF-AUTHORED OPS ALWAYS PASS, before the catalog check below is even
+/// read: `bus::replication::assignment::AssignmentStore::propose`
+/// deliberately materializes the author's OWN op locally at mint time
+/// (`sync::runtime::apply_core_operation_locally`'s doc — "LOCAL
+/// MATERIALIZATION AT MINT TIME", the fix for a measured ~40s leadership
+/// regression) via this SAME `apply_core_operation` entry point a peer's
+/// inbound op also goes through. At THAT instant a brand-new instance's
+/// `addons` catalog row may not exist yet — a topic being created IS this
+/// node hosting the instance, whether or not a separate install record has
+/// caught up — so gating a node's own freshly-minted op on that catalog
+/// row would make the very first write of a new instance vanish. A peer
+/// cannot forge this bypass: `actor_node_id` is set by the authoring node
+/// and is covered by the op's signature (`validate_integrity`), so a
+/// SIBLING node's op still carries the SIBLING's id here, never ours.
+///
+/// "Hosts" (for a REMOTE-authored op) means an `addons` row exists for
+/// `(package_id = "tentabus", addon_id = instance_id)` — installed,
+/// REGARDLESS of enabled/disabled: a disabled instance (`disable_semantics
+/// = "drain"`) still needs its own local data to keep draining, so gating
+/// on `is_enabled` too would delete a live instance's data out from under
+/// it the moment an operator disables it. An instance never installed on
+/// this node at all has no such row — that is exactly the sibling-node
+/// case this rung closes. Reads through the SAME transaction the caller is
+/// about to write into (rather than a fresh `DbPool` connection), so the
+/// check observes this transaction's own prior writes and stays inside the
+/// one all-or-nothing commit boundary every other guard in this file
+/// already uses.
+fn bus_instance_is_local(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+    instance_id: &str,
+) -> LedgerResult<bool> {
+    if crate::sync::runtime::local_node_id().as_deref()
+        == Some(operation.body.actor_node_id.as_str())
+    {
+        return Ok(true);
+    }
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM addons WHERE package_id = ?1 AND addon_id = ?2)",
+        rusqlite::params![crate::bus::instance::BusInstanceId::PACKAGE_ID, instance_id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
 /// Materializes a replicated `core.bus_topic` op into `bus_topics`
 /// (migration v141; M2 makes this table ledger-tracked, K-M2-4). Payload
 /// shape: unlike every `apply_*` function above (one `FieldValue` per
@@ -3477,6 +3574,9 @@ fn apply_bus_topic(
     let row_json = field_string(operation, "row_json")?;
     let mut row: crate::db::repository::DbBusTopic = serde_json::from_str(&row_json)
         .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_topic payload: {e}")))?;
+    if !bus_instance_is_local(tx, operation, &row.instance_id)? {
+        return Ok(0);
+    }
     // Defensive: the op's own resource_id must match the composite key
     // embedded in the payload (mirrors `apply_resource_permission`'s
     // `expected_id` check) so a malformed/mismatched payload cannot land
@@ -3597,6 +3697,9 @@ fn apply_bus_field_policy(
     let row_json = field_string(operation, "row_json")?;
     let row: crate::db::repository::DbBusFieldPolicy = serde_json::from_str(&row_json)
         .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_field_policy payload: {e}")))?;
+    if !bus_instance_is_local(tx, operation, &row.instance_id)? {
+        return Ok(0);
+    }
     let expected_id = crate::sync::resource_id::composite_resource_id(&[
         &row.instance_id,
         &row.org_id,
@@ -3668,6 +3771,9 @@ fn apply_bus_schema_subject(
         serde_json::from_str(&row_json).map_err(|e| {
             SyncLedgerError::Runtime(format!("invalid bus_schema_subject payload: {e}"))
         })?;
+    if !bus_instance_is_local(tx, operation, &row.instance_id)? {
+        return Ok(0);
+    }
     let expected_id = crate::sync::resource_id::composite_resource_id(&[
         &row.instance_id,
         &row.org_id,
@@ -3745,6 +3851,9 @@ fn apply_bus_schema_version(
         serde_json::from_str(&row_json).map_err(|e| {
             SyncLedgerError::Runtime(format!("invalid bus_schema_version payload: {e}"))
         })?;
+    if !bus_instance_is_local(tx, operation, &row.instance_id)? {
+        return Ok(0);
+    }
     let version_str = row.version.to_string();
     let expected_id = crate::sync::resource_id::composite_resource_id(&[
         &row.instance_id,
@@ -3892,6 +4001,14 @@ fn apply_bus_partition_assignment(
         serde_json::from_str(&payload).map_err(|e| {
             SyncLedgerError::Runtime(format!("invalid bus_partition_assignment payload: {e}"))
         })?;
+    if !bus_instance_is_local(tx, operation, &incoming.instance_id)? {
+        // Skip BEFORE the `bus_topics` lookup below: for a non-local
+        // instance that topic row is never materialized either (this same
+        // guard in `apply_bus_topic`), so reaching that lookup would read
+        // "topic not yet materialized" and retry this op forever instead of
+        // recognizing it as permanently not-ours.
+        return Ok(0);
+    }
     let expected_id = crate::sync::resource_id::composite_resource_id(&[
         &incoming.instance_id,
         &incoming.org_id,
@@ -4480,10 +4597,7 @@ fn require_map_scene(tx: &rusqlite::Transaction<'_>, scene_id: &str) -> LedgerRe
     }
 }
 
-fn require_provider_account(
-    tx: &rusqlite::Transaction<'_>,
-    account_id: &str,
-) -> LedgerResult<()> {
+fn require_provider_account(tx: &rusqlite::Transaction<'_>, account_id: &str) -> LedgerResult<()> {
     let exists: bool = tx
         .query_row(
             "SELECT 1 FROM provider_accounts WHERE account_id = ?1",
@@ -4713,7 +4827,10 @@ fn field_optional_f64(operation: &SyncOperation, key: &str) -> LedgerResult<Opti
     }
 }
 
-pub(crate) fn optional_present_i64(operation: &SyncOperation, key: &str) -> LedgerResult<Option<i64>> {
+pub(crate) fn optional_present_i64(
+    operation: &SyncOperation,
+    key: &str,
+) -> LedgerResult<Option<i64>> {
     match operation.body.changed_fields.get(key) {
         Some(FieldValue::I64(value)) => Ok(Some(*value)),
         Some(FieldValue::U64(value)) => i64::try_from(*value)
@@ -4870,9 +4987,9 @@ fn field_equals_stored(incoming: &FieldValue, held: &rusqlite::types::Value) -> 
         (FieldValue::Null, Value::Null) => true,
         (FieldValue::Bool(incoming), Value::Integer(held)) => i64::from(*incoming) == *held,
         (FieldValue::I64(incoming), Value::Integer(held)) => incoming == held,
-        (FieldValue::U64(incoming), Value::Integer(held)) => {
-            i64::try_from(*incoming).map(|value| value == *held).unwrap_or(false)
-        }
+        (FieldValue::U64(incoming), Value::Integer(held)) => i64::try_from(*incoming)
+            .map(|value| value == *held)
+            .unwrap_or(false),
         (FieldValue::String(incoming), Value::Text(held)) => incoming == held,
         (FieldValue::Decimal(incoming), Value::Text(held)) => incoming == held,
         (FieldValue::Decimal(incoming), Value::Real(held)) => incoming == &held.to_string(),
@@ -5215,7 +5332,10 @@ mod tests {
             }
         }
         let (kind, operator, trust) = node_row(&tx, "node-a");
-        assert_eq!((kind.as_str(), operator, trust.as_str()), ("laptop", false, "untrusted"));
+        assert_eq!(
+            (kind.as_str(), operator, trust.as_str()),
+            ("laptop", false, "untrusted")
+        );
 
         // 4. And it may not claim a whole row through an insert either — the
         //    upsert would carry every column at once, field set or no field set.
@@ -5273,7 +5393,10 @@ mod tests {
         .unwrap();
     }
 
-    fn full_node_row(tx: &rusqlite::Transaction<'_>, node_id: &str) -> (String, String, String, bool, String) {
+    fn full_node_row(
+        tx: &rusqlite::Transaction<'_>,
+        node_id: &str,
+    ) -> (String, String, String, bool, String) {
         tx.query_row(
             "SELECT public_key, trust_status, sync_profile, operator, node_kind \
              FROM sync_nodes WHERE node_id = ?1",
@@ -5318,7 +5441,10 @@ mod tests {
         );
 
         let mut seen_organizational = Vec::new();
-        for column in columns.iter().filter(|c| !NOT_WRITABLE.contains(&c.as_str())) {
+        for column in columns
+            .iter()
+            .filter(|c| !NOT_WRITABLE.contains(&c.as_str()))
+        {
             let organizational = EXPECTED_ORGANIZATIONAL.contains(&column.as_str());
             assert_eq!(
                 is_organizational_node_field(column),
@@ -5531,7 +5657,10 @@ mod tests {
             1_700_000_000_000,
         );
         assert_eq!(apply_sync_node(&tx, &stale_promotion).unwrap(), 0);
-        assert!(!full_node_row(&tx, "node-x").3, "a stale promotion must lose");
+        assert!(
+            !full_node_row(&tx, "node-x").3,
+            "a stale promotion must lose"
+        );
     }
 
     /// Values outside a column's CHECK arrive from peers. A device kind degrades
@@ -5614,23 +5743,24 @@ mod tests {
         .unwrap();
         seed_node(&tx, "node-plain", false);
 
-        let reseed_row = |node_id: &str, key: &str, kind: &str, trust: &str, profile: &str, operator: bool| {
-            node_operation(
-                node_id,
-                "node-stranger",
-                ActionType::Insert,
-                field_map(&[
-                    ("public_key", FieldValue::String(key.into())),
-                    ("public_key_type", FieldValue::String("ed25519".into())),
-                    ("display_name", FieldValue::String("".into())),
-                    ("node_kind", FieldValue::String(kind.into())),
-                    ("trust_status", FieldValue::String(trust.into())),
-                    ("owner_user_id", FieldValue::Null),
-                    ("sync_profile", FieldValue::String(profile.into())),
-                    ("operator", FieldValue::Bool(operator)),
-                ]),
-            )
-        };
+        let reseed_row =
+            |node_id: &str, key: &str, kind: &str, trust: &str, profile: &str, operator: bool| {
+                node_operation(
+                    node_id,
+                    "node-stranger",
+                    ActionType::Insert,
+                    field_map(&[
+                        ("public_key", FieldValue::String(key.into())),
+                        ("public_key_type", FieldValue::String("ed25519".into())),
+                        ("display_name", FieldValue::String("".into())),
+                        ("node_kind", FieldValue::String(kind.into())),
+                        ("trust_status", FieldValue::String(trust.into())),
+                        ("owner_user_id", FieldValue::Null),
+                        ("sync_profile", FieldValue::String(profile.into())),
+                        ("operator", FieldValue::Bool(operator)),
+                    ]),
+                )
+            };
 
         // Our own row, restated exactly: no write, no conflict — even though the
         // author is a stranger who could not otherwise touch the registry.
@@ -5638,7 +5768,14 @@ mod tests {
         assert_eq!(apply_sync_node(&tx, &own).unwrap(), 0);
 
         // Somebody else's row, restated exactly: same answer.
-        let other = reseed_row("node-plain", "pk", "unknown", "untrusted", "standard", false);
+        let other = reseed_row(
+            "node-plain",
+            "pk",
+            "unknown",
+            "untrusted",
+            "standard",
+            false,
+        );
         assert_eq!(apply_sync_node(&tx, &other).unwrap(), 0);
 
         // A reseed that actually disagrees about our own row still cannot state
@@ -5646,14 +5783,26 @@ mod tests {
         // operator, because a stranger would not get past the provenance gate at
         // all and this assertion is about the field rule, not about the author.
         seed_node(&tx, "node-op", true);
-        let mut disagreeing =
-            reseed_row("node-me", "theirkey", "laptop", "revoked", "ephemeral", true);
+        let mut disagreeing = reseed_row(
+            "node-me",
+            "theirkey",
+            "laptop",
+            "revoked",
+            "ephemeral",
+            true,
+        );
         disagreeing.body.actor_node_id = "node-op".to_string();
         disagreeing.body.hlc_timestamp.node_id = "node-op".to_string();
         apply_sync_node(&tx, &disagreeing).expect("dropped, not refused");
         let (key, trust, profile, operator, kind) = full_node_row(&tx, "node-me");
         assert_eq!(
-            (key.as_str(), trust.as_str(), profile.as_str(), operator, kind.as_str()),
+            (
+                key.as_str(),
+                trust.as_str(),
+                profile.as_str(),
+                operator,
+                kind.as_str()
+            ),
             ("mykey", "trusted", "authority", true, "laptop"),
             "only the organizational half of the reseed may land on our own row"
         );
@@ -5703,7 +5852,13 @@ mod tests {
         assert_eq!(apply_sync_node(&tx, &partial).unwrap(), 1);
         let (key, trust, profile, operator, kind) = full_node_row(&tx, "node-op");
         assert_eq!(
-            (key.as_str(), trust.as_str(), profile.as_str(), operator, kind.as_str()),
+            (
+                key.as_str(),
+                trust.as_str(),
+                profile.as_str(),
+                operator,
+                kind.as_str()
+            ),
             ("pk", "trusted", "authority", true, "server"),
             "an unnamed column must keep its value"
         );
@@ -5749,7 +5904,10 @@ mod tests {
             100,
         );
         assert_eq!(apply_sync_node(&tx, &stale).unwrap(), 0);
-        assert!(full_node_row(&tx, "node-op").3, "a stale insert must lose the slot");
+        assert!(
+            full_node_row(&tx, "node-op").3,
+            "a stale insert must lose the slot"
+        );
 
         // A genuinely new row still gets the column defaults.
         seed_trusted_node(&tx, "node-new");
@@ -6000,7 +6158,10 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap()
         };
-        for column in columns.iter().filter(|c| !NOT_WRITABLE.contains(&c.as_str())) {
+        for column in columns
+            .iter()
+            .filter(|c| !NOT_WRITABLE.contains(&c.as_str()))
+        {
             let different = match column.as_str() {
                 "operator" => FieldValue::Bool(false),
                 "public_key_type" => FieldValue::String("secp256k1".into()),
@@ -6148,10 +6309,7 @@ mod tests {
 
         let mut from_operator = from_self.clone();
         from_operator.body.actor_node_id = "node-op".to_string();
-        assert_eq!(
-            apply_node_user_assignment(&tx, &from_operator).unwrap(),
-            1
-        );
+        assert_eq!(apply_node_user_assignment(&tx, &from_operator).unwrap(), 1);
     }
 
     /// Replicated matrix rows (grant / default / visibility) must materialize as
@@ -6404,7 +6562,28 @@ mod tests {
     fn bus_db() -> crate::db::DbPool {
         let pool = crate::db::init(std::path::Path::new(":memory:")).unwrap();
         repository::bus_test_support::create_bus_tables(&pool).unwrap();
+        // `R4-9e-ledger-leak`: every `apply_bus_*` materializer now refuses
+        // an instance this node has no `addons` row for. Every existing
+        // fixture in this file materializes onto `"tentabus-00000001"`, so
+        // that is the one instance seeded as "installed" by default —
+        // isolation tests below seed a SECOND, deliberately un-hosted
+        // instance id instead of touching this default.
+        seed_bus_instance_installed(&pool, "tentabus-00000001");
         pool
+    }
+
+    /// Marks `instance_id` as installed on this node (`addons` row,
+    /// `package_id = "tentabus"`) — the precondition `bus_instance_is_local`
+    /// checks. `is_enabled` is irrelevant to that check (see its own doc),
+    /// so this always installs enabled; no test needs a disabled row.
+    fn seed_bus_instance_installed(pool: &crate::db::DbPool, instance_id: &str) {
+        let conn = pool.write().unwrap();
+        conn.execute(
+            "INSERT INTO addons (addon_id, package_id, name, version, display_name) \
+             VALUES (?1, 'tentabus', ?1, '0.0.0', ?1)",
+            rusqlite::params![instance_id],
+        )
+        .unwrap();
     }
 
     fn bus_topic_row(org_id: &str, name: &str) -> repository::DbBusTopic {
@@ -6644,6 +6823,116 @@ mod tests {
         assert!(
             result.is_err(),
             "an op whose row_json.instance_id disagrees with resource_id must be rejected"
+        );
+    }
+
+    /// SUM/tentabus/DECYZJE-2026-09-22.md, `R4-9e-ledger-leak`: a node that
+    /// only hosts `"tentabus-00000001"` must not materialize a topic op for
+    /// a SIBLING node's instance (`"tentabus-bbbbbbbb"`, deliberately never
+    /// installed here) — the op is accepted (no error, cursor advances) but
+    /// writes nothing.
+    #[test]
+    fn apply_bus_topic_skips_an_instance_this_node_does_not_host() {
+        let db = bus_db();
+        let mut row = bus_topic_row("org-1", "orders.created");
+        row.instance_id = "tentabus-bbbbbbbb".to_string();
+        let resource_id = crate::sync::resource_id::composite_resource_id(&[
+            &row.instance_id,
+            &row.org_id,
+            &row.name,
+        ]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "row_json".to_string(),
+            FieldValue::String(serde_json::to_string(&row).unwrap()),
+        );
+        let op = bus_operation(
+            &row.org_id,
+            "core.bus_topic",
+            &resource_id,
+            "bus_topics",
+            "instance_id,org_id,name",
+            ActionType::Insert,
+            fields,
+        );
+        assert_eq!(
+            apply_core_operation(&db, &op).unwrap(),
+            0,
+            "an unhosted instance's op must apply as a no-op, not an error"
+        );
+        assert!(
+            repository::bus_topic_get(&db, "tentabus-bbbbbbbb", "org-1", "orders.created")
+                .unwrap()
+                .is_none(),
+            "no row may be written for an instance this node never installed"
+        );
+    }
+
+    /// The other half of the same rung: a node hosting BOTH instances
+    /// materializes topics for both, independently — isolation is per
+    /// instance, not "only ever the first one seeded".
+    #[test]
+    fn apply_bus_topic_materializes_every_hosted_instance() {
+        let db = bus_db();
+        seed_bus_instance_installed(&db, "tentabus-bbbbbbbb");
+
+        let row_a = bus_topic_row("org-1", "orders.created");
+        assert_eq!(
+            apply_core_operation(&db, &bus_topic_op(&row_a, ActionType::Insert)).unwrap(),
+            1
+        );
+
+        let mut row_b = bus_topic_row("org-1", "shipments.created");
+        row_b.instance_id = "tentabus-bbbbbbbb".to_string();
+        let resource_id_b = crate::sync::resource_id::composite_resource_id(&[
+            &row_b.instance_id,
+            &row_b.org_id,
+            &row_b.name,
+        ]);
+        let mut fields_b = BTreeMap::new();
+        fields_b.insert(
+            "row_json".to_string(),
+            FieldValue::String(serde_json::to_string(&row_b).unwrap()),
+        );
+        let op_b = bus_operation(
+            &row_b.org_id,
+            "core.bus_topic",
+            &resource_id_b,
+            "bus_topics",
+            "instance_id,org_id,name",
+            ActionType::Insert,
+            fields_b,
+        );
+        assert_eq!(apply_core_operation(&db, &op_b).unwrap(), 1);
+
+        assert!(
+            repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.created")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repository::bus_topic_get(&db, "tentabus-bbbbbbbb", "org-1", "shipments.created")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Same isolation, exercised on `apply_bus_partition_assignment` — the
+    /// one materializer that ALSO reads `bus_topics` mid-apply (the parent
+    /// topic's `environment`). An unhosted instance must be recognized and
+    /// skipped BEFORE that lookup, or it would misread "topic not yet
+    /// materialized" and retry forever instead of settling as a clean no-op.
+    #[test]
+    fn apply_bus_partition_assignment_skips_an_instance_this_node_does_not_host() {
+        let db = bus_db();
+        let mut assignment = test_assignment("org-1", "orders.created", 0, "node-1", 1);
+        assignment.instance_id = "tentabus-bbbbbbbb".to_string();
+        let op = bus_assignment_op(&assignment, ActionType::Insert);
+        let result = apply_core_operation(&db, &op);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "an unhosted instance's assignment must apply as a no-op, not DeferredOrdering"
         );
     }
 
@@ -7072,10 +7361,7 @@ mod tests {
             schema_version_row_for_test("org-1", "orders.v1", 1, "hash-divergent", 902);
         let mut divergent_op = bus_schema_version_op(&divergent_row, ActionType::Insert);
         divergent_op.body.hlc_timestamp.wall_time_ms = 3;
-        assert_eq!(
-            apply_core_operation(&db, &divergent_op).unwrap(),
-            0
-        );
+        assert_eq!(apply_core_operation(&db, &divergent_op).unwrap(), 0);
 
         let stored =
             repository::bus_schema_version_get(&db, "tentabus-00000001", "org-1", "orders.v1", 1)
@@ -7144,10 +7430,7 @@ mod tests {
 
         let mut delete_v1_op = bus_schema_version_op(&v1, ActionType::Delete);
         delete_v1_op.body.hlc_timestamp.wall_time_ms = 4;
-        assert_eq!(
-            apply_core_operation(&db, &delete_v1_op).unwrap(),
-            1
-        );
+        assert_eq!(apply_core_operation(&db, &delete_v1_op).unwrap(), 1);
 
         assert!(
             repository::bus_schema_version_get(&db, "tentabus-00000001", "org-1", "orders.v1", 1)
@@ -7332,6 +7615,74 @@ mod tests {
         without.body.changed_fields.remove("home_lost_node_id");
         assert_eq!(apply_provider_account(&tx, &without).unwrap(), 1);
         assert_eq!(stored(&tx).1, None);
+    }
+
+    /// The LEDGER path that removes a peer's registry row has to clean up what
+    /// the local removal cleans up. `sync_nodes` has no FK from
+    /// `agent_runtime_nodes` or `provider_accounts` (migration 156), so a bare
+    /// DELETE left an account whose `home_node_id` named a node that is gone
+    /// from the registry — the card then rendered a home nobody could resolve
+    /// and, because the lost-home marker is what the card words it from, no
+    /// record that a home had been there at all. Which node applied the removal
+    /// is not part of the state, so this is the store's own call and not a
+    /// second implementation of it.
+    ///
+    /// Removing the REGISTRY row is not removing the secret: the credential the
+    /// account still holds stays where it is, and this test pins that too.
+    #[test]
+    fn a_deleted_peer_registry_row_clears_its_homes_like_the_local_removal() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-op", true);
+        seed_node(&tx, "node-gone", false);
+        tx.execute(
+            "INSERT INTO provider_accounts (account_id, org_id, engine_id, display_name, scope, \
+             credential_kind, home_node_id, status, created_by) \
+             VALUES ('acc-1', 'default', 'codex', 'Shared codex', 'global', 'api_key', \
+                     'node-gone', 'active', 'admin')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO provider_account_credentials (account_id, revision, material_enc, \
+             material_sha256, refreshed_at, refreshed_by_node) \
+             VALUES ('acc-1', 1, 'sealed', 'sha', '2026-09-18T00:00:00Z', 'node-gone')",
+            [],
+        )
+        .unwrap();
+
+        let delete = node_operation("node-gone", "node-op", ActionType::Delete, field_map(&[]));
+        assert_eq!(apply_sync_node(&tx, &delete).unwrap(), 1);
+        assert!(!node_exists(&tx, "node-gone"));
+
+        let (home, lost): (Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT home_node_id, home_lost_node_id FROM provider_accounts WHERE account_id = 'acc-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            home, None,
+            "the account still names a home the registry no longer has"
+        );
+        assert_eq!(
+            lost.as_deref(),
+            Some("node-gone"),
+            "the loss of the home was not recorded, so nothing can word it"
+        );
+        let material: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM provider_account_credentials WHERE account_id = 'acc-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            material, 1,
+            "the registry row was removed, not the credential the account still holds"
+        );
     }
 
     /// An engine row is what ONE node measured on its own filesystem. A peer

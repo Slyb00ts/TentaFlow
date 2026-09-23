@@ -22,9 +22,9 @@ use tentaflow_protocol::code_studio::{
     DiffHunkInfo, FileEntryInfo, GitBranchInfo, GitCommitInfo, GitStatusEntry, GrantInfo,
     GrepHitInfo, IndexStateInfo, OperationInfo, PatchFileDecision, PatchFileInfo, PatchHunkInfo,
     PatchSetInfo, ProcessSandboxCause, ProjectLinkInfo, ProvisionStepInfo, RepoEntryInfo,
-    RunAccountInfo, RunInfo, SessionInfo,
-    TaskInfo, TerminalCellRow, TimelineEventInfo, WorkspaceInfo, WorkspaceMemberInfo,
-    WorkspaceMemberInput, WorkspaceNodeInfo, WorkspaceUserCandidate, WorktreeInfo,
+    RunAccountInfo, RunInfo, SessionInfo, TaskInfo, TerminalCellRow, TimelineEventInfo,
+    WorkspaceInfo, WorkspaceMemberInfo, WorkspaceMemberInput, WorkspaceNodeInfo,
+    WorkspaceUserCandidate, WorktreeInfo,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
@@ -6902,12 +6902,32 @@ fn session_runs_v1(
                 // NULL is "nobody quoted one", not "it was free".
                 cost_usd: row.get(12)?,
                 account,
+                agent_name: None,
             })
         })
         .map_err(|e| db_error("runs_list", anyhow::anyhow!("{e}")))?;
-    let runs = rows
+    let mut runs = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| db_error("runs_list", anyhow::anyhow!("{e}")))?;
+    // Agents live in the platform database, not the workspace one, so the names
+    // are joined here, once per distinct agent.
+    let mut names: HashMap<String, Option<String>> = HashMap::new();
+    for run in &mut runs {
+        let Some(agent_id) = run.agent_id.clone() else {
+            continue;
+        };
+        let name = match names.get(&agent_id) {
+            Some(name) => name.clone(),
+            None => {
+                let name = crate::db::repository::get_agent(&ctx.state.db, &agent_id)
+                    .map_err(|e| db_error("run agent name", e))?
+                    .map(|agent| agent.name);
+                names.insert(agent_id, name.clone());
+                name
+            }
+        };
+        run.agent_name = name;
+    }
 
     Ok(cs(CodeStudioPayload::SessionRunsResponse {
         session_id: session_id.to_string(),
@@ -10610,7 +10630,6 @@ mod tests {
                 raised_at_ms: 0,
                 engine_id: None,
                 account_id: None,
-                candidate_accounts: Vec::new(),
                 user_id: None,
             },
         );
@@ -11596,11 +11615,7 @@ mod tests {
     fn a_peer_that_advertises_nothing_for_containers_stays_unknown() {
         let _guard = paths::test_data_dir_guard();
         let fx = fixture("u-owner", &[PERM_READ]);
-        let silent = node_info(
-            &fx.ctx,
-            "node-b".to_string(),
-            advertised(None, None, None),
-        );
+        let silent = node_info(&fx.ctx, "node-b".to_string(), advertised(None, None, None));
         assert_eq!(
             silent.supports_container, None,
             "nothing reported is not the same fact as no runtime"
@@ -11642,7 +11657,11 @@ mod tests {
         let contradictory = node_info(
             &fx.ctx,
             "node-b".to_string(),
-            advertised(Some(false), Some(true), Some(ProcessSandboxCause::GuiSessionRequired)),
+            advertised(
+                Some(false),
+                Some(true),
+                Some(ProcessSandboxCause::GuiSessionRequired),
+            ),
         );
         assert_eq!(contradictory.supports_process_sandbox, Some(true));
         assert_eq!(contradictory.process_sandbox_cause, None);
@@ -11689,11 +11708,7 @@ mod tests {
     fn a_peer_that_advertises_nothing_stays_unknown() {
         let _guard = paths::test_data_dir_guard();
         let fx = fixture("u-owner", &[PERM_READ]);
-        let silent = node_info(
-            &fx.ctx,
-            "node-b".to_string(),
-            advertised(None, None, None),
-        );
+        let silent = node_info(&fx.ctx, "node-b".to_string(), advertised(None, None, None));
         assert_eq!(silent.supports_process_sandbox, None);
         assert_eq!(silent.process_sandbox_cause, None);
         assert_eq!(silent.process_sandbox_reason, None);

@@ -634,6 +634,56 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         ON nas_elastic_operations(array_id) WHERE state = 'running';
     CREATE UNIQUE INDEX nas_elastic_operation_origin
         ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
+), (
+    18,
+    // WHICH ORGANISATION a job or an alert belongs to. This database is ONE
+    // per node, not one per tenant: TentaNas is a singleton package, every
+    // organisation's request resolves to the same instance id, and
+    // `app_db::open` keys its pool by that id alone — so every tenant of the
+    // node reads these two tables. Elastic Arrays are the one thing a tenant
+    // owns (`nas_elastic_arrays.org_id`), and a job or an alert about another
+    // tenant's array names that array, its user and its log.
+    //
+    // NULL is a node-wide row (a disk, a pool, a target: shared hardware every
+    // admin of the node may see). A non-NULL value is the owning organisation,
+    // and '' is a row that must be owned but whose owner could not be found
+    // (an array that no longer exists): shown to NO tenant, because guessing
+    // an owner is how another tenant's array would leak.
+    //
+    // Backfill: an Elastic job by its operation's array, then by the array
+    // holding its subject name; a disk wipe only when its log names a
+    // released journal, the one wipe line that names an array; an alert by
+    // the array it is about or the parked request it announces.
+    //
+    // A NAME IS UNIQUE ONLY AMONG THE ARRAYS THAT EXIST NOW. A dissolve
+    // deletes the array row and its operations (`delete_elastic_array`) and
+    // keeps the jobs and the alerts, so org A's dissolved `media` and org B's
+    // later `media` share one name in the history. The name match therefore
+    // takes only an array that already existed when the row was written
+    // (`created_at <= started_at` / `raised_at`); an older row finds no array
+    // and becomes '' — nobody's — instead of org B's. The comparison is
+    // textual and valid because all three columns are written by `now()`,
+    // the one fixed-width `YYYY-MM-DDTHH:MM:SSZ` UTC form (a create writes the
+    // array's `created_at` from its job's `started_at`, so they are equal).
+    "ALTER TABLE nas_jobs ADD COLUMN org_id TEXT;
+    ALTER TABLE nas_alerts ADD COLUMN org_id TEXT;
+    UPDATE nas_jobs SET org_id = COALESCE(
+            (SELECT a.org_id FROM nas_elastic_operations o
+               JOIN nas_elastic_arrays a ON a.array_id = o.array_id
+              WHERE o.job_id = nas_jobs.job_id),
+            (SELECT a.org_id FROM nas_elastic_arrays a
+              WHERE a.name = nas_jobs.subject AND a.created_at <= nas_jobs.started_at),
+            '')
+     WHERE substr(kind, 1, 8) = 'elastic_';
+    UPDATE nas_jobs SET org_id = ''
+     WHERE kind = 'disk_wipe' AND instr(log, 'zwolniono rezerwację dziennika') > 0;
+    UPDATE nas_alerts SET org_id = COALESCE(
+            (SELECT a.org_id FROM nas_elastic_arrays a
+              WHERE a.name = nas_alerts.subject_id AND a.created_at <= nas_alerts.raised_at), '')
+     WHERE subject_kind = 'elastic-array';
+    UPDATE nas_alerts SET org_id = COALESCE(
+            (SELECT p.org_id FROM nas_pending_approvals p WHERE p.request_id = nas_alerts.subject_id), '')
+     WHERE subject_kind = 'approval';",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -797,6 +847,20 @@ pub fn disk_row(pool: &DbPool, disk_id: &str) -> Result<Option<DiskRow>> {
             },
         )
         .optional()?)
+}
+
+/// The kernel name a disk was last seen under, kept after it leaves the live
+/// inventory. `None` for a disk never recorded, or recorded without a name.
+pub fn disk_last_name(pool: &DbPool, disk_id: &str) -> Result<Option<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT name FROM nas_disks WHERE disk_id = ?1",
+            params![disk_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .filter(|name| !name.is_empty()))
 }
 
 pub fn store_smart(
@@ -1008,6 +1072,32 @@ fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasAlert> {
 const ALERT_COLUMNS: &str = "alert_id, severity, subject_kind, subject_id, title, detail, \
                              raised_at, acked_at, resolved_at";
 
+/// The organisation an alert belongs to, as an SQL expression over two
+/// `raise_alert` parameters: `kind` names the subject kind's placeholder and
+/// `subject` the subject id's. See migration 18: NULL for shared hardware, the
+/// owner's org for an alert about an Elastic Array (by the name an EXISTING
+/// array holds right now) or a parked red-path request, and '' — nobody's —
+/// when that owner cannot be found, so an alert about an array whose row is
+/// gone is never shown to a tenant it might not belong to.
+///
+/// A function over the placeholders rather than one constant because the
+/// insert and the refresh of `raise_alert` bind their parameters in different
+/// positions, and both must stamp the owner with the very same rule.
+fn alert_owner_sql(kind: &str, subject: &str) -> String {
+    format!(
+        "CASE {kind} \
+         WHEN 'elastic-array' THEN COALESCE((SELECT org_id FROM nas_elastic_arrays WHERE name = {subject}), '') \
+         WHEN 'approval' THEN COALESCE((SELECT org_id FROM nas_pending_approvals WHERE request_id = {subject}), '') \
+         END"
+    )
+}
+
+/// The rows one organisation may see: its own and the node-wide ones. Never
+/// the '' rows (owner unknown) and never another organisation's.
+/// The `?1 <> ''` half keeps an empty org id (a request with no real tenant)
+/// from matching the unowned rows.
+const VISIBLE_TO_ORG_SQL: &str = "(org_id IS NULL OR (org_id = ?1 AND ?1 <> ''))";
+
 /// Raises an alert unless an open one with the same `dedupe_key` exists, and
 /// REFRESHES the text of the one that does. Returns true when a new row was
 /// inserted — an already-open alert is not a new event.
@@ -1016,8 +1106,26 @@ const ALERT_COLUMNS: &str = "alert_id, severity, subject_kind, subject_id, title
 /// A portal-drift alert says which interface the address went to; when it
 /// moves again from `lan0` to `mgmt0` while the alert is still open, an
 /// `INSERT OR IGNORE` would leave the admin reading about `lan0` forever.
-/// `raised_at` is deliberately NOT touched — the condition began when it
-/// began, and moving the timestamp would hide how long it has been true.
+/// `raised_at` is deliberately NOT touched for a refresh under the SAME
+/// owner — the condition began when it began, and moving the timestamp would
+/// hide how long it has been true.
+///
+/// The refresh RE-STAMPS THE OWNER as well. Array alerts are deduplicated by
+/// the array's NAME, a dissolve does not resolve every one of them, and a
+/// name can be taken again by another organisation: without the re-stamp,
+/// org B's condition would rewrite the text of an alert org A still owns —
+/// A reading about B's array, B never seeing it. The owner is also a reason
+/// to refresh on its own: identical text raised for a new owner still moves
+/// the row to that owner.
+///
+/// WHEN THE OWNER CHANGES, `acked_at` and `raised_at` are reset too:
+/// org A may have acknowledged the old condition, and org B's new one must
+/// not arrive pre-acked — B's badge and unacked list would never show it.
+/// `raised_at` moves to now for the same reason `acked_at` opens: this is a
+/// new condition for the new owner, not a continuation of A's, so its
+/// "since" time must be B's, not A's. Neither is touched when the owner is
+/// unchanged, which is why the CASE compares the OLD `org_id` (read before
+/// this statement's own SET runs) against the freshly computed owner.
 pub fn raise_alert(
     pool: &DbPool,
     dedupe_key: &str,
@@ -1028,19 +1136,35 @@ pub fn raise_alert(
     detail: &str,
 ) -> Result<bool> {
     let conn = write(pool)?;
+    let owner = alert_owner_sql("?5", "?6");
+    // Bound once and reused for the refresh's `raised_at` below: the insert
+    // path still calls `now()` itself, so this is not a shared timestamp,
+    // only a name that does not shadow the function.
+    let refresh_now = now();
     let updated = conn.execute(
-        "UPDATE nas_alerts SET severity = ?2, title = ?3, detail = ?4
-         WHERE dedupe_key = ?1 AND resolved_at IS NULL
-           AND (severity <> ?2 OR title <> ?3 OR detail <> ?4)",
-        params![dedupe_key, severity, title, detail],
+        &format!(
+            "UPDATE nas_alerts SET severity = ?2, title = ?3, detail = ?4, org_id = ({owner}),
+                 acked_at = CASE WHEN org_id IS NOT ({owner}) THEN NULL ELSE acked_at END,
+                 raised_at = CASE WHEN org_id IS NOT ({owner}) THEN ?7 ELSE raised_at END
+             WHERE dedupe_key = ?1 AND resolved_at IS NULL
+               AND (severity <> ?2 OR title <> ?3 OR detail <> ?4 OR org_id IS NOT ({owner}))"
+        ),
+        params![dedupe_key, severity, title, detail, subject_kind, subject_id, refresh_now],
     )?;
     if updated == 1 {
         return Ok(false);
     }
+    // The owner is stamped HERE, in the one statement every alert is born in,
+    // rather than by the two dozen raisers: none of them has to remember it,
+    // and a new raiser about an array cannot forget it (`alert_owner_sql`).
     let inserted = conn.execute(
-        "INSERT OR IGNORE INTO nas_alerts
-            (alert_id, severity, subject_kind, subject_id, title, detail, raised_at, dedupe_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        &format!(
+            "INSERT OR IGNORE INTO nas_alerts
+                (alert_id, severity, subject_kind, subject_id, title, detail, raised_at, dedupe_key,
+                 org_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {})",
+            alert_owner_sql("?3", "?4")
+        ),
         params![
             uuid::Uuid::now_v7().to_string(),
             severity,
@@ -1104,6 +1228,38 @@ pub fn list_alerts(pool: &DbPool, include_acked: bool) -> Result<Vec<NasAlert>> 
     Ok(rows)
 }
 
+/// `list_alerts` as one organisation may see it (migration 18). The unscoped
+/// `list_alerts` stays for the node's own loops, which act on every array.
+pub fn list_alerts_for_org(pool: &DbPool, org_id: &str, include_acked: bool) -> Result<Vec<NasAlert>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let sql = format!(
+        "SELECT {ALERT_COLUMNS} FROM nas_alerts
+         WHERE resolved_at IS NULL AND {VISIBLE_TO_ORG_SQL} {}
+         ORDER BY raised_at DESC LIMIT 500",
+        if include_acked { "" } else { "AND acked_at IS NULL" }
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![org_id], alert_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `ack_alert` limited to the alerts `org_id` may see: another tenant's alert
+/// is "not found" to it, exactly like an id that does not exist, so the
+/// answer confirms nothing about it.
+pub fn ack_alert_for_org(pool: &DbPool, org_id: &str, alert_id: &str) -> Result<bool> {
+    let conn = write(pool)?;
+    let n = conn.execute(
+        &format!(
+            "UPDATE nas_alerts SET acked_at = ?3
+              WHERE alert_id = ?2 AND acked_at IS NULL AND {VISIBLE_TO_ORG_SQL}"
+        ),
+        params![org_id, alert_id, now()],
+    )?;
+    Ok(n == 1)
+}
+
 pub fn alerts_for_subject(pool: &DbPool, kind: &str, subject_id: &str) -> Result<Vec<NasAlert>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut stmt = conn.prepare_cached(&format!(
@@ -1116,11 +1272,33 @@ pub fn alerts_for_subject(pool: &DbPool, kind: &str, subject_id: &str) -> Result
     Ok(rows)
 }
 
-pub fn count_open_alerts(pool: &DbPool) -> Result<u32> {
+/// Open, unacknowledged NODE-WIDE alerts (`org_id IS NULL`: disks, pools,
+/// targets). This is the figure the node publishes in its fleet summary,
+/// which lands in the instance's `addon_config` and is read by every tenant
+/// of every node: a count that included a tenant's own alerts would tell the
+/// others that it has some. Each tenant's own alerts are added at read time
+/// (`count_open_alerts_for_org`).
+pub fn count_open_node_alerts(pool: &DbPool) -> Result<u32> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM nas_alerts WHERE resolved_at IS NULL AND acked_at IS NULL",
+        "SELECT COUNT(*) FROM nas_alerts
+          WHERE resolved_at IS NULL AND acked_at IS NULL AND org_id IS NULL",
         [],
+        |r| r.get::<_, i64>(0),
+    )? as u32)
+}
+
+/// Open, unacknowledged alerts one organisation may see — exactly the rows
+/// `list_alerts_for_org(pool, org_id, false)` lists (the same visibility
+/// clause), so a badge and the list under it never disagree.
+pub fn count_open_alerts_for_org(pool: &DbPool, org_id: &str) -> Result<u32> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM nas_alerts
+              WHERE resolved_at IS NULL AND acked_at IS NULL AND {VISIBLE_TO_ORG_SQL}"
+        ),
+        params![org_id],
         |r| r.get::<_, i64>(0),
     )? as u32)
 }
@@ -1144,6 +1322,9 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasJob> {
         } else {
             log.lines().map(str::to_string).collect()
         },
+        // Stored subjects are what the job was spawned on; whether a shown
+        // name is only remembered is decided on the way out (`name_jobs`).
+        subject_last_known: false,
     })
 }
 
@@ -1372,6 +1553,28 @@ pub fn elastic_operation_running(pool: &DbPool, array_id: &str) -> Result<bool> 
 }
 
 pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>) -> Result<()> {
+    insert_job_owned(pool, job, intent, None)
+}
+
+/// `insert_job` with the row's owner written BY THE INSERT itself (migration
+/// 18's `org_id`), so the row is never visible to another organisation, not
+/// even between two statements.
+///
+/// ONE RULE FOR THE OWNER: an Elastic job's owner is its array's
+/// organisation, stamped in this same transaction (`stamp_elastic_job_org`),
+/// and a caller may not name another one — an explicit owner on an Elastic
+/// kind is refused rather than letting two sources disagree. Every other job
+/// is node-wide (NULL) unless `owner` says whose it is.
+pub fn insert_job_owned(
+    pool: &DbPool,
+    job: &NasJob,
+    intent: Option<&ElasticJobIntent>,
+    owner: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(owner.is_none() || !job.kind.starts_with("elastic_"),
+        "Zadanie Elastic należy do organizacji swojej macierzy; jawny właściciel jest odrzucany");
+    anyhow::ensure!(owner.is_none_or(|org| !org.is_empty()),
+        "Pusty identyfikator organizacji nie jest właścicielem");
     let mut conn = write(pool)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if intent.is_some() {
@@ -1398,8 +1601,8 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
     }
     tx.execute(
         "INSERT INTO nas_jobs (job_id, kind, subject, status, progress_pct, started_by,
-                               started_at, log)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                               started_at, log, org_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             job.job_id,
             job.kind,
@@ -1408,7 +1611,8 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
             job.progress_pct.map(i64::from),
             job.started_by,
             job.started_at,
-            job.log.join("\n")
+            job.log.join("\n"),
+            owner
         ],
     )?;
     if let Some(intent) = intent {
@@ -1597,6 +1801,8 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
             VALUES (?1,?2,?3,?4,'running',?5,'',?6)",
             params![operation_id,array_id,job.job_id,kind,request,job.started_at])?;
     }
+    // After the intent: a create's array row is written above, in this tx.
+    stamp_elastic_job_org(&tx, &job.job_id, &job.kind, &job.subject)?;
     tx.commit()?;
     Ok(())
 }
@@ -2060,6 +2266,52 @@ pub fn list_jobs(pool: &DbPool, limit: u32) -> Result<Vec<NasJob>> {
     Ok(rows)
 }
 
+/// `list_jobs` as one organisation may see it (migration 18): its own jobs
+/// and the node-wide ones, never another tenant's array work — whose subject
+/// is that array's name and whose log and author are that tenant's. The
+/// unscoped `list_jobs` stays for the node's own loops.
+pub fn list_jobs_for_org(pool: &DbPool, org_id: &str, limit: u32) -> Result<Vec<NasJob>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {JOB_COLUMNS} FROM nas_jobs WHERE {VISIBLE_TO_ORG_SQL}
+         ORDER BY started_at DESC LIMIT ?2"
+    ))?;
+    let rows = stmt
+        .query_map(params![org_id, i64::from(limit.clamp(1, 500))], job_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// One job, when `org_id` may see it. Another tenant's job is `None` — the
+/// same answer as an id that never existed, so a guessed id confirms nothing.
+pub fn job_for_org(pool: &DbPool, org_id: &str, job_id: &str) -> Result<Option<NasJob>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            &format!("SELECT {JOB_COLUMNS} FROM nas_jobs WHERE job_id = ?2 AND {VISIBLE_TO_ORG_SQL}"),
+            params![org_id, job_id],
+            job_from_row,
+        )
+        .optional()?)
+}
+
+/// Stamps an Elastic job with the organisation that owns its array, inside
+/// the transaction that wrote the job. Every Elastic job's subject is its
+/// array's name (unique per node), and the array row exists by now — for a
+/// create or an adoption it was written earlier in this same transaction.
+/// An array that cannot be found stamps '' (nobody's): see migration 18.
+fn stamp_elastic_job_org(tx: &rusqlite::Transaction<'_>, job_id: &str, kind: &str, subject: &str) -> Result<()> {
+    if !kind.starts_with("elastic_") {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE nas_jobs SET org_id = COALESCE((SELECT org_id FROM nas_elastic_arrays WHERE name = ?2), '')
+          WHERE job_id = ?1",
+        params![job_id, subject],
+    )?;
+    Ok(())
+}
+
 /// Jobs that were `running` when the process died: marked failed on init so
 /// the list never shows a spinner for work nobody is doing.
 ///
@@ -2487,6 +2739,18 @@ fn mover_runs(
 
 pub fn elastic_array(pool: &DbPool, owner: &ElasticOwner, name: &str) -> Result<Option<super::elastic::ElasticArrayRow>> {
     Ok(elastic_arrays(pool, owner)?.into_iter().find(|a| a.name == name))
+}
+
+/// The names of the Elastic Arrays one organisation owns on this node — the
+/// set `disks::hide_other_org_array` keeps names for. By organisation, not by
+/// instance: TentaNas is one instance per node, so the org is the tenant.
+pub fn elastic_array_names_of_org(pool: &DbPool, org_id: &str) -> Result<std::collections::BTreeSet<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT name FROM nas_elastic_arrays WHERE org_id = ?1")?;
+    let names = stmt
+        .query_map(params![org_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+    Ok(names)
 }
 
 pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
@@ -2985,16 +3249,20 @@ pub fn elastic_array_identities(pool: &DbPool) -> Result<Vec<(String, String)>> 
 /// with a sentence naming the disk rather than surface as a raw SQL error.
 ///
 /// The array arrives `active` — it is complete, its disks are verified and its
-/// union may well be serving already — carrying the reason it arrived with in
-/// `state_detail`, the way an imported target row does.
-pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, previous: &ElasticOwner,
-    started_by: &str) -> Result<()> {
+/// union may well be serving already — with an EMPTY `state_detail`: the
+/// Elastic card and the detail screen print that column as text, and an
+/// adopted array's origin used to be written there as the previous owner's
+/// org/addon ids — machine ids on screen, and possibly another tenant's. The
+/// job row already says the array was adopted (its kind is `elastic_import`),
+/// and who it was taken from is the node's log (`elastic::import_apply`), not
+/// anything this database shows.
+pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, started_by: &str) -> Result<()> {
     spec.validate()?;
     let at = now();
-    let detail = format!(
-        "adopted from owner {}/{}: the journal and the disks of this array were already on \
-         this node and this instance had no record of it",
-        previous.org_id, previous.addon_id);
+    // The job's one log line: what happened, without an owner. The job-log
+    // window and the job row's sub-text both print it.
+    let job_log = "the journal and the disks of this array were already on this node and this \
+         instance had no record of it; the journal now names this instance as the owner";
     let mut conn = write(pool)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let closing: bool = tx.query_row(
@@ -3026,12 +3294,12 @@ pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, previous: &Elasti
     tx.execute("INSERT INTO nas_jobs
         (job_id,kind,subject,status,progress_pct,started_by,started_at,finished_at,log)
         VALUES (?1,'elastic_import',?2,'succeeded',100,?3,?4,?4,?5)",
-        params![job_id,spec.name,started_by,at,detail])?;
+        params![job_id,spec.name,started_by,at,job_log])?;
     tx.execute("INSERT INTO nas_elastic_arrays
         (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
-        VALUES (?1,?2,?3,?4,?5,'active',?6,?7,?7)",
+        VALUES (?1,?2,?3,?4,?5,'active','',?6,?6)",
         params![spec.array_id,spec.owner.org_id,spec.owner.addon_id,spec.name,
-            spec.filesystem.as_str(),detail,at])?;
+            spec.filesystem.as_str(),at])?;
     insert_elastic_disks(&tx, spec)?;
     // The origin operation (migration 14): `elastic_spec` reads the persisted
     // intention from it, so an adopted array without this row could not be
@@ -3040,6 +3308,7 @@ pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, previous: &Elasti
         (operation_id,array_id,job_id,kind,state,request_json,error,created_at,finished_at)
         VALUES (?1,?2,?3,'import','succeeded',?4,'',?5,?5)",
         params![spec.operation_id,spec.array_id,job_id,serde_json::to_string(spec)?,at])?;
+    stamp_elastic_job_org(&tx, &job_id, "elastic_import", &spec.name)?;
     tx.commit()?;
     Ok(())
 }
@@ -4906,7 +5175,7 @@ mod tests {
             bytes: 32 * 1024 * 1024 * 1024, expected_uuid: uuid::Uuid::new_v4().to_string(),
         });
 
-        elastic_import(&pool, &spec, &previous_owner(), "admin").unwrap();
+        elastic_import(&pool, &spec, "admin").unwrap();
 
         // The row belongs to THIS addon, not to the owner the journal carried.
         let (org, addon, state, detail): (String, String, String, String) = pool.read().unwrap().query_row(
@@ -4914,9 +5183,10 @@ mod tests {
             params![spec.array_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
         assert_eq!((org.as_str(), addon.as_str()), ("org-default", "tentanas-8dd19dc4"));
         assert_eq!(state, "active");
-        // An imported row keeps the reason it arrived with, and that reason
-        // names where it came from.
-        assert!(detail.contains("adopted from owner orgtentanas-rig11/addontentanas"), "{detail}");
+        // The state detail is printed as text on the Elastic card and the
+        // detail screen, so an adoption leaves it empty rather than write the
+        // previous owner's ids there (MAJOR A, 2026-09-22).
+        assert_eq!(detail, "", "an adopted array's state names nobody");
 
         // Nothing is readable without the origin operation row, so the read
         // back is what proves the adoption is a whole array and not a header.
@@ -4943,6 +5213,35 @@ mod tests {
         );
     }
 
+    /// MAJOR A of 2026-09-22: the array's state detail (the Elastic card's
+    /// reason line and the detail screen's state row) and the job log (the
+    /// job row's sub-text and the job-log window) are all printed as text. An
+    /// adoption writes no owner id into any of them — neither the owner it
+    /// was taken from, which may be another installation's tenant, nor the
+    /// adopting one. The audit of who it came from is the server log.
+    #[test]
+    fn an_adoption_writes_no_owner_id_into_the_array_state_or_the_job_log() {
+        let pool = pool();
+        let mut spec = super::super::elastic::tests::create_spec("media");
+        spec.owner = ElasticOwner { org_id: "org-adopting-7f3a".into(), addon_id: "tentanas-adopting-91c2".into() };
+
+        elastic_import(&pool, &spec, "admin").unwrap();
+
+        let conn = pool.read().unwrap();
+        let detail: String = conn.query_row(
+            "SELECT state_detail FROM nas_elastic_arrays WHERE array_id=?1",
+            params![spec.array_id], |r| r.get(0)).unwrap();
+        let log: String = conn.query_row(
+            "SELECT log FROM nas_jobs WHERE kind='elastic_import'", [], |r| r.get(0)).unwrap();
+        assert_eq!(detail, "", "the state line stays empty");
+        assert!(!log.is_empty(), "the job still says what happened");
+        let previous = previous_owner();
+        for id in [&spec.owner.org_id, &spec.owner.addon_id, &previous.org_id, &previous.addon_id] {
+            assert!(!log.contains(id.as_str()), "the job log names no owner id ({id}): {log}");
+        }
+        assert!(!log.contains("from owner"), "nor a previous owner at all: {log}");
+    }
+
     #[test]
     fn an_adoption_that_collides_refuses_in_words_and_writes_nothing() {
         let pool = pool();
@@ -4955,7 +5254,7 @@ mod tests {
             rows("nas_elastic_disk_aliases"), rows("nas_jobs"));
 
         // Same array, offered a second time.
-        let again = elastic_import(&pool, &created, &previous_owner(), "admin").unwrap_err().to_string();
+        let again = elastic_import(&pool, &created, "admin").unwrap_err().to_string();
         assert!(again.contains("już zapisana w tej instancji"), "{again}");
 
         // A different array that wants a disk this one already holds. The
@@ -4963,19 +5262,19 @@ mod tests {
         // pre-check is that the admin is told WHICH disk.
         let mut overlapping = super::super::elastic::tests::create_spec("archiwum");
         overlapping.data[0] = created.data[0].clone();
-        let taken = elastic_import(&pool, &overlapping, &previous_owner(), "admin").unwrap_err().to_string();
+        let taken = elastic_import(&pool, &overlapping, "admin").unwrap_err().to_string();
         assert!(taken.contains(&created.data[0].disk_id), "the refusal names the disk: {taken}");
 
         // Only the filesystem UUID is shared: still a refusal, because that
         // UUID is the identity a second array must not be able to claim.
         let mut same_uuid = super::super::elastic::tests::create_spec("archiwum");
         same_uuid.data[0].expected_uuid = created.data[0].expected_uuid.clone();
-        assert!(elastic_import(&pool, &same_uuid, &previous_owner(), "admin").is_err());
+        assert!(elastic_import(&pool, &same_uuid, "admin").is_err());
 
         // A different array whose NAME is taken.
         let mut renamed = super::super::elastic::tests::create_spec("produkt");
         renamed.owner = previous_owner();
-        let name = elastic_import(&pool, &renamed, &previous_owner(), "admin").unwrap_err().to_string();
+        let name = elastic_import(&pool, &renamed, "admin").unwrap_err().to_string();
         assert!(name.contains("Nazwa macierzy jest już zajęta"), "{name}");
 
         assert_eq!(
@@ -5183,7 +5482,37 @@ mod tests {
         let p = Arc::new(crate::db::Db::from_connection(conn));
         let spec = super::super::elastic::tests::create_spec("schema-ten");
         let created = elastic_job(&spec);
-        insert_job(&p, &created, Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        // Written the way the SCHEMA-9 BUILD wrote it, by hand: `insert_job` is
+        // today's code and writes today's columns (`org_id`, migration 18), which
+        // a schema-9 table does not have. Using it here would test that the
+        // current writer can fill an old table — which it never has to, because
+        // the database is always migrated before the app writes — instead of
+        // what this test is about: a row from back then surviving migration 10.
+        {
+            let conn = p.write().unwrap();
+            conn.execute(
+                "INSERT INTO nas_elastic_arrays
+                 (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,'creating','',?6,?6)",
+                params![spec.array_id, spec.owner.org_id, spec.owner.addon_id, spec.name,
+                    spec.filesystem.as_str(), created.started_at],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO nas_jobs (job_id, kind, subject, status, progress_pct, started_by,
+                                       started_at, log)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '')",
+                params![created.job_id, created.kind, created.subject, created.status,
+                    created.progress_pct.map(i64::from), created.started_by, created.started_at],
+            ).unwrap();
+            insert_elastic_disks(&conn, &spec).unwrap();
+            conn.execute(
+                "INSERT INTO nas_elastic_operations
+                 (operation_id, array_id, job_id, kind, state, request_json, error, created_at)
+                 VALUES (?1, ?2, ?3, 'create', 'running', ?4, '', ?5)",
+                params![spec.operation_id, spec.array_id, created.job_id,
+                    serde_json::to_string(&spec).unwrap(), created.started_at],
+            ).unwrap();
+        }
         let before: String = p
             .read()
             .unwrap()
@@ -7731,6 +8060,7 @@ mod tests {
             finished_at: None,
             error: None,
             log: vec![],
+            subject_last_known: false,
         };
         insert_job(&p, &j, None).unwrap();
         append_job_log(&p, "j1", "first").unwrap();
@@ -8087,5 +8417,334 @@ mod tests {
         };
         set_smart_schedule(&p, &smart).unwrap();
         assert_eq!(smart_schedule(&p).unwrap(), smart);
+    }
+
+    // ----- tenants (migration 18) ---------------------------------------------------
+
+    /// One array per organisation, created the way the product creates one,
+    /// so the job and the array row come from the real write path.
+    fn tenant_array(p: &DbPool, org: &str, name: &str) -> ElasticCreateSpec {
+        let mut spec = super::super::elastic::tests::create_spec(name);
+        spec.owner = ElasticOwner { org_id: org.into(), addon_id: "tentanas-shared".into() };
+        insert_job(p, &elastic_job(&spec), Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        spec
+    }
+
+    fn plain_job(kind: &str, subject: &str) -> NasJob {
+        NasJob { job_id: uuid::Uuid::now_v7().to_string(), kind: kind.into(), subject: subject.into(),
+            status: "running".into(), started_by: "test".into(), started_at: now(), ..Default::default() }
+    }
+
+    fn subjects(jobs: &[NasJob]) -> std::collections::BTreeSet<String> {
+        jobs.iter().map(|j| format!("{}:{}", j.kind, j.subject)).collect()
+    }
+
+    #[test]
+    fn a_tenant_sees_its_own_and_the_node_wide_jobs_but_never_another_organisations_array_jobs() {
+        let p = pool();
+        tenant_array(&p, "org-a", "alpha");
+        tenant_array(&p, "org-b", "bravo");
+        // An Elastic job WITHOUT an intent is stamped by its array name too.
+        let bravo_mover = plain_job("elastic_mover", "bravo");
+        insert_job(&p, &bravo_mover, None).unwrap();
+        let scrub = plain_job("pool_scrub", "tank");
+        insert_job(&p, &scrub, None).unwrap();
+
+        let a = subjects(&list_jobs_for_org(&p, "org-a", 100).unwrap());
+        assert_eq!(a, ["elastic_create:alpha", "pool_scrub:tank"].map(String::from).into_iter().collect());
+        let b = subjects(&list_jobs_for_org(&p, "org-b", 100).unwrap());
+        assert_eq!(b, ["elastic_create:bravo", "elastic_mover:bravo", "pool_scrub:tank"]
+            .map(String::from).into_iter().collect());
+        // A guessed id of the other tenant's job answers like an unknown id.
+        assert!(job_for_org(&p, "org-a", &bravo_mover.job_id).unwrap().is_none());
+        assert!(job_for_org(&p, "org-b", &bravo_mover.job_id).unwrap().is_some());
+        assert!(job_for_org(&p, "org-a", &scrub.job_id).unwrap().is_some(), "shared hardware stays shared");
+        // The node's own loops still see every job.
+        assert_eq!(list_jobs(&p, 100).unwrap().len(), 4);
+        // No organisation id is empty, but an empty one must not match the
+        // unowned rows either.
+        assert_eq!(subjects(&list_jobs_for_org(&p, "", 100).unwrap()),
+            ["pool_scrub:tank"].map(String::from).into_iter().collect());
+    }
+
+    #[test]
+    fn an_adopted_array_job_belongs_to_the_adopting_organisation() {
+        let p = pool();
+        let mut spec = super::super::elastic::tests::create_spec("media");
+        spec.owner = ElasticOwner { org_id: "org-a".into(), addon_id: "tentanas-shared".into() };
+        elastic_import(&p, &spec, "admin").unwrap();
+        assert_eq!(list_jobs_for_org(&p, "org-a", 100).unwrap().len(), 1);
+        assert!(list_jobs_for_org(&p, "org-b", 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_alert_about_another_organisations_array_is_invisible_and_cannot_be_acked() {
+        let p = pool();
+        tenant_array(&p, "org-a", "alpha");
+        tenant_array(&p, "org-b", "bravo");
+        raise_alert(&p, "elastic:alpha:x", "warning", "elastic-array", "alpha", "Macierz alpha", "").unwrap();
+        raise_alert(&p, "elastic:bravo:x", "warning", "elastic-array", "bravo", "Macierz bravo", "").unwrap();
+        raise_alert(&p, "disk:d1:temp", "warning", "disk", "d1", "Disk sda: hot", "").unwrap();
+
+        let seen = |org: &str| -> std::collections::BTreeSet<String> {
+            list_alerts_for_org(&p, org, true).unwrap().into_iter().map(|a| a.subject_id).collect()
+        };
+        assert_eq!(seen("org-a"), ["alpha", "d1"].map(String::from).into_iter().collect());
+        assert_eq!(seen("org-b"), ["bravo", "d1"].map(String::from).into_iter().collect());
+
+        let bravo = list_alerts_for_org(&p, "org-b", true).unwrap()
+            .into_iter().find(|a| a.subject_id == "bravo").unwrap().alert_id;
+        assert!(!ack_alert_for_org(&p, "org-a", &bravo).unwrap(), "not this tenant's to acknowledge");
+        assert!(list_alerts_for_org(&p, "org-b", false).unwrap().iter().any(|a| a.alert_id == bravo));
+        assert!(ack_alert_for_org(&p, "org-b", &bravo).unwrap());
+        // The node-wide read (forwarding, the scheduler) still has all three.
+        assert_eq!(list_alerts(&p, true).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_parked_request_alert_belongs_to_the_organisation_that_parked_it() {
+        let p = pool();
+        let row = ApprovalRow {
+            payload_json: "{}".into(),
+            org_id: "org-a".into(),
+            addon_id: "tentanas-shared".into(),
+            approval: tentaflow_protocol::tentanas::NasPendingApproval {
+                request_id: "req-1".into(), operation: "elastic_destroy".into(), subject: "alpha".into(),
+                status: "pending".into(), requested_by: "u".into(), requested_at: now(), expires_at: now(),
+                ..Default::default()
+            },
+        };
+        insert_approval(&p, &row).unwrap();
+        raise_alert(&p, "approval:req-1", "warning", "approval", "req-1", "a red-path operation on 'alpha'", "").unwrap();
+        assert_eq!(list_alerts_for_org(&p, "org-a", true).unwrap().len(), 1);
+        assert!(list_alerts_for_org(&p, "org-b", true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_array_job_or_alert_whose_array_cannot_be_found_is_shown_to_no_tenant() {
+        let p = pool();
+        insert_job(&p, &plain_job("elastic_sync", "ghost"), None).unwrap();
+        raise_alert(&p, "elastic:ghost:x", "warning", "elastic-array", "ghost", "Macierz ghost", "").unwrap();
+        for org in ["org-a", "org-b"] {
+            assert!(list_jobs_for_org(&p, org, 100).unwrap().is_empty(), "{org}");
+            assert!(list_alerts_for_org(&p, org, true).unwrap().is_empty(), "{org}");
+        }
+        assert_eq!(list_jobs(&p, 100).unwrap().len(), 1, "the row itself is kept");
+    }
+
+    /// A job created WITH an owner (`insert_job_owned`, what `spawn_owned`
+    /// writes for a journal-releasing disk wipe) is that organisation's from
+    /// the moment the row exists: the INSERT carries it, so no read between
+    /// two writes can find it node-wide. The owner rule stays one rule: an
+    /// Elastic job's owner is its array's and a caller may not name another.
+    #[test]
+    fn a_job_inserted_with_an_owner_is_never_node_wide() {
+        let p = pool();
+        let wipe = plain_job("disk_wipe", "sdq");
+        insert_job_owned(&p, &wipe, None, Some("org-a")).unwrap();
+        // The row as first written: owned, not NULL.
+        let stored: Option<String> = p.read().unwrap()
+            .query_row("SELECT org_id FROM nas_jobs WHERE job_id = ?1", params![wipe.job_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("org-a"));
+        assert!(list_jobs_for_org(&p, "org-b", 100).unwrap().is_empty());
+        assert_eq!(list_jobs_for_org(&p, "org-a", 100).unwrap().len(), 1);
+
+        // Without an owner a wipe is shared hardware, as before.
+        let plain = plain_job("disk_wipe", "sdr");
+        insert_job(&p, &plain, None).unwrap();
+        assert_eq!(list_jobs_for_org(&p, "org-b", 100).unwrap().len(), 1, "node-wide");
+
+        // One rule for Elastic jobs: the array decides, an explicit owner is
+        // refused and writes nothing.
+        tenant_array(&p, "org-b", "bravo");
+        let mover = plain_job("elastic_mover", "bravo");
+        assert!(insert_job_owned(&p, &mover, None, Some("org-a")).is_err());
+        assert!(job_for_org(&p, "org-b", &mover.job_id).unwrap().is_none(), "nothing was inserted");
+        insert_job(&p, &mover, None).unwrap();
+        assert!(job_for_org(&p, "org-b", &mover.job_id).unwrap().is_some());
+        // An empty organisation id is nobody, not an owner.
+        assert!(insert_job_owned(&p, &plain_job("disk_wipe", "sds"), None, Some("")).is_err());
+    }
+
+    /// A node upgraded with jobs and alerts already in the table: every Elastic
+    /// row gets the owner of its array, a row whose array is gone gets nobody,
+    /// and a wipe whose log names a released journal leaves the shared list.
+    #[test]
+    fn migration_eighteen_backfills_the_owner_of_existing_array_jobs_and_alerts() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..17]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+               VALUES ('arr-a','org-a','nas','alpha','xfs','active','','now','now');
+             INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log) VALUES
+               ('j-create','elastic_create','renamed-since','succeeded','u','now',''),
+               ('j-sync','elastic_sync','alpha','succeeded','u','now',''),
+               ('j-gone','elastic_destroy','gone','succeeded','u','now',''),
+               ('j-scrub','pool_scrub','tank','succeeded','u','now',''),
+               ('j-wipe-plain','disk_wipe','sdq','succeeded','u','now','wipefs done'),
+               ('j-wipe-journal','disk_wipe','sdr','succeeded','u','now',
+                 'zwolniono rezerwację dziennika macierzy Elastic gone: koniec');
+             INSERT INTO nas_elastic_operations
+               (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+               VALUES ('op-1','arr-a','j-create','create','succeeded','{}','','now');
+             INSERT INTO nas_alerts
+               (alert_id,severity,subject_kind,subject_id,title,detail,raised_at,dedupe_key) VALUES
+               ('a-alpha','warning','elastic-array','alpha','t','','now','k1'),
+               ('a-gone','warning','elastic-array','gone','t','','now','k2'),
+               ('a-disk','warning','disk','d1','t','','now','k3');",
+        )
+        .unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+        let owner = |table: &str, key: &str, id: &str| -> Option<String> {
+            conn.query_row(&format!("SELECT org_id FROM {table} WHERE {key} = ?1"), params![id], |r| r.get(0))
+                .unwrap()
+        };
+        // By the operation first: the subject no longer names the array.
+        assert_eq!(owner("nas_jobs", "job_id", "j-create").as_deref(), Some("org-a"));
+        assert_eq!(owner("nas_jobs", "job_id", "j-sync").as_deref(), Some("org-a"));
+        assert_eq!(owner("nas_jobs", "job_id", "j-gone").as_deref(), Some(""));
+        assert_eq!(owner("nas_jobs", "job_id", "j-scrub"), None);
+        assert_eq!(owner("nas_jobs", "job_id", "j-wipe-plain"), None);
+        assert_eq!(owner("nas_jobs", "job_id", "j-wipe-journal").as_deref(), Some(""));
+        assert_eq!(owner("nas_alerts", "alert_id", "a-alpha").as_deref(), Some("org-a"));
+        assert_eq!(owner("nas_alerts", "alert_id", "a-gone").as_deref(), Some(""));
+        assert_eq!(owner("nas_alerts", "alert_id", "a-disk"), None);
+    }
+
+    /// Names are reused: org A dissolved its `media` (the row and its
+    /// operations are deleted, the jobs and the alerts stay) and org B later
+    /// created its own `media`. The backfill must not hand A's older history
+    /// to B through the name — only an array that existed when the row was
+    /// written may claim it, and A's rows become nobody's.
+    #[test]
+    fn migration_eighteen_does_not_give_a_dissolved_arrays_history_to_the_org_that_reused_its_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..17]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+               VALUES ('arr-b','org-b','nas','media','xfs','active','',
+                       '2026-09-20T10:00:00Z','2026-09-20T10:00:00Z');
+             INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log) VALUES
+               ('j-a-sync','elastic_sync','media','succeeded','u-a','2026-09-10T08:00:00Z',
+                 'snapraid sync of org A'),
+               ('j-a-destroy','elastic_destroy','media','succeeded','u-a','2026-09-12T08:00:00Z',''),
+               ('j-b-create','elastic_create','media','succeeded','u-b','2026-09-20T10:00:00Z',''),
+               ('j-b-sync','elastic_sync','media','succeeded','u-b','2026-09-21T08:00:00Z','');
+             INSERT INTO nas_alerts
+               (alert_id,severity,subject_kind,subject_id,title,detail,raised_at,dedupe_key) VALUES
+               ('a-a','warning','elastic-array','media','org A text','','2026-09-11T08:00:00Z','k-a'),
+               ('a-b','warning','elastic-array','media','org B text','','2026-09-21T09:00:00Z','k-b');",
+        )
+        .unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+        let owner = |table: &str, key: &str, id: &str| -> Option<String> {
+            conn.query_row(&format!("SELECT org_id FROM {table} WHERE {key} = ?1"), params![id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(owner("nas_jobs", "job_id", "j-a-sync").as_deref(), Some(""), "org A's job, not B's");
+        assert_eq!(owner("nas_jobs", "job_id", "j-a-destroy").as_deref(), Some(""));
+        // Created in the same second as the array row: `<=`, not `<`.
+        assert_eq!(owner("nas_jobs", "job_id", "j-b-create").as_deref(), Some("org-b"));
+        assert_eq!(owner("nas_jobs", "job_id", "j-b-sync").as_deref(), Some("org-b"));
+        assert_eq!(owner("nas_alerts", "alert_id", "a-a").as_deref(), Some(""), "org A's alert, not B's");
+        assert_eq!(owner("nas_alerts", "alert_id", "a-b").as_deref(), Some("org-b"));
+    }
+
+    /// An alert still open when its array's name passes to another
+    /// organisation: the next raise under the same dedupe key moves the row to
+    /// the new owner, whether or not its text changed, so org A never reads
+    /// org B's condition and B does not miss it.
+    #[test]
+    fn a_refreshed_alert_is_restamped_with_the_owner_of_the_array_that_now_holds_the_name() {
+        let p = pool();
+        let a = tenant_array(&p, "org-a", "media");
+        let key = "elastic:media:repair";
+        let raise = |detail: &str| {
+            raise_alert(&p, key, "warning", "elastic-array", "media", "Macierz media wymaga naprawy", detail)
+                .unwrap()
+        };
+        assert!(raise("the same words"));
+        let mine = list_alerts_for_org(&p, "org-a", true).unwrap();
+        assert_eq!(mine.len(), 1);
+        let alert_id = mine[0].alert_id.clone();
+        // Org A acknowledges it, and a fixed sentinel stands in for
+        // `raised_at` so the reset below cannot pass by timing luck (a test
+        // run within the same wall-clock second as the refresh would not
+        // otherwise tell "kept" from "reset to now" apart).
+        assert!(ack_alert_for_org(&p, "org-a", &alert_id).unwrap());
+        p.write().unwrap().execute(
+            "UPDATE nas_alerts SET raised_at = '2020-01-01T00:00:00Z' WHERE alert_id = ?1",
+            params![alert_id],
+        ).unwrap();
+        let acked = list_alerts_for_org(&p, "org-a", true).unwrap();
+        assert!(acked[0].acked_at.is_some(), "org A's ack really landed");
+        assert_eq!(acked[0].raised_at, "2020-01-01T00:00:00Z");
+
+        // Dissolved WITHOUT resolving this alert, then the name is reused.
+        assert!(delete_elastic_array(&p, &a.owner, &a.array_id).unwrap());
+        tenant_array(&p, "org-b", "media");
+
+        // Identical text: still re-owned, the owner alone is a change.
+        assert!(!raise("the same words"), "a refresh, not a new alert");
+        assert!(list_alerts_for_org(&p, "org-a", true).unwrap().is_empty());
+        let theirs = list_alerts_for_org(&p, "org-b", true).unwrap();
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].alert_id, alert_id, "the same row, re-owned, not a new one");
+        // N3: a re-owned alert must not arrive pre-acked with org A's "since"
+        // time — B's badge and unacked list would never show it otherwise.
+        assert!(theirs[0].acked_at.is_none(), "B's condition starts unacknowledged");
+        assert_ne!(theirs[0].raised_at, "2020-01-01T00:00:00Z", "B's \"since\" time is its own, not A's");
+        // New text: lands on org B's row only.
+        assert!(!raise("org B's disk d2"));
+        assert!(list_alerts_for_org(&p, "org-a", true).unwrap().is_empty());
+        let seen = list_alerts_for_org(&p, "org-b", true).unwrap();
+        assert_eq!(seen.iter().map(|a| a.detail.as_str()).collect::<Vec<_>>(), vec!["org B's disk d2"]);
+        // The current owner raising it again changes nothing and adds nothing,
+        // and does NOT reset `raised_at` or `acked_at` again — the owner is
+        // unchanged, so the CASE in the refresh must not fire a second time.
+        let before_same_owner = list_alerts_for_org(&p, "org-b", true).unwrap();
+        assert!(!raise("org B's disk d2"));
+        let after_same_owner = list_alerts_for_org(&p, "org-b", true).unwrap();
+        assert_eq!(after_same_owner[0].raised_at, before_same_owner[0].raised_at);
+        assert_eq!(after_same_owner[0].acked_at, before_same_owner[0].acked_at);
+        assert_eq!(list_alerts_for_org(&p, "org-b", true).unwrap().len(), 1);
+        assert_eq!(list_alerts(&p, true).unwrap().len(), 1, "one row throughout");
+    }
+
+    /// The fleet badge: the published node figure counts only node-wide
+    /// alerts, and a tenant's figure is exactly the list that tenant sees.
+    #[test]
+    fn the_alert_counts_match_what_each_tenant_is_shown() {
+        let p = pool();
+        tenant_array(&p, "org-a", "alpha");
+        tenant_array(&p, "org-b", "bravo");
+        raise_alert(&p, "elastic:alpha:x", "warning", "elastic-array", "alpha", "Macierz alpha", "").unwrap();
+        raise_alert(&p, "elastic:bravo:x", "warning", "elastic-array", "bravo", "Macierz bravo", "").unwrap();
+        raise_alert(&p, "elastic:bravo:y", "critical", "elastic-array", "bravo", "Macierz bravo 2", "").unwrap();
+        raise_alert(&p, "disk:d1:temp", "warning", "disk", "d1", "Disk sda: hot", "").unwrap();
+        raise_alert(&p, "elastic:ghost:x", "warning", "elastic-array", "ghost", "Macierz ghost", "").unwrap();
+        assert_eq!(count_open_node_alerts(&p).unwrap(), 1, "only the disk");
+        for (org, expected) in [("org-a", 2), ("org-b", 3), ("org-c", 1), ("", 1)] {
+            assert_eq!(count_open_alerts_for_org(&p, org).unwrap(), expected, "{org}");
+            assert_eq!(list_alerts_for_org(&p, org, false).unwrap().len() as u32, expected, "{org}");
+        }
+        let bravo = list_alerts_for_org(&p, "org-b", false).unwrap()[0].alert_id.clone();
+        assert!(ack_alert_for_org(&p, "org-b", &bravo).unwrap());
+        assert_eq!(count_open_alerts_for_org(&p, "org-b").unwrap(), 2, "an acknowledged alert leaves both");
+    }
+
+    #[test]
+    fn the_array_names_of_an_organisation_hold_only_its_own_arrays() {
+        let p = pool();
+        tenant_array(&p, "org-a", "alpha");
+        tenant_array(&p, "org-b", "bravo");
+        assert_eq!(elastic_array_names_of_org(&p, "org-a").unwrap(),
+            ["alpha"].map(String::from).into_iter().collect());
+        assert!(elastic_array_names_of_org(&p, "org-c").unwrap().is_empty());
     }
 }

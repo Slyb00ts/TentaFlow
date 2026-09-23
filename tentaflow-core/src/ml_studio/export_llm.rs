@@ -274,7 +274,7 @@ pub async fn mesh_export_start(export_id: &str, spec_json: &str) -> anyhow::Resu
         .unwrap_or("");
     if adapter_path.is_empty() || !std::path::Path::new(adapter_path).is_dir() {
         anyhow::bail!(
-            "adapter eksportu niedostępny na tym węźle: {}",
+            "adapter eksportu niedostępny na tym nodzie: {}",
             adapter_path
         );
     }

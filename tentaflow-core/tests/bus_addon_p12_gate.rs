@@ -76,6 +76,23 @@ impl bus::BusAuthorizer for AllowAllAuthorizer {
     }
 }
 
+
+/// The bus host functions resolve their `BusService` through the platform's
+/// app gate (`app_gate::sole_enabled_instance`), which reads the `addons`
+/// table — so a fixture that only starts a `BusService` is refused with
+/// `AbiError::Operation`. Registering the instance is what the real install
+/// does; without it these tests exercise nothing but the refusal.
+fn register_bus_instance(db: &db::DbPool, instance_id: &str) {
+    db.write()
+        .expect("db lock")
+        .execute(
+            "INSERT INTO addons (addon_id, package_id, name, version, is_enabled) \
+             VALUES (?1, ?2, 'TentaBus', '1.0.0', 1)",
+            rusqlite::params![instance_id, bus::instance::BusInstanceId::PACKAGE_ID],
+        )
+        .expect("register the TentaBus instance");
+}
+
 fn load_wasm() -> Option<Vec<u8>> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(BUS_TEST_ADDON_WASM);
     std::fs::read(&p).ok()
@@ -206,6 +223,7 @@ async fn run_gate(cycles: u64) {
     };
 
     let db = db::init(Path::new(":memory:")).expect("init db");
+    register_bus_instance(&db, "tentabus-00000001");
     let tmp = tempfile::tempdir().expect("create temp dir");
     let bus_dir = tmp.path().join("bus");
 

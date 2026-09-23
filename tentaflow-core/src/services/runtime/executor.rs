@@ -724,9 +724,7 @@ impl ModelRuntimeExecutor {
         // the request body and their tool-call deltas pass through untouched.
 
         match target {
-            ResolvedExecutionTarget::Local {
-                service_id, handle, ..
-            } => match handle {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
                 BackendHandle::Embedded { .. } => {
                     let rx = self
                         .local_inference
@@ -949,79 +947,6 @@ impl ModelRuntimeExecutor {
                         dispatch_at,
                         recorder,
                     )))
-                }
-                BackendHandle::AgentRpc => {
-                    let response = self
-                        .dispatch_coding_agent_chat(*service_id, request, ctx)
-                        .await?;
-                    let model = response.model;
-                    let text = response
-                        .choices
-                        .into_iter()
-                        .next()
-                        .and_then(|choice| choice.message.content)
-                        .and_then(|content| match content {
-                            crate::api::openai::types::MessageContent::Text(text) => Some(text),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-                    let created = chrono::Utc::now().timestamp() as u64;
-                    let chunks = vec![
-                        Ok(ChatCompletionChunk {
-                            id: id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model.clone(),
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: Some("assistant".to_string()),
-                                    content: Some(text),
-                                    reasoning_content: None,
-                                    tool_calls: None,
-                                },
-                                finish_reason: None,
-                                logprobs: None,
-                            }],
-                            system_fingerprint: None,
-                            audio: None,
-                            detected_intent: None,
-                            detected_tools: None,
-                            transcribed_text: None,
-                            speaker_id: None,
-                            speaker_name: None,
-                            usage: None,
-                            perf: None,
-                        }),
-                        Ok(ChatCompletionChunk {
-                            id,
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model,
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: Delta {
-                                    role: None,
-                                    content: None,
-                                    reasoning_content: None,
-                                    tool_calls: None,
-                                },
-                                finish_reason: Some("stop".to_string()),
-                                logprobs: None,
-                            }],
-                            system_fingerprint: None,
-                            audio: None,
-                            detected_intent: None,
-                            detected_tools: None,
-                            transcribed_text: None,
-                            speaker_id: None,
-                            speaker_name: None,
-                            usage: None,
-                            perf: None,
-                        }),
-                    ];
-                    Ok(Box::pin(futures::stream::iter(chunks)))
                 }
             },
             ResolvedExecutionTarget::MeshForward {
@@ -1281,9 +1206,7 @@ impl ModelRuntimeExecutor {
             None
         };
         let mut response = match target {
-            ResolvedExecutionTarget::Local {
-                service_id, handle, ..
-            } => match handle {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
                 BackendHandle::Embedded { .. } => self
                     .local_inference
                     .handle_chat_completion(&request, prompt_tools.as_deref())
@@ -1294,9 +1217,6 @@ impl ModelRuntimeExecutor {
                     .await
                     .map_err(|e| ExecutorError::Internal(e.to_string())),
                 BackendHandle::Quic(handle) => Self::dispatch_chat_quic(handle, request).await,
-                BackendHandle::AgentRpc => {
-                    self.dispatch_coding_agent_chat(*service_id, request, ctx).await
-                }
             },
             ResolvedExecutionTarget::MeshForward {
                 node_id,
@@ -1454,87 +1374,6 @@ impl ModelRuntimeExecutor {
             tool_calling::apply_prompt_mode_response(&mut response, tools);
         }
         Ok(response)
-    }
-
-    async fn dispatch_coding_agent_chat(
-        &self,
-        service_id: i64,
-        request: ChatCompletionRequest,
-        ctx: &ExecutionContext,
-    ) -> Result<ChatCompletionResponse, ExecutorError> {
-        let db = self.db.clone().ok_or_else(|| {
-            ExecutorError::Internal("coding-agent dispatch requires the service database".into())
-        })?;
-        let lookup_db = db.clone();
-        let service = tokio::task::spawn_blocking(move || {
-            let conn = lookup_db
-                .read()
-                .map_err(|e| format!("coding-agent database read: {e}"))?;
-            crate::services_repo::services::get(&conn, service_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("coding-agent service {service_id} not found"))
-        })
-        .await
-        .map_err(|e| ExecutorError::Internal(format!("coding-agent database task: {e}")))?
-        .map_err(ExecutorError::Internal)?;
-        let prompt = request
-            .messages
-            .iter()
-            .filter_map(|message| {
-                let content = match message.content.as_ref()? {
-                    crate::api::openai::types::MessageContent::Text(text) => text.clone(),
-                    crate::api::openai::types::MessageContent::Parts(parts) => parts
-                        .iter()
-                        .filter_map(|part| match part {
-                            crate::api::openai::types::ContentPart::Text { text } => {
-                                Some(text.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                };
-                if content.trim().is_empty() {
-                    None
-                } else {
-                    Some(format!("{}: {}", message.role, content))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if prompt.is_empty() {
-            return Err(ExecutorError::Internal(
-                "coding-agent chat request contains no text".into(),
-            ));
-        }
-        let user = ctx.user.as_ref().ok_or_else(|| ExecutorError::Internal("coding-agent accounts require an authenticated user".into()))?;
-        let text = crate::services::coding_agent::execute_chat(&db, &service, &user.user_id, &request.model, &prompt)
-            .await
-            .map_err(ExecutorError::Internal)?;
-        Ok(ChatCompletionResponse {
-            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp() as u64,
-            model: request.model,
-            choices: vec![crate::api::openai::types::Choice {
-                index: 0,
-                message: crate::api::openai::types::Message {
-                    role: "assistant".to_string(),
-                    content: Some(crate::api::openai::types::MessageContent::Text(text)),
-                    ..Default::default()
-                },
-                finish_reason: Some("stop".to_string()),
-                logprobs: None,
-            }],
-            usage: None,
-            system_fingerprint: None,
-            transcribed_text: None,
-            speaker_id: None,
-            speaker_name: None,
-            speaker_confidence: None,
-            detected_intent: None,
-            detected_tools: None,
-        })
     }
 
     /// R3b.7 — shared mesh forwarding for chat / embeddings / TTS / STT.
@@ -1980,9 +1819,6 @@ impl ModelRuntimeExecutor {
                         )),
                     }
                 }
-                BackendHandle::AgentRpc => Err(ExecutorError::Internal(
-                    "coding-agent models do not support embeddings".into(),
-                )),
             },
             ResolvedExecutionTarget::MeshForward {
                 node_id,
@@ -2221,9 +2057,6 @@ impl ModelRuntimeExecutor {
                         .map_err(|e| ExecutorError::Internal(format!("QUIC rerank: {}", e)))?;
                     rerank_result_to_response(response.result)
                 }
-                BackendHandle::AgentRpc => Err(ExecutorError::Internal(
-                    "coding-agent models do not support rerank".into(),
-                )),
             },
             ResolvedExecutionTarget::MeshForward {
                 node_id,
@@ -2571,9 +2404,6 @@ impl ModelRuntimeExecutor {
                     })?;
                     document_infer_result_to_response(response.result)
                 }
-                BackendHandle::AgentRpc => Err(ExecutorError::Internal(
-                    "coding-agent models do not support document inference".into(),
-                )),
             },
             ResolvedExecutionTarget::MeshForward {
                 node_id,
@@ -2696,7 +2526,7 @@ impl ModelRuntimeExecutor {
                         .await
                         .map_err(ExecutorError::Internal)
                 }
-                BackendHandle::Http(_) | BackendHandle::Quic(_) | BackendHandle::AgentRpc => {
+                BackendHandle::Http(_) | BackendHandle::Quic(_) => {
                     Err(ExecutorError::Internal(
                         "camera-cv wspiera wyłącznie transport embedded/mesh".into(),
                     ))
@@ -2857,6 +2687,12 @@ impl ModelRuntimeExecutor {
     /// wpiętego kanału obrazu, a embedded (telefon, Burn) to gniazdo na
     /// przyszłość — oba zwracają błąd, więc failover schodzi na zdalny backend
     /// zamiast blokować architekturę. Flow-target wykonuje documents-surface flow.
+    ///
+    /// Not yet wired to `execute_documents` — `docs/RAG_INGEST_FLOW_PLAN.md`
+    /// (Sekwencja implementacji, krok 3: typed `/v1/infer` detektorów +
+    /// mesh-forward sender) reuses this per-target dispatch once that step
+    /// lands; until then it is exercised only by its own unit tests below.
+    #[allow(dead_code)]
     async fn dispatch_documents_blocking(
         &self,
         target: &ResolvedExecutionTarget,
@@ -2907,9 +2743,6 @@ impl ModelRuntimeExecutor {
                 BackendHandle::Quic(_) => {
                     Err(ExecutorError::Internal("documents over QUIC TBD".into()))
                 }
-                BackendHandle::AgentRpc => Err(ExecutorError::Internal(
-                    "coding-agent models do not support document parsing".into(),
-                )),
             },
             // Mesh-forward obrazu (cross-node parse) to osobny slice — na razie
             // pending cutover, jak rerank.
@@ -3273,9 +3106,6 @@ impl ModelRuntimeExecutor {
                         )),
                     }
                 }
-                BackendHandle::AgentRpc => Err(ExecutorError::Internal(
-                    "coding-agent models do not support text-to-speech".into(),
-                )),
             },
             ResolvedExecutionTarget::MeshForward {
                 node_id,

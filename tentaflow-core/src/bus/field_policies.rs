@@ -42,6 +42,7 @@ use bytes::Bytes;
 use crate::db::repository::{self, DbBusFieldPolicy};
 use crate::db::DbPool;
 
+use super::dlq;
 use super::payload_format::PayloadFormat;
 use super::{topics, BusServiceError};
 
@@ -51,6 +52,39 @@ use super::{topics, BusServiceError};
 /// same `(org_id, topic, direction)` would otherwise both satisfy a
 /// `NULL`-based uniqueness check.
 pub const SUBJECT_ANY: &str = "*";
+
+/// What kind of subject `actor` names (`FP-subject-type`,
+/// SUM/tentabus/DECYZJE-2026-09-22.md). `BusCallContext.actor` is a raw
+/// string with no type tag of its own, so the CALLER decides the kind from
+/// context it already has — a dashboard/REST/CLI caller is always `User`,
+/// `addon::host_functions::bus::call_context` is the one place that builds
+/// an `Addon` caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorKind {
+    User,
+    Addon,
+}
+
+impl ActorKind {
+    /// `origin == bus::ADDON_ORIGIN` is the only signal recorded today that a
+    /// call crossed the addon wasm boundary — see that constant's doc.
+    /// Everything else (dashboard, REST, host CLI, the metrics rollup) is a
+    /// human/service user.
+    pub fn from_origin(origin: &str) -> ActorKind {
+        if origin == super::ADDON_ORIGIN {
+            ActorKind::Addon
+        } else {
+            ActorKind::User
+        }
+    }
+
+    fn subject_type_str(self) -> &'static str {
+        match self {
+            ActorKind::User => "user",
+            ActorKind::Addon => "addon",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -106,44 +140,67 @@ pub(crate) fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, 
 }
 
 /// Resolves the effective policy for `(org_id, topic, direction)` against
-/// `actor` — a raw actor string that is EITHER a real `user_id` or an
-/// `addon_id`, indistinguishable by type (`BusCallContext.actor` carries no
-/// type tag). This deliberately mirrors the same scope limitation
-/// `RbacBusAuthorizer::topic_acl_allows` already accepts elsewhere in this
-/// codebase (only `subject_type=="user"` is matched against the raw actor)
-/// rather than inventing new machinery to fully solve a problem this
-/// codebase already tolerates.
+/// `actor`, a raw actor string whose KIND (`FP-subject-type`,
+/// SUM/tentabus/DECYZJE-2026-09-22.md) the caller supplies as `actor_kind` —
+/// `BusCallContext.actor` itself carries no type tag, so the caller resolves
+/// it from context it already has (`ActorKind::from_origin`).
 ///
-/// Precedence: an exact `subject_type='user'` row for `actor` wins over the
-/// `subject_type='any'` wildcard row. `Ok(None)` means "unrestricted" — no
-/// matching row of either kind — which is also forced unconditionally for
-/// every `__`-prefixed reserved topic (system-internal topics, e.g.
-/// `__bus.metrics`, are never subject-policy-bearing).
+/// Precedence, most to least specific:
+///   1. an exact `subject_type` row matching `actor_kind` (`'user'` or
+///      `'addon'`) for `actor` itself;
+///   2. for a `User` actor only, a `subject_type='group'` row for one of the
+///      groups `actor` belongs to (`repository::get_user_groups` — the
+///      platform's one source of group membership; groups are not a
+///      meaningful concept for an addon actor, so this step is skipped for
+///      `Addon`). Group rows are checked in the same `(group.id)` ascending
+///      order `get_user_groups` already returns; the first match wins if a
+///      user belongs to more than one group with a row on this topic —
+///      arbitrary but deterministic, same tie-break shape as everywhere else
+///      in this file that has no ordering signal from the domain itself;
+///   3. the `subject_type='any'` topic-wide wildcard row.
+///
+/// `Ok(None)` means "unrestricted" — no matching row at any level — which is
+/// also forced unconditionally for every OTHER `__`-prefixed reserved topic
+/// (broker-internal topics, e.g. `__bus.metrics`, are never
+/// subject-policy-bearing).
+///
+/// `__dlq.<source_topic>` is the one reserved-prefix exception (owner
+/// decision, SUM/tentabus/DECYZJE-2026-09-22.md, `FP-reserved-bypass`): a DLQ
+/// reader must see exactly what they would see reading the SOURCE topic
+/// directly, so this resolves and returns the source topic's policy instead
+/// of exempting the DLQ topic. `set_policy` still refuses to store a policy
+/// row directly on `__dlq.<source_topic>` — there is nothing for such a row
+/// to do, since a lookup on the DLQ topic is redirected here before it could
+/// ever be consulted.
 pub fn resolve(
     pool: &DbPool,
     instance_id: &str,
     org_id: &str,
     topic: &str,
     actor: &str,
+    actor_kind: ActorKind,
     direction: Direction,
 ) -> Result<Option<FieldPolicy>, BusServiceError> {
-    // Reserved topics are broker-owned and carry no subject of their own, so
-    // no policy applies to them. `set_policy` refuses to store one on such a
-    // topic, so no newly created row can be silently shadowed here; a row
-    // written before that guard shipped still is — `list_policies` returns
-    // it and `delete_policy` (which deliberately does not refuse a reserved
-    // topic) removes it.
-    //
-    // Known consequence, deliberately left as-is: a DLQ topic is named
-    // `__dlq.<source_topic>` (`dlq::dlq_topic_name`), so a read policy hiding
-    // a field on `orders` does not apply to `__dlq.orders`, which stores the
-    // failed record's payload unprojected. `BusPayload::DlqListRequest` is
-    // served from the ordinary read dispatch block (`dispatch/bus.rs`), not
-    // the `gate_admin` one, so any caller allowed to read a topic's DLQ sees
-    // the fields that caller's read policy hides on the source topic.
-    // Redacting DLQ reads would trade the DLQ's debugging purpose (showing
-    // the exact payload that failed) against that confidentiality; the owner
-    // has not decided between them, so this file changes neither side.
+    if let Some(source_topic) = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX) {
+        // A DLQ topic is only ever named after a non-reserved source topic
+        // (`dlq::dlq_topic_name`), so `source_topic` never itself starts
+        // with `RESERVED_PREFIX` — no risk of looping back into this branch.
+        return resolve(
+            pool,
+            instance_id,
+            org_id,
+            source_topic,
+            actor,
+            actor_kind,
+            direction,
+        );
+    }
+    // Every OTHER reserved topic is broker-owned and carries no subject of
+    // its own, so no policy applies to it. `set_policy` refuses to store one
+    // on such a topic, so no newly created row can be silently shadowed
+    // here; a row written before that guard shipped still is —
+    // `list_policies` returns it and `delete_policy` (which deliberately
+    // does not refuse a reserved topic) removes it.
     if topic.starts_with(topics::RESERVED_PREFIX) {
         return Ok(None);
     }
@@ -152,11 +209,28 @@ pub fn resolve(
         instance_id,
         org_id,
         topic,
-        "user",
+        actor_kind.subject_type_str(),
         actor,
         direction.as_str(),
     )? {
         return decode(row, topic).map(Some);
+    }
+    if actor_kind == ActorKind::User {
+        let groups = repository::get_user_groups(pool, actor)
+            .map_err(|e| BusServiceError::Db(e.to_string()))?;
+        for group in groups {
+            if let Some(row) = repository::bus_field_policy_get(
+                pool,
+                instance_id,
+                org_id,
+                topic,
+                "group",
+                &group.id,
+                direction.as_str(),
+            )? {
+                return decode(row, topic).map(Some);
+            }
+        }
     }
     if let Some(row) = repository::bus_field_policy_get(
         pool,
@@ -236,10 +310,15 @@ pub fn project_read(policy: &FieldPolicy, format: PayloadFormat, payload: &Bytes
 }
 
 /// Creates or replaces the policy row for `(org_id, topic, subject_type,
-/// subject_id, direction)`. `subject_type` must be `"user"` or `"any"`
-/// (mirroring the table's own `CHECK` constraint, validated here first so
-/// the caller gets a clean `InvalidArgument` instead of a raw SQL error);
-/// `subject_type="any"` requires `subject_id == SUBJECT_ANY`.
+/// subject_id, direction)`. `subject_type` must be one of `"user"`,
+/// `"group"`, `"addon"` or `"any"` (mirroring the table's own widened `CHECK`
+/// constraint since v167/`FP-subject-type`, validated here first so the
+/// caller gets a clean `InvalidArgument` instead of a raw SQL error);
+/// `subject_type="any"` requires `subject_id == SUBJECT_ANY`. For `"group"`,
+/// `subject_id` is a `user_groups.id` — not validated for existence here,
+/// same as `"user"`'s `subject_id` is never checked against a real user:
+/// this feature is opt-in and tolerates a row naming a subject that has not
+/// been created (or has since been deleted) yet.
 /// `required_fields` must be a subset of `fields` — a field cannot be
 /// required if it is not even allowed. A `__`-prefixed reserved topic is
 /// refused outright, since `resolve` never applies a policy to one.
@@ -255,9 +334,9 @@ pub fn set_policy(
     fields: &BTreeSet<String>,
     required_fields: &BTreeSet<String>,
 ) -> Result<(), BusServiceError> {
-    if subject_type != "user" && subject_type != "any" {
+    if !["user", "group", "addon", "any"].contains(&subject_type) {
         return Err(BusServiceError::InvalidArgument(format!(
-            "subject_type must be 'user' or 'any', got '{subject_type}'"
+            "subject_type must be one of 'user', 'group', 'addon', 'any', got '{subject_type}'"
         )));
     }
     if subject_type == "any" && subject_id != SUBJECT_ANY {
@@ -556,5 +635,378 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// `FP-reserved-bypass` (SUM/tentabus/DECYZJE-2026-09-22.md): a DLQ
+    /// reader must see exactly what they would see reading the source topic
+    /// — resolving a read policy on `__dlq.<topic>` must return the SAME
+    /// policy as resolving it on `<topic>` directly, not `None`.
+    #[test]
+    fn resolve_on_a_dlq_topic_inherits_the_source_topics_read_policy() {
+        let db = test_db();
+        let source = "orders.created";
+        let cfg = topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            source,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create source topic");
+        let dlq_topic = dlq::dlq_topic_name(source);
+        topics::create_internal_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            &dlq_topic,
+            dlq::dlq_topic_options(&cfg),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create DLQ topic");
+
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            source,
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            &field_set(&["patient_id"]),
+            &BTreeSet::new(),
+        )
+        .expect("set a read policy on the source topic");
+
+        let via_dlq = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            &dlq_topic,
+            "some-actor",
+            ActorKind::User,
+            Direction::Read,
+        )
+        .expect("resolve on the DLQ topic")
+        .expect("DLQ topic must inherit the source topic's read policy");
+        assert_eq!(via_dlq.fields, field_set(&["patient_id"]));
+
+        let via_source = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            source,
+            "some-actor",
+            ActorKind::User,
+            Direction::Read,
+        )
+        .expect("resolve on the source topic")
+        .expect("source topic has a policy");
+        assert_eq!(via_dlq.fields, via_source.fields);
+    }
+
+    /// Companion: a DLQ topic whose source topic carries NO policy must
+    /// still resolve to `None` (unrestricted), not fall through to some
+    /// stale reserved-topic exemption path.
+    #[test]
+    fn resolve_on_a_dlq_topic_with_no_source_policy_is_unrestricted() {
+        let db = test_db();
+        let source = "orders.shipped";
+        let cfg = topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            source,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create source topic");
+        let dlq_topic = dlq::dlq_topic_name(source);
+        topics::create_internal_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            &dlq_topic,
+            dlq::dlq_topic_options(&cfg),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create DLQ topic");
+
+        let resolved = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            &dlq_topic,
+            "some-actor",
+            ActorKind::User,
+            Direction::Read,
+        )
+        .expect("resolve on the DLQ topic");
+        assert!(resolved.is_none());
+    }
+
+    /// A non-DLQ reserved topic (e.g. `__bus.metrics`) still gets the
+    /// unconditional exemption — only `__dlq.*` inherits.
+    #[test]
+    fn resolve_on_a_non_dlq_reserved_topic_stays_exempt() {
+        let db = test_db();
+        let resolved = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "__bus.metrics",
+            "some-actor",
+            ActorKind::User,
+            Direction::Read,
+        )
+        .expect("resolve on a broker-internal topic");
+        assert!(resolved.is_none());
+    }
+
+    /// `FP-subject-type`: a `subject_type='addon'` row applies only to an
+    /// `Addon`-kind actor, never to a `User`-kind actor with the same raw
+    /// id string — the two subject kinds must not collide.
+    #[test]
+    fn resolve_matches_addon_subject_only_for_an_addon_actor() {
+        let db = test_db();
+        let topic = "orders.created";
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "addon",
+            "meeting-recorder",
+            Direction::Read,
+            &field_set(&["patient_id"]),
+            &BTreeSet::new(),
+        )
+        .expect("set an addon-scoped read policy");
+
+        let as_addon = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "meeting-recorder",
+            ActorKind::Addon,
+            Direction::Read,
+        )
+        .expect("resolve as the addon actor")
+        .expect("addon row must apply to the addon actor");
+        assert_eq!(as_addon.fields, field_set(&["patient_id"]));
+
+        let as_user = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "meeting-recorder",
+            ActorKind::User,
+            Direction::Read,
+        )
+        .expect("resolve as a user actor sharing the same raw id string");
+        assert!(
+            as_user.is_none(),
+            "an addon-scoped row must not leak onto a user actor with the same id"
+        );
+    }
+
+    /// `FP-subject-type`: a `subject_type='group'` row applies to a `User`
+    /// actor who belongs to that group, resolved through the platform's own
+    /// group membership (`repository::get_user_groups`) — not to a user who
+    /// does not belong.
+    #[test]
+    fn resolve_falls_through_to_a_group_policy_for_a_member() {
+        let db = test_db();
+        let topic = "orders.created";
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+
+        let member_id = repository::create_user_account(
+            &db,
+            "group-member",
+            "hash",
+            "Group Member",
+            "group-member@example.com",
+        )
+        .expect("create member user");
+        let outsider_id = repository::create_user_account(
+            &db,
+            "outsider",
+            "hash",
+            "Outsider",
+            "outsider@example.com",
+        )
+        .expect("create outsider user");
+        let group_id =
+            repository::create_group(&db, "triage-team", "reads triage fields").expect("group");
+        repository::add_user_to_group(&db, &group_id, &member_id).expect("add member");
+
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "group",
+            &group_id,
+            Direction::Read,
+            &field_set(&["patient_id"]),
+            &BTreeSet::new(),
+        )
+        .expect("set a group-scoped read policy");
+
+        let member_resolved = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            &member_id,
+            ActorKind::User,
+            Direction::Read,
+        )
+        .expect("resolve for the group member")
+        .expect("group row must apply to a member");
+        assert_eq!(member_resolved.fields, field_set(&["patient_id"]));
+
+        let outsider_resolved = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            &outsider_id,
+            ActorKind::User,
+            Direction::Read,
+        )
+        .expect("resolve for a non-member");
+        assert!(
+            outsider_resolved.is_none(),
+            "a group row must not apply to a user outside the group"
+        );
+    }
+
+    /// Precedence: an exact `subject_type='user'` row for the actor wins
+    /// over a `subject_type='group'` row for a group the same actor belongs
+    /// to.
+    #[test]
+    fn resolve_prefers_an_exact_user_row_over_a_group_row() {
+        let db = test_db();
+        let topic = "orders.created";
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+
+        let member_id = repository::create_user_account(
+            &db,
+            "specific-user",
+            "hash",
+            "Specific User",
+            "specific-user@example.com",
+        )
+        .expect("create member user");
+        let group_id = repository::create_group(&db, "triage-team", "group").expect("group");
+        repository::add_user_to_group(&db, &group_id, &member_id).expect("add member");
+
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "group",
+            &group_id,
+            Direction::Read,
+            &field_set(&["patient_id", "status"]),
+            &BTreeSet::new(),
+        )
+        .expect("set a group-scoped read policy");
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "user",
+            &member_id,
+            Direction::Read,
+            &field_set(&["patient_id"]),
+            &BTreeSet::new(),
+        )
+        .expect("set a user-scoped read policy");
+
+        let resolved = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            &member_id,
+            ActorKind::User,
+            Direction::Read,
+        )
+        .expect("resolve for the user")
+        .expect("a row applies");
+        assert_eq!(
+            resolved.fields,
+            field_set(&["patient_id"]),
+            "the exact user row must win over the group row"
+        );
+    }
+
+    #[test]
+    fn set_policy_rejects_an_unknown_subject_type() {
+        let db = test_db();
+        let topic = "orders.created";
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+
+        let err = set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "robot",
+            "some-id",
+            Direction::Read,
+            &field_set(&["patient_id"]),
+            &BTreeSet::new(),
+        )
+        .expect_err("an unknown subject_type must be rejected");
+        assert!(matches!(err, BusServiceError::InvalidArgument(_)));
     }
 }

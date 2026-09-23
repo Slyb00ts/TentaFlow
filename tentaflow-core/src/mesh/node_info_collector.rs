@@ -909,35 +909,20 @@ pub fn collect_docker_containers() -> Vec<PeerContainerInfo> {
     detect_containers()
 }
 
-/// Sprawdza dostepnosc i wersje Docker serwera.
-/// Zwraca (docker_available, docker_version).
-pub fn collect_docker_info() -> (bool, String) {
-    let available = std::process::Command::new("docker")
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    let version = if available {
-        std::process::Command::new("docker")
-            .args(["version", "--format", "{{.Server.Version}}"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    (available, version)
+/// Docker server version, or an empty string when the daemon does not answer.
+///
+/// Availability is NOT probed here: whether this node can run a container
+/// workspace is `code_studio::container_runtime_available` — the predicate the
+/// create gate and the wire `NodeInfo` both read — and the local peer row
+/// carries neither. What is left for the CLI is the version string.
+pub fn docker_server_version() -> String {
+    std::process::Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Whether THIS node can isolate a workspace in `process_sandbox`, and why not

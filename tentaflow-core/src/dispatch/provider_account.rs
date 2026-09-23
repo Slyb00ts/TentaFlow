@@ -269,6 +269,7 @@ struct Decorations {
     nodes: HashMap<String, Option<String>>,
     grants: HashMap<String, u32>,
     sessions: HashMap<String, u32>,
+    session_users: HashMap<String, u32>,
     credentials: HashMap<String, (i64, Option<String>)>,
     used_on: HashMap<String, Vec<String>>,
     agents: AgentBindings,
@@ -333,6 +334,8 @@ fn decorate(
             .map_err(|e| internal("grant counts", e))?,
         sessions: store::session_counts(&ctx.state.db, &account_ids)
             .map_err(|e| internal("session counts", e))?,
+        session_users: store::session_user_counts(&ctx.state.db, &account_ids)
+            .map_err(|e| internal("session people", e))?,
         credentials: store::credential_revisions(&ctx.state.db, &account_ids)
             .map_err(|e| internal("credential revisions", e))?,
         used_on,
@@ -398,6 +401,7 @@ fn account_info(account: &AccountRecord, dec: &Decorations) -> ProviderAccountIn
         updated_at: account.updated_at.clone(),
         used_on: dec.used_on(&account.account_id),
         max_sessions: account.max_sessions,
+        session_user_count: dec.session_users.get(&account.account_id).copied().unwrap_or(0),
     }
 }
 
@@ -589,7 +593,7 @@ fn account_update(
     if !existed {
         return Err(not_found());
     }
-    Ok(ack(account_id, None))
+    Ok(ack(account_id, None, true))
 }
 
 async fn account_delete(
@@ -606,24 +610,52 @@ async fn account_delete(
     }
     // A sign-in still running for the account now has nowhere to store what it
     // obtains, and its bridge would keep a provider terminal open against an
-    // account this organisation no longer has. The credential goes with it:
-    // stopping the bridge alone would leave the account's token on this disk
+    // account this organisation no longer has. The credential goes with it, with
+    // or without a bridge: `drop_account_credential` tells a running bridge to
+    // drop what it holds, and removes the files from the account root itself when
+    // no bridge is up — a file left there would be a retired token on this disk
     // with no row left to say whose it was.
     login::forget_account(account_id);
-    if let Err(error) = crate::services::agent_runtime::drop_account_credential(account_id).await {
+    // The row is gone, so a failure here is one the operator can never be asked
+    // about again: nothing left in the store names the file the bridge kept, and
+    // the reconcile reaches accounts its own rows point at. The warning carries
+    // the path (`purge_account_credentials` names every tree it could not
+    // empty), and the ack says the outcome was not clean instead of the plain
+    // success the screen would otherwise print over a plaintext token still on
+    // the disk.
+    let purge = crate::services::agent_runtime::drop_account_credential(account_id).await;
+    if let Err(error) = &purge {
         tracing::warn!(
             %account_id,
             error = %format!("{error:#}"),
-            "a deleted agent account left a credential in its bridge"
+            "a deleted agent account left a credential on this node"
         );
     }
-    Ok(ack(account_id, None))
+    Ok(ack(
+        account_id,
+        purge.is_err().then_some(PURGE_INCOMPLETE),
+        purge.is_ok(),
+    ))
 }
 
-fn ack(account_id: &str, message_key: Option<&str>) -> MessageBody {
+/// The i18n key that says a purge landed in the store but not on the disk.
+///
+/// `AccountOpAck` carries no path field, so the path itself reaches the operator
+/// through the node's log, next to the warning that names it.
+const PURGE_INCOMPLETE: &str = "agent_accounts.purge_incomplete";
+
+/// The acknowledgement for a write that has nothing to return. `message_key` is
+/// an i18n key, never a sentence.
+///
+/// `ok` is false for the one partial outcome this family has: the operation the
+/// operator asked for was performed, but a plaintext provider credential could
+/// not be removed from this node's disk. A screen that rendered its success
+/// message anyway would be telling the operator the token is gone while it is
+/// still readable on the node.
+fn ack(account_id: &str, message_key: Option<&str>, ok: bool) -> MessageBody {
     pa(P::AccountOpAck {
         account_id: Some(account_id.to_string()),
-        ok: true,
+        ok,
         message_key: message_key.map(str::to_string),
     })
 }
@@ -643,6 +675,23 @@ fn credential_set(
     if account.credential_kind != "api_key" {
         return Err(ProtocolError::bad_request(
             "this account signs in through the provider, so it has no key to paste",
+        ));
+    }
+    // A paste is the `api_key` twin of a sign-in: both put the account's
+    // credential on THIS disk, so both pass the same node gate. `mint_credential`
+    // claims the home, and a node may not become the home of a credential it is
+    // forbidden to hold — `set_receives_accounts` refuses to take a home node out
+    // of the fleet, and without this check the paste path went around that
+    // protection in the other order: it homed the account here and the fleet
+    // purged the only copy on the next reconcile, leaving a home with no
+    // credential on it. Refused BEFORE the write, so nothing is minted, nothing
+    // is homed and no audit row claims a move.
+    if !store::receives_accounts(&ctx.state.db, ctx.state.local_node_id.as_ref())
+        .map_err(|e| internal("runtime node", e))?
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            crate::services::agent_runtime::NOT_RECEIVING_ACCOUNTS,
         ));
     }
     let meta = CredentialMeta {
@@ -678,7 +727,7 @@ fn credential_set(
             ))
         }
     };
-    Ok(ack(account_id, message_key))
+    Ok(ack(account_id, message_key, true))
 }
 
 async fn credential_clear(
@@ -690,24 +739,33 @@ async fn credential_clear(
     caller.require_account_keeper(&account, "removing a credential")?;
     let cleared = store::clear_credential(&ctx.state.db, account_id, Some(&caller.user_id))
         .map_err(|e| internal("credential clear", e))?;
+    let mut purge_failed = false;
     if cleared {
         // This node's own copy goes now; the other nodes learn from the
         // revocation mark the account row carries and purge on their own
         // reconcile. There is nothing to "push" for a removal — the material
         // never travels, so its absence carries nothing.
-        if let Err(error) =
-            crate::services::agent_runtime::drop_account_credential(account_id).await
-        {
+        let purge = crate::services::agent_runtime::drop_account_credential(account_id).await;
+        purge_failed = purge.is_err();
+        if let Err(error) = &purge {
             tracing::warn!(
                 %account_id,
                 error = %format!("{error:#}"),
-                "a cleared agent credential could not be dropped from its bridge"
+                "a cleared agent credential could not be dropped from this node"
             );
         }
     }
     Ok(ack(
         account_id,
-        (!cleared).then_some("agent_accounts.credential_absent"),
+        if purge_failed {
+            // The revocation is real and the row is gone, so the file is what
+            // the operator still has to deal with — saying only "cleared" would
+            // report a token this node can no longer name as gone.
+            Some(PURGE_INCOMPLETE)
+        } else {
+            (!cleared).then_some("agent_accounts.credential_absent")
+        },
+        !purge_failed,
     ))
 }
 
@@ -1396,7 +1454,7 @@ async fn session_revoke(
     }
     store::delete_session(&ctx.state.db, account_id, session_id)
         .map_err(|e| internal("session delete", e))?;
-    Ok(ack(account_id, None))
+    Ok(ack(account_id, None, true))
 }
 
 // =============================================================================
@@ -1776,6 +1834,22 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Rows this run wrote under one action — the dispatch layer's own record of
+    /// what it decided, which is the only place a "nothing happened" claim can
+    /// be falsified without trusting the handler's return value.
+    fn audit_rows(ctx: &HandlerContext, action: &str) -> i64 {
+        ctx.state
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = ?1",
+                rusqlite::params![action],
+                |row| row.get(0),
+            )
+            .expect("audit rows")
     }
 
     fn listed(body: &MessageBody) -> Vec<String> {
@@ -2170,6 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn the_same_api_key_pasted_twice_is_not_a_rotation() {
         let admin = ctx_for(Some("admin"), BOB);
+        node_receives_accounts(&admin);
         store::create_account(
             &admin.state.db,
             &NewAccount {
@@ -2263,6 +2338,50 @@ mod tests {
                 "{request:?} answered {error:?}"
             );
         }
+    }
+
+    /// A01's "5 · 3 osoby": the session count and the people behind it are two
+    /// numbers, and three sessions of two people must not read as three people.
+    #[tokio::test]
+    async fn the_account_list_counts_sessions_and_the_people_holding_them() {
+        let admin = ctx_for(Some("admin"), BOB);
+        seed_user(&admin, ALICE, "Alice");
+        seed_account(&admin, "acc-people", "global", None);
+        for (session_id, user) in [("s1", ALICE), ("s2", ALICE), ("s3", BOB)] {
+            store::upsert_session(
+                &admin.state.db,
+                &crate::provider_accounts::SessionRecord {
+                    account_id: "acc-people".into(),
+                    session_id: session_id.into(),
+                    user_id: user.into(),
+                    agent_id: None,
+                    workspace_id: None,
+                    node_id: admin.state.local_node_id.to_string(),
+                    vendor_session_id: None,
+                    started_at: String::new(),
+                    last_used_at: None,
+                },
+            )
+            .unwrap();
+        }
+        let body = provider_account_dispatch(
+            &pa(P::AccountListRequest {
+                engine_id: None,
+                scope: None,
+                query: None,
+            }),
+            &admin,
+        )
+        .await
+        .unwrap();
+        let MessageBody::ProviderAccountBody(P::AccountListResponse { accounts, .. }) = body else {
+            panic!("expected an account list");
+        };
+        let account = accounts
+            .iter()
+            .find(|account| account.account_id == "acc-people")
+            .expect("the seeded account is listed");
+        assert_eq!((account.session_count, account.session_user_count), (3, 2));
     }
 
     /// A03 lists what is OPEN. Revoking a session on this node removes the row
@@ -2440,6 +2559,103 @@ mod tests {
             error.code,
             ProtocolErrorCode::NotAvailable,
             "with the decision made, what is left is the missing runtime: {error:?}"
+        );
+    }
+
+    /// The paste path is the `api_key` twin of a sign-in: both write the
+    /// credential onto THIS disk and both claim the home, so both pass the same
+    /// node gate. The paste used to reach `mint_credential` without it, which
+    /// homed the account on a node the fleet refuses to let hold it — the next
+    /// reconcile purged the only copy and left a home with no credential on it.
+    /// What the refusal must leave behind is the state BEFORE the paste: no
+    /// material, no home, and no audit row claiming a move that never happened.
+    #[tokio::test]
+    async fn an_api_key_is_refused_on_a_node_that_does_not_receive_accounts() {
+        let admin = ctx_for(Some("admin"), BOB);
+        store::create_account(
+            &admin.state.db,
+            &NewAccount {
+                account_id: "acc-key".to_string(),
+                org_id: ORG.to_string(),
+                engine_id: "codex".to_string(),
+                display_name: "Key".to_string(),
+                scope: "global".to_string(),
+                owner_user_id: None,
+                credential_kind: "api_key".to_string(),
+                created_by: BOB.to_string(),
+            },
+        )
+        .unwrap();
+        // `claim_home_tx` reads this node's id from `settings`, not from the
+        // state, so without the row the home assertions below would hold
+        // vacuously — nothing would be homed whether the paste was refused or
+        // not, and the test would prove nothing.
+        admin
+            .state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    crate::db::repository::LOCAL_NODE_ID_SETTING,
+                    admin.state.local_node_id.as_ref()
+                ],
+            )
+            .unwrap();
+
+        let request = pa(P::CredentialSetRequest {
+            account_id: "acc-key".to_string(),
+            material: "sk-pasted".to_string(),
+        });
+        let error = provider_account_dispatch(&request, &admin)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::PolicyDenied, "{error:?}");
+        assert_eq!(
+            error.message,
+            crate::services::agent_runtime::NOT_RECEIVING_ACCOUNTS
+        );
+
+        assert!(
+            store::credential_summary(&admin.state.db, "acc-key")
+                .unwrap()
+                .is_none(),
+            "the refused paste minted a credential"
+        );
+        let account = store::get_account(&admin.state.db, "acc-key")
+            .unwrap()
+            .expect("the account");
+        assert_eq!(account.home_node_id, None, "the refused paste claimed a home");
+        assert_eq!(
+            audit_rows(&admin, "provider_account.home_moved"),
+            0,
+            "the refused paste logged a move that never happened"
+        );
+        assert_eq!(
+            audit_rows(&admin, "provider_account.credential_set"),
+            0,
+            "the refused paste logged a credential set"
+        );
+
+        // The same paste, once the node is allowed to hold accounts, is the
+        // ordinary write this gate sits in front of.
+        node_receives_accounts(&admin);
+        provider_account_dispatch(&request, &admin).await.unwrap();
+        assert_eq!(
+            store::credential_summary(&admin.state.db, "acc-key")
+                .unwrap()
+                .expect("a credential is stored")
+                .revision,
+            1
+        );
+        assert_eq!(
+            store::get_account(&admin.state.db, "acc-key")
+                .unwrap()
+                .expect("the account")
+                .home_node_id,
+            Some(admin.state.local_node_id.to_string()),
+            "an allowed paste homes the account on the node that stored it"
         );
     }
 
@@ -2785,6 +3001,7 @@ mod tests {
     #[tokio::test]
     async fn an_administrator_may_disable_a_personal_account_but_not_hold_its_credential() {
         let admin = ctx_for(Some("admin"), BOB);
+        node_receives_accounts(&admin);
         seed_user(&admin, ALICE, "Alice");
         store::create_account(
             &admin.state.db,

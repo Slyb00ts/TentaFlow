@@ -409,7 +409,7 @@ async fn run_due_elastic_tasks(
                     "elastic-array",
                     &array.name,
                     "Zaplanowany Sync wstrzymany: parity zgłasza błędy",
-                    "Scrub tej macierzy zgłosił błędy, których nic jeszcze nie naprawiło. Węzeł nie uruchamia                      zaplanowanego Sync, bo usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom                      naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
+                    "Scrub tej macierzy zgłosił błędy, których nic jeszcze nie naprawiło. Node nie uruchamia                      zaplanowanego Sync, bo usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom                      naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
                 )
                 .map(|_| ()),
                 None => store::resolve_alert(db, &repair_key),
@@ -552,7 +552,7 @@ async fn run_automatic_movers(
                 &array.name,
                 "Automatyczne dokończenie przenoszenia wstrzymane",
                 &format!(
-                    "{} kolejnych przebiegów przenoszenia zakończyło się niepowodzeniem, więc węzeł nie uruchamia \
+                    "{} kolejnych przebiegów przenoszenia zakończyło się niepowodzeniem, więc node nie uruchamia \
                      następnych sam. Sprawdź przyczynę w historii przenoszenia i uruchom przenoszenie ręcznie.",
                     array.mover_failed_runs
                 ),

@@ -179,16 +179,6 @@ impl From<anyhow::Error> for SupervisorError {
 /// `threshold * health_check_interval`.
 const HEALTH_FAILURE_THRESHOLD: u32 = 3;
 
-/// Per-service state of coding-agent model discovery: which bridge instance was
-/// probed, whether it produced a model list, and when it was last tried.
-#[derive(Debug, Clone)]
-struct AgentModelSync {
-    /// `(runtime_pid, restart_count)` — changes when the bridge is restarted.
-    instance: (Option<i64>, i64),
-    done: bool,
-    last_attempt: Instant,
-}
-
 #[derive(Debug, Clone)]
 struct RestartState {
     attempts: u32,
@@ -261,9 +251,6 @@ pub struct Supervisor {
     /// by `(node_id, service_id)` so the supervisor can abort the right task
     /// when a row is removed from the snapshot. Sole producer.
     reconnect_tasks: Arc<Mutex<HashMap<(String, i64), JoinHandle<()>>>>,
-    /// Model-discovery bookkeeping per coding-agent service. See
-    /// `sync_coding_agent_models`.
-    agent_model_sync: Arc<Mutex<HashMap<i64, AgentModelSync>>>,
     /// Optional catalog provider; when set, every successful
     /// `reconcile_handles` tick triggers a rebuild so deploy / undeploy /
     /// peer announce/disconnect propagate to `/v1/models` without an
@@ -309,7 +296,6 @@ impl Supervisor {
             mesh_registry,
             live_handles,
             reconnect_tasks: Arc::new(Mutex::new(HashMap::new())),
-            agent_model_sync: Arc::new(Mutex::new(HashMap::new())),
             catalog_provider: None,
             // Shared singleton zgodny z router/handler/executor/flow_engine.
             // reconcile uzywa go do rejestrowania HTTP backendow STT services
@@ -387,10 +373,6 @@ impl Supervisor {
                 }
             }
 
-            if svc.transport == Transport::AgentRpc {
-                // A surviving bridge's gateway belonged to the previous Core.
-                continue;
-            }
             let health = self.health_of(svc).await;
             self.apply_health(svc, health, /*allow_restart=*/ false)
                 .await;
@@ -426,8 +408,6 @@ impl Supervisor {
         if let Err(e) = self.auto_start_pinned().await {
             tracing::warn!("supervisor: auto_start_pinned failed: {}", e);
         }
-
-        self.sync_coding_agent_models(&services).await;
 
         // Mesh registry + live handles reconcile before the V2 snapshot so
         // call sites that pull handles via `live_handles.get_for_model` see a
@@ -522,15 +502,11 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Embedded model state and managed-agent network gateways belong to Core.
-    /// Surviving agent bridges must restart to acquire the new gateway; paused
-    /// accounts retain their transfer barrier and are recovered by its owner.
+    /// Embedded model state belongs to Core: it lives in this process, so a
+    /// restart loses it and a pinned engine must reload before it can serve.
     async fn reload_process_state_on_boot(&self, services: &[ServiceRow]) -> Result<(), SupervisorError> {
         for svc in services {
-            if svc.paused || !matches!(svc.transport, Transport::Embedded | Transport::AgentRpc) {
-                continue;
-            }
-            if svc.transport == Transport::Embedded && !svc.pinned {
+            if svc.paused || svc.transport != Transport::Embedded || !svc.pinned {
                 continue;
             }
             if !matches!(svc.status, ServiceStatus::Running | ServiceStatus::Degraded | ServiceStatus::Starting | ServiceStatus::Deploying) {
@@ -559,15 +535,6 @@ impl Supervisor {
             );
             return;
         }
-        let account_guard = if svc.transport == Transport::AgentRpc {
-            match crate::services::coding_agent::lock_account(svc.id).await {
-                Ok(guard) => Some(guard),
-                Err(_) => return,
-            }
-        } else { None };
-        if svc.transport == Transport::AgentRpc && !self.agent_snapshot_is_current(svc) {
-            return;
-        }
         self.mark_status(svc.id, ServiceStatus::Starting, None)
             .await;
 
@@ -581,7 +548,6 @@ impl Supervisor {
         let settings_cipher_for_task = self.settings_cipher.clone();
 
         tokio::spawn(async move {
-            let _account_guard = account_guard;
             // Heartbeat progress: co 5s update progress_message
             // ("warming up — alive Xs") zeby GUI snapshot pokazywal
             // user'owi PROGRES startu (cold start vLLM ~3 min).
@@ -651,11 +617,7 @@ impl Supervisor {
                     );
                     update_status_detached(&db_for_task, svc_id, ServiceStatus::Failed, Some(&msg))
                         .await;
-                    // Managed shutdown may have failed before reaping the old
-                    // bridge; its endpoint is still needed to retry cleanup.
-                    if deploy_method != crate::services_repo::services::DeployMethod::NativeManagedCli {
-                        clear_runtime_detached(&db_for_task, svc_id).await;
-                    }
+                    clear_runtime_detached(&db_for_task, svc_id).await;
                     update_progress_detached(
                         &db_for_task,
                         svc_id,
@@ -778,7 +740,6 @@ impl Supervisor {
             // baked hash, ale nie przebudował obrazu — running obraz jest stary,
             // a DB twierdzi że aktualny). ŹRÓDŁEM PRAWDY jest tag obrazu.
             self.sync_docker_deployed_hashes(&services).await;
-            self.sync_coding_agent_models(&services).await;
 
             // pinned-respawn handled by Krok N4 — list_pinned() is already
             // available in services_repo for the consumer there.
@@ -912,93 +873,6 @@ impl Supervisor {
         })
         .await
         .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
-    }
-
-    /// Discovers models of coding-agent CLI bridges ONCE per bridge instance.
-    ///
-    /// It used to refresh every 300 s (and retry every 10 s until something was
-    /// discovered). For Claude Code that meant driving a real CLI session, and
-    /// every one of them showed up in the user's session history. The model
-    /// list of a CLI changes when the vendor ships a release, not during the
-    /// day: one sync per bridge process is enough, and the dashboard can ask
-    /// for a refresh explicitly (defect D1 of §1.2).
-    ///
-    /// The Core-side cache in `coding_agent` is what keeps every OTHER caller
-    /// off the bridge; here it must be dropped first, because "a new bridge
-    /// instance" is exactly the moment a cached answer stops being the truth.
-    async fn sync_coding_agent_models(&self, services: &[ServiceRow]) {
-        // A bridge that is up but not logged in yet cannot report models, so a
-        // failed attempt is retried — just not on every health tick.
-        const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(300);
-        for service in services {
-            if service.transport != Transport::AgentRpc
-                || !matches!(
-                    service.status,
-                    ServiceStatus::Running | ServiceStatus::Degraded
-                )
-            {
-                continue;
-            }
-            // A restarted bridge is a new instance: pid and restart counter
-            // change, so its models are discovered again.
-            let instance = (service.runtime_pid, service.restart_count);
-            {
-                let mut synced = self.agent_model_sync.lock().await;
-                let known = synced.get(&service.id);
-                if known.is_some_and(|state| {
-                    state.instance == instance
-                        && (state.done || state.last_attempt.elapsed() < RETRY_AFTER_FAILURE)
-                }) {
-                    continue;
-                }
-                if !known.is_some_and(|state| state.instance == instance) {
-                    crate::services::coding_agent::forget_models(service.id);
-                }
-                synced.insert(
-                    service.id,
-                    AgentModelSync {
-                        instance,
-                        done: false,
-                        last_attempt: Instant::now(),
-                    },
-                );
-            }
-            let auth = match crate::services::coding_agent::execute(service, "auth.status", "{}")
-                .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::debug!(service_id = service.id, %error, "coding-agent auth probe failed");
-                    continue;
-                }
-            };
-            let authenticated = serde_json::from_str::<serde_json::Value>(&auth)
-                .ok()
-                .and_then(|value| value.get("authenticated").and_then(|v| v.as_bool()))
-                .unwrap_or(false);
-            if !authenticated {
-                continue;
-            }
-            match crate::services::coding_agent::execute(service, "models.list", "{}").await {
-                Ok(result) => {
-                    match crate::services::coding_agent::sync_models(&self.db, service, &result) {
-                        Ok(_) => {
-                            if let Some(state) =
-                                self.agent_model_sync.lock().await.get_mut(&service.id)
-                            {
-                                state.done = true;
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(service_id = service.id, %error, "coding-agent model sync failed");
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(service_id = service.id, %error, "coding-agent model discovery failed");
-                }
-            }
-        }
     }
 
     async fn write_runtime(&self, id: i64, runtime: &RuntimeHandle) -> Result<(), SupervisorError> {
@@ -1141,7 +1015,6 @@ impl Supervisor {
             .mesh_registry
             .visible_services()
             .into_iter()
-            .filter(|svc| svc.transport != Transport::AgentRpc.as_db_tag())
             .filter(|svc| {
                 if svc.node_id == local_id {
                     return true;
@@ -1374,7 +1247,7 @@ impl Supervisor {
                 Some(p) => p.probe("").await,
                 None => HealthStatus::Ok,
             },
-            Transport::HttpDirect | Transport::AgentRpc => match endpoint_url {
+            Transport::HttpDirect => match endpoint_url {
                 Some(url) => http_probe(url, self.health_timeout).await,
                 None => HealthStatus::Failed("HttpDirect: missing endpoint_url".into()),
             },
@@ -1403,31 +1276,7 @@ impl Supervisor {
 
     // ---- Reaction logic ----------------------------------------------------
 
-    fn agent_snapshot_is_current(&self, snapshot: &ServiceRow) -> bool {
-        let Ok(conn) = self.db.read() else { return false; };
-        let Ok(Some(current)) = services_repo::get(&conn, snapshot.id) else { return false; };
-        !current.paused
-            && current.active_deploy_id.is_empty()
-            && current.status == snapshot.status
-            && current.runtime_pid == snapshot.runtime_pid
-            && current.runtime_port == snapshot.runtime_port
-            && current.endpoint_url == snapshot.endpoint_url
-            && current.engine_id == snapshot.engine_id
-            && current.config_json == snapshot.config_json
-    }
-
     async fn apply_health(&self, svc: &ServiceRow, health: HealthStatus, allow_restart: bool) {
-        let _account_guard = if svc.transport == Transport::AgentRpc {
-            match crate::services::coding_agent::lock_account(svc.id).await {
-                Ok(guard) => Some(guard),
-                Err(_) => return,
-            }
-        } else { None };
-        if svc.transport == Transport::AgentRpc
-            && (!self.agent_snapshot_is_current(svc)
-                || matches!(svc.status, ServiceStatus::Starting | ServiceStatus::Deploying)) {
-            return;
-        }
         match health {
             HealthStatus::Ok => {
                 self.mark_health(svc.id, true, None).await;
@@ -1538,9 +1387,7 @@ impl Supervisor {
                         let msg = format!("restart {}: {}", attempt, e);
                         self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
                             .await;
-                        if svc.deploy_method != crate::services_repo::services::DeployMethod::NativeManagedCli {
-                            clear_runtime_detached(&self.db, svc.id).await;
-                        }
+                        clear_runtime_detached(&self.db, svc.id).await;
                         tracing::warn!(
                             "supervisor: respawn failed for service {} ({}): {}",
                             svc.id,
@@ -2706,55 +2553,6 @@ mod tests {
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Running);
-    }
-
-    #[tokio::test]
-    async fn agent_health_waits_for_lifecycle_and_discards_stale_probe() {
-        let db = open_db();
-        let (supervisor, _, _) = build_supervisor_with_registry(db.clone());
-        let supervisor = Arc::new(supervisor);
-        let mut row = NewService::minimal("agent-test", DeployMethod::NativeManagedCli, Transport::AgentRpc);
-        row.status = ServiceStatus::Running;
-        let id = services_repo::insert(&db.write().unwrap(), &row).unwrap();
-        let snapshot = services_repo::get(&db.read().unwrap(), id).unwrap().unwrap();
-        let guard = crate::services::coding_agent::lock_account(id).await.unwrap();
-        let task_supervisor = supervisor.clone();
-        let mut probe = tokio::spawn(async move {
-            task_supervisor.apply_health(&snapshot, HealthStatus::Ok, true).await;
-        });
-        assert!(tokio::time::timeout(Duration::from_millis(30), &mut probe).await.is_err());
-        services_repo::set_status(&db.write().unwrap(), id, ServiceStatus::Starting).unwrap();
-        drop(guard);
-        probe.await.unwrap();
-        let current = services_repo::get(&db.read().unwrap(), id).unwrap().unwrap();
-        assert_eq!(current.status, ServiceStatus::Starting);
-        assert!(current.health_last_ok.is_none());
-    }
-
-    #[tokio::test]
-    async fn boot_reloads_unpinned_agent_gateway_but_preserves_paused_account() {
-        let db = open_db();
-        let (supervisor, _, _) = build_supervisor_with_registry(db.clone());
-        let mut ids = Vec::new();
-        for paused in [false, true] {
-            let mut row = NewService::minimal("uninstalled-agent-test", DeployMethod::NativeManagedCli, Transport::AgentRpc);
-            row.status = ServiceStatus::Running;
-            row.pinned = false;
-            row.paused = paused;
-            ids.push(services_repo::insert(&db.write().unwrap(), &row).unwrap());
-        }
-        let services = supervisor.read_supervised().await.unwrap();
-        supervisor.reload_process_state_on_boot(&services).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let status = services_repo::get(&db.read().unwrap(), ids[0]).unwrap().unwrap().status;
-                if status == ServiceStatus::Failed { break; }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }).await.unwrap();
-        let paused = services_repo::get(&db.read().unwrap(), ids[1]).unwrap().unwrap();
-        assert_eq!(paused.status, ServiceStatus::Running);
-        assert!(paused.paused);
     }
 
     // ---- N7.2: live-handles reconcile ----------------------------------------

@@ -556,36 +556,56 @@ mod tests {
     fn retract_to_lowers_only_the_cursors_past_the_new_log_end() {
         let (_dir, db) = temp_db();
         let store = GroupOffsetStore::open(&db).unwrap();
-        store.commit("org-1", "ahead", "orders", 0, 8, 1_000).unwrap();
-        store.commit("org-1", "behind", "orders", 0, 3, 1_000).unwrap();
+        store
+            .commit("org-1", "ahead", "orders", 0, 8, 1_000)
+            .unwrap();
+        store
+            .commit("org-1", "behind", "orders", 0, 3, 1_000)
+            .unwrap();
         // Same group name, a partition and a topic the truncate does not name.
-        store.commit("org-1", "ahead", "orders", 1, 8, 1_000).unwrap();
-        store.commit("org-1", "ahead", "billing", 0, 8, 1_000).unwrap();
+        store
+            .commit("org-1", "ahead", "orders", 1, 8, 1_000)
+            .unwrap();
+        store
+            .commit("org-1", "ahead", "billing", 0, 8, 1_000)
+            .unwrap();
         // Another org entirely — the scan starts from the org prefix.
-        store.commit("org-2", "ahead", "orders", 0, 8, 1_000).unwrap();
+        store
+            .commit("org-2", "ahead", "orders", 0, 8, 1_000)
+            .unwrap();
 
         let moved = store.retract_to("org-1", "orders", 0, 5, 2_000).unwrap();
         assert_eq!(moved, 1, "exactly the one cursor past the new end moves");
 
         assert_eq!(
-            store.committed_offset("org-1", "ahead", "orders", 0).unwrap(),
+            store
+                .committed_offset("org-1", "ahead", "orders", 0)
+                .unwrap(),
             5
         );
         assert_eq!(
-            store.committed_offset("org-1", "behind", "orders", 0).unwrap(),
+            store
+                .committed_offset("org-1", "behind", "orders", 0)
+                .unwrap(),
             3,
             "a cursor already inside the retained log must not be dragged up"
         );
         assert_eq!(
-            store.committed_offset("org-1", "ahead", "orders", 1).unwrap(),
+            store
+                .committed_offset("org-1", "ahead", "orders", 1)
+                .unwrap(),
             8
         );
         assert_eq!(
-            store.committed_offset("org-1", "ahead", "billing", 0).unwrap(),
+            store
+                .committed_offset("org-1", "ahead", "billing", 0)
+                .unwrap(),
             8
         );
         assert_eq!(
-            store.committed_offset("org-2", "ahead", "orders", 0).unwrap(),
+            store
+                .committed_offset("org-2", "ahead", "orders", 0)
+                .unwrap(),
             8
         );
 

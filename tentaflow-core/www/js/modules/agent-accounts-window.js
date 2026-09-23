@@ -30,11 +30,11 @@ import {
   grantedByLabel,
   nodeCredentialLabel,
   nodeTitle,
+  reportWriteOutcome,
   shortId,
   sinceLabel,
   statusChipHtml,
   usedOnLabel,
-  whenLabel,
 } from '/js/modules/agent-accounts.js';
 import { openLoginWizard } from '/js/modules/agent-accounts-login.js';
 
@@ -431,7 +431,7 @@ export async function openAccountWindow(accountId, {
         <dd>${escapeHtml(accountSubtitle(account) || '—')}</dd>
         <dt>${escapeHtml(T('kv_credential'))}</dt>
         <dd>${escapeHtml(credentialKindLabel(account.credential_kind))} · ${escapeHtml(revision > 0
-          ? T('kv_revision', { n: revision, when: whenLabel(account.updated_at) })
+          ? T('kv_credential_stored')
           : T('kv_no_credential'))}</dd>
         <dt>${escapeHtml(T('kv_status'))}</dt>
         <dd>${statusChipHtml(account)}${account.status === 'needs_login'
@@ -507,8 +507,7 @@ export async function openAccountWindow(accountId, {
     }
     const sessionsTable = pane.querySelector('[data-table="sessions"]');
     sessionsTable.rows = state.sessions.map((session) => ({
-      user: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(session.user_display_name ?? '')}</div>`
-        + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(session.session_id))}</div>`,
+      user: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(session.user_display_name ?? '')}</div>`,
       agent: session.agent_name ?? T('value_none'),
       workspace: session.workspace_name ?? T('value_none'),
       node: nodeTitle(session),
@@ -555,7 +554,10 @@ export async function openAccountWindow(accountId, {
       const isLocal = Boolean(localNodeId) && nodeId === localNodeId;
       return {
         node: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(nodeTitle(node))}</div>`
-          + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(nodeId))}</div>`
+          // A node that reported no name is told apart from another by its id.
+          + (nodeTitle(node) === T('node_unnamed')
+            ? `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(nodeId))}</div>`
+            : '')
           + (isLocal ? `<div class="tf-table__cell-sub">${escapeHtml(T('node_local'))}</div>` : ''),
         credential: `<tf-chip size="sm" status="${credential.tone}" dot label="${escapeAttr(credential.label)}"></tf-chip>`
           + (node.last_error ? `<div class="tf-table__cell-sub">${escapeHtml(node.last_error)}</div>` : ''),
@@ -680,8 +682,7 @@ export async function openAccountWindow(accountId, {
       if (!ok) return;
       button.setAttribute('disabled', '');
       try {
-        await AgentAccounts.clearCredential(accountId);
-        toast(T('key_cleared'), 'success');
+        reportWriteOutcome(await AgentAccounts.clearCredential(accountId), T('key_cleared'));
         notifyChanged();
         await reload();
       } catch (err) {
@@ -897,8 +898,7 @@ export async function openAccountWindow(accountId, {
       <div class="aa-foot">${escapeHtml(T('agents_foot', { count: state.agents.length }))}</div>
       <p class="aa-note">${escapeHtml(T('agents_note'))}</p>`;
     pane.querySelector('[data-table="agents"]').rows = state.agents.map((agent) => ({
-      agent: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(agent.agent_name ?? '')}</div>`
-        + `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(shortId(agent.agent_id))}</div>`,
+      agent: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(agent.agent_name ?? '')}</div>`,
       mode: T(agent.bind_mode === 'user' ? 'bind_mode_user' : 'bind_mode_global'),
     }));
   }
@@ -919,8 +919,9 @@ export async function openAccountWindow(accountId, {
     });
     if (!confirmed) return;
     try {
-      await AgentAccounts.remove(accountId);
-      toast(T('deleted'), 'success');
+      // The account is gone from the store either way, so the window closes on
+      // a partial outcome too — the toast is what carries the difference.
+      reportWriteOutcome(await AgentAccounts.remove(accountId), T('deleted'));
       host.close();
       onChanged?.();
     } catch (err) {

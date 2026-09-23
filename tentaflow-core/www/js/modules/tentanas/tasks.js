@@ -11,9 +11,10 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
-  jobTone, jobKindLabel, fmtSchedule,
+  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, patchHtml } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/modules/tentanas/dom-patch.js';
+import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields, normalizeSchedule } from '/js/modules/tentanas/schedule-editor.js';
 import { openSnapshotScheduleEditor, keepSummary } from '/js/modules/tentanas/snapshots.js';
 import { openMoverScheduleEditor, openElasticScheduleEditor } from '/js/modules/tentanas/elastic-detail.js';
@@ -24,7 +25,7 @@ import '/js/components/tf-table.js';
 import '/js/components/tf-filter-chips.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
-import '/js/components/tf-window.js';
+import { TfWindow } from '/js/components/tf-window.js';
 import '/js/components/tf-toggle.js';
 
 const POLL_SCHEDULES_MS = 30000;
@@ -33,6 +34,92 @@ const SCRUB_ONLY = ['weekly', 'monthly'];
 // TRIM competes with real I/O, so the cadences stop at weekly for the same
 // reason the scrub's do (§5.10).
 const TRIM_ONLY = ['weekly', 'monthly'];
+
+// A job's subject as every job renderer shows it — the running list and the
+// history here, the overview card and the job-log header in tentanas.js.
+//
+// The subject is a NAME for every job kind but one: a SMART test is spawned
+// on the `disk_id`, and the node swaps in the disk's name when it has one
+// (`name_jobs` in dispatch/tentanas.rs). So:
+// - an id that reached the row anyway (a disk the node never named) is not
+//   text — the row shows the kind alone and the id is the tooltip;
+// - a name the node only REMEMBERS (the disk has since left its inventory)
+//   is marked as last-known, never shown as if it were the current device:
+//   the kernel may have handed that name to another disk since.
+//
+// Only a SMART test's subject can BE a disk id, so only that kind uses the
+// disk rule; every other kind's subject is a pool/dataset/share/target name
+// that must not be hidden just because it starts with `dev-`/`usb-`/`pci-`/…
+// or is all digits (a share named `dev-backups`, a pool `2024`).
+//
+// Returns `{ text, title }`; both are plain strings, escaped by the caller.
+export function jobSubject(j) {
+  const subject = String(j?.subject || '').trim();
+  if (!subject) return { text: '', title: '' };
+  const isId = j?.kind === 'smart_test' ? isDiskIdShape(subject) : isOpaqueId(subject);
+  if (isId) return { text: '', title: subject };
+  if (j.subjectLastKnown) return { text: T('jobs.subject_last_known', { name: subject }), title: '' };
+  return { text: subject, title: '' };
+}
+
+function titleAttr(title) {
+  return title ? ` title="${escapeAttr(title)}"` : '';
+}
+
+// ===== The running-job row: ONE skeleton + painter shared by the n02 node
+// dashboard (tentanas.js overview card) and this tab's own running-jobs list.
+// Before this, tentanas.js kept a second copy (`jobRowHtml`/`wireJobRows`)
+// that baked `progressPct` and the "started …" text straight into the row's
+// markup and re-rendered the whole row — Cancel button included — every time
+// either one ticked. This version carries only what a job's IDENTITY decides
+// (icon slot, name, subject, whether it can be cancelled) in the skeleton:
+// stable for the job's whole life. `progressPct`, the elapsed "started …"
+// text and the status chip tick on almost every poll, so they are left as
+// empty slots here and painted by `paintJobRow` below — otherwise keying this
+// list by `jobId` would still rebuild the row on every poll (a fresh string
+// every time) and the Cancel button under the cursor would never survive a
+// single tick.
+export function jobRowSkeleton(j, subject = jobSubject(j)) {
+  return `
+    <div class="job-row" data-job="${escapeAttr(j.jobId)}">
+      <div class="job-ico" data-role="ico"></div>
+      <div class="job-main">
+        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2"${titleAttr(subject.title)}>${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
+        <div class="job-sub" data-role="sub"></div>
+        ${j.progressPct != null ? `<tf-progress-bar data-role="progress" size="sm" tone="accent"></tf-progress-bar>` : ''}
+      </div>
+      <div class="job-actions">
+        <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
+        ${jobCanCancel(j) ? `<tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>` : ''}
+      </div>
+    </div>`;
+}
+
+// Only the icon's inner markup differs by state (spinning refresh vs a static
+// clock), so it goes through `patchHtml` too — the same "write only when it
+// changed" rule, just scoped to one child instead of the row.
+export function paintJobRow(row, j) {
+  if (!row) return;
+  const running = j.status === 'running';
+  const ico = row.querySelector('[data-role="ico"]');
+  setClass(ico, 'running', running);
+  patchHtml(ico, sprite(running ? 'refresh' : 'clock'));
+  const chip = row.querySelector('[data-role="status"]');
+  setAttr(chip, 'status', jobTone(j.status));
+  setAttr(chip, 'label', T('jobs.status_' + j.status));
+  const last = (j.log || []).slice(-1)[0] || '';
+  const author = jobAuthor(j.startedBy);
+  const sub = row.querySelector('[data-role="sub"]');
+  setText(sub, T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }) + (last ? ' · ' + last : ''));
+  setAttr(sub, 'title', author.title || '');
+  if (j.progressPct != null) setAttr(row.querySelector('[data-role="progress"]'), 'value', Number(j.progressPct));
+}
+
+// The history table's task cell: the kind, and the subject under it.
+function historyTaskHtml(j) {
+  const subject = jobSubject(j);
+  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind))}</span><div class="tf-table__cell-sub tf-table__cell-sub--mono"${titleAttr(subject.title)}>${escapeHtml(subject.text)}</div>`;
+}
 
 export async function drawTasks(screen, body) {
   const admin = screen.isAdmin;
@@ -84,7 +171,7 @@ export async function drawTasks(screen, body) {
   // other things the Tasks tab watches, and it moves on the slow cadence
   // because an audit log is reviewed, not watched live.
   const accessLog = wireAccessLog(screen, body);
-  const nodeName = screen.currentNode()?.nodeName || '';
+  const node = screen.currentNode();
 
   const jobsTable = body.querySelector('#nas-jobs-table');
   jobsTable.rowActions = (row, idx, currentRow) => {
@@ -102,6 +189,10 @@ export async function drawTasks(screen, body) {
   filters.filters = ['all', 'errors', 'scrub', 'mover'].map((id) => ({ id, label: T('jobs.filter_' + id), active: id === state.filter }));
   filters.addEventListener('change', (e) => { state.filter = e.detail.id; paintHistory(); });
 
+  // The running-jobs list uses the shared `jobRowSkeleton`/`paintJobRow`
+  // (above) — the very same row implementation the n02 node dashboard uses
+  // for its own running-jobs card (tentanas.js), so a job renders identically
+  // wherever it is running and keeps its identity across a poll in both.
   const paintHistory = () => {
     const rows = state.done.filter((j) => {
       if (state.filter === 'errors') return j.status === 'failed' || j.status === 'blocked';
@@ -114,13 +205,38 @@ export async function drawTasks(screen, body) {
     });
     jobsTable.rows = rows.map((j) => ({
       _job: j,
-      task: `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind))}</span><div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(j.subject)}</div>`,
-      node: `<span class="tf-table__cell--mono">${escapeHtml(nodeName)}</span>`,
+      task: historyTaskHtml(j),
+      node: `<span class="tf-table__cell--mono" title="${escapeAttr(node?.nodeId || '')}">${escapeHtml(nodeLabel(node))}</span>`,
       startedAt: `<span class="tf-table__cell--mono">${escapeHtml(fmtDate(j.startedAt))}</span>`,
       duration: `<span class="tf-table__cell--mono">${escapeHtml(jobDuration(j))}</span>`,
       result: `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(j.error)}</div>` : ''}`,
     }));
   };
+
+  // Delegated ONCE on the container rather than per row: `patchKeyedList`
+  // keeps a row's Cancel/Log buttons as the very node a poll found them at,
+  // so re-attaching a listener to them on every poll would either stack a
+  // second handler on a survivor or silently do nothing for one that moved.
+  // A listener on the (never rebuilt) container works for both cases and
+  // every future row alike.
+  const runEl = body.querySelector('#nas-jobs-running');
+  const cancelJob = async (jobId) => {
+    const ok = await TfWindow.confirm({ title: T('jobs.cancel'), message: T('jobs.cancel_confirm'), confirmLabel: T('jobs.cancel'), cancelLabel: I18n.t('common.cancel'), danger: true });
+    if (!ok) return;
+    try {
+      await screen.nas('tentaNasJobCancelRequest', { jobId });
+      refreshJobs();
+    } catch (e) {
+      toast(errMessage(e), 'error');
+    }
+  };
+  runEl.addEventListener('click', (e) => {
+    const row = e.target.closest('.job-row');
+    if (!row) return;
+    const jobId = row.dataset.job;
+    if (e.target.closest('[data-act="log"]')) { screen.openJobLog(jobId); return; }
+    if (e.target.closest('[data-act="cancel"]')) { e.stopPropagation(); cancelJob(jobId); }
+  });
 
   const refreshJobs = async () => {
     if (screen.disposed || !body.isConnected) return;
@@ -130,12 +246,15 @@ export async function drawTasks(screen, body) {
       state.jobs = res.jobs || [];
       const running = state.jobs.filter((j) => j.status === 'running' || j.status === 'queued');
       state.done = state.jobs.filter((j) => !running.includes(j));
-      const runEl = body.querySelector('#nas-jobs-running');
-      // Re-wire exactly when the rows were rebuilt. A 3 s poll that brings the
-      // same running jobs now touches no node, so a cancel button under the
-      // cursor keeps its hover and stays the element the click lands on.
-      if (patchHtml(runEl, running.length ? running.map((j) => screen.jobRowHtml(j)).join('') : `<div class="muted">${escapeHtml(T('jobs.none_running'))}</div>`)) {
-        screen.wireJobRows(runEl, refreshJobs);
+      if (!running.length) {
+        patchHtml(runEl, `<div class="muted">${escapeHtml(T('jobs.none_running'))}</div>`);
+      } else {
+        // Keyed by jobId: a job whose progress or elapsed-time text moves
+        // keeps its own row (and every sibling's), unlike the old
+        // `patchHtml` over the whole joined string, which rebuilt everyone's
+        // Cancel button on every 3 s tick.
+        patchKeyedList(runEl, running.map((j) => ({ key: j.jobId, html: jobRowSkeleton(j) })));
+        running.forEach((j, i) => paintJobRow(runEl.children[i], j));
       }
       setAttr(body.querySelector('#nas-jobs-count'), 'label', String(running.length));
       paintHistory();
@@ -202,14 +321,57 @@ export async function drawTasks(screen, body) {
             : r.lastResult === 'failed' ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(r.lastRunAt) }))
               : escapeHtml(r.nextRunAt ? T('schedules.prot_next', { t: fmtIn(r.nextRunAt), when: fmtSchedule(r.schedule) }) : '—')}</span></div>`)
         : [`<div class="sr"><span class="k">${sprite('refresh')} ${escapeHtml(T('schedules.prot_scrub'))}</span><span class="v">${chip('warn', T('schedules.prot_none'))}</span></div>`]),
-      `<div class="sr"><span class="k">${sprite('cylinder')} ${escapeHtml(T('schedules.prot_smart'))}</span><span class="v">${
-        !smart.enabled ? chip('warn', T('schedule.off'))
-          : smart.lastShortAt ? chip('ok', T('schedules.prot_smart_last', { t: fmtAgo(smart.lastShortAt) }))
-            : chip('info', T('schedules.prot_pending', { t: fmtIn(smart.nextShortAt) }))}</span></div>`,
+      // The wire has NO real pass/fail for SMART here: `smart` (NasSmartSchedule)
+      // carries only timestamps, and the core always sends `last_result:
+      // String::new()` for the smart_short/smart_long rows too (§5.10). A
+      // green "OK" the moment a timestamp exists would be invented — the last
+      // run's actual result is honored when the row ever carries one, and
+      // otherwise this says only THAT it ran, in a neutral tone, never OK.
+      (() => {
+        const shortRow = rows.find((r) => r.kind === 'smart_short');
+        return `<div class="sr"><span class="k">${sprite('cylinder')} ${escapeHtml(T('schedules.prot_smart'))}</span><span class="v">${
+          !smart.enabled ? chip('warn', T('schedule.off'))
+            : !smart.lastShortAt ? chip('info', T('schedules.prot_pending', { t: fmtIn(smart.nextShortAt) }))
+              : shortRow?.lastResult === 'failed' ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(smart.lastShortAt) }))
+                : chip('info', T('schedules.prot_last', { t: fmtAgo(smart.lastShortAt) }))}</span></div>`;
+      })(),
     ].join('');
     patchHtml(body.querySelector('#nas-prot'), `<div class="stat-rows">${left}</div><div class="stat-rows">${right}</div>`);
   };
 
+  // One key per row: kind+subject already identifies a schedule uniquely on
+  // the wire (one scrub per pool, one cadence per Elastic array-and-verb, one
+  // schedule per dataset); the SMART pair folds to a single row that has no
+  // `row` of its own.
+  const scheduleKey = (it) => (it.kind === 'smart' ? 'smart' : `${it.kind}:${it.row.subject}`);
+
+  // The skeleton is everything that only changes when an admin actually EDITS
+  // the schedule (icon, name, pills, whether the row admin controls exist at
+  // all): stable for as long as the row is on screen. `sub` — "last run …",
+  // built with `fmtAgo`/`fmtIn` — ticks on its own as time passes, so it is
+  // left as an empty slot and painted by hand below; baking it into the
+  // compared string here would rebuild the row (and every later sibling, on
+  // the old `patchHtml`) on a poll where nothing the admin can see actually
+  // changed.
+  const scheduleSkeleton = (it) => `
+    <div class="job-row" data-key="${escapeAttr(scheduleKey(it))}">
+      <div class="job-ico">${sprite(it.icon)}</div>
+      <div class="job-main">
+        <div class="job-name">${escapeHtml(it.name)}</div>
+        <div class="job-sub">${it.pills.map((p) => `<span class="sched-pill">${sprite('clock')} ${escapeHtml(p)}</span>`).join(' ')} <span data-role="sub"></span></div>
+      </div>
+      <div class="job-actions">
+        <tf-toggle data-act="toggle" ${admin ? '' : 'disabled'}></tf-toggle>
+        ${admin ? `
+        <tf-button size="sm" variant="ghost" icon="play" data-act="run" title="${escapeAttr(T('schedules.run_now'))}"></tf-button>
+        <tf-button size="sm" variant="ghost" icon="edit" data-act="edit" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>` : ''}
+      </div>
+    </div>`;
+
+  // Looked up by the delegated handlers below, always the CURRENT items —
+  // rebuilt on every `paintSchedules()` call, so a click always acts on what
+  // is actually on screen even when the row node itself was kept.
+  const itemByKey = new Map();
   const paintSchedules = () => {
     const rows = state.schedules?.rows || [];
     const smart = state.schedules?.smart || {};
@@ -220,31 +382,41 @@ export async function drawTasks(screen, body) {
     if (smartRows.length) items.push(smartItem(smart, smartRows));
     setAttr(body.querySelector('#nas-sched-count'), 'label', String(items.length));
     const list = body.querySelector('#nas-sched-list');
+    itemByKey.clear();
+    items.forEach((it) => itemByKey.set(scheduleKey(it), it));
     if (!items.length) { patchHtml(list, `<div class="muted">${escapeHtml(T('schedules.none'))}</div>`); return; }
-    const html = items.map((it, i) => `
-      <div class="job-row" data-idx="${i}">
-        <div class="job-ico">${sprite(it.icon)}</div>
-        <div class="job-main">
-          <div class="job-name">${escapeHtml(it.name)}</div>
-          <div class="job-sub">${it.pills.map((p) => `<span class="sched-pill">${sprite('clock')} ${escapeHtml(p)}</span>`).join(' ')} <span>${escapeHtml(it.sub)}</span></div>
-        </div>
-        <div class="job-actions">
-          <tf-toggle data-act="toggle" ${it.enabled ? 'checked' : ''} ${admin ? '' : 'disabled'} title="${escapeAttr(it.enabled ? T('schedule.on') : T('schedule.off'))}"></tf-toggle>
-          ${admin ? `
-          <tf-button size="sm" variant="ghost" icon="play" data-act="run" title="${escapeAttr(T('schedules.run_now'))}"></tf-button>
-          <tf-button size="sm" variant="ghost" icon="edit" data-act="edit" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>` : ''}
-        </div>
-      </div>`).join('');
-    // The toggle/run/edit handlers below close over THIS `items` array, so
-    // they may only be attached to markup written in this same call.
-    if (!patchHtml(list, html)) return;
-    list.querySelectorAll('.job-row').forEach((rowEl) => {
-      const it = items[Number(rowEl.dataset.idx)];
-      rowEl.querySelector('[data-act="toggle"]').addEventListener('change', (e) => setEnabled(it, Boolean(e.target.checked)));
-      rowEl.querySelector('[data-act="run"]')?.addEventListener('click', () => runNow(it));
-      rowEl.querySelector('[data-act="edit"]')?.addEventListener('click', () => editSchedule(it));
+    // Keyed by schedule: a row whose "last run" text moved keeps its own
+    // toggle, and — unlike the old whole-list `patchHtml` — every sibling
+    // keeps its toggle too, instead of the entire list being torn down
+    // because ONE row's relative time crossed a minute.
+    patchKeyedList(list, items.map((it) => ({ key: scheduleKey(it), html: scheduleSkeleton(it) })));
+    items.forEach((it, i) => {
+      const rowEl = list.children[i];
+      setText(rowEl.querySelector('[data-role="sub"]'), it.sub);
+      const toggle = rowEl.querySelector('[data-act="toggle"]');
+      setAttr(toggle, 'checked', it.enabled);
+      setAttr(toggle, 'title', it.enabled ? T('schedule.on') : T('schedule.off'));
     });
   };
+
+  // Delegated once on the list container for the same reason as the jobs
+  // list above: `patchKeyedList` keeps a row's toggle/run/edit buttons as the
+  // exact node a poll found them at, so wiring them per row on every rebuild
+  // would double up on a survivor.
+  const scheduleList = body.querySelector('#nas-sched-list');
+  scheduleList.addEventListener('change', (e) => {
+    const toggle = e.target.closest('[data-act="toggle"]');
+    const row = toggle?.closest('.job-row');
+    const it = row && itemByKey.get(row.dataset.key);
+    if (it) setEnabled(it, Boolean(e.target.checked));
+  });
+  scheduleList.addEventListener('click', (e) => {
+    const row = e.target.closest('.job-row');
+    const it = row && itemByKey.get(row.dataset.key);
+    if (!it) return;
+    if (e.target.closest('[data-act="run"]')) runNow(it);
+    else if (e.target.closest('[data-act="edit"]')) editSchedule(it);
+  });
 
   const scheduleItem = (r) => {
     // The three Elastic cadences (§5.3). `subject` is the ARRAY, and the kind
@@ -353,7 +525,15 @@ export async function drawTasks(screen, body) {
       return;
     }
     // "All disks" means one short test per disk that reports SMART; a single
-    // sudo prompt covers the whole batch.
+    // sudo prompt covers the whole batch. A disk that refuses per se (busy,
+    // a test already runs, the disk rejects the command) must not stop the
+    // batch: the old loop's bare `await` inside the `for` threw on the FIRST
+    // rejection, which aborted the whole callback and left every later disk
+    // silently untested (A6). A privilege/credential error is the opposite
+    // case — it will fail identically for every remaining disk, so it must
+    // stop the batch at once rather than replay the same rejected password
+    // against sudo once per disk (see `runDiskBatch` / `isBatchHaltError` in
+    // format.js, shared with the n03 bulk SMART action in tentanas.js).
     let disks;
     try {
       disks = (await screen.nas('tentaNasDisksListRequest', {})).disks || [];
@@ -363,12 +543,26 @@ export async function drawTasks(screen, body) {
     }
     const targets = disks.filter((d) => d.smartAvailable);
     if (!targets.length) { toast(T('schedules.smart_no_disks'), 'warning'); return; }
-    const res = await screen.withSudo(async (sudoPassword) => {
-      for (const d of targets) await screen.nas('tentaNasDiskSmartTestRequest', { diskId: d.diskId, kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS });
-      return { count: targets.length };
-    }, title);
-    if (res === null) return;
-    toast(T('schedules.smart_started', { n: targets.length }), 'success');
+    let outcome;
+    try {
+      outcome = await screen.withSudo((sudoPassword) => runDiskBatch(targets, (d) => screen.nas(
+        'tentaNasDiskSmartTestRequest', { diskId: d.diskId, kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS },
+      )), title);
+    } catch (e) {
+      // `withSudo` itself already catches and toasts every rejection from
+      // its callback — this is a defensive backstop, not the normal path.
+      toast(errMessage(e), 'error');
+      return;
+    }
+    // `outcome` is null both when the prompt was cancelled and when
+    // `runDiskBatch` halted the batch on a privilege/credential error —
+    // `withSudo`'s own catch already toasted that one error.
+    if (outcome === null) return;
+    if (outcome.started.length) toast(T('schedules.smart_started', { n: outcome.started.length }), 'success');
+    // The refusals are real per-disk data — each disk by name with the
+    // node's own reason — so they are listed, never dropped; the sentence
+    // around them is ours and translated.
+    if (outcome.refused.length) toast(T('jobs.smart_batch_refused', { n: outcome.refused.length, disks: refusedBatchNames(outcome.refused) }), 'warning');
     refreshJobs();
   };
 

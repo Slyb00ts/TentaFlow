@@ -36,6 +36,12 @@ const MAX_FRAME_SIZE: usize = 1_048_576;
 /// Maly ruch — `send().await` z backpressure jest tu dopuszczalny.
 const CONTROL_QUEUE_CAPACITY: usize = 256;
 
+/// Requests one connection may have in dispatch at once. Each frame gets its
+/// own task so a slow handler does not hold back the rest; this bound keeps a
+/// client that floods small frames from turning that into unbounded tasks. At
+/// the bound the read loop waits, which is backpressure on that client only.
+const MAX_INFLIGHT_DISPATCH: usize = 64;
+
 /// Pojemnosc kolejki media (chunki wideo fMP4, ramki detekcji). Mala celowo:
 /// przy pelnym oknie TCP klienta WAN najstarsze elementy wypadaja zamiast
 /// blokowac reszte ruchu polaczenia.
@@ -271,6 +277,7 @@ pub async fn handle_ws_connection<S>(
     // Writer-task: jedyny wlasciciel sinka. Kanal control ma bezwzgledny
     // priorytet nad kolejka media; shutdown przychodzi z petli odczytu.
     let (control_tx, control_rx) = mpsc::channel::<ControlFrame>(CONTROL_QUEUE_CAPACITY);
+    let dispatch_slots = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_DISPATCH));
     let media_queue = Arc::new(MediaQueue::new());
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(connection_writer(
@@ -946,7 +953,11 @@ pub async fn handle_ws_connection<S>(
                 let control_tx_dispatch = control_tx.clone();
                 let correlation_id = envelope.correlation_id;
                 let message_kind = envelope.message_kind;
+                let Ok(slot) = dispatch_slots.clone().acquire_owned().await else {
+                    break;
+                };
                 tokio::spawn(async move {
+                    let _slot = slot;
                     let (resp_body, is_error) = dispatch::dispatch(&body, &ctx).await;
                     let flags = if is_error {
                         EnvelopeFlags::IS_ERROR

@@ -62,6 +62,21 @@ test('n07/n08: the window title names the pool kind, the h1 stays "Nowa pula"', 
   screen.dispose();
 });
 
+// The owner's rule: a machine id is never shown as a name. The node sends an
+// EMPTY `nodeName` when its hostname is unknown (it used to send its 64-hex
+// id, and the header printed that raw) — the "node.node_tag" badge next to
+// the wizard's h1 must fall back to the Polish "Węzeł bez nazwy" label
+// through `nodeLabel`, exactly like every other node name on this screen.
+test('the header node tag falls back to "Node bez nazwy" instead of an empty string', async () => {
+  const screen = fakeScreen({ tentaNasPoolPlanRequest: plan });
+  screen.currentNode = () => ({ nodeId: 'node-64hex', nodeName: '', isLocal: true });
+  const win = openPoolWizard(screen, { freeDisks });
+  await flush();
+  assert.match(win.querySelector('.install-header-meta .version').textContent, /Node bez nazwy/);
+  win.remove();
+  screen.dispose();
+});
+
 test('the wizard plans with the checked disk ids and creates with the chosen layout', async () => {
   let done = null;
   const screen = fakeScreen({
@@ -205,6 +220,64 @@ test('changing the disk selection drops the cached plan and Back returns to the 
   assert.deepEqual(screen.calls.at(-1).payload, { diskIds: ['sda', 'sdb', 'sdc'] });
   win.remove();
   screen.dispose();
+});
+
+// M15 (critic n01-n10): the create job's window used to redraw its whole
+// `innerHTML` on every 1.5 s tick, which reset the log's scroll position.
+test('the create job patches its tick in place: the progress bar and log node survive, only the tail is appended', async () => {
+  const realSetTimeout = globalThis.setTimeout;
+  const ticks = [];
+  globalThis.setTimeout = (fn, ms, ...rest) => (ms === 1500 ? (ticks.push(fn), 0) : realSetTimeout(fn, ms, ...rest));
+  try {
+    let job = { jobId: 'job-7', kind: 'pool_create', status: 'running', progressPct: 10, log: ['zpool create tank mirror sda sdb'] };
+    const screen = fakeScreen({
+      tentaNasPoolPlanRequest: plan,
+      tentaNasPoolCreateRequest: { job },
+      tentaNasJobGetRequest: () => ({ job }),
+    });
+    const win = openPoolWizard(screen, { freeDisks });
+    await flush();
+    click(nextBtn(win));
+    await flush();
+    checkDisk(win, 'sda');
+    checkDisk(win, 'sdb');
+    click(nextBtn(win));
+    await flush();
+    await flush();
+    typeInto(win.querySelector('#nas-pw-name'), 'tank');
+    click(nextBtn(win));
+    await flush();
+    typeInto(win.querySelector('#nas-pw-confirm'), 'tank');
+    click(nextBtn(win));
+    await flush();
+    await flush();
+
+    assert.equal(ticks.length, 1, 'the job is being followed');
+    const bar = win.querySelector('tf-progress-bar');
+    const log = win.querySelector('.job-log');
+    const footer = win.querySelector('[slot="footer"]');
+    assert.ok(bar && log, 'the running-job view is up');
+    assert.equal(bar.getAttribute('value'), '10');
+    const firstText = log.firstChild;
+
+    job = { ...job, progressPct: 55, log: [...job.log, 'resilvering'] };
+    await ticks.shift()();
+    await flush();
+
+    // Compared as booleans, never as raw DOM nodes: on a mismatch, assert's
+    // failure-message inspector walks a live element's circular
+    // parent/document graph and can hang for a very long time.
+    assert.equal(win.querySelector('tf-progress-bar') === bar, true, 'the progress bar is the same node');
+    assert.equal(bar.getAttribute('value'), '55', 'and shows the new progress');
+    assert.equal(win.querySelector('.job-log') === log, true, 'the log is the same node');
+    assert.equal(log.firstChild === firstText, true, 'the text already on screen is untouched — the tail is appended');
+    assert.match(log.textContent, /resilvering$/);
+    assert.equal(win.querySelector('[slot="footer"]') === footer, true, 'the footer survives the tick — the window is not rebuilt');
+    win.remove();
+    screen.dispose();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
 });
 
 test('a cancelled sudo prompt leaves the summary step armed and sends nothing', async () => {

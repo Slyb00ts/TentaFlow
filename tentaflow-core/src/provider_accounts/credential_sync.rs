@@ -43,7 +43,7 @@ pub fn publish_to_fleet() {
 }
 
 /// Removes every credential copy this node may no longer hold, and returns how
-/// many were removed.
+/// many store rows went with them.
 ///
 /// Two reasons, both decided elsewhere and both arriving on the ledger: the
 /// credential was cleared for the whole organisation (the revocation mark on the
@@ -51,33 +51,78 @@ pub fn publish_to_fleet() {
 /// the runtime-node row). The store row goes and the bridge is told to drop the
 /// file it owns — a purge that left either half behind would leave a retired
 /// token in front of the next session.
+///
+/// Every stale account is reached even when one of them fails. A bridge failure
+/// may not hide the next account's file, and neither may a store failure: the
+/// remaining rows are the only names left for their own files, and an account
+/// whose row survives keeps being reported by `stale_local_credentials` until it
+/// is purged, while one whose bridge was never told is only reachable here.
+/// The failures are raised once all of them have been handled, so nobody waiting
+/// on this reconcile reads a clean count over a file that is still on the disk.
 pub async fn reconcile_local(db: &DbPool, node_id: &str) -> Result<usize> {
     let stale = store::stale_local_credentials(db, node_id)?;
     let mut purged = 0usize;
+    let mut incomplete = Vec::new();
+    let mut unrecorded = Vec::new();
     for credential in stale {
         // The bridge first: with the row already gone a failure here would leave
         // the file with nothing left to say it should not be there.
-        if let Err(error) =
-            crate::services::agent_runtime::drop_account_credential(&credential.account_id).await
-        {
+        let dropped =
+            crate::services::agent_runtime::drop_account_credential(&credential.account_id).await;
+        if let Err(error) = &dropped {
             tracing::warn!(
                 account_id = %credential.account_id,
                 reason = credential.reason,
                 error = %format!("{error:#}"),
                 "a revoked agent credential could not be dropped from its bridge"
             );
+            incomplete.push(credential.account_id.clone());
         }
-        if store::purge_local_credential(db, &credential.account_id, node_id, credential.reason)? {
-            purged += 1;
-            tracing::info!(
-                account_id = %credential.account_id,
-                revision = credential.revision,
-                reason = credential.reason,
-                "an agent account credential was purged from this node"
-            );
+        match store::purge_local_credential(db, &credential.account_id, node_id, credential.reason)
+        {
+            Ok(true) => {
+                purged += 1;
+                // ONE account's store half may not be reported as a finished
+                // purge while its file half is still on the disk: whoever reads
+                // this log afterwards has nothing else to go on.
+                if dropped.is_ok() {
+                    tracing::info!(
+                        account_id = %credential.account_id,
+                        revision = credential.revision,
+                        reason = credential.reason,
+                        "an agent account credential was purged from this node"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    account_id = %credential.account_id,
+                    reason = credential.reason,
+                    error = %format!("{error:#}"),
+                    "a revoked agent credential could not be removed from this node's store"
+                );
+                unrecorded.push(credential.account_id.clone());
+            }
         }
     }
-    Ok(purged)
+    if incomplete.is_empty() && unrecorded.is_empty() {
+        return Ok(purged);
+    }
+    let mut failures = Vec::new();
+    if !incomplete.is_empty() {
+        failures.push(format!(
+            "agent credentials that left a file on this node: {}",
+            incomplete.join(", ")
+        ));
+    }
+    if !unrecorded.is_empty() {
+        failures.push(format!(
+            "agent credential rows that could not be purged from the store: {}",
+            unrecorded.join(", ")
+        ));
+    }
+    Err(anyhow::anyhow!(failures.join("; ")))
 }
 
 /// Drops the bridge copy of an account that no longer exists here.
@@ -95,10 +140,13 @@ pub fn spawn_account_drop(account_id: &str) {
         if let Err(error) =
             crate::services::agent_runtime::drop_account_credential(&account_id).await
         {
+            // The account row and its credential row are already gone, so
+            // nothing may be reported as a clean drop here: the node's log is
+            // the only report there is, and it carries the path.
             tracing::warn!(
                 %account_id,
                 error = %format!("{error:#}"),
-                "a deleted agent account left a credential in its bridge"
+                "a deleted agent account left a credential on this node"
             );
         }
     });

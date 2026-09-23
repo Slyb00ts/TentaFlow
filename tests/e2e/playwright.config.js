@@ -62,6 +62,16 @@ module.exports = defineConfig({
     { name: 'analytics', testMatch: 'analytics.spec.js' },
     { name: 'agents-ui', testMatch: 'agents-ui.spec.js' },
     { name: 'agent-accounts', testMatch: 'agent-accounts.spec.js' },
+    // C01 inside Code Studio needs its own node: it seeds workspace state and
+    // delegates to a CLI agent, which the account-administration suite has no
+    // reason to do. Separate project, separate port, separate runtime dir.
+    { name: 'agent-accounts-code-studio', testMatch: 'agent-accounts-code-studio.spec.js' },
+    // The credential fan-out only exists BETWEEN nodes, so this suite boots a
+    // second real node, pairs it over the mesh and reads both databases. Own
+    // project and own ports: it may not share a node with the single-node
+    // account suite, whose whole premise is that it is alone.
+    { name: 'agent-accounts-mesh', testMatch: 'agent-accounts-mesh.spec.js' },
     { name: 'tentaquant', testMatch: 'tentaquant.spec.js' },
+    { name: 'tentabus-seed', testMatch: 'tentabus-seed.spec.js' },
   ],
 });

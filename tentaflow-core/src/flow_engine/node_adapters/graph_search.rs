@@ -71,7 +71,7 @@ impl GraphSearchNodeAdapter {
         ctx.addon_id.as_deref().ok_or_else(|| {
             anyhow!(
                 "graph_search adapter: brak tożsamości addona (ctx.addon_id=None) — \
-                 węzeł graph_search wymaga wywołania flow JAKO MODEL przez addon (RAG E1.0)"
+                 node graph_search wymaga wywołania flow JAKO MODEL przez addon (RAG E1.0)"
             )
         })
     }
@@ -795,7 +795,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("compute capacity exhausted"),
-            "węzeł przy wysyconym per-addon capie ma odmówić (graph compute busy), był: {err}"
+            "node przy wysyconym per-addon capie ma odmówić (graph compute busy), był: {err}"
         );
 
         // Zwolnij jeden slot (Drop) → ta sama op przez węzeł znów przechodzi.

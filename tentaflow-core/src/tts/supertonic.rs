@@ -629,6 +629,12 @@ const MODEL_FILES: &[(&str, &str)] = &[
 /// Voice presety pobierane do `voice_styles/` (5 zenskich + 5 meskich).
 const VOICE_PRESETS: &[&str] = &["F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5"];
 
+/// Glos "Jarvis" (voice clone) osadzony w binarce — dostepny lokalnie bez
+/// zaleznosci od pobrania z HuggingFace. Zapisywany do `voice_styles/jarvis.json`
+/// przy kazdym `prepare_model`, wiec dziala tez gdy cache zostal zaladowany
+/// przed dodaniem tego glosu.
+const JARVIS_VOICE_STYLE: &[u8] = include_bytes!("../../assets/voices/supertonic/jarvis.json");
+
 /// Pobiera model + voice_styles z `Supertone/supertonic-3` do
 /// `models/supertonic/<repo_sanitized>/`. Idempotentne — jezeli komplet plikow
 /// juz istnieje, zwraca natychmiast. Uzywa `download_with_progress`.
@@ -640,6 +646,10 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
         .collect::<String>();
     let target = supertonic_cache_dir().join(&safe_name);
     std::fs::create_dir_all(target.join("voice_styles")).ok();
+
+    let jarvis_dest = target.join("voice_styles/jarvis.json");
+    std::fs::write(&jarvis_dest, JARVIS_VOICE_STYLE)
+        .with_context(|| format!("zapis osadzonego glosu jarvis -> {}", jarvis_dest.display()))?;
 
     let complete = MODEL_FILES
         .iter()

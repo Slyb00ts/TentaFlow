@@ -91,10 +91,28 @@ struct SharedEnv {
 /// on a second call), but the db/bus_dir arguments of a second call would be
 /// silently discarded, so every test must funnel through this one shared db
 /// rather than building its own.
+
+/// The bus host functions resolve their `BusService` through the platform's
+/// app gate (`app_gate::sole_enabled_instance`), which reads the `addons`
+/// table — so a fixture that only starts a `BusService` is refused with
+/// `AbiError::Operation`. Registering the instance is what the real install
+/// does; without it these tests exercise nothing but the refusal.
+fn register_bus_instance(db: &db::DbPool, instance_id: &str) {
+    db.write()
+        .expect("db lock")
+        .execute(
+            "INSERT INTO addons (addon_id, package_id, name, version, is_enabled) \
+             VALUES (?1, ?2, 'TentaBus', '1.0.0', 1)",
+            rusqlite::params![instance_id, bus::instance::BusInstanceId::PACKAGE_ID],
+        )
+        .expect("register the TentaBus instance");
+}
+
 fn shared_env() -> &'static SharedEnv {
     static ENV: OnceLock<SharedEnv> = OnceLock::new();
     ENV.get_or_init(|| {
         let db = db::init(Path::new(":memory:")).expect("init db");
+        register_bus_instance(&db, "tentabus-00000001");
         // PLAN §7.2: `create_if_missing` is only an opt-in under the org's
         // `bus.autocreate` ceiling, which defaults to off outside Dev — and a
         // fresh `:memory:` db declares no environment at all, i.e. Prod. The

@@ -892,7 +892,7 @@ mod tests {
             .nodes
             .iter()
             .find(|n| n.node_type == "loop")
-            .expect("outer flow ma węzeł loop");
+            .expect("outer flow ma node loop");
         assert!(
             loop_node.config.get("body_flow_engine_id").is_none(),
             "body_flow_engine_id wymaga tożsamości addona — flow platformowy jej nie ma"

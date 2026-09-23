@@ -1045,9 +1045,29 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "provider_account_home_lost",
             MigrationStep::Sql(PROVIDER_ACCOUNT_HOME_LOST),
         ),
-        (165, "shared_maps", MigrationStep::Sql(SHARED_MAPS)),
+        (
+            165,
+            "drop_coding_agent_account_grants",
+            MigrationStep::Sql(DROP_CODING_AGENT_ACCOUNT_GRANTS),
+        ),
         (
             166,
+            "drop_coding_agent_legacy_service_path",
+            MigrationStep::Sql(DROP_CODING_AGENT_LEGACY_SERVICE_PATH),
+        ),
+        (
+            167,
+            "bus_field_policy_subject_kind_and_compact_cleanup",
+            MigrationStep::Sql(BUS_FIELD_POLICY_SUBJECT_KIND_AND_COMPACT_CLEANUP),
+        ),
+        (
+            168,
+            "topic_acl_actions_and_groups",
+            MigrationStep::Sql(TOPIC_ACL_ACTIONS_AND_GROUPS),
+        ),
+        (169, "shared_maps", MigrationStep::Sql(SHARED_MAPS)),
+        (
+            170,
             "shared_maps_permissions",
             MigrationStep::Rust(roles_add_map_permissions),
         ),
@@ -1331,12 +1351,15 @@ DROP TABLE IF EXISTS coding_agent_account_moves;
 // a home, so a re-homed account stops reading as lost. Nothing ever sets it at
 // creation.
 //
-// `update_account` can also write a `home_node_id` and does NOT clear the marker
-// — deliberately, and it cannot break the invariant: a marker only exists while
-// the home is NULL, and the one production caller that writes a home this way
-// (`login.rs::adopt_credential`) runs after `mint_credential`, which claims the
-// home itself whenever the home is NULL. By the time that write happens the
-// marker is already gone.
+// `update_account` can also write a `home_node_id`, and it clears the marker in
+// the same statement when it does (`CASE WHEN ?5 IS NOT NULL THEN NULL`), so the
+// invariant belongs to the store rather than to the order its callers happen to
+// follow. Only one production caller names a home — the sign-in path
+// (`provider_accounts/login.rs::adopt_credential`), which reaches this after
+// `mint_credential` already claimed it; the wire edit handler hard-codes
+// `home_node_id: None` (`dispatch/provider_account.rs`), in the account update
+// it builds. An edit that names NO home leaves the record alone: it is the
+// account's history and a rename or a new session limit must not erase it.
 //
 // WHICH node was the home, never its name: the node is gone from the registry,
 // so no node can resolve a display name for it, and a name column would be NULL
@@ -1347,7 +1370,108 @@ ALTER TABLE provider_accounts
     ADD COLUMN home_lost_node_id TEXT NULL;
 "#;
 
-// v165 — the shared map: places, reconstructions and which device writes into
+// v165 — the per-service grant table retires.
+//
+// v160 copied every row into `provider_account_grants`, and since then the
+// account screen has written only there, so the two tables drifted apart: a
+// grant revoked on the screen stayed live here, and a grant given on the screen
+// never reached here. `coding_agent::account_permission` now asks the account
+// registry, which leaves nothing that reads this table. Keeping it would only
+// keep a second answer to "who may use this account" on disk.
+//
+// Rungs that create and adopt it stay as they are (the ladder is append-only);
+// `child_remaps` keeps its entries because the remap skips a table that does
+// not exist.
+const DROP_CODING_AGENT_ACCOUNT_GRANTS: &str = "
+DROP TABLE IF EXISTS coding_agent_account_grants;
+";
+
+// v166 — the old "agent account = services row" path is gone; the node-local
+// session table and the services rows it bound retire with it.
+//
+// `coding_agent_session_owners` bound an open agent session to a service row
+// so `execute_authorized` could ask "does this user own the session on this
+// service". Nothing calls it any more: a session lives in
+// `provider_account_sessions` (v160 already adopted every row this table
+// held; v161 replaced the binding this table never actually enforced), so
+// keeping it would only keep a second, stale answer to the same question.
+//
+// A `services` row with `deploy_method = 'native_managed_cli'` WAS the agent
+// itself — `codex`/`claude-code`/`grok-build`/`muse-code` deployed as a
+// service and driven over `Transport::AgentRpc`. The new model never writes
+// one: every coding agent runs through a provider account and an on-demand
+// bridge instead. A surviving row is either something v160 already adopted
+// into `provider_accounts` (its credential and sessions are safe there) or a
+// row that predates the account model and adopted nothing either way. Either
+// way nothing may read it past this rung: `DeployMethod::NativeManagedCli`
+// and `Transport::AgentRpc` lose their variants in the same change that adds
+// this rung, so an undeleted row would fail to deserialize instead of
+// running — this DELETE is what keeps that removal safe.
+//
+// `model_registry` and `service_aliases` cascade on `service_id`, so their
+// rows for a deleted service go with it. `deployments` carries no FK to
+// `services` — `deploy_id` has always been its own key, never a foreign one —
+// so its rows for a removed deploy stay as dead history, exactly the way a
+// normal redeploy or service delete has always left them.
+const DROP_CODING_AGENT_LEGACY_SERVICE_PATH: &str = "
+DROP INDEX IF EXISTS coding_agent_sessions_user;
+DROP TABLE IF EXISTS coding_agent_session_owners;
+DELETE FROM services WHERE deploy_method = 'native_managed_cli';
+";
+
+// v168 — per-topic bus ACL grows an `action` dimension and starts honouring
+// `subject_type = 'group'` rows. `resource_permissions` is shared platform-
+// wide (models/flows/addons/model bundles/API keys all key off it), so this
+// widens the existing table in place instead of forking a topic-only one.
+//
+// MAPPING for rows recorded before this rung: every one of them acted on
+// EVERY action alike — the old bus authorizer's `topic_acl_allows` took no
+// action parameter at all (a `topic` deny row blocked produce, consume AND
+// admin together), and for every OTHER `resource_type` the concept of an
+// "action" never existed to begin with. Both are preserved exactly by
+// pinning every pre-existing row's `action` to `'*'`: the authorizer's new
+// action-aware lookup treats a `'*'` row as matching every action it is
+// asked about, so a deny recorded yesterday still denies produce/consume/
+// admin today, and a model/flow/addon/API-key ACL row keeps meaning "this
+// subject, this resource, full stop" — nothing downstream of THOSE resource
+// types reads the new column, so they are untouched in behaviour.
+//
+// The UNIQUE constraint widens from (resource_type, resource_id,
+// subject_type, subject_id) to include `action`, so a topic can now carry
+// independent read/write/admin rows per subject instead of one overwriting
+// another — while every pre-existing row, pinned at `action = '*'`, keeps
+// colliding with itself exactly as it did before (still exactly one row per
+// (type, id, subject) pair for anything that never asked for an
+// action-scoped grant). No FK touches this table (`subject_id` names a row
+// in a different table depending on `subject_type`), so no
+// `foreign_key_check` follow-up is needed, unlike the CHECK-widening rung
+// that last rebuilt this table (`api_keys_access_v2`).
+const TOPIC_ACL_ACTIONS_AND_GROUPS: &str = "
+DROP INDEX IF EXISTS idx_resperm_subject;
+DROP INDEX IF EXISTS idx_resperm_resource;
+CREATE TABLE resource_permissions_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL
+        CHECK(subject_type IN ('user','group','api_key')),
+    subject_id TEXT NOT NULL,
+    action TEXT NOT NULL DEFAULT '*' CHECK(action IN ('read','write','admin','*')),
+    access_level TEXT NOT NULL CHECK(access_level IN ('allow','deny')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(resource_type, resource_id, subject_type, subject_id, action)
+);
+INSERT INTO resource_permissions_new
+    (id, resource_type, resource_id, subject_type, subject_id, action, access_level, created_at)
+    SELECT id, resource_type, resource_id, subject_type, subject_id, '*', access_level, created_at
+    FROM resource_permissions;
+DROP TABLE resource_permissions;
+ALTER TABLE resource_permissions_new RENAME TO resource_permissions;
+CREATE INDEX idx_resperm_subject ON resource_permissions(subject_type, subject_id);
+CREATE INDEX idx_resperm_resource ON resource_permissions(resource_type, resource_id);
+";
+
+// v169 — the shared map: places, reconstructions and which device writes into
 // which one.
 //
 // Today a robot's map is the last frame it sent (`services/slam_scene.rs`), so
@@ -1462,7 +1586,7 @@ CREATE TABLE IF NOT EXISTS map_device_sessions (
 CREATE INDEX IF NOT EXISTS map_device_sessions_scene ON map_device_sessions(scene_id);
 "#;
 
-// v166 — who may see and change the map.
+// v170 — who may see and change the map.
 //
 // Reading a map is reading the building, so every role that can look at the
 // fleet gets `map.read`. Placing a device rewrites where its scans land, which
@@ -1785,6 +1909,59 @@ fn model_metrics_rollup_add_account_id(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+// =============================================================================
+// v167 — TentaBus field policies distinguish subject kind (user / group /
+// addon), and a stored `cleanup_policy = 'compact'` is rewritten to 'delete'.
+// =============================================================================
+//
+// SUM/tentabus/DECYZJE-2026-09-22.md, `FP-subject-type`: `bus_field_policies`
+// could only target `subject_type IN ('user','any')`, so a group- or
+// addon-scoped rule was indistinguishable from a user row (an addon actor and
+// a user actor are both raw strings in `BusCallContext.actor`, per
+// `bus::field_policies::resolve`'s doc). Widens the CHECK to also accept
+// `'group'` and `'addon'`; no existing row uses either value yet (the DB
+// constraint blocked writing one), so the rebuild's `INSERT ... SELECT`
+// preserves every row unchanged. Neither `bus_field_policies` nor anything
+// referencing it carries a foreign key (see `BUS_FIELD_POLICIES`'s own doc
+// comment), so the rebuild runs as a plain `MigrationStep::Sql` batch inside
+// the runner's own transaction — no `PRAGMA foreign_keys` dance needed.
+//
+// SUM/tentabus/DECYZJE-2026-09-22.md, `C9-cleanup-policy-compact`: real
+// per-key compaction is deferred to M5; until then a topic whose stored
+// `cleanup_policy` is 'compact' behaves exactly like 'delete' at the engine
+// level (`bus::retention::sweep_partition` never branches on the value), so
+// rewriting the stored value to 'delete' changes nothing about how such a
+// topic is swept — it only stops the wizard/API from re-offering a choice
+// that was never actually implemented. `create_topic`/`update_topic` reject
+// `compact` outright from this version on (`bus::topics::reject_cleanup_compact`),
+// so no new row can reintroduce the value this statement clears.
+const BUS_FIELD_POLICY_SUBJECT_KIND_AND_COMPACT_CLEANUP: &str = r#"
+DROP INDEX IF EXISTS idx_bus_field_policies_lookup;
+CREATE TABLE bus_field_policies_new (
+    instance_id           TEXT NOT NULL,
+    org_id                TEXT NOT NULL,
+    topic                 TEXT NOT NULL,
+    subject_type          TEXT NOT NULL CHECK(subject_type IN ('user','group','addon','any')),
+    subject_id            TEXT NOT NULL,
+    direction             TEXT NOT NULL CHECK(direction IN ('write','read')),
+    fields_json           TEXT NOT NULL,
+    required_fields_json  TEXT,
+    created_at_ms         INTEGER NOT NULL,
+    updated_at_ms         INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id, topic, subject_type, subject_id, direction)
+);
+INSERT INTO bus_field_policies_new
+    SELECT instance_id, org_id, topic, subject_type, subject_id, direction,
+           fields_json, required_fields_json, created_at_ms, updated_at_ms
+    FROM bus_field_policies;
+DROP TABLE bus_field_policies;
+ALTER TABLE bus_field_policies_new RENAME TO bus_field_policies;
+CREATE INDEX IF NOT EXISTS idx_bus_field_policies_lookup
+    ON bus_field_policies(instance_id, org_id, topic, direction);
+
+UPDATE bus_topics SET cleanup_policy = 'delete' WHERE cleanup_policy = 'compact';
+"#;
 
 /// Which agents an agent may delegate to.
 ///
@@ -4494,7 +4671,7 @@ fn child_remaps() -> Vec<ChildRemap> {
         f("sync_resource_acl", "owner_user_id", UserAccounts),
         f("sync_resource_acl", "assigned_user_id", UserAccounts),
         f("sync_resource_acl", "manager_user_id", UserAccounts),
-        // -- shared map (165): who created the place / the reconstruction --
+        // -- shared map (169): who created the place / the reconstruction --
         f("map_sites", "created_by", UserAccounts),
         f("map_scenes", "created_by", UserAccounts),
         f("map_device_placements", "set_by", UserAccounts),
@@ -12642,19 +12819,19 @@ mod tests {
         );
     }
 
-    /// v165 creates the map schema and v166 grants its permissions. The scene's
+    /// v169 creates the map schema and v170 grants its permissions. The scene's
     /// foreign key must cascade — deleting a place deletes the reconstructions
     /// inside it, or the index would outlive the chunks on disk.
     #[test]
-    fn migration_v165_creates_the_map_schema_and_v166_grants_its_permissions() {
+    fn migration_v169_creates_the_map_schema_and_v170_grants_its_permissions() {
         let conn = Connection::open_in_memory().unwrap();
-        run_ladder_up_to(&conn, 164);
+        run_ladder_up_to(&conn, 168);
         assert!(
             !table_exists(&conn, "map_sites").unwrap(),
             "the map tables must not exist before the rung runs"
         );
 
-        apply_migration(&conn, 165, "shared_maps", &MigrationStep::Sql(SHARED_MAPS)).unwrap();
+        apply_migration(&conn, 169, "shared_maps", &MigrationStep::Sql(SHARED_MAPS)).unwrap();
         for table in [
             "map_sites",
             "map_scenes",
@@ -12838,8 +13015,14 @@ mod tests {
         .unwrap();
 
         // The rung runs where it really runs — through the ladder — rather than
-        // by calling the SQL the test happens to have in hand.
-        run(&conn).unwrap();
+        // by calling the SQL the test happens to have in hand. The ladder stops
+        // before v165, which retires the grant table this rung reads; the end
+        // of the test takes it to the head.
+        for (rung, name, step) in get_migrations() {
+            if (160..=164).contains(&rung) {
+                apply_migration(&conn, rung, name, &step).unwrap();
+            }
+        }
         assert_eq!(
             conn.query_row(
                 "SELECT name FROM _migrations WHERE version = 160",
@@ -12998,6 +13181,100 @@ mod tests {
             .unwrap(),
             "active/renamed",
             "a replayed rung leaves an adopted account exactly as it found it"
+        );
+
+        // v165 retires the per-service grant table; the grant it held lives on
+        // in the registry, which is the only thing asked from now on.
+        run(&conn).unwrap();
+        assert!(!table_exists(&conn, "coding_agent_account_grants").unwrap());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM provider_account_grants", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    /// v166 removes the entire old "agent account = services row" path: the
+    /// service row an agent deployed as, and the node-local session table that
+    /// bound a session to it. The fixture also carries a `model_registry` row
+    /// and an unrelated `ollama` service, so the test proves the cascade
+    /// clears exactly the legacy row's children and leaves everything else.
+    #[test]
+    fn migration_v166_drops_the_legacy_agent_service_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 165);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute(
+            "INSERT INTO user_accounts (id, username, password_hash, role, is_active) \
+             VALUES ('admin-1', 'root', 'x', 'org_admin', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services \
+               (engine_id, category, display_name, deploy_method, transport, config_json) \
+             VALUES ('codex', 'agent', 'Codex legacy', 'native_managed_cli', 'agent_rpc', '{}')",
+            [],
+        )
+        .unwrap();
+        let legacy_service_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO model_registry (service_id, model_name) VALUES (?1, 'codex-default')",
+            rusqlite::params![legacy_service_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO coding_agent_session_owners (service_id, session_id, user_id) \
+             VALUES (?1, 'sess-1', 'admin-1')",
+            rusqlite::params![legacy_service_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services \
+               (engine_id, category, display_name, deploy_method, transport, config_json) \
+             VALUES ('ollama', 'llm', 'Ollama', 'docker', 'http_direct', '{}')",
+            [],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        assert!(
+            !table_exists(&conn, "coding_agent_session_owners").unwrap(),
+            "the node-local session table must be gone"
+        );
+        assert!(
+            !index_exists(&conn, "coding_agent_sessions_user"),
+            "its index must be gone with it"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM services WHERE deploy_method = 'native_managed_cli'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "every legacy agent-deployed-as-a-service row must be gone"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_registry WHERE service_id = ?1",
+                rusqlite::params![legacy_service_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "model_registry cascades on service_id"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM services WHERE engine_id = 'ollama'", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a service that never was a coding agent must survive"
         );
     }
 
@@ -13637,5 +13914,95 @@ mod tests {
             [],
         )
         .expect("a connector host carries its connector, not a node id");
+    }
+
+    /// v167 (`FP-subject-type` / `C9-cleanup-policy-compact`,
+    /// SUM/tentabus/DECYZJE-2026-09-22.md): a pre-167 `bus_topics` row
+    /// stored with `cleanup_policy='compact'` is rewritten to `'delete'`,
+    /// an existing `bus_field_policies` row survives the table rebuild
+    /// unchanged, and the widened `subject_type` CHECK accepts `'group'`/
+    /// `'addon'` (while still rejecting anything else).
+    #[test]
+    fn migration_v167_rewrites_compact_cleanup_and_widens_field_policy_subject_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 166);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute(
+            "INSERT INTO bus_topics \
+                (instance_id, org_id, name, partitions, retention_ms, retention_bytes, \
+                 cleanup_policy, delivery, dedup_window_ms, max_delivery_attempts, \
+                 retry_backoff_ms, validation, content_type, replication_factor, acks, \
+                 durability, max_inline_bytes, compression, environment, created_at_ms, \
+                 updated_at_ms) \
+             VALUES \
+                ('tentabus-00000001', 'org-1', 'orders.legacy-compact', 1, 86400000, 0, \
+                 'compact', 'at_least_once', 86400000, 5, 1000, 'off', 'application/json', 1, \
+                 'leader', 'os', 65536, 'lz4', 'prod', 1000, 1000)",
+            [],
+        )
+        .expect("insert a pre-167 topic with cleanup_policy=compact");
+        conn.execute(
+            "INSERT INTO bus_field_policies \
+                (instance_id, org_id, topic, subject_type, subject_id, direction, fields_json, \
+                 required_fields_json, created_at_ms, updated_at_ms) \
+             VALUES \
+                ('tentabus-00000001', 'org-1', 'orders.legacy-compact', 'any', '*', 'read', \
+                 '[\"a\"]', NULL, 1000, 1000)",
+            [],
+        )
+        .expect("insert a pre-167 field policy row");
+
+        run(&conn).expect("v167 must apply cleanly on top of a pre-167 database");
+
+        let cleanup_policy: String = conn
+            .query_row(
+                "SELECT cleanup_policy FROM bus_topics WHERE name = 'orders.legacy-compact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cleanup_policy, "delete",
+            "a stored 'compact' value must be rewritten to 'delete'"
+        );
+
+        let surviving_subject_type: String = conn
+            .query_row(
+                "SELECT subject_type FROM bus_field_policies WHERE topic = 'orders.legacy-compact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            surviving_subject_type, "any",
+            "the pre-existing field policy row must survive the table rebuild unchanged"
+        );
+
+        for subject_type in ["group", "addon"] {
+            conn.execute(
+                "INSERT INTO bus_field_policies \
+                    (instance_id, org_id, topic, subject_type, subject_id, direction, \
+                     fields_json, required_fields_json, created_at_ms, updated_at_ms) \
+                 VALUES \
+                    ('tentabus-00000001', 'org-1', 'orders.legacy-compact', ?1, 'sub-1', \
+                     'write', '[\"a\"]', NULL, 2000, 2000)",
+                rusqlite::params![subject_type],
+            )
+            .unwrap_or_else(|e| panic!("subject_type='{subject_type}' must be accepted: {e}"));
+        }
+        let rejected = conn.execute(
+            "INSERT INTO bus_field_policies \
+                (instance_id, org_id, topic, subject_type, subject_id, direction, fields_json, \
+                 required_fields_json, created_at_ms, updated_at_ms) \
+             VALUES \
+                ('tentabus-00000001', 'org-1', 'orders.legacy-compact', 'robot', 'sub-2', \
+                 'write', '[\"a\"]', NULL, 3000, 3000)",
+            [],
+        );
+        assert!(
+            rejected.is_err(),
+            "the CHECK constraint must still reject a subject_type outside the allow-list"
+        );
     }
 }

@@ -20,7 +20,6 @@ import '/js/components/tf-spinner.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 import * as Access from '/js/modules/services/access.js';
-import { agentRequest } from '/js/modules/coding-agent.js';
 import * as AgentAccountsTab from '/js/modules/services/agent-accounts-tab.js';
 
 // Kolumna SILNIK tymczasowo ukryta na zyczenie — flip na true zeby przywrocic.
@@ -317,10 +316,6 @@ function patchModelsTab() {
 function bindTabEvents() {
   const body = byId('svc-tab-body');
   if (!body) return;
-
-  body.querySelectorAll('[data-agent-open]').forEach((button) => {
-    button.onclick = () => openCodingAgentConsole(codingAgentById(button.dataset.agentOpen, button.dataset.agentNode));
-  });
 
   // List tab — N5 row actions: Pause/Play toggle, Pin toggle, Delete.
   body.querySelectorAll('[data-svc-delete]').forEach((b) => {
@@ -737,174 +732,6 @@ async function updateAliasActive(id, checked) {
 
 // ---- List tab -------------------------------------------------------------
 
-function codingAgentServices() {
-  return services.filter((service) => ['codex', 'claude-code', 'grok-build', 'muse-code'].includes(service.engineId || service.engine_id));
-}
-
-function codingAgentById(id, nodeId) {
-  return codingAgentServices().find((service) => String(service.id) === String(id) && String(service.nodeId || service.node_id) === String(nodeId));
-}
-
-async function openCodingAgentConsole(service) {
-  if (!service) return;
-  const win = document.createElement('tf-window');
-  win.setAttribute('title', `${service.displayName || service.display_name} — sesje`);
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('width', '760');
-  const body = document.createElement('div');
-  body.slot = 'body';
-  body.innerHTML = `
-    <div data-agent-auth-state></div>
-    <p>${escapeHtml(I18n.t('agent_accounts.private_console'))}</p>
-    <div>
-      <tf-select data-agent-mode label="Tryb" value="new"><option value="new">Nowa sesja</option><option value="resume">Wznów sesję</option><option value="fork">Rozgałęź sesję</option></tf-select>
-    </div>
-    <tf-select data-agent-model label="Model" disabled><option value="">Pobieranie modeli z CLI…</option></tf-select>
-    <tf-input data-agent-vendor label="ID istniejącej sesji" placeholder="Wymagane dla wznowienia lub fork"></tf-input>
-    <div style="display:flex;gap:8px;margin:10px 0"><tf-button variant="primary" data-agent-create>Otwórz sesję</tf-button></div>
-    <div data-agent-session-list></div>
-    <div data-agent-approvals style="display:flex;flex-direction:column;gap:8px;margin:10px 0"></div>
-    <pre data-agent-output style="min-height:180px;max-height:360px;overflow:auto;white-space:pre-wrap"></pre>
-    <tf-input data-agent-prompt label="Polecenie"></tf-input>`;
-  const footer = document.createElement('div');
-  footer.slot = 'footer';
-  footer.innerHTML = `
-    <tf-button variant="ghost" data-agent-close disabled>Zamknij sesję</tf-button>
-    <tf-button variant="primary" data-agent-turn disabled>Wyślij</tf-button>`;
-  win.append(body, footer);
-  document.body.appendChild(win);
-
-  let sessionId = null;
-  let afterSeq = 0;
-  let closed = false;
-  win.addEventListener('close', () => { closed = true; win.remove(); });
-  const auth = await agentRequest(service, 'auth.status');
-  if (!auth.authenticated) {
-    const state = body.querySelector('[data-agent-auth-state]');
-    if (state) state.innerHTML = `<tf-chip status="error" dot>Sesja CLI wygasła</tf-chip><p>${currentUserIsAdmin
-      ? 'Użyj przycisku Logowanie na karcie usługi, aby ponownie zalogować konto.'
-      : 'Ponowne logowanie może wykonać wyłącznie administrator.'}</p>`;
-    body.querySelector('[data-agent-create]')?.setAttribute('disabled', '');
-    body.querySelector('[data-agent-model]').innerHTML = '<option value="">Brak aktywnej sesji CLI</option>';
-    return;
-  }
-  const modelSelect = body.querySelector('[data-agent-model]');
-  try {
-    const result = await agentRequest(service, 'models.list');
-    const models = result.models || result.data || [];
-    if (!models.length) throw new Error('CLI nie zwróciło dostępnych modeli');
-    modelSelect.innerHTML = models.map((model) => {
-      const id = model.id || model.model;
-      const name = model.display_name || model.displayName || id;
-      const selected = model.selected || model.isDefault || model.is_default;
-      return `<option value="${escapeAttr(id)}"${selected ? ' selected' : ''}>${escapeHtml(name)}</option>`;
-    }).join('');
-    modelSelect.removeAttribute('disabled');
-  } catch (error) {
-    modelSelect.innerHTML = `<option value="">${escapeHtml(error.message || String(error))}</option>`;
-    toast(error.message || String(error), 'error');
-  }
-  const refreshSessions = async () => {
-    const result = await agentRequest(service, 'sessions.list');
-    const list = body.querySelector('[data-agent-session-list]');
-    if (list) list.innerHTML = (result.sessions || []).map((session) =>
-      `<tf-button variant="ghost" data-use-session="${escapeAttr(session.vendor_session_id)}">${escapeHtml(session.vendor_session_id)} · ${escapeHtml(session.workspace)}</tf-button>`).join('');
-    list?.querySelectorAll('[data-use-session]').forEach((button) => {
-      button.onclick = () => { body.querySelector('[data-agent-vendor]').value = button.dataset.useSession; };
-    });
-  };
-  await refreshSessions();
-  body.querySelector('[data-agent-create]')?.addEventListener('click', async () => {
-    try {
-      const mode = body.querySelector('[data-agent-mode]')?.value || 'new';
-      const vendor = String(body.querySelector('[data-agent-vendor]')?.value || '').trim();
-      const model = String(modelSelect?.value || '').trim();
-      if (!model) throw new Error('Wybierz model');
-      if (mode !== 'new' && !vendor) throw new Error('Podaj ID istniejącej sesji');
-      const result = await agentRequest(service, 'session.create', {
-        model,
-        resume_vendor_session_id: mode === 'new' ? null : vendor,
-        fork: mode === 'fork',
-      });
-      sessionId = result.session.id;
-      footer.querySelector('[data-agent-turn]')?.removeAttribute('disabled');
-      footer.querySelector('[data-agent-close]')?.removeAttribute('disabled');
-      await refreshSessions();
-      pollAgentEvents();
-    } catch (error) { toast(error.message || String(error), 'error'); }
-  });
-  footer.querySelector('[data-agent-turn]')?.addEventListener('click', async () => {
-    const input = body.querySelector('[data-agent-prompt]');
-    const prompt = String(input?.value || '').trim();
-    if (!sessionId || !prompt) return;
-    await agentRequest(service, 'session.turn', { session_id: sessionId, prompt });
-    input.value = '';
-  });
-  footer.querySelector('[data-agent-close]')?.addEventListener('click', async () => {
-    if (!sessionId) return;
-    try {
-      await agentRequest(service, 'session.close', { session_id: sessionId });
-      sessionId = null;
-      footer.querySelector('[data-agent-turn]')?.setAttribute('disabled', '');
-      footer.querySelector('[data-agent-close]')?.setAttribute('disabled', '');
-      await refreshSessions();
-      toast('Sesja CLI zamknięta', 'success');
-    } catch (error) { toast(error.message || String(error), 'error'); }
-  });
-  // Codex runs with `approvalPolicy: on-request`: the turn stops until the
-  // operator answers, so the request has to become a visible decision.
-  const renderApproval = (event) => {
-    const container = body.querySelector('[data-agent-approvals]');
-    const requestId = Number(event.data?.request_id);
-    if (!container || !Number.isFinite(requestId)) return;
-    if (container.querySelector(`[data-approval="${requestId}"]`)) return;
-    const card = document.createElement('div');
-    card.dataset.approval = String(requestId);
-    card.className = 'section-card';
-    card.innerHTML = `
-      <h3>Agent prosi o zgodę — ${escapeHtml(String(event.data?.method || 'nieznana operacja'))}</h3>
-      <pre style="max-height:160px;overflow:auto;white-space:pre-wrap">${escapeHtml(JSON.stringify(event.data?.params ?? {}, null, 2))}</pre>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <tf-button variant="primary" data-decision="approved">Zezwól raz</tf-button>
-        <tf-button variant="ghost" data-decision="approved_for_session">Zezwól na sesję</tf-button>
-        <tf-button variant="ghost" data-decision="denied">Odmów</tf-button>
-        <tf-button variant="danger" data-decision="abort">Przerwij turę</tf-button>
-      </div>`;
-    card.querySelectorAll('[data-decision]').forEach((button) => {
-      button.addEventListener('click', async () => {
-        try {
-          await agentRequest(service, 'session.approval', {
-            session_id: sessionId,
-            request_id: requestId,
-            decision: button.dataset.decision,
-          });
-          card.remove();
-        } catch (error) { toast(error.message || String(error), 'error'); }
-      });
-    });
-    container.appendChild(card);
-  };
-  const pollAgentEvents = async () => {
-    while (!closed && sessionId) {
-      try {
-        const result = await agentRequest(service, 'session.events', { session_id: sessionId, after_seq: afterSeq });
-        const output = body.querySelector('[data-agent-output]');
-        for (const event of result.events || []) {
-          afterSeq = Math.max(afterSeq, Number(event.seq || 0));
-          if (event.kind === 'approval_request') {
-            renderApproval(event);
-            continue;
-          }
-          const text = event.data?.text || event.data?.delta || JSON.stringify(event.data);
-          if (output) output.textContent += `${text}\n`;
-        }
-        if (output) output.scrollTop = output.scrollHeight;
-      } catch (error) { toast(error.message || String(error), 'error'); return; }
-      await new Promise((resolve) => setTimeout(resolve, 750));
-    }
-  };
-}
-
 function renderListTab(rows = services) {
   if (rows.length === 0) {
     return `
@@ -1241,16 +1068,6 @@ function renderRow(s) {
           data-svc-method="${escapeAttr(s.deploy_method || '')}"
           title="${escapeAttr(I18n.t('services.btn_deploy_logs'))}"></tf-button>`
     : '';
-  // A coding-agent service row opens its own console and nothing else: signing
-  // an account in and administering it belong to the "Konta agentów" tab, where
-  // an account is not tied to one node's service row.
-  const isCodingAgent = ['codex', 'claude-code', 'grok-build', 'muse-code'].includes(s.engine_id || s.engineId);
-  const codingAgentActions = isCodingAgent
-    ? `<tf-button variant="ghost" size="sm" icon="terminal"
-          data-agent-open="${svcId}" data-agent-node="${svcNodeId}"
-          title="Sesje"></tf-button>`
-    : '';
-
   // Karty GPU serwisu (z deploy configu): "all" | "0,1" | "CPU". Puste = nie
   // dotyczy (np. serwis zdalny bez tej informacji) -> myslnik. Indeksy monospace.
   const gpuSel = String(s.gpuSelection ?? s.gpu_selection ?? '').trim();
@@ -1289,7 +1106,6 @@ function renderRow(s) {
         ${deleting ? `<tf-spinner size="sm" tone="warning"
           aria-label="${escapeAttr(I18n.t('services.status.deleting'))}"
           title="${escapeAttr(I18n.t('services.status.deleting'))}"></tf-spinner>` : `
-        ${codingAgentActions}
         ${hidePausePlay ? '' : `<tf-button variant="ghost" size="sm" icon="${ppIcon}"
           data-svc-pause-play="${svcId}"
           data-svc-action="${ppAction}"

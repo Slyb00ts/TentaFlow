@@ -224,6 +224,88 @@ impl fmt::Display for AccountRefusal {
 
 impl std::error::Error for AccountRefusal {}
 
+/// Refuses when `account_id` already has `max_sessions` sessions open on this
+/// node; `0` means no limit.
+fn session_limit(db: &DbPool, account_id: &str, max_sessions: i64) -> Result<(), AccountRefusal> {
+    if max_sessions <= 0 {
+        return Ok(());
+    }
+    let open = store::session_counts(db, &[account_id.to_string()])
+        .map_err(registry)?
+        .get(account_id)
+        .copied()
+        .unwrap_or(0);
+    if i64::from(open) >= max_sessions {
+        return Err(AccountRefusal::SessionLimitReached {
+            account_id: account_id.to_string(),
+            limit: max_sessions,
+            open: i64::from(open),
+        });
+    }
+    Ok(())
+}
+
+/// The right to open one more session on an account, held from the limit check
+/// until the opened session is recorded.
+///
+/// `resolve_run_account` checks the limit early so a refusal is cheap, but the
+/// session row it counts is only written after the bridge started the CLI —
+/// seconds later. Runs that resolve concurrently would all pass that early check
+/// and all start, so the check that decides counts the starts still on their
+/// way as well as the recorded rows. A start is counted until its admission is
+/// dropped, which the caller does once the row exists (or the start failed).
+pub struct SessionAdmission {
+    account_id: String,
+}
+
+fn starts_in_flight() -> &'static std::sync::Mutex<std::collections::HashMap<String, i64>> {
+    static STARTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::OnceLock::new();
+    STARTS.get_or_init(Default::default)
+}
+
+impl Drop for SessionAdmission {
+    fn drop(&mut self) {
+        let mut starts = starts_in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = starts.get_mut(&self.account_id) {
+            *count -= 1;
+            if *count <= 0 {
+                starts.remove(&self.account_id);
+            }
+        }
+    }
+}
+
+pub fn admit_session(db: &DbPool, account_id: &str) -> Result<SessionAdmission, AccountRefusal> {
+    let max_sessions = store::get_account(db, account_id)
+        .map_err(registry)?
+        .map_or(0, |account| account.max_sessions);
+    let mut starts = starts_in_flight()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if max_sessions > 0 {
+        let recorded = store::session_counts(db, &[account_id.to_string()])
+            .map_err(registry)?
+            .get(account_id)
+            .copied()
+            .map_or(0, i64::from);
+        let open = recorded + starts.get(account_id).copied().unwrap_or(0);
+        if open >= max_sessions {
+            return Err(AccountRefusal::SessionLimitReached {
+                account_id: account_id.to_string(),
+                limit: max_sessions,
+                open,
+            });
+        }
+    }
+    *starts.entry(account_id.to_string()).or_default() += 1;
+    Ok(SessionAdmission {
+        account_id: account_id.to_string(),
+    })
+}
+
 /// Resolves the account a run of `agent` may use, for `principal`, near
 /// `preferred_node`.
 ///
@@ -297,20 +379,7 @@ pub fn resolve_run_account(
     // is counted is the sessions THIS node has open on the account — the rows
     // `CliBridge::open` writes and `close` deletes — because that is the state a
     // per-node admission decision can see; the table never replicates.
-    if account.max_sessions > 0 {
-        let open = store::session_counts(db, std::slice::from_ref(&account.account_id))
-            .map_err(registry)?
-            .get(&account.account_id)
-            .copied()
-            .unwrap_or(0);
-        if i64::from(open) >= account.max_sessions {
-            return Err(AccountRefusal::SessionLimitReached {
-                account_id: account.account_id,
-                limit: account.max_sessions,
-                open: i64::from(open),
-            });
-        }
-    }
+    session_limit(db, &account.account_id, account.max_sessions)?;
 
     let node_id = select_node(
         db,
@@ -387,32 +456,6 @@ pub fn describe_agent_account(
         engine_id,
         mode: mode.to_string(),
     })
-}
-
-/// The accounts of `engine_id` this principal could use instead: their own for
-/// the engine plus every global one granted to them.
-///
-/// This is the "instead" list of a refused run — the mockup says in so many
-/// words that a global account will not be used in place of a personal one, so
-/// the question that offers a sign-in must be able to say which accounts exist.
-/// Names only: an id here would reach a card the person cannot act on.
-pub fn candidate_accounts(
-    db: &DbPool,
-    principal: &AgentPrincipal,
-    engine_id: &str,
-) -> Vec<String> {
-    let (Some(user_id), Some(org_id)) = (principal.user_id.as_deref(), principal.org_id.as_deref())
-    else {
-        return Vec::new();
-    };
-    store::list_accounts_for_user(db, org_id, user_id, Some(engine_id))
-        .map(|accounts| {
-            accounts
-                .into_iter()
-                .map(|account| account.display_name)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The account named by `mode="global"`: it must exist, run the SAME engine the
@@ -1363,5 +1406,32 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    /// Two runs that both passed the early check race to the bridge; the
+    /// admission that decides counts the one still starting, so only as many
+    /// get through as the limit allows — and a failed start gives its place back.
+    #[test]
+    fn concurrent_starts_cannot_overshoot_the_session_limit() {
+        let db = db();
+        account(&db, "acc-race", "global", "codex", None);
+        set_limit(&db, "acc-race", 1);
+
+        let first = admit_session(&db, "acc-race").unwrap();
+        assert_eq!(
+            admit_session(&db, "acc-race").map(|_| ()).unwrap_err(),
+            AccountRefusal::SessionLimitReached {
+                account_id: "acc-race".to_string(),
+                limit: 1,
+                open: 1,
+            },
+            "a second start was admitted beside one still starting"
+        );
+        drop(first);
+        drop(admit_session(&db, "acc-race").expect("a failed start gives its place back"));
+
+        // A recorded session counts on its own once its start is over.
+        open_session(&db, "acc-race", "sess-first");
+        assert!(admit_session(&db, "acc-race").is_err());
     }
 }

@@ -191,7 +191,7 @@ test('brak mergerfs lub niepełna odpowiedź capabilities nie odblokowują Elast
     assert.equal(win.querySelector('#nas-pw-filesystem'), null); screen.dispose();
   }
 });
-test('spóźnione capabilities po zmianie węzła nie odblokowują karty', async () => {
+test('spóźnione capabilities po zmianie noda nie odblokowują karty', async () => {
   let resolve;
   const { screen, win } = setup({ tentaNasElasticCapabilitiesRequest: () => new Promise((r) => { resolve = r; }) });
   screen.nodeId = 'different';

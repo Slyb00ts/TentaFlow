@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use tentaflow_protocol::features::FeatureState;
 use tentaflow_protocol::tentanas::{
     NasDisk, NasElasticArray, NasElasticBranch, NasElasticCapabilities, NasElasticFolder,
-    NasElasticImportCandidate, NasElasticParity, NasElasticPlan, NasElasticProtection,
+    NasElasticImportCandidate, NasElasticImportMember, NasElasticParity, NasElasticPlan, NasElasticProtection,
     NasElasticRefusal, NasMoverRun, NasMoverSettings, NasSchedule, NasSnapraidRun,
     NasSnapraidState,
 };
@@ -652,6 +652,12 @@ pub struct ArrayObservation {
     /// Files a stuck mover record left in two versions, as the helper found
     /// them on the branches (A3 of the second review).
     pub conflicts: Vec<ElasticConflict>,
+    /// The kernel name the helper resolved each member's device to in this
+    /// very read, keyed by mountpoint like `probes`. A LIVE name: it is the
+    /// device as it is now, so it names a member the node's inventory does
+    /// not hold yet (right after a core start, before the first sampler
+    /// pass) — see the naming rule at `disks::ShownDiskName`.
+    pub kernel_names: BTreeMap<String, String>,
 }
 
 impl ArrayObservation {
@@ -677,6 +683,9 @@ impl ArrayObservation {
                 ElasticRole::Cache => cache_branch_path(array_name, "c1"),
                 ElasticRole::Parity(i) => parity_mount_path(array_name, i),
             };
+            if let Some(name) = disk.kernel_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                self.kernel_names.insert(path.clone(), name.to_string());
+            }
             self.probes.insert(
                 path,
                 BranchProbe {
@@ -1122,7 +1131,7 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
         // it no longer selects a sentence that asserts a quantity.
         let waiting = "na cache bez parity (czeka na mover): ochronę domyka najbliższy sync, \
              który mover uruchamia zaraz po przenosinach";
-        let unmeasured = "ten węzeł nie zmierzył, ile czeka na cache";
+        let unmeasured = "ten node nie zmierzył, ile czeka na cache";
         let moved = "pliki już przeniesione przez mover także są poza parity: ich sprzężony sync \
              nie potwierdził ochrony, domknie ją dopiero kolejny udany sync";
         let unconfirmed = "sprzężony sync nie potwierdził ochrony; domknie ją dopiero kolejny udany sync";
@@ -1207,7 +1216,7 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
     } else if cache_bytes.is_none() {
         (
             "unknown",
-            "ten węzeł nie zmierzył, ile czeka na cache".to_string(),
+            "ten node nie zmierzył, ile czeka na cache".to_string(),
         )
     } else if observed.moved_unsynced_bytes.is_some_and(|bytes| bytes > 0) {
         (
@@ -2200,6 +2209,47 @@ pub fn free_disks(disks: &[NasDisk], taken: &BTreeSet<String>) -> Vec<NasDisk> {
 // To the wire
 // =============================================================================
 
+/// What the screen calls a member: a LIVE kernel name, or nothing.
+///
+/// The naming rule is `disks::pick_shown_name`: the inventory's name for the
+/// `disk_id` first, then the name the helper observed for the member's device
+/// in this same read (`observed`). An empty answer means neither source has
+/// the disk now; the last-known name then travels separately
+/// (`disk_last_name`), so the screen can mark it as last-known instead of
+/// presenting it as the current device.
+///
+/// The rows name members by slot (`d1`, `parity1`) because that is what the
+/// branch directory and the snapraid entry are called, and `device` is a
+/// by-uuid path — neither is a disk anybody can find in a shelf, and both
+/// used to be printed as the disk's name.
+fn member_disk_name(disks: &BTreeMap<String, NasDisk>, disk_id: &str, observed: Option<&str>) -> String {
+    let inventory = disks.get(disk_id).map(|d| d.name.clone());
+    match super::disks::pick_shown_name(inventory, observed, || None) {
+        super::disks::ShownDiskName::Live(name) => name,
+        _ => String::new(),
+    }
+}
+
+/// Adds the name a member was LAST seen under to every member no live source
+/// could name — the third step of the naming rule. The screen marks it as
+/// last-known; it is never put into `disk_name`, which is the device now.
+pub(crate) fn fill_last_known_names(
+    array: &mut NasElasticArray,
+    last_known: impl Fn(&str) -> Option<String>,
+) {
+    let fill = |disk_name: &str, disk_id: &str, into: &mut String| {
+        if disk_name.is_empty() {
+            *into = last_known(disk_id).map(|n| n.trim().to_string()).unwrap_or_default();
+        }
+    };
+    for branch in array.data_disks.iter_mut().chain(array.cache_disks.iter_mut()) {
+        fill(&branch.disk_name, &branch.disk_id, &mut branch.disk_last_name);
+    }
+    for parity in array.parity_disks.iter_mut() {
+        fill(&parity.disk_name, &parity.disk_id, &mut parity.disk_last_name);
+    }
+}
+
 fn branch_to_protocol(
     array: &ElasticArrayRow,
     branch: &BranchRow,
@@ -2215,8 +2265,14 @@ fn branch_to_protocol(
     let disk = disks.get(&branch.disk_id);
     NasElasticBranch {
         disk_id: branch.disk_id.clone(),
-            name: branch.name.clone(),
+        name: branch.name.clone(),
         device: branch.device.clone(),
+        disk_name: member_disk_name(
+            disks,
+            &branch.disk_id,
+            observed.kernel_names.get(&mountpoint).map(String::as_str),
+        ),
+        disk_last_name: String::new(),
         kind: disk.map(|d| d.kind.clone()).unwrap_or_else(|| "unknown".to_string()),
         role: branch.role.clone(),
         filesystem: array.filesystem.clone(),
@@ -2373,6 +2429,12 @@ pub fn to_protocol(
                 disk_id: p.disk_id.clone(),
                 name: p.name.clone(),
                 device: p.device.clone(),
+                disk_name: member_disk_name(
+                    disks,
+                    &p.disk_id,
+                    observed.kernel_names.get(&mountpoint).map(String::as_str),
+                ),
+                disk_last_name: String::new(),
                 index: p.index,
                 mountpoint,
                 parity_file: parity_file_path(&array.name, p.index),
@@ -2557,18 +2619,19 @@ fn parity_errors_in_window(
 /// `precondition_failed` from the helper's own guard.
 pub fn repair_blocker(array: &NasElasticArray) -> Option<String> {
     for member in &array.data_disks {
+        // Named as the screen names it — `sdg`, or the member's part in the
+        // array when the inventory lost it — never by the slot key.
+        let shown = member_label(&member.name, &member.disk_name);
         if member.device_present == Some(false) {
             return Some(format!(
-                "dysk '{}' nie jest widoczny na tym węźle: podłącz go ponownie, \
-                 bo naprawa z parity zapisuje właśnie ten dysk",
-                member.name
+                "dysk '{shown}' nie jest widoczny na tym nodzie: podłącz go ponownie, \
+                 bo naprawa z parity zapisuje właśnie ten dysk"
             ));
         }
         if member.mounted == Some(false) {
             return Some(format!(
-                "dysk '{}' nie jest zamontowany: odtwórz montowania macierzy, \
-                 bo naprawa zapisałaby katalog brancha na systemie plików węzła",
-                member.name
+                "dysk '{shown}' nie jest zamontowany: odtwórz montowania macierzy, \
+                 bo naprawa zapisałaby katalog brancha na systemie plików noda"
             ));
         }
     }
@@ -2967,29 +3030,129 @@ pub fn claimed_disk_ids(disks: &[NasDisk], claims: &[tentanas_helper::elastic::E
 // fails every Inspect, Restore, Sync and mover on it. So `import_apply`
 // re-owns the journal through the helper FIRST and writes the row second.
 
-/// Every member of a journal spec named the way the array's own rows name it —
-/// `d1`, `c1`, `parity1` — plus the hardware identity, because a refusal has
-/// to point at a disk somebody can find in a shelf.
-fn member_names(spec: &ElasticCreateSpec) -> Vec<(String, &ElasticDiskSpec)> {
-    fn label(branch: String, disk: &ElasticDiskSpec) -> (String, &ElasticDiskSpec) {
-        let mut name = format!("{branch} · {}", disk.disk_id);
-        if let Some(serial) = disk.serial.as_deref().filter(|s| !s.is_empty()) {
-            name.push_str(&format!(" (S/N {serial})"));
-        }
-        (name, disk)
-    }
+/// Every member of a journal spec with its place in the array — the slot the
+/// array's own rows give it (`d1`, `c1`, `parity1`), its role and, for
+/// parity, its level — plus the serial the journal recorded. The kernel name
+/// is left empty: only the scan knows whether the disk is here at all.
+///
+/// The place travels as DATA (`NasElasticImportMember`), never as a sentence:
+/// the import dialog words it with the same helper the Elastic detail screen
+/// names its members with, in the admin's own language.
+fn member_names(spec: &ElasticCreateSpec) -> Vec<(NasElasticImportMember, &ElasticDiskSpec)> {
+    let place = |slot: String, role: &str, index: Option<u8>, disk: &ElasticDiskSpec| NasElasticImportMember {
+        name: slot,
+        role: role.to_string(),
+        index,
+        disk_name: String::new(),
+        serial: disk.serial.clone().unwrap_or_default(),
+    };
     spec.data
         .iter()
         .enumerate()
-        .map(|(i, disk)| label(format!("d{}", i + 1), disk))
-        .chain(spec.cache.iter().map(|disk| label("c1".to_string(), disk)))
-        .chain(
-            spec.parity
-                .iter()
-                .enumerate()
-                .map(|(i, disk)| label(format!("parity{}", i + 1), disk)),
-        )
+        .map(|(i, disk)| (place(format!("d{}", i + 1), "data", None, disk), disk))
+        .chain(spec.cache.iter().map(|disk| (place("c1".to_string(), "cache", None, disk), disk)))
+        .chain(spec.parity.iter().enumerate().map(|(i, disk)| {
+            let level = u8::try_from(i + 1).unwrap_or(u8::MAX);
+            (place(format!("parity{}", i + 1), "parity", Some(level), disk), disk)
+        }))
         .collect()
+}
+
+/// A member as a node-side refusal names it: its kernel name when this node
+/// has the disk, otherwise its part in the array ("dysk danych 2").
+///
+/// Only `repair_blocker` still needs it, for a refusal the node itself
+/// returns (the server-text class tracked in the backlog). Anything the
+/// SCREEN shows is worded on the front end from structured data — the detail
+/// screen's own `repairBlocker` and the import dialog both use
+/// `memberName` in `elastic-detail.js` — so this is not a second source of
+/// on-screen member names.
+///
+/// Never the `disk_id` (`wwn-…`, `sn-…`) and never the bare slot: both are
+/// keys, and the owner's rule is that a disk is named the way the admin sees
+/// it on the Disks tab.
+pub(crate) fn member_label(slot: &str, disk_name: &str) -> String {
+    if !disk_name.is_empty() {
+        return disk_name.to_string();
+    }
+    if let Some(n) = slot.strip_prefix("parity") {
+        return format!("dysk parity {n}");
+    }
+    if slot.starts_with('c') {
+        return "dysk cache".to_string();
+    }
+    if let Some(n) = slot.strip_prefix('d') {
+        return format!("dysk danych {n}");
+    }
+    slot.to_string()
+}
+
+/// Whose journal this is, as a CODE the front end turns into a sentence
+/// (`tentanas.owner_kind.*`). The node never sends the sentence itself: it
+/// would be Polish in every locale.
+///
+/// The journal is owned by the instance asking.
+pub const OWNER_KIND_THIS_INSTANCE: &str = "this_instance";
+/// By another TentaNas instance of the SAME organisation as the one asking —
+/// the ordinary case after a re-provisioning inside one organisation. Only in
+/// this case may the owner's instance be named (`owner_instance_name`): the
+/// admin asking is a member of that organisation.
+pub const OWNER_KIND_THIS_ORG: &str = "this_org";
+/// By an organisation this node has NO record of — in practice disks carried
+/// over from another machine, whose journal names that machine's tenant.
+/// Such a journal stays visible and adoptable (with the re-own warning):
+/// whoever holds the disks in this node holds them, and no tenant HERE is
+/// being overruled. Nothing about that owner is named — not the organisation,
+/// not the instance — because this node cannot tell whose it is, and an id is
+/// not a name anyway.
+pub const OWNER_KIND_OTHER_INSTALLATION: &str = "other_installation";
+/// By ANOTHER ORGANISATION THAT EXISTS ON THIS NODE. The owner's rule
+/// (2026-09-22): such a journal is invisible to the asking tenant. It is not
+/// offered by the import scan, the adoption refuses it as it refuses a journal
+/// that does not exist, and the wipe of one of its disks is refused without
+/// naming the array — if a tenant may not adopt another tenant's array, it
+/// may not destroy it either (OWASP A01). The code itself reaches the client
+/// only as the wipe refusal `journal_other_org`; its array name, role and ids
+/// never do.
+pub const OWNER_KIND_OTHER_ORG_ON_NODE: &str = "other_org_on_node";
+
+/// The owner kind of a journal, judged against the instance that asks and
+/// the organisations this node has a record of (`orgs_on_node`, every row of
+/// the platform's `organizations` table whatever its status — see
+/// `orgs_on_node` in the dispatch module for why a deleted one still counts).
+///
+/// The organisation decides first: a journal of another organisation is never
+/// "this instance" even when the addon id happens to be this one's (the
+/// TentaNas package is one instance per node, shared by every organisation on
+/// it, so an equal addon id says nothing about the tenant). Only then does it
+/// matter whether that other organisation lives here — a tenant of this node
+/// (hidden) or somebody this node has never heard of (disks moved in).
+pub fn owner_kind(owner: &ElasticOwner, asking: &ElasticOwner, orgs_on_node: &BTreeSet<String>) -> &'static str {
+    if owner.org_id == asking.org_id {
+        if owner.addon_id == asking.addon_id { OWNER_KIND_THIS_INSTANCE } else { OWNER_KIND_THIS_ORG }
+    } else if orgs_on_node.contains(&owner.org_id) {
+        OWNER_KIND_OTHER_ORG_ON_NODE
+    } else {
+        OWNER_KIND_OTHER_INSTALLATION
+    }
+}
+
+/// The owner ids a client may see for a journal of this `kind`: the owner's
+/// own ids when it belongs to the asking organisation, and NOTHING for
+/// another installation.
+///
+/// Another tenant's org and addon ids are opaque, but they are still that
+/// tenant's identifiers, and a node shared by several tenants hands none of
+/// them to the admin of another (OWASP A01) — not in a sentence and not in a
+/// tooltip. Nothing on the client needs them: the adoption request names the
+/// array and the retyped name only, and the node reads the previous owner
+/// from the journal itself (`import_apply`).
+pub(crate) fn owner_ids_for(kind: &str, owner: &ElasticOwner) -> (String, String) {
+    if kind == OWNER_KIND_THIS_INSTANCE || kind == OWNER_KIND_THIS_ORG {
+        (owner.org_id.clone(), owner.addon_id.clone())
+    } else {
+        (String::new(), String::new())
+    }
 }
 
 /// Whether one inventory disk is the same PIECE OF HARDWARE the journal
@@ -3008,12 +3171,19 @@ fn same_hardware(disk: &NasDisk, member: &ElasticDiskSpec) -> bool {
 /// for, whatever the owner — an array with a row is not offered a second time,
 /// and neither is one whose NAME a different array already holds, because that
 /// name is UNIQUE in the database and the adoption could not be written.
+///
+/// A journal of another organisation that lives on this node is NOT a
+/// candidate at all (`OWNER_KIND_OTHER_ORG_ON_NODE`): it is dropped here,
+/// before anything of it — name, members, status — becomes part of the
+/// answer, and because `import_selection` only ever picks from this list, the
+/// adoption refuses it with the same sentence as a journal that is not there.
 pub fn import_candidates(
     entries: &[ElasticJournalEntry],
     unreadable: &[ElasticUnreadableJournal],
     disks: &[NasDisk],
     known: &[(String, String)],
     owner: &ElasticOwner,
+    orgs_on_node: &BTreeSet<String>,
 ) -> Vec<NasElasticImportCandidate> {
     // A journal the node cannot load is listed, never hidden (A7 of the second
     // review): with its spec when that much could be read, by its file name
@@ -3024,13 +3194,17 @@ pub fn import_candidates(
         .filter(|journal| !entries.iter().any(|entry| entry.spec.array_id == journal.array_id))
         .map(|journal| NasElasticImportCandidate {
             array_id: journal.array_id.clone(),
-            name: journal.array_id.clone(),
+            // Nothing could be read, so there is no NAME — and the file name
+            // is the array's UUID, which is not one. The dialog names the row
+            // by its state and keeps the id in a tooltip.
+            name: String::new(),
             status: "unreadable".to_string(),
             detail: journal.reason.clone(),
             ..Default::default()
         });
     entries
         .iter()
+        .filter(|entry| owner_kind(&entry.spec.owner, owner, orgs_on_node) != OWNER_KIND_OTHER_ORG_ON_NODE)
         .map(|entry| {
             let spec = &entry.spec;
             let members = member_names(spec);
@@ -3038,21 +3212,25 @@ pub fn import_candidates(
             let mut matched = 0u32;
             let mut disks_missing = Vec::new();
             let mut disks_reused = Vec::new();
-            for (name, member) in members {
+            for (place, member) in members {
                 if disks.iter().any(|disk| {
                     disk.fs_uuid
                         .as_deref()
                         .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&member.expected_uuid))
                 }) {
                     matched += 1;
-                } else if disks.iter().any(|disk| same_hardware(disk, member)) {
+                } else if let Some(present) = disks.iter().find(|disk| same_hardware(disk, member)) {
                     // The hardware is here and the array's filesystem is not:
                     // either somebody reused the disk or it was wiped. Both
                     // mean adopting it would claim bytes that are no longer
-                    // the array's.
-                    disks_reused.push(name);
+                    // the array's. The disk is HERE, so it has the name the
+                    // Disks tab shows for it.
+                    disks_reused.push(NasElasticImportMember { disk_name: present.name.clone(), ..place });
                 } else {
-                    disks_missing.push(name);
+                    // Gone, so no kernel name: the dialog says its part in the
+                    // array and the serial printed on the drive — the one
+                    // thing that finds it in a shelf.
+                    disks_missing.push(place);
                 }
             }
             let owned_elsewhere = spec.owner != *owner;
@@ -3064,13 +3242,17 @@ pub fn import_candidates(
                     "already_known",
                     "this node already has a database record of this array".to_string(),
                 ),
+                // The array holding the name may be ANOTHER organisation's
+                // (`known` is every owner's, because the name column is
+                // unique per node), so the sentence names neither array: the
+                // row already shows the journal's own name, and repeating it
+                // here as "a different array named …" told this tenant what
+                // another tenant had called its array.
                 Some(_) => (
                     "already_known",
-                    format!(
-                        "this node already has a different array named '{}', and an array name \
-                         is unique per node",
-                        spec.name
-                    ),
+                    "another array on this node already uses this name, and an array name \
+                     is unique per node"
+                        .to_string(),
                 ),
                 None if !disks_missing.is_empty() || !disks_reused.is_empty() => (
                     "incomplete",
@@ -3084,11 +3266,13 @@ pub fn import_candidates(
                 ),
                 None => (
                     "importable",
+                    // The owner is NOT named here: the ids are not a name,
+                    // and the dialog composes the owner from `owner_kind` above this.
                     if owned_elsewhere {
                         format!(
                             "all {total} members still carry the filesystem UUID the journal \
-                             recorded; adopting re-owns the array from {}/{} to this instance",
-                            spec.owner.org_id, spec.owner.addon_id
+                             recorded; adopting re-owns the array from another TentaNas \
+                             installation to this instance"
                         )
                     } else {
                         format!(
@@ -3098,12 +3282,20 @@ pub fn import_candidates(
                     },
                 ),
             };
+            let kind = owner_kind(&spec.owner, owner, orgs_on_node);
+            let (owner_org_id, owner_addon_id) = owner_ids_for(kind, &spec.owner);
             NasElasticImportCandidate {
                 array_id: spec.array_id.clone(),
                 name: spec.name.clone(),
                 filesystem: spec.filesystem.as_str().to_string(),
-                owner_org_id: spec.owner.org_id.clone(),
-                owner_addon_id: spec.owner.addon_id.clone(),
+                owner_org_id,
+                owner_addon_id,
+                owner_foreign: owned_elsewhere,
+                owner_kind: kind.to_string(),
+                // The instance's display name lives in the platform database,
+                // which this pure function does not read: the dispatch
+                // handler adds it, and only for an owner of the asking org.
+                owner_instance_name: String::new(),
                 data_disks: spec.data.len() as u32,
                 parity_disks: spec.parity.len() as u32,
                 cache_disks: spec.cache.iter().count() as u32,
@@ -3135,7 +3327,7 @@ pub fn import_selection<'a>(
     let candidate = candidates
         .iter()
         .find(|candidate| candidate.array_id == array_id)
-        .ok_or_else(|| anyhow!("Węzeł nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
+        .ok_or_else(|| anyhow!("Node nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
     // The same sentence every other retype-to-confirm path in this module
     // answers with, so one typo reads the same wherever it happens.
     ensure!(
@@ -3145,12 +3337,20 @@ pub fn import_selection<'a>(
     match candidate.status.as_str() {
         "importable" => Ok(candidate),
         "already_known" => Err(anyhow!("Ta macierz jest już zapisana w tej instancji")),
+        // Counts, and the one name that is a name: a REUSED member is here
+        // under a kernel name. A missing member's part in the array is
+        // words, and the dialog already lists it in the admin's language
+        // from the scan's structured members.
         _ => Err(anyhow!(
-            "Macierz niekompletna: {} z {} dysków potwierdziło UUID z dziennika (brak: {}; użyte ponownie: {})",
+            "Macierz niekompletna: {} z {} dysków potwierdziło UUID z dziennika (brakuje: {}; użyte ponownie: {})",
             candidate.disks_matched,
             candidate.disks_matched as usize + candidate.disks_missing.len() + candidate.disks_reused.len(),
-            if candidate.disks_missing.is_empty() { "—".to_string() } else { candidate.disks_missing.join(", ") },
-            if candidate.disks_reused.is_empty() { "—".to_string() } else { candidate.disks_reused.join(", ") },
+            candidate.disks_missing.len(),
+            if candidate.disks_reused.is_empty() {
+                "—".to_string()
+            } else {
+                candidate.disks_reused.iter().map(|m| m.disk_name.as_str()).collect::<Vec<_>>().join(", ")
+            },
         )),
     }
 }
@@ -3194,35 +3394,71 @@ pub async fn journals(
 
 /// One scan, as the dialog reads it: the journals, this node's live disk
 /// signatures and the arrays it already knows, turned into candidates.
+/// `orgs_on_node` is what hides another tenant's journals (`owner_kind`).
 pub async fn import_scan(
     db: &DbPool,
     owner: &ElasticOwner,
+    orgs_on_node: &BTreeSet<String>,
     explicit: Option<&ElevationToken>,
 ) -> Result<Vec<NasElasticImportCandidate>> {
+    Ok(scan_journals(db, owner, orgs_on_node, explicit).await?.1)
+}
+
+/// The journals and the candidates made of them, from ONE read. The apply
+/// path needs both: the candidate for its gate, and the journal for the
+/// previous owner's ids — which go to the server log only, and which a
+/// candidate of another installation deliberately does not carry
+/// (`owner_ids_for`).
+async fn scan_journals(
+    db: &DbPool,
+    owner: &ElasticOwner,
+    orgs_on_node: &BTreeSet<String>,
+    explicit: Option<&ElevationToken>,
+) -> Result<(ElasticJournalsResult, Vec<NasElasticImportCandidate>)> {
     let journals = journals(db, explicit).await?;
     super::disks::refresh_inventory(db).await?;
     let known = store::elastic_array_identities(db)?;
-    Ok(import_candidates(&journals.arrays, &journals.unreadable, &super::disks::snapshot().0, &known, owner))
+    let candidates = import_candidates(
+        &journals.arrays,
+        &journals.unreadable,
+        &super::disks::snapshot().0,
+        &known,
+        owner,
+        orgs_on_node,
+    );
+    Ok((journals, candidates))
 }
 
 /// Adopts one scanned array. Verifies again on its own measurement, re-owns
 /// the journal, then writes the row — in that order, because a row whose
 /// journal still names the previous owner describes an array this instance
 /// cannot operate.
+///
+/// Another tenant's journal cannot get past `import_selection`: the scan it
+/// picks from never lists one (`import_candidates`), so the refusal is the
+/// same "no such journal" a made-up `array_id` gets and confirms nothing.
 pub async fn import_apply(
     db: &DbPool,
     owner: &ElasticOwner,
+    orgs_on_node: &BTreeSet<String>,
     array_id: &str,
     confirm_name: &str,
     started_by: &str,
     explicit: Option<&ElevationToken>,
 ) -> Result<String> {
-    let candidates = import_scan(db, owner, explicit).await?;
+    let (journals, candidates) = scan_journals(db, owner, orgs_on_node, explicit).await?;
     let candidate = import_selection(&candidates, array_id, confirm_name)?;
-    let previous = ElasticOwner {
-        org_id: candidate.owner_org_id.clone(),
-        addon_id: candidate.owner_addon_id.clone(),
-    };
+    // The previous owner, for the SERVER LOG only, from the journal itself:
+    // the candidate blanks another installation's ids (`owner_ids_for`), and
+    // a candidate that passed the gate always has its journal in this read.
+    // Nothing the admin reads carries these ids — not the array's state, not
+    // the job log (`store::elastic_import`).
+    let previous = journals
+        .arrays
+        .iter()
+        .find(|entry| entry.spec.array_id == array_id)
+        .map(|entry| entry.spec.owner.clone())
+        .ok_or_else(|| anyhow!("Node nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
     let name = candidate.name.clone();
     let (out, _) = super::broker::run_privileged(
         db,
@@ -3246,7 +3482,20 @@ pub async fn import_apply(
         spec.owner == *owner && spec.array_id == array_id && spec.name == name,
         "Helper zwrócił niezgodną specyfikację przejmowanej macierzy"
     );
-    store::elastic_import(db, &spec, &previous, started_by)?;
+    store::elastic_import(db, &spec, started_by)?;
+    // The audit of WHO the array was taken from. Ids are an operator's
+    // business, so they go where the operator reads — the node's log — and
+    // never onto a screen another tenant's admin may be looking at.
+    tracing::info!(
+        array_id,
+        array = %name,
+        previous_org_id = %previous.org_id,
+        previous_addon_id = %previous.addon_id,
+        org_id = %owner.org_id,
+        addon_id = %owner.addon_id,
+        started_by,
+        "tentanas Elastic: array adopted from its previous owner"
+    );
     Ok(name)
 }
 
@@ -3853,7 +4102,7 @@ pub fn replacement_blocker(array: &NasElasticArray, branch: &str) -> Option<Stri
     let slot = array.data_disks.iter().find(|member| member.name == branch)?;
     if slot.device_present == Some(true) && slot.health != "failing" {
         return Some(format!(
-            "dysk '{branch}' jest obecny na tym węźle i nie zgłasza awarii: jeśli ma błędy, \
+            "dysk '{branch}' jest obecny na tym nodzie i nie zgłasza awarii: jeśli ma błędy, \
              użyj naprawy z parity, a wymianę uruchom po jego odłączeniu"
         ));
     }
@@ -4320,8 +4569,8 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             // A recovery after a boot stopped part-way: only a reboot retries it.
             if result.restart_required {
                 failure = Some(match failure {
-                    Some(detail) => format!("Wymagany restart węzła: {detail}"),
-                    None => "Wymagany restart węzła".to_string(),
+                    Some(detail) => format!("Wymagany restart noda: {detail}"),
+                    None => "Wymagany restart noda".to_string(),
                 });
             }
             let service_safe = result.service.as_ref().is_none_or(|service| {
@@ -4368,7 +4617,9 @@ pub async fn list(db: &DbPool, owner: &ElasticOwner) -> Result<Vec<NasElasticArr
             Ok(_) => observe_array(db,&array).await,
             Err(error) => Err(anyhow!("Brak pomiaru środowiska: {error}")),
         };
-        arrays.push(observed_protocol(&array,&disks,observed,features));
+        let mut wire = observed_protocol(&array,&disks,observed,features);
+        fill_last_known_names(&mut wire, |id| store::disk_last_name(db, id).ok().flatten());
+        arrays.push(wire);
     }
     Ok(arrays)
 }
@@ -4546,6 +4797,12 @@ where
     restored
 }
 
+/// Who the Tasks tab shows as the starter of a boot-time Restore: the node
+/// itself, not an account, exactly like `scheduler::STARTED_BY`. Every
+/// author check that lets the scheduler through must let this one through
+/// too (see `dispatch::tentanas::is_system_author`).
+pub const STARTED_BY_STARTUP: &str = "startup";
+
 pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
     static STARTING: OnceLock<Mutex<BTreeSet<(String,String)>>> = OnceLock::new();
     let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
@@ -4568,7 +4825,7 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
                         if !super::instance_should_run(&main_db,&db) {
                             anyhow::bail!("Instancja nie jest aktywna; przywracanie zatrzymane");
                         }
-                        spawn_restore(&db,row,"startup",None,Some(completion))
+                        spawn_restore(&db,row,STARTED_BY_STARTUP,None,Some(completion))
                     }),
                     || super::shares::apply(&db, &main_db, &owner.addon_id, None, super::shares::ApplyTrigger::Startup),
                 ).await;
@@ -4953,14 +5210,17 @@ pub(crate) mod tests {
     fn a_repair_is_blocked_by_the_disk_it_would_have_to_write() {
         assert_eq!(repair_blocker(&observed_array()), None);
 
+        // The fixture's member is not in any inventory, so the sentence names
+        // its part in the array — never the slot key `d1`.
         let mut absent = observed_array();
         absent.data_disks[0].device_present = Some(false);
-        assert!(repair_blocker(&absent).is_some_and(|why| why.contains("d1")
-            && why.contains("podłącz")));
+        assert!(repair_blocker(&absent).is_some_and(|why| why.contains("dysk danych 1")
+            && !why.contains("'d1'") && why.contains("podłącz")));
 
         let mut cold = observed_array();
         cold.data_disks[0].mounted = Some(false);
-        assert!(repair_blocker(&cold).is_some_and(|why| why.contains("d1")
+        cold.data_disks[0].disk_name = "sdg".into();
+        assert!(repair_blocker(&cold).is_some_and(|why| why.contains("'sdg'")
             && why.contains("odtwórz montowania")));
 
         // Both are tri-states and only `Some(false)` counts: `None` is
@@ -5503,7 +5763,7 @@ pub(crate) mod tests {
         row.create_spec = Some(spec);
         let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result.clone()), &[]);
         assert_eq!(wire.state, "needs_attention");
-        assert_eq!(wire.state_detail, "Wymagany restart węzła: mount: Input/output error");
+        assert_eq!(wire.state_detail, "Wymagany restart noda: mount: Input/output error");
         // The prefix comes from the flag, never from recognising a word in the
         // helper's own sentence: a cause that happens to mention a restart is
         // still prefixed exactly once.
@@ -5512,7 +5772,7 @@ pub(crate) mod tests {
         let wire = observed_protocol(&row, &BTreeMap::new(), Ok(mentions), &[]);
         assert_eq!(
             wire.state_detail,
-            "Wymagany restart węzła: restart demona mergerfs nie powiódł się"
+            "Wymagany restart noda: restart demona mergerfs nie powiódł się"
         );
     }
 
@@ -6740,6 +7000,73 @@ pub(crate) mod tests {
         }
     }
 
+    /// n11 names each member by a LIVE kernel name: the inventory's for its
+    /// `disk_id` first, then the one the helper resolved the member's device
+    /// to in the same read — which is what names every member right after a
+    /// core start, before the inventory's first pass. The slot and the
+    /// by-uuid path are keys and never a name.
+    #[test]
+    fn a_member_is_named_by_the_inventory_then_by_the_helper_s_own_observation() {
+        let (spec, row, features) = observation_fixture();
+        let data_id = spec.data[0].disk_id.clone();
+        let inventory: BTreeMap<String, NasDisk> = [(
+            data_id.clone(),
+            NasDisk { disk_id: data_id, name: "sdg".into(), ..Default::default() },
+        )]
+        .into_iter()
+        .collect();
+        let mut result = ready_result(&spec);
+        result.disks[0].kernel_name = Some("sdz".into());
+        let parity = result
+            .disks
+            .iter_mut()
+            .find(|d| matches!(d.role, ElasticRole::Parity(_)))
+            .expect("a parity observation");
+        parity.kernel_name = Some("sdo".into());
+        let wire = observed_protocol(&row, &inventory, Ok(result.clone()), &features);
+        // The inventory wins where it has the disk…
+        assert_eq!((wire.data_disks[0].name.as_str(), wire.data_disks[0].disk_name.as_str()), ("d1", "sdg"));
+        // …and the helper's live observation names the one it does not hold.
+        assert_eq!((wire.parity_disks[0].name.as_str(), wire.parity_disks[0].disk_name.as_str()), ("p1", "sdo"));
+        assert_eq!(wire.parity_disks[0].device_present, Some(true));
+
+        // An EMPTY inventory (a core that has just started): every present
+        // member is still named, none reads as missing.
+        let cold = observed_protocol(&row, &BTreeMap::new(), Ok(result.clone()), &features);
+        assert_eq!(cold.data_disks[0].disk_name, "sdz");
+        assert_eq!(cold.parity_disks[0].disk_name, "sdo");
+
+        // A member the helper found no device for has no live name at all.
+        let mut gone = result;
+        gone.disks[0].kernel_name = None;
+        gone.disks[0].device_present = Some(false);
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(gone), &features);
+        assert_eq!(wire.data_disks[0].disk_name, "");
+    }
+
+    /// The third step of the naming rule: a member no live source names gets
+    /// the name it was last seen under — in its OWN field, so the screen can
+    /// say "last seen as", and never in `disk_name`.
+    #[test]
+    fn a_member_no_live_source_names_carries_its_last_known_name_apart() {
+        let mut array = NasElasticArray {
+            data_disks: vec![
+                NasElasticBranch { disk_id: "wwn-live".into(), disk_name: "sdg".into(), ..Default::default() },
+                NasElasticBranch { disk_id: "wwn-gone".into(), ..Default::default() },
+            ],
+            parity_disks: vec![NasElasticParity { disk_id: "wwn-never".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        fill_last_known_names(&mut array, |id| match id {
+            "wwn-live" => panic!("a live member must not be looked up"),
+            "wwn-gone" => Some("sdq".into()),
+            _ => None,
+        });
+        assert_eq!((array.data_disks[0].disk_name.as_str(), array.data_disks[0].disk_last_name.as_str()), ("sdg", ""));
+        assert_eq!((array.data_disks[1].disk_name.as_str(), array.data_disks[1].disk_last_name.as_str()), ("", "sdq"));
+        assert_eq!((array.parity_disks[0].disk_name.as_str(), array.parity_disks[0].disk_last_name.as_str()), ("", ""));
+    }
+
     #[test]
     fn observation_rejects_identity_roles_bounds_and_unproven_mounts() {
         let (spec, row, features) = observation_fixture();
@@ -7555,6 +7882,7 @@ pub(crate) mod tests {
             last_mover: None,
             cache_age: None,
             conflicts: Vec::new(),
+            kernel_names: BTreeMap::new(),
         }
     }
 
@@ -7987,7 +8315,7 @@ pub(crate) mod tests {
             // The drift guard: falling through to the unmeasured-cache arm
             // below would drop the confirmed half entirely.
             assert_ne!(
-                p.detail, "ten węzeł nie zmierzył, ile czeka na cache",
+                p.detail, "ten node nie zmierzył, ile czeka na cache",
                 "{case}: potwierdzona nieaktualna parity nie może zniknąć"
             );
         }
@@ -9369,6 +9697,12 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// No organisation of this node other than the asking one: every other
+    /// org is one the node has never heard of (disks moved in).
+    fn no_orgs() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     fn this_addon() -> ElasticOwner {
         ElasticOwner { org_id: "org-default".into(), addon_id: "tentanas-8dd19dc4".into() }
     }
@@ -9379,7 +9713,7 @@ pub(crate) mod tests {
         let disks = member_disks(&entry);
         let owner = this_addon();
 
-        let candidates = import_candidates(&[entry.clone()], &[], &disks, &[], &owner);
+        let candidates = import_candidates(&[entry.clone()], &[], &disks, &[], &owner, &no_orgs());
         assert_eq!(candidates.len(), 1);
         let candidate = &candidates[0];
         assert_eq!(candidate.status, "importable");
@@ -9387,11 +9721,17 @@ pub(crate) mod tests {
         assert_eq!((candidate.data_disks, candidate.parity_disks, candidate.cache_disks), (2, 1, 0));
         assert!(candidate.disks_missing.is_empty() && candidate.disks_reused.is_empty());
         assert!(candidate.union_mounted, "the union is still published");
-        // The dialog has to be able to say whose storage this is.
-        assert_eq!(candidate.owner_org_id, "orgtentanas-rig11");
+        // The dialog has to be able to say whose storage this is — in words.
+        assert!(candidate.owner_foreign);
+        // Another organisation's journal: a code, and nothing of that tenant
+        // — no name, and not its ids either, not even for a tooltip.
+        assert_eq!(candidate.owner_kind, OWNER_KIND_OTHER_INSTALLATION);
+        assert_eq!(candidate.owner_instance_name, "");
+        assert_eq!((candidate.owner_org_id.as_str(), candidate.owner_addon_id.as_str()), ("", ""));
+        assert!(candidate.detail.contains("re-owns"), "{}", candidate.detail);
         assert!(
-            candidate.detail.contains("re-owns") && candidate.detail.contains("addontentanas"),
-            "{}",
+            !candidate.detail.contains("addontentanas") && !candidate.detail.contains("orgtentanas"),
+            "no owner id in the sentence: {}",
             candidate.detail
         );
         assert!(import_selection(&candidates, &candidate.array_id, "media").is_ok());
@@ -9405,29 +9745,32 @@ pub(crate) mod tests {
         // else's filesystem. Hardware identity says "present", and that is
         // exactly the evidence an adoption may not act on.
         disks[0].fs_uuid = Some(uuid::Uuid::new_v4().to_string());
-        let candidates = import_candidates(&[entry.clone()], &[], &disks, &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &[], &disks, &[], &this_addon(), &no_orgs());
         let candidate = &candidates[0];
 
         assert_eq!(candidate.status, "incomplete");
         assert_eq!(candidate.disks_matched, 2);
         assert_eq!(candidate.disks_reused.len(), 1, "{:?}", candidate.disks_reused);
         assert!(candidate.disks_missing.is_empty(), "{:?}", candidate.disks_missing);
-        assert!(
-            candidate.disks_reused[0].starts_with("d1 · media-data")
-                && candidate.disks_reused[0].contains("serial-media-data"),
-            "the refusal names the disk: {:?}",
-            candidate.disks_reused
+        // The disk is present, so it carries the name the Disks tab shows for
+        // it, and its place in the array as data — never `d1 · <disk_id>`.
+        let reused = &candidate.disks_reused[0];
+        assert_eq!(
+            (reused.name.as_str(), reused.role.as_str(), reused.index, reused.disk_name.as_str()),
+            ("d1", "data", None, disks[0].name.as_str()),
+            "the refusal names the disk"
         );
         let refusal = import_selection(&candidates, &candidate.array_id, "media")
             .expect_err("a changed UUID must refuse")
             .to_string();
-        assert!(refusal.contains("2 z 3") && refusal.contains("media-data"), "{refusal}");
+        assert!(refusal.contains("2 z 3") && refusal.contains(&disks[0].name), "{refusal}");
+        assert!(!refusal.contains("media-data"), "no disk id in the refusal: {refusal}");
 
         // And the same disk present with NO readable signature at all is not
         // read as a match either.
         disks[0].fs_uuid = None;
         disks[0].fs_type = None;
-        let blank = import_candidates(&[entry], &[], &disks, &[], &this_addon());
+        let blank = import_candidates(&[entry], &[], &disks, &[], &this_addon(), &no_orgs());
         assert_eq!(blank[0].status, "incomplete");
         assert_eq!(blank[0].disks_matched, 2);
     }
@@ -9445,11 +9788,13 @@ pub(crate) mod tests {
             ElasticUnreadableJournal { array_id: entry.spec.array_id.clone(), reason: "journal: unknown variant `exploded`".into() },
             ElasticUnreadableJournal { array_id: lost.into(), reason: "journal: EOF while parsing".into() },
         ];
-        let candidates = import_candidates(&[entry.clone()], &unreadable, &disks, &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &unreadable, &disks, &[], &this_addon(), &no_orgs());
         assert_eq!(candidates.len(), 2);
         assert_eq!((candidates[0].status.as_str(), candidates[0].detail.as_str()), ("unreadable", "journal: unknown variant `exploded`"));
         assert_eq!(candidates[0].name, "archiwum");
         assert_eq!((candidates[1].array_id.as_str(), candidates[1].status.as_str()), (lost, "unreadable"));
+        // The file name is the array's UUID, and a UUID is not a name.
+        assert_eq!(candidates[1].name, "");
         assert!(candidates[1].detail.contains("EOF"));
         assert!(import_selection(&candidates, &entry.spec.array_id, "archiwum").is_err());
     }
@@ -9459,12 +9804,24 @@ pub(crate) mod tests {
         let entry = lost_journal("archiwum");
         let mut disks = member_disks(&entry);
         let gone = disks.remove(1);
-        let candidates = import_candidates(&[entry], &[], &disks, &[], &this_addon());
+        let candidates = import_candidates(&[entry], &[], &disks, &[], &this_addon(), &no_orgs());
         let candidate = &candidates[0];
 
         assert_eq!(candidate.status, "incomplete");
         assert_eq!(candidate.disks_matched, 2);
-        assert_eq!(candidate.disks_missing, vec![format!("d2 · {} (S/N {})", gone.disk_id, gone.serial)]);
+        // Gone means no kernel name: its place in the array and the serial on
+        // the drive, as data the dialog words — never a Polish sentence, and
+        // never the journal's disk id.
+        assert_eq!(
+            candidate.disks_missing,
+            vec![NasElasticImportMember {
+                name: "d2".to_string(),
+                role: "data".to_string(),
+                index: None,
+                disk_name: String::new(),
+                serial: gone.serial.clone(),
+            }]
+        );
         assert!(candidate.disks_reused.is_empty());
         assert!(
             candidate.detail.contains("2 of 3") && candidate.detail.contains("cannot be found"),
@@ -9484,6 +9841,7 @@ pub(crate) mod tests {
             &[], &disks,
             &[(entry.spec.array_id.clone(), "produkt".to_string())],
             &owner,
+            &no_orgs(),
         );
         assert_eq!(by_id[0].status, "already_known");
         assert!(import_selection(&by_id, &entry.spec.array_id, "produkt").is_err());
@@ -9496,15 +9854,35 @@ pub(crate) mod tests {
             &[], &disks,
             &[("11111111-1111-4111-8111-111111111111".to_string(), "produkt".to_string())],
             &owner,
+            &no_orgs(),
         );
         assert_eq!(by_name[0].status, "already_known");
-        assert!(by_name[0].detail.contains("different array named 'produkt'"), "{}", by_name[0].detail);
+        assert!(by_name[0].detail.contains("already uses this name"), "{}", by_name[0].detail);
+    }
+
+    /// The array that already holds the name may be ANOTHER organisation's
+    /// (`known` is every owner's), so the clash sentence names no array: it
+    /// used to repeat the name as "a different array named '…'", telling this
+    /// tenant what another tenant had called its array.
+    #[test]
+    fn the_name_clash_sentence_names_no_array() {
+        let entry = lost_journal("ksiegowosc");
+        let clash = import_candidates(
+            &[entry.clone()],
+            &[], &member_disks(&entry),
+            &[("22222222-2222-4222-8222-222222222222".to_string(), "ksiegowosc".to_string())],
+            &this_addon(),
+            &no_orgs(),
+        );
+        assert_eq!(clash[0].status, "already_known");
+        assert!(!clash[0].detail.contains("ksiegowosc"), "{}", clash[0].detail);
+        assert!(!clash[0].detail.contains("22222222"), "{}", clash[0].detail);
     }
 
     #[test]
     fn the_apply_gate_refuses_a_mistyped_name_and_an_array_the_fresh_scan_no_longer_sees() {
         let entry = lost_journal("media");
-        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon(), &no_orgs());
 
         let typo = import_selection(&candidates, &entry.spec.array_id, "Media")
             .expect_err("the retyped name must match exactly")
@@ -9525,18 +9903,136 @@ pub(crate) mod tests {
         // journal owner is already ours, so there is nothing to re-own.
         let mut entry = lost_journal("media");
         entry.spec.owner = this_addon();
-        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon(), &no_orgs());
 
         assert_eq!(candidates[0].status, "importable");
+        assert!(!candidates[0].owner_foreign, "this instance's own journal is not foreign");
+        assert_eq!(candidates[0].owner_kind, OWNER_KIND_THIS_INSTANCE);
         assert!(!candidates[0].detail.contains("re-owns"), "{}", candidates[0].detail);
         assert!(candidates[0].detail.contains("already names this instance"), "{}", candidates[0].detail);
+    }
+
+    /// The owner ids reach the client only for the asking organisation's own
+    /// journals; another installation's are blanked on the node.
+    #[test]
+    fn owner_ids_are_sent_only_for_an_owner_of_the_asking_organisation() {
+        let mut entry = lost_journal("media");
+        entry.spec.owner = ElasticOwner { org_id: this_addon().org_id, addon_id: "tentanas-old".into() };
+        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon(), &no_orgs());
+        assert_eq!(candidates[0].owner_kind, OWNER_KIND_THIS_ORG);
+        assert_eq!(
+            (candidates[0].owner_org_id.as_str(), candidates[0].owner_addon_id.as_str()),
+            ("org-default", "tentanas-old")
+        );
+        let other = ElasticOwner { org_id: "org-b".into(), addon_id: "nas-9".into() };
+        assert_eq!(owner_ids_for(OWNER_KIND_OTHER_INSTALLATION, &other), (String::new(), String::new()));
+        assert_eq!(owner_ids_for(OWNER_KIND_THIS_INSTANCE, &other), ("org-b".to_string(), "nas-9".to_string()));
+    }
+
+    /// A parity member keeps its level and a cache member its role, so the
+    /// dialog can say "dysk parity 1" / "dysk cache" without a slot parser.
+    #[test]
+    fn every_member_place_carries_its_role_and_a_parity_level() {
+        let entry = lost_journal("media");
+        let places: Vec<_> = member_names(&entry.spec)
+            .into_iter()
+            .map(|(place, _)| (place.name, place.role, place.index, place.disk_name))
+            .collect();
+        assert_eq!(
+            places,
+            vec![
+                ("d1".to_string(), "data".to_string(), None, String::new()),
+                ("d2".to_string(), "data".to_string(), None, String::new()),
+                ("parity1".to_string(), "parity".to_string(), Some(1), String::new()),
+            ]
+        );
+    }
+
+    /// The owner of a journal is a code judged against the asking instance,
+    /// and the organisation decides first: another tenant's journal is
+    /// "another installation" even under this very addon id.
+    #[test]
+    fn a_journal_owner_kind_is_decided_by_the_organisation_first() {
+        let asking = ElasticOwner { org_id: "org-a".into(), addon_id: "nas-1".into() };
+        let owner = |org: &str, addon: &str| ElasticOwner { org_id: org.into(), addon_id: addon.into() };
+        assert_eq!(owner_kind(&owner("org-a", "nas-1"), &asking, &no_orgs()), OWNER_KIND_THIS_INSTANCE);
+        assert_eq!(owner_kind(&owner("org-a", "nas-0"), &asking, &no_orgs()), OWNER_KIND_THIS_ORG);
+        assert_eq!(owner_kind(&owner("org-b", "nas-1"), &asking, &no_orgs()), OWNER_KIND_OTHER_INSTALLATION);
+        assert_eq!(owner_kind(&owner("org-b", "nas-9"), &asking, &no_orgs()), OWNER_KIND_OTHER_INSTALLATION);
+    }
+
+    /// The split of 2026-09-22: another organisation is judged by whether
+    /// this node has a record of it. One it has is a tenant HERE (hidden);
+    /// one it has not is somebody else's machine (visible, adoptable).
+    #[test]
+    fn another_org_is_other_org_on_node_only_when_this_node_has_a_record_of_it() {
+        let asking = ElasticOwner { org_id: "org-a".into(), addon_id: "nas-1".into() };
+        let owner = |org: &str, addon: &str| ElasticOwner { org_id: org.into(), addon_id: addon.into() };
+        let orgs: BTreeSet<String> = ["org-a".to_string(), "org-b".to_string()].into();
+        assert_eq!(owner_kind(&owner("org-b", "nas-1"), &asking, &orgs), OWNER_KIND_OTHER_ORG_ON_NODE);
+        assert_eq!(owner_kind(&owner("org-c", "nas-1"), &asking, &orgs), OWNER_KIND_OTHER_INSTALLATION);
+        // The asking org's own journals are never "another org", whatever
+        // the set holds.
+        assert_eq!(owner_kind(&owner("org-a", "nas-1"), &asking, &orgs), OWNER_KIND_THIS_INSTANCE);
+        assert_eq!(owner_kind(&owner("org-a", "nas-0"), &asking, &orgs), OWNER_KIND_THIS_ORG);
+        assert_eq!(owner_ids_for(OWNER_KIND_OTHER_ORG_ON_NODE, &owner("org-b", "nas-1")), (String::new(), String::new()));
+    }
+
+    /// Another organisation of this node: its journal is not a candidate at
+    /// all — no row, so no name, no members, no status — and an adoption that
+    /// names its array id anyway (a guessed or remembered id) is refused with
+    /// the same sentence as a journal that does not exist.
+    #[test]
+    fn a_journal_of_another_org_on_this_node_is_not_listed_and_its_adoption_is_refused() {
+        let entry = lost_journal("media");
+        let mine = {
+            let mut own = lost_journal("archiwum");
+            own.spec.owner = this_addon();
+            own
+        };
+        let disks: Vec<NasDisk> = member_disks(&entry).into_iter().chain(member_disks(&mine)).collect();
+        let orgs: BTreeSet<String> = [this_addon().org_id, entry.spec.owner.org_id.clone()].into();
+
+        let candidates = import_candidates(&[entry.clone(), mine.clone()], &[], &disks, &[], &this_addon(), &orgs);
+        assert_eq!(candidates.len(), 1, "only this org's own journal: {candidates:?}");
+        assert_eq!(candidates[0].array_id, mine.spec.array_id);
+        let wire = serde_json::to_string(&candidates).unwrap();
+        assert!(!wire.contains("\"media\"") && !wire.contains(&entry.spec.array_id), "the name is never sent: {wire}");
+
+        let refusal = import_selection(&candidates, &entry.spec.array_id, "media").unwrap_err().to_string();
+        assert!(refusal.contains("nie widzi już dziennika"), "refused like a journal that is not there: {refusal}");
+        assert!(!refusal.contains("media"), "{refusal}");
+    }
+
+    /// An organisation this node has NO record of (the disks came from
+    /// another machine): listed, adoptable, with the re-own sentence — and
+    /// still without its ids.
+    #[test]
+    fn a_journal_of_an_org_unknown_to_this_node_is_listed_and_adoptable() {
+        let entry = lost_journal("media");
+        let orgs: BTreeSet<String> = [this_addon().org_id, "org-other-tenant".to_string()].into();
+        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon(), &orgs);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "media");
+        assert_eq!(candidates[0].status, "importable");
+        assert_eq!(candidates[0].owner_kind, OWNER_KIND_OTHER_INSTALLATION);
+        assert_eq!((candidates[0].owner_org_id.as_str(), candidates[0].owner_addon_id.as_str()), ("", ""));
+        assert!(import_selection(&candidates, &entry.spec.array_id, "media").is_ok());
+    }
+
+    #[test]
+    fn a_member_is_named_by_its_kernel_name_or_by_its_part_in_the_array() {
+        assert_eq!(member_label("d2", "sdh"), "sdh");
+        assert_eq!(member_label("d2", ""), "dysk danych 2");
+        assert_eq!(member_label("c1", ""), "dysk cache");
+        assert_eq!(member_label("parity1", ""), "dysk parity 1");
     }
 
     #[test]
     fn an_unreadable_mount_table_never_reads_as_an_unmounted_union() {
         let mut entry = lost_journal("media");
         entry.union_mounted = None;
-        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon());
+        let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon(), &no_orgs());
         assert!(!candidates[0].union_mounted, "unknown is rendered as 'not claimed to be mounted'");
         assert_eq!(candidates[0].status, "importable", "and it does not block the adoption");
     }

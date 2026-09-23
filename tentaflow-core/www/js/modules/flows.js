@@ -162,7 +162,11 @@ async function newFlow() {
     const resp = await ApiBinary.action('flowCreateRequest', {
       name: I18n.t('flows.default_name'),
       description: null,
-      graphJson: '{"nodes":[],"edges":[]}',
+      // R5 (flow_engine/validation.rs) rejects a graph with zero entry nodes,
+      // so a brand-new flow needs a seeded `trigger` node from the start —
+      // same node/graph shape the builder canvas writes on save (`position`
+      // nested, not flat x/y).
+      graphJson: '{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}}],"edges":[]}',
     });
     const id = resp?.flowId ?? resp?.flow_id;
     if (!id) throw new Error(I18n.t('flows.create_error_missing_id'));

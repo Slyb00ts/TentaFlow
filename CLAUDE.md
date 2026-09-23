@@ -342,7 +342,7 @@ addon tools from agents. `call_tool`/`invoke_block` honor guest return code 3
 Notable bundled addons: `eureka`, `company-lookup`, `contacts` (CRM source of truth), `memory`,
 `embeddings-chunker`, `notes` (SQLite source of truth + `graph_outbox` → Cozo `notes_kg` + zvec
 namespaces, hybrid RRF search), `deep-research` (thin facade over the web-research service).
-Protocol `SCHEMA_VERSION` 31 (`tentaflow-protocol/src/envelope.rs`) — old/new binaries reject
+Protocol `SCHEMA_VERSION` 32 (`tentaflow-protocol/src/envelope.rs`) — old/new binaries reject
 each other on handshake; rebuild all mesh nodes together.
 
 ### Web research

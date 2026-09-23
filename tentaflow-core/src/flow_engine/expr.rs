@@ -186,11 +186,10 @@ fn blob_descriptor(kind: &str, mime: &str, blob_ref: &BlobRef) -> serde_json::Va
     })
 }
 
-fn evaluate_cel(
-    expr: &str,
-    scope: &ExprScope,
-    timeout: Option<Duration>,
-) -> Result<CelValue, ExprError> {
+/// Length/nesting guards plus a parse-only compile pass (cached — see
+/// `compiled`'s doc), shared by `evaluate_cel` (which goes on to execute the
+/// program against a scope) and `validate_syntax` (which does not have one).
+fn compile_checked(expr: &str, timeout: Option<Duration>) -> Result<Arc<Program>, ExprError> {
     if expr.trim().is_empty() {
         return Err(ExprError::new(expr, "expression is empty"));
     }
@@ -211,7 +210,30 @@ fn evaluate_cel(
         ));
     }
     let timeout = timeout.unwrap_or(Duration::from_millis(DEFAULT_EVAL_TIMEOUT_MS));
-    let program = compiled(expr, timeout)?;
+    compiled(expr, timeout)
+}
+
+/// Validates that `expr` is syntactically well-formed CEL — the same
+/// length/nesting guards and parse pass `evaluate`/`evaluate_bool` run,
+/// without executing the program against any scope. For a caller that
+/// accepts a CEL expression at CONFIG time, before any record/scope exists
+/// to evaluate it against (e.g. a bus topic's `idempotency_key`,
+/// `C9`/`idempotency-key-cel`), so a malformed expression is rejected at
+/// bind time rather than failing every publish later. Does NOT catch
+/// errors that only show up at evaluation time against a real scope
+/// (an undeclared-variable reference, a type mismatch) — CEL is
+/// dynamically typed, so those are unavoidably runtime-only.
+pub fn validate_syntax(expr: &str, timeout: Option<Duration>) -> Result<(), ExprError> {
+    compile_checked(expr, timeout).map(|_| ())
+}
+
+fn evaluate_cel(
+    expr: &str,
+    scope: &ExprScope,
+    timeout: Option<Duration>,
+) -> Result<CelValue, ExprError> {
+    let timeout = timeout.unwrap_or(Duration::from_millis(DEFAULT_EVAL_TIMEOUT_MS));
+    let program = compile_checked(expr, Some(timeout))?;
     let bindings = referenced_bindings(&program, scope);
     // Execution runs on the big-stack worker under the wall-clock budget:
     // interpreter recursion follows AST depth, and the crate has internal
@@ -1059,5 +1081,28 @@ mod tests {
     fn failed_compilation_is_not_cached_and_stays_failing() {
         assert!(eval("1 +").is_err());
         assert!(eval("1 +").is_err());
+    }
+
+    // --- validate_syntax (idempotency-key-cel) ---
+
+    #[test]
+    fn validate_syntax_accepts_well_formed_expressions_without_a_scope() {
+        assert!(validate_syntax("payload.patient_id", None).is_ok());
+        assert!(validate_syntax("payload.a + '-' + payload.b", None).is_ok());
+    }
+
+    #[test]
+    fn validate_syntax_rejects_a_parse_error() {
+        assert!(validate_syntax("1 +", None).is_err());
+        assert!(validate_syntax("", None).is_err());
+        assert!(validate_syntax("   ", None).is_err());
+    }
+
+    #[test]
+    fn validate_syntax_rejects_over_limit_and_over_nested_input() {
+        let too_long = "a".repeat(MAX_EXPR_CHARS + 1);
+        assert!(validate_syntax(&too_long, None).is_err());
+        let too_nested: String = "(".repeat(MAX_EXPR_NESTING + 1);
+        assert!(validate_syntax(&too_nested, None).is_err());
     }
 }

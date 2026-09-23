@@ -661,11 +661,27 @@ function renderTable(component, ctx) {
   // Transform SDK rows to flat objects for tf-table .rows property.
   // tf-table reads values by column key from row objects.
   const transformRows = (rows) => {
+    // Read the selection ONCE for the whole page rather than per row: it is
+    // the same bind for every row in this call, and `getSelectedSet` re-reads
+    // and re-parses the store value on every call.
+    const selectedSet = getSelectedSet();
     return rows.map((row) => {
       const flat = { ...row };
       // Preserve the raw row key BEFORE the column loop; the loop can never
       // overwrite it because ROW_KEY_PROP is rejected as a column id.
-      flat[ROW_KEY_PROP] = row != null && typeof row === 'object' ? row[rowKeyField] : undefined;
+      const rawKey = row != null && typeof row === 'object' ? row[rowKeyField] : undefined;
+      flat[ROW_KEY_PROP] = rawKey;
+      // tf-table treats the DATA row's `_selected` as the one source of
+      // selection truth (every render syncs each checkbox from it, a click
+      // writes it back into the row). This renderer used to hand tf-table
+      // fresh `{...row}` objects that never carried the field, so ticks stayed
+      // on whatever DOM slot last had them — a never-selected row on page 2
+      // showed ticked, and a sort left the tick on the wrong row (MAJOR B,
+      // critic 2026-09-22, probes S1/S2/S4). Setting it here from the
+      // canonical `selected_ids` bind on every transform makes the tick follow
+      // the ROW across paging, sorting and filtering, in both single and
+      // multi select modes.
+      flat._selected = typeof rawKey === 'string' && selectedSet.has(rawKey);
       // Formatted cell values live under the column id (the tf-column key).
       for (const col of columns) {
         if (col.hidden_by_default) continue;

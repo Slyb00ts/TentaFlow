@@ -87,7 +87,6 @@ impl ResolvedExecutionTarget {
                 BackendHandle::Http(_) => "http",
                 BackendHandle::Quic(_) => "quic",
                 BackendHandle::Embedded { .. } => "embedded",
-                BackendHandle::AgentRpc => "agent_rpc",
             },
             Self::MeshForward { .. } => "mesh_forward",
             Self::Flow { .. } => "flow_engine",

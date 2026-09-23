@@ -200,11 +200,17 @@ mod core_sync_repository_tests {
             "password@example.com",
         )
         .expect("create user");
-        db.write().expect("db lock").execute(
-            "UPDATE user_accounts SET must_change_password = 1 WHERE id = ?1", [&user_id],
-        ).expect("require initial password rotation");
+        db.write()
+            .expect("db lock")
+            .execute(
+                "UPDATE user_accounts SET must_change_password = 1 WHERE id = ?1",
+                [&user_id],
+            )
+            .expect("require initial password rotation");
         update_user_account_password(&db, &user_id, "new-secret-hash").expect("update password");
-        let user = get_user_account_by_id(&db, &user_id).expect("user").expect("account");
+        let user = get_user_account_by_id(&db, &user_id)
+            .expect("user")
+            .expect("account");
         assert!(!user.must_change_password);
         assert_eq!(user.password_hash, "new-secret-hash");
         let capture_id = capture_id_for_action(&db, "core.user_account", &user_id, "update");
@@ -1020,7 +1026,10 @@ fn shared_secret_version_tx(
         .query_row(
             "SELECT hlc_wall, hlc_logical, hlc_node FROM core_resource_versions \
              WHERE resource_type = ?1 AND resource_id = ?2",
-            rusqlite::params![crate::sync::core_registry::SHARED_SETTING_RESOURCE_TYPE, key],
+            rusqlite::params![
+                crate::sync::core_registry::SHARED_SETTING_RESOURCE_TYPE,
+                key
+            ],
             |row| {
                 Ok(crate::sync::ledger::HybridLogicalTimestamp {
                     wall_time_ms: row.get(0)?,
@@ -1043,7 +1052,13 @@ pub fn set_shared_secret_setting_secure(
     value: &str,
     cipher: &crate::crypto::SettingsCipher,
 ) -> Result<()> {
-    store_shared_secret(pool, key, value, cipher, &crate::sync::runtime::core_hlc_now())
+    store_shared_secret(
+        pool,
+        key,
+        value,
+        cipher,
+        &crate::sync::runtime::core_hlc_now(),
+    )
 }
 
 fn store_shared_secret(
@@ -4224,7 +4239,6 @@ pub fn list_all_cluster_members(pool: &DbPool) -> Result<Vec<DbClusterMember>> {
     Ok(rows)
 }
 
-
 // --- Flows ---
 
 const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at, is_system";
@@ -5835,7 +5849,7 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
             }
             K::ResourcePermission => {
                 let mut stmt = tx.prepare(
-                    "SELECT resource_type, resource_id, subject_type, subject_id, access_level \
+                    "SELECT resource_type, resource_id, subject_type, subject_id, action, access_level \
                      FROM resource_permissions",
                 )?;
                 let rows = stmt
@@ -5846,18 +5860,22 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
                             r.get::<_, String>(2)?,
                             r.get::<_, String>(3)?,
                             r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
                         ))
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                for (resource_type, resource_id, subject_type, subject_id, access_level) in rows {
+                for (resource_type, resource_id, subject_type, subject_id, action, access_level) in
+                    rows
+                {
                     record_core_capture_tx(
                         &tx,
                         descriptor.kind,
-                        resource_permission_resource_id(
+                        resource_permission_resource_id_for_action(
                             &resource_type,
                             &resource_id,
                             &subject_type,
                             &subject_id,
+                            &action,
                         ),
                         Insert,
                         resource_permission_changed_fields(
@@ -5865,6 +5883,7 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
                             &resource_id,
                             &subject_type,
                             &subject_id,
+                            &action,
                             Some(&access_level),
                         ),
                         None,
@@ -7270,6 +7289,13 @@ fn api_key_changed_fields(
 /// Composite resource_id for a `resource_permissions` row. The four key columns
 /// (resource_type, resource_id, subject_type, subject_id) map to one length-
 /// prefixed key so distinct rules never collide and each gets its own LWW slot.
+///
+/// UNCHANGED by migration 168 — every EXISTING caller (models/flows/addons/
+/// API-key scopes via `set`/`clear`, and a `'*'`-action bus topic row) still
+/// resolves to this exact 4-segment shape, so an already-replicated op's
+/// sync/LWW key never moves. `resource_permission_resource_id_for_action`
+/// below is the one that changes shape, and ONLY for a genuinely
+/// action-scoped (`action != "*"`) row.
 fn resource_permission_resource_id(
     resource_type: &str,
     resource_id: &str,
@@ -7284,15 +7310,48 @@ fn resource_permission_resource_id(
     ])
 }
 
-/// Replicated field set for a `resource_permissions` upsert. Carries the four key
-/// components (the materializer reconstructs the row from these, not from the
-/// composite resource_id) plus the `access_level`. A `clear` replicates as a
-/// Delete that needs only the key components, so it does not set `access_level`.
+/// migration 168, `topic-acl-actions`: the sync/LWW key for an action-scoped
+/// grant. `action = "*"` (every pre-168 row, and every non-bus resource type,
+/// which never calls the action-aware repository functions) resolves to the
+/// EXACT SAME 4-segment id `resource_permission_resource_id` always has —
+/// full backward compatibility for anything that never asked for an action
+/// dimension. A genuinely action-scoped row (`"read"`/`"write"`/`"admin"`)
+/// gets its OWN 5-segment id instead, so independent read/write/admin grants
+/// for the SAME (resource, subject) pair land in DIFFERENT ledger LWW slots
+/// — without this, a `write` deny and a later `read` allow for the same
+/// subject would contend for one slot and the newer HLC could silently drop
+/// the other action's row on a replica.
+fn resource_permission_resource_id_for_action(
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+) -> String {
+    if action == "*" {
+        resource_permission_resource_id(resource_type, resource_id, subject_type, subject_id)
+    } else {
+        crate::sync::resource_id::composite_resource_id(&[
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action,
+        ])
+    }
+}
+
+/// Replicated field set for a `resource_permissions` upsert. Carries the four
+/// key components (the materializer reconstructs the row from these, not
+/// from the composite resource_id) plus `action` and `access_level`. A
+/// `clear` replicates as a Delete that needs only the key components plus
+/// `action`, so it does not set `access_level`.
 fn resource_permission_changed_fields(
     resource_type: &str,
     resource_id: &str,
     subject_type: &str,
     subject_id: &str,
+    action: &str,
     access_level: Option<&str>,
 ) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
     let mut fields = BTreeMap::new();
@@ -7300,6 +7359,7 @@ fn resource_permission_changed_fields(
     fields.insert("resource_id".to_string(), field_string(resource_id));
     fields.insert("subject_type".to_string(), field_string(subject_type));
     fields.insert("subject_id".to_string(), field_string(subject_id));
+    fields.insert("action".to_string(), field_string(action));
     if let Some(level) = access_level {
         fields.insert("access_level".to_string(), field_string(level));
     }
@@ -16142,11 +16202,12 @@ pub fn remove_revoked_node(pool: &DbPool, node_id: &str) -> Result<()> {
 /// Lista wszystkich revoked nodow jako `(node_id, revoked_at)`.
 pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<(String, String)>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT node_id, revoked_at FROM revoked_nodes ORDER BY revoked_at DESC",
-    )?;
+    let mut stmt = conn
+        .prepare_cached("SELECT node_id, revoked_at FROM revoked_nodes ORDER BY revoked_at DESC")?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -21864,9 +21925,18 @@ pub mod resource_permissions {
         pub subject_type: String, // "user" | "group" | "api_key"
         pub subject_id: String,
         pub access_level: String, // "allow" | "deny"
+        /// "read" | "write" | "admin" | "*" (migration 168). `'*'` matches
+        /// every action a caller asks about — the meaning every row had
+        /// before this column existed, and still the only value any
+        /// resource_type other than `topic` ever writes.
+        pub action: String,
     }
 
-    /// Upsert permission — INSERT albo UPDATE gdy (type,id,subj,sid) istnieje.
+    /// Upsert permission — INSERT albo UPDATE gdy (type,id,subj,sid,action) istnieje.
+    /// Always writes `action = '*'` (applies to every action) — the shape every
+    /// OTHER resource type (model/flow/addon/model_bundle/api_key scopes) still
+    /// wants. `topic` ACL rows that need a specific read/write/admin grant go
+    /// through `set_with_action` instead.
     pub fn set(
         pool: &DbPool,
         resource_type: &str,
@@ -21875,20 +21945,15 @@ pub mod resource_permissions {
         subject_id: &str,
         access_level: &str,
     ) -> Result<()> {
-        let conn = pool
-            .write()
-            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
-        let tx = conn.unchecked_transaction()?;
-        set_tx(
-            &tx,
+        set_with_action(
+            pool,
             resource_type,
             resource_id,
             subject_type,
             subject_id,
+            "*",
             access_level,
-        )?;
-        tx.commit()?;
-        Ok(())
+        )
     }
 
     /// Transactional upsert — same logic + capture as `set`, but joins a caller's
@@ -21901,34 +21966,91 @@ pub mod resource_permissions {
         subject_id: &str,
         access_level: &str,
     ) -> Result<()> {
+        set_with_action_tx(
+            tx,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            "*",
+            access_level,
+        )
+    }
+
+    /// Action-aware upsert (migration 168) — one row per (resource, subject,
+    /// action). `action` must be `'read'`, `'write'`, `'admin'` or `'*'`
+    /// (matches every action). Used by the bus topic ACL, which is the one
+    /// resource type that needs independent read/write/admin grants per
+    /// subject; every other resource type keeps calling plain `set` (pinned
+    /// to `action = '*'`).
+    pub fn set_with_action(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        action: &str,
+        access_level: &str,
+    ) -> Result<()> {
+        let conn = pool
+            .write()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let tx = conn.unchecked_transaction()?;
+        set_with_action_tx(
+            &tx,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            action,
+            access_level,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn set_with_action_tx(
+        tx: &rusqlite::Transaction<'_>,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        action: &str,
+        access_level: &str,
+    ) -> Result<()> {
         if !matches!(access_level, "allow" | "deny") {
             anyhow::bail!("access_level must be 'allow' or 'deny'");
         }
         if !matches!(subject_type, "user" | "group" | "api_key") {
             anyhow::bail!("subject_type must be 'user', 'group' or 'api_key'");
         }
+        if !matches!(action, "read" | "write" | "admin" | "*") {
+            anyhow::bail!("action must be 'read', 'write', 'admin' or '*'");
+        }
         tx.execute(
             "INSERT INTO resource_permissions
-                (resource_type, resource_id, subject_type, subject_id, access_level)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(resource_type, resource_id, subject_type, subject_id)
+                (resource_type, resource_id, subject_type, subject_id, action, access_level)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(resource_type, resource_id, subject_type, subject_id, action)
              DO UPDATE SET access_level = excluded.access_level",
             rusqlite::params![
                 resource_type,
                 resource_id,
                 subject_type,
                 subject_id,
+                action,
                 access_level
             ],
         )?;
         super::record_core_capture_tx(
             tx,
             crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
-            super::resource_permission_resource_id(
+            super::resource_permission_resource_id_for_action(
                 resource_type,
                 resource_id,
                 subject_type,
                 subject_id,
+                action,
             ),
             crate::sync::runtime::SqlWriteAction::Update,
             super::resource_permission_changed_fields(
@@ -21936,6 +22058,7 @@ pub mod resource_permissions {
                 resource_id,
                 subject_type,
                 subject_id,
+                action,
                 Some(access_level),
             ),
             None,
@@ -21946,6 +22069,11 @@ pub mod resource_permissions {
     /// Usun wpis (reset do default-allow). Replikuje sie jako Delete (tombstone),
     /// dzieki czemu starszy `allow` z innego wezla nie wskrzesi skasowanej reguly
     /// (LWW po HLC: nowszy clear wygrywa nad starszym allow).
+    ///
+    /// Removes every action row for this (resource, subject) pair — correct for
+    /// every resource type that only ever has the single `action = '*'` row `set`
+    /// writes. A `topic` ACL that wants to clear ONE action without touching a
+    /// subject's other action rows must use `clear_with_action` instead.
     pub fn clear(
         pool: &DbPool,
         resource_type: &str,
@@ -21995,10 +22123,59 @@ pub mod resource_permissions {
                 resource_id,
                 subject_type,
                 subject_id,
+                "*",
                 None,
             ),
             None,
         )?;
+        Ok(())
+    }
+
+    /// Removes exactly one action's row for this (resource, subject) pair —
+    /// the topic ACL's own clear, so revoking `write` never touches a
+    /// subject's separately-granted `read`/`admin` rows. Same tombstone
+    /// semantics as `clear_tx`.
+    pub fn clear_with_action(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        action: &str,
+    ) -> Result<()> {
+        let conn = pool
+            .write()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let tx = conn.unchecked_transaction()?;
+        let affected = tx.execute(
+            "DELETE FROM resource_permissions
+             WHERE resource_type = ?1 AND resource_id = ?2
+               AND subject_type = ?3 AND subject_id = ?4 AND action = ?5",
+            rusqlite::params![resource_type, resource_id, subject_type, subject_id, action],
+        )?;
+        let _ = affected;
+        super::record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
+            super::resource_permission_resource_id_for_action(
+                resource_type,
+                resource_id,
+                subject_type,
+                subject_id,
+                action,
+            ),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            super::resource_permission_changed_fields(
+                resource_type,
+                resource_id,
+                subject_type,
+                subject_id,
+                action,
+                None,
+            ),
+            None,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -22011,10 +22188,10 @@ pub mod resource_permissions {
     ) -> Result<Vec<ResourcePermission>> {
         let conn = pool.read().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level
+            "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level, action
              FROM resource_permissions
              WHERE resource_type = ?1 AND resource_id = ?2
-             ORDER BY subject_type, subject_id",
+             ORDER BY subject_type, subject_id, action",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![resource_type, resource_id], |row| {
@@ -22025,6 +22202,7 @@ pub mod resource_permissions {
                     subject_type: row.get(3)?,
                     subject_id: row.get(4)?,
                     access_level: row.get(5)?,
+                    action: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -22053,10 +22231,10 @@ pub mod resource_permissions {
     ) -> Result<Vec<ResourcePermission>> {
         let conn = pool.read().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level
+            "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level, action
              FROM resource_permissions
              WHERE subject_type = ?1 AND subject_id = ?2
-             ORDER BY resource_type, resource_id",
+             ORDER BY resource_type, resource_id, action",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![subject_type, subject_id], |row| {
@@ -22067,6 +22245,7 @@ pub mod resource_permissions {
                     subject_type: row.get(3)?,
                     subject_id: row.get(4)?,
                     access_level: row.get(5)?,
+                    action: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -22127,13 +22306,18 @@ pub mod resource_permissions {
         pool: &DbPool,
         resource_id_prefix: &str,
     ) -> Result<usize> {
+        // DISTINCT: migration 168 widened uniqueness to include `action`, so a
+        // subject with independent read/write/admin grants now has multiple
+        // rows here. `clear` below removes every action row for a (resource,
+        // subject) pair in one DELETE, so a duplicate tuple would only inflate
+        // `removed` without deleting anything extra.
         let matches: Vec<(String, String, String)> = {
             let conn = pool
                 .read()
                 .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
             let pattern = format!("{}%", escape_like_prefix(resource_id_prefix));
             let mut stmt = conn.prepare(
-                "SELECT resource_id, subject_type, subject_id FROM resource_permissions \
+                "SELECT DISTINCT resource_id, subject_type, subject_id FROM resource_permissions \
                  WHERE resource_type = 'topic' AND resource_id LIKE ?1 ESCAPE '\\'",
             )?;
             let rows = stmt
@@ -22185,12 +22369,16 @@ pub mod resource_permissions {
         // 2. + 3. User-level override. Only "no matching row" collapses to
         // None; any real DB error must propagate so the /v1 fail-closed
         // wrapper (`check_v1_access`) denies instead of falling through to
-        // the group/default path.
+        // the group/default path. `action = '*'` restricts this to the
+        // action-blind row shape every caller of this function (model/flow/
+        // alias/model_bundle/ml_studio_export ACLs, never `topic`) writes —
+        // an action-scoped `topic` row would otherwise make `query_row`
+        // panic-free but wrong (it expects at most one row back).
         let user_level: Option<String> = conn
             .query_row(
                 "SELECT access_level FROM resource_permissions
                  WHERE resource_type = ?1 AND resource_id = ?2
-                   AND subject_type = 'user' AND subject_id = ?3",
+                   AND subject_type = 'user' AND subject_id = ?3 AND action = '*'",
                 rusqlite::params![resource_type, resource_id, user_id],
                 |row| row.get(0),
             )
@@ -22204,7 +22392,7 @@ pub mod resource_permissions {
             "SELECT access_level FROM resource_permissions rp
              JOIN group_members gm ON rp.subject_id = gm.group_id
              WHERE rp.resource_type = ?1 AND rp.resource_id = ?2
-               AND rp.subject_type = 'group' AND gm.user_id = ?3",
+               AND rp.subject_type = 'group' AND gm.user_id = ?3 AND rp.action = '*'",
         )?;
         let levels: Vec<String> = stmt
             .query_map(
@@ -22294,6 +22482,70 @@ pub mod resource_permissions {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Action-aware variant of `check_inner`'s priority chain (migration 168):
+    /// `user_deny > user_allow > group_deny > group_allow > default_allow`,
+    /// where every level now sums the rows that match `action` EXACTLY plus
+    /// the rows recorded as `'*'` (matches every action — what every
+    /// pre-168 row means, per the migration's own mapping note). No
+    /// admin-role bypass: unlike `check_inner`'s Tier-1 shape, the bus topic
+    /// ACL (this function's only caller today) sits BEHIND the addon
+    /// permission matrix's own `bus.admin` check, so folding a second,
+    /// org-role-based bypass in here would let an org admin who was never
+    /// granted `bus.admin` on this instance skip that layer entirely.
+    pub fn check_action(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        action: &str,
+        user_id: &str,
+        default_allow: bool,
+    ) -> Result<bool> {
+        let conn = pool
+            .read()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+
+        let mut user_stmt = conn.prepare_cached(
+            "SELECT access_level FROM resource_permissions
+             WHERE resource_type = ?1 AND resource_id = ?2
+               AND subject_type = 'user' AND subject_id = ?3
+               AND (action = ?4 OR action = '*')",
+        )?;
+        let user_levels: Vec<String> = user_stmt
+            .query_map(
+                rusqlite::params![resource_type, resource_id, user_id, action],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if user_levels.iter().any(|l| l == "deny") {
+            return Ok(false);
+        }
+        if user_levels.iter().any(|l| l == "allow") {
+            return Ok(true);
+        }
+
+        let mut group_stmt = conn.prepare_cached(
+            "SELECT rp.access_level FROM resource_permissions rp
+             JOIN group_members gm ON rp.subject_id = gm.group_id
+             WHERE rp.resource_type = ?1 AND rp.resource_id = ?2
+               AND rp.subject_type = 'group' AND gm.user_id = ?3
+               AND (rp.action = ?4 OR rp.action = '*')",
+        )?;
+        let group_levels: Vec<String> = group_stmt
+            .query_map(
+                rusqlite::params![resource_type, resource_id, user_id, action],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if group_levels.iter().any(|l| l == "deny") {
+            return Ok(false);
+        }
+        if group_levels.iter().any(|l| l == "allow") {
+            return Ok(true);
+        }
+
+        Ok(default_allow)
     }
 }
 
@@ -26288,8 +26540,7 @@ mod chunk_c_visibility_consumer_tests {
                     crate::sync::core_capture::load_core_write_capture(&conn, &capture_id)
                         .expect("load capture")
                         .expect("capture");
-                let mut fields: Vec<String> =
-                    capture.changed_fields.keys().cloned().collect();
+                let mut fields: Vec<String> = capture.changed_fields.keys().cloned().collect();
                 fields.sort();
                 (action, fields)
             })
@@ -26345,7 +26596,11 @@ mod chunk_c_visibility_consumer_tests {
         )
         .expect("no-op");
         assert!(unchanged.is_empty());
-        assert_eq!(node_captures(&db, "node-x").len(), 1, "a no-op mints nothing");
+        assert_eq!(
+            node_captures(&db, "node-x").len(),
+            1,
+            "a no-op mints nothing"
+        );
 
         // The operator flag travels on its own, not smuggled next to the kind.
         let promoted = update_sync_node_profile(
@@ -26562,7 +26817,10 @@ mod chunk_c_visibility_consumer_tests {
             )
             .expect("count")
         };
-        assert_eq!(survived, 1, "the row must survive a guard that could not run");
+        assert_eq!(
+            survived, 1,
+            "the row must survive a guard that could not run"
+        );
     }
 
     /// The floor from PLAN §6.1 holds on this path too: the local admin edit is a
@@ -26588,7 +26846,9 @@ mod chunk_c_visibility_consumer_tests {
             },
             None,
         );
-        let message = refused.expect_err("the last operator must not be removable").to_string();
+        let message = refused
+            .expect_err("the last operator must not be removable")
+            .to_string();
         assert!(message.contains("last operator"), "message: {message}");
         assert_eq!(operator_node_ids(&db), vec!["node-last".to_string()]);
 
@@ -27258,7 +27518,11 @@ mod chunk_c_visibility_consumer_tests {
             "standard",
         )
         .unwrap();
-        for resource_type in ["core.vm_host", "core.vm_guest", "core.vm_connector_secret_grant"] {
+        for resource_type in [
+            "core.vm_host",
+            "core.vm_guest",
+            "core.vm_connector_secret_grant",
+        ] {
             let targets = list_sync_targets_for_resource(
                 &db,
                 crate::services::org::DEFAULT_ORG_ID,
@@ -27330,7 +27594,6 @@ mod chunk_c_visibility_consumer_tests {
             .unwrap();
         assert_eq!(empty, 0);
     }
-
 }
 
 #[cfg(test)]
@@ -29179,7 +29442,7 @@ mod token_metrics_tests {
 }
 
 // =============================================================================
-// Shared map — sites, scenes and device placement (migration 165).
+// Shared map — sites, scenes and device placement (migration 169).
 //
 // The rows here are the map's METADATA; its geometry lives under
 // `paths::maps_dir()` and is indexed by `map_chunks`. Every function is
@@ -30555,6 +30818,16 @@ pub fn bus_topic_get(
 /// re-derive the composite key it deletes by. A row that is already gone
 /// (the caller checked, then lost the race) deletes zero rows and publishes
 /// nothing: there is nothing left for a peer to agree with us about.
+///
+/// The local `DELETE` commits unconditionally before the capture is
+/// attempted, and a capture failure is logged rather than propagated —
+/// same house style as the bulk `bus_partition_assignments_delete_by_
+/// instance` below ("already deleted locally"). Once the local row is
+/// gone there is no state left to roll the delete back from, so returning
+/// `Err` here would misreport a delete that already succeeded as a failed
+/// call; the caller would see an error for an operation it cannot retry
+/// (the row this delete was keyed on no longer exists) while every OTHER
+/// node still carries the topic.
 pub fn bus_topic_delete(pool: &DbPool, instance_id: &str, org_id: &str, name: &str) -> Result<()> {
     let conn = acquire(pool)?;
     let row: Option<DbBusTopic> = conn
@@ -30573,7 +30846,14 @@ pub fn bus_topic_delete(pool: &DbPool, instance_id: &str, org_id: &str, name: &s
         rusqlite::params![instance_id, org_id, name],
     )?;
     drop(conn);
-    let _ = publish_bus_topic_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)?;
+    if let Err(e) =
+        publish_bus_topic_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)
+    {
+        tracing::warn!(
+            instance_id, org_id, topic = name, error = %e,
+            "bus_topic_delete: capture publish failed; already deleted locally"
+        );
+    }
     Ok(())
 }
 
@@ -33032,7 +33312,7 @@ mod bus_repository_tests {
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                match crate::sync::runtime::init(db.clone(), security.clone(), cipher.clone()) {
+                match crate::sync::runtime::init(db.clone(), security.clone()) {
                     Ok(_) => break,
                     Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
                         if std::time::Instant::now() < deadline =>
@@ -33137,8 +33417,7 @@ mod bus_repository_tests {
             "bus_assignment_upsert must not itself mint a capture"
         );
 
-        let emitted =
-            reseed_core_state_from_current_rows(&author).expect("reseed must not hang");
+        let emitted = reseed_core_state_from_current_rows(&author).expect("reseed must not hang");
         assert!(
             emitted >= 2,
             "reseed must publish both the topic and the assignment"

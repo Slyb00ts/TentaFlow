@@ -15,13 +15,14 @@
 // (plan-app-platform §7 W4: `<instance data dir>/log/`, one per
 // `BusInstanceId`, via the addon platform's per-instance storage — there is
 // no process-wide `paths::StorageCategory` for the bus anymore, unlike M1).
-// This module deliberately does not depend on `paths` directly. `bus::init`/
-// `bus::global()` remain a thin single-instance compatibility shim over
-// `init_instance`/`instance` (this module's doc right above their
-// definitions) for the handful of callers not yet threaded onto the
-// registry; real per-instance wiring (choosing where in the startup
-// sequence, resolving `bus_dir`, wiring `BusAuthorizer` to the permission
-// matrix) is `bus::native`'s job.
+// This module deliberately does not depend on `paths` directly. There is no
+// `bus::global()` singleton anymore (deleted in W8, once its last production
+// caller was threaded onto the per-instance registry); `bus::init` is a thin
+// wrapper that just delegates to `init_instance` (this module's doc right
+// above its definition), and every caller resolves a specific engine by
+// `BusInstanceId` through `instance`/`running_instances`. Real per-instance
+// wiring (choosing where in the startup sequence, resolving `bus_dir`,
+// wiring `BusAuthorizer` to the permission matrix) is `bus::native`'s job.
 //
 // COORDINATION (tor P/D, RBAC + dispatch): authorization is a trait
 // (`BusAuthorizer`) injected at `init()`, never implemented here — this
@@ -44,13 +45,17 @@
 //
 // GDPR/RODO org purge: `BusService::purge_org` hard-deletes
 // everything this module holds for an org (topic/group rows, fjall offset
-// and producer-sequence keys, the on-disk directory). `services::org::repo::
-// delete_organization` is a SOFT delete and does NOT call this — it must
-// not, since a soft-deleted org may still need its data for the retention
-// window a compliance policy grants it. Whatever hard-delete/compliance-
-// erasure flow eventually gets built (there is none in this repo yet) is
-// the caller responsible for invoking `purge_org` once an org's erasure
-// becomes irreversible.
+// and producer-sequence keys, the on-disk directory). SUM/tentabus/
+// DECYZJE-2026-09-22.md, `C2-purge-org-no-caller`: `services::org::repo::
+// delete_organization`'s row flip (`status = 'deleted'`) is the ONLY place
+// an org's deletion becomes irreversible in this codebase today — no
+// separate two-step hard-delete/compliance-erasure flow exists — so that
+// function now calls `purge_org` for every `running_instances()` entry
+// right after the flip commits, aggregating per-instance failures into one
+// `OrgError::BusPurgeFailed` and auditing every outcome
+// (`bus.org.purge`/`bus.org.purge_failed`) rather than leaving a failed
+// purge silent. See `services::org::repo::purge_bus_data_for_org`'s doc for
+// the retry story.
 //
 // PARTITION HANDLE LIFETIME (M1): `open_consumer` opens and keeps a full
 // `Partition` (writer thread + directory flock included, not a read-only
@@ -110,6 +115,8 @@ use dashmap::DashMap;
 use tentaflow_protocol::environment::NodeEnvironment;
 
 use crate::db::DbPool;
+use crate::flow_engine::envelope::FlowValue;
+use crate::flow_engine::expr;
 use instance::BusInstanceId;
 
 /// plan-app-platform §7 W4 finding 3: `bus::init`/`bus::global` are a
@@ -724,6 +731,14 @@ pub enum BusServiceError {
         "payload of {len} bytes exceeds max_inline_bytes ({max_inline_bytes}); use a BlobRef (PLAN §2.4) instead"
     )]
     PayloadTooLarge { len: usize, max_inline_bytes: usize },
+    /// A topic's `idempotency_key` CEL expression did not produce a usable
+    /// dedup key for a given record — `compute_idempotency_dedup_key`'s
+    /// doc lists every case that lands here (evaluation failure, or a
+    /// non-scalar/null result), which since `idempotency-key-cel` is no
+    /// longer only "the record carried no routing key" (the old M1
+    /// placeholder's one failure mode, which the error text still
+    /// describes as the common case: `idempotency_key = "key"` reproduces
+    /// exactly that placeholder behaviour).
     #[error("topic '{topic}' requires a record key for idempotency-key dedup")]
     DedupKeyRequired { topic: String },
     #[error("producer epoch fenced: current epoch is {current_epoch}")]
@@ -982,6 +997,15 @@ pub struct BusCallContext {
     pub correlation_id: Option<String>,
     pub origin: String,
 }
+
+/// The `origin` value `addon::host_functions::bus::call_context` stamps on
+/// every `BusCallContext` it builds — the SOLE entry point through which an
+/// addon's wasm code reaches `BusService`. `field_policies::resolve`'s
+/// `ActorKind::from_origin` is the only reader: it is how a field policy
+/// (`FP-subject-type`, SUM/tentabus/DECYZJE-2026-09-22.md) tells an addon
+/// actor apart from a human/service user actor, since `BusCallContext.actor`
+/// itself carries no type tag either way.
+pub const ADDON_ORIGIN: &str = "addon";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusAction {
@@ -1366,6 +1390,92 @@ pub struct PublishBatch {
     pub records: Vec<PublishRecord>,
 }
 
+/// Evaluates a topic's `idempotency_key` CEL expression (PLAN §3.1 layer 2,
+/// `idempotency-key-cel`, SUM/tentabus/DECYZJE-2026-09-22.md) against one
+/// record, returning the canonical dedup-key bytes fed into
+/// `dedup::MmapDedupStore`. This is the real integration the placeholder
+/// `publish` code used to substitute `r.key` bytes for (see the removed
+/// SCOPE NOTE this replaces) — `topics::reject_idempotency_key` only
+/// validates the expression's CEL SYNTAX at bind time; every runtime
+/// outcome (a field the expression references being absent from a given
+/// record, a non-scalar result) is necessarily decided per record, here.
+///
+/// Scope: `payload` is the record body, bound as `FlowValue::Json` when it
+/// parses as JSON (so `payload.patient_id` addresses a field directly) or
+/// as `FlowValue::Text` otherwise (lossy UTF-8) — the expression still has
+/// something to evaluate against rather than failing before it even runs.
+/// `key` (the record's own routing key as a UTF-8 string, or CEL `null`
+/// when absent) and `headers` (a map of header name to UTF-8 value) are
+/// bound alongside it as top-level extras — an operator who already
+/// partitions by a routing key can write `idempotency_key = "key"` and get
+/// the OLD M1 placeholder behaviour back, now for real instead of by
+/// accident (see `bus/mod.rs`'s dedup tests, which do exactly this).
+///
+/// The computed value must be a JSON string or number to be usable as a key
+/// — `null`, `bool`, an object, an array, or an evaluation failure (an
+/// undeclared reference, a type error, a timeout) all report
+/// `BusServiceError::DedupKeyRequired`: none of those give this record a
+/// usable identity for dedup, the same outcome a genuinely keyless record
+/// produced under the old placeholder. Bool is refused deliberately, not
+/// merely unsupported — see the `match` below for why.
+fn compute_idempotency_dedup_key(
+    expr_text: &str,
+    r: &PublishRecord,
+    topic: &str,
+) -> Result<Bytes, BusServiceError> {
+    let payload_value = serde_json::from_slice::<serde_json::Value>(&r.payload)
+        .map(FlowValue::Json)
+        .unwrap_or_else(|_| FlowValue::Text(String::from_utf8_lossy(&r.payload).into_owned()));
+    let key_extra = match &r.key {
+        Some(k) => serde_json::Value::String(String::from_utf8_lossy(k).into_owned()),
+        None => serde_json::Value::Null,
+    };
+    let headers_extra = serde_json::Value::Object(
+        r.headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    serde_json::Value::String(String::from_utf8_lossy(v).into_owned()),
+                )
+            })
+            .collect(),
+    );
+    let vars = std::collections::BTreeMap::new();
+    let artifacts = std::collections::HashMap::new();
+    let meta = std::collections::BTreeMap::new();
+    let extras: [(&str, serde_json::Value); 2] = [("key", key_extra), ("headers", headers_extra)];
+    let scope = expr::ExprScope {
+        vars: &vars,
+        payload: &payload_value,
+        artifacts: &artifacts,
+        meta: &meta,
+        extras: &extras,
+    };
+    let dedup_key_required = || BusServiceError::DedupKeyRequired {
+        topic: topic.to_string(),
+    };
+    let result = expr::evaluate(expr_text, &scope, None).map_err(|_| dedup_key_required())?;
+    match result {
+        serde_json::Value::String(s) => Ok(Bytes::from(s.into_bytes())),
+        serde_json::Value::Number(n) => Ok(Bytes::from(n.to_string().into_bytes())),
+        // Bool is deliberately NOT accepted as a dedup key, even though it is
+        // representable. `cel` 0.13's `Expr::Select` (`objects.rs`) has a
+        // quirk: field selection on anything that is not itself a CEL map
+        // silently evaluates to the bool `false` instead of a type error
+        // (`_ => Ok(bool(false))` — there is no runtime "no such field"
+        // failure to catch). So `payload.order_id` against a non-JSON/non-
+        // object payload does not error here, it silently becomes `false` —
+        // and every OTHER malformed record would collide on that same
+        // key, deduplicating structurally unrelated records into one.
+        // Refusing Bool entirely turns that quirk back into the loud
+        // `DedupKeyRequired` failure this feature needs instead of a silent
+        // false positive; a boolean is not a meaningful per-record identity
+        // anyway.
+        _ => Err(dedup_key_required()),
+    }
+}
+
 /// Per-partition outcome of a `publish` call — one entry per distinct
 /// partition that any record in the batch landed on or replayed against
 /// (partitioning is per record, not per whole batch, so a single `publish` call can touch more than one partition).
@@ -1520,13 +1630,14 @@ pub const PEEK_MAX_BYTES: usize = 1024 * 1024;
 // `ReplicationCoordinator` instead of depending on `bus::replication`
 // directly, breaking the `bus` <-> `bus::replication` cycle and letting
 // this crate test `BusService` with a stub coordinator. `set_replication`
-// is never called by anything in this build yet — every method below is
-// signature-only scaffolding for wave 1/2 (agents RL/RF/EL wire the real
-// `ReplicationManager`; agent S wires `preflight`/`await_acks`/`role` into
-// `publish`/`open_consumer`/`fetch`/`commit`). Until `set_replication` is
-// wired up, `BusService::replication` stays `None` and every existing
-// `publish`/`fetch`/`commit` call path is completely unaffected — that is
-// the "no behaviour change" requirement this wave's tests enforce.
+// is called in production by `bus::replication::init` (once a real
+// `ReplicationManager` has been built for the instance), and by
+// `dispatch::environment`'s `SetKind`/`SetStrictIsolation` handlers, which
+// read it back through the public `replication()` getter below to evict a
+// node from its replica sets on an environment change. `BusService::
+// replication` stays `None` — a no-op for every `ReplicationCoordinator`
+// call site — for any instance that never had replication wired up (RF=1,
+// no mesh), matching the original "no behaviour change" M1 baseline.
 
 /// A partition's role as this node's `ReplicationCoordinator` currently
 /// sees it (PLAN-M2 §1e). `role()` is queried by `publish`/`open_consumer`/
@@ -3375,27 +3486,37 @@ impl BusService {
     /// from existing partition assignments, so a fresh org's empty registry
     /// can never contain an `is_local` entry to find — every `create_topic`
     /// call silently proposed zero assignments, forever, because the
-    /// registry could never bootstrap its own first row. `same_env` still
-    /// comes from the snapshot (a real, lesser limitation: the very first
-    /// topic in a brand-new multi-node cluster still can't discover OTHER
-    /// peers this way and settles for RF=1 on this node alone — but unlike
-    /// the identity check, this self-corrects, since every topic after that
-    /// first one sees the growing registry).
+    /// registry could never bootstrap its own first row.
     ///
-    /// Closing that gap needs a registry of the nodes that actually run
-    /// THIS bus instance, together with a liveness signal for them. The
-    /// mesh trust table (`trusted_nodes`, db/migrations.rs) is NOT that
-    /// registry and must not be substituted for it: it records platform-wide
-    /// pairing with no instance column, no org column and no liveness, so a
-    /// paired node that never runs this bus instance would be written into
-    /// `PartitionAssignment.replicas`. `election::min_isr_required(rf)` =
-    /// `floor(rf/2)+1` is computed from the replica set, so that seat raises
-    /// the write quorum permanently and every publish is refused with
-    /// `NotEnoughReplicas` — a worse outcome than the RF=1 placement above.
-    /// The snapshot cannot supply the missing liveness either:
-    /// `ReplicationManager::snapshot` stamps `reachable: true` and
-    /// `environment: self.local_env` on every node it builds, so the filter
-    /// below really means "holds an assignment for this org", live or not.
+    /// `same_env` normally comes from the snapshot too, but that has the
+    /// same bootstrap problem ONE level up: a brand-new org/environment (or
+    /// this node's very first topic) has no assignment yet for the snapshot
+    /// to derive ANY peer from, so `same_env` used to come back empty and
+    /// every topic settled for RF=1-on-this-node until a second node
+    /// happened to receive an assignment some other way. `C11-first-topic-
+    /// peer-discovery` (SUM/tentabus/OTWARTE-POZYCJE.md): when the snapshot
+    /// yields nothing, fall back to the mesh TRUST registry
+    /// (`db::repository::list_trusted_nodes`, ROADMAP Z12's per-peer
+    /// `environment` column) for same-environment candidates instead. This
+    /// is deliberately a FALLBACK, not a merge: once the registry has real
+    /// assignments to report, the snapshot's actual `reachable` signal is
+    /// strictly better than trust-pairing's "was reachable at handshake
+    /// time" and takes over again on its own (the self-correcting half of
+    /// this doc's previous note still holds).
+    ///
+    /// Residual, accepted limitation: a trusted peer is not necessarily
+    /// running THIS TentaBus instance (`trusted_nodes` has no instance
+    /// column — platform-wide pairing, not per-app membership) or even
+    /// online right now (pairing-time liveness, not current). Padding
+    /// `replicas`/`isr` with such a node would normally be a problem
+    /// (`election::min_isr_required(rf) = floor(rf/2)+1` computed from the
+    /// replica set, permanently raising the write quorum), but
+    /// `propose_partition_assignments`'s existing best-effort handling
+    /// already covers it: a partition whose peer never actually accepts the
+    /// proposal just stays usable at RF=1 for that partition (its own doc,
+    /// unchanged by this fix) rather than failing topic creation — the same
+    /// degraded-but-working outcome this function already produced for
+    /// every topic before the FIRST one, now extended to the first one too.
     fn resolve_topic_placement(
         &self,
         org_id: &str,
@@ -3410,6 +3531,28 @@ impl BusService {
             .filter(|n| n.environment == env && n.reachable && n.node_id != local_node_id)
             .map(|n| n.node_id.clone())
             .collect();
+        if same_env.is_empty() {
+            same_env = crate::db::repository::list_trusted_nodes(&self.db)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        org_id, error = %e,
+                        "resolve_topic_placement: list_trusted_nodes failed, \
+                         settling for RF=1 on this node"
+                    );
+                    Vec::new()
+                })
+                .into_iter()
+                .filter(|n| n.is_active && n.node_id != local_node_id)
+                .filter(|n| {
+                    n.environment
+                        .as_deref()
+                        .and_then(NodeEnvironment::parse)
+                        .unwrap_or_default()
+                        == env
+                })
+                .map(|n| n.node_id)
+                .collect();
+        }
         same_env.sort();
         Some(TopicPlacement {
             local_node_id,
@@ -4062,6 +4205,7 @@ impl BusService {
             &ctx.org_id,
             topic,
             ctx.actor.as_deref().unwrap_or(""),
+            field_policies::ActorKind::from_origin(&ctx.origin),
             field_policies::Direction::Write,
         )? {
             let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
@@ -4241,14 +4385,25 @@ impl BusService {
             }
         }
 
-        // Dedup key presence is validated for the WHOLE batch up front
-        // (before any engine append) rather than lazily per partition
-        // group below — a batch that fans out across partitions must not
-        // partially land before failing on a later record.
-        if cfg.idempotency_key.is_some() && batch.records.iter().any(|r| r.key.is_none()) {
-            return Err(BusServiceError::DedupKeyRequired {
-                topic: topic.to_string(),
-            });
+        // The dedup key is computed by evaluating `cfg.idempotency_key`'s
+        // CEL expression per record (`compute_idempotency_dedup_key`) — a
+        // per-record RUNTIME outcome (an absent field, a non-scalar
+        // result), not something the WHOLE batch can fail on together the
+        // way "every record carries a key" used to. Validated here up
+        // front anyway (before any engine append) rather than lazily per
+        // partition group below, for the same reason the old presence
+        // check ran here: a batch that fans out across partitions must not
+        // partially land before failing on a later record. The computed
+        // key itself is intentionally NOT kept from this pass — it is
+        // cheap to recompute (the CEL program is compiled once and cached
+        // by `flow_engine::expr`, so this only re-runs the interpreter, not
+        // the parser) and keeping it would require threading a second
+        // value through every downstream per-partition-group structure
+        // below for a feature that is opt-in per topic.
+        if let Some(expr_text) = &cfg.idempotency_key {
+            for r in &batch.records {
+                compute_idempotency_dedup_key(expr_text, r, topic)?;
+            }
         }
 
         // Per-record partitioning: group records by
@@ -4417,12 +4572,14 @@ impl BusService {
             }
 
             // Layer 2: per-record idempotency-key dedup (PLAN §3.1,
-            // `dedup.rs` plan B). SCOPE NOTE: evaluating the topic's
-            // `idempotency_key` CEL expression against a record body is
-            // `flow_engine/expr.rs` integration work outside this file's
-            // ownership (`create_topic`/`update_topic` reject the field
-            // until that lands, see `topics.rs`) — this uses each record's
-            // `key` bytes directly as a placeholder dedup input.
+            // `dedup.rs` plan B). The dedup key is `cfg.idempotency_key`'s
+            // CEL expression evaluated against each record
+            // (`compute_idempotency_dedup_key`, `idempotency-key-cel`) —
+            // already validated to succeed for every record in this batch
+            // by the up-front pass above, so a miss here would mean that
+            // pass and this one disagree, which is exactly the kind of
+            // violated invariant that should fail the request rather than
+            // panic the whole process via `.expect`.
             //
             // TWO-PHASE: `contains` only PROBES the persistent
             // store; nothing is written here. A matching key is filtered
@@ -4436,21 +4593,18 @@ impl BusService {
             let mut pending_keys: Vec<Bytes> = Vec::new();
             let records = if let Some(store) = &dedup_handle {
                 let now = now_ms();
+                // `dedup_handle` is only ever `Some` when `cfg.idempotency_key`
+                // is, so this always has an expression to evaluate.
+                let expr_text = cfg
+                    .idempotency_key
+                    .as_deref()
+                    .expect("dedup_handle implies cfg.idempotency_key is set");
                 let mut kept = Vec::with_capacity(records.len());
                 for r in records {
-                    // Presence was validated for the whole batch above, so
-                    // this is not expected to ever miss — but a violated
-                    // invariant on this hot path should fail the request,
-                    // not panic the whole process via `.expect`.
-                    let key = match r.key.clone() {
-                        Some(k) => k,
-                        None => {
-                            return Err(wrap_err(
-                                &acks,
-                                BusServiceError::DedupKeyRequired {
-                                    topic: topic.to_string(),
-                                },
-                            ));
+                    let key = match compute_idempotency_dedup_key(expr_text, &r, topic) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            return Err(wrap_err(&acks, e));
                         }
                     };
                     if seen_this_call.contains(&key) || store.contains(&key, now) {
@@ -5146,6 +5300,7 @@ impl BusService {
                 &ctx.org_id,
                 topic,
                 ctx.actor.as_deref().unwrap_or(""),
+                field_policies::ActorKind::from_origin(&ctx.origin),
                 field_policies::Direction::Read,
             )? {
                 let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
@@ -5868,9 +6023,9 @@ impl BusService {
     /// by a hard-delete/compliance-erasure flow that already runs with full
     /// system privileges, not by a per-request caller.
     ///
-    /// NOT wired to `services::org::repo::delete_organization` — that is a
-    /// SOFT delete (a purge would be the wrong thing to trigger from it).
-    /// See this file's module doc for who must call this instead.
+    /// Called by `services::org::repo::delete_organization` for every
+    /// `running_instances()` entry right after its `status = 'deleted'`
+    /// flip commits (`C2-purge-org-no-caller`) — see this file's module doc.
     ///
     /// Best-effort on the on-disk removal (`dir_removed = false` if the
     /// directory did not exist or could not be removed) — the DB rows and
@@ -6498,6 +6653,7 @@ impl ConsumerHandle {
                                 &self.org_id,
                                 &rec.topic,
                                 self.ctx.actor.as_deref().unwrap_or(""),
+                                field_policies::ActorKind::from_origin(&self.ctx.origin),
                                 field_policies::Direction::Read,
                             )?;
                             let resolved = match resolved {
@@ -6731,20 +6887,17 @@ impl ConsumerHandle {
     }
 }
 
-// ---- Process-global singleton + free-function API (PLAN §6.1) -----------
+// ---- Per-instance registry + free-function API (PLAN §6.1) --------------
 //
-// plan-app-platform §7 W4: `init`/`global` predate the per-instance
-// `BUS_INSTANCES` registry above (`init_instance`/`instance`/`stop_instance`/
-// `running_instances`) and are now a thin, deliberately-kept compatibility
-// shim over it — `init` registers its instance in the SAME registry
-// `init_instance` uses (so `running_instances()` sees it too), `global` just
-// resolves whichever single instance this shim last set. Every new caller
-// should resolve a specific `BusInstanceId` through the registry instead;
-// this shim exists only because `dispatch::bus`, `addon::host_functions::
-// bus`, `api::bus_rest`, the flow-engine bus nodes and `services::
-// metrics_export` (W7/W8 scope) still call `bus::global()`/`bus::init()`
-// directly and rewiring all of them to resolve a per-request instance id is
-// out of W4's file list.
+// plan-app-platform §7 W4 introduced the per-instance `BUS_INSTANCES`
+// registry (`init_instance`/`instance`/`stop_instance`/`running_instances`,
+// above); W8 finished the migration by deleting the single-instance
+// `bus::global()` shim once its last production caller (`dispatch::bus`,
+// `addon::host_functions::bus`, `api::bus_rest`, the flow-engine bus nodes
+// and `services::metrics_export`) was rewired to resolve a specific
+// `BusInstanceId` through the registry instead. `init` is kept only as a
+// thin wrapper around `init_instance` (same registry, same idempotency) —
+// there is no global/singleton resolution left anywhere in this file.
 
 /// plan-app-platform §7 W4 finding 3: delegates straight to `init_instance`,
 /// which is ALREADY idempotent per `cfg.instance_id` (early-returns the
@@ -7675,7 +7828,13 @@ mod tests {
              must not charge it for empty/preallocated files"
         );
 
-        let payload = "x".repeat(512);
+        // Incompressible on purpose: topics compress with LZ4 by default
+        // (`topics.rs::from_options`), and 512 identical bytes shrink to ~200
+        // on disk — which would compare the ceiling against the WRONG unit and
+        // say nothing about what the counter charges.
+        let payload: String = (0..512u32)
+            .map(|i| char::from(b'!' + ((i.wrapping_mul(2_654_435_761) >> 24) % 94) as u8))
+            .collect();
         let publish_one = |svc: &BusService| {
             svc.publish(
                 &ctx,
@@ -9293,14 +9452,14 @@ mod tests {
     fn two_phase_dedup_does_not_poison_store_on_failed_append() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
-        topics::create_topic_for_dedup_test(
+        topics::create_topic(
             &svc.db,
             svc.instance_id(),
             &ctx.org_id,
             "labs.dedup.failed-append",
             topics::TopicOptions {
                 partitions: Some(1),
-                idempotency_key: Some("msg.run_id".to_string()),
+                idempotency_key: Some("key".to_string()),
                 ..Default::default()
             },
             NodeEnvironment::Prod,
@@ -9344,10 +9503,10 @@ mod tests {
         assert!(!ok.duplicate);
     }
 
-    // ---- idempotency_key fail-closed, dedup path -------
+    // ---- idempotency_key CEL syntax validation, dedup path -------
 
     #[test]
-    fn create_topic_rejects_idempotency_key() {
+    fn create_topic_rejects_a_malformed_idempotency_key_expression() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         let err = svc
@@ -9355,7 +9514,7 @@ mod tests {
                 &ctx,
                 "orders.idem",
                 topics::TopicOptions {
-                    idempotency_key: Some("msg.run_id".to_string()),
+                    idempotency_key: Some("payload.(((".to_string()),
                     ..Default::default()
                 },
             )
@@ -9364,7 +9523,7 @@ mod tests {
     }
 
     #[test]
-    fn update_topic_rejects_idempotency_key() {
+    fn update_topic_rejects_a_malformed_idempotency_key_expression() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         svc.create_topic(&ctx, "orders.idem2", topics::TopicOptions::default())
@@ -9374,12 +9533,132 @@ mod tests {
                 &ctx,
                 "orders.idem2",
                 topics::TopicOptions {
-                    idempotency_key: Some("msg.run_id".to_string()),
+                    idempotency_key: Some("payload.(((".to_string()),
                     ..Default::default()
                 },
             )
             .unwrap_err();
         assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+    }
+
+    /// `idempotency-key-cel`: a syntactically valid `idempotency_key` is
+    /// now ACCEPTED at both create and update — the real integration this
+    /// replaces the old always-reject placeholder with.
+    #[test]
+    fn create_and_update_topic_accept_a_well_formed_idempotency_key_expression() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let cfg = svc
+            .create_topic(
+                &ctx,
+                "orders.idem3",
+                topics::TopicOptions {
+                    idempotency_key: Some("payload.order_id".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cfg.idempotency_key.as_deref(), Some("payload.order_id"));
+
+        let updated = svc
+            .update_topic(
+                &ctx,
+                "orders.idem3",
+                topics::TopicOptions {
+                    idempotency_key: Some("payload.order_id + '-' + payload.line".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            updated.idempotency_key.as_deref(),
+            Some("payload.order_id + '-' + payload.line")
+        );
+    }
+
+    /// End-to-end proof that the CEL expression, not the record's routing
+    /// `key`, drives dedup identity: two records sharing the same routing
+    /// key but a DIFFERENT `payload.order_id` are both accepted, and a
+    /// retry of the same `order_id` under a DIFFERENT routing key is still
+    /// deduplicated.
+    #[test]
+    fn publish_dedup_key_is_computed_from_the_payload_via_cel_not_from_the_routing_key() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "orders.idem-cel",
+            topics::TopicOptions {
+                partitions: Some(1),
+                idempotency_key: Some("payload.order_id".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let publish_json = |routing_key: &str, order_id: &str| {
+            svc.publish(
+                &ctx,
+                "orders.idem-cel",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: Some(Bytes::from(routing_key.to_string())),
+                        headers: vec![],
+                        payload: Bytes::from(format!(r#"{{"order_id":"{order_id}"}}"#)),
+                        timestamp_ms: now_ms(),
+                        schema_id: 0,
+                    }],
+                },
+            )
+        };
+
+        // Same routing key ("same-routing-key"), two distinct order ids:
+        // both must be accepted — the routing key alone is no longer what
+        // dedup keys on.
+        let r1 = publish_json("same-routing-key", "ord-1").unwrap();
+        assert_eq!(r1.accepted, 1);
+        let r2 = publish_json("same-routing-key", "ord-2").unwrap();
+        assert_eq!(r2.accepted, 1);
+
+        // A different routing key but the SAME order_id: deduplicated.
+        let r3 = publish_json("a-completely-different-routing-key", "ord-1").unwrap();
+        assert_eq!(r3.accepted, 0);
+        assert_eq!(r3.deduplicated, 1);
+    }
+
+    /// A record whose payload is not JSON (or lacks the referenced field)
+    /// evaluates `payload.order_id` to an undeclared-field runtime error —
+    /// reported as `DedupKeyRequired`, the same outcome a genuinely keyless
+    /// record produced under the old placeholder.
+    #[test]
+    fn publish_dedup_key_eval_failure_reports_dedup_key_required() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "orders.idem-cel-bad-payload",
+            topics::TopicOptions {
+                partitions: Some(1),
+                idempotency_key: Some("payload.order_id".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = svc
+            .publish(
+                &ctx,
+                "orders.idem-cel-bad-payload",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record("not-json-so-order_id-is-unreachable")],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::DedupKeyRequired { .. }));
     }
 
     // ---- v143: durability class/explicit surfaced in audit details -----
@@ -9498,14 +9777,14 @@ mod tests {
     fn publish_dedup_layer_requires_key_rejects_duplicate_and_handles_partial_batches() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
-        topics::create_topic_for_dedup_test(
+        topics::create_topic(
             &svc.db,
             svc.instance_id(),
             &ctx.org_id,
             "labs.dedup2",
             topics::TopicOptions {
                 partitions: Some(1),
-                idempotency_key: Some("msg.run_id".to_string()),
+                idempotency_key: Some("key".to_string()),
                 ..Default::default()
             },
             NodeEnvironment::Prod,
@@ -9601,14 +9880,14 @@ mod tests {
         let (_tmp, svc) = test_service();
         let svc = Arc::new(svc);
         let ctx = test_ctx("org-1");
-        topics::create_topic_for_dedup_test(
+        topics::create_topic(
             &svc.db,
             svc.instance_id(),
             &ctx.org_id,
             "labs.dedup.same-key-race",
             topics::TopicOptions {
                 partitions: Some(1),
-                idempotency_key: Some("msg.run_id".to_string()),
+                idempotency_key: Some("key".to_string()),
                 ..Default::default()
             },
             NodeEnvironment::Prod,
@@ -9690,14 +9969,14 @@ mod tests {
         let low = make_svc(10);
         let high = make_svc(100);
         for svc in [&low, &high] {
-            topics::create_topic_for_dedup_test(
+            topics::create_topic(
                 &svc.db,
                 svc.instance_id(),
                 &ctx.org_id,
                 "labs.dedup.rate",
                 topics::TopicOptions {
                     partitions: Some(1),
-                    idempotency_key: Some("msg.run_id".to_string()),
+                    idempotency_key: Some("key".to_string()),
                     ..Default::default()
                 },
                 NodeEnvironment::Prod,
@@ -9880,14 +10159,14 @@ mod tests {
         let (_tmp, svc) = test_service();
         let svc = Arc::new(svc);
         let ctx = test_ctx("org-1");
-        topics::create_topic_for_dedup_test(
+        topics::create_topic(
             &svc.db,
             svc.instance_id(),
             &ctx.org_id,
             "labs.dedup.race-open",
             topics::TopicOptions {
                 partitions: Some(1),
-                idempotency_key: Some("msg.run_id".to_string()),
+                idempotency_key: Some("key".to_string()),
                 ..Default::default()
             },
             NodeEnvironment::Prod,
@@ -11427,6 +11706,7 @@ mod tests {
             "org-a",
             "orders.created",
             "anyone",
+            field_policies::ActorKind::User,
             field_policies::Direction::Read,
         )
         .unwrap()
@@ -11446,6 +11726,7 @@ mod tests {
                 "org-b",
                 "orders.created",
                 "anyone",
+                field_policies::ActorKind::User,
                 field_policies::Direction::Read,
             )
             .unwrap()
@@ -12848,7 +13129,7 @@ mod tests {
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                match crate::sync::runtime::init(db.clone(), security.clone(), cipher.clone()) {
+                match crate::sync::runtime::init(db.clone(), security.clone()) {
                     Ok(_) => break,
                     Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
                         if std::time::Instant::now() < deadline =>
@@ -13228,6 +13509,123 @@ mod tests {
             cfg.replication_factor, 3,
             "min(3, healthy same-env nodes) = min(3, 3 incl. local)"
         );
+    }
+
+    /// SUM/tentabus/OTWARTE-POZYCJE.md, `C11-first-topic-peer-discovery`: a
+    /// brand-new org/environment has no partition assignment yet for
+    /// `snapshot(org, None).nodes` to derive ANY peer from (a fresh
+    /// `FakeCoordinator` starts with `ReplicationSnapshot::default()`, i.e.
+    /// `nodes: vec![]`) — `resolve_topic_placement` must fall back to the
+    /// mesh trust registry instead of settling for `same_env: []` forever.
+    #[test]
+    fn resolve_topic_placement_falls_back_to_trusted_nodes_when_snapshot_is_empty() {
+        let (_tmp, svc) = test_service();
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("local-node");
+        svc.set_replication(coord);
+
+        crate::db::repository::add_trusted_node(
+            &svc.db,
+            "peer-prod",
+            "pk-prod",
+            "host-a",
+            "admin",
+            None,
+        )
+        .unwrap();
+        crate::db::repository::set_trusted_node_environment(
+            &svc.db,
+            "peer-prod",
+            NodeEnvironment::Prod,
+        )
+        .unwrap();
+        // Wrong environment: must not be offered as a Prod candidate.
+        crate::db::repository::add_trusted_node(
+            &svc.db, "peer-dev", "pk-dev", "host-b", "admin", None,
+        )
+        .unwrap();
+        crate::db::repository::set_trusted_node_environment(
+            &svc.db,
+            "peer-dev",
+            NodeEnvironment::Dev,
+        )
+        .unwrap();
+        // The local node itself, paired under its own id: must never appear
+        // in its own `same_env` candidate list.
+        crate::db::repository::add_trusted_node(
+            &svc.db,
+            "local-node",
+            "pk-local",
+            "host-c",
+            "admin",
+            None,
+        )
+        .unwrap();
+        crate::db::repository::set_trusted_node_environment(
+            &svc.db,
+            "local-node",
+            NodeEnvironment::Prod,
+        )
+        .unwrap();
+
+        let placement = svc
+            .resolve_topic_placement("org-1", NodeEnvironment::Prod)
+            .expect("coordinator is installed, so placement must resolve");
+        assert_eq!(placement.local_node_id, "local-node");
+        assert_eq!(
+            placement.same_env,
+            vec!["peer-prod".to_string()],
+            "must source the same-environment candidate from the trust registry, \
+             excluding the wrong-environment peer and the local node itself"
+        );
+    }
+
+    /// Once the snapshot itself reports at least one same-environment peer,
+    /// the trust-registry fallback must NOT also contribute — the snapshot's
+    /// `reachable` signal is authoritative once it exists at all (this
+    /// function's own doc).
+    #[test]
+    fn resolve_topic_placement_prefers_snapshot_over_trusted_nodes_once_populated() {
+        let (_tmp, svc) = test_service();
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("local-node");
+        coord.set_snapshot(ReplicationSnapshot {
+            nodes: vec![ReplicaNodeInfo {
+                node_id: "node-from-snapshot".to_string(),
+                label: "snap".to_string(),
+                environment: NodeEnvironment::Prod,
+                is_local: false,
+                reachable: true,
+                last_heartbeat_ms_ago: Some(50),
+                leader_count: 0,
+                follower_count: 0,
+                isr_count: 0,
+            }],
+            partitions: vec![],
+            failovers: vec![],
+        });
+        svc.set_replication(coord);
+
+        crate::db::repository::add_trusted_node(
+            &svc.db,
+            "peer-prod",
+            "pk-prod",
+            "host-a",
+            "admin",
+            None,
+        )
+        .unwrap();
+        crate::db::repository::set_trusted_node_environment(
+            &svc.db,
+            "peer-prod",
+            NodeEnvironment::Prod,
+        )
+        .unwrap();
+
+        let placement = svc
+            .resolve_topic_placement("org-1", NodeEnvironment::Prod)
+            .expect("placement");
+        assert_eq!(placement.same_env, vec!["node-from-snapshot".to_string()]);
     }
 
     /// P9: create RF=1 (no coordinator, M1 path) stays fast — a loose ×3
@@ -14812,7 +15210,7 @@ mod tests {
     fn update_topic_allows_a_content_type_change_with_an_unresolved_legacy_schema_id() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
-        topics::create_topic_for_dedup_test(
+        topics::create_topic_bypassing_guards(
             &svc.db,
             svc.instance_id(),
             "org-1",
@@ -14845,10 +15243,10 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         // Bypasses the F3 binding guard entirely, same shape a pre-F3 row
-        // has: `create_topic_for_dedup_test` builds/persists a `TopicConfig`
+        // has: `create_topic_bypassing_guards` builds/persists a `TopicConfig`
         // directly, without going through `topics::create_topic`'s guard
         // call.
-        topics::create_topic_for_dedup_test(
+        topics::create_topic_bypassing_guards(
             &svc.db,
             svc.instance_id(),
             "org-1",
@@ -14897,7 +15295,7 @@ mod tests {
     fn update_topic_rejects_turning_on_validation_for_an_unregistered_legacy_schema_id() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
-        topics::create_topic_for_dedup_test(
+        topics::create_topic_bypassing_guards(
             &svc.db,
             svc.instance_id(),
             "org-1",

@@ -1249,8 +1249,6 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResOauthStart(_) => "ServiceOauthStartResponse",
             tentaflow_protocol::ServicePayload::ReqOauthPoll(_) => "ServiceOauthPollRequest",
             tentaflow_protocol::ServicePayload::ResOauthPoll(_) => "ServiceOauthPollResponse",
-            tentaflow_protocol::ServicePayload::ReqAgent(_) => "ServiceAgentRequest",
-            tentaflow_protocol::ServicePayload::ResAgent(_) => "ServiceAgentResponse",
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {
@@ -3378,11 +3376,7 @@ mod tests {
             // `dispatch/environment.rs`'s and `resolver.rs`'s init fixtures).
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                match crate::sync::runtime::init(
-                    security.db.clone(),
-                    security.clone(),
-                    cipher.clone(),
-                ) {
+                match crate::sync::runtime::init(security.db.clone(), security.clone()) {
                     Ok(_) => break,
                     Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
                         if std::time::Instant::now() < deadline =>
@@ -3749,6 +3743,54 @@ mod tests {
         match w_update_no_admin.0 {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
             other => panic!("expected PolicyDenied, got {:?}", other),
+        }
+    }
+
+    /// A managed-CLI coding agent (codex/claude-code/grok-build/muse-code) is
+    /// never a `services` row any more — it runs through a provider account
+    /// and an on-demand bridge instead. `service_manifest_deploy` must refuse
+    /// it BEFORE resolving a `DeployMethod`, with a message pointing at the
+    /// "Konta agentów" screen, so the wizard can never create a services row
+    /// for it.
+    #[tokio::test]
+    async fn service_manifest_deploy_refuses_a_managed_cli_agent() {
+        let user_bytes = *uuid::Uuid::nil().as_bytes();
+        let ctx_admin = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: user_bytes,
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 200,
+            connection_id: 0,
+            resume_secret: None,
+            origin: crate::dispatch::RequestOrigin::Local,
+            state: authenticated_test_state(),
+            org_context: None,
+        };
+
+        let resp = dispatch(
+            &MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqStart(
+                tentaflow_protocol::ServiceManifestDeployRequest {
+                    engine_id: "codex".to_string(),
+                    deploy_method: "native".to_string(),
+                    node_id: "test-node".to_string(),
+                    config_json: "{}".to_string(),
+                },
+            )),
+            &ctx_admin,
+        )
+        .await;
+        assert!(resp.1, "a managed-CLI agent deploy must be refused, not accepted");
+        match resp.0 {
+            MessageBody::Error(e) => {
+                assert_eq!(e.code, ProtocolErrorCode::BadRequest);
+                assert!(
+                    e.message.contains("Konta agentów"),
+                    "the refusal must point at the agent accounts screen: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected BadRequest, got {:?}", other),
         }
     }
 
@@ -4359,7 +4401,6 @@ mod tests {
             raised_at_ms: crate::agents::interaction_now_ms(),
             engine_id: None,
             account_id: None,
-            candidate_accounts: Vec::new(),
             user_id: None,
         });
 
