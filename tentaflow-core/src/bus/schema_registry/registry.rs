@@ -133,12 +133,14 @@ pub struct RegisterOutcome {
     pub deduplicated: bool,
 }
 
-/// The version a topic's `schema_id` binding currently resolves to — highest
-/// non-deprecated version of a non-deprecated subject (PLAN-F3 §3).
-/// `resolve_effective` returns `None` for a missing OR deprecated subject OR
-/// one with zero versions (registration failed/raced) — every one of those
-/// is "nothing to validate against" from a publish-time caller's point of
-/// view, so they collapse to the same `Option::None`.
+/// The version a topic's `schema_id` binding currently resolves to — the
+/// subject's latest version (PLAN-F3 §3). Deprecation is only a marker
+/// (owner decision 23.09, "Wycofanie wzoru"): a deprecated subject keeps
+/// validating every topic already bound to it, it just cannot be bound to a
+/// new topic or take a new version. `resolve_effective` returns `None` only
+/// for a missing subject or one with zero versions (registration failed/
+/// raced) — "nothing to validate against", which `publish` turns into a loud
+/// `SchemaNotFound`, never a silent "validation off".
 #[derive(Debug)]
 pub struct EffectiveSchema {
     pub schema_type: SchemaType,
@@ -189,10 +191,8 @@ pub fn list_versions(
     )
 }
 
-/// `version: None` resolves to the latest version regardless of deprecation
-/// (an admin reading a specific/latest version's text is not the same
-/// operation as `resolve_effective`'s publish-time binding resolution, which
-/// DOES fail closed on a deprecated subject).
+/// `version: None` resolves to the latest version, deprecated or not — the
+/// same version `resolve_effective` validates publishes against.
 pub fn get(
     db: &DbPool,
     instance_id: &str,
@@ -668,11 +668,12 @@ pub fn set_compatibility(
 /// Deletes a subject entirely (`version: None`) or exactly one version
 /// (`Some(v)`), or soft-deprecates it (`deprecate_only: true`, which cannot
 /// be combined with a specific `version`). Owner decision 3
-/// (SUM/tentabus/PLAN-F3.md §9.3): ANY of these while a topic in the org
-/// still has `schema_id == subject` is hard-rejected, listing the offending
+/// (SUM/tentabus/PLAN-F3.md §9.3): a hard delete while a topic in the org
+/// still has `schema_id == subject` is rejected, listing the offending
 /// topics — `deprecate_only` is the soft alternative that leaves existing
-/// bindings intact and simply stops new ones (`bus::topics`' binding guard
-/// checks `deprecated_at_ms`).
+/// bindings (and their validation) intact and simply stops new ones
+/// (`bus::topics`' binding guard checks `deprecated_at_ms`, `register`
+/// refuses a new version).
 pub fn delete(
     db: &DbPool,
     instance_id: &str,
@@ -689,11 +690,8 @@ pub fn delete(
     }
 
     if deprecate_only {
-        let versions: Vec<u32> =
-            repository::bus_schema_version_list(db, instance_id, org_id, subject)?
-                .into_iter()
-                .map(|v| v.version)
-                .collect();
+        // A deprecation removes nothing — every version stays stored and the
+        // latest keeps validating — so the "removed" list is empty.
         if row.deprecated_at_ms.is_none() {
             let now = crate::bus::now_ms();
             let updated = DbBusSchemaSubject {
@@ -704,7 +702,7 @@ pub fn delete(
             repository::bus_schema_subject_upsert(db, &updated)?;
             bump_generation();
         }
-        return Ok(versions);
+        return Ok(Vec::new());
     }
 
     // Hard delete only (whole subject or a single version) — the binding
@@ -714,11 +712,9 @@ pub fn delete(
     // blokowane, dopóki topik używa schematu"). Checked here, after the
     // `deprecate_only` branch has already returned, so a bound subject can
     // still be soft-deprecated at any time.
-    let bound_topics: Vec<String> = repository::bus_topic_list(db, instance_id, org_id)?
-        .into_iter()
-        .filter(|t| t.schema_id.as_deref() == Some(subject))
-        .map(|t| t.name)
-        .collect();
+    let bound_topics = topics_by_subject(db, instance_id, org_id)?
+        .remove(subject)
+        .unwrap_or_default();
     if !bound_topics.is_empty() {
         return Err(BusServiceError::InvalidArgument(format!(
             "schema subject '{subject}' is bound by topics: {}",
@@ -751,9 +747,32 @@ pub fn delete(
     }
 }
 
+/// Every subject of the org that at least one topic is bound to, mapped to
+/// those topics' names (sorted) — the set the hard-delete guard refuses on
+/// and `BusSchemaSubjectWire::used_by_topics` reports. One topic-list read
+/// for the whole org, however many subjects the caller then looks up.
+pub fn topics_by_subject(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, BusServiceError> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for topic in repository::bus_topic_list(db, instance_id, org_id)? {
+        if let Some(subject) = topic.schema_id.filter(|s| !s.is_empty()) {
+            out.entry(subject).or_default().push(topic.name);
+        }
+    }
+    for names in out.values_mut() {
+        names.sort();
+    }
+    Ok(out)
+}
+
 /// Publish-time binding resolution (PLAN-F3 §3): the version a topic's
 /// `schema_id == subject` binding currently resolves to. `None` for a
-/// missing, deprecated, or version-less subject.
+/// missing or version-less subject; a deprecated subject still resolves
+/// (see `EffectiveSchema`'s doc).
 pub fn resolve_effective(
     db: &DbPool,
     instance_id: &str,
@@ -763,9 +782,6 @@ pub fn resolve_effective(
     let Some(row) = repository::bus_schema_subject_get(db, instance_id, org_id, subject)? else {
         return Ok(None);
     };
-    if row.deprecated_at_ms.is_some() {
-        return Ok(None);
-    }
     let Some(latest) = repository::bus_schema_version_latest(db, instance_id, org_id, subject)?
     else {
         return Ok(None);
@@ -1073,8 +1089,11 @@ mod tests {
         );
     }
 
+    /// Owner decision 23.09 ("Wycofanie wzoru"): deprecation is a marker
+    /// only — the subject keeps resolving to its latest version, so topics
+    /// bound to it keep validating.
     #[test]
-    fn deprecate_only_then_resolve_effective_is_none() {
+    fn deprecate_only_keeps_resolving_to_the_latest_version() {
         let db = fresh_db();
         register(
             &db,
@@ -1094,12 +1113,11 @@ mod tests {
         );
 
         let removed = delete(&db, "tentabus-00000001", "org-1", "orders", None, true).unwrap();
-        assert_eq!(removed, vec![1]);
-        assert!(
-            resolve_effective(&db, "tentabus-00000001", "org-1", "orders")
-                .unwrap()
-                .is_none()
-        );
+        assert!(removed.is_empty(), "a deprecation removes no version");
+        let effective = resolve_effective(&db, "tentabus-00000001", "org-1", "orders")
+            .unwrap()
+            .expect("a deprecated subject still resolves for validation");
+        assert_eq!(effective.version, 1);
         // Versions themselves must survive a deprecate_only call.
         assert_eq!(
             list_versions(&db, "tentabus-00000001", "org-1", "orders")
@@ -1146,14 +1164,14 @@ mod tests {
 
         let removed = delete(&db, "tentabus-00000001", "org-1", "orders", None, true)
             .expect("deprecate_only must succeed even while orders.events still binds it");
-        assert_eq!(removed, vec![1]);
+        assert!(removed.is_empty(), "a deprecation removes no version");
         assert!(
             resolve_effective(&db, "tentabus-00000001", "org-1", "orders")
                 .unwrap()
-                .is_none(),
-            "a deprecated subject must no longer resolve for validation"
+                .is_some(),
+            "the bound topic keeps validating against the deprecated subject"
         );
-        // The binding itself is untouched — the bound topic keeps reading,
+        // The binding itself is untouched — the bound topic keeps validating,
         // only NEW bindings/versions are refused from here on.
         assert_eq!(
             crate::bus::topics::get_topic(&db, "tentabus-00000001", "org-1", "orders.events")

@@ -22,20 +22,51 @@ use super::instance::BusInstanceId;
 
 /// Schema steps, applied once each by `app_db::run_versioned_migrations`.
 /// Append-only: a change to the content schema is a new step, never an edit.
-const STEPS: &[(i64, &str)] = &[(
-    1,
-    "CREATE TABLE IF NOT EXISTS bus_groups (
-        org_id         TEXT NOT NULL,
-        group_id       TEXT NOT NULL,
-        topic          TEXT NOT NULL,
-        commit_mode    TEXT NOT NULL,
-        paused         INTEGER NOT NULL DEFAULT 0,
-        created_at_ms  INTEGER NOT NULL,
-        updated_at_ms  INTEGER NOT NULL,
-        PRIMARY KEY (org_id, group_id, topic)
-    );
-    CREATE INDEX IF NOT EXISTS idx_bus_groups_org ON bus_groups(org_id);",
-)];
+///
+/// Step 2 — lag/DLQ history (`bus::lag_history`, PLAN-UI B1b): one row per
+/// (group, topic) and one per source topic with a DLQ, per minute, kept 24 h.
+/// Rows are aggregated over partitions (the UI trends a group, never a single
+/// partition), which bounds the table at 1 440 rows per series. It lives here
+/// and not in `tentaflow.db` for the same reason `bus_groups` does: it
+/// describes what THIS node measured for THIS instance, so it must never
+/// reach the Sync Ledger, and it disappears with the instance.
+const STEPS: &[(i64, &str)] = &[
+    (
+        1,
+        "CREATE TABLE IF NOT EXISTS bus_groups (
+            org_id         TEXT NOT NULL,
+            group_id       TEXT NOT NULL,
+            topic          TEXT NOT NULL,
+            commit_mode    TEXT NOT NULL,
+            paused         INTEGER NOT NULL DEFAULT 0,
+            created_at_ms  INTEGER NOT NULL,
+            updated_at_ms  INTEGER NOT NULL,
+            PRIMARY KEY (org_id, group_id, topic)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bus_groups_org ON bus_groups(org_id);",
+    ),
+    (
+        2,
+        "CREATE TABLE IF NOT EXISTS bus_lag_samples (
+            org_id           TEXT NOT NULL,
+            group_id         TEXT NOT NULL,
+            topic            TEXT NOT NULL,
+            sampled_at_ms    INTEGER NOT NULL,
+            lag_total        INTEGER NOT NULL,
+            committed_total  INTEGER NOT NULL,
+            PRIMARY KEY (org_id, group_id, topic, sampled_at_ms)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_bus_lag_samples_at ON bus_lag_samples(sampled_at_ms);
+        CREATE TABLE IF NOT EXISTS bus_dlq_samples (
+            org_id         TEXT NOT NULL,
+            topic          TEXT NOT NULL,
+            sampled_at_ms  INTEGER NOT NULL,
+            dlq_depth      INTEGER NOT NULL,
+            PRIMARY KEY (org_id, topic, sampled_at_ms)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_bus_dlq_samples_at ON bus_dlq_samples(sampled_at_ms);",
+    ),
+];
 
 /// Brings the instance's content database up to date. Idempotent: the
 /// versioned runner skips applied steps, so the install/enable hooks and
@@ -65,6 +96,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(present, 1, "bus_groups must exist in the content database");
+        for table in ["bus_lag_samples", "bus_dlq_samples"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{table} must exist in the content database");
+        }
         let index: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
@@ -92,6 +133,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_column, 0);
+    }
+
+    /// An instance database created before step 2 existed (only step 1
+    /// applied) must pick up the history tables on the next open, keeping
+    /// its `bus_groups` rows.
+    #[test]
+    fn migrate_upgrades_a_step_one_database_without_touching_bus_groups() {
+        let conn = Connection::open_in_memory().unwrap();
+        app_db::run_versioned_migrations(&conn, BusInstanceId::PACKAGE_ID, &STEPS[..1]).unwrap();
+        conn.execute(
+            "INSERT INTO bus_groups \
+             (org_id, group_id, topic, commit_mode, paused, created_at_ms, updated_at_ms) \
+             VALUES ('org-1', 'g1', 'orders', 'explicit', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let history_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name IN ('bus_lag_samples', 'bus_dlq_samples')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_tables, 2);
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bus_groups", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
     }
 
     #[test]

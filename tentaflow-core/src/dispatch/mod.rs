@@ -2416,6 +2416,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Bp::SchemaCompatibilitySetResponse => "BusSchemaCompatibilitySetResponse",
                 Bp::SchemaDeleteRequest { .. } => "BusSchemaDeleteRequest",
                 Bp::SchemaDeleteResponse { .. } => "BusSchemaDeleteResponse",
+                Bp::LagHistoryRequest { .. } => "BusLagHistoryRequest",
+                Bp::LagHistoryResponse { .. } => "BusLagHistoryResponse",
             }
         }
         MessageBody::TentaNasBody(p) => {

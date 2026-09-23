@@ -194,6 +194,16 @@ pub struct BusTopicSummaryWire {
     /// `BusTopicConfigWire::durability_explicit`'s doc.
     #[serde(default)]
     pub durability_explicit: bool,
+    /// The topic's declared payload content type (`BusTopicConfigWire::
+    /// content_type`) — lets the topic list show "HL7 v2 · JSON · XML"
+    /// without a `TopicDetail` round trip per row. Empty on a peer built
+    /// before this field existed.
+    #[serde(default)]
+    pub content_type: String,
+    /// The schema-registry subject this topic is bound to, if any
+    /// (`BusTopicConfigWire::schema_id`).
+    #[serde(default)]
+    pub schema_id: Option<String>,
 }
 
 /// Per-partition size proxy for `TopicDetailResponse` (PLAN §6.2 "per-
@@ -250,6 +260,12 @@ pub struct BusPartitionInfoWire {
     /// separately-tracked one the M06/M03 UI reads instead.
     #[serde(default)]
     pub high_watermark: u64,
+    /// Timestamp of the record at `earliest_offset` — "najstarsza
+    /// wiadomość z …". `None` for an empty partition, for a caller without
+    /// read access to the topic, and on a peer built before this field
+    /// existed.
+    #[serde(default)]
+    pub earliest_timestamp_ms: Option<i64>,
 }
 
 /// One row of `TopicDetailResponse.groups` — a consumer group's summed lag
@@ -276,6 +292,13 @@ pub struct BusGroupSummaryWire {
     pub paused: bool,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Messages waiting for this group on `topic`, summed over every
+    /// partition (`high_watermark - committed_offset`). `None` when this
+    /// node cannot measure it (the caller may not read the topic, or a
+    /// partition is led by another node) and on a peer built before this
+    /// field existed — never a guessed `0`.
+    #[serde(default)]
+    pub lag_total: Option<u64>,
 }
 
 /// One partition's state for `GroupDetailResponse` — `committed_offset` is
@@ -460,6 +483,13 @@ pub struct BusAclEntryWire {
     /// a pre-168 wire payload — decodes to `'*'` via `default_acl_action`.
     #[serde(default = "default_acl_action")]
     pub action: String,
+    /// Display name of the subject (user name, group name, API key name).
+    /// `None` when the id is unknown to this node.
+    #[serde(default)]
+    pub subject_label: Option<String>,
+    /// Member count for a `group` subject; `None` for every other type.
+    #[serde(default)]
+    pub member_count: Option<u32>,
 }
 
 // =============================================================================
@@ -482,6 +512,12 @@ pub struct BusFieldPolicyWire {
     pub required_fields: Vec<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// See `BusAclEntryWire::subject_label`'s doc. `None` for `any`.
+    #[serde(default)]
+    pub subject_label: Option<String>,
+    /// See `BusAclEntryWire::member_count`'s doc.
+    #[serde(default)]
+    pub member_count: Option<u32>,
 }
 
 // =============================================================================
@@ -509,6 +545,16 @@ pub struct BusSchemaSubjectWire {
     pub created_by: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Topics of this org whose `schema_id` names this subject — the same
+    /// set the hard-delete guard refuses on. Empty on a peer built before
+    /// this field existed.
+    #[serde(default)]
+    pub used_by_topics: Vec<String>,
+    /// `created_by` resolved to a display name (a user's name, or an API
+    /// key's name for a REST registration). `None` when the author is
+    /// unknown to this node.
+    #[serde(default)]
+    pub created_by_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -520,6 +566,9 @@ pub struct BusSchemaVersionWire {
     #[serde(default)]
     pub created_by: Option<String>,
     pub created_at_ms: i64,
+    /// See `BusSchemaSubjectWire::created_by_label`'s doc.
+    #[serde(default)]
+    pub created_by_label: Option<String>,
 }
 
 // =============================================================================
@@ -567,9 +616,11 @@ pub struct BusQuotaWire {
 /// so this is always at least one full window old); `total_bytes_on_disk`
 /// sums `BusService::partition_stats` across every partition (SEALED
 /// segments only, see that struct's doc); `total_lag` sums every group
-/// subscribed to this topic; `dlq_depth` is `high_watermark - earliest`
-/// summed across the derived `__dlq.<topic>` topic's partitions (`0` when
-/// that topic does not exist yet, i.e. it has never needed its DLQ).
+/// subscribed to this topic; `dlq_depth` is the records still waiting in
+/// the derived `__dlq.<topic>` topic — `high_watermark - earliest` summed
+/// across its partitions MINUS the records discarded there (`DlqDiscard`),
+/// `0` when that topic does not exist yet (it has never needed its DLQ) or
+/// for a `__dlq.*` row itself.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BusTopicStatsWire {
     pub topic: String,
@@ -578,6 +629,44 @@ pub struct BusTopicStatsWire {
     pub total_bytes_on_disk: u64,
     pub total_lag: u64,
     pub dlq_depth: u64,
+    /// Records that entered `__dlq.<topic>` during the last hour and are
+    /// still waiting there (discarded ones excluded). Arrival time is the
+    /// record's `dlq.last_failed_at_ms`/`dlq.rejected_at_ms` header, not its
+    /// original publish timestamp. `0` on a peer built before this field
+    /// existed.
+    #[serde(default)]
+    pub dlq_last_hour: u64,
+    /// Arrival time of the newest record still waiting in `__dlq.<topic>`.
+    /// `None` when the DLQ is empty or does not exist yet.
+    #[serde(default)]
+    pub dlq_last_at_ms: Option<i64>,
+}
+
+/// One consumer group's state in `BusStatsSnapshotWire.groups` — the lag the
+/// snapshot already measures per group, instead of only its per-topic sum.
+/// `lag_rising_since_ms`/`consume_rate_per_min` come from the persisted
+/// per-minute history (`LagHistoryRequest`), so they need at least two
+/// samples and are `None` before that.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusGroupStatsWire {
+    pub group: String,
+    pub topic: String,
+    /// See `BusGroupSummaryWire::lag_total`'s doc — `None` means not
+    /// measurable on this node, never `0`.
+    #[serde(default)]
+    pub lag_total: Option<u64>,
+    pub paused: bool,
+    /// Start of the current uninterrupted growth of this group's lag (the
+    /// sample the growth started from). `None` when the lag is not growing
+    /// right now, is zero, or fewer than two samples exist.
+    #[serde(default)]
+    pub lag_rising_since_ms: Option<i64>,
+    /// Messages the group acknowledged per minute over the last sampled
+    /// interval (normalized to 60 s). An integer per MINUTE rather than a
+    /// float per second: the wire structs derive `Eq`, and a per-minute
+    /// integer keeps sub-1/s consumers visible.
+    #[serde(default)]
+    pub consume_rate_per_min: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -587,7 +676,7 @@ pub struct BusStatsSnapshotWire {
     pub partition_count_total: u32,
     pub group_count: u32,
     pub paused_group_count: u32,
-    /// Org-wide sum of every non-DLQ topic's `msgs_in_per_sec` (follow-up
+    /// Org-wide sum of every row's `msgs_in_per_sec` in `topics` (follow-up
     /// toru P task 3). `0` on a peer built before this field existed.
     #[serde(default)]
     pub total_msgs_in_per_sec: u32,
@@ -600,17 +689,23 @@ pub struct BusStatsSnapshotWire {
     /// Org-wide sum of `BusTopicStatsWire::total_lag`.
     #[serde(default)]
     pub total_lag: u64,
-    /// Org-wide sum of `BusTopicStatsWire::dlq_depth` — the exact figure
+    /// Org-wide sum of `BusTopicStatsWire::dlq_depth` (discarded records
+    /// excluded) — the exact figure
     /// the M01 DLQ badge previously had to approximate as "number of topics
     /// with a non-empty DLQ" (POSTEP.md's "Tor U" gap).
     #[serde(default)]
     pub total_dlq_depth: u64,
-    /// Per-topic breakdown, non-DLQ topics only (a `__dlq.*` topic's own
-    /// figures are folded into its SOURCE topic's `dlq_depth`, not listed
-    /// again as its own row) — empty on a peer built before this field
-    /// existed.
+    /// Per-topic breakdown, `__dlq.*` topics INCLUDED as their own rows:
+    /// their bytes are real disk usage, so the per-topic column adds up to
+    /// `total_bytes_on_disk`. A DLQ row has `dlq_depth = 0`; its waiting
+    /// records are reported on the SOURCE topic's row (`dlq_depth`,
+    /// `dlq_last_hour`). Empty on a peer built before this field existed.
     #[serde(default)]
     pub topics: Vec<BusTopicStatsWire>,
+    /// Per consumer group (hidden `tf-*` groups excluded, same as
+    /// `GroupList`) — empty on a peer built before this field existed.
+    #[serde(default)]
+    pub groups: Vec<BusGroupStatsWire>,
 }
 
 // =============================================================================
@@ -625,12 +720,45 @@ pub struct BusStatsSnapshotWire {
 /// just an org admin with `bus.admin`). A UI gates a control on whichever of
 /// these actually matches the request it is about to send, rather than
 /// collapsing everything onto `is_site_admin` the way M1's first cut did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BusCapabilitiesWire {
     pub can_read: bool,
     pub can_write: bool,
     pub can_admin: bool,
     pub is_site_admin: bool,
+    /// Replication factor a topic created now without an explicit
+    /// `replication_factor` gets — the SAME resolution `create_topic`
+    /// applies (min(3, healthy same-environment nodes) once replication is
+    /// wired, otherwise 1). `0` on a peer built before this field existed.
+    #[serde(default)]
+    pub default_replication_factor: u32,
+    /// Healthy same-environment nodes that resolution counted, this node
+    /// included. `0` on a peer built before this field existed.
+    #[serde(default)]
+    pub node_count: u32,
+    /// Canonical `content_type` values this server can parse for field
+    /// policies and validation — the topic creator offers exactly these.
+    #[serde(default)]
+    pub content_types: Vec<String>,
+    /// `schema_type` values this server can validate payloads against
+    /// (`SchemaType::has_validator`) — "Dodaj wzór" offers exactly these.
+    #[serde(default)]
+    pub schema_types: Vec<String>,
+    /// Read-side field policy actions this server applies ('hide' today;
+    /// 'mask'/'hash' once implemented).
+    #[serde(default)]
+    pub field_actions: Vec<String>,
+}
+
+/// The calling session's effective rights on ONE topic
+/// (`TopicDetailResponse.access`) — the topic-level ACL resolved by the same
+/// authorizer `publish`/`fetch`/admin calls use, with `can_admin` also
+/// requiring the instance double lock (`bus.admin` + org Admin role).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusTopicAccessWire {
+    pub can_read: bool,
+    pub can_write: bool,
+    pub can_admin: bool,
 }
 
 // =============================================================================
@@ -700,6 +828,50 @@ pub struct BusFailoverEventWire {
     pub to_epoch: u32,
     pub duration_ms: u64,
     pub reason: String,
+    /// Display name of whoever triggered the change — set for a manual
+    /// leader transfer, `None` for an automatic failover and on a peer
+    /// built before this field existed.
+    #[serde(default)]
+    pub actor_label: Option<String>,
+}
+
+// =============================================================================
+// Lag history (B1b) — persisted per-minute samples, 24 h, node-local
+// =============================================================================
+
+/// One per-minute sample of a consumer group's position on one topic.
+/// `committed_total` is the sum of the group's committed offsets over every
+/// partition: the difference between two samples is what the group
+/// acknowledged in between (an offset reset can make it go backwards).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusLagSampleWire {
+    pub at_ms: i64,
+    pub lag_total: u64,
+    pub committed_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusGroupLagSeriesWire {
+    pub group: String,
+    pub topic: String,
+    /// Oldest first.
+    pub samples: Vec<BusLagSampleWire>,
+}
+
+/// One per-minute sample of how many records wait in `__dlq.<topic>`
+/// (discarded ones excluded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusDlqSampleWire {
+    pub at_ms: i64,
+    pub dlq_depth: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusTopicDlqSeriesWire {
+    /// The SOURCE topic, not `__dlq.<topic>`.
+    pub topic: String,
+    /// Oldest first.
+    pub samples: Vec<BusDlqSampleWire>,
 }
 
 // =============================================================================
@@ -757,6 +929,18 @@ pub enum BusPayload {
         topic: BusTopicConfigWire,
         partitions: Vec<BusPartitionInfoWire>,
         groups: Vec<BusGroupLagSummaryWire>,
+        /// The caller's own rights on this topic. Without read access
+        /// `partitions` and `groups` are empty (the config is still
+        /// returned, like in `TopicList`). `None` on a peer built before
+        /// this field existed.
+        #[serde(default)]
+        access: Option<BusTopicAccessWire>,
+        /// Display names of the subjects allowed to administer this topic
+        /// (`admin`/`*` allow rows of its ACL), so a caller WITHOUT admin
+        /// rights can be told who has them. Empty = nobody below the
+        /// instance administrators.
+        #[serde(default)]
+        admin_labels: Vec<String>,
     },
 
     GroupListRequest,
@@ -838,6 +1022,16 @@ pub enum BusPayload {
         /// applied to the derived `__dlq.<source_topic>` topic.
         #[serde(default)]
         partition: Option<u32>,
+        /// `true` pages BACKWARDS from the newest record: each
+        /// `from_offsets` entry is an EXCLUSIVE upper bound (absent = the
+        /// partition's high watermark), records come back newest arrival
+        /// first, and each partition's `next_offset` is the bound for the
+        /// next (older) page. `false` (default, and every peer built before
+        /// this field existed) keeps the oldest-first paging. Combined with
+        /// the scalar `from_offset` the request is rejected
+        /// (`bus.invalid_argument`) — one shared bound would skip records.
+        #[serde(default)]
+        newest_first: bool,
     },
     DlqListResponse {
         result: BusDlqListResultWire,
@@ -1076,7 +1270,40 @@ pub enum BusPayload {
         deprecate_only: bool,
     },
     SchemaDeleteResponse {
+        /// Versions actually deleted — empty for a deprecation, which
+        /// removes nothing (every version stays and keeps validating).
         removed_versions: Vec<u32>,
+        /// `true` when the request was `deprecate_only`: the subject is now
+        /// marked deprecated. `false` on a peer built before this field.
+        #[serde(default)]
+        deprecated: bool,
+    },
+
+    // ===== B1b (PLAN-UI-20260923) — persisted lag / DLQ history. `bus.read`,
+    // series the caller may not consume are left out. =====
+    /// At least one of `topic`/`group` is REQUIRED (`bus.invalid_argument`
+    /// otherwise): a whole-instance answer would carry up to 1 440 samples
+    /// for every group. `since_ms` absent = everything retained (24 h).
+    /// Size bound: at most 64 group series (by group, then topic — see
+    /// `LagHistoryResponse::truncated`) plus the topic's one DLQ series,
+    /// each ≤ 1 440 samples of three integers — a few MB at worst, well
+    /// inside the 16 MiB frame limit.
+    LagHistoryRequest {
+        #[serde(default)]
+        topic: Option<String>,
+        #[serde(default)]
+        group: Option<String>,
+        #[serde(default)]
+        since_ms: Option<i64>,
+    },
+    LagHistoryResponse {
+        groups: Vec<BusGroupLagSeriesWire>,
+        topics: Vec<BusTopicDlqSeriesWire>,
+        /// Nominal spacing of the samples, for gap detection in a chart.
+        sample_interval_ms: u64,
+        /// `true` when more group series matched than the 64 returned.
+        #[serde(default)]
+        truncated: bool,
     },
 }
 
@@ -1193,6 +1420,8 @@ mod tests {
                 durability: "fsync_interval:50".to_string(),
                 durability_class: "standard".to_string(),
                 durability_explicit: false,
+                content_type: "application/hl7-v2".to_string(),
+                schema_id: Some("wynik-badania".to_string()),
             }],
         });
     }
@@ -1269,6 +1498,8 @@ mod tests {
                 durability: "fsync_batch_full".to_string(),
                 durability_class: "critical".to_string(),
                 durability_explicit: false,
+                content_type: "application/json".to_string(),
+                schema_id: None,
             }],
         });
     }
@@ -1310,11 +1541,18 @@ mod tests {
                 isr_count: 2,
                 replica_count: 3,
                 high_watermark: 1234,
+                earliest_timestamp_ms: Some(1_756_000_000_000),
             }],
             groups: vec![BusGroupLagSummaryWire {
                 group: "radiologia-worker".to_string(),
                 lag_total: 87,
             }],
+            access: Some(BusTopicAccessWire {
+                can_read: true,
+                can_write: false,
+                can_admin: false,
+            }),
+            admin_labels: vec!["Anna Kowalska".to_string()],
         });
     }
 
@@ -1329,6 +1567,7 @@ mod tests {
                 paused: false,
                 created_at_ms: 1,
                 updated_at_ms: 2,
+                lag_total: Some(18_420),
             }],
         });
     }
@@ -1453,6 +1692,7 @@ mod tests {
             from_offsets: vec![],
             limit: 46,
             partition: None,
+            newest_first: true,
         });
         round_trip(BusPayload::DlqListResponse {
             result: BusDlqListResultWire {
@@ -1513,10 +1753,12 @@ mod tests {
         });
         round_trip(BusPayload::AclListResponse {
             entries: vec![BusAclEntryWire {
-                subject_type: "user".to_string(),
-                subject_id: "u-1".to_string(),
+                subject_type: "group".to_string(),
+                subject_id: "g-1".to_string(),
                 access_level: "allow".to_string(),
                 action: "read".to_string(),
+                subject_label: Some("Lekarze".to_string()),
+                member_count: Some(12),
             }],
         });
         round_trip(BusPayload::AclSetRequest {
@@ -1570,6 +1812,8 @@ mod tests {
                     subject_id: "u-1".to_string(),
                     access_level: "allow".to_string(),
                     action: "*".to_string(),
+                    subject_label: None,
+                    member_count: None,
                 }],
             }
         );
@@ -1616,6 +1860,16 @@ mod tests {
                     total_bytes_on_disk: 1024 * 1024,
                     total_lag: 42,
                     dlq_depth: 3,
+                    dlq_last_hour: 2,
+                    dlq_last_at_ms: Some(1_756_000_000_000),
+                }],
+                groups: vec![BusGroupStatsWire {
+                    group: "radiologia-worker".to_string(),
+                    topic: "pacs.badania.nowe".to_string(),
+                    lag_total: Some(42),
+                    paused: false,
+                    lag_rising_since_ms: Some(1_755_999_000_000),
+                    consume_rate_per_min: Some(24_000),
                 }],
             },
         });
@@ -1665,6 +1919,7 @@ mod tests {
                     total_lag: 0,
                     total_dlq_depth: 0,
                     topics: vec![],
+                    groups: vec![],
                 }
             }
         );
@@ -1847,6 +2102,7 @@ mod tests {
                 from_offsets: vec![],
                 limit: 46,
                 partition: None,
+                newest_first: false,
             }
         );
     }
@@ -1860,6 +2116,15 @@ mod tests {
                 can_write: true,
                 can_admin: false,
                 is_site_admin: false,
+                default_replication_factor: 3,
+                node_count: 3,
+                content_types: vec![
+                    "application/json".to_string(),
+                    "application/xml".to_string(),
+                    "application/hl7-v2".to_string(),
+                ],
+                schema_types: vec!["json_schema".to_string()],
+                field_actions: vec!["hide".to_string()],
             },
         });
     }
@@ -1916,6 +2181,7 @@ mod tests {
             to_epoch: 3,
             duration_ms: 840,
             reason: "lease_expired".to_string(),
+            actor_label: None,
         }
     }
 
@@ -2028,6 +2294,8 @@ mod tests {
                 required_fields: vec!["patient_id".to_string()],
                 created_at_ms: 1000,
                 updated_at_ms: 2000,
+                subject_label: None,
+                member_count: None,
             }],
         });
         round_trip(BusPayload::FieldPolicySetRequest {
@@ -2059,6 +2327,8 @@ mod tests {
             created_by: Some("u-admin".to_string()),
             created_at_ms: 1000,
             updated_at_ms: 2000,
+            used_by_topics: vec!["patients.updated".to_string()],
+            created_by_label: Some("Anna Kowalska".to_string()),
         };
         let version_wire = BusSchemaVersionWire {
             subject: "patients.updated".to_string(),
@@ -2067,6 +2337,7 @@ mod tests {
             content_hash: "blake3:deadbeef".to_string(),
             created_by: Some("u-admin".to_string()),
             created_at_ms: 1500,
+            created_by_label: Some("Anna Kowalska".to_string()),
         };
 
         round_trip(BusPayload::SchemaSubjectListRequest {});
@@ -2136,6 +2407,11 @@ mod tests {
         });
         round_trip(BusPayload::SchemaDeleteResponse {
             removed_versions: vec![1, 2],
+            deprecated: false,
+        });
+        round_trip(BusPayload::SchemaDeleteResponse {
+            removed_versions: vec![],
+            deprecated: true,
         });
     }
 
@@ -2258,7 +2534,478 @@ mod tests {
                 isr_count: 0,
                 replica_count: 0,
                 high_watermark: 0,
+                earliest_timestamp_ms: None,
             }]
+        );
+    }
+
+    // =========================================================================
+    // B1 / B1b (SUM/tentabus/PLAN-UI-20260923.md) — every field added there
+    // is `#[serde(default)]`; each test below encodes the shape a peer built
+    // BEFORE the field existed sends and decodes it with today's types.
+    // =========================================================================
+
+    #[test]
+    fn topic_summary_without_content_type_and_schema_id_decodes() {
+        #[derive(SerdeSerialize)]
+        struct LegacySummary {
+            name: String,
+            partitions: u32,
+            retention_ms: i64,
+            replication_factor: u32,
+            acks: String,
+            environment: String,
+            cleanup_policy: String,
+            created_at_ms: i64,
+            updated_at_ms: i64,
+            is_dlq: bool,
+            durability: String,
+            durability_class: String,
+            durability_explicit: bool,
+        }
+        let bytes = crate::cbor::encode(&LegacySummary {
+            name: "wizyty".to_string(),
+            partitions: 3,
+            retention_ms: 1,
+            replication_factor: 1,
+            acks: "leader".to_string(),
+            environment: "prod".to_string(),
+            cleanup_policy: "delete".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            is_dlq: false,
+            durability: "os".to_string(),
+            durability_class: "standard".to_string(),
+            durability_explicit: true,
+        })
+        .expect("encode");
+        let decoded: BusTopicSummaryWire = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded.content_type, "");
+        assert_eq!(decoded.schema_id, None);
+        assert_eq!(decoded.partitions, 3);
+    }
+
+    #[test]
+    fn group_summary_without_lag_total_decodes_as_unknown() {
+        #[derive(SerdeSerialize)]
+        struct LegacyGroup {
+            group: String,
+            topic: String,
+            commit_mode: String,
+            paused: bool,
+            created_at_ms: i64,
+            updated_at_ms: i64,
+        }
+        let bytes = crate::cbor::encode(&LegacyGroup {
+            group: "lekarze".to_string(),
+            topic: "wyniki-badan".to_string(),
+            commit_mode: "auto_after_success".to_string(),
+            paused: false,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        })
+        .expect("encode");
+        let decoded: BusGroupSummaryWire = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded.lag_total, None, "absent means unknown, never 0");
+    }
+
+    #[test]
+    fn topic_stats_without_dlq_recency_fields_decodes() {
+        #[derive(SerdeSerialize)]
+        struct LegacyTopicStats {
+            topic: String,
+            msgs_in_per_sec: u32,
+            bytes_in_per_sec: u64,
+            total_bytes_on_disk: u64,
+            total_lag: u64,
+            dlq_depth: u64,
+        }
+        let bytes = crate::cbor::encode(&LegacyTopicStats {
+            topic: "wyniki-badan".to_string(),
+            msgs_in_per_sec: 1,
+            bytes_in_per_sec: 2,
+            total_bytes_on_disk: 3,
+            total_lag: 4,
+            dlq_depth: 5,
+        })
+        .expect("encode");
+        let decoded: BusTopicStatsWire = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded.dlq_last_hour, 0);
+        assert_eq!(decoded.dlq_last_at_ms, None);
+        assert_eq!(decoded.dlq_depth, 5);
+    }
+
+    #[test]
+    fn capabilities_without_b1_fields_decode() {
+        #[derive(SerdeSerialize)]
+        struct LegacyCapabilities {
+            can_read: bool,
+            can_write: bool,
+            can_admin: bool,
+            is_site_admin: bool,
+        }
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            CapabilitiesResponse { capabilities: LegacyCapabilities },
+        }
+        let bytes = crate::cbor::encode(&LegacyBusPayload::CapabilitiesResponse {
+            capabilities: LegacyCapabilities {
+                can_read: true,
+                can_write: false,
+                can_admin: false,
+                is_site_admin: false,
+            },
+        })
+        .expect("encode");
+        let decoded: BusPayload = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(
+            decoded,
+            BusPayload::CapabilitiesResponse {
+                capabilities: BusCapabilitiesWire {
+                    can_read: true,
+                    can_write: false,
+                    can_admin: false,
+                    is_site_admin: false,
+                    default_replication_factor: 0,
+                    node_count: 0,
+                    content_types: vec![],
+                    schema_types: vec![],
+                    field_actions: vec![],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn topic_detail_response_without_access_fields_decodes() {
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            TopicDetailResponse {
+                topic: BusTopicConfigWire,
+                partitions: Vec<BusPartitionInfoWire>,
+                groups: Vec<BusGroupLagSummaryWire>,
+            },
+        }
+        let bytes = crate::cbor::encode(&LegacyBusPayload::TopicDetailResponse {
+            topic: sample_topic_config(),
+            partitions: vec![],
+            groups: vec![],
+        })
+        .expect("encode");
+        let decoded: BusPayload = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(
+            decoded,
+            BusPayload::TopicDetailResponse {
+                topic: sample_topic_config(),
+                partitions: vec![],
+                groups: vec![],
+                access: None,
+                admin_labels: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn failover_event_without_actor_label_decodes() {
+        #[derive(SerdeSerialize)]
+        struct LegacyFailover {
+            at_ms: i64,
+            topic: String,
+            partition: u32,
+            from_node: Option<String>,
+            to_node: String,
+            from_epoch: u32,
+            to_epoch: u32,
+            duration_ms: u64,
+            reason: String,
+        }
+        let bytes = crate::cbor::encode(&LegacyFailover {
+            at_ms: 1,
+            topic: "t".to_string(),
+            partition: 0,
+            from_node: None,
+            to_node: "n".to_string(),
+            from_epoch: 0,
+            to_epoch: 1,
+            duration_ms: 5,
+            reason: "lease_expired".to_string(),
+        })
+        .expect("encode");
+        let decoded: BusFailoverEventWire = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded.actor_label, None);
+    }
+
+    #[test]
+    fn schema_and_policy_rows_without_labels_decode() {
+        #[derive(SerdeSerialize)]
+        struct LegacySubject {
+            subject: String,
+            schema_type: String,
+            compatibility: String,
+            deprecated_at_ms: Option<i64>,
+            latest_version: Option<u32>,
+            created_by: Option<String>,
+            created_at_ms: i64,
+            updated_at_ms: i64,
+        }
+        let bytes = crate::cbor::encode(&LegacySubject {
+            subject: "wizyta".to_string(),
+            schema_type: "json_schema".to_string(),
+            compatibility: "backward".to_string(),
+            deprecated_at_ms: None,
+            latest_version: Some(1),
+            created_by: Some("u-1".to_string()),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        })
+        .expect("encode");
+        let subject: BusSchemaSubjectWire = crate::cbor::decode(&bytes).expect("decode");
+        assert!(subject.used_by_topics.is_empty());
+        assert_eq!(subject.created_by_label, None);
+
+        #[derive(SerdeSerialize)]
+        struct LegacyVersion {
+            subject: String,
+            version: u32,
+            schema_ref_id: u32,
+            content_hash: String,
+            created_by: Option<String>,
+            created_at_ms: i64,
+        }
+        let bytes = crate::cbor::encode(&LegacyVersion {
+            subject: "wizyta".to_string(),
+            version: 1,
+            schema_ref_id: 7,
+            content_hash: "h".to_string(),
+            created_by: None,
+            created_at_ms: 1,
+        })
+        .expect("encode");
+        let version: BusSchemaVersionWire = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(version.created_by_label, None);
+
+        #[derive(SerdeSerialize)]
+        struct LegacyPolicy {
+            subject_type: String,
+            subject_id: String,
+            direction: String,
+            fields: Vec<String>,
+            required_fields: Vec<String>,
+            created_at_ms: i64,
+            updated_at_ms: i64,
+        }
+        let bytes = crate::cbor::encode(&LegacyPolicy {
+            subject_type: "group".to_string(),
+            subject_id: "g-1".to_string(),
+            direction: "read".to_string(),
+            fields: vec!["id".to_string()],
+            required_fields: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        })
+        .expect("encode");
+        let policy: BusFieldPolicyWire = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(policy.subject_label, None);
+        assert_eq!(policy.member_count, None);
+    }
+
+    #[test]
+    fn lag_history_round_trip() {
+        round_trip(BusPayload::LagHistoryRequest {
+            topic: Some("faktury".to_string()),
+            group: None,
+            since_ms: Some(1_756_000_000_000),
+        });
+        round_trip(BusPayload::LagHistoryResponse {
+            groups: vec![BusGroupLagSeriesWire {
+                group: "ksiegowosc".to_string(),
+                topic: "faktury".to_string(),
+                samples: vec![
+                    BusLagSampleWire {
+                        at_ms: 1_756_000_000_000,
+                        lag_total: 10_000,
+                        committed_total: 500,
+                    },
+                    BusLagSampleWire {
+                        at_ms: 1_756_000_060_000,
+                        lag_total: 10_800,
+                        committed_total: 500,
+                    },
+                ],
+            }],
+            topics: vec![BusTopicDlqSeriesWire {
+                topic: "faktury".to_string(),
+                samples: vec![BusDlqSampleWire {
+                    at_ms: 1_756_000_000_000,
+                    dlq_depth: 3,
+                }],
+            }],
+            sample_interval_ms: 60_000,
+            truncated: false,
+        });
+    }
+
+    #[test]
+    fn schema_delete_and_lag_history_responses_without_new_flags_decode() {
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            SchemaDeleteResponse {
+                removed_versions: Vec<u32>,
+            },
+            LagHistoryResponse {
+                groups: Vec<BusGroupLagSeriesWire>,
+                topics: Vec<BusTopicDlqSeriesWire>,
+                sample_interval_ms: u64,
+            },
+        }
+        let bytes = crate::cbor::encode(&LegacyBusPayload::SchemaDeleteResponse {
+            removed_versions: vec![2],
+        })
+        .expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<BusPayload>(&bytes).expect("decode"),
+            BusPayload::SchemaDeleteResponse {
+                removed_versions: vec![2],
+                deprecated: false,
+            }
+        );
+        let bytes = crate::cbor::encode(&LegacyBusPayload::LagHistoryResponse {
+            groups: vec![],
+            topics: vec![],
+            sample_interval_ms: 60_000,
+        })
+        .expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<BusPayload>(&bytes).expect("decode"),
+            BusPayload::LagHistoryResponse {
+                groups: vec![],
+                topics: vec![],
+                sample_interval_ms: 60_000,
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn lag_history_request_filters_default_to_none() {
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            LagHistoryRequest {},
+        }
+        let bytes = crate::cbor::encode(&LegacyBusPayload::LagHistoryRequest {}).expect("encode");
+        let decoded: BusPayload = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(
+            decoded,
+            BusPayload::LagHistoryRequest {
+                topic: None,
+                group: None,
+                since_ms: None,
+            }
+        );
+    }
+
+    /// ciborium tags `BusPayload` by variant NAME, so a rename breaks every
+    /// deployed dashboard while each round trip above stays green (it
+    /// re-encodes with the new name). The full list, in declaration order,
+    /// pins both: a rename or an insertion fails here; a new variant is
+    /// appended to the END of the enum and to the end of this list.
+    #[test]
+    fn bus_payload_variant_names_are_pinned_in_order() {
+        const SOURCE: &str = include_str!("bus.rs");
+        crate::wire_pin::assert_parseable(SOURCE);
+        let payload = crate::wire_pin::wire_enums(SOURCE)
+            .into_iter()
+            .find(|item| item.name == "BusPayload")
+            .expect("BusPayload is declared in bus.rs");
+        let live: Vec<String> = payload
+            .members
+            .iter()
+            .map(|m| {
+                // `Name | field…`, or `Name {}`-style for an empty struct
+                // variant; attributes (if any) come first.
+                let head = m.split(" | ").next().unwrap_or(m);
+                head.split_whitespace()
+                    .filter(|token| *token != "{}")
+                    .last()
+                    .unwrap_or(head)
+                    .to_string()
+            })
+            .collect();
+        let pinned = [
+            "TopicListRequest",
+            "TopicListResponse",
+            "TopicCreateRequest",
+            "TopicCreateResponse",
+            "TopicUpdateRequest",
+            "TopicUpdateResponse",
+            "TopicDeleteRequest",
+            "TopicDeleteResponse",
+            "TopicDetailRequest",
+            "TopicDetailResponse",
+            "GroupListRequest",
+            "GroupListResponse",
+            "GroupDetailRequest",
+            "GroupDetailResponse",
+            "GroupPauseRequest",
+            "GroupPauseResponse",
+            "GroupResumeRequest",
+            "GroupResumeResponse",
+            "OffsetResetRequest",
+            "OffsetResetResponse",
+            "MessagesBrowseRequest",
+            "MessagesBrowseResponse",
+            "DlqListRequest",
+            "DlqListResponse",
+            "DlqRetryRequest",
+            "DlqRetryResponse",
+            "DlqDiscardRequest",
+            "DlqDiscardResponse",
+            "DlqRetryAllRequest",
+            "DlqRetryAllResponse",
+            "AclListRequest",
+            "AclListResponse",
+            "AclSetRequest",
+            "AclSetResponse",
+            "StatsSnapshotRequest",
+            "StatsSnapshotResponse",
+            "QuotaGetRequest",
+            "QuotaGetResponse",
+            "QuotaSetRequest",
+            "QuotaSetResponse",
+            "CapabilitiesRequest",
+            "CapabilitiesResponse",
+            "ReplicaListRequest",
+            "ReplicaListResponse",
+            "ReassignRequest",
+            "ReassignResponse",
+            "LeaderTransferRequest",
+            "LeaderTransferResponse",
+            "FieldPolicyListRequest",
+            "FieldPolicyListResponse",
+            "FieldPolicySetRequest",
+            "FieldPolicySetResponse",
+            "FieldPolicyDeleteRequest",
+            "FieldPolicyDeleteResponse",
+            "SchemaSubjectListRequest",
+            "SchemaSubjectListResponse",
+            "SchemaVersionListRequest",
+            "SchemaVersionListResponse",
+            "SchemaGetRequest",
+            "SchemaGetResponse",
+            "SchemaDerivedGetRequest",
+            "SchemaDerivedGetResponse",
+            "SchemaRegisterRequest",
+            "SchemaRegisterResponse",
+            "SchemaCompatibilitySetRequest",
+            "SchemaCompatibilitySetResponse",
+            "SchemaDeleteRequest",
+            "SchemaDeleteResponse",
+            "LagHistoryRequest",
+            "LagHistoryResponse",
+        ];
+        assert_eq!(
+            live, pinned,
+            "BusPayload variants were renamed, reordered or inserted mid-enum — append only"
         );
     }
 }

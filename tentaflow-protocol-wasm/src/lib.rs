@@ -2202,6 +2202,9 @@ pub fn encode_bus_dlq_list_request(
     // See `encode_bus_messages_browse_request`'s `partition` doc — same
     // semantics, applied to the derived `__dlq.<source_topic>` topic.
     partition: Option<u32>,
+    // `true` pages backwards from the newest record (`BusPayload::
+    // DlqListRequest::newest_first`); absent = oldest first.
+    newest_first: Option<bool>,
 ) -> Result<Vec<u8>, JsError> {
     let from_offsets = parse_from_offsets_json(from_offsets_json)?;
     encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
@@ -2212,6 +2215,7 @@ pub fn encode_bus_dlq_list_request(
             from_offsets,
             limit,
             partition,
+            newest_first: newest_first.unwrap_or(false),
         },
     }))
     .map_err(|e| JsError::new(&e))
@@ -2298,6 +2302,27 @@ pub fn encode_bus_acl_set_request(
             subject_id,
             access_level,
             action: action.unwrap_or_else(|| "*".to_string()),
+        },
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// Persisted lag / DLQ history (`BusPayload::LagHistoryRequest`). Every
+/// argument optional: no `topic`/`group` = the whole instance, no
+/// `since_ms` = everything retained (24 h).
+#[wasm_bindgen(js_name = encodeBusLagHistoryRequest)]
+pub fn encode_bus_lag_history_request(
+    instance_id: String,
+    topic: Option<String>,
+    group: Option<String>,
+    since_ms: Option<i64>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::LagHistoryRequest {
+            topic,
+            group,
+            since_ms,
         },
     }))
     .map_err(|e| JsError::new(&e))
@@ -11303,6 +11328,13 @@ fn decode_environment_promotion_payload(
     }
 }
 
+/// Sets one bus field under both its camelCase and snake_case key (this
+/// file's convention for every TentaBus response).
+fn set_bus(obj: &js_sys::Object, camel: &str, snake: &str, value: JsValue) {
+    set(obj, camel, value.clone());
+    set(obj, snake, value);
+}
+
 fn bus_topic_config_to_js(t: &tentaflow_protocol::BusTopicConfigWire) -> JsValue {
     let o = js_sys::Object::new();
     set(&o, "name", t.name.clone().into());
@@ -11501,7 +11533,57 @@ fn bus_topic_stats_to_js(t: &tentaflow_protocol::BusTopicStatsWire) -> JsValue {
     set(&o, "total_lag", (t.total_lag as f64).into());
     set(&o, "dlqDepth", (t.dlq_depth as f64).into());
     set(&o, "dlq_depth", (t.dlq_depth as f64).into());
+    set_bus(&o, "dlqLastHour", "dlq_last_hour", (t.dlq_last_hour as f64).into());
+    set_bus(
+        &o,
+        "dlqLastAtMs",
+        "dlq_last_at_ms",
+        opt_f64_to_js(t.dlq_last_at_ms.map(|v| v as f64)),
+    );
     o.into()
+}
+
+fn bus_group_stats_to_js(g: &tentaflow_protocol::BusGroupStatsWire) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "group", g.group.clone().into());
+    set(&o, "topic", g.topic.clone().into());
+    set_bus(
+        &o,
+        "lagTotal",
+        "lag_total",
+        opt_f64_to_js(g.lag_total.map(|v| v as f64)),
+    );
+    set(&o, "paused", g.paused.into());
+    set_bus(
+        &o,
+        "lagRisingSinceMs",
+        "lag_rising_since_ms",
+        opt_f64_to_js(g.lag_rising_since_ms.map(|v| v as f64)),
+    );
+    set_bus(
+        &o,
+        "consumeRatePerMin",
+        "consume_rate_per_min",
+        opt_f64_to_js(g.consume_rate_per_min.map(|v| v as f64)),
+    );
+    o.into()
+}
+
+/// `subjectLabel` + `memberCount` of an ACL / field-policy row (`null` when
+/// unknown / not a group).
+fn set_bus_subject_labels(o: &js_sys::Object, label: &Option<String>, members: Option<u32>) {
+    set_bus(
+        o,
+        "subjectLabel",
+        "subject_label",
+        label.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
+    set_bus(
+        o,
+        "memberCount",
+        "member_count",
+        opt_f64_to_js(members.map(f64::from)),
+    );
 }
 
 fn bus_field_policy_to_js(p: &tentaflow_protocol::BusFieldPolicyWire) -> JsValue {
@@ -11526,6 +11608,7 @@ fn bus_field_policy_to_js(p: &tentaflow_protocol::BusFieldPolicyWire) -> JsValue
     set(&o, "created_at_ms", (p.created_at_ms as f64).into());
     set(&o, "updatedAtMs", (p.updated_at_ms as f64).into());
     set(&o, "updated_at_ms", (p.updated_at_ms as f64).into());
+    set_bus_subject_labels(&o, &p.subject_label, p.member_count);
     o.into()
 }
 
@@ -11569,6 +11652,18 @@ fn bus_schema_subject_to_js(s: &tentaflow_protocol::BusSchemaSubjectWire) -> JsV
     set(&o, "created_at_ms", (s.created_at_ms as f64).into());
     set(&o, "updatedAtMs", (s.updated_at_ms as f64).into());
     set(&o, "updated_at_ms", (s.updated_at_ms as f64).into());
+    set_bus(
+        &o,
+        "usedByTopics",
+        "used_by_topics",
+        string_vec_to_js(s.used_by_topics.clone()).into(),
+    );
+    set_bus(
+        &o,
+        "createdByLabel",
+        "created_by_label",
+        s.created_by_label.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
     o.into()
 }
 
@@ -11592,6 +11687,12 @@ fn bus_schema_version_to_js(v: &tentaflow_protocol::BusSchemaVersionWire) -> JsV
     }
     set(&o, "createdAtMs", (v.created_at_ms as f64).into());
     set(&o, "created_at_ms", (v.created_at_ms as f64).into());
+    set_bus(
+        &o,
+        "createdByLabel",
+        "created_by_label",
+        v.created_by_label.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
     o.into()
 }
 
@@ -11645,6 +11746,13 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 set(&o, "durability_class", t.durability_class.clone().into());
                 set(&o, "durabilityExplicit", t.durability_explicit.into());
                 set(&o, "durability_explicit", t.durability_explicit.into());
+                set_bus(&o, "contentType", "content_type", t.content_type.clone().into());
+                set_bus(
+                    &o,
+                    "schemaId",
+                    "schema_id",
+                    t.schema_id.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+                );
                 arr.push(&o);
             }
             set(obj, "topics", arr.into());
@@ -11666,6 +11774,8 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
             topic,
             partitions,
             groups,
+            access,
+            admin_labels,
         } => {
             set(obj, "variant", "BusTopicDetailResponse".into());
             set(obj, "topic", bus_topic_config_to_js(&topic));
@@ -11698,9 +11808,32 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 set(&o, "replica_count", (p.replica_count as f64).into());
                 set(&o, "highWatermark", (p.high_watermark as f64).into());
                 set(&o, "high_watermark", (p.high_watermark as f64).into());
+                set_bus(
+                    &o,
+                    "earliestTimestampMs",
+                    "earliest_timestamp_ms",
+                    opt_f64_to_js(p.earliest_timestamp_ms.map(|v| v as f64)),
+                );
                 parr.push(&o);
             }
             set(obj, "partitions", parr.into());
+            let access_js = match access {
+                Some(a) => {
+                    let ao = js_sys::Object::new();
+                    set_bus(&ao, "canRead", "can_read", a.can_read.into());
+                    set_bus(&ao, "canWrite", "can_write", a.can_write.into());
+                    set_bus(&ao, "canAdmin", "can_admin", a.can_admin.into());
+                    ao.into()
+                }
+                None => JsValue::NULL,
+            };
+            set(obj, "access", access_js);
+            set_bus(
+                obj,
+                "adminLabels",
+                "admin_labels",
+                string_vec_to_js(admin_labels).into(),
+            );
             let garr = js_sys::Array::new();
             for g in &groups {
                 let o = js_sys::Object::new();
@@ -11726,6 +11859,12 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 set(&o, "created_at_ms", (g.created_at_ms as f64).into());
                 set(&o, "updatedAtMs", (g.updated_at_ms as f64).into());
                 set(&o, "updated_at_ms", (g.updated_at_ms as f64).into());
+                set_bus(
+                    &o,
+                    "lagTotal",
+                    "lag_total",
+                    opt_f64_to_js(g.lag_total.map(|v| v as f64)),
+                );
                 arr.push(&o);
             }
             set(obj, "groups", arr.into());
@@ -11822,6 +11961,8 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 set(&o, "subject_id", e.subject_id.clone().into());
                 set(&o, "accessLevel", e.access_level.clone().into());
                 set(&o, "access_level", e.access_level.clone().into());
+                set(&o, "action", e.action.clone().into());
+                set_bus_subject_labels(&o, &e.subject_label, e.member_count);
                 arr.push(&o);
             }
             set(obj, "entries", arr.into());
@@ -11912,6 +12053,11 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 tarr.push(&bus_topic_stats_to_js(t));
             }
             set(obj, "topics", tarr.into());
+            let garr = js_sys::Array::new();
+            for g in &snapshot.groups {
+                garr.push(&bus_group_stats_to_js(g));
+            }
+            set(obj, "groups", garr.into());
         }
         BP::QuotaGetRequest => set(obj, "variant", "BusQuotaGetRequest".into()),
         BP::QuotaGetResponse { quota } => {
@@ -11935,6 +12081,31 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
             set(&o, "can_admin", capabilities.can_admin.into());
             set(&o, "isSiteAdmin", capabilities.is_site_admin.into());
             set(&o, "is_site_admin", capabilities.is_site_admin.into());
+            set_bus(
+                &o,
+                "defaultReplicationFactor",
+                "default_replication_factor",
+                (capabilities.default_replication_factor as f64).into(),
+            );
+            set_bus(&o, "nodeCount", "node_count", (capabilities.node_count as f64).into());
+            set_bus(
+                &o,
+                "contentTypes",
+                "content_types",
+                string_vec_to_js(capabilities.content_types).into(),
+            );
+            set_bus(
+                &o,
+                "schemaTypes",
+                "schema_types",
+                string_vec_to_js(capabilities.schema_types).into(),
+            );
+            set_bus(
+                &o,
+                "fieldActions",
+                "field_actions",
+                string_vec_to_js(capabilities.field_actions).into(),
+            );
             set(obj, "capabilities", o.into());
         }
         BP::ReplicaListRequest { .. } => set(obj, "variant", "BusReplicaListRequest".into()),
@@ -12049,6 +12220,12 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 set(&o, "durationMs", (f.duration_ms as f64).into());
                 set(&o, "duration_ms", (f.duration_ms as f64).into());
                 set(&o, "reason", f.reason.clone().into());
+                set_bus(
+                    &o,
+                    "actorLabel",
+                    "actor_label",
+                    f.actor_label.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+                );
                 farr.push(&o);
             }
             set(obj, "failovers", farr.into());
@@ -12140,7 +12317,11 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
             set(obj, "variant", "BusSchemaCompatibilitySetResponse".into())
         }
         BP::SchemaDeleteRequest { .. } => set(obj, "variant", "BusSchemaDeleteRequest".into()),
-        BP::SchemaDeleteResponse { removed_versions } => {
+        BP::SchemaDeleteResponse {
+            removed_versions,
+            deprecated,
+        } => {
+            set(obj, "deprecated", deprecated.into());
             set(obj, "variant", "BusSchemaDeleteResponse".into());
             let arr = js_sys::Array::new();
             for v in &removed_versions {
@@ -12148,6 +12329,59 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
             }
             set(obj, "removedVersions", arr.clone().into());
             set(obj, "removed_versions", arr.into());
+        }
+        BP::LagHistoryRequest { .. } => set(obj, "variant", "BusLagHistoryRequest".into()),
+        BP::LagHistoryResponse {
+            groups,
+            topics,
+            sample_interval_ms,
+            truncated,
+        } => {
+            set(obj, "variant", "BusLagHistoryResponse".into());
+            set(obj, "truncated", truncated.into());
+            let garr = js_sys::Array::new();
+            for series in groups {
+                let o = js_sys::Object::new();
+                set(&o, "group", series.group.into());
+                set(&o, "topic", series.topic.into());
+                let samples = js_sys::Array::new();
+                for sample in &series.samples {
+                    let so = js_sys::Object::new();
+                    set_bus(&so, "atMs", "at_ms", (sample.at_ms as f64).into());
+                    set_bus(&so, "lagTotal", "lag_total", (sample.lag_total as f64).into());
+                    set_bus(
+                        &so,
+                        "committedTotal",
+                        "committed_total",
+                        (sample.committed_total as f64).into(),
+                    );
+                    samples.push(&so);
+                }
+                set(&o, "samples", samples.into());
+                garr.push(&o);
+            }
+            set(obj, "groups", garr.into());
+            let tarr = js_sys::Array::new();
+            for series in topics {
+                let o = js_sys::Object::new();
+                set(&o, "topic", series.topic.into());
+                let samples = js_sys::Array::new();
+                for sample in &series.samples {
+                    let so = js_sys::Object::new();
+                    set_bus(&so, "atMs", "at_ms", (sample.at_ms as f64).into());
+                    set_bus(&so, "dlqDepth", "dlq_depth", (sample.dlq_depth as f64).into());
+                    samples.push(&so);
+                }
+                set(&o, "samples", samples.into());
+                tarr.push(&o);
+            }
+            set(obj, "topics", tarr.into());
+            set_bus(
+                obj,
+                "sampleIntervalMs",
+                "sample_interval_ms",
+                (sample_interval_ms as f64).into(),
+            );
         }
     }
 }

@@ -62,18 +62,19 @@ use bytes::Bytes;
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
-    BusDlqRecordWire, BusFailoverEventWire, BusFieldPolicyWire, BusGroupDetailWire,
-    BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupSummaryWire, BusHeaderWire,
-    BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire,
-    BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire,
-    BusReplicaNodeWire, BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire,
-    BusTopicConfigWire, BusTopicOptionsWire, BusTopicStatsWire, BusTopicSummaryWire, MessageBody,
-    ProtocolError, ProtocolErrorCode,
+    BusDlqRecordWire, BusDlqSampleWire, BusFailoverEventWire, BusFieldPolicyWire,
+    BusGroupDetailWire, BusGroupLagSeriesWire, BusGroupLagSummaryWire, BusGroupPartitionDetailWire,
+    BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire, BusLagSampleWire, BusMessagePreviewWire,
+    BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire,
+    BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire,
+    BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire, BusTopicAccessWire,
+    BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire, BusTopicStatsWire,
+    BusTopicSummaryWire, MessageBody, ProtocolError, ProtocolErrorCode,
 };
 
 use super::HandlerContext;
 use crate::bus::{
-    self, dlq, field_policies, groups, instance::BusInstanceId, quota, schema_registry, topics,
+    self, dlq, field_policies, instance::BusInstanceId, quota, schema_registry, topics,
     BusCallContext, BusServiceError, PartitionReplicaInfo, ReplError, ReplicaLagInfo,
     ReplicaNodeInfo, UnavailableReason,
 };
@@ -651,6 +652,103 @@ fn topic_config_to_summary_wire(cfg: &topics::TopicConfig) -> BusTopicSummaryWir
         durability: cfg.durability.to_wire_string(),
         durability_class: cfg.durability_class().as_str().to_string(),
         durability_explicit: cfg.durability_explicit(),
+        content_type: cfg.content_type.clone(),
+        schema_id: cfg.schema_id.clone(),
+    }
+}
+
+/// Display names for the ids the bus screens show — ACL/field-policy
+/// subjects and the `created_by` of registry rows — resolved in Core like the
+/// Analytics screen does, so the UI never titles a row with a bare id. Built
+/// with one batched lookup per subject kind.
+#[derive(Default)]
+struct SubjectLabels {
+    users: std::collections::HashMap<String, repository::UserNameRow>,
+    groups: std::collections::HashMap<String, (String, i64)>,
+    api_keys: std::collections::HashMap<String, String>,
+}
+
+/// `created_by` prefix of a REST registration (`api/bus_schema_rest.rs`).
+const API_KEY_ACTOR_PREFIX: &str = "api_key:";
+
+impl SubjectLabels {
+    /// `subjects` are `(subject_type, subject_id)`; `actors` are
+    /// `created_by`/audit actors (a user id, or `api_key:<uid>`).
+    fn resolve(
+        db: &crate::db::DbPool,
+        subjects: &[(String, String)],
+        actors: &[String],
+    ) -> Result<Self, ProtocolError> {
+        let mut user_ids = Vec::new();
+        let mut group_ids = Vec::new();
+        let mut want_api_keys = false;
+        for (kind, id) in subjects {
+            match kind.as_str() {
+                "user" => user_ids.push(id.clone()),
+                "group" => group_ids.push(id.clone()),
+                "api_key" => want_api_keys = true,
+                _ => {}
+            }
+        }
+        for actor in actors {
+            if actor.starts_with(API_KEY_ACTOR_PREFIX) {
+                want_api_keys = true;
+            } else {
+                user_ids.push(actor.clone());
+            }
+        }
+        let mut labels = SubjectLabels::default();
+        if !user_ids.is_empty() {
+            labels.users = repository::lookup_user_names(db, &user_ids)
+                .map_err(|e| db_err("lookup_user_names", e))?;
+        }
+        if !group_ids.is_empty() {
+            labels.groups = repository::lookup_group_info(db, &group_ids)
+                .map_err(|e| db_err("lookup_group_info", e))?;
+        }
+        if want_api_keys {
+            labels.api_keys = repository::list_api_keys(db)
+                .map_err(|e| db_err("list_api_keys", e))?
+                .into_iter()
+                .map(|k| (k.uid, k.name))
+                .collect();
+        }
+        Ok(labels)
+    }
+
+    /// `display_name`, else `username` — never the e-mail address, which
+    /// Analytics' `user_presentation` falls back to: these labels reach
+    /// callers with nothing more than `bus.read` (ACL list, the topic's
+    /// administrators shown to a non-admin, schema authors).
+    fn user(&self, id: &str) -> Option<String> {
+        let row = self.users.get(id)?;
+        [&row.display_name, &row.username]
+            .into_iter()
+            .find(|v| !v.is_empty())
+            .cloned()
+    }
+
+    /// `(label, member_count)` of one ACL/field-policy subject.
+    fn subject(&self, subject_type: &str, subject_id: &str) -> (Option<String>, Option<u32>) {
+        match subject_type {
+            "user" => (self.user(subject_id), None),
+            "group" => match self.groups.get(subject_id) {
+                Some((name, members)) => (
+                    Some(name.clone()),
+                    Some(u32::try_from(*members).unwrap_or(0)),
+                ),
+                None => (None, None),
+            },
+            "api_key" => (self.api_keys.get(subject_id).cloned(), None),
+            _ => (None, None),
+        }
+    }
+
+    fn actor(&self, actor: &str) -> Option<String> {
+        match actor.strip_prefix(API_KEY_ACTOR_PREFIX) {
+            Some(uid) => self.api_keys.get(uid).cloned(),
+            None => self.user(actor),
+        }
     }
 }
 
@@ -876,6 +974,129 @@ fn peek_topic(
     Ok((all_records, any_has_more, max_next_offset, partitions_wire))
 }
 
+/// `DlqListRequest { newest_first: true }`: pages a DLQ BACKWARDS, newest
+/// arrival first. `ends` holds each partition's EXCLUSIVE upper bound (a
+/// partition absent from it starts at its high watermark). Every partition
+/// contributes its newest `limit` records below its bound; those per-
+/// partition lists (offset-descending) are merged by always taking the head
+/// with the latest `dlq::arrival_ms`, and the merge stops at `limit`. Taking
+/// only heads means what a partition contributed is always a contiguous
+/// run just below its bound, so its `next_offset` (the lowest offset taken,
+/// or the unchanged bound) is the exact bound of the next page: no record is
+/// skipped or repeated across pages even when two partitions' arrival clocks
+/// interleave. The top-level `next_offset` is the lowest per-partition one.
+fn peek_dlq_newest_first(
+    bctx: &BusCallContext,
+    dlq_topic: &str,
+    partitions: u32,
+    ends: &std::collections::HashMap<u32, u64>,
+    limit: u32,
+    partition_filter: Option<u32>,
+) -> Result<
+    (
+        Vec<bus::FetchedRecordMeta>,
+        bool,
+        u64,
+        Vec<BusBrowsePartitionInfoWire>,
+    ),
+    ProtocolError,
+> {
+    let limit = limit.clamp(1, BROWSE_MAX_RECORDS) as usize;
+    let svc = instance_service(&bctx.instance_id)?;
+    let partition_range: Vec<u32> = match partition_filter {
+        Some(p) => vec![p],
+        None => (0..partitions).collect(),
+    };
+
+    struct Window {
+        partition: u32,
+        earliest: u64,
+        high_watermark: u64,
+        end: u64,
+        /// Offset-descending.
+        records: std::collections::VecDeque<bus::FetchedRecordMeta>,
+        taken_low: Option<u64>,
+    }
+    let mut windows = Vec::with_capacity(partition_range.len());
+    for partition in partition_range {
+        let stats = svc
+            .partition_stats(bctx, dlq_topic, partition)
+            .map_err(map_bus_error)?;
+        let end = ends
+            .get(&partition)
+            .copied()
+            .unwrap_or(stats.high_watermark)
+            .min(stats.high_watermark);
+        let start = end.saturating_sub(limit as u64).max(stats.earliest_offset);
+        // `peek` stops at its byte budget, which would drop the NEWEST end
+        // of the window — keep reading up to `end` so the page is always
+        // the run directly below the bound.
+        let mut in_window: Vec<bus::FetchedRecordMeta> = Vec::new();
+        let mut cursor = start;
+        while cursor < end {
+            let peeked = svc
+                .peek(
+                    bctx,
+                    dlq_topic,
+                    partition,
+                    cursor,
+                    (end - cursor) as usize,
+                    bus::PEEK_MAX_BYTES,
+                )
+                .map_err(map_bus_error)?;
+            let Some(highest) = peeked.records.iter().map(|r| r.offset).max() else {
+                break;
+            };
+            in_window.extend(peeked.records.into_iter().filter(|r| r.offset < end));
+            cursor = highest + 1;
+        }
+        in_window.sort_by(|a, b| b.offset.cmp(&a.offset));
+        let records: std::collections::VecDeque<_> = in_window.into_iter().collect();
+        windows.push(Window {
+            partition,
+            earliest: stats.earliest_offset,
+            high_watermark: stats.high_watermark,
+            end,
+            records,
+            taken_low: None,
+        });
+    }
+
+    let arrival = |r: &bus::FetchedRecordMeta| dlq::arrival_ms(&r.headers, r.timestamp_ms);
+    let mut out = Vec::with_capacity(limit);
+    while out.len() < limit {
+        let Some(next) = windows
+            .iter_mut()
+            .filter(|w| !w.records.is_empty())
+            .max_by_key(|w| w.records.front().map(arrival))
+        else {
+            break;
+        };
+        let record = next.records.pop_front().expect("filtered on non-empty");
+        next.taken_low = Some(record.offset);
+        out.push(record);
+    }
+
+    let mut partitions_wire = Vec::with_capacity(windows.len());
+    let mut any_has_more = false;
+    let mut lowest_next = u64::MAX;
+    for w in &windows {
+        let next_offset = w.taken_low.unwrap_or(w.end);
+        let has_more = next_offset > w.earliest;
+        any_has_more |= has_more;
+        lowest_next = lowest_next.min(next_offset);
+        partitions_wire.push(BusBrowsePartitionInfoWire {
+            partition: w.partition,
+            earliest_offset: w.earliest,
+            high_watermark: w.high_watermark,
+            next_offset,
+            has_more,
+        });
+    }
+    let next_offset = if windows.is_empty() { 0 } else { lowest_next };
+    Ok((out, any_has_more, next_offset, partitions_wire))
+}
+
 /// Drops every record in `records` (already fetched from `dlq_topic` via
 /// `peek_topic`) that `BusService::dlq_discard` has marked handled — the
 /// `DlqList`/`DlqRetryAll` half of M1-R2 review N-5, coordinator decision 2.
@@ -1000,6 +1221,7 @@ pub async fn bus_dispatch(
             from_offsets,
             limit,
             partition,
+            newest_first,
         } => {
             dlq_list_v1(
                 ctx,
@@ -1009,6 +1231,7 @@ pub async fn bus_dispatch(
                 from_offsets.clone(),
                 *limit,
                 *partition,
+                *newest_first,
             )
             .await?
         }
@@ -1192,6 +1415,11 @@ pub async fn bus_dispatch(
             version,
             deprecate_only,
         } => schema_delete_v1(ctx, instance_id, subject.clone(), *version, *deprecate_only).await?,
+        BusPayload::LagHistoryRequest {
+            topic,
+            group,
+            since_ms,
+        } => lag_history_v1(ctx, instance_id, topic.clone(), group.clone(), *since_ms).await?,
 
         BusPayload::TopicListResponse { .. }
         | BusPayload::TopicCreateResponse { .. }
@@ -1226,7 +1454,8 @@ pub async fn bus_dispatch(
         | BusPayload::SchemaDerivedGetResponse { .. }
         | BusPayload::SchemaRegisterResponse { .. }
         | BusPayload::SchemaCompatibilitySetResponse
-        | BusPayload::SchemaDeleteResponse { .. } => {
+        | BusPayload::SchemaDeleteResponse { .. }
+        | BusPayload::LagHistoryResponse { .. } => {
             return Err(ProtocolError::bad_request(
                 "variant is not routed through bus_dispatch (UserSession tier)",
             ))
@@ -1329,6 +1558,10 @@ register_bus_variant!("BusSchemaGetRequest", "tentaflow_ws_handler_bus_schema_ge
 register_bus_variant!(
     "BusSchemaDerivedGetRequest",
     "tentaflow_ws_handler_bus_schema_derived_get"
+);
+register_bus_variant!(
+    "BusLagHistoryRequest",
+    "tentaflow_ws_handler_bus_lag_history"
 );
 
 // plan-app-platform §4.2/§7 W7: the 11 variants formerly routed through
@@ -1440,9 +1673,12 @@ async fn topic_delete_v1(
     Ok(BusPayload::TopicDeleteResponse)
 }
 
-/// Per-partition `log_end_offset` and per-group lag summary (this file's
-/// module doc, point 2) — both derived by opening consumers, never from a
-/// dedicated stats getter (none exists on `BusService`'s public surface).
+/// Config, per-partition figures and per-group lag of one topic, plus the
+/// caller's own rights on it. Everything below the config needs read access
+/// to the topic; without it the response still carries the config (the
+/// topic list shows it anyway) and `access`, so the UI can say why the rest
+/// is not shown. Lag comes from `BusService::group_lag`, which never writes
+/// the group's `bus_groups` row.
 async fn topic_detail_v1(
     ctx: &HandlerContext,
     instance_id: &str,
@@ -1462,6 +1698,27 @@ async fn topic_detail_v1(
             })
     })
     .await?;
+
+    let svc = g.svc.clone();
+    let bctx_access = bctx.clone();
+    let name_access = name.clone();
+    let (can_read, can_write, topic_admin) =
+        run_blocking(move || Ok(svc.topic_access(&bctx_access, &name_access))).await?;
+    let access = BusTopicAccessWire {
+        can_read,
+        can_write,
+        can_admin: topic_admin && ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin")),
+    };
+    let admin_labels = topic_admin_labels(ctx, &g, &name).await?;
+    if !can_read {
+        return Ok(BusPayload::TopicDetailResponse {
+            topic: topic_config_to_wire(&cfg),
+            partitions: Vec::new(),
+            groups: Vec::new(),
+            access: Some(access),
+            admin_labels,
+        });
+    }
 
     let local_db = g.svc.local_db().clone();
     let org_id2 = g.org_id.clone();
@@ -1520,6 +1777,12 @@ async fn topic_detail_v1(
                             ),
                             None => (Some(local_node_id.clone()), 0, 1, 1, stats.high_watermark),
                         };
+                    // Display-only: a retention sweep racing this read can
+                    // move the floor between the two calls, which leaves
+                    // the time unknown rather than failing the whole view.
+                    let earliest_timestamp_ms = svc
+                        .partition_earliest_timestamp(&bctx2, &name3, partition)
+                        .unwrap_or(None);
                     Ok(BusPartitionInfoWire {
                         partition,
                         log_end_offset: stats.high_watermark,
@@ -1531,6 +1794,7 @@ async fn topic_detail_v1(
                         isr_count,
                         replica_count,
                         high_watermark,
+                        earliest_timestamp_ms,
                     })
                 })
                 .collect()
@@ -1545,26 +1809,13 @@ async fn topic_detail_v1(
         move || -> Result<Vec<BusGroupLagSummaryWire>, ProtocolError> {
             let mut out = Vec::with_capacity(group_rows.len());
             for row in group_rows {
-                let handle = match svc.open_consumer(
-                    &bctx3,
-                    &row.group_id,
-                    std::slice::from_ref(&name4),
-                    bus::ConsumerConfig {
-                        commit_mode: groups::CommitMode::Explicit,
-                    },
-                ) {
-                    Ok(h) => h,
-                    // A group this admin cannot re-authorize for (revoked ACL
-                    // since it last consumed) is skipped rather than failing the
-                    // whole detail view.
-                    Err(_) => continue,
+                // A group whose lag this session cannot read here (revoked
+                // ACL, a partition led by another node) is left out rather
+                // than failing the whole detail view.
+                let Ok(parts) = svc.group_lag(&bctx3, &row.group_id, &name4) else {
+                    continue;
                 };
-                let lag_total: u64 = handle
-                    .lag()
-                    .map_err(map_bus_error)?
-                    .into_iter()
-                    .map(|(_, l)| l)
-                    .sum();
+                let lag_total: u64 = parts.iter().map(|p| p.lag).sum();
                 out.push(BusGroupLagSummaryWire {
                     group: row.group_id,
                     lag_total,
@@ -1579,7 +1830,44 @@ async fn topic_detail_v1(
         topic: topic_config_to_wire(&cfg),
         partitions: partitions_wire,
         groups: groups_wire,
+        access: Some(access),
+        admin_labels,
     })
+}
+
+/// Names of the subjects holding an `admin`/`*` ALLOW row in `topic`'s ACL —
+/// what a caller without admin rights is told ("zmiany może robić …").
+/// Subjects this node cannot name (deleted user/group) are left out: an id
+/// would not tell the reader anything.
+async fn topic_admin_labels(
+    ctx: &HandlerContext,
+    g: &Gate,
+    topic: &str,
+) -> Result<Vec<String>, ProtocolError> {
+    let db = ctx.state.db.clone();
+    let resource_id = crate::services::bus_authorizer::topic_acl_resource_id(
+        g.instance.as_str(),
+        &g.org_id,
+        topic,
+    );
+    run_blocking(move || {
+        let admins: Vec<(String, String)> =
+            repository::resource_permissions::list_for_resource(&db, "topic", &resource_id)
+                .map_err(|e| db_err("resource_permissions::list_for_resource", e))?
+                .into_iter()
+                .filter(|r| r.access_level == "allow" && matches!(r.action.as_str(), "admin" | "*"))
+                .map(|r| (r.subject_type, r.subject_id))
+                .collect();
+        let labels = SubjectLabels::resolve(&db, &admins, &[])?;
+        let mut names: Vec<String> = admins
+            .iter()
+            .filter_map(|(kind, id)| labels.subject(kind, id).0)
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    })
+    .await
 }
 
 // =============================================================================
@@ -1591,25 +1879,42 @@ async fn group_list_v1(
     instance_id: &str,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
     let org_id = g.org_id.clone();
-    let local_db = g.svc.local_db().clone();
-    let rows = run_blocking(move || {
-        repository::bus_group_list(&local_db, &org_id).map_err(|e| db_err("bus_group_list", e))
+    let svc = g.svc.clone();
+    let groups = run_blocking(move || {
+        let rows = repository::bus_group_list(svc.local_db(), &org_id)
+            .map_err(|e| db_err("bus_group_list", e))?;
+        Ok(rows
+            .into_iter()
+            .filter(|g| !is_hidden_group(&g.group_id))
+            .map(|g| BusGroupSummaryWire {
+                lag_total: group_lag_total(&svc, &bctx, &g.group_id, &g.topic),
+                group: g.group_id,
+                topic: g.topic,
+                commit_mode: g.commit_mode,
+                paused: g.paused,
+                created_at_ms: g.created_at_ms,
+                updated_at_ms: g.updated_at_ms,
+            })
+            .collect())
     })
     .await?;
-    let groups = rows
-        .into_iter()
-        .filter(|g| !is_hidden_group(&g.group_id))
-        .map(|g| BusGroupSummaryWire {
-            group: g.group_id,
-            topic: g.topic,
-            commit_mode: g.commit_mode,
-            paused: g.paused,
-            created_at_ms: g.created_at_ms,
-            updated_at_ms: g.updated_at_ms,
-        })
-        .collect();
     Ok(BusPayload::GroupListResponse { groups })
+}
+
+/// A group's lag summed over the topic's partitions, or `None` when this
+/// session cannot measure it on this node (see `BusGroupSummaryWire::
+/// lag_total`'s doc) — never a guessed `0`.
+fn group_lag_total(
+    svc: &bus::BusService,
+    bctx: &BusCallContext,
+    group: &str,
+    topic: &str,
+) -> Option<u64> {
+    svc.group_lag(bctx, group, topic)
+        .ok()
+        .map(|parts| parts.iter().map(|p| p.lag).sum())
 }
 
 async fn group_detail_v1(
@@ -1634,46 +1939,24 @@ async fn group_detail_v1(
     })
     .await?;
 
-    // Follow-up toru P/M1-R2 decision 3: high watermark comes from
-    // `BusService::partition_stats` (a no-consumer-session read) rather than
-    // the old `PROBE_GROUP`-backed second `open_consumer`/`lag()` call —
-    // see this file's module doc. Only the group's OWN lag still needs a
-    // real `open_consumer`, since lag is inherently a property of the
-    // (group, topic) pair.
+    // `group_lag` reads the committed offsets without a consumer session:
+    // opening one here would rewrite this group's `commit_mode` in
+    // `bus_groups` on every poll (the value its own program chose).
     let group2 = group.clone();
     let topic2 = topic.clone();
-    let bctx2 = bctx.clone();
     let svc = g.svc.clone();
-    let partitions = run_blocking(
-        move || -> Result<Vec<BusGroupPartitionDetailWire>, ProtocolError> {
-            let handle = svc
-                .open_consumer(
-                    &bctx,
-                    &group2,
-                    std::slice::from_ref(&topic2),
-                    bus::ConsumerConfig {
-                        commit_mode: groups::CommitMode::Explicit,
-                    },
-                )
-                .map_err(map_bus_error)?;
-            handle
-                .lag()
-                .map_err(map_bus_error)?
-                .into_iter()
-                .map(|(tp, lag)| {
-                    let hw = svc
-                        .partition_stats(&bctx2, &topic2, tp.partition)
-                        .map_err(map_bus_error)?
-                        .high_watermark;
-                    Ok(BusGroupPartitionDetailWire {
-                        partition: tp.partition,
-                        committed_offset: hw.saturating_sub(lag),
-                        lag,
-                    })
-                })
-                .collect()
-        },
-    )
+    let partitions = run_blocking(move || {
+        Ok(svc
+            .group_lag(&bctx, &group2, &topic2)
+            .map_err(map_bus_error)?
+            .into_iter()
+            .map(|p| BusGroupPartitionDetailWire {
+                partition: p.partition,
+                committed_offset: p.committed_offset,
+                lag: p.lag,
+            })
+            .collect())
+    })
     .await?;
 
     Ok(BusPayload::GroupDetailResponse {
@@ -1862,6 +2145,7 @@ async fn messages_browse_v1(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dlq_list_v1(
     ctx: &HandlerContext,
     instance_id: &str,
@@ -1870,8 +2154,18 @@ async fn dlq_list_v1(
     from_offsets: Vec<BusPartitionOffsetWire>,
     limit: u32,
     partition: Option<u32>,
+    newest_first: bool,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
+    // The scalar applies one bound to every partition, which backwards
+    // paging cannot honour: each partition's next page ends at its OWN
+    // `next_offset`, so one shared value would skip records.
+    if newest_first && from_offset.is_some() {
+        return Err(ProtocolError::bad_request(
+            "bus.invalid_argument: newest_first pages with from_offsets (one bound per \
+             partition); the scalar from_offset is not accepted with it",
+        ));
+    }
     let bctx = bus_ctx(ctx, &g);
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
@@ -1895,14 +2189,25 @@ async fn dlq_list_v1(
     let dlq_topic_for_fetch = dlq_topic.clone();
     let dlq_topic_for_filter = dlq_topic.clone();
     let (records, has_more, next_offset, partitions_wire) = run_blocking(move || {
-        let (records, has_more, next_offset, partitions_wire) = peek_topic(
-            &bctx,
-            &dlq_topic_for_fetch,
-            partitions,
-            &starts,
-            limit,
-            partition,
-        )?;
+        let (records, has_more, next_offset, partitions_wire) = if newest_first {
+            peek_dlq_newest_first(
+                &bctx,
+                &dlq_topic_for_fetch,
+                partitions,
+                &starts,
+                limit,
+                partition,
+            )?
+        } else {
+            peek_topic(
+                &bctx,
+                &dlq_topic_for_fetch,
+                partitions,
+                &starts,
+                limit,
+                partition,
+            )?
+        };
         // M1-R2 review N-5, coordinator decision 2: `peek` itself stays
         // discard-unaware (it also backs `MessagesBrowse`, which never
         // reads a DLQ topic) — filtering a discarded record out of what
@@ -2050,22 +2355,32 @@ async fn acl_list_v1(
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
     let org_id = g.org_id.clone();
-    let rows = run_blocking(move || {
+    let entries = run_blocking(move || {
         let resource_id =
             crate::services::bus_authorizer::topic_acl_resource_id(&instance, &org_id, &topic);
-        repository::resource_permissions::list_for_resource(&db, "topic", &resource_id)
-            .map_err(|e| db_err("resource_permissions::list_for_resource", e))
+        let rows = repository::resource_permissions::list_for_resource(&db, "topic", &resource_id)
+            .map_err(|e| db_err("resource_permissions::list_for_resource", e))?;
+        let subjects: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.subject_type.clone(), r.subject_id.clone()))
+            .collect();
+        let labels = SubjectLabels::resolve(&db, &subjects, &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let (subject_label, member_count) = labels.subject(&r.subject_type, &r.subject_id);
+                BusAclEntryWire {
+                    subject_type: r.subject_type,
+                    subject_id: r.subject_id,
+                    access_level: r.access_level,
+                    action: r.action,
+                    subject_label,
+                    member_count,
+                }
+            })
+            .collect())
     })
     .await?;
-    let entries = rows
-        .into_iter()
-        .map(|r| BusAclEntryWire {
-            subject_type: r.subject_type,
-            subject_id: r.subject_id,
-            access_level: r.access_level,
-            action: r.action,
-        })
-        .collect();
     Ok(BusPayload::AclListResponse { entries })
 }
 
@@ -2178,9 +2493,14 @@ async fn field_policy_list_v1(
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
     let policies = run_blocking(move || {
-        field_policies::list_policies(&db, &instance, &org_id, &topic)
-            .map_err(map_bus_error)?
-            .into_iter()
+        let rows = field_policies::list_policies(&db, &instance, &org_id, &topic)
+            .map_err(map_bus_error)?;
+        let subjects: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.subject_type.clone(), r.subject_id.clone()))
+            .collect();
+        let labels = SubjectLabels::resolve(&db, &subjects, &[])?;
+        rows.into_iter()
             .map(|row| {
                 let subject_type = row.subject_type.clone();
                 let subject_id = row.subject_id.clone();
@@ -2188,6 +2508,7 @@ async fn field_policy_list_v1(
                 let created_at_ms = row.created_at_ms;
                 let updated_at_ms = row.updated_at_ms;
                 let row_topic = row.topic.clone();
+                let (subject_label, member_count) = labels.subject(&subject_type, &subject_id);
                 field_policies::decode(row, &row_topic)
                     .map(|p| BusFieldPolicyWire {
                         subject_type,
@@ -2197,6 +2518,8 @@ async fn field_policy_list_v1(
                         required_fields: p.required_fields.into_iter().collect(),
                         created_at_ms,
                         updated_at_ms,
+                        subject_label,
+                        member_count,
                     })
                     .map_err(map_bus_error)
             })
@@ -2312,8 +2635,13 @@ async fn field_policy_delete_v1(
 // are `gate_admin` (a bound schema can start DLQ-diverting live traffic).
 // =============================================================================
 
-fn schema_subject_to_wire(info: schema_registry::registry::SubjectInfo) -> BusSchemaSubjectWire {
+fn schema_subject_to_wire(
+    info: schema_registry::registry::SubjectInfo,
+    used_by_topics: Vec<String>,
+    labels: &SubjectLabels,
+) -> BusSchemaSubjectWire {
     BusSchemaSubjectWire {
+        created_by_label: info.created_by.as_deref().and_then(|a| labels.actor(a)),
         subject: info.subject,
         schema_type: info.schema_type.as_str().to_string(),
         compatibility: info.compatibility.as_str().to_string(),
@@ -2322,11 +2650,16 @@ fn schema_subject_to_wire(info: schema_registry::registry::SubjectInfo) -> BusSc
         created_by: info.created_by,
         created_at_ms: info.created_at_ms,
         updated_at_ms: info.updated_at_ms,
+        used_by_topics,
     }
 }
 
-fn schema_version_to_wire(info: schema_registry::registry::VersionInfo) -> BusSchemaVersionWire {
+fn schema_version_to_wire(
+    info: schema_registry::registry::VersionInfo,
+    labels: &SubjectLabels,
+) -> BusSchemaVersionWire {
     BusSchemaVersionWire {
+        created_by_label: info.created_by.as_deref().and_then(|a| labels.actor(a)),
         subject: info.subject,
         version: info.version,
         schema_ref_id: info.schema_ref_id,
@@ -2345,10 +2678,24 @@ async fn schema_subject_list_v1(
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
     let subjects = run_blocking(move || {
-        schema_registry::registry::list_subjects(&db, &instance, &org_id).map_err(map_bus_error)
+        let subjects = schema_registry::registry::list_subjects(&db, &instance, &org_id)
+            .map_err(map_bus_error)?;
+        let mut used_by = schema_registry::registry::topics_by_subject(&db, &instance, &org_id)
+            .map_err(map_bus_error)?;
+        let actors: Vec<String> = subjects
+            .iter()
+            .filter_map(|s| s.created_by.clone())
+            .collect();
+        let labels = SubjectLabels::resolve(&db, &[], &actors)?;
+        Ok(subjects
+            .into_iter()
+            .map(|info| {
+                let topics = used_by.remove(&info.subject).unwrap_or_default();
+                schema_subject_to_wire(info, topics, &labels)
+            })
+            .collect())
     })
     .await?;
-    let subjects = subjects.into_iter().map(schema_subject_to_wire).collect();
     Ok(BusPayload::SchemaSubjectListResponse { subjects })
 }
 
@@ -2362,11 +2709,19 @@ async fn schema_version_list_v1(
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
     let versions = run_blocking(move || {
-        schema_registry::registry::list_versions(&db, &instance, &org_id, &subject)
-            .map_err(map_bus_error)
+        let versions = schema_registry::registry::list_versions(&db, &instance, &org_id, &subject)
+            .map_err(map_bus_error)?;
+        let actors: Vec<String> = versions
+            .iter()
+            .filter_map(|v| v.created_by.clone())
+            .collect();
+        let labels = SubjectLabels::resolve(&db, &[], &actors)?;
+        Ok(versions
+            .into_iter()
+            .map(|v| schema_version_to_wire(v, &labels))
+            .collect())
     })
     .await?;
-    let versions = versions.into_iter().map(schema_version_to_wire).collect();
     Ok(BusPayload::SchemaVersionListResponse { versions })
 }
 
@@ -2380,13 +2735,20 @@ async fn schema_get_v1(
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
-    let (info, schema_text) = run_blocking(move || {
-        schema_registry::registry::get(&db, &instance, &org_id, &subject, version)
-            .map_err(map_bus_error)
+    let (schema, schema_text) = run_blocking(move || {
+        let (info, schema_text) =
+            schema_registry::registry::get(&db, &instance, &org_id, &subject, version)
+                .map_err(map_bus_error)?;
+        let labels = SubjectLabels::resolve(
+            &db,
+            &[],
+            &info.created_by.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        Ok((schema_version_to_wire(info, &labels), schema_text))
     })
     .await?;
     Ok(BusPayload::SchemaGetResponse {
-        schema: schema_version_to_wire(info),
+        schema,
         schema_text,
     })
 }
@@ -2552,10 +2914,13 @@ async fn schema_delete_v1(
     // decision 3); a real delete of one or more immutable versions is not
     // — distinct audit actions so an operator reviewing the log does not
     // have to inspect `details` to tell them apart.
-    let action = if deprecate_only {
-        "bus.schema.deprecate"
+    let (action, details) = if deprecate_only {
+        ("bus.schema.deprecate", "deprecated=true".to_string())
     } else {
-        "bus.schema.delete"
+        (
+            "bus.schema.delete",
+            format!("versions={removed_versions:?}"),
+        )
     };
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -2563,11 +2928,14 @@ async fn schema_delete_v1(
         None,
         action,
         Some(&subject),
-        Some(&format!("versions={removed_versions:?}")),
+        Some(&details),
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(BusPayload::SchemaDeleteResponse { removed_versions })
+    Ok(BusPayload::SchemaDeleteResponse {
+        removed_versions,
+        deprecated: deprecate_only,
+    })
 }
 
 // =============================================================================
@@ -2575,35 +2943,41 @@ async fn schema_delete_v1(
 // instead — see this file's module doc)
 // =============================================================================
 
-/// Sum of `high_watermark - earliest_offset` across every partition of
-/// `source_topic`'s derived `__dlq.<source_topic>` topic, minus every
-/// offset in that range marked discarded (`BusService::dlq_discard`, M1-R2
-/// review N-5, coordinator decision 2) — `0` when the DLQ topic does not
-/// exist yet (the source topic has never needed its DLQ), a normal
-/// outcome, not an error (follow-up toru P task 3).
-fn dlq_depth_for(
+/// DLQ figures of one source topic for `StatsSnapshot`: records waiting
+/// (discarded ones excluded — M1-R2 review N-5, coordinator decision 2), how
+/// many of them arrived since `since_ms`, and when the newest arrived. All
+/// zero/`None` when `__dlq.<source_topic>` does not exist yet (the source
+/// topic has never needed its DLQ) — a normal outcome, not an error — and
+/// when this session cannot read the DLQ.
+#[derive(Debug, Default, Clone, Copy)]
+struct DlqStats {
+    depth: u64,
+    arrived_since: u64,
+    last_at_ms: Option<i64>,
+}
+
+fn dlq_stats_for(
     svc: &bus::BusService,
     bctx: &BusCallContext,
-    db: &crate::db::DbPool,
-    org_id: &str,
+    dlq_exists: bool,
     source_topic: &str,
-) -> u64 {
-    let dlq_topic = dlq::dlq_topic_name(source_topic);
-    let Ok(Some(dlq_cfg)) = topics::get_topic(db, svc.instance_id(), org_id, &dlq_topic) else {
-        return 0;
-    };
-    (0..dlq_cfg.partitions)
-        .filter_map(|p| {
-            let stats = svc.partition_stats(bctx, &dlq_topic, p).ok()?;
-            let raw = stats.high_watermark.saturating_sub(stats.earliest_offset);
-            let discarded = svc
-                .dlq_discarded_offsets(bctx, &dlq_topic, p)
-                .map(|offsets| offsets.len() as u64)
-                .unwrap_or(0);
-            Some(raw.saturating_sub(discarded))
-        })
-        .sum()
+    since_ms: i64,
+) -> DlqStats {
+    if !dlq_exists {
+        return DlqStats::default();
+    }
+    match svc.dlq_recency(bctx, &dlq::dlq_topic_name(source_topic), since_ms) {
+        Ok(r) => DlqStats {
+            depth: r.waiting,
+            arrived_since: r.arrived_since,
+            last_at_ms: r.last_arrival_ms,
+        },
+        Err(_) => DlqStats::default(),
+    }
 }
+
+/// "N w ostatniej godzinie" window of `BusTopicStatsWire::dlq_last_hour`.
+const DLQ_RECENT_WINDOW_MS: i64 = 60 * 60 * 1000;
 
 async fn stats_snapshot_v1(
     ctx: &HandlerContext,
@@ -2645,35 +3019,49 @@ async fn stats_snapshot_v1(
     // stay O(groups), not O(topics × groups); rates/disk-bytes/dlq_depth
     // are cheap per-topic reads (`topic_rates` is an in-memory lookup,
     // `partition_stats` opens an already-cached `Partition` handle).
-    let db2 = ctx.state.db.clone();
     let org_id2 = g.org_id.clone();
     let bctx2 = bctx.clone();
     let svc2 = g.svc.clone();
-    let (topics_wire, total_lag, total_dlq_depth, total_bytes_on_disk) = run_blocking(
-        move || -> Result<(Vec<BusTopicStatsWire>, u64, u64, u64), ProtocolError> {
+    type SnapshotParts = (
+        Vec<BusTopicStatsWire>,
+        Vec<BusGroupStatsWire>,
+        u64,
+        u64,
+        u64,
+    );
+    let (topics_wire, groups_wire, total_lag, total_dlq_depth, total_bytes_on_disk) =
+        run_blocking(move || -> Result<SnapshotParts, ProtocolError> {
             let svc = svc2;
+            let dlq_since_ms = bus::now_ms() - DLQ_RECENT_WINDOW_MS;
             let mut lag_by_topic: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
+            let mut groups_wire = Vec::with_capacity(groups.len());
             for row in &groups {
-                let handle = match svc.open_consumer(
-                    &bctx2,
-                    &row.group_id,
-                    std::slice::from_ref(&row.topic),
-                    bus::ConsumerConfig {
-                        commit_mode: groups::CommitMode::Explicit,
-                    },
-                ) {
-                    Ok(h) => h,
-                    // A group this session cannot re-authorize for (revoked
-                    // ACL) is skipped rather than failing the whole
-                    // snapshot — same tolerance `topic_detail_v1` already
-                    // has for its own per-group lag loop.
-                    Err(_) => continue,
-                };
-                if let Ok(lag) = handle.lag() {
-                    let sum: u64 = lag.into_iter().map(|(_, l)| l).sum();
-                    *lag_by_topic.entry(row.topic.clone()).or_insert(0) += sum;
+                // Read without a consumer session (`BusService::group_lag`):
+                // this handler is polled every few seconds, and opening a
+                // consumer used to overwrite every group's `commit_mode`.
+                // A group this session cannot measure here keeps `None` and
+                // stays out of the per-topic sum.
+                let lag_total = group_lag_total(&svc, &bctx2, &row.group_id, &row.topic);
+                if let Some(lag) = lag_total {
+                    *lag_by_topic.entry(row.topic.clone()).or_insert(0) += lag;
                 }
+                // The trend is derived from the same lag, so it is shown
+                // only to a caller allowed to read that lag here — never
+                // "rośnie od …" for a group whose lag the caller may not see.
+                let trend = if lag_total.is_some() {
+                    svc.lag_trend(&org_id2, &row.group_id, &row.topic)
+                } else {
+                    bus::lag_history::LagTrend::default()
+                };
+                groups_wire.push(BusGroupStatsWire {
+                    group: row.group_id.clone(),
+                    topic: row.topic.clone(),
+                    lag_total,
+                    paused: row.paused,
+                    lag_rising_since_ms: trend.rising_since_ms,
+                    consume_rate_per_min: trend.consume_rate_per_min,
+                });
             }
 
             let mut topics_wire = Vec::new();
@@ -2684,22 +3072,27 @@ async fn stats_snapshot_v1(
             // real disk usage and the UI reconciles the per-topic column with
             // the org-wide total. A DLQ topic has no DLQ of its own, so its
             // `dlq_depth` is 0 and it never feeds `total_dlq_depth`.
+            // The DLQs that exist, from the list already in hand — no
+            // per-topic lookup.
+            let existing: std::collections::HashSet<&str> =
+                topics.iter().map(|t| t.name.as_str()).collect();
             for cfg in topics.iter() {
                 let is_dlq = cfg.name.starts_with(dlq::DLQ_TOPIC_PREFIX);
                 let (msgs_in_per_sec, bytes_in_per_sec) = svc.topic_rates(&org_id2, &cfg.name);
-                let topic_bytes_on_disk: u64 = (0..cfg.partitions)
-                    .filter_map(|p| svc.partition_stats(&bctx2, &cfg.name, p).ok())
-                    .map(|s| s.size_bytes)
-                    .sum();
+                let topic_bytes_on_disk: u64 = svc
+                    .topic_partition_stats(&bctx2, &cfg.name)
+                    .map(|parts| parts.iter().map(|s| s.size_bytes).sum())
+                    .unwrap_or(0);
                 let topic_lag = lag_by_topic.get(&cfg.name).copied().unwrap_or(0);
-                let dlq_depth = if is_dlq {
-                    0
+                let dlq = if is_dlq {
+                    DlqStats::default()
                 } else {
-                    dlq_depth_for(&svc, &bctx2, &db2, &org_id2, &cfg.name)
+                    let dlq_exists = existing.contains(dlq::dlq_topic_name(&cfg.name).as_str());
+                    dlq_stats_for(&svc, &bctx2, dlq_exists, &cfg.name, dlq_since_ms)
                 };
 
                 total_lag += topic_lag;
-                total_dlq_depth += dlq_depth;
+                total_dlq_depth += dlq.depth;
                 total_bytes_on_disk += topic_bytes_on_disk;
 
                 topics_wire.push(BusTopicStatsWire {
@@ -2708,13 +3101,20 @@ async fn stats_snapshot_v1(
                     bytes_in_per_sec,
                     total_bytes_on_disk: topic_bytes_on_disk,
                     total_lag: topic_lag,
-                    dlq_depth,
+                    dlq_depth: dlq.depth,
+                    dlq_last_hour: dlq.arrived_since,
+                    dlq_last_at_ms: dlq.last_at_ms,
                 });
             }
-            Ok((topics_wire, total_lag, total_dlq_depth, total_bytes_on_disk))
-        },
-    )
-    .await?;
+            Ok((
+                topics_wire,
+                groups_wire,
+                total_lag,
+                total_dlq_depth,
+                total_bytes_on_disk,
+            ))
+        })
+        .await?;
 
     let total_msgs_in_per_sec: u32 = topics_wire
         .iter()
@@ -2735,7 +3135,85 @@ async fn stats_snapshot_v1(
             total_lag,
             total_dlq_depth,
             topics: topics_wire,
+            groups: groups_wire,
         },
+    })
+}
+
+// =============================================================================
+// Lag / DLQ history (PLAN-UI-20260923 B1b) — the persisted per-minute samples
+// `bus::lag_history` keeps for 24 h on this node.
+// =============================================================================
+
+/// Group series one `LagHistoryResponse` carries at most (see the wire doc
+/// for the size this bounds).
+const LAG_HISTORY_MAX_SERIES: usize = 64;
+
+/// `bus.read`; the service drops every series of a topic the caller may not
+/// consume, and hidden `tf-*` groups are dropped here like everywhere else.
+async fn lag_history_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    topic: Option<String>,
+    group: Option<String>,
+    since_ms: Option<i64>,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    if topic.is_none() && group.is_none() {
+        return Err(ProtocolError::bad_request(
+            "bus.invalid_argument: lag history needs a topic or a group",
+        ));
+    }
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
+    let since_ms = since_ms
+        .unwrap_or(0)
+        .max(bus::now_ms() - bus::lag_history::RETENTION_MS);
+    let (groups, dlqs) = run_blocking(move || {
+        svc.lag_history(&bctx, topic.as_deref(), group.as_deref(), since_ms)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    let mut groups: Vec<_> = groups
+        .into_iter()
+        .filter(|s| !is_hidden_group(&s.group_id))
+        .collect();
+    let truncated = groups.len() > LAG_HISTORY_MAX_SERIES;
+    groups.truncate(LAG_HISTORY_MAX_SERIES);
+    Ok(BusPayload::LagHistoryResponse {
+        truncated,
+        groups: groups
+            .into_iter()
+            .map(|s| BusGroupLagSeriesWire {
+                group: s.group_id,
+                topic: s.topic,
+                samples: s
+                    .points
+                    .into_iter()
+                    .map(|p| BusLagSampleWire {
+                        at_ms: p.at_ms,
+                        lag_total: p.lag_total,
+                        committed_total: p.committed_total,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        topics: dlqs
+            .into_iter()
+            .map(|s| BusTopicDlqSeriesWire {
+                topic: s.topic,
+                samples: s
+                    .points
+                    .into_iter()
+                    .map(|p| BusDlqSampleWire {
+                        at_ms: p.at_ms,
+                        dlq_depth: p.dlq_depth,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        sample_interval_ms: u64::try_from(bus::lag_history::SAMPLE_INTERVAL.as_millis())
+            .unwrap_or(u64::MAX),
     })
 }
 
@@ -2751,6 +3229,10 @@ async fn stats_snapshot_v1(
 /// exist/is disabled, gets the same `PolicyDenied`/`AppUnavailable` every
 /// other `gate_read` caller gets. `can_read` itself is therefore always
 /// `true` in a successful response: reaching this line already proved it.
+/// The one read-side field policy action implemented today: a field outside
+/// the policy's allow-list is removed (`field_policies::project_read`).
+const FIELD_ACTION_HIDE: &str = "hide";
+
 async fn capabilities_v1(
     ctx: &HandlerContext,
     instance_id: &str,
@@ -2767,6 +3249,10 @@ async fn capabilities_v1(
             .is_granted()
     };
     let is_org_admin = ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"));
+    let svc = g.svc.clone();
+    let org_id = g.org_id.clone();
+    let (default_replication_factor, node_count) =
+        run_blocking(move || Ok(svc.default_replication(&org_id))).await?;
     let capabilities = BusCapabilitiesWire {
         can_read: true,
         can_write: can(PERM_WRITE),
@@ -2774,6 +3260,18 @@ async fn capabilities_v1(
         // an operator with delegated bus.admin sees buttons that always 403.
         can_admin: can(PERM_ADMIN) && is_org_admin,
         is_site_admin: SessionAuthKind::Admin.session_satisfies(&ctx.session),
+        default_replication_factor,
+        node_count,
+        content_types: bus::payload_format::PayloadFormat::ALL
+            .iter()
+            .map(|f| f.canonical_content_type().to_string())
+            .collect(),
+        schema_types: schema_registry::SchemaType::ALL
+            .iter()
+            .filter(|t| t.has_validator())
+            .map(|t| t.as_str().to_string())
+            .collect(),
+        field_actions: vec![FIELD_ACTION_HIDE.to_string()],
     };
     Ok(BusPayload::CapabilitiesResponse { capabilities })
 }
@@ -2850,6 +3348,15 @@ fn partition_replica_wire(p: &PartitionReplicaInfo) -> BusPartitionReplicaWire {
 ///     was no prior leader for this partition).
 const BUS_FAILOVER_AUDIT_ACTION: &str = "bus.leader.failover";
 
+/// Audit action of a manual leader transfer (`leader_transfer_v1`). Its
+/// details: `instance_id=<id> org_id=<org> partition=<u32> from_node=<id|->
+/// from_epoch=<u32> target_node_id=<id> leader_epoch=<u32> duration_ms=<u64>`.
+const BUS_LEADER_TRANSFER_AUDIT_ACTION: &str = "bus.leader.transfer";
+
+/// `BusFailoverEventWire::reason` of a manual transfer — failover reasons
+/// come from the replication layer, a transfer has none of its own.
+const LEADER_TRANSFER_REASON: &str = "manual_transfer";
+
 /// Upper bound on `audit_log` rows scanned per `ReplicaList` call — `audit_
 /// log` has no `org_id`/tenant column (PLAN-M2 §1f's own note: sourced from
 /// the existing table, no new one), so this handler filters by `org_id=`
@@ -2862,6 +3369,14 @@ const BUS_FAILOVER_AUDIT_SCAN_LIMIT: i64 = 1000;
 /// — the M06 timeline is a recent-history strip, not a full audit export
 /// (that already exists as the separate, generic audit log viewer).
 const BUS_FAILOVER_HISTORY_MAX: usize = 50;
+
+/// A value safe to embed in `key=value` audit details (`parse_audit_kv`).
+fn valid_audit_token(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '=')
+}
 
 fn parse_audit_kv(details: &str) -> std::collections::HashMap<&str, &str> {
     details
@@ -2876,21 +3391,45 @@ fn parse_audit_kv(details: &str) -> std::collections::HashMap<&str, &str> {
 /// (wave 1, agent EL owns that implementor), so this list is correct even
 /// before/without a coordinator wired up, and does not depend on EL having
 /// mirrored the SAME audit rows into its own snapshot type.
+///
+/// Manual transfers (`bus.leader.transfer`, written by `leader_transfer_v1`
+/// with the same `key=value` details plus `target_node_id`) are part of the
+/// same timeline — T10's "historia przejęć" lists both — and are the rows
+/// that carry an actor, reported as `actor_label`. A transfer row written
+/// before its details carried `org_id` cannot be attributed to an org and is
+/// skipped, like any other row of a foreign org.
+///
+/// Rows are matched on `instance_id` as well as `org_id`: two instances of
+/// one org may host the same topic name, and their timelines must not mix.
+/// A row without `instance_id` (written before the field existed, or by an
+/// instance-anonymous `AuditLogReplAudit::new`, which writes `-`) cannot be
+/// attributed to an instance and is left out.
 fn failover_events_from_audit(
     db: &crate::db::DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: Option<&str>,
 ) -> Result<Vec<BusFailoverEventWire>, ProtocolError> {
-    let rows = repository::list_audit_logs(
-        db,
-        &crate::db::models::AuditLogFilters {
-            action: Some(BUS_FAILOVER_AUDIT_ACTION.to_string()),
-            ..Default::default()
-        },
-        0,
-        BUS_FAILOVER_AUDIT_SCAN_LIMIT,
-    )
-    .map_err(|e| db_err("list_audit_logs(bus.leader.failover)", e))?;
+    let mut rows = Vec::new();
+    for action in [BUS_FAILOVER_AUDIT_ACTION, BUS_LEADER_TRANSFER_AUDIT_ACTION] {
+        rows.extend(
+            repository::list_audit_logs(
+                db,
+                &crate::db::models::AuditLogFilters {
+                    action: Some(action.to_string()),
+                    ..Default::default()
+                },
+                0,
+                BUS_FAILOVER_AUDIT_SCAN_LIMIT,
+            )
+            .map_err(|e| db_err("list_audit_logs(bus.leader.*)", e))?,
+        );
+    }
+    // Newest first across both actions; `id` breaks ties inside one second
+    // (the precision `audit_log.timestamp` has).
+    rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.id.cmp(&a.id)));
+    let actors: Vec<String> = rows.iter().filter_map(|r| r.user_id.clone()).collect();
+    let labels = SubjectLabels::resolve(db, &[], &actors)?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -2907,10 +3446,18 @@ fn failover_events_from_audit(
         }
         let details = row.details.unwrap_or_default();
         let kv = parse_audit_kv(&details);
-        if kv.get("org_id").copied() != Some(org_id) {
+        if kv.get("org_id").copied() != Some(org_id)
+            || kv.get("instance_id").copied() != Some(instance_id)
+        {
             continue;
         }
-        let Some(to_node) = row.node_id.clone() else {
+        let is_transfer = row.action == BUS_LEADER_TRANSFER_AUDIT_ACTION;
+        let to_node = if is_transfer {
+            kv.get("target_node_id").map(|v| v.to_string())
+        } else {
+            row.node_id.clone()
+        };
+        let Some(to_node) = to_node else {
             continue;
         };
         let partition: u32 = kv
@@ -2925,12 +3472,24 @@ fn failover_events_from_audit(
             .get("from_epoch")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let to_epoch: u32 = kv.get("to_epoch").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let to_epoch: u32 = kv
+            .get(if is_transfer {
+                "leader_epoch"
+            } else {
+                "to_epoch"
+            })
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let duration_ms: u64 = kv
             .get("duration_ms")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let reason = kv.get("reason").copied().unwrap_or("").to_string();
+        let reason = if is_transfer {
+            LEADER_TRANSFER_REASON.to_string()
+        } else {
+            kv.get("reason").copied().unwrap_or("").to_string()
+        };
+        let actor_label = row.user_id.as_deref().and_then(|u| labels.actor(u));
         // `audit_log.timestamp` is `%Y-%m-%d %H:%M:%S` UTC, second precision
         // (`log_audit_conn`'s own format) — the only precision this table
         // has, not a limitation introduced here.
@@ -2947,6 +3506,7 @@ fn failover_events_from_audit(
             to_epoch,
             duration_ms,
             reason,
+            actor_label,
         });
     }
     Ok(out)
@@ -3056,8 +3616,10 @@ async fn replica_list_v1(
     })
     .await?;
 
+    let instance = g.instance.as_str().to_string();
     let failovers =
-        run_blocking(move || failover_events_from_audit(&db, &org_id, topic.as_deref())).await?;
+        run_blocking(move || failover_events_from_audit(&db, &instance, &org_id, topic.as_deref()))
+            .await?;
 
     Ok(BusPayload::ReplicaListResponse {
         nodes,
@@ -3172,6 +3734,15 @@ async fn leader_transfer_v1(
             "bus.invalid_argument: target_node_id must not be empty",
         ));
     }
+    // The id lands in `key=value` audit details that
+    // `failover_events_from_audit` splits on whitespace and `=`; one that
+    // contains either could forge or shadow the row's other fields.
+    if !valid_audit_token(&target_node_id) {
+        return Err(ProtocolError::bad_request(
+            "bus.invalid_argument: target_node_id must not contain whitespace, '=' or \
+             control characters",
+        ));
+    }
 
     let topic_for_check = topic.clone();
     let org_id_for_check = org_id.clone();
@@ -3196,33 +3767,51 @@ async fn leader_transfer_v1(
     let org_id_for_call = org_id.clone();
     let target_for_call = target_node_id.clone();
     let svc = g.svc.clone();
-    let leader_epoch = run_blocking(move || -> Result<u32, ProtocolError> {
-        let svc = svc;
-        let coordinator = svc.replication().ok_or_else(|| {
-            ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "bus.replication_disabled: no replication coordinator installed on this node",
-            )
-        })?;
-        coordinator
-            .transfer_leader(
-                &org_id_for_call,
-                &topic_for_call,
-                partition,
-                &target_for_call,
-            )
-            .map_err(map_repl_error)
-    })
+    let (leader_epoch, from_node, from_epoch, duration_ms) = run_blocking(
+        move || -> Result<(u32, Option<String>, u32, u64), ProtocolError> {
+            let svc = svc;
+            let coordinator = svc.replication().ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::NotAvailable,
+                    "bus.replication_disabled: no replication coordinator installed on this node",
+                )
+            })?;
+            let before = coordinator
+                .snapshot(&org_id_for_call, Some(&topic_for_call))
+                .partitions
+                .into_iter()
+                .find(|p| p.partition == partition);
+            let started = std::time::Instant::now();
+            let leader_epoch = coordinator
+                .transfer_leader(
+                    &org_id_for_call,
+                    &topic_for_call,
+                    partition,
+                    &target_for_call,
+                )
+                .map_err(map_repl_error)?;
+            Ok((
+                leader_epoch,
+                before.as_ref().and_then(|p| p.leader_node_id.clone()),
+                before.map(|p| p.leader_epoch).unwrap_or(0),
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ))
+        },
+    )
     .await?;
 
     let _ = repository::log_audit(
         &db,
         Some(&user_id),
         None,
-        "bus.leader.transfer",
+        BUS_LEADER_TRANSFER_AUDIT_ACTION,
         Some(&topic),
         Some(&format!(
-            "partition={partition} target_node_id={target_node_id} leader_epoch={leader_epoch}"
+            "instance_id={} org_id={org_id} partition={partition} from_node={} \
+             from_epoch={from_epoch} target_node_id={target_node_id} \
+             leader_epoch={leader_epoch} duration_ms={duration_ms}",
+            g.instance.as_str(),
+            from_node.as_deref().unwrap_or("-")
         )),
         None,
         Some(&local_node_id),
@@ -3322,6 +3911,7 @@ fn quota_set_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::groups;
     use crate::db::models::AuditLogFilters;
     use crate::db::DbPool;
     use std::sync::{Mutex, OnceLock};
@@ -3569,6 +4159,7 @@ mod tests {
             vec![],
             10,
             None,
+            false,
         )
         .await
         .expect("dlq list")
@@ -4313,6 +4904,16 @@ mod tests {
                 assert!(capabilities.can_read);
                 assert!(capabilities.can_write);
                 assert!(!capabilities.can_admin, "org has no bus.admin permission");
+                // No replication coordinator on the fixture: this node is
+                // the only replica, exactly what `create_topic` would use.
+                assert_eq!(capabilities.default_replication_factor, 1);
+                assert_eq!(capabilities.node_count, 1);
+                assert_eq!(
+                    capabilities.content_types,
+                    vec!["application/json", "application/xml", "application/hl7-v2"]
+                );
+                assert_eq!(capabilities.schema_types, vec!["json_schema"]);
+                assert_eq!(capabilities.field_actions, vec!["hide"]);
                 // `handler_ctx` always mints an "admin"-role `UserSession`
                 // (see its own doc) — this is the SEPARATE
                 // `SessionAuthKind::Admin` site-admin tier, independent of
@@ -5343,12 +5944,16 @@ mod tests {
             subject_id: "u-target".to_string(),
             access_level: "deny".to_string(),
             action: "write".to_string(),
+            subject_label: None,
+            member_count: None,
         }));
         assert!(entries.contains(&BusAclEntryWire {
             subject_type: "user".to_string(),
             subject_id: "u-target".to_string(),
             access_level: "allow".to_string(),
             action: "read".to_string(),
+            subject_label: None,
+            member_count: None,
         }));
 
         // Clearing the `write` row must leave the `read` row untouched.
@@ -5377,6 +5982,8 @@ mod tests {
                 subject_id: "u-target".to_string(),
                 access_level: "allow".to_string(),
                 action: "read".to_string(),
+                subject_label: None,
+                member_count: None,
             }],
             "clearing 'write' must not remove the separately-set 'read' row"
         );
@@ -5654,8 +6261,12 @@ mod tests {
         .await
         .expect("delete must succeed");
         match deleted {
-            BusPayload::SchemaDeleteResponse { removed_versions } => {
+            BusPayload::SchemaDeleteResponse {
+                removed_versions,
+                deprecated,
+            } => {
                 assert_eq!(removed_versions, vec![1]);
+                assert!(!deprecated);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -6021,6 +6632,929 @@ mod tests {
                 return Some((name, &source[body_start..i], i));
             }
             search_from = name_end.max(kw_start + 3);
+        }
+    }
+
+    // =========================================================================
+    // PLAN-UI-20260923 B1 / B1b
+    // =========================================================================
+
+    /// A fresh admin session on the shared fixture instance: `(ctx, org_id,
+    /// user_id)`.
+    fn admin_session(db: &DbPool) -> (HandlerContext, String, String) {
+        let user_id = format!("u-b1-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(db, &user_id, "org_admin");
+        let ctx = handler_ctx(db.clone(), org_context(&org_id, &user_id, &["org.admin"]));
+        (ctx, org_id, user_id)
+    }
+
+    /// Publishes `(payload, timestamp_ms)` records to partition 0 of `topic`.
+    async fn publish_records(ctx: &HandlerContext, topic: &str, records: Vec<(String, i64)>) {
+        let g = gate_read(ctx, fixture_instance_id().as_str()).expect("gate");
+        let svc = g.svc.clone();
+        let bctx = bus_ctx(ctx, &g);
+        let topic = topic.to_string();
+        tokio::task::spawn_blocking(move || {
+            svc.publish(
+                &bctx,
+                &topic,
+                bus::PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: records
+                        .into_iter()
+                        .map(|(payload, timestamp_ms)| bus::PublishRecord {
+                            key: None,
+                            headers: vec![],
+                            payload: Bytes::from(payload),
+                            timestamp_ms,
+                            schema_id: 0,
+                        })
+                        .collect(),
+                },
+            )
+            .expect("publish");
+        })
+        .await
+        .expect("publish task");
+    }
+
+    fn seed_user(db: &DbPool, user_id: &str, display_name: &str) {
+        db.write()
+            .unwrap()
+            .execute(
+                "INSERT INTO user_accounts (id, username, password_hash, display_name) \
+                 VALUES (?1, ?2, 'x', ?3)",
+                rusqlite::params![user_id, format!("login-{user_id}"), display_name],
+            )
+            .unwrap();
+    }
+
+    /// Regression for PLAN-UI §0.1: the lag reads behind `StatsSnapshot`,
+    /// `GroupDetail`, `TopicDetail` and `GroupList` used to open a consumer
+    /// with `CommitMode::Explicit` under the REAL group id, so every
+    /// dashboard poll rewrote the `commit_mode` the group's own program had
+    /// chosen. Polls ten times each and requires the row to be untouched —
+    /// while the lag itself is still reported.
+    #[tokio::test]
+    async fn polling_lag_views_never_rewrites_the_groups_commit_mode() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("wyniki.{}", uuid::Uuid::new_v4().simple());
+        let group = format!("lekarze-{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+
+        let g = gate_read(&ctx, inst.as_str()).expect("gate");
+        let svc = g.svc.clone();
+        {
+            let (svc, bctx, group, topic) =
+                (svc.clone(), bus_ctx(&ctx, &g), group.clone(), topic.clone());
+            tokio::task::spawn_blocking(move || {
+                svc.open_consumer(
+                    &bctx,
+                    &group,
+                    std::slice::from_ref(&topic),
+                    bus::ConsumerConfig {
+                        commit_mode: groups::CommitMode::AutoAfterSuccess,
+                    },
+                )
+                .map(|_| ())
+                .expect("the group's own program opens its consumer");
+            })
+            .await
+            .unwrap();
+        }
+        let now = bus::now_ms();
+        publish_records(
+            &ctx,
+            &topic,
+            (0..3).map(|i| (format!("r-{i}"), now)).collect(),
+        )
+        .await;
+        let row = |svc: &bus::BusService| {
+            repository::bus_group_get(svc.local_db(), &org_id, &group, &topic)
+                .unwrap()
+                .expect("group row")
+        };
+        let before = row(&svc);
+        assert_eq!(before.commit_mode, "auto_after_success");
+
+        for _ in 0..10 {
+            stats_snapshot_v1(&ctx, inst.as_str()).await.expect("stats");
+            group_detail_v1(&ctx, inst.as_str(), group.clone(), topic.clone())
+                .await
+                .expect("group detail");
+            topic_detail_v1(&ctx, inst.as_str(), topic.clone())
+                .await
+                .expect("topic detail");
+            group_list_v1(&ctx, inst.as_str())
+                .await
+                .expect("group list");
+        }
+
+        let after = row(&svc);
+        assert_eq!(
+            after.commit_mode, "auto_after_success",
+            "a read-only poll rewrote the commit mode the consumer chose"
+        );
+        assert_eq!(after.updated_at_ms, before.updated_at_ms);
+
+        match group_detail_v1(&ctx, inst.as_str(), group.clone(), topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::GroupDetailResponse { detail } => {
+                assert_eq!(detail.commit_mode, "auto_after_success");
+                assert_eq!(detail.partitions.iter().map(|p| p.lag).sum::<u64>(), 3);
+                assert!(detail.partitions.iter().all(|p| p.committed_offset == 0));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match stats_snapshot_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                let stats = snapshot
+                    .groups
+                    .iter()
+                    .find(|g| g.group == group)
+                    .expect("group in the snapshot");
+                assert_eq!(stats.lag_total, Some(3));
+                assert_eq!(stats.topic, topic);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match group_list_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::GroupListResponse { groups } => {
+                let summary = groups.iter().find(|g| g.group == group).expect("listed");
+                assert_eq!(summary.lag_total, Some(3));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn topic_detail_reports_access_admin_labels_and_oldest_record_time() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, org_id, admin_id) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("wizyty.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                content_type: Some("application/hl7-v2".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        publish_records(&ctx, &topic, vec![("MSH|a".to_string(), 1_750_000_000_000)]).await;
+
+        let admin_name = format!("Anna Kowalska {}", uuid::Uuid::new_v4().simple());
+        seed_user(&db, &admin_id, &admin_name);
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            admin_id.clone(),
+            "allow".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("acl set");
+
+        match topic_detail_v1(&ctx, inst.as_str(), topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::TopicDetailResponse {
+                partitions,
+                access,
+                admin_labels,
+                ..
+            } => {
+                assert_eq!(
+                    access,
+                    Some(BusTopicAccessWire {
+                        can_read: true,
+                        can_write: true,
+                        can_admin: true,
+                    })
+                );
+                assert_eq!(admin_labels, vec![admin_name.clone()]);
+                assert_eq!(partitions[0].earliest_timestamp_ms, Some(1_750_000_000_000));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match topic_list_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::TopicListResponse { topics } => {
+                let row = topics.iter().find(|t| t.name == topic).expect("listed");
+                assert_eq!(row.content_type, "application/hl7-v2");
+                assert_eq!(row.schema_id, None);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // A reader without the org Admin role (and without bus.write) sees
+        // the administrators by name and no admin/write rights of its own.
+        let reader_id = format!("u-reader-{}", uuid::Uuid::new_v4());
+        seed_bus_permissions(&db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&org_id, &reader_id, &[]));
+        match topic_detail_v1(&reader, inst.as_str(), topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::TopicDetailResponse {
+                access,
+                admin_labels,
+                partitions,
+                ..
+            } => {
+                let access = access.expect("access");
+                assert!(access.can_read);
+                assert!(!access.can_write);
+                assert!(!access.can_admin);
+                assert_eq!(admin_labels, vec![admin_name.clone()]);
+                assert_eq!(partitions.len(), 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // An explicit read deny: the config still comes back, the data does
+        // not, and `access` says why.
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            reader_id.clone(),
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("acl deny");
+        match topic_detail_v1(&reader, inst.as_str(), topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::TopicDetailResponse {
+                topic: cfg,
+                partitions,
+                groups,
+                access,
+                ..
+            } => {
+                assert_eq!(cfg.name, topic);
+                assert!(partitions.is_empty());
+                assert!(groups.is_empty());
+                assert!(!access.expect("access").can_read);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acl_and_field_policy_rows_carry_subject_labels() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("pacjenci.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let (user_id, group_id) = (format!("u-{suffix}"), format!("g-{suffix}"));
+        seed_user(&db, &user_id, "Tomasz Nowak");
+        db.write()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO user_groups (id, name) VALUES ('{group_id}', 'Lekarze {suffix}'); \
+                 INSERT INTO group_members (group_id, user_id) VALUES ('{group_id}', '{user_id}');"
+            ))
+            .unwrap();
+        for (kind, id) in [("user", &user_id), ("group", &group_id)] {
+            acl_set_v1(
+                &ctx,
+                inst.as_str(),
+                topic.clone(),
+                kind.to_string(),
+                id.clone(),
+                "allow".to_string(),
+                "read".to_string(),
+            )
+            .await
+            .expect("acl set");
+        }
+        field_policy_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "group".to_string(),
+            group_id.clone(),
+            "read".to_string(),
+            vec!["id".to_string()],
+            vec![],
+        )
+        .await
+        .expect("field policy set");
+
+        match acl_list_v1(&ctx, inst.as_str(), topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::AclListResponse { entries } => {
+                let user = entries.iter().find(|e| e.subject_id == user_id).unwrap();
+                assert_eq!(user.subject_label.as_deref(), Some("Tomasz Nowak"));
+                assert_eq!(user.member_count, None);
+                let group = entries.iter().find(|e| e.subject_id == group_id).unwrap();
+                assert_eq!(group.subject_label, Some(format!("Lekarze {suffix}")));
+                assert_eq!(group.member_count, Some(1));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match field_policy_list_v1(&ctx, inst.as_str(), topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::FieldPolicyListResponse { policies } => {
+                assert_eq!(policies.len(), 1);
+                assert_eq!(policies[0].subject_label, Some(format!("Lekarze {suffix}")));
+                assert_eq!(policies[0].member_count, Some(1));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_subjects_report_the_topics_using_them_and_the_authors_name() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, user_id) = admin_session(&db);
+        seed_user(&db, &user_id, "Anna Kowalska");
+        let inst = fixture_instance_id();
+        let subject = format!("wizyta-{}", uuid::Uuid::new_v4().simple());
+        schema_register_v1(
+            &ctx,
+            inst.as_str(),
+            subject.clone(),
+            "json_schema".to_string(),
+            r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#
+                .to_string(),
+            None,
+        )
+        .await
+        .expect("register");
+        let topic = format!("wizyty.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                content_type: Some("application/json".to_string()),
+                schema_id: Some(subject.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+
+        match schema_subject_list_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::SchemaSubjectListResponse { subjects } => {
+                let row = subjects.iter().find(|s| s.subject == subject).unwrap();
+                assert_eq!(row.used_by_topics, vec![topic.clone()]);
+                assert_eq!(row.created_by_label.as_deref(), Some("Anna Kowalska"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match schema_version_list_v1(&ctx, inst.as_str(), subject.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::SchemaVersionListResponse { versions } => {
+                assert_eq!(
+                    versions[0].created_by_label.as_deref(),
+                    Some("Anna Kowalska")
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match topic_list_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::TopicListResponse { topics } => {
+                let row = topics.iter().find(|t| t.name == topic).unwrap();
+                assert_eq!(row.schema_id.as_deref(), Some(subject.as_str()));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A topic with `validation = dlq` quarantines violating records into
+    /// `__dlq.<topic>` — the real DLQ path, with `dlq.rejected_at_ms` set.
+    /// Returns the source topic name.
+    async fn topic_with_rejected_records(ctx: &HandlerContext, rejected: usize) -> String {
+        let inst = fixture_instance_id();
+        let subject = format!("zlecenie-{}", uuid::Uuid::new_v4().simple());
+        schema_register_v1(
+            ctx,
+            inst.as_str(),
+            subject.clone(),
+            "json_schema".to_string(),
+            r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#
+                .to_string(),
+            None,
+        )
+        .await
+        .expect("register");
+        let topic = format!("zlecenia.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                content_type: Some("application/json".to_string()),
+                schema_id: Some(subject),
+                validation: Some("dlq".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let now = bus::now_ms();
+        publish_records(
+            ctx,
+            &topic,
+            (0..rejected)
+                .map(|i| (format!(r#"{{"missing_id":{i}}}"#), now))
+                .collect(),
+        )
+        .await;
+        topic
+    }
+
+    /// `newest_first` pages a DLQ backwards: following each partition's
+    /// `next_offset` visits every waiting record exactly once, newest first,
+    /// and never returns a discarded one.
+    #[tokio::test]
+    async fn dlq_list_newest_first_pages_backwards_without_gaps_or_repeats() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_rejected_records(&ctx, 7).await;
+        dlq_discard_v1(&ctx, inst.as_str(), topic.clone(), 0, 3)
+            .await
+            .expect("discard offset 3");
+
+        let mut seen = Vec::new();
+        let mut from_offsets: Vec<BusPartitionOffsetWire> = Vec::new();
+        for _ in 0..10 {
+            let result = match dlq_list_v1(
+                &ctx,
+                inst.as_str(),
+                topic.clone(),
+                None,
+                from_offsets.clone(),
+                3,
+                None,
+                true,
+            )
+            .await
+            .expect("dlq list")
+            {
+                BusPayload::DlqListResponse { result } => result,
+                other => panic!("unexpected response: {other:?}"),
+            };
+            seen.extend(result.records.iter().map(|r| r.offset));
+            if !result.has_more {
+                break;
+            }
+            from_offsets = result
+                .partitions
+                .iter()
+                .map(|p| BusPartitionOffsetWire {
+                    partition: p.partition,
+                    offset: p.next_offset,
+                })
+                .collect();
+        }
+        assert_eq!(seen, vec![6, 5, 4, 2, 1, 0]);
+
+        let err = dlq_list_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            Some(4),
+            vec![],
+            3,
+            None,
+            true,
+        )
+        .await
+        .expect_err("a scalar from_offset cannot page backwards");
+        assert!(err.message.contains("newest_first"), "{}", err.message);
+
+        match stats_snapshot_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                let row = snapshot.topics.iter().find(|t| t.topic == topic).unwrap();
+                assert_eq!(row.dlq_depth, 6);
+                assert_eq!(row.dlq_last_hour, 6, "all six arrived just now");
+                let last = row.dlq_last_at_ms.expect("newest arrival");
+                assert!((bus::now_ms() - last).abs() < 60_000);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// B1b end to end: two sampling rounds with a growing lag are persisted
+    /// and read back through `LagHistory`, and the group's `StatsSnapshot`
+    /// row carries the trend the service derived from them.
+    #[tokio::test]
+    async fn lag_history_is_persisted_and_feeds_the_rising_trend() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("faktury.{}", uuid::Uuid::new_v4().simple());
+        let group = format!("ksiegowosc-{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let g = gate_read(&ctx, inst.as_str()).expect("gate");
+        let svc = g.svc.clone();
+        {
+            let (svc, bctx, group, topic) =
+                (svc.clone(), bus_ctx(&ctx, &g), group.clone(), topic.clone());
+            tokio::task::spawn_blocking(move || {
+                svc.open_consumer(
+                    &bctx,
+                    &group,
+                    std::slice::from_ref(&topic),
+                    bus::ConsumerConfig {
+                        commit_mode: groups::CommitMode::Explicit,
+                    },
+                )
+                .map(|_| ())
+                .expect("consumer");
+            })
+            .await
+            .unwrap();
+        }
+        // In the future: the fixture engine's own sampler thread samples
+        // at real time, and a trend ignores samples older than its newest.
+        let t0 = bus::now_ms() + 3_600_000;
+        publish_records(&ctx, &topic, vec![("a".to_string(), t0)]).await;
+        {
+            let svc = svc.clone();
+            tokio::task::spawn_blocking(move || svc.sample_lag_history(t0))
+                .await
+                .unwrap();
+        }
+        publish_records(
+            &ctx,
+            &topic,
+            vec![("b".to_string(), t0), ("c".to_string(), t0)],
+        )
+        .await;
+        {
+            let svc = svc.clone();
+            tokio::task::spawn_blocking(move || svc.sample_lag_history(t0 + 60_000))
+                .await
+                .unwrap();
+        }
+
+        match lag_history_v1(&ctx, inst.as_str(), Some(topic.clone()), None, None)
+            .await
+            .expect("lag history")
+        {
+            BusPayload::LagHistoryResponse {
+                groups,
+                sample_interval_ms,
+                ..
+            } => {
+                assert_eq!(sample_interval_ms, 60_000);
+                assert_eq!(groups.len(), 1);
+                let series = &groups[0];
+                assert_eq!(series.group, group);
+                let lags: Vec<(i64, u64)> = series
+                    .samples
+                    .iter()
+                    .map(|s| (s.at_ms, s.lag_total))
+                    .collect();
+                assert!(lags.contains(&(t0, 1)), "{lags:?}");
+                assert!(lags.contains(&(t0 + 60_000, 3)), "{lags:?}");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match stats_snapshot_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                let row = snapshot.groups.iter().find(|g| g.group == group).unwrap();
+                assert_eq!(row.lag_rising_since_ms, Some(t0));
+                assert_eq!(row.consume_rate_per_min, Some(0));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        // A topic filter that matches nothing returns nothing.
+        match lag_history_v1(&ctx, inst.as_str(), Some("nie.ma".to_string()), None, None)
+            .await
+            .unwrap()
+        {
+            BusPayload::LagHistoryResponse { groups, topics, .. } => {
+                assert!(groups.is_empty());
+                assert!(topics.is_empty());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // PLAN-UI review 1: a reader denied read on the topic sees neither
+        // the lag nor anything derived from it — no trend in the snapshot,
+        // no series in the history (group or DLQ).
+        let reader_id = format!("u-reader-{}", uuid::Uuid::new_v4());
+        seed_bus_permissions(&db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&g.org_id, &reader_id, &[]));
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            reader_id.clone(),
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("acl deny");
+        match stats_snapshot_v1(&reader, inst.as_str()).await.unwrap() {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                let row = snapshot.groups.iter().find(|g| g.group == group).unwrap();
+                assert_eq!(row.lag_total, None);
+                assert_eq!(
+                    row.lag_rising_since_ms, None,
+                    "trend leaked past the lag ACL"
+                );
+                assert_eq!(
+                    row.consume_rate_per_min, None,
+                    "rate leaked past the lag ACL"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        for (t, gr) in [(Some(topic.clone()), None), (None, Some(group.clone()))] {
+            match lag_history_v1(&reader, inst.as_str(), t, gr, None)
+                .await
+                .unwrap()
+            {
+                BusPayload::LagHistoryResponse { groups, topics, .. } => {
+                    assert!(groups.is_empty());
+                    assert!(topics.is_empty());
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+    }
+
+    /// PLAN-UI review 1: the DLQ series follows the DLQ's own read check,
+    /// which for `__dlq.<topic>` is read on the source topic.
+    #[tokio::test]
+    async fn lag_history_hides_the_dlq_series_from_a_reader_without_read() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_rejected_records(&ctx, 2).await;
+        let svc = gate_read(&ctx, inst.as_str()).expect("gate").svc.clone();
+        let at = bus::now_ms() + 3_600_000;
+        tokio::task::spawn_blocking(move || svc.sample_lag_history(at))
+            .await
+            .unwrap();
+        match lag_history_v1(&ctx, inst.as_str(), Some(topic.clone()), None, None)
+            .await
+            .unwrap()
+        {
+            BusPayload::LagHistoryResponse { topics, .. } => {
+                assert_eq!(topics.len(), 1);
+                assert_eq!(topics[0].samples.last().map(|s| s.dlq_depth), Some(2));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let reader_id = format!("u-reader-{}", uuid::Uuid::new_v4());
+        seed_bus_permissions(&db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&org_id, &reader_id, &[]));
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            reader_id,
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("acl deny");
+        match lag_history_v1(&reader, inst.as_str(), Some(topic), None, None)
+            .await
+            .unwrap()
+        {
+            BusPayload::LagHistoryResponse { groups, topics, .. } => {
+                assert!(groups.is_empty());
+                assert!(topics.is_empty());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// PLAN-UI review 5: no whole-instance history, and at most
+    /// `LAG_HISTORY_MAX_SERIES` group series with `truncated` set.
+    #[tokio::test]
+    async fn lag_history_requires_a_filter_and_caps_the_series() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let err = lag_history_v1(&ctx, inst.as_str(), None, None, None)
+            .await
+            .expect_err("a whole-instance request is refused");
+        assert!(err.message.contains("topic or a group"), "{}", err.message);
+
+        let topic = format!("duzo.{}", uuid::Uuid::new_v4().simple());
+        let samples: Vec<bus::lag_history::GroupSample> = (0..LAG_HISTORY_MAX_SERIES + 6)
+            .map(|i| bus::lag_history::GroupSample {
+                org_id: org_id.clone(),
+                group_id: format!("g-{i:03}"),
+                topic: topic.clone(),
+                lag_total: 1,
+                committed_total: 0,
+            })
+            .collect();
+        let svc = gate_read(&ctx, inst.as_str()).expect("gate").svc.clone();
+        bus::lag_history::record(svc.local_db(), bus::now_ms(), &samples, &[]).unwrap();
+        match lag_history_v1(&ctx, inst.as_str(), Some(topic), None, None)
+            .await
+            .unwrap()
+        {
+            BusPayload::LagHistoryResponse {
+                groups, truncated, ..
+            } => {
+                assert_eq!(groups.len(), LAG_HISTORY_MAX_SERIES);
+                assert!(truncated);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A manual leader transfer is part of the failover timeline and names
+    /// who made it. Two instances of ONE org hosting the same topic name
+    /// keep separate timelines, and rows of another org or without an
+    /// instance never show up.
+    #[tokio::test]
+    async fn failover_timeline_is_per_instance_and_includes_manual_transfers() {
+        let (_guard, db) = bus_fixture();
+        let org_id = format!("org-{}", uuid::Uuid::new_v4());
+        let actor = format!("u-{}", uuid::Uuid::new_v4());
+        seed_user(&db, &actor, "Piotr Admin");
+        let topic = format!("t.{}", uuid::Uuid::new_v4().simple());
+        let (inst_a, inst_b) = ("tentabus-0000000a", "tentabus-0000000b");
+        let audit = |action: &str, user: Option<&str>, details: String, node: &str| {
+            repository::log_audit(
+                &db,
+                user,
+                None,
+                action,
+                Some(&topic),
+                Some(&details),
+                None,
+                Some(node),
+            )
+            .unwrap();
+        };
+        audit(
+            BUS_LEADER_TRANSFER_AUDIT_ACTION,
+            Some(&actor),
+            format!(
+                "instance_id={inst_a} org_id={org_id} partition=2 from_node=node-a \
+                 from_epoch=4 target_node_id=node-b leader_epoch=5 duration_ms=12"
+            ),
+            "node-a",
+        );
+        audit(
+            BUS_LEADER_TRANSFER_AUDIT_ACTION,
+            Some(&actor),
+            format!(
+                "instance_id={inst_b} org_id={org_id} partition=2 from_node=node-a \
+                 from_epoch=1 target_node_id=node-c leader_epoch=2 duration_ms=7"
+            ),
+            "node-a",
+        );
+        audit(
+            BUS_FAILOVER_AUDIT_ACTION,
+            None,
+            format!(
+                "instance_id={inst_b} org_id={org_id} partition=0 from_node=- from_epoch=0 \
+                 to_epoch=1 duration_ms=40 reason=lease_expired"
+            ),
+            "node-d",
+        );
+        audit(
+            BUS_LEADER_TRANSFER_AUDIT_ACTION,
+            Some(&actor),
+            format!(
+                "instance_id={inst_a} org_id=org-inna partition=2 from_node=node-a \
+                 from_epoch=4 target_node_id=node-x leader_epoch=5 duration_ms=12"
+            ),
+            "node-a",
+        );
+        audit(
+            BUS_FAILOVER_AUDIT_ACTION,
+            None,
+            format!(
+                "instance_id=- org_id={org_id} partition=0 from_node=- from_epoch=0 \
+                 to_epoch=1 duration_ms=40 reason=lease_expired"
+            ),
+            "node-e",
+        );
+
+        let events = failover_events_from_audit(&db, inst_a, &org_id, Some(&topic)).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.to_node, "node-b");
+        assert_eq!(event.from_node.as_deref(), Some("node-a"));
+        assert_eq!((event.from_epoch, event.to_epoch), (4, 5));
+        assert_eq!(event.partition, 2);
+        assert_eq!(event.duration_ms, 12);
+        assert_eq!(event.reason, LEADER_TRANSFER_REASON);
+        assert_eq!(event.actor_label.as_deref(), Some("Piotr Admin"));
+
+        let events_b = failover_events_from_audit(&db, inst_b, &org_id, Some(&topic)).unwrap();
+        let mut to_nodes: Vec<&str> = events_b.iter().map(|e| e.to_node.as_str()).collect();
+        to_nodes.sort();
+        assert_eq!(to_nodes, vec!["node-c", "node-d"]);
+        assert!(events_b
+            .iter()
+            .any(|e| e.to_node == "node-d" && e.actor_label.is_none()));
+    }
+
+    #[test]
+    fn subject_labels_never_expose_an_email_address() {
+        let mut labels = SubjectLabels::default();
+        labels.users.insert(
+            "u-1".to_string(),
+            repository::UserNameRow {
+                display_name: String::new(),
+                username: "anna.k".to_string(),
+                email: "anna@szpital.pl".to_string(),
+            },
+        );
+        labels.users.insert(
+            "u-2".to_string(),
+            repository::UserNameRow {
+                display_name: String::new(),
+                username: String::new(),
+                email: "tomasz@szpital.pl".to_string(),
+            },
+        );
+        assert_eq!(labels.subject("user", "u-1").0.as_deref(), Some("anna.k"));
+        assert_eq!(labels.subject("user", "u-2").0, None);
+        assert_eq!(labels.actor("u-2"), None);
+    }
+
+    #[tokio::test]
+    async fn leader_transfer_rejects_a_target_that_could_forge_audit_fields() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        for bad in ["node-b org_id=other", "node=b", "node\tb"] {
+            let err = leader_transfer_v1(
+                &ctx,
+                fixture_instance_id().as_str(),
+                "any.topic".to_string(),
+                0,
+                bad.to_string(),
+            )
+            .await
+            .expect_err("must be rejected");
+            assert!(
+                err.message.contains("target_node_id"),
+                "{bad}: {}",
+                err.message
+            );
         }
     }
 

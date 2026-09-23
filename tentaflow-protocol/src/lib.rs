@@ -55,12 +55,14 @@ pub use benchmark::{
 };
 pub use bus::{
     BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
-    BusDlqRecordWire, BusEnvelope, BusFailoverEventWire, BusFieldPolicyWire, BusGroupDetailWire,
-    BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupSummaryWire, BusHeaderWire,
-    BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire,
-    BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire,
-    BusReplicaNodeWire, BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire,
-    BusTopicConfigWire, BusTopicOptionsWire, BusTopicStatsWire, BusTopicSummaryWire,
+    BusDlqRecordWire, BusDlqSampleWire, BusEnvelope, BusFailoverEventWire, BusFieldPolicyWire,
+    BusGroupDetailWire, BusGroupLagSeriesWire, BusGroupLagSummaryWire, BusGroupPartitionDetailWire,
+    BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire, BusLagSampleWire, BusMessagePreviewWire,
+    BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire,
+    BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire,
+    BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire, BusTopicAccessWire,
+    BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire, BusTopicStatsWire,
+    BusTopicSummaryWire,
 };
 pub use camera::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDetectionsFrame,
@@ -107,7 +109,6 @@ pub use message_body::{
     AddonAdminOnlySetResponse,
     AddonApplicationInfo,
     AddonConfigField,
-    AddonRequirement,
     AddonConfigGetRequest,
     AddonConfigGetResponse,
     AddonConfigSetRequest,
@@ -176,6 +177,7 @@ pub use message_body::{
     AddonRecordingStats,
     AddonReloadRequest,
     AddonReloadResponse,
+    AddonRequirement,
     AddonResourcesGetRequest,
     AddonResourcesGetResponse,
     AddonResourcesSetRequest,

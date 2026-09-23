@@ -1492,7 +1492,7 @@ mod tests {
         assert_eq!(dep.status(), StatusCode::OK);
         let dep = body_json(dep);
         assert_eq!(dep["deprecated"], true);
-        assert_eq!(dep["removed_versions"], serde_json::json!([1, 2]));
+        assert_eq!(dep["removed_versions"], serde_json::json!([]));
 
         let after = body_json(send(&fx, "GET", &format!("{}{q}", fx.path("")), key(), ""));
         assert!(after["subjects"][0]["deprecated_at_ms"].is_i64());

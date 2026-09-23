@@ -30976,6 +30976,35 @@ pub fn bus_group_list(pool: &DbPool, org_id: &str) -> Result<Vec<DbBusGroup>> {
     Ok(rows)
 }
 
+/// Every org that owns at least one topic of `instance_id` — the system-side
+/// enumeration for work that has no request org (metrics exporter, lag
+/// history sampler).
+pub fn bus_topic_org_ids(pool: &DbPool, instance_id: &str) -> Result<Vec<String>> {
+    let conn = pool.read()?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT org_id FROM bus_topics WHERE instance_id = ?1 ORDER BY org_id")?;
+    let rows = stmt
+        .query_map(rusqlite::params![instance_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every `bus_groups` row of the instance database, all orgs — the
+/// system-side enumeration the metrics exporter and the lag-history sampler
+/// walk (no request context, so no org to scope to).
+pub fn bus_group_list_all(pool: &DbPool) -> Result<Vec<DbBusGroup>> {
+    let conn = pool.read()?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_GROUP_COLUMNS} FROM bus_groups ORDER BY org_id, group_id, topic"
+    ))?;
+    let rows = stmt
+        .query_map([], map_bus_group_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Deletes every `bus_topics` row for `(instance_id, org_id)`, returning how
 /// many rows were removed. Part of the RODO/GDPR org-deletion path (review
 /// M1 coordinator decision #9): does not touch anything on disk under
