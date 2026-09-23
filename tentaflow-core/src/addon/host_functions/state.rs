@@ -99,6 +99,7 @@ pub fn state_get_v1(
     out_cap: i32,
     out_len_ptr: i32,
 ) -> i32 {
+    let _timer = crate::services::pipeline_rate::timer("host.state_get", &caller.data().addon_id);
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
@@ -159,6 +160,7 @@ pub fn state_get_v1(
 ///
 /// Writes are significant — audit-logged like the other mutating host fns.
 pub fn state_set_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_len: i32) -> i32 {
+    let _timer = crate::services::pipeline_rate::timer("host.state_set", &caller.data().addon_id);
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),

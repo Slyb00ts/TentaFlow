@@ -125,7 +125,10 @@ pub fn lidar_publish_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_
     // source of truth, persists across viewers/refresh, ready for cross-robot
     // fusion). Sync + lock-light (per-robot mutex, dedup grid) — safe at frame rate.
     // Done before `publish` consumes the buffer; `Bytes` clone for the hub is O(1).
+    let fold_started = std::time::Instant::now();
     crate::services::slam_scene::SlamSceneManager::global().on_lidar_frame(&addon_id, &frame);
+    crate::services::pipeline_rate::note_duration("slam.fold", &addon_id, fold_started.elapsed());
+    crate::services::pipeline_rate::note("lidar.publish", &addon_id, 1);
     LidarStreamHub::global().publish(&addon_id, header.frame_seq, frame);
     ABI_OK
 }

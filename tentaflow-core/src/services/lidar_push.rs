@@ -196,6 +196,7 @@ async fn spawn_pump(
         // frame (lag is handled by the broadcast `Lagged` path upstream).
         if let Some(frame) = hub.latest(&robot_id) {
             if !frame.is_empty() {
+                crate::services::pipeline_rate::note("lidar.push", &robot_id, 1);
                 src.broadcast(prepare_wire_frame(&frame));
             }
         }

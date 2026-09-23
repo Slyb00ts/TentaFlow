@@ -15,6 +15,7 @@ pub mod model_download;
 pub mod model_residency;
 pub mod models;
 pub mod nim;
+pub mod pipeline_rate;
 pub mod portainer;
 pub mod stt;
 pub mod teams_bot_bootstrap;

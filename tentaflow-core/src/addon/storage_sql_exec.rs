@@ -373,6 +373,12 @@ fn acquire_pool(org_id: &str, addon_id: &str) -> Result<AddonDbPool, StorageSqlE
 
 /// Guard, ktory uruchamia watchdog thread przerywajacy zapytanie SQL po
 /// uplywie `timeout_ms`. Drop guarda anuluje watek bez wycieku.
+///
+/// The watchdog PARKS until the deadline instead of sleeping in fixed steps,
+/// and the drop unparks it. A stepped sleep made every query — including a
+/// microsecond one — wait for the current step to end before `join` returned:
+/// a flat ~50 ms per SQL call, which alone pushed an addon's 100 ms tick over
+/// budget and dropped robot LiDAR frames.
 struct QueryTimeoutGuard {
     canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -394,9 +400,8 @@ impl QueryTimeoutGuard {
                     handle.interrupt();
                     return;
                 }
-                let remaining = deadline.saturating_duration_since(now);
-                let step = remaining.min(Duration::from_millis(50));
-                std::thread::sleep(step);
+                // Spurious wake-ups are fine: the loop re-checks both exits.
+                std::thread::park_timeout(deadline.saturating_duration_since(now));
             }
         });
         Self {
@@ -411,6 +416,7 @@ impl Drop for QueryTimeoutGuard {
         self.canceled
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(j) = self.join.take() {
+            j.thread().unpark();
             let _ = j.join();
         }
     }
@@ -1145,6 +1151,42 @@ fn abi_to_storage(e: AbiError) -> StorageSqlError {
 
 #[cfg(test)]
 mod tests {
+
+    /// Ending a query must not wait for the watchdog: a stepped sleep once
+    /// added a flat ~50 ms to every addon SQL call.
+    #[test]
+    fn a_finished_query_releases_its_watchdog_at_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let started = Instant::now();
+        for _ in 0..20 {
+            let guard = QueryTimeoutGuard::new(&conn, QUERY_TIMEOUT_MS);
+            conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).unwrap();
+            drop(guard);
+        }
+        let per_call = started.elapsed() / 20;
+        assert!(
+            per_call < Duration::from_millis(5),
+            "each guarded query cost {per_call:?}"
+        );
+    }
+
+    /// The watchdog still does its job: a query running past its deadline is
+    /// interrupted.
+    #[test]
+    fn a_query_past_its_deadline_is_interrupted() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let _guard = QueryTimeoutGuard::new(&conn, 100);
+        let started = Instant::now();
+        let result = conn.query_row(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+             SELECT count(*) FROM c",
+            [],
+            |r| r.get::<_, i64>(0),
+        );
+        assert!(result.is_err(), "an endless query must be interrupted");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     use super::*;
 
     fn with_tmp_home<F: FnOnce()>(f: F) {

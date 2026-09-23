@@ -2633,6 +2633,7 @@ impl AddonManager {
                         break;
                     }
                     _ = interval.tick() => {
+                        let tick_started = std::time::Instant::now();
                         let res = tokio::task::block_in_place(|| {
                             Self::call_tick_static(
                                 &manager_instances,
@@ -2642,6 +2643,11 @@ impl AddonManager {
                                 timeout_ms,
                             )
                         });
+                        crate::services::pipeline_rate::note_duration(
+                            "addon.tick",
+                            &addon_id_for_log,
+                            tick_started.elapsed(),
+                        );
                         if let Err(e) = res {
                             warn!(
                                 "on_tick failed for '{}' (instance={}): {}",

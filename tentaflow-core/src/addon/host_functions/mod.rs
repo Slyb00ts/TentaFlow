@@ -936,7 +936,11 @@ pub fn audit_log_with_risk(
     error_message: Option<&str>,
 ) {
     let action_hash = fnv1a_hash(action);
-    if let Ok(conn) = state.db.write() {
+    let lock_wait = crate::services::pipeline_rate::timer("host.audit_lock_wait", &state.addon_id);
+    let writer = state.db.write();
+    drop(lock_wait);
+    let _audit_timer = crate::services::pipeline_rate::timer("host.audit_write", &state.addon_id);
+    if let Ok(conn) = writer {
         // F1b P4 (DoD-15) — extend each row with a Merkle hash linked to the
         // previous row's hash. The single writer connection serializes us against
         // every other writer, so the SELECT(latest hash) + INSERT pair is

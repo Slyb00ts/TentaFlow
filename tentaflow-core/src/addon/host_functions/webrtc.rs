@@ -626,6 +626,18 @@ pub fn webrtc_drain_v1(
                 .dc_drain_budget_with_remaining(max, MAX_DRAIN_BYTES),
         );
         ops.pending = msgs.into_iter().map(to_message).collect();
+        let binary = ops.pending.iter().filter(|m| !m.is_text).count() as u64;
+        crate::services::pipeline_rate::note("webrtc.binary_in", &addon_id, binary);
+        crate::services::pipeline_rate::note(
+            "webrtc.text_in",
+            &addon_id,
+            ops.pending.len() as u64 - binary,
+        );
+        if remaining > 0 {
+            // A backlog left behind by the drain budget: the addon will only see
+            // it next tick, so it is latency the robot did not cause.
+            crate::services::pipeline_rate::note("webrtc.drain_left_behind", &addon_id, remaining as u64);
+        }
         ops.dropped_count = entry.chan.dropped_count();
         ops.queue_len = remaining as u32;
         ops.closed = matches!(

@@ -43,6 +43,7 @@ pub fn sql_exec_v1(
     out_cap: i32,
     out_len_ptr: i32,
 ) -> i32 {
+    let _timer = crate::services::pipeline_rate::timer("host.sql_exec", &caller.data().addon_id);
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
@@ -178,6 +179,7 @@ pub fn sql_exec_v1(
         }
     }
 
+    let exec_timer = crate::services::pipeline_rate::timer("host.sql_exec_body", &addon_id);
     let result = exec_for_addon(
         &org_id,
         &addon_id,
@@ -185,6 +187,7 @@ pub fn sql_exec_v1(
         &params,
         caller.data().user_id.clone(),
     );
+    drop(exec_timer);
     match result {
         Ok((rows_affected, last_insert_id)) => {
             audit_log_with_risk(
@@ -250,6 +253,7 @@ pub fn sql_query_v1(
     out_cap: i32,
     out_len_ptr: i32,
 ) -> i32 {
+    let _timer = crate::services::pipeline_rate::timer("host.sql_query", &caller.data().addon_id);
     sql_query_inner(
         &mut caller,
         query_ptr,
@@ -274,6 +278,7 @@ pub fn sql_query_one_v1(
     out_cap: i32,
     out_len_ptr: i32,
 ) -> i32 {
+    let _timer = crate::services::pipeline_rate::timer("host.sql_query_one", &caller.data().addon_id);
     sql_query_inner(
         &mut caller,
         query_ptr,
@@ -428,11 +433,13 @@ fn sql_query_inner(
             }
         }
     }
+    let query_timer = crate::services::pipeline_rate::timer("host.sql_query_body", &addon_id);
     let result = if one {
         query_one_for_addon(&org_id, &addon_id, &query, &params)
     } else {
         query_for_addon(&org_id, &addon_id, &query, &params, None)
     };
+    drop(query_timer);
     match result {
         Ok(response) => {
             audit_log_with_risk(
