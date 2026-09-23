@@ -24,6 +24,7 @@ import { ResourcesTab } from '/js/modules/addons/resources.js';
 import { NetworkTab } from '/js/modules/addons/network.js';
 import { BindingsTab } from '/js/modules/addons/bindings.js';
 import { openUninstallDialog } from '/js/modules/addons/uninstall-dialog.js';
+import { openRobotCloudDialog, robotCloudFieldValues, robotCloudVendorName } from '/js/modules/addons/robot-cloud-dialog.js';
 // `openInstallWizard` reserved for the future "Install from ZIP" flow on the
 // addons list page; it is no longer triggered from the per-addon header.
 
@@ -621,11 +622,17 @@ function openInstallInstanceModal(pkg) {
   // Multi-instance package: the name is what tells two instances apart on the
   // apps grid and in the permission matrix, so it is required AND must differ
   // from the names already taken by this package's instances.
+  // A package bound to a robot vendor account ([robot.cloud_account]) can fill
+  // its connection params by signing into that account instead of by hand.
+  const cloudProvider = pkg.cloudAccountProvider ?? pkg.cloud_account_provider ?? '';
+  const cloudButton = cloudProvider && params.length > 0
+    ? `<tf-button variant="secondary" icon="cloud" id="inst-robot-cloud">${escapeHtml(I18n.t('addons.robot_cloud.open', { vendor: robotCloudVendorName(cloudProvider) }))}</tf-button>`
+    : '';
   const singleton = !!(pkg.singleton ?? false);
   const takenNames = addonsList
     .filter((a) => (a.packageId ?? a.package_id) === pkgId)
     .map((a) => String(a.displayName ?? a.display_name ?? a.name ?? '').trim().toLowerCase());
-  openModal({
+  const win = openModal({
     title: I18n.t('addons.install_title', { name: pkg.name || pkgId }),
     icon: 'download',
     confirmLabel: I18n.t(takenNames.length > 0 ? 'addons.install_another' : 'addons.install_action'),
@@ -639,6 +646,7 @@ function openInstallInstanceModal(pkg) {
         <label style="display:flex;flex-direction:column;gap:4px;">${escapeHtml(I18n.t('addons.instance_version'))}
           <tf-select id="inst-version">${opts}</tf-select>
         </label>
+        ${cloudButton}
         ${paramFields}
       </div>`,
     onConfirm: async (win) => {
@@ -698,6 +706,20 @@ function openInstallInstanceModal(pkg) {
       if (pkgId === TENTANAS_PACKAGE_ID) await Router.navigate('tentanas', { setup: '1' });
       return true;
     },
+  });
+  win.querySelector('#inst-robot-cloud')?.addEventListener('click', () => {
+    openRobotCloudDialog({
+      provider: cloudProvider,
+      onPick: (device) => {
+        for (const [key, value] of Object.entries(robotCloudFieldValues(device))) {
+          const el = win.querySelector(`tf-input[data-param-key="${CSS.escape(key)}"]`);
+          if (el) el.value = value;
+        }
+        const nameEl = win.querySelector('#inst-name');
+        if (nameEl && !String(nameEl.value || '').trim() && device.alias) nameEl.value = device.alias;
+        toast(I18n.t('addons.robot_cloud.filled'), 'success');
+      },
+    });
   });
 }
 

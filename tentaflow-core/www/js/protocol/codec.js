@@ -61,6 +61,20 @@ export function setForwardTarget(frame, nodeIdHex) {
 // Encode helpery (build binary frames)
 // =============================================================================
 
+/** Optional wire string: an absent value is `null`, never `''` — the core
+ * treats `Some("")` as a filter that matches nothing. */
+function strOrNull(v) {
+  return v === undefined || v === null || v === '' ? null : String(v);
+}
+
+/** Optional wire number: an absent or unparseable value is `null`, not 0 —
+ * a coordinate of 0 is a real place, so the two must stay distinguishable. */
+function numOrNull(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 /**
  * Typed factory dla frameow do wyslania.
  *
@@ -8384,12 +8398,165 @@ export const encode = {
   },
 
   // ===========================================================================
+  // Shared map — MessageBody::MapBody. Sites (places), scenes (one metric
+  // reconstruction each) and device placement. Fields are the wire's
+  // snake_case; an absent filter is `null`, never an empty string. Geometry
+  // never travels here — it arrives on the `map:` stream.
+  // ===========================================================================
+
+  /** Every site of the caller's organization, with scene/device counts. */
+  // wire: MapBody::SiteListRequest
+  mapSiteListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapSiteListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Creates a site (empty site_id) or edits one in place. */
+  // wire: MapBody::SiteUpsertRequest
+  mapSiteUpsertRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const site = payload.site ?? payload;
+    const body = _wasm.encodeMapSiteUpsertRequest(JSON.stringify({
+      site: {
+        site_id: String(site.siteId ?? site.site_id ?? ''),
+        name: String(site.name ?? ''),
+        description: String(site.description ?? ''),
+        address: String(site.address ?? ''),
+        lat: numOrNull(site.lat),
+        lon: numOrNull(site.lon),
+        alt: numOrNull(site.alt),
+      },
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: MapBody::SiteDeleteRequest
+  mapSiteDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapSiteDeleteRequest(JSON.stringify({
+      site_id: String(payload.siteId ?? payload.site_id ?? ''),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Scenes of one site, or of every site when siteId is absent. */
+  // wire: MapBody::SceneListRequest
+  mapSceneListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapSceneListRequest(JSON.stringify({
+      site_id: strOrNull(payload.siteId ?? payload.site_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Creates a scene (empty scene_id) or edits one in place. */
+  // wire: MapBody::SceneUpsertRequest
+  mapSceneUpsertRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const scene = payload.scene ?? payload;
+    const body = _wasm.encodeMapSceneUpsertRequest(JSON.stringify({
+      scene: {
+        scene_id: String(scene.sceneId ?? scene.scene_id ?? ''),
+        site_id: String(scene.siteId ?? scene.site_id ?? ''),
+        name: String(scene.name ?? ''),
+        voxel_res_m: Number(scene.voxelResM ?? scene.voxel_res_m ?? 0.05),
+        owner_node_id: String(scene.ownerNodeId ?? scene.owner_node_id ?? ''),
+        geo_lat: numOrNull(scene.geoLat ?? scene.geo_lat),
+        geo_lon: numOrNull(scene.geoLon ?? scene.geo_lon),
+        geo_alt: numOrNull(scene.geoAlt ?? scene.geo_alt),
+        geo_heading: numOrNull(scene.geoHeading ?? scene.geo_heading),
+        max_voxels: Number(scene.maxVoxels ?? scene.max_voxels ?? 0),
+      },
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: MapBody::SceneDeleteRequest — `force` also drops geometry on disk.
+  mapSceneDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapSceneDeleteRequest(JSON.stringify({
+      scene_id: String(payload.sceneId ?? payload.scene_id ?? ''),
+      force: Boolean(payload.force ?? false),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: MapBody::SceneSetOwnerRequest
+  mapSceneSetOwnerRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapSceneSetOwnerRequest(JSON.stringify({
+      scene_id: String(payload.sceneId ?? payload.scene_id ?? ''),
+      node_id: String(payload.nodeId ?? payload.node_id ?? ''),
+      accept_loss: Boolean(payload.acceptLoss ?? payload.accept_loss ?? false),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: MapBody::SceneGeoAnchorSetRequest — a null component clears it.
+  mapSceneGeoAnchorSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapSceneGeoAnchorSetRequest(JSON.stringify({
+      scene_id: String(payload.sceneId ?? payload.scene_id ?? ''),
+      lat: numOrNull(payload.lat),
+      lon: numOrNull(payload.lon),
+      alt: numOrNull(payload.alt),
+      heading: numOrNull(payload.heading),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Devices of one scene, or every device the map knows when sceneId is absent. */
+  // wire: MapBody::DeviceListRequest
+  mapDeviceListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapDeviceListRequest(JSON.stringify({
+      scene_id: strOrNull(payload.sceneId ?? payload.scene_id),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: MapBody::DeviceAssignRequest
+  mapDeviceAssignRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapDeviceAssignRequest(JSON.stringify({
+      scene_id: String(payload.sceneId ?? payload.scene_id ?? ''),
+      node_id: String(payload.nodeId ?? payload.node_id ?? ''),
+      device_id: String(payload.deviceId ?? payload.device_id ?? ''),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: MapBody::DeviceUnassignRequest
+  mapDeviceUnassignRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMapDeviceUnassignRequest(JSON.stringify({
+      node_id: String(payload.nodeId ?? payload.node_id ?? ''),
+      device_id: String(payload.deviceId ?? payload.device_id ?? ''),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // ===========================================================================
   // Agent provider accounts — MessageBody::ProviderAccountBody. The fields are
   // the wire's snake_case; an ABSENT filter is `null`, never an empty string —
   // the core treats `Some("")` as a filter that matches nothing. A login id
   // names the node running its terminal, so the login exchange needs no node
   // parameter after the start.
   // ===========================================================================
+
+  /** Robot vendor account → bound robots (serial, LAN key, discovered IP). */
+  // wire: RobotCloudBody::DevicesRequest — the password is never echoed back.
+  robotCloudDevicesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRobotCloudDevicesRequest(JSON.stringify({
+      provider: String(payload.provider ?? ''),
+      region: String(payload.region ?? 'global'),
+      email: String(payload.email ?? ''),
+      password: String(payload.password ?? ''),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
 
   /** Konta agentów widoczne dla wołającego (A01; nie-admin dostaje własne + nadane). */
   // wire: AccountListRequest

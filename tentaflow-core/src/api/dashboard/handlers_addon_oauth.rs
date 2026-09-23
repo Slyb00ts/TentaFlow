@@ -885,6 +885,7 @@ mod tests {
             origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
+        dispatch::seed_session_account(&ctx_user);
         let body =
             MessageBody::AddonOAuthTestConnectionRequestBody(AddonOAuthTestConnectionRequest {
                 addon_id: "any".into(),
@@ -914,6 +915,7 @@ mod tests {
             origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
+        dispatch::seed_session_account(&ctx_admin);
         let body =
             MessageBody::AddonOAuthTestConnectionRequestBody(AddonOAuthTestConnectionRequest {
                 addon_id: "missing-addon".into(),

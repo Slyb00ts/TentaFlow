@@ -91,6 +91,9 @@ pub struct CameraConfig {
     /// działający fallback CPU. `CameraConfig` nie jest serializowany (brak
     /// derive serde), więc default „None" jest wymuszany przez konstruktory.
     pub decoder_override: Option<super::decoder_detect::HwDecoder>,
+    /// What the GPU privacy probe does to every frame before any branch sees it.
+    /// `OFF` leaves the frame path untouched.
+    pub privacy: super::privacy_options::PrivacyOptions,
 }
 
 impl CameraConfig {
@@ -113,6 +116,7 @@ impl CameraConfig {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         }
     }
 }
@@ -220,6 +224,11 @@ pub enum SessionCommand {
     DetachMp4Branch {
         preview: bool,
     },
+    /// Apply new privacy options to a running webrtc camera. The session
+    /// rebuilds its pipeline (the privacy path is a different graph, not a
+    /// switch) while the robot's stream keeps flowing into the new appsrc, so
+    /// no frame can slip through unprocessed during the change.
+    SetPrivacy(super::privacy_options::PrivacyOptions),
 }
 
 /// External handle to a running session, stored in the supervisor registry.
@@ -400,13 +409,18 @@ enum SourceKind {
 
 async fn run_session(
     source: SessionSource,
-    config: CameraConfig,
+    mut config: CameraConfig,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     health_tx: watch::Sender<CameraHealth>,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
 ) {
     let cam_id = config.camera_id.clone();
+    // Held for the whole session: every return path below clears the marker.
+    // Re-registered when the options change (the guard is replaced, never
+    // dropped to nothing while privacy is still on).
+    let mut privacy_guard =
+        super::privacy_options::ActivePrivacyGuard::register(&cam_id, config.privacy);
     publish(
         &health_tx,
         &cam_id,
@@ -422,13 +436,15 @@ async fn run_session(
         SessionSource::WebRtc(_) => SourceKind::WebRtc,
     };
     let mut webrtc_pump: Option<tokio::task::JoinHandle<()>> = None;
+    // The appsrc the pump feeds; swapped on a privacy rebuild.
+    let mut webrtc_appsrc: Option<Arc<super::webrtc_source::AppSrcSlot>> = None;
     // WebRTC fMP4 fan-out: the tee that Branch B (mp4mux → appsink) attaches to,
     // and the live branch state while a consumer is subscribed. `None` for
     // File/Local sources, which do not support fMP4 streaming. Flaga `bool`
     // przy stanie gałęzi to wariant publishera (preview/full), którym sesja
     // dopasowuje `DetachMp4Branch { preview }` — webrtc nie transkoduje, więc
     // preview jest tu passthroughem pełnej jakości (jedna gałąź naraz).
-    let mut webrtc_tee: Option<gst::Element> = None;
+    let mut webrtc_fanout: Option<super::webrtc_source::WebRtcFanout> = None;
     let mut webrtc_mp4_branch: Option<(super::rtsp::Mp4BranchState, bool)> = None;
     let pipeline = match source {
         SessionSource::File(ref path) => {
@@ -441,16 +457,18 @@ async fn run_session(
                 mailbox.clone(),
                 counters.clone(),
             ) {
-                Ok((p, appsrc, tee)) => {
-                    webrtc_pump = Some(tokio::spawn(super::webrtc_source::webrtc_pump(rx, appsrc)));
-                    webrtc_tee = Some(tee);
+                Ok((p, appsrc, fanout)) => {
+                    let slot = Arc::new(super::webrtc_source::AppSrcSlot::new(appsrc));
+                    webrtc_appsrc = Some(slot.clone());
+                    webrtc_pump = Some(tokio::spawn(super::webrtc_source::webrtc_pump(rx, slot)));
+                    webrtc_fanout = Some(fanout);
                     Ok(p)
                 }
                 Err(e) => Err(e),
             }
         }
     };
-    let pipeline = match pipeline {
+    let mut pipeline = match pipeline {
         Ok(p) => p,
         Err(e) => {
             let reason = e.to_string();
@@ -493,7 +511,7 @@ async fn run_session(
         return;
     }
 
-    let bus = pipeline.pipeline.bus().expect("pipeline has bus");
+    let mut bus = pipeline.pipeline.bus().expect("pipeline has bus");
 
     // FPS moving-average state. Sampled every second from the counters.
     let mut last_total: u64 = 0;
@@ -516,7 +534,7 @@ async fn run_session(
                     Some(SessionCommand::Stop) | None => {
                         tracing::debug!(camera_id = %cam_id, "webrtc session stopping (Stop/None)");
                         publish(&health_tx, &cam_id, CameraStatus::Stopping, None, &counters, fps_window.back().copied());
-                        teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
+                        teardown_webrtc_branch(&pipeline.pipeline, webrtc_fanout.as_ref().map(|f| f.tee()), &mut webrtc_mp4_branch);
                         let _ = set_state_blocking(&pipeline.pipeline, gst::State::Null).await;
                         if let Some(h) = webrtc_pump.take() {
                             h.abort();
@@ -544,13 +562,26 @@ async fn run_session(
                         // mark the publisher unsupported — the hub-side
                         // `init_segment()` returns None immediately instead of
                         // stalling for the full 3 s timeout window.
-                        match webrtc_tee.as_ref() {
-                            Some(tee) if webrtc_mp4_branch.is_none() => {
-                                match super::webrtc_source::attach_mp4_branch_webrtc(
-                                    &pipeline.pipeline,
-                                    tee,
-                                    &pub_,
-                                ) {
+                        match webrtc_fanout.as_ref() {
+                            Some(fanout) if webrtc_mp4_branch.is_none() => {
+                                let attached = match fanout {
+                                    super::webrtc_source::WebRtcFanout::Passthrough(tee) => {
+                                        super::webrtc_source::attach_mp4_branch_webrtc(
+                                            &pipeline.pipeline,
+                                            tee,
+                                            &pub_,
+                                        )
+                                    }
+                                    super::webrtc_source::WebRtcFanout::Anonymized(tee_cuda) => {
+                                        attach_anonymized_branch(
+                                            &pipeline.pipeline,
+                                            tee_cuda,
+                                            &pub_,
+                                            config.target_fps,
+                                        )
+                                    }
+                                };
+                                match attached {
                                     Ok(state) => {
                                         webrtc_mp4_branch = Some((state, pub_.is_preview()));
                                         tracing::info!(camera_id = %cam_id, "webrtc: fMP4 branch attached");
@@ -576,7 +607,7 @@ async fn run_session(
                             .is_some_and(|(_, p)| *p == preview);
                         if matches_variant {
                             if let (Some(tee), Some((state, _))) =
-                                (webrtc_tee.as_ref(), webrtc_mp4_branch.take())
+                                (webrtc_fanout.as_ref().map(|f| f.tee()), webrtc_mp4_branch.take())
                             {
                                 super::webrtc_source::detach_mp4_branch_webrtc(
                                     &pipeline.pipeline,
@@ -588,6 +619,62 @@ async fn run_session(
                         }
                         // No branch ever attached for File/Local — nothing to
                         // tear down. Drop arrives here on publisher destruct.
+                    }
+                    Some(SessionCommand::SetPrivacy(options)) => {
+                        // Only a webrtc (robot) camera has a privacy path; a
+                        // stray command for a file/local source is ignored
+                        // rather than treated as a rebuild failure.
+                        if webrtc_appsrc.is_none() {
+                            tracing::debug!(camera_id = %cam_id, "privacy options ignored: not a webrtc camera");
+                        } else if config.privacy != options {
+                            match rebuild_webrtc_for_privacy(
+                                &mut pipeline,
+                                &mut config,
+                                options,
+                                webrtc_appsrc.as_ref(),
+                                &mailbox,
+                                &counters,
+                                &mut webrtc_fanout,
+                                &mut webrtc_mp4_branch,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    bus = pipeline.pipeline.bus().expect("pipeline has bus");
+                                    // Drop the old guard BEFORE registering the
+                                    // new one: its Drop removes the entry by
+                                    // camera_id and would erase the fresh one.
+                                    privacy_guard.take();
+                                    privacy_guard = super::privacy_options::ActivePrivacyGuard::register(
+                                        &cam_id,
+                                        config.privacy,
+                                    );
+                                    // Viewers are on the OLD pipeline's fMP4 branch:
+                                    // close the stream so they resubscribe and the
+                                    // session attaches a branch on the new graph.
+                                    crate::services::streaming_bus()
+                                        .close_camera(&cam_id, "privacy options changed")
+                                        .await;
+                                    tracing::info!(
+                                        camera_id = %cam_id,
+                                        person_detect = options.person_detect,
+                                        face_blur = options.face_blur,
+                                        "webrtc: privacy options applied"
+                                    );
+                                }
+                                Err(e) => {
+                                    let reason = format!("privacy rebuild failed: {e}");
+                                    tracing::warn!(camera_id = %cam_id, "{reason}");
+                                    publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.clone()), &counters, None);
+                                    if let Some(h) = webrtc_pump.take() {
+                                        h.abort();
+                                    }
+                                    crate::services::streaming_bus().close_camera(&cam_id, &reason).await;
+                                    drain_until_stop(&mut cmd_rx, &health_tx).await;
+                                    return;
+                                }
+                            }
+                        }
                     }
                     Some(SessionCommand::GetHealth(reply)) => {
                         let h = health_tx.borrow().clone();
@@ -669,7 +756,7 @@ async fn run_session(
                                     let reason = "webrtc video stream ended";
                                     tracing::warn!(camera_id = %cam_id, "webrtc session terminal: EOS on bus");
                                     publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, fps_window.back().copied());
-                                    teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
+                                    teardown_webrtc_branch(&pipeline.pipeline, webrtc_fanout.as_ref().map(|f| f.tee()), &mut webrtc_mp4_branch);
                                     let _ = set_state_blocking(&pipeline.pipeline, gst::State::Null).await;
                                     if let Some(h) = webrtc_pump.take() {
                                         h.abort();
@@ -684,7 +771,7 @@ async fn run_session(
                             let text = format!("{} ({})", err.error(), err.debug().unwrap_or_default());
                             tracing::warn!(camera_id = %cam_id, error = %text, "webrtc session terminal: GST bus Error");
                             publish(&health_tx, &cam_id, CameraStatus::Error, Some(text.clone()), &counters, fps_window.back().copied());
-                            teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
+                            teardown_webrtc_branch(&pipeline.pipeline, webrtc_fanout.as_ref().map(|f| f.tee()), &mut webrtc_mp4_branch);
                             let _ = set_state_blocking(&pipeline.pipeline, gst::State::Null).await;
                             if let Some(h) = webrtc_pump.take() {
                                 h.abort();
@@ -720,7 +807,7 @@ async fn run_session(
                         let reason = "no frames within warmup window";
                         tracing::warn!(camera_id = %cam_id, "webrtc session terminal: warmup window elapsed with no frames");
                         publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, None);
-                        teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
+                        teardown_webrtc_branch(&pipeline.pipeline, webrtc_fanout.as_ref().map(|f| f.tee()), &mut webrtc_mp4_branch);
                         let _ = set_state_blocking(&pipeline.pipeline, gst::State::Null).await;
                         if let Some(h) = webrtc_pump.take() {
                             h.abort();
@@ -744,6 +831,83 @@ async fn run_session(
             }
         }
     }
+}
+
+/// Swap a running webrtc session onto a pipeline built with `options`. The
+/// privacy path is a different graph (NVDEC + probe + CUDA tee) rather than a
+/// switch inside one graph, so applying new options means building the new
+/// pipeline, stopping the old one and pointing the pump at the new appsrc. The
+/// mailbox and counters are carried over, so frame history and health are
+/// continuous. On failure the session has no pipeline left and the caller ends
+/// the session — it must never keep running the OLD graph under the NEW
+/// options, which for "blur on" would publish unprocessed frames.
+#[allow(clippy::too_many_arguments)]
+async fn rebuild_webrtc_for_privacy(
+    pipeline: &mut super::fakefile::FakeFilePipeline,
+    config: &mut CameraConfig,
+    options: super::privacy_options::PrivacyOptions,
+    appsrc_slot: Option<&Arc<super::webrtc_source::AppSrcSlot>>,
+    mailbox: &Arc<FrameMailbox>,
+    counters: &Arc<FrameCounters>,
+    fanout: &mut Option<super::webrtc_source::WebRtcFanout>,
+    branch: &mut Option<(super::rtsp::Mp4BranchState, bool)>,
+) -> std::result::Result<(), String> {
+    let slot = appsrc_slot.ok_or_else(|| "not a webrtc session".to_string())?;
+    teardown_webrtc_branch(&pipeline.pipeline, fanout.as_ref().map(|f| f.tee()), branch);
+    let _ = set_state_blocking(&pipeline.pipeline, gst::State::Null).await;
+
+    let previous = config.privacy;
+    config.privacy = options;
+    let built = super::webrtc_source::build_webrtc_pipeline(config, mailbox.clone(), counters.clone());
+    let (new_pipeline, new_appsrc, new_fanout) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            config.privacy = previous;
+            return Err(e.to_string());
+        }
+    };
+    if let Err(e) = set_state_blocking(&new_pipeline.pipeline, gst::State::Playing).await {
+        let _ = set_state_blocking(&new_pipeline.pipeline, gst::State::Null).await;
+        config.privacy = previous;
+        return Err(format!("set_state(Playing): {e}"));
+    }
+    *slot.lock() = new_appsrc;
+    *pipeline = new_pipeline;
+    *fanout = Some(new_fanout);
+    Ok(())
+}
+
+/// Branch B behind the privacy probe. Only reachable when the pipeline was
+/// built with the GPU privacy path (`WebRtcFanout::Anonymized`), which exists
+/// only when these features are compiled in.
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+))]
+fn attach_anonymized_branch(
+    pipeline: &gst::Pipeline,
+    tee_cuda: &gst::Element,
+    publisher: &Arc<super::stream_publisher::Mp4StreamPublisher>,
+    source_fps: u32,
+) -> std::result::Result<super::rtsp::Mp4BranchState, String> {
+    super::webrtc_source::attach_mp4_branch_webrtc_encoded(pipeline, tee_cuda, publisher, source_fps)
+}
+
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+)))]
+fn attach_anonymized_branch(
+    _pipeline: &gst::Pipeline,
+    _tee_cuda: &gst::Element,
+    _publisher: &Arc<super::stream_publisher::Mp4StreamPublisher>,
+    _source_fps: u32,
+) -> std::result::Result<super::rtsp::Mp4BranchState, String> {
+    Err("anonymized branch requires the GPU privacy path, which this build lacks".into())
 }
 
 fn publish(
@@ -819,6 +983,10 @@ async fn drain_until_stop(
             SessionCommand::DetachMp4Branch { .. } => {
                 // Already drained / pipeline already Null — no-op.
             }
+            SessionCommand::SetPrivacy(_) => {
+                // Session is dead — the options are read again when the
+                // supervisor re-adds the camera.
+            }
         }
     }
 }
@@ -839,6 +1007,7 @@ mod tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::UnsupportedVendor(_)));
@@ -856,6 +1025,7 @@ mod tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidUrl(_)));
@@ -872,6 +1042,7 @@ mod tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::FileNotFound(_)));
@@ -894,6 +1065,7 @@ mod tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::SymlinkNotAllowed(_)));
@@ -910,6 +1082,7 @@ mod tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidConfig(_)));
@@ -926,6 +1099,7 @@ mod tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidConfig(_)));

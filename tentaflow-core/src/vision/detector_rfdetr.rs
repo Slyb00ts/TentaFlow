@@ -374,7 +374,13 @@ impl RfDetrDetector {
 
         // Fused GPU preprocess → device buffer [n,3,560,560] f32.
         let batch = crate::vision::gpu_preprocess::preprocess_nv12_batch_gpu(
-            frames, res, MEAN, STD, color,
+            frames,
+            res,
+            MEAN,
+            STD,
+            crate::vision::preprocessing::FrameFit::Stretch,
+            crate::vision::preprocessing::ChannelOrder::Rgb,
+            color,
         )?;
 
         // The device buffer must OUTLIVE the ORT run. It lives in this thread's

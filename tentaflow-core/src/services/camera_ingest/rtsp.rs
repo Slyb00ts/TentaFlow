@@ -3100,6 +3100,10 @@ pub async fn run_rtsp_session(
                             // Hot reconfigure not yet implemented for RTSP —
                             // operator must remove+re-add the camera.
                         }
+                        Some(SessionCommand::SetPrivacy(_)) => {
+                            // Anonymization is a webrtc-path graph; an RTSP
+                            // camera never carries robot privacy options.
+                        }
                         Some(SessionCommand::Restart(new_config)) => {
                             // Credentials rotation (or other supervisor-driven
                             // restart) — swap config and rebuild the pipeline
@@ -3751,6 +3755,9 @@ async fn sleep_with_cancel(
                     Some(SessionCommand::DetachMp4Branch { .. }) => {
                         // Branch already absent (no pipeline) — no-op.
                     }
+                    Some(SessionCommand::SetPrivacy(_)) => {
+                        // Not a webrtc session — nothing to rebuild.
+                    }
                 }
             }
             _ = &mut sleeper => return true,
@@ -3804,6 +3811,7 @@ async fn drain_until_stop(
                 publisher.mark_unsupported();
             }
             SessionCommand::DetachMp4Branch { .. } => {}
+            SessionCommand::SetPrivacy(_) => {}
         }
     }
 }

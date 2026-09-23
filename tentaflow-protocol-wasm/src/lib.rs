@@ -7463,6 +7463,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&item, "connectionParams", params.clone().into());
                         set(&item, "connection_params", params.into());
                         set(&item, "singleton", pkg.singleton.into());
+                        if let Some(provider) = pkg.cloud_account_provider {
+                            set(&item, "cloudAccountProvider", provider.into());
+                        }
                         arr.push(&item.into());
                     }
                     set(&obj, "packages", arr.into());
@@ -10114,10 +10117,27 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 vals_arr.push(&pair.into());
             }
             set(&obj, "values", vals_arr.into());
+            let reqs = js_sys::Array::new();
+            for req in r.requirements {
+                let ro = js_sys::Object::new();
+                set(&ro, "engineId", req.engine_id.into());
+                set(&ro, "status", req.status.into());
+                reqs.push(&ro.into());
+            }
+            set(&obj, "requirements", reqs.into());
+            if let Some(provider) = r.cloud_account_provider {
+                set(&obj, "cloudAccountProvider", provider.into());
+            }
         }
         MessageBody::AddonConfigSetResponseBody(r) => {
             set(&obj, "variant", "AddonConfigSetResponse".into());
             set(&obj, "ok", r.ok.into());
+            let pending = js_sys::Array::new();
+            for host in r.pending_network_hosts {
+                pending.push(&host.into());
+            }
+            set(&obj, "pendingNetworkHosts", pending.into());
+            set(&obj, "privacyCamerasApplied", r.privacy_cameras_applied.into());
         }
         MessageBody::AddonLogsResponseBody(r) => {
             set(&obj, "variant", "AddonLogsResponse".into());
@@ -10929,6 +10949,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ProviderAccountBody(payload) => {
             decode_provider_account_payload(&obj, payload)
         }
+        MessageBody::RobotCloudBody(payload) => decode_robot_cloud_payload(&obj, payload),
+        MessageBody::MapBody(payload) => decode_map_payload(&obj, payload),
     }
     Ok(obj.into())
 }
@@ -12343,20 +12365,34 @@ fn decode_provider_account_payload(
     obj: &js_sys::Object,
     payload: tentaflow_protocol::provider_account::ProviderAccountPayload,
 ) {
-    let value = match serde_json::to_value(&payload) {
-        Ok(v) => v,
-        Err(_) => {
-            set(obj, "variant", "ProviderAccountDecodeError".into());
-            return;
-        }
-    };
+    decode_json_family_payload(obj, "ProviderAccount", serde_json::to_value(&payload));
+}
+
+fn decode_map_payload(obj: &js_sys::Object, payload: tentaflow_protocol::map::MapPayload) {
+    decode_json_family_payload(obj, "Map", serde_json::to_value(&payload));
+}
+
+fn decode_robot_cloud_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::robot_cloud::RobotCloudPayload,
+) {
+    decode_json_family_payload(obj, "RobotCloud", serde_json::to_value(&payload));
+}
+
+/// A serde-tagged family enum as a JS object: `variant` = family prefix +
+/// variant name, every field under both its snake_case and camelCase key.
+fn decode_json_family_payload(
+    obj: &js_sys::Object,
+    family: &str,
+    value: serde_json::Result<serde_json::Value>,
+) {
     match value {
-        serde_json::Value::String(name) => {
-            set(obj, "variant", format!("ProviderAccount{name}").into());
+        Ok(serde_json::Value::String(name)) => {
+            set(obj, "variant", format!("{family}{name}").into());
         }
-        serde_json::Value::Object(map) => {
+        Ok(serde_json::Value::Object(map)) => {
             if let Some((name, fields)) = map.into_iter().next() {
-                set(obj, "variant", format!("ProviderAccount{name}").into());
+                set(obj, "variant", format!("{family}{name}").into());
                 if let serde_json::Value::Object(fields) = fields {
                     for (key, val) in &fields {
                         let js_val = json_value_to_js_dual(val);
@@ -12369,7 +12405,7 @@ fn decode_provider_account_payload(
                 }
             }
         }
-        _ => set(obj, "variant", "ProviderAccountDecodeError".into()),
+        _ => set(obj, "variant", format!("{family}DecodeError").into()),
     }
 }
 
@@ -22734,6 +22770,101 @@ fn encode_provider_account_json_request(
         serde_json::from_value(serde_json::json!({ variant: fields }))
             .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
     encode_body_inner(&MessageBody::ProviderAccountBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+// =============================================================================
+// Shared map — `MessageBody::MapBody`. Sites, scenes and which device writes
+// into which scene. Built from a JSON object of the variant's fields, like the
+// provider-account family; geometry never passes through here.
+// =============================================================================
+
+fn encode_map_json_request(variant: &str, fields_json: &str) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::map::MapPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::MapBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// Every site of the caller's organization, with scene and device counts.
+#[wasm_bindgen(js_name = encodeMapSiteListRequest)]
+pub fn encode_map_site_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("SiteListRequest", &request_json)
+}
+
+/// Creates a site (empty `site_id`) or edits one in place.
+#[wasm_bindgen(js_name = encodeMapSiteUpsertRequest)]
+pub fn encode_map_site_upsert_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("SiteUpsertRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeMapSiteDeleteRequest)]
+pub fn encode_map_site_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("SiteDeleteRequest", &request_json)
+}
+
+/// Scenes of one site, or of every site when `site_id` is null.
+#[wasm_bindgen(js_name = encodeMapSceneListRequest)]
+pub fn encode_map_scene_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("SceneListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeMapSceneUpsertRequest)]
+pub fn encode_map_scene_upsert_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("SceneUpsertRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeMapSceneDeleteRequest)]
+pub fn encode_map_scene_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("SceneDeleteRequest", &request_json)
+}
+
+/// Hands the scene to another node; `accept_loss` is the operator stating the
+/// current owner is unreachable.
+#[wasm_bindgen(js_name = encodeMapSceneSetOwnerRequest)]
+pub fn encode_map_scene_set_owner_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("SceneSetOwnerRequest", &request_json)
+}
+
+/// Georeferences the scene; a null component clears it.
+#[wasm_bindgen(js_name = encodeMapSceneGeoAnchorSetRequest)]
+pub fn encode_map_scene_geo_anchor_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("SceneGeoAnchorSetRequest", &request_json)
+}
+
+/// Devices of one scene, or every device known to the map when `scene_id` is
+/// null (including the unassigned ones the UI offers to place).
+#[wasm_bindgen(js_name = encodeMapDeviceListRequest)]
+pub fn encode_map_device_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("DeviceListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeMapDeviceAssignRequest)]
+pub fn encode_map_device_assign_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("DeviceAssignRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeMapDeviceUnassignRequest)]
+pub fn encode_map_device_unassign_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_map_json_request("DeviceUnassignRequest", &request_json)
+}
+
+// =============================================================================
+// Robot vendor cloud accounts — `MessageBody::RobotCloudBody`. The password in
+// `DevicesRequest` rides the encrypted transport once and is never echoed.
+// =============================================================================
+
+/// Signs into a robot vendor account and lists its robots (addon install form
+/// and settings). JSON: `{ provider, region, email, password }`.
+#[wasm_bindgen(js_name = encodeRobotCloudDevicesRequest)]
+pub fn encode_robot_cloud_devices_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(&request_json)
+        .map_err(|e| JsError::new(&format!("invalid DevicesRequest json: {e}")))?;
+    let payload: tentaflow_protocol::robot_cloud::RobotCloudPayload =
+        serde_json::from_value(serde_json::json!({ "DevicesRequest": fields }))
+            .map_err(|e| JsError::new(&format!("invalid DevicesRequest fields: {e}")))?;
+    encode_body_inner(&MessageBody::RobotCloudBody(payload)).map_err(|e| JsError::new(&e))
 }
 
 /// The administrator's account list (A01) and, for everybody else, the accounts

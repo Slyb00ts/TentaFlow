@@ -618,14 +618,16 @@ mod tests {
         assert_eq!(level, RecipeMatch::NormalizedSameOrg);
         assert_eq!(e.hf_id, "Qwen/Qwen3.5-27B");
 
-        // Community repack → canonical org wins.
-        let (e, level) = resolve_embedded("Inferact/Qwen3.8-27B-NVFP4").expect("any org");
-        assert_eq!(level, RecipeMatch::NormalizedAnyOrg);
-        assert_eq!(e.hf_id, "Qwen/Qwen3.8-27B");
-        assert!(e.base_argv.iter().any(|a| a == "qwen3_coder"));
+        // Community repack → canonical org wins. The id has to be one the
+        // snapshot does not carry itself, otherwise this asserts an exact hit:
+        // upstream publishes some repacks (e.g. `Inferact/Qwen3.8-27B-NVFP4`)
+        // as recipes of their own. The parser flag proves a REAL recipe was
+        // picked up, without pinning the test to the parser upstream currently
+        // names for this family.
         let (e, level) = resolve_embedded("unsloth/Qwen3.8-27B-FP8-Dynamic").expect("any org");
         assert_eq!(level, RecipeMatch::NormalizedAnyOrg);
         assert_eq!(e.hf_id, "Qwen/Qwen3.8-27B");
+        assert!(e.base_argv.iter().any(|a| a == "--tool-call-parser"));
 
         // Supplement entries are exact hits and mirror the 3.6 recipe.
         let (fp8, level) = resolve_embedded("Qwen/Qwen3.8-27B-FP8").expect("supplement");

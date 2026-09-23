@@ -5912,6 +5912,10 @@ pub struct AddonPackageInfo {
     /// the install fail server-side.
     #[serde(default)]
     pub singleton: bool,
+    /// `[robot.cloud_account] provider` — the vendor account the install form
+    /// can sign into to fill the connection params (e.g. "unitree").
+    #[serde(default)]
+    pub cloud_account_provider: Option<String>,
 }
 
 /// One declared connection parameter (`[[robot.connection_param]]`). Drives the
@@ -6419,6 +6423,24 @@ pub struct AddonConfigGetRequest {
 pub struct AddonConfigGetResponse {
     pub schema: Vec<AddonConfigField>,
     pub values: Vec<(String, String)>,
+    /// Vision engines the package declares it needs (`[[requires.vision_engine]]`)
+    /// with their state on THIS node, so the settings form can say why an option
+    /// cannot work yet instead of failing silently when it is switched on.
+    #[serde(default)]
+    pub requirements: Vec<AddonRequirement>,
+    /// Same as `AddonPackageInfo.cloud_account_provider`, so the settings form
+    /// offers the vendor-account fill as well.
+    #[serde(default)]
+    pub cloud_account_provider: Option<String>,
+}
+
+/// One declared requirement of an addon and its state on this node.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonRequirement {
+    /// Engine id (a camera-CV bundle, e.g. `privacy-cv`).
+    pub engine_id: String,
+    /// `installed` | `missing` | `unsupported_host`.
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6430,6 +6452,15 @@ pub struct AddonConfigSetRequest {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonConfigSetResponse {
     pub ok: bool,
+    /// Hosts the saved config points the addon's network rules at that still
+    /// need admin approval (a new robot IP moves its network rule).
+    #[serde(default)]
+    pub pending_network_hosts: Vec<String>,
+    /// Running cameras the saved privacy options were applied to (the pipeline
+    /// was rebuilt). `0` when the addon owns no running camera — the options
+    /// then take effect when its robot connects again.
+    #[serde(default)]
+    pub privacy_cameras_applied: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -8393,6 +8424,19 @@ pub enum MessageBody {
     // replicated, so nothing here addresses a node except the requests whose
     // SUBJECT is a node (login, runtime install, node state).
     ProviderAccountBody(crate::provider_account::ProviderAccountPayload),
+    // ----- Robot vendor cloud accounts (addon install form + settings) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the family (request+response) in `RobotCloudPayload`: sign
+    // into a robot vendor account and list its robots with serial, LAN key and
+    // discovered IP. Admin-only; the request carries a password.
+    RobotCloudBody(crate::robot_cloud::RobotCloudPayload),
+    // ----- Shared map (sites, scenes, device placement) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the family in `MapPayload`: the places an organization
+    // manages, the reconstructions inside them and which device writes into
+    // which scene. Geometry never travels here — it goes over the `map:`
+    // stream and the mesh chunk pull.
+    MapBody(crate::map::MapPayload),
 }
 
 // =============================================================================

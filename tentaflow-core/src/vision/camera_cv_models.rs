@@ -9,15 +9,21 @@
 // load lazily from `vision_models_dir()`, so the only deploy-time work is making
 // sure the model files land there.
 //
-// Each bundle mixes two kinds of files:
-//   * binary weights (`*.onnx`, ONNX external `*.onnx.data`) — large, downloaded
-//     from the release URL declared in the manifest's `[[model_preset]] repo`,
+// Each bundle mixes three kinds of files:
+//   * our own binary weights (`*.onnx`, ONNX external `*.onnx.data`, `*.bpk`) —
+//     large, downloaded from the release URL declared in the manifest's
+//     `[[model_preset]] repo`,
+//   * third-party upstream weights (YOLOX-tiny, YuNet) — fetched from the
+//     project's own release URL and pinned by sha256 in this file: the bytes
+//     we run are exactly the bytes whose license and behaviour we checked, and
+//     a moved or re-uploaded upstream file fails the deploy instead of loading,
 //   * sidecar configs (`*-classes.json`, `*-config.json`) — tiny and stable, so
 //     they are embedded in the binary and written out verbatim. This keeps the
 //     pipeline working even when the release server only hosts the weights.
 //
 // The download base comes from the manifest (mesh-propagated), so pointing the
 // install at a different release server is a manifest edit, not a code change.
+// A peer's `/models/manifest/` URL serves every file, pinned ones included.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -29,15 +35,25 @@ use crate::paths::vision_models_dir;
 use crate::services::deploy::LogSink;
 use crate::services::model_download::{download_with_progress, ProgressFn};
 
-/// One file in a camera-CV bundle. `remote` set → fetched from `<base>/<name>`;
-/// `embedded` set → written from the binary-embedded bytes (config sidecars).
-/// `ort_only` marks artifacts (the ORT `.onnx` graphs) that ONLY the
-/// `vision-ort` build loads — a pure-Burn deploy must not require them.
+/// One file in a camera-CV bundle. `remote` set → downloaded: from `upstream`
+/// when pinned, otherwise from `<base>/<name>`; `embedded` set → written from
+/// the binary-embedded bytes (config sidecars). `ort_only` marks artifacts (the
+/// ORT `.onnx` graphs) that ONLY the `vision-ort` build loads — a pure-Burn
+/// deploy must not require them.
 struct CvFile {
     name: &'static str,
     remote: bool,
     embedded: Option<&'static str>,
     ort_only: bool,
+    upstream: Option<Upstream>,
+}
+
+/// A third-party file fetched from its publisher and pinned by content hash.
+#[derive(Clone, Copy)]
+struct Upstream {
+    url: &'static str,
+    /// Lowercase hex sha256 of the published file.
+    sha256: &'static str,
 }
 
 struct CvBundle {
@@ -61,6 +77,37 @@ const STAN_CLASSES: &str = include_str!("cv_assets/stan-classes.json");
 const PLATE_CONFIG: &str = include_str!("cv_assets/plate-ocr-config.json");
 const ADR_OCR_ALPHABET: &str = include_str!("cv_assets/adr-ocr-alphabet.txt");
 
+/// File name of the YOLOX-tiny COCO detector in `vision_models_dir()`.
+pub const YOLOX_TINY_FILE: &str = "yolox_tiny.onnx";
+
+/// File name of the YuNet face detector in `vision_models_dir()`.
+pub const YUNET_FILE: &str = "face_detection_yunet_2023mar.onnx";
+
+/// YOLOX-tiny COCO detector (Megvii, Apache-2.0): vehicle association next to
+/// RF-DETR and person boxes for the camera privacy probe.
+const YOLOX_TINY: CvFile = CvFile {
+    name: YOLOX_TINY_FILE,
+    remote: true,
+    embedded: None,
+    ort_only: true,
+    upstream: Some(Upstream {
+        url: "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx",
+        sha256: "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7",
+    }),
+};
+
+/// YuNet face detector (OpenCV zoo, MIT) for the camera privacy probe.
+const YUNET: CvFile = CvFile {
+    name: YUNET_FILE,
+    remote: true,
+    embedded: None,
+    ort_only: true,
+    upstream: Some(Upstream {
+        url: "https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",
+        sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    }),
+};
+
 const BUNDLES: &[CvBundle] = &[
     CvBundle {
         engine_id: "rfdetr-adr",
@@ -72,6 +119,7 @@ const BUNDLES: &[CvBundle] = &[
                 remote: true,
                 embedded: None,
                 ort_only: false,
+                upstream: None,
             },
             CvFile {
                 // ONNX graph for the ORT/TensorRT session pool. Only the vision-ort
@@ -81,13 +129,18 @@ const BUNDLES: &[CvBundle] = &[
                 remote: true,
                 embedded: None,
                 ort_only: true,
+                upstream: None,
             },
             CvFile {
                 name: "rfdetr-classes.json",
                 remote: false,
                 embedded: Some(RFDETR_CLASSES),
                 ort_only: false,
+                upstream: None,
             },
+            // The parallel vehicle detector the ADR association runs next to
+            // RF-DETR; without it every sign keeps `vehicle_id = 0`.
+            YOLOX_TINY,
         ],
     },
     CvBundle {
@@ -98,6 +151,7 @@ const BUNDLES: &[CvBundle] = &[
                 remote: true,
                 embedded: None,
                 ort_only: false,
+                upstream: None,
             },
             CvFile {
                 // ONNX graph + its external-weights sidecar for the ort session
@@ -106,18 +160,21 @@ const BUNDLES: &[CvBundle] = &[
                 remote: true,
                 embedded: None,
                 ort_only: true,
+                upstream: None,
             },
             CvFile {
                 name: "model_stan.onnx.data",
                 remote: true,
                 embedded: None,
                 ort_only: true,
+                upstream: None,
             },
             CvFile {
                 name: "stan-classes.json",
                 remote: false,
                 embedded: Some(STAN_CLASSES),
                 ort_only: false,
+                upstream: None,
             },
         ],
     },
@@ -129,6 +186,7 @@ const BUNDLES: &[CvBundle] = &[
                 remote: true,
                 embedded: None,
                 ort_only: false,
+                upstream: None,
             },
             CvFile {
                 // ONNX graph for the ort session pool. Supertonic-only (see rfdetr).
@@ -136,12 +194,14 @@ const BUNDLES: &[CvBundle] = &[
                 remote: true,
                 embedded: None,
                 ort_only: true,
+                upstream: None,
             },
             CvFile {
                 name: "plate-ocr-config.json",
                 remote: false,
                 embedded: Some(PLATE_CONFIG),
                 ort_only: false,
+                upstream: None,
             },
             CvFile {
                 // Nasz wytrenowany CRNN do numerów ADR (~4 MB). GŁÓWNY czytnik
@@ -151,6 +211,7 @@ const BUNDLES: &[CvBundle] = &[
                 remote: true,
                 embedded: None,
                 ort_only: false,
+                upstream: None,
             },
             CvFile {
                 // Alfabet klas ADR OCR (`0123456789`) — mały i stabilny, więc
@@ -159,6 +220,7 @@ const BUNDLES: &[CvBundle] = &[
                 remote: false,
                 embedded: Some(ADR_OCR_ALPHABET),
                 ort_only: false,
+                upstream: None,
             },
         ],
     },
@@ -173,7 +235,16 @@ const BUNDLES: &[CvBundle] = &[
             remote: true,
             embedded: None,
             ort_only: false,
+            upstream: None,
         }],
+    },
+    CvBundle {
+        // Camera privacy: person boxes (YOLOX-tiny) and faces (YuNet) the probe
+        // pixelates on the GPU before a frame leaves the node. Both are
+        // third-party releases pinned by sha256, so the bundle needs no release
+        // URL of ours.
+        engine_id: "privacy-cv",
+        files: &[YOLOX_TINY, YUNET],
     },
 ];
 
@@ -317,7 +388,7 @@ pub async fn ensure_bundle(
     std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
 
     let effective = bundle.effective_files();
-    let mut missing: Vec<&'static str> = Vec::new();
+    let mut missing: Vec<&'static CvFile> = Vec::new();
     for f in &effective {
         let dest = dir.join(f.name);
 
@@ -330,7 +401,7 @@ pub async fn ensure_bundle(
         }
 
         if f.remote && !file_ok(&dest) {
-            missing.push(f.name);
+            missing.push(f);
         }
     }
 
@@ -339,11 +410,8 @@ pub async fn ensure_bundle(
         // file is verified against the manifest — already-present files with
         // a mismatched hash are deleted and re-downloaded. Deploy-time only,
         // so the extra hashing cost is acceptable.
-        let required: Vec<&'static str> = effective
-            .iter()
-            .filter(|f| f.remote)
-            .map(|f| f.name)
-            .collect();
+        let required: Vec<&'static CvFile> =
+            effective.iter().copied().filter(|f| f.remote).collect();
         if required.is_empty() {
             return Ok(());
         }
@@ -351,20 +419,43 @@ pub async fn ensure_bundle(
             .await;
     }
 
+    // Pinned upstream files are re-verified even when present: the hash is the
+    // whole point of pinning, and a truncated or swapped file must not load.
+    for f in &effective {
+        if let Some(pin) = f.upstream {
+            let dest = dir.join(f.name);
+            if file_ok(&dest) && !sha256_matches(&dest, pin.sha256).await? {
+                if let Some(s) = log_sink {
+                    s.info(&format!(
+                        "vision: {} on disk mismatches its pinned sha256 — re-downloading",
+                        f.name
+                    ));
+                }
+                std::fs::remove_file(&dest)
+                    .map_err(|e| anyhow!("remove stale {}: {}", dest.display(), e))?;
+                missing.push(f);
+            }
+        }
+    }
+
     if missing.is_empty() {
         return Ok(());
     }
 
     let base = base_url.trim_end_matches('/');
-    if base.is_empty() {
+    if base.is_empty() && missing.iter().any(|f| f.upstream.is_none()) {
         return Err(anyhow!(
             "camera-CV '{}': no release URL configured (manifest model_preset.repo is empty)",
             engine_id
         ));
     }
-    for name in missing {
+    for f in missing {
+        let name = f.name;
         let dest = dir.join(name);
-        let url = format!("{}/{}", base, name);
+        let url = match f.upstream {
+            Some(pin) => pin.url.to_string(),
+            None => format!("{}/{}", base, name),
+        };
 
         if let Some(s) = log_sink {
             s.phase("downloading-vision", &format!("Pobieram {}", name));
@@ -377,12 +468,34 @@ pub async fn ensure_bundle(
             .await
             .map_err(|e| anyhow!("download {} from {}: {}", name, url, e))?;
 
+        if let Some(pin) = f.upstream {
+            if !sha256_matches(&dest, pin.sha256).await? {
+                let _ = std::fs::remove_file(&dest);
+                return Err(anyhow!(
+                    "camera-CV '{}': {} from {} does not match its pinned sha256 {} — \
+                     file deleted, deploy aborted",
+                    engine_id,
+                    name,
+                    url,
+                    pin.sha256
+                ));
+            }
+        }
+
         if let Some(s) = log_sink {
             s.info(&format!("vision: {} pobrany", name));
         }
     }
 
     Ok(())
+}
+
+/// Whether the file at `path` hashes to `expected` (lowercase hex sha256).
+async fn sha256_matches(path: &Path, expected: &str) -> Result<bool> {
+    let actual = crate::api::model_bundle::sha256_file_hex(path)
+        .await
+        .map_err(|e| anyhow!("hash {}: {}", path.display(), e))?;
+    Ok(actual == expected)
 }
 
 /// Ceiling for the manifest JSON body — the manifest lists at most a few
@@ -595,7 +708,7 @@ async fn download_from_bundle_manifest(
     engine_id: &str,
     manifest_url: &str,
     api_key: Option<&str>,
-    needed: &[&'static str],
+    needed: &[&'static CvFile],
     log_sink: Option<&LogSink>,
 ) -> Result<()> {
     let base = reqwest::Url::parse(manifest_url)
@@ -652,7 +765,8 @@ async fn download_from_bundle_manifest(
 
     let dir = vision_models_dir();
     let mut cumulative: u64 = 0;
-    for name in needed {
+    for file in needed {
+        let name = &file.name;
         let entry = entries
             .iter()
             .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(*name))
@@ -674,6 +788,19 @@ async fn download_from_bundle_manifest(
             .map(str::to_ascii_lowercase)
             .filter(|h| h.len() == 64)
             .ok_or_else(|| anyhow!("manifest entry '{}' has no valid sha256", name))?;
+        // A peer serving a pinned upstream file must serve THOSE bytes.
+        if let Some(pin) = file.upstream {
+            if expected_sha != pin.sha256 {
+                return Err(anyhow!(
+                    "camera-CV '{}': the remote manifest lists '{}' with sha256 {} but the \
+                     pinned upstream release is {}",
+                    engine_id,
+                    name,
+                    expected_sha,
+                    pin.sha256
+                ));
+            }
+        }
         let declared_size = entry.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
         let file_url = resolve_manifest_file_url(&base, rel_url)
             .map_err(|why| anyhow!("manifest entry '{}': {}", name, why))?;
@@ -1249,5 +1376,39 @@ mod tests {
         assert!(per_file_ceiling(TOTAL_IMPORT_LIMIT + 1, 0).is_err());
         // A full cumulative budget rejects the next file.
         assert!(per_file_ceiling(1, TOTAL_IMPORT_LIMIT).is_err());
+    }
+
+    #[test]
+    fn pinned_upstream_files_are_well_formed() {
+        for b in BUNDLES {
+            for f in b.files {
+                let Some(pin) = f.upstream else { continue };
+                assert!(pin.url.starts_with("https://"), "{}", pin.url);
+                assert!(pin.url.ends_with(".onnx"), "{}", pin.url);
+                assert_eq!(pin.sha256.len(), 64, "{}", f.name);
+                assert!(pin
+                    .sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+                assert!(f.remote && f.embedded.is_none(), "{}", f.name);
+                assert!(validate_file_name(f.name), "{}", f.name);
+            }
+        }
+    }
+
+    #[test]
+    fn privacy_bundle_ships_yolox_and_yunet() {
+        assert!(is_camera_cv_engine("privacy-cv"));
+        let expected: Vec<&str> = if cfg!(feature = "vision-ort") {
+            vec![YOLOX_TINY_FILE, YUNET_FILE]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(bundle_file_names("privacy-cv").unwrap(), expected);
+        let rfdetr = bundle_file_names("rfdetr-adr").unwrap();
+        assert_eq!(
+            rfdetr.contains(&YOLOX_TINY_FILE),
+            cfg!(feature = "vision-ort")
+        );
     }
 }

@@ -604,6 +604,24 @@ pub fn addon_config_get(
     let manifest = parse_manifest(&addon.manifest_json);
     let schema = extract_config_schema(&manifest);
 
+    // Read from the PACKAGE, not the instance manifest: the declaration belongs
+    // to the package and an instance installed before it was added still gets
+    // the vendor-account fill without a reinstall.
+    let package_manifest =
+        match repository::get_addon_instance_package_ref(&ctx.state.db, &payload.addon_id)
+            .map_err(db_err)?
+        {
+            Some((package_id, version)) => {
+                repository::get_addon_package(&ctx.state.db, &package_id, &version)
+                    .map_err(db_err)?
+                    .map(|pkg| pkg.manifest_json)
+            }
+            None => None,
+        };
+    let cloud_account_provider = package_manifest
+        .as_deref()
+        .and_then(crate::addon::lifecycle::parse_cloud_account_provider);
+
     let rows =
         repository::list_addon_config_rows(&ctx.state.db, &payload.addon_id).map_err(db_err)?;
     // Sekret wartosci — zwracamy "" aby GUI wiedzialo ze jest ustawione, ale nie widzi plaintextu.
@@ -623,9 +641,63 @@ pub fn addon_config_get(
         })
         .collect();
 
+    let requirements = package_manifest
+        .as_deref()
+        .map(|m| vision_engine_requirements(m))
+        .unwrap_or_default();
+
     Ok(MessageBody::AddonConfigGetResponseBody(
-        AddonConfigGetResponse { schema, values },
+        AddonConfigGetResponse {
+            schema,
+            values,
+            requirements,
+            cloud_account_provider,
+        },
     ))
+}
+
+/// State of every vision engine the package declares it needs. `installed`
+/// means every file of the engine's camera-CV bundle is in the vision model
+/// directory; `unsupported_host` means this build/host cannot run the GPU path
+/// at all, so installing the files would not help.
+fn vision_engine_requirements(manifest_json: &str) -> Vec<tentaflow_protocol::AddonRequirement> {
+    crate::addon::lifecycle::parse_required_vision_engines(manifest_json)
+        .into_iter()
+        .map(|engine_id| {
+            let status = if !gpu_vision_available() {
+                "unsupported_host"
+            } else if vision_bundle_installed(&engine_id) {
+                "installed"
+            } else {
+                "missing"
+            };
+            tentaflow_protocol::AddonRequirement {
+                engine_id,
+                status: status.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// True when this build runs the GPU vision path the camera-CV engines need.
+fn gpu_vision_available() -> bool {
+    cfg!(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "inference-vision-gpu",
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
+    ))
+}
+
+/// True when every file of the engine's camera-CV bundle is present locally.
+/// An engine that is not a camera-CV bundle has nothing to install, so it
+/// counts as installed.
+fn vision_bundle_installed(engine_id: &str) -> bool {
+    let Some(files) = crate::vision::camera_cv_models::bundle_file_names(engine_id) else {
+        return true;
+    };
+    let dir = crate::paths::vision_models_dir();
+    files.iter().all(|name| dir.join(name).exists())
 }
 
 // =============================================================================
@@ -635,7 +707,7 @@ pub fn addon_config_get(
 #[handler(variant = "AddonConfigSetRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn addon_config_set(
+pub async fn addon_config_set(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -659,13 +731,16 @@ pub fn addon_config_set(
         schema.iter().map(|f| (f.id.as_str(), f)).collect();
 
     // Walidacja: kazde pole musi istniec w schema. Puste value dla secret — pomijamy (nie nadpisujemy).
-    for (k, _) in payload.values.iter() {
+    for (k, v) in payload.values.iter() {
         if !schema_map.contains_key(k.as_str()) {
             return Err(ProtocolError::bad_request(format!(
                 "nieznane pole konfiguracji: {}",
                 k
             )));
         }
+        // Before anything is written: a robot IP lands in a network rule host.
+        crate::addon::lifecycle::validate_connection_param_value(&addon.manifest_json, k, v)
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     }
 
     let updated_by = current_user_id(ctx);
@@ -712,10 +787,39 @@ pub fn addon_config_set(
         severity,
     );
 
-    Ok(MessageBody::AddonConfigSetResponseBody(
-        AddonConfigSetResponse { ok: true },
-    ))
+    // Privacy options drive the camera pipeline, so a change must reach the
+    // RUNNING camera; the session rebuilds its graph rather than switching one,
+    // which is what keeps an unprocessed frame from slipping out mid-change.
+    let privacy_cameras_applied = if fields_changed.iter().any(|k| {
+        k == crate::services::camera_ingest::privacy_options::CONFIG_FACE_BLUR
+            || k == crate::services::camera_ingest::privacy_options::CONFIG_PERSON_DETECT
+    }) {
+        crate::addon::host_functions::camera::apply_privacy_to_addon_cameras(
+            &ctx.state.db,
+            &payload.addon_id,
+        )
+        .await
+        .map_err(|e| ProtocolError::internal(format!("privacy options: {e:#}")))?
+    } else {
+        0
+    };
+
+    // A connection param (robot IP) feeds the instance's network rules, which
+    // were resolved at install — re-resolve them and reload the runtime.
+    let pending_network_hosts = match ctx.state.addon_manager.clone() {
+        Some(mgr) => mgr
+            .rebind_instance_connection(&payload.addon_id, updated_by.as_deref())
+            .map_err(|e| ProtocolError::internal(format!("network rules: {e:#}")))?,
+        None => Vec::new(),
+    };
+
+    Ok(MessageBody::AddonConfigSetResponseBody(AddonConfigSetResponse {
+        ok: true,
+        pending_network_hosts,
+        privacy_cameras_applied,
+    }))
 }
+
 
 // =============================================================================
 // 6. AddonLogsRequest — Admin
@@ -1340,6 +1444,9 @@ pub fn addon_instance_dispatch(
                     versions: vec![row.version],
                     source: row.source,
                     installed_instances,
+                    cloud_account_provider: crate::addon::lifecycle::parse_cloud_account_provider(
+                        &row.manifest_json,
+                    ),
                     connection_params,
                     singleton,
                 });

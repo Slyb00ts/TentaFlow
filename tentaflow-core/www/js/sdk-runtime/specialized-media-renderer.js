@@ -46,16 +46,9 @@ function attachLiveDetections(wrapper, tile, readStreamId, ctx) {
   let overlay = null;
   let cancelled = false;
   import('/js/modules/vision-detections-overlay.js')
-    .then(({ attachDetectionsOverlay }) => {
+    .then(({ attachOverlayToVideoStreamTile }) => {
       if (cancelled) return;
-      overlay = attachDetectionsOverlay({
-        video: tile,
-        cameraId,
-        videoResolver: () => tile.shadowRoot?.querySelector('video') || null,
-        // Baza media-time (base_pts_ns) z init-segmentu MSE — tf-video-stream
-        // udostepnia ja przez getter, nakladka czyta co klatke (sledzi resubscribe).
-        mediaBasePtsProvider: () => tile.mediaBasePtsNs ?? null,
-      });
+      overlay = attachOverlayToVideoStreamTile(tile, cameraId);
     })
     .catch((e) => {
       console.warn('[specialized-media] detections overlay load failed:', e?.message ?? e);

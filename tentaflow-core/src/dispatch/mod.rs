@@ -51,6 +51,8 @@ pub mod model_conversion;
 pub mod model_metrics;
 pub mod project_studio;
 pub mod provider_account;
+pub mod maps;
+pub mod robot_cloud;
 pub mod recorder;
 pub mod resume_token;
 pub mod robots;
@@ -283,6 +285,35 @@ pub fn check_password_rotation(
     Ok(())
 }
 
+/// Test-only: makes the context's session a REAL, active, non-rotating account
+/// in the context's own database.
+///
+/// `dispatch()` runs `check_password_rotation` before any policy gate, so a
+/// fixture session whose `user_id` has no `user_accounts` row is refused with
+/// `AuthRequired: account unavailable` — every per-handler assertion behind it
+/// (policy denial, NotFound, the handler's own answer) would then never be
+/// reached. Fixtures call this once the session is final.
+#[cfg(test)]
+pub(crate) fn seed_session_account(ctx: &HandlerContext) {
+    let SessionAuth::UserSession { user_id, role } = &ctx.session else {
+        return;
+    };
+    let id = uuid::Uuid::from_bytes(*user_id).to_string();
+    let role = role.as_deref().unwrap_or("user");
+    ctx.state
+        .db
+        .write()
+        .expect("test db writer")
+        .execute(
+            "INSERT OR REPLACE INTO user_accounts \
+             (id, username, password_hash, display_name, is_active, is_admin, \
+              must_change_password, role) \
+             VALUES (?1, ?1, '', ?1, 1, ?2, 0, ?3)",
+            rusqlite::params![id, i64::from(role == "admin"), role],
+        )
+        .expect("seed fixture account");
+}
+
 /// Wybiera handler po wariancie MessageBody, sprawdza policy, wola dispatch_fn.
 /// Zwraca (response_body, is_error_flag_needed). Signatura jest async —
 /// sync handlery sa owijane w `async move` przez makro `#[handler]`.
@@ -394,6 +425,8 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
             | MessageBody::SettingsUpdateRequestBody(_)
             | MessageBody::AddonConfigSetRequestBody(_)
             | MessageBody::AddonInstallRequestBody(_)
+            // Request: vendor account password. Response: per-robot LAN keys.
+            | MessageBody::RobotCloudBody(_)
     ) {
         return true;
     }
@@ -2688,6 +2721,35 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Pa::AccountOpAck { .. } => "ProviderAccountAccountOpAck",
             }
         }
+        MessageBody::MapBody(p) => {
+            use tentaflow_protocol::map::MapPayload as M;
+            match p {
+                M::SiteListRequest {} => "MapSiteListRequest",
+                M::SiteListResponse { .. } => "MapSiteListResponse",
+                M::SiteUpsertRequest { .. } => "MapSiteUpsertRequest",
+                M::SiteDeleteRequest { .. } => "MapSiteDeleteRequest",
+                M::SiteResponse { .. } => "MapSiteResponse",
+                M::SceneListRequest { .. } => "MapSceneListRequest",
+                M::SceneListResponse { .. } => "MapSceneListResponse",
+                M::SceneUpsertRequest { .. } => "MapSceneUpsertRequest",
+                M::SceneDeleteRequest { .. } => "MapSceneDeleteRequest",
+                M::SceneResponse { .. } => "MapSceneResponse",
+                M::SceneSetOwnerRequest { .. } => "MapSceneSetOwnerRequest",
+                M::SceneGeoAnchorSetRequest { .. } => "MapSceneGeoAnchorSetRequest",
+                M::DeviceListRequest { .. } => "MapDeviceListRequest",
+                M::DeviceListResponse { .. } => "MapDeviceListResponse",
+                M::DeviceAssignRequest { .. } => "MapDeviceAssignRequest",
+                M::DeviceUnassignRequest { .. } => "MapDeviceUnassignRequest",
+                M::DeviceResponse { .. } => "MapDeviceResponse",
+            }
+        }
+        MessageBody::RobotCloudBody(p) => {
+            use tentaflow_protocol::robot_cloud::RobotCloudPayload as Rc;
+            match p {
+                Rc::DevicesRequest { .. } => "RobotCloudDevicesRequest",
+                Rc::DevicesResponse { .. } => "RobotCloudDevicesResponse",
+            }
+        }
     }
 }
 
@@ -3061,6 +3123,7 @@ mod tests {
             origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
+        seed_session_account(&ctx);
         let body = MessageBody::Error(ProtocolError {
             code: ProtocolErrorCode::Internal,
             message: "test".to_string(),

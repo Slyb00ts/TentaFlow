@@ -1,0 +1,97 @@
+/* =============================================================================
+   maps.css — Shared map screen (sites, scenes, devices).
+   Layout only: every control is a tf-* component styled by controls.css, so
+   this sheet carries the page scaffolding and the two banner kinds the map
+   windows need (a destructive warning and a server-refusal box).
+   ============================================================================= */
+
+.maps-loading {
+  padding: var(--tf-space-xl, 24px);
+  text-align: center;
+  color: var(--tf-text-3);
+}
+
+.maps-section-title {
+  margin: var(--tf-space-lg, 16px) 0 var(--tf-space-sm, 8px);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--tf-text);
+}
+
+/* Row count under every list, the way the other feature screens close a table. */
+.maps-table-footer {
+  padding: var(--tf-space-sm, 8px) 2px 0;
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+#maps-toolbar {
+  margin-bottom: var(--tf-space-md, 12px);
+}
+
+.maps-window-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-md, 12px);
+}
+
+.maps-window-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.maps-footer-right {
+  display: flex;
+  gap: var(--tf-space-sm, 8px);
+}
+
+/* Coordinate triples share one row and collapse on a phone. */
+.maps-field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+}
+
+.maps-field-row > tf-input {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.maps-hint {
+  font-size: 13px;
+  color: var(--tf-text-3);
+}
+
+.maps-danger,
+.maps-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--tf-space-sm, 8px);
+  padding: var(--tf-space-sm, 8px) var(--tf-space-md, 12px);
+  border-radius: var(--tf-radius-sm, 6px);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.maps-danger {
+  background: color-mix(in srgb, var(--tf-warn) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tf-warn) 35%, transparent);
+  color: var(--tf-text);
+}
+
+/* The server's own refusal text — never a paraphrase, so it must stay readable
+   even when it is a long sentence. */
+.maps-error {
+  background: color-mix(in srgb, var(--tf-danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tf-danger) 35%, transparent);
+  color: var(--tf-text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.maps-danger .icon,
+.maps-error .icon {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+}

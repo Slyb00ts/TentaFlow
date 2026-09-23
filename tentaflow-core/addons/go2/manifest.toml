@@ -88,10 +88,24 @@ type = "string"
 required = false
 placeholder = "32 znaki hex (z chmury Unitree)"
 
+# The Unitree account the robot is bound to holds its serial and per-device AES
+# key. The install form and the settings offer signing into it (Core fetches the
+# robot list, then LAN discovery finds the current IP) instead of copying them
+# by hand. Provider ids are implemented in Core (`dispatch/robot_cloud.rs`).
+[robot.cloud_account]
+provider = "unitree"
+
+# Person detection and face anonymization run on models from this camera-CV
+# bundle; the settings form shows whether the node has them.
+[[requires.vision_engine]]
+engine = "privacy-cv"
+
 [config.schema]
 ip = { type = "string", label = "Adres IP robota", required = true }
 serial = { type = "string", label = "Numer seryjny (opcjonalnie)", required = false }
 aes_key = { type = "string", label = "Klucz AES-128 robota (dla firmware >= 1.1.15)", required = false }
+privacy_face_blur = { type = "bool", label = "Anonimizacja: zamazuj głowy wszystkich osób na obrazie kamery", default = "true" }
+privacy_person_detect = { type = "bool", label = "Detekcja osób na żywo (ramki na podglądzie kamery)", default = "false" }
 
 # What the robot can do — lets the Robots app / Flow Builder expose controls,
 # status tiles and sensor previews uniformly across robot types.

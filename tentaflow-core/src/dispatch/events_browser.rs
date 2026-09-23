@@ -342,7 +342,7 @@ mod tests {
     }
 
     fn ctx_with(who: &Principal, permissions: &[&str]) -> HandlerContext {
-        HandlerContext {
+        let ctx = HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: who.bytes,
                 role: None,
@@ -358,7 +358,9 @@ mod tests {
                 role_id: "role-test".to_string(),
                 permissions: permissions.iter().map(|p| p.to_string()).collect(),
             }),
-        }
+        };
+        crate::dispatch::seed_session_account(&ctx);
+        ctx
     }
 
     /// Seeds one run owned by `who`, inside `session_id` so the test can find

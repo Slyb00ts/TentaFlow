@@ -278,6 +278,7 @@ async fn supervisor_rejects_unsupported_vendor() {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .unwrap_err();
@@ -300,6 +301,7 @@ async fn supervisor_rejects_zero_and_oversized_fps() {
                 owner_addon_id: None,
                 credentials_encrypted: None,
                 decoder_override: None,
+                privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
             })
             .await
             .unwrap_err();
@@ -322,6 +324,7 @@ async fn supervisor_rejects_missing_file_url() {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .unwrap_err();
@@ -504,6 +507,7 @@ async fn dos_quota_per_addon_blocks_after_cap() {
             owner_addon_id: Some(owner.clone()),
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         };
         match sup.add_camera(cfg).await {
             Ok(()) => added += 1,
@@ -531,6 +535,7 @@ async fn dos_quota_per_addon_blocks_after_cap() {
             owner_addon_id: Some(owner.clone()),
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await;
     let err = one_past.expect_err("33rd camera for the same owner MUST be QuotaExceeded");
@@ -561,6 +566,7 @@ async fn dos_quota_below_cap_succeeds() {
         owner_addon_id: Some(owner),
         credentials_encrypted: None,
         decoder_override: None,
+        privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     };
     match sup.add_camera(cfg).await {
         Ok(()) => {}

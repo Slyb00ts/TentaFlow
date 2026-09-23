@@ -1045,6 +1045,12 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "provider_account_home_lost",
             MigrationStep::Sql(PROVIDER_ACCOUNT_HOME_LOST),
         ),
+        (165, "shared_maps", MigrationStep::Sql(SHARED_MAPS)),
+        (
+            166,
+            "shared_maps_permissions",
+            MigrationStep::Rust(roles_add_map_permissions),
+        ),
     ]
 }
 
@@ -1340,6 +1346,138 @@ const PROVIDER_ACCOUNT_HOME_LOST: &str = r#"
 ALTER TABLE provider_accounts
     ADD COLUMN home_lost_node_id TEXT NULL;
 "#;
+
+// v165 — the shared map: places, reconstructions and which device writes into
+// which one.
+//
+// Today a robot's map is the last frame it sent (`services/slam_scene.rs`), so
+// it dies with the session and cannot be shared. These tables hold the METADATA
+// of a persistent map; the geometry itself never enters SQLite (chunks are
+// immutable snapshots under `paths::maps_dir()`, indexed by `map_chunks` — see
+// `docs/SHARED_MAP_PLAN.md` §1.2). Putting voxels in rows would make every scan
+// a write amplification the WAL cannot absorb.
+//
+// `map_scenes.owner_node_id` is load-bearing: exactly one node owns a scene and
+// is the only writer of its chunks and placements, which is what keeps LWW from
+// ever having to decide between a human's placement and a drift correction.
+//
+// Foreign keys point only INSIDE the feature (`scene → site`). Nothing points at
+// `sync_nodes`, `user_accounts` or `organizations`: a replicated row may name a
+// peer row that has not materialized yet, and an enforced FK would turn arrival
+// order into a refused write (same reason as `provider_accounts`, v156).
+//
+// `map_device_sessions` is deliberately NODE-LOCAL and absent from the sync
+// registry: a session is the period one machine's odometry stayed continuous,
+// and `clock_offset_us` is measured against THIS node's clock. Replicating
+// either would state something about a machine the receiver cannot read.
+//
+// Deletion is a hard DELETE replicated as an operation, like every other core
+// table — there is no `deleted_at_ms` column anywhere in this schema, and adding
+// one here would invent a second deletion mechanism for one feature.
+const SHARED_MAPS: &str = r#"
+CREATE TABLE IF NOT EXISTS map_sites (
+    site_id       TEXT PRIMARY KEY,
+    org_id        TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    address       TEXT NOT NULL DEFAULT '',
+    lat           REAL,
+    lon           REAL,
+    alt           REAL,
+    created_by    TEXT NOT NULL DEFAULT '',
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS map_sites_org ON map_sites(org_id);
+
+CREATE TABLE IF NOT EXISTS map_scenes (
+    scene_id      TEXT PRIMARY KEY,
+    site_id       TEXT NOT NULL REFERENCES map_sites(site_id) ON DELETE CASCADE,
+    org_id        TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    voxel_res_m   REAL NOT NULL DEFAULT 0.05,
+    owner_node_id TEXT NOT NULL,
+    owner_epoch   INTEGER NOT NULL DEFAULT 1,
+    geo_lat       REAL,
+    geo_lon       REAL,
+    geo_alt       REAL,
+    geo_heading   REAL,
+    max_voxels    INTEGER NOT NULL DEFAULT 50000000,
+    tfmc_version  INTEGER NOT NULL DEFAULT 1,
+    created_by    TEXT NOT NULL DEFAULT '',
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS map_scenes_site ON map_scenes(site_id);
+CREATE INDEX IF NOT EXISTS map_scenes_owner ON map_scenes(owner_node_id);
+
+CREATE TABLE IF NOT EXISTS map_device_placements (
+    scene_id      TEXT NOT NULL REFERENCES map_scenes(scene_id) ON DELETE CASCADE,
+    node_id       TEXT NOT NULL,
+    device_id     TEXT NOT NULL,
+    session_epoch INTEGER NOT NULL,
+    tx            REAL NOT NULL,
+    ty            REAL NOT NULL,
+    tz            REAL NOT NULL,
+    qx            REAL NOT NULL,
+    qy            REAL NOT NULL,
+    qz            REAL NOT NULL,
+    qw            REAL NOT NULL,
+    method        TEXT NOT NULL CHECK (method IN ('identity','manual','icp')),
+    locked        INTEGER NOT NULL DEFAULT 0,
+    confidence    REAL NOT NULL DEFAULT 0,
+    set_by        TEXT NOT NULL DEFAULT '',
+    set_at_ms     INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (scene_id, node_id, device_id, session_epoch)
+);
+CREATE INDEX IF NOT EXISTS map_device_placements_device
+    ON map_device_placements(node_id, device_id);
+
+CREATE TABLE IF NOT EXISTS map_chunks (
+    scene_id    TEXT NOT NULL REFERENCES map_scenes(scene_id) ON DELETE CASCADE,
+    chunk_key   TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
+    owner_epoch INTEGER NOT NULL,
+    sha256      TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    occupied    INTEGER NOT NULL,
+    updated_hlc TEXT NOT NULL,
+    PRIMARY KEY (scene_id, chunk_key)
+);
+
+CREATE TABLE IF NOT EXISTS map_device_sessions (
+    node_id              TEXT NOT NULL,
+    device_id            TEXT NOT NULL,
+    session_epoch        INTEGER NOT NULL,
+    scene_id             TEXT,
+    started_at_ms        INTEGER NOT NULL,
+    last_frame_ms        INTEGER,
+    state                TEXT NOT NULL
+        CHECK (state IN ('unplaced','relocalizing','placed','lost')),
+    clock_offset_us      INTEGER,
+    clock_offset_samples INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (node_id, device_id, session_epoch)
+);
+CREATE INDEX IF NOT EXISTS map_device_sessions_scene ON map_device_sessions(scene_id);
+"#;
+
+// v166 — who may see and change the map.
+//
+// Reading a map is reading the building, so every role that can look at the
+// fleet gets `map.read`. Placing a device rewrites where its scans land, which
+// is an operator decision (`map.write`), and creating a place, handing a scene
+// to another node or georeferencing it changes what the whole organization
+// sees, so it stays with the administrator (`map.admin`).
+fn roles_add_map_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "org_operator", "org_viewer", "dpo", "supervisor"],
+        &["map.read"],
+    )?;
+    roles_add_permissions(conn, &["org_admin", "org_operator"], &["map.write"])?;
+    roles_add_permissions(conn, &["org_admin"], &["map.admin"])
+}
 
 // v160 — the accounts this node already runs, adopted into the replicated
 // registry.
@@ -4356,6 +4494,10 @@ fn child_remaps() -> Vec<ChildRemap> {
         f("sync_resource_acl", "owner_user_id", UserAccounts),
         f("sync_resource_acl", "assigned_user_id", UserAccounts),
         f("sync_resource_acl", "manager_user_id", UserAccounts),
+        // -- shared map (165): who created the place / the reconstruction --
+        f("map_sites", "created_by", UserAccounts),
+        f("map_scenes", "created_by", UserAccounts),
+        f("map_device_placements", "set_by", UserAccounts),
         f("sync_explicit_shares", "granted_by", UserAccounts),
         f(
             "__tentaflow_core_sync_captures",
@@ -12497,6 +12639,104 @@ mod tests {
                 ("acc-never-homed".to_string(), None, None),
             ],
             "the home survives the upgrade and no row is marked as having lost one"
+        );
+    }
+
+    /// v165 creates the map schema and v166 grants its permissions. The scene's
+    /// foreign key must cascade — deleting a place deletes the reconstructions
+    /// inside it, or the index would outlive the chunks on disk.
+    #[test]
+    fn migration_v165_creates_the_map_schema_and_v166_grants_its_permissions() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 164);
+        assert!(
+            !table_exists(&conn, "map_sites").unwrap(),
+            "the map tables must not exist before the rung runs"
+        );
+
+        apply_migration(&conn, 165, "shared_maps", &MigrationStep::Sql(SHARED_MAPS)).unwrap();
+        for table in [
+            "map_sites",
+            "map_scenes",
+            "map_device_placements",
+            "map_chunks",
+            "map_device_sessions",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "{table} was not created");
+        }
+
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute(
+            "INSERT INTO map_sites (site_id, org_id, name, created_at_ms, updated_at_ms)              VALUES ('site-1', 'default', 'Hala', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO map_scenes                (scene_id, site_id, org_id, name, owner_node_id, created_at_ms, updated_at_ms)              VALUES ('scn-1', 'site-1', 'default', 'Parter', 'helios', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO map_device_placements                (scene_id, node_id, device_id, session_epoch, tx, ty, tz, qx, qy, qz, qw,                 method, set_at_ms, updated_at_ms)              VALUES ('scn-1', 'helios', 'go2-1', 1, 0, 0, 0, 0, 0, 0, 1, 'identity', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM map_sites WHERE site_id = 'site-1'", [])
+            .unwrap();
+        let scenes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM map_scenes", [], |r| r.get(0))
+            .unwrap();
+        let placements: i64 = conn
+            .query_row("SELECT COUNT(*) FROM map_device_placements", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            (scenes, placements),
+            (0, 0),
+            "deleting a site must take its scenes and their placements with it"
+        );
+
+        roles_add_map_permissions(&conn).unwrap();
+        for (role, expected) in [
+            ("org_admin", vec!["map.read", "map.write", "map.admin"]),
+            ("org_operator", vec!["map.read", "map.write"]),
+            ("org_viewer", vec!["map.read"]),
+        ] {
+            let json: String = conn
+                .query_row(
+                    "SELECT permissions_json FROM roles WHERE name = ?1",
+                    rusqlite::params![role],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let perms: Vec<String> = serde_json::from_str(&json).unwrap();
+            for want in &expected {
+                assert!(perms.iter().any(|p| p == want), "{role} is missing {want}");
+            }
+            for absent in ["map.read", "map.write", "map.admin"]
+                .iter()
+                .filter(|p| !expected.contains(p))
+            {
+                assert!(
+                    !perms.iter().any(|p| p == absent),
+                    "{role} must not receive {absent}"
+                );
+            }
+        }
+
+        // Running it again grants nothing twice.
+        roles_add_map_permissions(&conn).unwrap();
+        let admin_json: String = conn
+            .query_row(
+                "SELECT permissions_json FROM roles WHERE name = 'org_admin'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let perms: Vec<String> = serde_json::from_str(&admin_json).unwrap();
+        assert_eq!(
+            perms.iter().filter(|p| p.as_str() == "map.read").count(),
+            1,
+            "the grant must be idempotent"
         );
     }
 

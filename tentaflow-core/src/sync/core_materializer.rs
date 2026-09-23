@@ -131,6 +131,13 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::ProviderAccountGrant
             | CoreSyncResourceKind::AgentRuntimeNode
             | CoreSyncResourceKind::AgentRuntimeEngine
+            // Shared map: a site is renamed, a scene is handed to another node
+            // and a device is unassigned, all from any node with the
+            // permission. Unassigning is a revocation, so the Delete tombstone
+            // has to beat an older add that arrived the long way round.
+            | CoreSyncResourceKind::MapSite
+            | CoreSyncResourceKind::MapScene
+            | CoreSyncResourceKind::MapDevicePlacement
     )
 }
 
@@ -294,6 +301,9 @@ pub fn apply_core_operation(
         }
         CoreSyncResourceKind::AgentRuntimeNode => apply_agent_runtime_node(&tx, operation)?,
         CoreSyncResourceKind::AgentRuntimeEngine => apply_agent_runtime_engine(&tx, operation)?,
+        CoreSyncResourceKind::MapSite => apply_map_site(&tx, operation)?,
+        CoreSyncResourceKind::MapScene => apply_map_scene(&tx, operation)?,
+        CoreSyncResourceKind::MapDevicePlacement => apply_map_device_placement(&tx, operation)?,
     };
 
     if lww_tracked && authorized {
@@ -4274,6 +4284,202 @@ fn apply_provider_account_grant(
     }
 }
 
+/// A place the organization manages. Nothing here names a node or a user
+/// account, so the row applies wherever it lands.
+fn apply_map_site(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let site_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO map_sites \
+                   (site_id, org_id, name, description, address, lat, lon, alt, \
+                    created_by, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(site_id) DO UPDATE SET \
+                    org_id = excluded.org_id, name = excluded.name, \
+                    description = excluded.description, address = excluded.address, \
+                    lat = excluded.lat, lon = excluded.lon, alt = excluded.alt, \
+                    updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![
+                    site_id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "name")?,
+                    field_string_or(operation, "description", "")?,
+                    field_string_or(operation, "address", "")?,
+                    field_optional_f64(operation, "lat")?,
+                    field_optional_f64(operation, "lon")?,
+                    field_optional_f64(operation, "alt")?,
+                    field_string_or(operation, "created_by", "")?,
+                    field_i64_or(operation, "created_at_ms", 0)?,
+                    field_i64_or(operation, "updated_at_ms", 0)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM map_sites WHERE site_id = ?1",
+                rusqlite::params![site_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// One reconstruction. `voxel_res_m` is NOT updated on conflict: the resolution
+/// is chosen once and every chunk on disk is written at it, so a replicated
+/// change would reinterpret geometry that is already there.
+fn apply_map_scene(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let scene_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let site_id = field_string(operation, "site_id")?;
+            require_map_site(tx, &site_id)?;
+            tx.execute(
+                "INSERT INTO map_scenes \
+                   (scene_id, site_id, org_id, name, voxel_res_m, owner_node_id, owner_epoch, \
+                    geo_lat, geo_lon, geo_alt, geo_heading, max_voxels, tfmc_version, \
+                    created_by, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+                 ON CONFLICT(scene_id) DO UPDATE SET \
+                    site_id = excluded.site_id, org_id = excluded.org_id, \
+                    name = excluded.name, owner_node_id = excluded.owner_node_id, \
+                    owner_epoch = MAX(map_scenes.owner_epoch, excluded.owner_epoch), \
+                    geo_lat = excluded.geo_lat, geo_lon = excluded.geo_lon, \
+                    geo_alt = excluded.geo_alt, geo_heading = excluded.geo_heading, \
+                    max_voxels = excluded.max_voxels, \
+                    tfmc_version = excluded.tfmc_version, \
+                    updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![
+                    scene_id,
+                    site_id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "name")?,
+                    field_f64_or(operation, "voxel_res_m", 0.05)?,
+                    field_string(operation, "owner_node_id")?,
+                    field_i64_or(operation, "owner_epoch", 1)?,
+                    field_optional_f64(operation, "geo_lat")?,
+                    field_optional_f64(operation, "geo_lon")?,
+                    field_optional_f64(operation, "geo_alt")?,
+                    field_optional_f64(operation, "geo_heading")?,
+                    field_i64_or(operation, "max_voxels", 50_000_000)?,
+                    field_i64_or(operation, "tfmc_version", 1)?,
+                    field_string_or(operation, "created_by", "")?,
+                    field_i64_or(operation, "created_at_ms", 0)?,
+                    field_i64_or(operation, "updated_at_ms", 0)?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM map_scenes WHERE scene_id = ?1",
+                rusqlite::params![scene_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Where a device's odometry frame sits in a scene. Written by the scene's
+/// owner; a node that has not materialized the scene yet defers rather than
+/// dropping the placement, because the scene is on its way in the same stream.
+fn apply_map_device_placement(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let scene_id = field_string(operation, "scene_id")?;
+    let node_id = field_string(operation, "node_id")?;
+    let device_id = field_string(operation, "device_id")?;
+    let session_epoch = field_i64_or(operation, "session_epoch", 1)?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            require_map_scene(tx, &scene_id)?;
+            tx.execute(
+                "INSERT INTO map_device_placements \
+                   (scene_id, node_id, device_id, session_epoch, tx, ty, tz, qx, qy, qz, qw, \
+                    method, locked, confidence, set_by, set_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                         ?16, ?17) \
+                 ON CONFLICT(scene_id, node_id, device_id, session_epoch) DO UPDATE SET \
+                    tx = excluded.tx, ty = excluded.ty, tz = excluded.tz, \
+                    qx = excluded.qx, qy = excluded.qy, qz = excluded.qz, qw = excluded.qw, \
+                    method = excluded.method, locked = excluded.locked, \
+                    confidence = excluded.confidence, set_by = excluded.set_by, \
+                    set_at_ms = excluded.set_at_ms, updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![
+                    scene_id,
+                    node_id,
+                    device_id,
+                    session_epoch,
+                    field_f64_or(operation, "tx", 0.0)?,
+                    field_f64_or(operation, "ty", 0.0)?,
+                    field_f64_or(operation, "tz", 0.0)?,
+                    field_f64_or(operation, "qx", 0.0)?,
+                    field_f64_or(operation, "qy", 0.0)?,
+                    field_f64_or(operation, "qz", 0.0)?,
+                    field_f64_or(operation, "qw", 1.0)?,
+                    field_string_or(operation, "method", "manual")?,
+                    field_i64_or(operation, "locked", 0)?,
+                    field_f64_or(operation, "confidence", 0.0)?,
+                    field_string_or(operation, "set_by", "")?,
+                    field_i64_or(operation, "set_at_ms", 0)?,
+                    field_i64_or(operation, "updated_at_ms", 0)?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM map_device_placements \
+                 WHERE scene_id = ?1 AND node_id = ?2 AND device_id = ?3 AND session_epoch = ?4",
+                rusqlite::params![scene_id, node_id, device_id, session_epoch],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn require_map_site(tx: &rusqlite::Transaction<'_>, site_id: &str) -> LedgerResult<()> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM map_sites WHERE site_id = ?1",
+            rusqlite::params![site_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or(false);
+    if exists {
+        Ok(())
+    } else {
+        Err(SyncLedgerError::DeferredOrdering(format!(
+            "map site not found: {site_id}"
+        )))
+    }
+}
+
+fn require_map_scene(tx: &rusqlite::Transaction<'_>, scene_id: &str) -> LedgerResult<()> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM map_scenes WHERE scene_id = ?1",
+            rusqlite::params![scene_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or(false);
+    if exists {
+        Ok(())
+    } else {
+        Err(SyncLedgerError::DeferredOrdering(format!(
+            "map scene not found: {scene_id}"
+        )))
+    }
+}
+
 fn require_provider_account(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
@@ -4486,6 +4692,23 @@ fn field_f64_or(operation: &SyncOperation, key: &str, default: f64) -> LedgerRes
         Some(FieldValue::Null) | None => Ok(default),
         _ => Err(SyncLedgerError::Runtime(format!(
             "core operation field has invalid f64 type: {key}"
+        ))),
+    }
+}
+
+/// A real that may legitimately be absent (a georeference nobody set yet).
+/// `None` and "0.0" must stay distinguishable: 0° is a real coordinate.
+fn field_optional_f64(operation: &SyncOperation, key: &str) -> LedgerResult<Option<f64>> {
+    match operation.body.changed_fields.get(key) {
+        Some(FieldValue::Decimal(value)) => value
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|e| SyncLedgerError::Runtime(format!("invalid f64 field {key}: {e}"))),
+        Some(FieldValue::I64(value)) => Ok(Some(*value as f64)),
+        Some(FieldValue::U64(value)) => Ok(Some(*value as f64)),
+        Some(FieldValue::Null) | None => Ok(None),
+        _ => Err(SyncLedgerError::Runtime(format!(
+            "core operation field has invalid optional f64 type: {key}"
         ))),
     }
 }

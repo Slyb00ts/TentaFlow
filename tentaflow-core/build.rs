@@ -365,8 +365,9 @@ fn main() {
 // GPU crop-preprocess CUDA kernel — nvcc compile + link flags
 // =============================================================================
 
-/// Compiles the fused-preprocess CUDA kernels (`cuda/crop_resize_normalize.cu`
-/// and `cuda/nv12_to_rgb_resize_normalize.cu`) into static libs in OUT_DIR via
+/// Compiles the fused-preprocess CUDA kernels (`cuda/crop_resize_normalize.cu`,
+/// `cuda/nv12_to_rgb_resize_normalize.cu`) and the in-place privacy mosaic
+/// (`cuda/nv12_mosaic_regions.cu`) into static libs in OUT_DIR via
 /// nvcc i emituje flagi linkera dla bibliotek oraz runtime CUDA. Jawna funkcja
 /// `vision-cuda-preprocess` włącza tę ścieżkę, więc buildy AMD/Intel nie wywołują
 /// nvcc. `--fmad=false` zachowuje zgodność obliczeń próbkowania f64 z CPU
@@ -397,6 +398,7 @@ fn compile_cuda_preprocess(out_dir: &Path) {
             "cuda/nv12_to_rgb_resize_normalize.cu",
             "libtf_nv12_preprocess.a",
         ),
+        ("cuda/nv12_mosaic_regions.cu", "libtf_nv12_mosaic.a"),
     ] {
         let cu = Path::new(src);
         if !cu.exists() {
@@ -424,6 +426,7 @@ fn compile_cuda_preprocess(out_dir: &Path) {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=tf_crop_resize");
     println!("cargo:rustc-link-lib=static=tf_nv12_preprocess");
+    println!("cargo:rustc-link-lib=static=tf_nv12_mosaic");
     if let Some(dir) = &cuda_lib_dir {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }

@@ -11,11 +11,14 @@
 //     decoded frame (nvcodec packs NV12 Y+UV into ONE allocation at plane
 //     offsets — planar-split buffers make the single-memory map fail and the
 //     caller falls back to the host-download path).
-//   * `gst_memory_map(mem, &info, GST_MAP_READ | GST_MAP_CUDA)` — the magic
+//   * `gst_memory_map(mem, &info, GST_MAP_READ [| GST_MAP_WRITE] | GST_MAP_CUDA)` — the magic
 //     `GST_MAP_CUDA = GST_MAP_FLAG_LAST << 1 = 0x20000` flag makes GstCudaMemory
 //     hand back the raw `CUdeviceptr` in `info.data` (mapping WITHOUT it copies
 //     to host, which is exactly what we are avoiding). A non-CUDA memory rejects
-//     the flag → map fails → fallback.
+//     the flag → map fails → fallback. A WRITE map (the privacy mosaic edits
+//     the decoded surface in place) additionally tells GstCudaMemory that the
+//     device copy is now the authoritative one, so a later host map downloads
+//     the edited pixels instead of a stale host mirror.
 //   * `cudaPointerGetAttributes` validates the pointer lives on CUDA DEVICE 0 —
 //     the same device ORT's CUDA/TRT execution provider runs on. nvcodec and ORT
 //     both bind device 0's CUDA *primary* context, so a device-0 device pointer
@@ -31,8 +34,11 @@
 // from; the device pointer is valid ONLY while the map (and the buffer's ref)
 // live. `Drop` unmaps. The caller MUST keep the `GstBuffer` referenced (it holds
 // a decode surface from the decoder's finite pool) for the whole time it reads
-// the pointer, and drop the map as soon as the reading kernel has synced — see
-// `preprocess_nv12_device_gpu`.
+// the pointer, and drop the map only after every kernel that reads or writes it
+// has completed on its stream — see `preprocess_nv12_device_gpu`. For a WRITE
+// map the buffer must also be exclusively owned by the caller (writable in the
+// refcount sense and not aliasing a decoder reference surface): GStreamer does
+// not stop another holder of the same memory from reading it mid-edit.
 //
 // Gated on the GPU inference features: without them nvcc/cudart are not linked
 // (so `cudaPointerGetAttributes` would not resolve) and no device-tensor path
@@ -59,16 +65,21 @@ const GST_MAP_CUDA: u32 = (gst::ffi::GST_MAP_FLAG_LAST as u32) << 1;
 const CUDA_MEMORY_TYPE_DEVICE: c_int = 2;
 
 /// Runtime-API pointer-attributes query (cudart, already linked by the GPU
-/// preprocess). Stable layout across CUDA 11/12/13: `{ type, device,
-/// devicePointer, hostPointer }`. Device pointers share one unified virtual
-/// address space per device, so this resolves the owning device ordinal
-/// regardless of which context/stream allocated the surface.
+/// preprocess). Layout of `struct cudaPointerAttributes` in CUDA 12/13
+/// `driver_types.h`: `{ type, device, devicePointer, hostPointer, long
+/// reserved[8] }`. The trailing `reserved` MUST be declared: cudart writes the
+/// whole struct, and a Rust struct without it lets the call overwrite 64 bytes
+/// of the caller's stack (it smashed the return address of the first write-map
+/// caller). Device pointers share one unified virtual address space per device,
+/// so this resolves the owning device ordinal regardless of which context/stream
+/// allocated the surface.
 #[repr(C)]
 struct CudaPointerAttributes {
     type_: c_int,
     device: c_int,
     device_ptr: *mut c_void,
     host_ptr: *mut c_void,
+    reserved: [std::os::raw::c_long; 8],
 }
 
 extern "C" {
@@ -168,13 +179,20 @@ impl<'a> Drop for CudaNv12Map<'a> {
 /// Maps the NVDEC device NV12 surface of `buffer` in place (no host download) and
 /// validates it lives on CUDA device 0. `info` is the caps-derived `VideoInfo`
 /// used only as a stride/offset fallback when the buffer carries no
-/// `GstVideoMeta`. On any error the caller falls back to the host-download path.
+/// `GstVideoMeta`. `write = false` maps READ (inference reads the surface);
+/// `write = true` maps READ|WRITE for kernels that modify the surface in place.
+/// On any error the caller falls back to the host-download path (read) or treats
+/// the frame as unprocessable (write).
 ///
 /// SAFETY / lifetime: the returned map borrows `buffer`; keep the buffer (and its
-/// decode surface) alive for the whole time the device pointers are read.
+/// decode surface) alive for the whole time the device pointers are read or
+/// written. The borrow is shared (`&BufferRef`) even for `write = true` because
+/// the edit happens in device memory the Rust borrow checker cannot see; the
+/// caller guarantees exclusive ownership of the buffer for a write map.
 pub fn map_nv12_device<'a>(
     buffer: &'a gst::BufferRef,
     info: &gst_video::VideoInfo,
+    write: bool,
 ) -> Result<CudaNv12Map<'a>, CudaMapError> {
     let raw = buffer.as_ptr() as *mut gst::ffi::GstBuffer;
 
@@ -189,10 +207,14 @@ pub fn map_nv12_device<'a>(
         return Err(CudaMapError::NoMemory);
     }
 
-    // Map READ|CUDA. GstCudaMemory returns the CUdeviceptr in `info.data`; a
-    // non-CUDA memory rejects the flag and the map fails.
+    // Map READ[|WRITE]|CUDA. GstCudaMemory returns the CUdeviceptr in
+    // `info.data`; a non-CUDA memory rejects the flag and the map fails.
     let mut map_info: gst::ffi::GstMapInfo = unsafe { std::mem::zeroed() };
-    let flags = (gst::ffi::GST_MAP_READ as u32 | GST_MAP_CUDA) as gst::ffi::GstMapFlags;
+    let mut access = gst::ffi::GST_MAP_READ as u32;
+    if write {
+        access |= gst::ffi::GST_MAP_WRITE as u32;
+    }
+    let flags = (access | GST_MAP_CUDA) as gst::ffi::GstMapFlags;
     let ok = unsafe { gst::ffi::gst_memory_map(mem, &mut map_info, flags) };
     if ok == 0 {
         return Err(CudaMapError::NotCudaMemory);
@@ -210,6 +232,7 @@ pub fn map_nv12_device<'a>(
         device: -1,
         device_ptr: std::ptr::null_mut(),
         host_ptr: std::ptr::null_mut(),
+        reserved: [0; 8],
     };
     let rc = unsafe { cudaPointerGetAttributes(&mut attr, base as *const c_void) };
     if rc != 0 || attr.device != 0 || attr.type_ != CUDA_MEMORY_TYPE_DEVICE {
@@ -264,4 +287,14 @@ pub fn map_nv12_device<'a>(
         height,
         _borrow: PhantomData,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// `sizeof(struct cudaPointerAttributes)` on 64-bit CUDA 12/13 (LP64 `long`):
+    /// 4 + 4 + 8 + 8 + 8·8. A smaller Rust struct is a stack overwrite.
+    #[test]
+    fn pointer_attributes_match_the_cuda_header_layout() {
+        assert_eq!(std::mem::size_of::<super::CudaPointerAttributes>(), 88);
+    }
 }

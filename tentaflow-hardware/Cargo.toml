@@ -16,8 +16,9 @@ edition = "2021"
 default = ["full"]
 # Pure Go2 signaling crypto/framing — no webrtc/tokio/std::net, wasm32-compatible.
 protocol = []
-# Native WebRTC session + channel + video ingress (pulls webrtc-rs + tokio).
-full = ["protocol", "dep:tokio", "dep:webrtc", "dep:bytes"]
+# Native WebRTC session + channel + video ingress (pulls webrtc-rs + tokio),
+# plus the vendor cloud account client and LAN discovery (reqwest + socket2).
+full = ["protocol", "dep:tokio", "dep:webrtc", "dep:bytes", "dep:reqwest", "dep:socket2"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -34,4 +35,6 @@ rand = { workspace = true, default-features = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"], optional = true }
 webrtc = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["rustls", "form"], optional = true }
+socket2 = { workspace = true, optional = true }
 memchr = { workspace = true }

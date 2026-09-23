@@ -124,9 +124,11 @@ pub struct VisionConfig {
     #[serde(default = "default_vision_sessions")]
     pub adr_sessions: usize,
 
-    /// ort session-pool size for the parallel YOLOv8 vehicle detector. The model
-    /// is tiny (~tens of MB per session) and only produces coarse vehicle boxes,
-    /// so a small pool (default 2) is plenty. `0` falls back to that default.
+    /// ort session-pool size for the YOLOX-tiny COCO detector, shared by the
+    /// parallel vehicle detector and the camera privacy probe (persons). The model
+    /// is tiny (~20 MB per session) and the probe needs at most 2 concurrent
+    /// forwards, so a small pool (default 2) is plenty. `0` falls back to that
+    /// default.
     #[serde(default = "default_vehicle_sessions")]
     pub vehicle_sessions: usize,
 

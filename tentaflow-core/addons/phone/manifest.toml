@@ -48,6 +48,17 @@ camera = true
 lidar = true
 audio = false
 
+# The phone's camera runs through the same GPU privacy probe as any robot
+# camera; these are read by core when the camera registers.
+# Person detection and face anonymization run on models from this camera-CV
+# bundle; the settings form shows whether the node has them.
+[[requires.vision_engine]]
+engine = "privacy-cv"
+
+[config.schema]
+privacy_face_blur = { type = "bool", label = "Anonimizacja: zamazuj głowy wszystkich osób na obrazie kamery", default = "true" }
+privacy_person_detect = { type = "bool", label = "Detekcja osób na żywo (ramki na podglądzie kamery)", default = "false" }
+
 # ── Per-sensor permissions (the "lidar yes, camera no" model) ────────────────
 [[permission]]
 id = "sensor.imu"

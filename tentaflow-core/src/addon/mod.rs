@@ -1824,6 +1824,57 @@ impl AddonManager {
         Ok(())
     }
 
+    /// Applies a connection-param config change (e.g. a new robot IP) to the
+    /// instance's network rules and, when a rule target moved, swaps the
+    /// runtime so host functions check the new manifest. A service instance
+    /// that was running is started again; a stopped one stays stopped.
+    /// Returns the hosts whose rules still await network approval (hosts, as
+    /// the Network tab's allow list takes them).
+    pub fn rebind_instance_connection(
+        &self,
+        addon_id: &str,
+        acting_admin: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let restart = {
+            let op = self.addon_op_lock(addon_id);
+            let _guard = op.lock();
+            match lifecycle::rebind_instance_connection(&self.db, addon_id, acting_admin)? {
+                None => None,
+                Some(manifest) => {
+                    let enabled = crate::db::repository::get_addon(&self.db, addon_id)?
+                        .map(|a| a.is_enabled)
+                        .unwrap_or(false);
+                    let was_running = self.has_running_instance(addon_id);
+                    let (package_id, version) =
+                        crate::db::repository::get_addon_instance_package_ref(&self.db, addon_id)?
+                            .ok_or_else(|| anyhow::anyhow!("instancja '{addon_id}' nie istnieje"))?;
+                    self.unregister_addon_runtime(addon_id);
+                    // A disabled instance has no runtime registered (boot restores
+                    // only enabled rows); the new manifest is picked up on enable.
+                    if enabled {
+                        self.register_addon_runtime(
+                            &manifest,
+                            &bundled::package_dir(&package_id, &version),
+                        )?;
+                    }
+                    Some(enabled && was_running)
+                }
+            }
+        };
+        // start_addon takes the per-instance op lock itself (not reentrant).
+        if restart == Some(true) {
+            self.start_addon(addon_id, None, None)?;
+        }
+        let mut pending: Vec<String> =
+            crate::db::repository::get_addon_declared_network_rules(&self.db, addon_id)?
+                .into_iter()
+                .filter(|r| !r.approved)
+                .map(|r| r.host)
+                .collect();
+        pending.dedup();
+        Ok(pending)
+    }
+
     /// Buduje w pełni zainicjalizowaną instancję WASM: state → store →
     /// instantiate → WASI `_start`/`_initialize` → `on_start`. Wspólne dla
     /// `start_addon` (instancja główna/serwisowa) i puli workerów

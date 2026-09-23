@@ -269,6 +269,7 @@ async fn supervisor_add_and_health_via_test_api() {
         owner_addon_id: None,
         credentials_encrypted: None,
         decoder_override: None,
+        privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     };
     sup.add_camera(cfg).await.expect("add");
 
@@ -294,6 +295,7 @@ async fn supervisor_rejects_unsupported_vendor() {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .unwrap_err();
@@ -316,6 +318,7 @@ async fn supervisor_rejects_fps_out_of_range() {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .unwrap_err();
@@ -331,6 +334,7 @@ async fn supervisor_rejects_fps_out_of_range() {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .unwrap_err();
@@ -356,6 +360,7 @@ async fn supervisor_snapshot_returns_rgb24_frame() {
         owner_addon_id: None,
         credentials_encrypted: None,
         decoder_override: None,
+        privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     })
     .await
     .expect("add");
@@ -483,6 +488,7 @@ async fn supervisor_reset_drains_sessions_without_dropping_singleton() {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .expect("add");
@@ -534,6 +540,7 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
         owner_addon_id: None,
         credentials_encrypted: None,
         decoder_override: None,
+        privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     })
     .await
     .expect("first add");
@@ -553,6 +560,7 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
         owner_addon_id: None,
         credentials_encrypted: None,
         decoder_override: None,
+        privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     })
     .await
     .expect("re-add");
@@ -580,6 +588,7 @@ async fn supervisor_rejects_missing_file_path_fakefile() {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .unwrap_err();
@@ -617,6 +626,7 @@ async fn supervisor_fps_actual_approaches_target_after_warmup() {
         owner_addon_id: None,
         credentials_encrypted: None,
         decoder_override: None,
+        privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     })
     .await
     .expect("add");
@@ -650,6 +660,7 @@ async fn supervisor_remove_closes_streaming_bus() {
         owner_addon_id: None,
         credentials_encrypted: None,
         decoder_override: None,
+        privacy: tentaflow_core::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     })
     .await
     .expect("add");

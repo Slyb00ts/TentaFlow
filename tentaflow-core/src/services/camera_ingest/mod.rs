@@ -31,6 +31,16 @@ pub mod onvif_discovery;
 pub mod onvif_events;
 pub mod onvif_media;
 pub mod onvif_metadata_parser;
+/// GPU privacy probe (person detection + irreversible head anonymization) on
+/// the NVDEC side of the CUDA tee; same gate as the zero-copy path it builds on.
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+))]
+pub mod privacy;
+pub mod privacy_options;
 pub mod rtsp;
 pub mod session;
 pub mod stage_metrics;
@@ -98,6 +108,7 @@ mod integration_tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         };
         sup.add_camera(cfg.clone()).await.expect("first add");
         let err = sup.add_camera(cfg).await.unwrap_err();
@@ -131,6 +142,7 @@ mod integration_tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         };
         sup.add_camera(cfg.clone()).await.expect("first add");
         let err = sup.add_camera(cfg).await.unwrap_err();
@@ -154,6 +166,7 @@ mod integration_tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .expect("add");
@@ -189,6 +202,7 @@ mod integration_tests {
             owner_addon_id: None,
             credentials_encrypted: None,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         })
         .await
         .expect("add");

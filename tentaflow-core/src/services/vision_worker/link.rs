@@ -195,6 +195,7 @@ impl CameraAssignment {
             owner_addon_id: self.owner_addon_id,
             credentials_encrypted: self.credentials_encrypted,
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         }
     }
 }

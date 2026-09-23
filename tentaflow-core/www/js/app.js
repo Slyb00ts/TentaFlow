@@ -61,6 +61,7 @@ import TentaNasScreen from '/js/modules/tentanas.js';
 import TentaQuantScreen from '/js/modules/tentaquant.js';
 import MlStudioScreen from '/js/modules/ml-studio.js';
 import RobotsScreen from '/js/modules/robots.js';
+import MapsScreen from '/js/modules/maps.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
 import SkillsScreen from '/js/modules/skills.js';
 import AgentsScreen from '/js/modules/agents.js';
@@ -130,6 +131,7 @@ const ADMIN_NAV = [
       { id: 'agents', labelKey: 'nav.agents', icon: 'brain' },
       { id: 'skills', labelKey: 'nav.skills', icon: 'sparkle' },
       { id: 'robots', labelKey: 'nav.robots', icon: 'cpu' },
+      { id: 'maps', labelKey: 'nav.maps', icon: 'pin', userVisible: true },
     ],
   },
   {
@@ -600,6 +602,7 @@ async function renderApp() {
   Router.register('tentaquant', TentaQuantScreen);
   Router.register('ml-studio', MlStudioScreen);
   Router.register('robots', RobotsScreen);
+  Router.register('maps', MapsScreen);
   Router.register('skills', SkillsScreen);
   Router.register('agents', AgentsScreen);
   Router.register('code-studio', CodeStudioScreen);

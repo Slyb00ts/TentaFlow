@@ -129,7 +129,7 @@ fn claim_home_tx(
         return Ok(());
     }
     tx.execute(
-        "UPDATE provider_accounts SET home_node_id = ?2, \
+        "UPDATE provider_accounts SET home_node_id = ?2, home_lost_node_id = NULL, \
            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE account_id = ?1",
         params![account_id, local_node],
     )

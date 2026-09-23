@@ -346,6 +346,17 @@ impl AliasResolver {
                     dropped_no_live,
                     dropped_cross_env,
                 ) {
+                    // A cycle or a depth overrun on the PRIMARY path is a defect
+                    // of the alias graph itself, not an unreachable target, so it
+                    // is the one error a fallback cannot stand in for: swallowing
+                    // it reports the misconfiguration to the operator as
+                    // `CapabilityUnsupported` and sends them looking at
+                    // modalities instead of at the chain. A broken FALLBACK is a
+                    // different case and stays silent below — it must not tank
+                    // its healthy siblings.
+                    if matches!(e, ResolveError::AliasLimit { .. }) {
+                        return Err(e);
+                    }
                     tracing::trace!(
                         alias = alias_id,
                         primary = primary_target,

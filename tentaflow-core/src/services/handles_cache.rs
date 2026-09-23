@@ -515,7 +515,13 @@ mod tests {
             .upsert_service_info(&service, None)
             .expect("agent RPC service should be accepted without an inference handle");
 
-        assert!(cache.is_empty());
+        // The service is registered, but with the AgentRpc marker handle —
+        // `build_handle` (which would need an inference endpoint) is never
+        // reached for this transport.
+        assert!(matches!(
+            cache.get("nodeA", 7),
+            Some(BackendHandle::AgentRpc)
+        ));
     }
 
     #[test]

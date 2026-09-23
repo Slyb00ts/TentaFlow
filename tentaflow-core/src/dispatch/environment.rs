@@ -873,6 +873,7 @@ mod tests {
             state: crate::dispatch::state::AppState::for_test(),
             org_context: None,
         };
+        crate::dispatch::seed_session_account(&ctx);
         (ctx, guard)
     }
 
@@ -882,6 +883,7 @@ mod tests {
             user_id: *uuid::Uuid::new_v4().as_bytes(),
             role: Some("power_user".to_string()),
         };
+        crate::dispatch::seed_session_account(&ctx);
         (ctx, guard)
     }
 

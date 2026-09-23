@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 use tentaflow_core::vision::gpu_preprocess::{preprocess_nv12_batch_gpu, ColorCoeffs, Nv12Frame};
+use tentaflow_core::vision::preprocessing::{ChannelOrder, FrameFit};
 use tentaflow_core::vision::resize::resize_rgb;
 
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -199,13 +200,13 @@ fn main() -> Result<()> {
 
     // Warm + timed GPU run.
     for _ in 0..3 {
-        let _ = preprocess_nv12_batch_gpu(&frames, S, MEAN, STD, color)?;
+        let _ = preprocess_nv12_batch_gpu(&frames, S, MEAN, STD, FrameFit::Stretch, ChannelOrder::Rgb, color)?;
     }
     let iters = 50u32;
     let t = Instant::now();
-    let mut batch = preprocess_nv12_batch_gpu(&frames, S, MEAN, STD, color)?;
+    let mut batch = preprocess_nv12_batch_gpu(&frames, S, MEAN, STD, FrameFit::Stretch, ChannelOrder::Rgb, color)?;
     for _ in 1..iters {
-        batch = preprocess_nv12_batch_gpu(&frames, S, MEAN, STD, color)?;
+        batch = preprocess_nv12_batch_gpu(&frames, S, MEAN, STD, FrameFit::Stretch, ChannelOrder::Rgb, color)?;
     }
     let gpu_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
     let gpu_host = batch.copy_to_host()?;

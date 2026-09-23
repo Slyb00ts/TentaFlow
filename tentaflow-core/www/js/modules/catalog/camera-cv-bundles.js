@@ -15,6 +15,7 @@ export const CAMERA_CV_BUNDLE_IDS = [
   'nalepka-stan',
   'plate-ocr',
   'depth-native',
+  'privacy-cv',
 ];
 
 /// True when the deploy wizard should offer the "Custom" bundle-source tab —

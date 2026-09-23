@@ -53,6 +53,7 @@ const KLASA_KOLORY = {
   nalepka_9: '#22c55e',
   znak_srodowiskowy: '#06b6d4',
   termometr: '#ef4444',
+  person: '#a855f7',
 };
 const KOLOR_DOMYSLNY = '#e5e7eb';
 
@@ -277,6 +278,19 @@ function trackFadeMs() {
 //                   media-time. Alternatywa: setter overlay.setMediaBasePts(ns).
 export function attachDetectionsOverlay(opts) {
   return new DetectionsOverlay(opts);
+}
+
+/// Attach the overlay to a `<tf-video-stream stream-id="camera:<id>">` tile —
+/// the wiring every caller needs (the <video> lives in the element's shadow
+/// root and the media-time base comes from its MSE init segment). Returns the
+/// overlay so the caller can `destroy()` it when the tile goes away.
+export function attachOverlayToVideoStreamTile(tile, cameraId) {
+  return attachDetectionsOverlay({
+    video: tile,
+    cameraId,
+    videoResolver: () => tile.shadowRoot?.querySelector('video') || null,
+    mediaBasePtsProvider: () => tile.mediaBasePtsNs ?? null,
+  });
 }
 
 // =============================================================================

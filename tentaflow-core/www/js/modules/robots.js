@@ -304,6 +304,7 @@ const RobotsScreen = {
     stopLidarLoop();
     disposeVoxel();
     stopPadLoop();
+    destroyDetectionOverlays();
     // Pad is ON by default for the next visit; a toggle-off must not leak across a
     // full screen unmount. padMaxSpeed intentionally persists as a user preference.
     padEnabled = true;
@@ -1503,8 +1504,21 @@ function refreshOfflineDisable(panel, r) {
 // Mounts the live camera stream into a tile. The <tf-video-stream> is keyed by
 // stream-id so a poll never rebuilds the live MSE element. `full` controls tile
 // height (full-size on the Kamera tab).
+/// Drop every camera tile's detections overlay (stream subscription + rAF loop)
+/// — a screen unmount must not leave them running on a detached element.
+function destroyDetectionOverlays() {
+  document.querySelectorAll('[data-field="camera-tile"]').forEach((host) => {
+    host._detectionsOverlay?.destroy();
+    host._detectionsOverlay = null;
+  });
+}
+
 function mountCameraTile(host, r, full) {
   if (!host) return;
+  // The tile is rebuilt on camera/size changes: drop the previous overlay's
+  // stream subscription and rAF loop before the element it drew on is gone.
+  host._detectionsOverlay?.destroy();
+  host._detectionsOverlay = null;
   const cam = cameraId(r);
   const id = robotId(r);
   // Key the tile by camera id + size so reconcileCameraTile() can detect a flip
@@ -1528,6 +1542,17 @@ function mountCameraTile(host, r, full) {
     const btn = e.currentTarget;
     handleShareCamera(btn.dataset.robot, btn.dataset.shareCamera, btn);
   });
+  // Live detections (persons from the camera's privacy probe, or whatever else
+  // publishes for this camera) drawn over the tile, same as the SDK renderer.
+  const tile = host.querySelector('tf-video-stream');
+  if (tile) {
+    import('/js/modules/vision-detections-overlay.js')
+      .then(({ attachOverlayToVideoStreamTile }) => {
+        if (!tile.isConnected) return;
+        host._detectionsOverlay = attachOverlayToVideoStreamTile(tile, cam);
+      })
+      .catch((e) => console.warn('[robots] detections overlay load failed:', e?.message ?? e));
+  }
   updateSpeedOverlays();
 }
 

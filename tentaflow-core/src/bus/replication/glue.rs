@@ -1407,15 +1407,22 @@ mod tests {
             + fast_follower_config().ack_interval
                 * (ACK_INTERVALS_PER_BATCH * u32::try_from(BATCHES).expect("batch count fits u32"));
         let deadline = tokio::time::Instant::now() + catchup_budget;
+        // The high watermark, not just the log end offset: a follower appends
+        // first and learns the leader's HW from the NEXT header/heartbeat, and
+        // `fetch_from_offset` serves nothing above the HW. Waiting on the LEO
+        // alone reads the log one ack cadence too early and sees an empty
+        // partition that is, on disk, already complete.
         loop {
-            if f1_part.log_end_offset() >= BATCHES && f2_part.log_end_offset() >= BATCHES {
+            if f1_part.high_watermark() >= BATCHES && f2_part.high_watermark() >= BATCHES {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "followers never caught up within {catchup_budget:?}                  (2 s base + 5 ack intervals per batch): f1_leo={} f2_leo={}",
+                "followers never caught up within {catchup_budget:?}                  (2 s base + 5 ack intervals per batch): f1_leo={} f1_hw={} f2_leo={} f2_hw={}",
                 f1_part.log_end_offset(),
+                f1_part.high_watermark(),
                 f2_part.log_end_offset(),
+                f2_part.high_watermark(),
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

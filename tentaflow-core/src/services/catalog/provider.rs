@@ -577,6 +577,13 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "patch_review",
     "exec_command",
     "delegate_cli",
+    // TentaBus blocks (PLAN §6.3): the entry node hands on a JSON record, the
+    // publish node is a side effect that forwards its envelope unchanged, and
+    // the transform node reshapes JSON with CEL. None of them carries a media
+    // payload, so none constrains a flow's modalities.
+    "bus_consume",
+    "bus_publish",
+    "bus_transform",
 ];
 
 /// Best-effort capability inference from a stored flow graph. Walks

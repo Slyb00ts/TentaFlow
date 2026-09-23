@@ -808,6 +808,14 @@ pub fn keys_dir() -> PathBuf {
     category_dir(StorageCategory::Keys)
 }
 
+/// Katalog geometrii wspolnej mapy (`<data>/maps/<scene_id>/`): snapshoty
+/// chunkow, submapy sesji i WAL. Pochodna `data_dir()`, bo geometria sceny musi
+/// lezec obok bazy, ktora ja indeksuje — rozjechanie tych dwoch daje indeks
+/// wskazujacy na nieistniejace pliki.
+pub fn maps_dir() -> PathBuf {
+    data_dir().join("maps")
+}
+
 /// Per-installation HTTPS certificate (`<data>/tls/{cert,key}.pem`).
 pub fn tls_dir() -> PathBuf {
     data_dir().join("tls")
@@ -918,6 +926,7 @@ pub fn ensure_app_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(orgs_dir())?;
     std::fs::create_dir_all(keys_dir())?;
     std::fs::create_dir_all(tls_dir())?;
+    std::fs::create_dir_all(maps_dir())?;
     std::fs::create_dir_all(sync_dir())?;
 
     let containers_parent = containers_install_root();

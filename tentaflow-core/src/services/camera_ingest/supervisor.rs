@@ -156,6 +156,28 @@ impl CameraIngestSupervisor {
         Ok(())
     }
 
+    /// Apply new privacy options to a running camera. The session rebuilds its
+    /// pipeline; a camera that is not running is skipped (it picks the options
+    /// up from the addon config when it registers again).
+    pub async fn set_privacy(
+        &self,
+        camera_id: &str,
+        options: super::privacy_options::PrivacyOptions,
+    ) -> Result<()> {
+        let cmd_tx = {
+            let g = self.registry.read().await;
+            let handle = g
+                .get(camera_id)
+                .ok_or_else(|| CameraIngestError::NotFound(camera_id.to_string()))?;
+            handle.cmd_tx.clone()
+        };
+        cmd_tx
+            .send(SessionCommand::SetPrivacy(options))
+            .await
+            .map_err(|_| CameraIngestError::SessionCrashed(camera_id.to_string()))?;
+        Ok(())
+    }
+
     pub async fn remove_camera(&self, camera_id: &str) -> Result<()> {
         let handle = {
             let mut g = self.registry.write().await;

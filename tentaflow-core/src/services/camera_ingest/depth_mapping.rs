@@ -667,14 +667,21 @@ mod tests {
         // An even-width map whose principal point lands ON a sampled pixel proves
         // depth → +X with zero lateral/vertical offset. w=h=6, stride 3 samples
         // (0,0) and (3,3); pixel (3,3) sits at cx=cy=3.0 → optical (0,0,d) →
-        // body (d,0,0) → world (d,0,0).
-        let dm = flat_depth(6, 6, 4.0);
+        // body (d,0,0) → world (d,0,0). The depth must stay inside
+        // `MAX_DEPTH_M`, otherwise every sample is dropped as out of range and
+        // the loop below has nothing to assert on.
+        let depth = MAX_DEPTH_M - 0.5;
+        let dm = flat_depth(6, 6, depth);
         let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, &Pose::identity());
         // Find the on-axis point (the one with ~zero y and z).
         let mut found = false;
         for p in pts.chunks_exact(3) {
             if p[1].abs() < 1e-4 && p[2].abs() < 1e-4 {
-                assert!((p[0] - 4.0).abs() < 1e-4, "on-axis depth = 4, got {}", p[0]);
+                assert!(
+                    (p[0] - depth).abs() < 1e-4,
+                    "on-axis depth = {depth}, got {}",
+                    p[0]
+                );
                 found = true;
             }
         }

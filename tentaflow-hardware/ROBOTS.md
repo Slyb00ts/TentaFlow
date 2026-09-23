@@ -21,6 +21,15 @@ Fields (cross-robot, generic — a drone/arm/rover declares the same shape):
 - `[[robot.connection_param]]` — typed fields the Robots app collects on
   registration (`key`, `label`, `type`, `required`, `placeholder`). Different
   robots need different params (IP, serial, credentials, cloud token, …).
+  A `type = "host"` param may appear as `${key}` in a `[[network_rule]].host`;
+  it is substituted at install AND re-substituted when the instance config
+  changes — the moved rule then needs network approval again (auto-approved
+  only when the admin's allow list for the addon already holds that host).
+- `[robot.cloud_account]` — `provider` (e.g. `"unitree"`): the vendor account
+  the robot is bound to. The install form and the addon settings offer signing
+  into it; Core (`dispatch/robot_cloud.rs`) logs in, lists the bound robots and
+  runs LAN discovery, and the picked robot fills the params keyed `serial`,
+  `aes_key` and `ip`. The password is used once and never stored.
 - `[robot.capabilities]` — `locomotion`, `poses`, `actions[]`, `estop`,
   `telemetry[]`, `camera`, `lidar`, `audio`. Lets the app/Flow Builder render
   controls, status tiles and sensor previews uniformly.

@@ -37,6 +37,8 @@ if (typeof globalThis.MutationObserver !== 'function' && window.MutationObserver
   globalThis.MutationObserver = window.MutationObserver;
 }
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
+// The install form addresses its param inputs through CSS.escape, as a browser would.
+if (typeof globalThis.CSS === 'undefined' && window.CSS) globalThis.CSS = window.CSS;
 globalThis.fetch = (url) => {
   const m = /^\/i18n\/(\w+)\.json$/.exec(String(url));
   if (m) {
@@ -153,5 +155,65 @@ test('installing any other package navigates nowhere', async () => {
 
   assert.ok(calls.some((c) => c.kind === 'addonInstanceInstallRequest'), 'the install ran');
   assert.deepEqual(navigations, [], 'only TentaNas needs a privilege channel chosen after install');
+  AddonsScreen.unmount();
+});
+
+test('a robot package fills its connection params from the vendor account', async () => {
+  calls.length = 0;
+  const robotPkg = {
+    ...pkg('go2', 'Unitree Go2'),
+    cloudAccountProvider: 'unitree',
+    connectionParams: [
+      { key: 'ip', label: 'IP', paramType: 'host', required: true, placeholder: '' },
+      { key: 'serial', label: 'Serial', paramType: 'string', required: false, placeholder: '' },
+      { key: 'aes_key', label: 'AES', paramType: 'string', required: false, placeholder: '' },
+    ],
+  };
+  stubTransport(fixtures({
+    addonCatalogListRequest: { packages: [robotPkg] },
+    robotCloudDevicesRequest: {
+      devices: [{
+        serial: 'B42D2000TEST0001', alias: 'Pies', model: 'Go2', series: 'Air', online: true,
+        aesKey: '00112233445566778899aabbccddeeff', lanIp: '192.168.50.250',
+      }],
+    },
+  }));
+  document.body.innerHTML = '<div id="main"></div>';
+  document.getElementById('main').innerHTML = AddonsScreen.render();
+  await AddonsScreen.mount({ install: 'go2' });
+  await flush();
+
+  const installWin = [...document.querySelectorAll('tf-window')].at(-1);
+  installWin.querySelector('#inst-robot-cloud').click();
+  await flush();
+  const cloudWin = [...document.querySelectorAll('tf-window')].at(-1);
+  assert.notEqual(cloudWin, installWin, 'the vendor sign-in window opened on top');
+  cloudWin.querySelector('#rc-email').value = 'owner@example.com';
+  cloudWin.querySelector('#rc-password').value = 'hunter2';
+  const confirm = () => cloudWin.dispatchEvent(
+    new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }),
+  );
+  confirm();
+  for (let i = 0; i < 4; i += 1) await flush();
+  const fetch = calls.find((c) => c.kind === 'robotCloudDevicesRequest');
+  assert.deepEqual(fetch.payload, {
+    provider: 'unitree', region: 'global', email: 'owner@example.com', password: 'hunter2',
+  });
+  confirm();
+  for (let i = 0; i < 4; i += 1) await flush();
+
+  const field = (key) => installWin.querySelector(`tf-input[data-param-key="${key}"]`).value;
+  assert.equal(field('ip'), '192.168.50.250');
+  assert.equal(field('serial'), 'B42D2000TEST0001');
+  assert.equal(field('aes_key'), '00112233445566778899aabbccddeeff');
+  assert.equal(installWin.querySelector('#inst-name').value, 'Pies', 'an empty name takes the robot alias');
+
+  installWin.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 6; i += 1) await flush();
+  const sent = calls.find((c) => c.kind === 'addonInstanceInstallRequest');
+  assert.deepEqual(Object.fromEntries(sent.payload.config), {
+    ip: '192.168.50.250', serial: 'B42D2000TEST0001', aes_key: '00112233445566778899aabbccddeeff',
+  });
+  assert.ok(!JSON.stringify(sent.payload).includes('hunter2'), 'the vendor password never reaches the install');
   AddonsScreen.unmount();
 });

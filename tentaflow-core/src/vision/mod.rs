@@ -67,19 +67,26 @@ pub mod classifier_stan;
 pub mod detector_rfdetr;
 #[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
 pub mod inference_batcher;
-// YOLOv8 vehicle detector — runs in parallel with RF-DETR (own ort pool) so each
-// ADR/plate/sticker can be associated to the vehicle it sits on (per-truck reads).
 #[cfg(feature = "inference-vision-gpu")]
 pub mod depth_anything;
+// YOLOX-tiny COCO detector — vehicles run in parallel with RF-DETR (own ort
+// pool) so each ADR/plate/sticker can be associated to the vehicle it sits on;
+// persons feed the camera privacy probe.
 #[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
-pub mod detector_vehicle;
+pub mod detector_coco;
+// YuNet face detector for the camera privacy probe.
+#[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
+pub mod face_yunet;
+// Real-image fixtures shared by the detector tests.
+#[cfg(all(test, feature = "inference-vision-gpu", feature = "vision-ort"))]
+mod test_frames;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod ocr_plate;
 // Shared OCR crop pre-processing: perspective deskew (angled plates) + env-gated
 // crop dumps. Feeds both the plate and ADR readers before the model.
 #[cfg(feature = "inference-vision-gpu")]
 pub mod ocr_prep;
-// Process-wide runner singletons (detector / vehicle / classifier / OCR). Shared
+// Process-wide runner singletons (detector / COCO / face / classifier / OCR). Shared
 // by the camera analysis engine, the flow vision node, local CV and the batcher —
 // none of which requires the `camera` ingest feature to exist.
 #[cfg(feature = "inference-vision-gpu")]

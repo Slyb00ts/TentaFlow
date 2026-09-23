@@ -131,6 +131,19 @@ pub enum CoreSyncResourceKind {
     /// only by the node it describes (enforced in the handler, where the
     /// node's identity is known); it replicates so N01 is a fleet view.
     AgentRuntimeEngine,
+    /// A place the organization manages (migration 165). The building exists
+    /// for everyone, so every node has to be able to name it — a site known to
+    /// one node only would make the scene under it unaddressable elsewhere.
+    MapSite,
+    /// One reconstruction, including WHICH node owns its geometry. The owner
+    /// is the single writer of chunks and placements, so every node needs the
+    /// same answer to "who do I ask for this map".
+    MapScene,
+    /// Where a device's odometry frame sits inside a scene. Revocation-bearing
+    /// (unassigning a device is a removal), composite PK, and written only by
+    /// the scene's owner — which is what keeps LWW from ever deciding between
+    /// a human's placement and a drift correction.
+    MapDevicePlacement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1041,6 +1054,46 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "agent-accounts",
     },
+    // ---------------------------------------------------------------------
+    // Shared map (docs/SHARED_MAP_PLAN.md §1.1, §6). One partition for the
+    // three tables: a scene cannot be ordered before its site, nor a placement
+    // before its scene, and `DeferredOrdering` only helps while the
+    // prerequisite travels on the same ordered stream.
+    //
+    // NEVER add here, and each omission is a decision:
+    //   * `map_chunks` — an INDEX of files on the owner's disk. The bytes are
+    //     pulled on demand (§6.2); replicating the index alone would promise
+    //     geometry the receiver cannot open;
+    //   * `map_device_sessions` — node-local runtime state whose
+    //     `clock_offset_us` is measured against THIS node's clock, like
+    //     `flow_executions`.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::MapSite,
+        table_name: "map_sites",
+        resource_type: "core.map_site",
+        primary_key_column: "site_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "maps",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::MapScene,
+        table_name: "map_scenes",
+        resource_type: "core.map_scene",
+        primary_key_column: "scene_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "maps",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::MapDevicePlacement,
+        table_name: "map_device_placements",
+        resource_type: "core.map_device_placement",
+        primary_key_column: "scene_id,node_id,device_id,session_epoch",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "maps",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -1356,6 +1409,40 @@ mod tests {
                 !table.starts_with("vm_"),
                 "{table} is an application table and must not travel in the baseline"
             );
+        }
+    }
+
+    /// The shared map: three metadata tables in one partition. The two that
+    /// are NOT here are the point of the test — the chunk index (an index of
+    /// files on the owner's disk) and the device sessions (node-local, with a
+    /// clock offset measured against this node's clock).
+    #[test]
+    fn registry_contains_the_map_tables_but_not_the_geometry() {
+        for (table, resource_type, primary_key) in [
+            ("map_sites", "core.map_site", "site_id"),
+            ("map_scenes", "core.map_scene", "scene_id"),
+            (
+                "map_device_placements",
+                "core.map_device_placement",
+                "scene_id,node_id,device_id,session_epoch",
+            ),
+        ] {
+            let descriptor =
+                descriptor_for_table(table).unwrap_or_else(|| panic!("missing descriptor {table}"));
+            assert_eq!(descriptor.resource_type, resource_type);
+            assert_eq!(descriptor.primary_key_column, primary_key);
+            assert_eq!(descriptor.scope, CoreSyncScope::Organization);
+            assert_eq!(descriptor.retention, CoreSyncRetention::Durable);
+            assert_eq!(
+                descriptor
+                    .partition_id("org-default", None, NodeEnvironment::Prod)
+                    .unwrap()
+                    .as_str(),
+                "core/env/prod/org/org-default/maps"
+            );
+        }
+        for table in ["map_chunks", "map_device_sessions"] {
+            assert!(!is_core_sync_table(table), "{table} must stay node-local");
         }
     }
 

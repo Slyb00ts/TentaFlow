@@ -1,0 +1,33 @@
+# =============================================================================
+# Plik: privacy-cv.toml
+# Opis: Modele prywatności kamer — osoby (YOLOX-tiny, COCO) i twarze (YuNet),
+#       które sonda prywatności pikselizuje na GPU, zanim klatka opuści węzeł.
+#       Embedded: sesje ONNX Runtime (EP TensorRT/CUDA) ładowane leniwie przez
+#       sondę; deploy jedynie pobiera dwa pliki do vision_models_dir() i
+#       rejestruje serwis dla mesh. Oba pliki pochodzą z oficjalnych wydań
+#       autorów i są przypięte sumą sha256 w `vision/camera_cv_models.rs`
+#       (bundle `privacy-cv`), więc manifest nie potrzebuje własnego release URL.
+#
+#       Licencje: YOLOX-tiny — Apache-2.0 (Megvii-BaseDetection/YOLOX, wydanie
+#       0.1.1rc0); YuNet `face_detection_yunet_2023mar` — MIT (OpenCV zoo).
+# =============================================================================
+
+[engine]
+id = "privacy-cv"
+category = "vision"
+name = "Prywatność kamer (YOLOX-tiny + YuNet)"
+description_pl = "Wykrywanie osób (YOLOX-tiny, COCO) i twarzy (YuNet) do zamazywania głów i twarzy w obrazie kamer — w całości na GPU, przed wysłaniem klatki."
+description_en = "Person (YOLOX-tiny, COCO) and face (YuNet) detection for blurring heads and faces in camera video — fully on the GPU, before a frame leaves the node."
+homepage = "https://github.com/Megvii-BaseDetection/YOLOX"
+license = "Apache-2.0 (YOLOX-tiny) + MIT (YuNet)"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "yolox-tiny-0.1.1rc0+yunet-2023mar"
+service_surfaces = ["camera_cv"]
+input_modalities = ["image"]
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "embedded"
+feature_flag = "vision-cuda-preprocess"

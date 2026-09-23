@@ -2084,6 +2084,13 @@ mod tests {
                 SimulateOptions {
                     shots: 8,
                     record_evolution: Some(false),
+                    // A `cx` chain is Clifford, so `auto` would answer it on
+                    // the stabilizer tableau — microseconds, and no per-gate
+                    // pass over a state for a cancel to land in. The loop
+                    // this test is about is the statevector one, so ask for
+                    // it by name. The unmeasured case below gets it already,
+                    // through `want_state`.
+                    method: "statevector".to_string(),
                     ..SimulateOptions::default()
                 },
             ),

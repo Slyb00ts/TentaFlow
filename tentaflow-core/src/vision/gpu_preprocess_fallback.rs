@@ -83,6 +83,8 @@ pub fn preprocess_nv12_batch_gpu(
     _s: usize,
     _mean: [f32; 3],
     _stdv: [f32; 3],
+    _fit: crate::vision::preprocessing::FrameFit,
+    _order: crate::vision::preprocessing::ChannelOrder,
     _color: ColorCoeffs,
 ) -> Result<DeviceBatch> {
     bail!("CUDA preprocessing is not enabled")

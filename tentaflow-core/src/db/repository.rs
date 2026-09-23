@@ -200,7 +200,7 @@ mod core_sync_repository_tests {
             "password@example.com",
         )
         .expect("create user");
-        db.read().expect("db lock").execute(
+        db.write().expect("db lock").execute(
             "UPDATE user_accounts SET must_change_password = 1 WHERE id = ?1", [&user_id],
         ).expect("require initial password rotation");
         update_user_account_password(&db, &user_id, "new-secret-hash").expect("update password");
@@ -4338,6 +4338,10 @@ fn field_bool(value: bool) -> crate::sync::ledger::FieldValue {
     crate::sync::ledger::FieldValue::Bool(value)
 }
 
+fn field_i64(value: i64) -> crate::sync::ledger::FieldValue {
+    crate::sync::ledger::FieldValue::I64(value)
+}
+
 fn field_optional_i64(value: Option<i64>) -> crate::sync::ledger::FieldValue {
     value
         .map(crate::sync::ledger::FieldValue::I64)
@@ -4348,6 +4352,14 @@ fn field_optional_i64(value: Option<i64>) -> crate::sync::ledger::FieldValue {
 /// wire carries the full precision instead of a lossy integer cast.
 fn field_f64(value: f64) -> crate::sync::ledger::FieldValue {
     crate::sync::ledger::FieldValue::Decimal(value.to_string())
+}
+
+/// A real that may be absent (a georeference nobody set). `Null` and "0.0" must
+/// stay distinguishable: 0° is a real coordinate.
+fn field_optional_f64(value: Option<f64>) -> crate::sync::ledger::FieldValue {
+    value
+        .map(field_f64)
+        .unwrap_or(crate::sync::ledger::FieldValue::Null)
 }
 
 fn sync_resource_acl_core_id(
@@ -6780,6 +6792,92 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 drop(stmt);
                 bus_schema_versions_to_publish = rows;
+            }
+            // Shared map. Sites first, then scenes, then placements: a peer
+            // defers a scene whose site it has not materialized yet, and
+            // emitting them in dependency order spares it that retry.
+            K::MapSite => {
+                let sites = {
+                    let mut stmt = tx.prepare(
+                        "SELECT s.site_id, s.name, s.description, s.address, s.lat, s.lon,                                 s.alt, s.created_by, s.created_at_ms, s.updated_at_ms, 0, NULL,                                 s.org_id FROM map_sites s ORDER BY s.site_id",
+                    )?;
+                    let rows = stmt
+                        .query_map([], |r| Ok((row_to_site(r)?, r.get::<_, String>(12)?)))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    rows
+                };
+                for (site, org_id) in sites {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        K::MapSite,
+                        &org_id,
+                        site.site_id.clone(),
+                        Insert,
+                        map_site_fields(&org_id, &site),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::MapScene => {
+                let scenes = {
+                    let sql = format!(
+                        "SELECT {MAP_SCENE_COLS}, s.org_id FROM map_scenes s ORDER BY s.scene_id"
+                    );
+                    let mut stmt = tx.prepare(&sql)?;
+                    let rows = stmt
+                        .query_map([], |r| Ok((row_to_scene(r)?, r.get::<_, String>(16)?)))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    rows
+                };
+                for (scene, org_id) in scenes {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        K::MapScene,
+                        &org_id,
+                        scene.scene_id.clone(),
+                        Insert,
+                        map_scene_fields(&org_id, &scene),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::MapDevicePlacement => {
+                let keys: Vec<(String, String, String, i64, String)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT p.scene_id, p.node_id, p.device_id, p.session_epoch, c.org_id                            FROM map_device_placements p                            JOIN map_scenes c ON c.scene_id = p.scene_id                           ORDER BY p.scene_id, p.node_id, p.device_id, p.session_epoch",
+                    )?;
+                    let rows = stmt
+                        .query_map([], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, i64>(3)?,
+                                r.get::<_, String>(4)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    drop(stmt);
+                    rows
+                };
+                for (scene_id, node_id, device_id, epoch, org_id) in keys {
+                    if let Some(fields) =
+                        map_placement_fields_tx(&tx, &scene_id, &node_id, &device_id, epoch)?
+                    {
+                        record_core_capture_for_org_tx(
+                            &tx,
+                            K::MapDevicePlacement,
+                            &org_id,
+                            map_placement_resource_id(&scene_id, &node_id, &device_id, epoch),
+                            Insert,
+                            fields,
+                            None,
+                        )?;
+                        emitted += 1;
+                    }
+                }
             }
         }
     }
@@ -29078,6 +29176,837 @@ mod token_metrics_tests {
             .unwrap();
         assert_eq!(count, 2);
     }
+}
+
+// =============================================================================
+// Shared map — sites, scenes and device placement (migration 165).
+//
+// The rows here are the map's METADATA; its geometry lives under
+// `paths::maps_dir()` and is indexed by `map_chunks`. Every function is
+// org-scoped: a row of another organization must read as missing, not as
+// forbidden, so the caller can answer `NotFound` without leaking existence.
+// =============================================================================
+
+use tentaflow_protocol::map::{MapDevice, MapPlacement, MapScene, MapSite};
+
+fn map_now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn row_to_site(r: &rusqlite::Row<'_>) -> rusqlite::Result<MapSite> {
+    Ok(MapSite {
+        site_id: r.get(0)?,
+        name: r.get(1)?,
+        description: r.get(2)?,
+        address: r.get(3)?,
+        lat: r.get(4)?,
+        lon: r.get(5)?,
+        alt: r.get(6)?,
+        created_by: r.get(7)?,
+        created_at_ms: r.get(8)?,
+        updated_at_ms: r.get(9)?,
+        scene_count: r.get::<_, i64>(10)? as u32,
+        devices_online: 0,
+        last_update_ms: r.get(11)?,
+    })
+}
+
+/// Ledger fields of a site row. Mirrors `core_materializer::apply_map_site`:
+/// peers materialize exactly these names, so the two lists move together.
+fn map_site_fields(org_id: &str, site: &MapSite) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut f = BTreeMap::new();
+    f.insert("org_id".to_string(), field_string(org_id));
+    f.insert("name".to_string(), field_string(&site.name));
+    f.insert("description".to_string(), field_string(&site.description));
+    f.insert("address".to_string(), field_string(&site.address));
+    f.insert("lat".to_string(), field_optional_f64(site.lat));
+    f.insert("lon".to_string(), field_optional_f64(site.lon));
+    f.insert("alt".to_string(), field_optional_f64(site.alt));
+    f.insert("created_by".to_string(), field_string(&site.created_by));
+    f.insert("created_at_ms".to_string(), field_i64(site.created_at_ms));
+    f.insert("updated_at_ms".to_string(), field_i64(site.updated_at_ms));
+    f
+}
+
+fn map_scene_fields(
+    org_id: &str,
+    scene: &MapScene,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut f = BTreeMap::new();
+    f.insert("org_id".to_string(), field_string(org_id));
+    f.insert("site_id".to_string(), field_string(&scene.site_id));
+    f.insert("name".to_string(), field_string(&scene.name));
+    f.insert("voxel_res_m".to_string(), field_f64(scene.voxel_res_m as f64));
+    f.insert(
+        "owner_node_id".to_string(),
+        field_string(&scene.owner_node_id),
+    );
+    f.insert("owner_epoch".to_string(), field_i64(scene.owner_epoch as i64));
+    f.insert("geo_lat".to_string(), field_optional_f64(scene.geo_lat));
+    f.insert("geo_lon".to_string(), field_optional_f64(scene.geo_lon));
+    f.insert("geo_alt".to_string(), field_optional_f64(scene.geo_alt));
+    f.insert(
+        "geo_heading".to_string(),
+        field_optional_f64(scene.geo_heading),
+    );
+    f.insert("max_voxels".to_string(), field_i64(scene.max_voxels));
+    f.insert("created_by".to_string(), field_string(&scene.created_by));
+    f.insert("created_at_ms".to_string(), field_i64(scene.created_at_ms));
+    f.insert("updated_at_ms".to_string(), field_i64(scene.updated_at_ms));
+    f
+}
+
+fn map_placement_resource_id(
+    scene_id: &str,
+    node_id: &str,
+    device_id: &str,
+    session_epoch: i64,
+) -> String {
+    let epoch = session_epoch.to_string();
+    crate::sync::resource_id::composite_resource_id(&[scene_id, node_id, device_id, &epoch])
+}
+
+/// Reads one placement back and turns it into ledger fields. Reading it back
+/// (instead of echoing what the caller passed) keeps the capture equal to what
+/// the row actually holds after `ON CONFLICT`.
+fn map_placement_fields_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scene_id: &str,
+    node_id: &str,
+    device_id: &str,
+    session_epoch: i64,
+) -> Result<Option<BTreeMap<String, crate::sync::ledger::FieldValue>>> {
+    let row = tx
+        .query_row(
+            "SELECT tx, ty, tz, qx, qy, qz, qw, method, locked, confidence, set_by, \
+                    set_at_ms, updated_at_ms \
+               FROM map_device_placements \
+              WHERE scene_id = ?1 AND node_id = ?2 AND device_id = ?3 AND session_epoch = ?4",
+            rusqlite::params![scene_id, node_id, device_id, session_epoch],
+            |r| {
+                Ok((
+                    r.get::<_, f64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, f64>(5)?,
+                    r.get::<_, f64>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, f64>(9)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, i64>(12)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((tx_, ty, tz, qx, qy, qz, qw, method, locked, confidence, set_by, set_at, updated)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let mut f = BTreeMap::new();
+    f.insert("scene_id".to_string(), field_string(scene_id));
+    f.insert("node_id".to_string(), field_string(node_id));
+    f.insert("device_id".to_string(), field_string(device_id));
+    f.insert("session_epoch".to_string(), field_i64(session_epoch));
+    f.insert("tx".to_string(), field_f64(tx_));
+    f.insert("ty".to_string(), field_f64(ty));
+    f.insert("tz".to_string(), field_f64(tz));
+    f.insert("qx".to_string(), field_f64(qx));
+    f.insert("qy".to_string(), field_f64(qy));
+    f.insert("qz".to_string(), field_f64(qz));
+    f.insert("qw".to_string(), field_f64(qw));
+    f.insert("method".to_string(), field_string(&method));
+    f.insert("locked".to_string(), field_i64(locked));
+    f.insert("confidence".to_string(), field_f64(confidence));
+    f.insert("set_by".to_string(), field_string(&set_by));
+    f.insert("set_at_ms".to_string(), field_i64(set_at));
+    f.insert("updated_at_ms".to_string(), field_i64(updated));
+    Ok(Some(f))
+}
+
+/// Every site of the organization, newest activity first. `scene_count` and
+/// `last_update_ms` are derived from the scenes so the list needs one query.
+pub fn map_site_list(pool: &DbPool, org_id: &str) -> Result<Vec<MapSite>> {
+    let conn = pool.read()?;
+    let mut stmt = conn.prepare(
+        "SELECT s.site_id, s.name, s.description, s.address, s.lat, s.lon, s.alt, \
+                s.created_by, s.created_at_ms, s.updated_at_ms, \
+                (SELECT COUNT(*) FROM map_scenes c WHERE c.site_id = s.site_id), \
+                (SELECT MAX(c.updated_at_ms) FROM map_scenes c WHERE c.site_id = s.site_id) \
+           FROM map_sites s WHERE s.org_id = ?1 ORDER BY s.name",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], |r| row_to_site(r))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn map_site_get(pool: &DbPool, org_id: &str, site_id: &str) -> Result<Option<MapSite>> {
+    Ok(map_site_list(pool, org_id)?
+        .into_iter()
+        .find(|s| s.site_id == site_id))
+}
+
+/// Creates the site when `site.site_id` is empty and returns the stored row.
+/// An update touches only the fields a site owns — counters are derived.
+/// One site, read inside an open write transaction so a capture describes the
+/// row the same statement just wrote.
+fn map_site_read_tx(
+    tx: &rusqlite::Transaction<'_>,
+    org_id: &str,
+    site_id: &str,
+) -> Result<Option<MapSite>> {
+    let site = tx
+        .query_row(
+            "SELECT s.site_id, s.name, s.description, s.address, s.lat, s.lon, s.alt, \
+                    s.created_by, s.created_at_ms, s.updated_at_ms, \
+                    (SELECT COUNT(*) FROM map_scenes c WHERE c.site_id = s.site_id), \
+                    (SELECT MAX(c.updated_at_ms) FROM map_scenes c WHERE c.site_id = s.site_id) \
+               FROM map_sites s WHERE s.site_id = ?1 AND s.org_id = ?2",
+            rusqlite::params![site_id, org_id],
+            |r| row_to_site(r),
+        )
+        .optional()?;
+    Ok(site)
+}
+
+fn map_scene_read_tx(
+    tx: &rusqlite::Transaction<'_>,
+    org_id: &str,
+    scene_id: &str,
+) -> Result<Option<MapScene>> {
+    let sql = format!(
+        "SELECT {MAP_SCENE_COLS} FROM map_scenes s WHERE s.scene_id = ?1 AND s.org_id = ?2"
+    );
+    let scene = tx
+        .query_row(&sql, rusqlite::params![scene_id, org_id], |r| row_to_scene(r))
+        .optional()?;
+    Ok(scene)
+}
+
+pub fn map_site_upsert(
+    pool: &DbPool,
+    org_id: &str,
+    actor: &str,
+    site: &MapSite,
+) -> Result<Option<MapSite>> {
+    use crate::sync::core_registry::CoreSyncResourceKind as K;
+    use crate::sync::runtime::SqlWriteAction;
+
+    let now = map_now_ms();
+    let site_id = if site.site_id.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        site.site_id.clone()
+    };
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE map_sites SET name = ?3, description = ?4, address = ?5, \
+                lat = ?6, lon = ?7, alt = ?8, updated_at_ms = ?9 \
+          WHERE site_id = ?1 AND org_id = ?2",
+        rusqlite::params![
+            site_id,
+            org_id,
+            site.name,
+            site.description,
+            site.address,
+            site.lat,
+            site.lon,
+            site.alt,
+            now
+        ],
+    )?;
+    let action = if changed > 0 {
+        SqlWriteAction::Update
+    } else {
+        if !site.site_id.trim().is_empty() {
+            // The id named a site of another organization (or none at all):
+            // creating it here would mint a row under an id someone else owns.
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO map_sites \
+               (site_id, org_id, name, description, address, lat, lon, alt, \
+                created_by, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            rusqlite::params![
+                site_id,
+                org_id,
+                site.name,
+                site.description,
+                site.address,
+                site.lat,
+                site.lon,
+                site.alt,
+                actor,
+                now
+            ],
+        )?;
+        SqlWriteAction::Insert
+    };
+    let stored = map_site_read_tx(&tx, org_id, &site_id)?;
+    if let Some(stored) = &stored {
+        record_core_capture_for_org_tx(
+            &tx,
+            K::MapSite,
+            org_id,
+            site_id.clone(),
+            action,
+            map_site_fields(org_id, stored),
+            Some(actor.to_string()),
+        )?;
+    }
+    tx.commit()?;
+    Ok(stored)
+}
+
+/// Deletes a site with every scene inside it (SQLite cascade). Returns false
+/// when the org does not own a site with that id.
+pub fn map_site_delete(pool: &DbPool, org_id: &str, site_id: &str) -> Result<bool> {
+    use crate::sync::core_registry::CoreSyncResourceKind as K;
+    use crate::sync::runtime::SqlWriteAction;
+
+    let mut conn = acquire(pool)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = conn.transaction()?;
+    // The scenes go with the site (cascade), and each one has to be reported
+    // on its own: a peer that only heard about the site would keep rendering
+    // reconstructions whose geometry is gone here.
+    let scene_ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT scene_id FROM map_scenes WHERE site_id = ?1 AND org_id = ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![site_id, org_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let n = tx.execute(
+        "DELETE FROM map_sites WHERE site_id = ?1 AND org_id = ?2",
+        rusqlite::params![site_id, org_id],
+    )?;
+    if n == 0 {
+        return Ok(false);
+    }
+    for scene_id in scene_ids {
+        record_core_capture_for_org_tx(
+            &tx,
+            K::MapScene,
+            org_id,
+            scene_id,
+            SqlWriteAction::Delete,
+            BTreeMap::new(),
+            None,
+        )?;
+    }
+    record_core_capture_for_org_tx(
+        &tx,
+        K::MapSite,
+        org_id,
+        site_id.to_string(),
+        SqlWriteAction::Delete,
+        BTreeMap::new(),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn row_to_scene(r: &rusqlite::Row<'_>) -> rusqlite::Result<MapScene> {
+    Ok(MapScene {
+        scene_id: r.get(0)?,
+        site_id: r.get(1)?,
+        name: r.get(2)?,
+        voxel_res_m: r.get::<_, f64>(3)? as f32,
+        owner_node_id: r.get(4)?,
+        owner_epoch: r.get::<_, i64>(5)? as u32,
+        geo_lat: r.get(6)?,
+        geo_lon: r.get(7)?,
+        geo_alt: r.get(8)?,
+        geo_heading: r.get(9)?,
+        max_voxels: r.get(10)?,
+        created_by: r.get(11)?,
+        created_at_ms: r.get(12)?,
+        updated_at_ms: r.get(13)?,
+        chunks: r.get(14)?,
+        voxels: r.get::<_, Option<i64>>(15)?.unwrap_or(0),
+        last_update_ms: None,
+        owner_online: false,
+        replica_state: String::new(),
+    })
+}
+
+const MAP_SCENE_COLS: &str = "s.scene_id, s.site_id, s.name, s.voxel_res_m, s.owner_node_id, \
+     s.owner_epoch, s.geo_lat, s.geo_lon, s.geo_alt, s.geo_heading, s.max_voxels, \
+     s.created_by, s.created_at_ms, s.updated_at_ms, \
+     (SELECT COUNT(*) FROM map_chunks k WHERE k.scene_id = s.scene_id), \
+     (SELECT SUM(k.occupied) FROM map_chunks k WHERE k.scene_id = s.scene_id)";
+
+/// Scenes of one site, or of the whole organization when `site_id` is `None`.
+pub fn map_scene_list(
+    pool: &DbPool,
+    org_id: &str,
+    site_id: Option<&str>,
+) -> Result<Vec<MapScene>> {
+    let conn = pool.read()?;
+    let sql = format!(
+        "SELECT {MAP_SCENE_COLS} FROM map_scenes s \
+          WHERE s.org_id = ?1 AND (?2 IS NULL OR s.site_id = ?2) ORDER BY s.name"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id, site_id], |r| row_to_scene(r))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn map_scene_get(pool: &DbPool, org_id: &str, scene_id: &str) -> Result<Option<MapScene>> {
+    let conn = pool.read()?;
+    let sql = format!(
+        "SELECT {MAP_SCENE_COLS} FROM map_scenes s WHERE s.scene_id = ?1 AND s.org_id = ?2"
+    );
+    let scene = conn
+        .query_row(&sql, rusqlite::params![scene_id, org_id], |r| {
+            row_to_scene(r)
+        })
+        .optional()?;
+    Ok(scene)
+}
+
+/// Creates the scene when `scene.scene_id` is empty. The owner is chosen once,
+/// at creation: an update never moves a scene to another node, because the
+/// geometry is on the owner's disk and only `map_scene_set_owner` knows how to
+/// hand it over.
+pub fn map_scene_upsert(
+    pool: &DbPool,
+    org_id: &str,
+    actor: &str,
+    scene: &MapScene,
+) -> Result<Option<MapScene>> {
+    use crate::sync::core_registry::CoreSyncResourceKind as K;
+    use crate::sync::runtime::SqlWriteAction;
+
+    let now = map_now_ms();
+    let scene_id = if scene.scene_id.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        scene.scene_id.clone()
+    };
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE map_scenes SET name = ?3, max_voxels = ?4, updated_at_ms = ?5 \
+          WHERE scene_id = ?1 AND org_id = ?2",
+        rusqlite::params![scene_id, org_id, scene.name, scene.max_voxels, now],
+    )?;
+    let action = if changed > 0 {
+        SqlWriteAction::Update
+    } else {
+        if !scene.scene_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let site_owned: bool = tx
+            .query_row(
+                "SELECT 1 FROM map_sites WHERE site_id = ?1 AND org_id = ?2",
+                rusqlite::params![scene.site_id, org_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !site_owned {
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO map_scenes \
+               (scene_id, site_id, org_id, name, voxel_res_m, owner_node_id, owner_epoch, \
+                geo_lat, geo_lon, geo_alt, geo_heading, max_voxels, created_by, \
+                created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+            rusqlite::params![
+                scene_id,
+                scene.site_id,
+                org_id,
+                scene.name,
+                scene.voxel_res_m as f64,
+                scene.owner_node_id,
+                scene.geo_lat,
+                scene.geo_lon,
+                scene.geo_alt,
+                scene.geo_heading,
+                if scene.max_voxels > 0 {
+                    scene.max_voxels
+                } else {
+                    50_000_000
+                },
+                actor,
+                now
+            ],
+        )?;
+        SqlWriteAction::Insert
+    };
+    let stored = map_scene_read_tx(&tx, org_id, &scene_id)?;
+    if let Some(stored) = &stored {
+        record_core_capture_for_org_tx(
+            &tx,
+            K::MapScene,
+            org_id,
+            scene_id.clone(),
+            action,
+            map_scene_fields(org_id, stored),
+            Some(actor.to_string()),
+        )?;
+    }
+    tx.commit()?;
+    Ok(stored)
+}
+
+/// True when the scene still holds indexed geometry — the caller refuses a
+/// delete without `force` so nobody drops a mapped building by a mis-click.
+pub fn map_scene_has_geometry(pool: &DbPool, scene_id: &str) -> Result<bool> {
+    let conn = pool.read()?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM map_chunks WHERE scene_id = ?1",
+        rusqlite::params![scene_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+pub fn map_scene_delete(pool: &DbPool, org_id: &str, scene_id: &str) -> Result<bool> {
+    use crate::sync::core_registry::CoreSyncResourceKind as K;
+    use crate::sync::runtime::SqlWriteAction;
+
+    let mut conn = acquire(pool)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let tx = conn.transaction()?;
+    let placements = map_placement_keys_tx(&tx, scene_id)?;
+    let n = tx.execute(
+        "DELETE FROM map_scenes WHERE scene_id = ?1 AND org_id = ?2",
+        rusqlite::params![scene_id, org_id],
+    )?;
+    if n == 0 {
+        return Ok(false);
+    }
+    for (node_id, device_id, epoch) in placements {
+        record_core_capture_for_org_tx(
+            &tx,
+            K::MapDevicePlacement,
+            org_id,
+            map_placement_resource_id(scene_id, &node_id, &device_id, epoch),
+            SqlWriteAction::Delete,
+            BTreeMap::new(),
+            None,
+        )?;
+    }
+    record_core_capture_for_org_tx(
+        &tx,
+        K::MapScene,
+        org_id,
+        scene_id.to_string(),
+        SqlWriteAction::Delete,
+        BTreeMap::new(),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Placement keys of a scene, used to report each one's removal when the scene
+/// (or its site) goes away under a cascade.
+fn map_placement_keys_tx(
+    tx: &rusqlite::Transaction<'_>,
+    scene_id: &str,
+) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = tx.prepare(
+        "SELECT node_id, device_id, session_epoch FROM map_device_placements \
+          WHERE scene_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![scene_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Hands the scene to another node and bumps `owner_epoch`, which is what makes
+/// a late write from the previous owner recognizable as stale.
+pub fn map_scene_set_owner(
+    pool: &DbPool,
+    org_id: &str,
+    scene_id: &str,
+    node_id: &str,
+) -> Result<bool> {
+    map_scene_update_and_capture(pool, org_id, scene_id, |tx| {
+        tx.execute(
+            "UPDATE map_scenes SET owner_node_id = ?3, owner_epoch = owner_epoch + 1, \
+                    updated_at_ms = ?4 WHERE scene_id = ?1 AND org_id = ?2",
+            rusqlite::params![scene_id, org_id, node_id, map_now_ms()],
+        )
+    })
+}
+
+/// Georeferences the scene. A `None` component clears it: a half-known anchor
+/// is still usable (heading without altitude is common indoors).
+pub fn map_scene_set_geo(
+    pool: &DbPool,
+    org_id: &str,
+    scene_id: &str,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    alt: Option<f64>,
+    heading: Option<f64>,
+) -> Result<bool> {
+    map_scene_update_and_capture(pool, org_id, scene_id, |tx| {
+        tx.execute(
+            "UPDATE map_scenes SET geo_lat = ?3, geo_lon = ?4, geo_alt = ?5, geo_heading = ?6, \
+                    updated_at_ms = ?7 WHERE scene_id = ?1 AND org_id = ?2",
+            rusqlite::params![scene_id, org_id, lat, lon, alt, heading, map_now_ms()],
+        )
+    })
+}
+
+/// Runs one scene UPDATE and captures the resulting row. Every scene edit that
+/// is not a create goes through here, so none of them can forget the capture.
+fn map_scene_update_and_capture<F>(
+    pool: &DbPool,
+    org_id: &str,
+    scene_id: &str,
+    update: F,
+) -> Result<bool>
+where
+    F: FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<usize>,
+{
+    use crate::sync::core_registry::CoreSyncResourceKind as K;
+    use crate::sync::runtime::SqlWriteAction;
+
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    if update(&tx)? == 0 {
+        return Ok(false);
+    }
+    let Some(stored) = map_scene_read_tx(&tx, org_id, scene_id)? else {
+        return Ok(false);
+    };
+    record_core_capture_for_org_tx(
+        &tx,
+        K::MapScene,
+        org_id,
+        scene_id.to_string(),
+        SqlWriteAction::Update,
+        map_scene_fields(org_id, &stored),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Devices placed in one scene, or in every scene of the organization. The
+/// session row carries the live state; a placement without a session is a
+/// device that has not reported since the node restarted.
+pub fn map_device_list(
+    pool: &DbPool,
+    org_id: &str,
+    scene_id: Option<&str>,
+) -> Result<Vec<MapDevice>> {
+    let conn = pool.read()?;
+    let mut stmt = conn.prepare(
+        "SELECT p.node_id, p.device_id, p.session_epoch, p.scene_id, \
+                p.tx, p.ty, p.tz, p.qx, p.qy, p.qz, p.qw, p.method, p.locked, p.confidence, \
+                p.set_by, p.set_at_ms, \
+                (SELECT s.state FROM map_device_sessions s \
+                  WHERE s.node_id = p.node_id AND s.device_id = p.device_id \
+                    AND s.session_epoch = p.session_epoch), \
+                (SELECT s.last_frame_ms FROM map_device_sessions s \
+                  WHERE s.node_id = p.node_id AND s.device_id = p.device_id \
+                    AND s.session_epoch = p.session_epoch) \
+           FROM map_device_placements p \
+           JOIN map_scenes c ON c.scene_id = p.scene_id \
+          WHERE c.org_id = ?1 AND (?2 IS NULL OR p.scene_id = ?2) \
+          ORDER BY p.device_id, p.session_epoch DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id, scene_id], |r| {
+            Ok(MapDevice {
+                node_id: r.get(0)?,
+                device_id: r.get(1)?,
+                session_epoch: r.get(2)?,
+                scene_id: r.get(3)?,
+                placement: Some(MapPlacement {
+                    tx: r.get(4)?,
+                    ty: r.get(5)?,
+                    tz: r.get(6)?,
+                    qx: r.get(7)?,
+                    qy: r.get(8)?,
+                    qz: r.get(9)?,
+                    qw: r.get(10)?,
+                    method: r.get(11)?,
+                    locked: r.get::<_, i64>(12)? != 0,
+                    confidence: r.get::<_, f64>(13)? as f32,
+                    set_by: r.get(14)?,
+                    set_at_ms: r.get(15)?,
+                }),
+                state: r
+                    .get::<_, Option<String>>(16)?
+                    .unwrap_or_else(|| "lost".to_string()),
+                last_frame_ms: r.get(17)?,
+                drift_estimate_m: None,
+                display_name: String::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Gives a device the right to write into a scene. The first device of an empty
+/// scene gauges it, so its placement is the identity — there is nothing yet to
+/// align against, and every later device is placed relative to what it built.
+pub fn map_device_assign(
+    pool: &DbPool,
+    org_id: &str,
+    actor: &str,
+    scene_id: &str,
+    node_id: &str,
+    device_id: &str,
+) -> Result<bool> {
+    use crate::sync::core_registry::CoreSyncResourceKind as K;
+    use crate::sync::runtime::SqlWriteAction;
+
+    let now = map_now_ms();
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let scene_owned: bool = tx
+        .query_row(
+            "SELECT 1 FROM map_scenes WHERE scene_id = ?1 AND org_id = ?2",
+            rusqlite::params![scene_id, org_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !scene_owned {
+        return Ok(false);
+    }
+    let epoch: i64 = tx
+        .query_row(
+            "SELECT MAX(session_epoch) FROM map_device_sessions \
+              WHERE node_id = ?1 AND device_id = ?2",
+            rusqlite::params![node_id, device_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten()
+        .unwrap_or(1);
+    let scene_empty: bool = tx.query_row(
+        "SELECT COUNT(*) = 0 FROM map_device_placements WHERE scene_id = ?1",
+        rusqlite::params![scene_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO map_device_placements \
+           (scene_id, node_id, device_id, session_epoch, tx, ty, tz, qx, qy, qz, qw, \
+            method, locked, confidence, set_by, set_at_ms, updated_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, 0, 0, 1, ?5, 0, ?6, ?7, ?8, ?8) \
+         ON CONFLICT(scene_id, node_id, device_id, session_epoch) DO UPDATE SET \
+            updated_at_ms = ?8",
+        rusqlite::params![
+            scene_id,
+            node_id,
+            device_id,
+            epoch,
+            if scene_empty { "identity" } else { "manual" },
+            if scene_empty { 1.0_f64 } else { 0.0_f64 },
+            actor,
+            now
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO map_device_sessions \
+           (node_id, device_id, session_epoch, scene_id, started_at_ms, state) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(node_id, device_id, session_epoch) DO UPDATE SET scene_id = ?4",
+        rusqlite::params![
+            node_id,
+            device_id,
+            epoch,
+            scene_id,
+            now,
+            if scene_empty { "placed" } else { "unplaced" }
+        ],
+    )?;
+    if let Some(fields) = map_placement_fields_tx(&tx, scene_id, node_id, device_id, epoch)? {
+        record_core_capture_for_org_tx(
+            &tx,
+            K::MapDevicePlacement,
+            org_id,
+            map_placement_resource_id(scene_id, node_id, device_id, epoch),
+            SqlWriteAction::Insert,
+            fields,
+            Some(actor.to_string()),
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Takes the device out of every scene of the organization. Its geometry stays:
+/// what it already contributed is part of the building, not of the device.
+pub fn map_device_unassign(
+    pool: &DbPool,
+    org_id: &str,
+    node_id: &str,
+    device_id: &str,
+) -> Result<bool> {
+    use crate::sync::core_registry::CoreSyncResourceKind as K;
+    use crate::sync::runtime::SqlWriteAction;
+
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let removed: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT p.scene_id, p.session_epoch FROM map_device_placements p \
+               JOIN map_scenes c ON c.scene_id = p.scene_id \
+              WHERE p.node_id = ?1 AND p.device_id = ?2 AND c.org_id = ?3",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![node_id, device_id, org_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        rows
+    };
+    if removed.is_empty() {
+        return Ok(false);
+    }
+    tx.execute(
+        "DELETE FROM map_device_placements \
+          WHERE node_id = ?1 AND device_id = ?2 AND scene_id IN \
+                (SELECT scene_id FROM map_scenes WHERE org_id = ?3)",
+        rusqlite::params![node_id, device_id, org_id],
+    )?;
+    tx.execute(
+        "UPDATE map_device_sessions SET scene_id = NULL, state = 'unplaced' \
+          WHERE node_id = ?1 AND device_id = ?2",
+        rusqlite::params![node_id, device_id],
+    )?;
+    for (scene_id, epoch) in removed {
+        record_core_capture_for_org_tx(
+            &tx,
+            K::MapDevicePlacement,
+            org_id,
+            map_placement_resource_id(&scene_id, node_id, device_id, epoch),
+            SqlWriteAction::Delete,
+            BTreeMap::new(),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 #[cfg(test)]

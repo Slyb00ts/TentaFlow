@@ -2629,6 +2629,12 @@ mod tests {
 
     struct Fixture {
         _data: tempfile::TempDir,
+        /// The lock `paths` itself names as the one guard over
+        /// `set_category_override`: the other three `AddonData` fixtures
+        /// (`tentavm`, `tentanas`, `code_studio`) hold it, so a fixture that
+        /// held only `disk_lock` was a second writer over one global and read
+        /// their tempdir instead of its own.
+        _overrides: MutexGuard<'static, ()>,
         _guard: MutexGuard<'static, ()>,
         state: Arc<AppState>,
         /// Instance ids installed by this fixture, closed on drop: the pool
@@ -2647,12 +2653,14 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        let overrides = crate::paths::lock_category_overrides();
         let guard = disk_lock();
         let data = tempfile::tempdir().expect("data dir");
         let root = data.path().to_string_lossy().to_string();
         crate::paths::set_category_override(crate::paths::StorageCategory::AddonData, Some(root));
         Fixture {
             _data: data,
+            _overrides: overrides,
             _guard: guard,
             state: AppState::for_test(),
             labs: Vec::new(),

@@ -40,7 +40,7 @@ use crate::vision::detector_rfdetr::MODEL_BATCH;
 ))]
 use crate::vision::runners::get_detector;
 #[cfg(feature = "vision-ort")]
-use crate::vision::runners::get_vehicle_detector;
+use crate::vision::runners::get_coco_detector;
 #[cfg(not(feature = "vision-ort"))]
 use crate::vision::runners::{get_classifier, get_ocr};
 use tentaflow_protocol::{CameraCvResult, CvDetection, CvOcrMode};
@@ -780,7 +780,7 @@ struct FrameJob {
     detect_ms_total: u32,
     /// Liczba etapów zakończonych błędem executora (bez wyniku).
     failed_stages: usize,
-    /// Boxy pojazdow (`klasa="vehicle"`) wykryte przez YOLOv8 RÓWNOLEGLE z
+    /// Boxy pojazdow (`klasa="vehicle"`) wykryte przez YOLOX RÓWNOLEGLE z
     /// RF-DETR na TEJ SAMEJ klatce (tokio::join!). Trakowane osobnym trackerem
     /// IOU `(kamera,"vehicles")` w `stage_completed`, potem propagowane do cold
     /// path do asocjacji znak→pojazd. Puste, gdy model pojazdow niedostepny
@@ -1016,7 +1016,7 @@ async fn run_device_detect_forward(
     Ok(batch)
 }
 
-/// Runs the YOLOv8 vehicle detector on a batch of NV12 detect frames — the
+/// Runs the YOLOX vehicle detector on a batch of NV12 detect frames — the
 /// PARALLEL half of the NV12 detect closure's `tokio::join!`. Its own ort pool
 /// gives independent CUDA streams, so this overlaps the RF-DETR forward. Any
 /// failure (model absent, forward error) degrades to an all-empty result, so
@@ -1031,7 +1031,7 @@ async fn run_nv12_vehicle_forward(
     color: crate::vision::gpu_preprocess::ColorCoeffs,
 ) -> Vec<Vec<Detection>> {
     let n = frames.len();
-    let Some(detector) = get_vehicle_detector().await else {
+    let Some(detector) = get_coco_detector().await else {
         return vec![Vec::new(); n];
     };
     let out = tokio::task::spawn_blocking(move || {
@@ -1064,7 +1064,7 @@ async fn run_nv12_vehicle_forward(
     }
 }
 
-/// Runs the YOLOv8 vehicle detector on a batch of RGB detect frames (the device
+/// Runs the YOLOX vehicle detector on a batch of RGB detect frames (the device
 /// zero-copy path has no YOLO-usable pixels — its `OwnedDeviceTensor` is already
 /// RF-DETR-normalized at 560 — so the launcher passes the full-res RGB `frame`
 /// here instead). Same degrade-to-empty guard as the NV12 path.
@@ -1074,7 +1074,7 @@ async fn run_rgb_vehicle_forward(frames: Vec<CvFrameLocal>) -> Vec<Vec<Detection
     if n == 0 {
         return Vec::new();
     }
-    let Some(detector) = get_vehicle_detector().await else {
+    let Some(detector) = get_coco_detector().await else {
         return vec![Vec::new(); n];
     };
     let out = tokio::task::spawn_blocking(move || {
@@ -1744,9 +1744,9 @@ async fn engine_loop() {
             let handle = forwards.spawn(async move {
                 let _permit = permit;
                 let detect_start = Instant::now();
-                // RF-DETR and YOLOv8-vehicle run CONCURRENTLY on the SAME frame:
+                // RF-DETR and the YOLOX vehicle detector run CONCURRENTLY on the SAME frame:
                 // separate ort pools → independent CUDA streams → wall time ≈
-                // max(DETR, YOLO), NOT the sum. The vehicle half degrades to empty
+                // max(DETR, YOLOX), NOT the sum. The vehicle half degrades to empty
                 // internally, so it never blocks or fails detection.
                 let (outcome, vehicles) = tokio::join!(
                     run_nv12_detect_forward(nv12, color, threshold),
@@ -1805,7 +1805,7 @@ async fn engine_loop() {
         let n = batch.len().max(1) as u32;
         // Vehicle detector runs on a CLONE of the SAME detect frames (Arc-cheap),
         // concurrently with the executor detect (own ort pool). Only on the ort
-        // path — the Burn path has no YOLOv8 vehicle graph.
+        // path — the Burn path has no YOLOX vehicle graph.
         #[cfg(feature = "vision-ort")]
         let vehicle_frames = frames.clone();
         let handle = forwards.spawn(async move {

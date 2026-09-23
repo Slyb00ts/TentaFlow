@@ -34,6 +34,8 @@ pub mod pii;
 pub mod profiling;
 pub mod project_studio;
 pub mod provider_account;
+pub mod map;
+pub mod robot_cloud;
 pub mod storage;
 pub mod stream;
 pub mod tentanas;
@@ -105,6 +107,7 @@ pub use message_body::{
     AddonAdminOnlySetResponse,
     AddonApplicationInfo,
     AddonConfigField,
+    AddonRequirement,
     AddonConfigGetRequest,
     AddonConfigGetResponse,
     AddonConfigSetRequest,

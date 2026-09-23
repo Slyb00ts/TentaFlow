@@ -2108,10 +2108,43 @@ mod tests {
         drop(client);
     }
 
+    /// Why this host cannot run the real sandbox, or `None` when it can.
+    ///
+    /// The sandbox is `bwrap --unshare-all`, which brings up `lo` inside the new
+    /// network namespace. A kernel that denies unprivileged user namespaces
+    /// (Ubuntu ships `kernel.apparmor_restrict_unprivileged_userns=1`; `unshare
+    /// -Urn true` fails the same way) makes that impossible, so the test has no
+    /// sandbox to measure. Probed rather than assumed: a host that CAN do it
+    /// always runs the test, which a blanket `#[ignore]` would not.
+    #[cfg(target_os = "linux")]
+    fn unprivileged_netns_denial() -> Option<String> {
+        match std::process::Command::new("/usr/bin/bwrap")
+            .args(["--unshare-all", "--dev-bind", "/", "/", "/bin/true"])
+            .output()
+        {
+            Ok(probe) if probe.status.success() => None,
+            Ok(probe) => Some(format!(
+                "bwrap cannot create a usable private network namespace ({}): {}",
+                probe.status,
+                String::from_utf8_lossy(&probe.stderr).trim()
+            )),
+            Err(error) => Some(format!("/usr/bin/bwrap is not runnable: {error}")),
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn real_linux_sandbox_only_reaches_its_proxy() {
         use std::io::{Read, Write};
+        if let Some(reason) = unprivileged_netns_denial() {
+            eprintln!(
+                "SKIP real_linux_sandbox_only_reaches_its_proxy: {reason}. \
+                 This host denies unprivileged user/network namespaces \
+                 (kernel.apparmor_restrict_unprivileged_userns=1), so the \
+                 sandbox under test cannot start at all — nothing is asserted."
+            );
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("project");
         let private = root.path().join("profile");

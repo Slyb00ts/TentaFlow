@@ -698,7 +698,7 @@ mod tests {
     use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
 
     fn ctx_admin() -> HandlerContext {
-        HandlerContext {
+        let ctx = HandlerContext {
             origin: crate::dispatch::RequestOrigin::Local,
             session: SessionAuth::UserSession {
                 user_id: *uuid::Uuid::new_v4().as_bytes(),
@@ -709,7 +709,9 @@ mod tests {
             resume_secret: None,
             state: crate::dispatch::state::AppState::for_test(),
             org_context: None,
-        }
+        };
+        crate::dispatch::seed_session_account(&ctx);
+        ctx
     }
 
     fn insert_service(ctx: &HandlerContext, new: &NewService) -> i64 {
@@ -877,6 +879,7 @@ mod tests {
             user_id: *uuid::Uuid::new_v4().as_bytes(),
             role: Some("power_user".to_string()),
         };
+        crate::dispatch::seed_session_account(&ctx);
         let id = insert_service(&ctx, &target_service());
         let (body, is_err) = crate::dispatch::dispatch(&start_body(id), &ctx).await;
         assert!(is_err, "power_user must not pass an Admin gate");

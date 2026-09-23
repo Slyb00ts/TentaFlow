@@ -3,16 +3,23 @@
 // Opis: Tab Settings dla detail addona (admin). Renderuje dynamiczny formularz
 //       z schema zwroconej przez backend (AddonConfigGetRequest) i zapisuje
 //       wartosci (AddonConfigSetRequest). Pola secret nie pokazuja plaintextu —
-//       pusta wartosc = backend pomija (nie nadpisuje sekretu).
+//       pusta wartosc = backend pomija (nie nadpisuje sekretu). Pakiet z
+//       [robot.cloud_account] dostaje przycisk wypelnienia pol z konta
+//       producenta robota; nowy adres robota po zapisie prosi o zgode sieciowa.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { Router } from '/js/router.js';
+import { confirmDialog } from '/js/lib/confirm-dialog.js';
+import { openRobotCloudDialog, robotCloudFieldValues, robotCloudVendorName } from '/js/modules/addons/robot-cloud-dialog.js';
 
 let currentAddonId = null;
 let currentSchema = [];
 let currentValues = new Map();
+let cloudProvider = '';
+let requirements = [];
 
 export const SettingsTab = {
   async mount(container, addonId) {
@@ -24,6 +31,8 @@ export const SettingsTab = {
     currentAddonId = null;
     currentSchema = [];
     currentValues = new Map();
+    cloudProvider = '';
+    requirements = [];
   },
 };
 
@@ -32,6 +41,8 @@ async function loadAndRender(container) {
   try {
     const resp = await ApiBinary.one('addonConfigGetRequest', { addonId: currentAddonId });
     currentSchema = Array.isArray(resp.schema) ? resp.schema : [];
+    cloudProvider = resp.cloudAccountProvider ?? resp.cloud_account_provider ?? '';
+    requirements = Array.isArray(resp.requirements) ? resp.requirements : [];
     // values: tablica [[k,v], ...] lub obiekt
     currentValues = new Map();
     const raw = resp.values;
@@ -65,15 +76,22 @@ function render(container) {
   }
 
   const rows = currentSchema.map((field) => renderField(field)).join('');
+  const requirementRows = requirements.map((req) => renderRequirement(req)).join('');
 
   container.innerHTML = `
     <div class="card" style="padding:16px;">
-      <div style="font-weight:700;color:var(--text);margin-bottom:12px;">
-        ${escapeHtml(I18n.t('addon_settings.title'))}
+      <div class="tf-toolbar" style="margin-bottom:12px;">
+        <div style="font-weight:700;color:var(--text);">${escapeHtml(I18n.t('addon_settings.title'))}</div>
+        <div class="tf-toolbar-spacer"></div>
+        ${cloudProvider ? `<tf-button variant="secondary" icon="cloud" id="addon-settings-robot-cloud">${escapeHtml(I18n.t('addons.robot_cloud.open', { vendor: robotCloudVendorName(cloudProvider) }))}</tf-button>` : ''}
       </div>
       <form id="addon-settings-form" style="display:flex;flex-direction:column;gap:14px;">
         ${rows}
       </form>
+      ${requirementRows ? `<div class="addon-settings-reqs" style="margin-top:16px;">
+        <div style="font-weight:700;color:var(--text);margin-bottom:8px;">${escapeHtml(I18n.t('addon_settings.requirements_title'))}</div>
+        ${requirementRows}
+      </div>` : ''}
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
         <tf-button variant="ghost" id="addon-settings-reload" icon="refresh">
           ${escapeHtml(I18n.t('addon_settings.reload_now'))}
@@ -87,12 +105,53 @@ function render(container) {
 
   container.querySelector('#addon-settings-save')?.addEventListener('click', () => onSave(container));
   container.querySelector('#addon-settings-reload')?.addEventListener('click', () => onReload());
+  container.querySelectorAll('[data-install-engine]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      // The catalog is where an engine is deployed; the settings form only
+      // reports what this node has.
+      Router.navigate('catalog', { engine: btn.getAttribute('data-install-engine') });
+    });
+  });
+  container.querySelector('#addon-settings-robot-cloud')?.addEventListener('click', () => {
+    openRobotCloudDialog({
+      provider: cloudProvider,
+      onPick: (device) => {
+        let filled = 0;
+        for (const [key, value] of Object.entries(robotCloudFieldValues(device))) {
+          const el = container.querySelector(`[data-cfg-id="${CSS.escape(key)}"]`);
+          if (!el) continue;
+          el.value = value;
+          filled += 1;
+        }
+        toast(I18n.t(filled > 0 ? 'addons.robot_cloud.filled_save' : 'addons.robot_cloud.nothing_to_fill'), filled > 0 ? 'success' : 'warning');
+      },
+    });
+  });
+}
+
+/// One declared requirement: which engine, and whether this node has it. A
+/// missing engine links to the catalog (that is where an engine is deployed);
+/// an unsupported host says so instead of offering an install that cannot work.
+function renderRequirement(req) {
+  const engine = String(req.engineId ?? req.engine_id ?? '');
+  const status = String(req.status ?? '');
+  const tone = status === 'installed' ? 'success' : status === 'missing' ? 'warning' : 'danger';
+  const label = I18n.t(`addon_settings.requirement_${status}`);
+  const action = status === 'missing'
+    ? `<tf-button variant="ghost" size="sm" icon="download" data-install-engine="${escapeAttr(engine)}">${escapeHtml(I18n.t('addon_settings.requirement_install'))}</tf-button>`
+    : '';
+  return `<div class="tf-toolbar" style="gap:8px;">
+      <code>${escapeHtml(engine)}</code>
+      <tf-chip tone="${escapeAttr(tone)}">${escapeHtml(label)}</tf-chip>
+      <div class="tf-toolbar-spacer"></div>
+      ${action}
+    </div>`;
 }
 
 function renderField(field) {
   const id = String(field.id ?? '');
   const label = String(field.label ?? id);
-  const type = String(field.fieldType ?? field.field_type ?? 'text');
+  const type = String(field.type ?? field.fieldType ?? field.field_type ?? 'text');
   const desc = String(field.description ?? '');
   const required = !!field.required;
   const secret = !!field.secret;
@@ -156,11 +215,15 @@ async function onSave(container) {
     if (isSecret && val === '') continue;
     entries.push([id, val]);
   }
+  let pendingHosts = [];
+  let privacyApplied = 0;
   try {
-    await ApiBinary.action('addonConfigSetRequest', {
+    const res = await ApiBinary.action('addonConfigSetRequest', {
       addonId: currentAddonId,
       values: entries,
     });
+    pendingHosts = Array.isArray(res?.pendingNetworkHosts) ? res.pendingNetworkHosts : [];
+    privacyApplied = Number(res?.privacyCamerasApplied ?? 0);
     for (const [id, val] of entries) {
       currentValues.set(id, val);
     }
@@ -174,7 +237,49 @@ async function onSave(container) {
         el.setAttribute('placeholder', setPlaceholder);
       }
     });
-    toast(I18n.t('addon_settings.save_success'), 'success');
+    toast(
+      privacyApplied > 0
+        ? I18n.t('addon_settings.save_success_privacy', { count: privacyApplied })
+        : I18n.t('addon_settings.save_success'),
+      'success',
+    );
+  } catch (err) {
+    toast(`${I18n.t('addon_settings.save_error')}: ${err.message}`, 'error');
+    return;
+  }
+  if (pendingHosts.length > 0) await approvePendingHosts(currentAddonId, pendingHosts);
+}
+
+// The saved config moved a network rule (e.g. a new robot IP). The rule is not
+// approved by the save itself — the admin confirms the new host here, which is
+// the same allow-list write the Network tab performs.
+async function approvePendingHosts(addonId, hosts) {
+  const ok = await confirmDialog({
+    title: I18n.t('addon_settings.network_approve_title'),
+    lead: I18n.t('addon_settings.network_approve_lead'),
+    consequences: hosts,
+    confirmLabel: I18n.t('addon_settings.network_approve_action'),
+    cancelLabel: I18n.t('common.cancel'),
+    confirmIcon: 'check',
+    variant: 'primary',
+  });
+  if (!ok) {
+    toast(I18n.t('addon_settings.network_approve_skipped'), 'warning');
+    return;
+  }
+  try {
+    const current = await ApiBinary.one('addonNetworkRulesGetRequest', { addonId });
+    const allowed = Array.isArray(current.allowedHosts ?? current.allowed_hosts)
+      ? [...(current.allowedHosts ?? current.allowed_hosts)]
+      : [];
+    for (const host of hosts) if (!allowed.includes(host)) allowed.push(host);
+    await ApiBinary.action('addonNetworkRulesSetRequest', {
+      addonId,
+      allowedHosts: allowed,
+      blockedHosts: current.blockedHosts ?? current.blocked_hosts ?? [],
+      mode: current.mode ?? 'strict',
+    });
+    toast(I18n.t('addon_settings.network_approved'), 'success');
   } catch (err) {
     toast(`${I18n.t('addon_settings.save_error')}: ${err.message}`, 'error');
   }

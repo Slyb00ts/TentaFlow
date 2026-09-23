@@ -101,3 +101,42 @@ pub fn rgb_to_nchw_imagenet(img: &RgbImage) -> Vec<f32> {
 pub fn rgb_buf_to_image(rgb: &[u8], width: u32, height: u32) -> Option<RgbImage> {
     RgbImage::from_raw(width, height, rgb.to_vec())
 }
+
+/// How a frame is fitted into a square model input. Shared by the host and
+/// the CUDA preprocess so both describe the model contract the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameFit {
+    /// Resized to the whole square (aspect ratio not kept).
+    Stretch,
+    /// Aspect-preserving resize into the top-left corner, the rest filled with
+    /// `pad` — how detectors such as YOLOX were trained. Near-edge objects that
+    /// a stretch distorts past the detection threshold stay detectable.
+    Letterbox { pad: u8 },
+}
+
+/// Channel order the model was trained with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelOrder {
+    Rgb,
+    /// OpenCV-trained models (YOLOX, YuNet) read frames as B,G,R.
+    Bgr,
+}
+
+/// Size of the letterboxed content for a `w`×`h` frame in a `side`×`side`
+/// input: scale by `min(side/w, side/h)` and truncate, as the reference
+/// preprocessing does (`int(w * r)`).
+pub fn letterbox_content(w: u32, h: u32, side: u32) -> (u32, u32) {
+    let r = (side as f64 / w as f64).min(side as f64 / h as f64);
+    (
+        ((w as f64 * r) as u32).clamp(1, side),
+        ((h as f64 * r) as u32).clamp(1, side),
+    )
+}
+
+/// Size a `w`×`h` frame is resized to inside a `side`×`side` input under `fit`.
+pub fn fitted_content(fit: FrameFit, w: u32, h: u32, side: u32) -> (u32, u32) {
+    match fit {
+        FrameFit::Stretch => (side, side),
+        FrameFit::Letterbox { .. } => letterbox_content(w, h, side),
+    }
+}

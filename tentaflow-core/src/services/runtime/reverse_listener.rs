@@ -300,6 +300,21 @@ mod tests {
         let path = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         let db = crate::db::init(&path).expect("db");
+        // `run_flow_turn` gates on the Meeting Bot app being INSTALLED before
+        // it looks at the meeting, so the fixture needs that instance row —
+        // otherwise the request stops at the app gate and never reaches the
+        // flow-turn validator this test is about.
+        db.write()
+            .expect("db writer")
+            .execute(
+                "INSERT INTO addons \
+                 (addon_id, name, version, package_id, package_version, runtime, is_enabled, \
+                  manifest_json) \
+                 VALUES ('meeting-bot-test', 'meeting-bot', '1.0.0', 'meeting-bot', '1.0.0', \
+                         'native', 1, '{}')",
+                [],
+            )
+            .expect("meeting-bot instance row");
         let router = Router::new(crate::config::RouterConfig::default(), Some(db)).expect("router");
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

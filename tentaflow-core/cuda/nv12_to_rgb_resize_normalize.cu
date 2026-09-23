@@ -118,8 +118,61 @@ __device__ __forceinline__ void nv12_sample_rgb(
     nv12_yuv_to_rgb_u8(yv, uu, vv, kr, kb, full_range, r, g, b);
 }
 
+// Computes the three normalized CHW outputs of output pixel (x, y) for one NV12
+// frame. Shared by the batch kernel and the single-frame kernel so both entry
+// points run the SAME instruction sequence and stay bit-identical to each other
+// (the zero-copy verify gate compares them element by element).
+//
+// `dw`×`dh` is the size the frame is resized TO (the whole `s`×`s` plane for a
+// stretch, a smaller top-left box for a letterbox); `s` is the plane stride.
+// `bgr` writes the channels in B,G,R order (models trained on OpenCV frames);
+// `mean`/`std` index the OUTPUT channel.
+__device__ __forceinline__ void nv12_rgb_resize_normalize_pixel(
+    const unsigned char* yp, int y_stride,
+    const unsigned char* uvp, int uv_stride,
+    int w, int h, int dw, int dh, int s, int x, int y,
+    float m0, float m1, float m2,
+    float s0, float s1, float s2,
+    float kr, float kb, int full_range, int bgr,
+    float* out_frame)
+{
+    int left, right, wr;
+    nv12_axis_plan(x, w, dw, &left, &right, &wr);
+    int wl = WEIGHT_ONE - wr;
+
+    int top, bot, wb;
+    nv12_axis_plan(y, h, dh, &top, &bot, &wb);
+    int wt = WEIGHT_ONE - wb;
+
+    // Convert the four source corners to u8 RGB, then blend with the SAME Q8
+    // integer math as resize_rgb (horizontal u8 intermediate, then vertical).
+    unsigned char tl[3], tr[3], bl[3], br[3];
+    nv12_sample_rgb(yp, y_stride, uvp, uv_stride, left, top, kr, kb, full_range, &tl[0], &tl[1], &tl[2]);
+    nv12_sample_rgb(yp, y_stride, uvp, uv_stride, right, top, kr, kb, full_range, &tr[0], &tr[1], &tr[2]);
+    nv12_sample_rgb(yp, y_stride, uvp, uv_stride, left, bot, kr, kb, full_range, &bl[0], &bl[1], &bl[2]);
+    nv12_sample_rgb(yp, y_stride, uvp, uv_stride, right, bot, kr, kb, full_range, &br[0], &br[1], &br[2]);
+
+    const float means[3] = {m0, m1, m2};
+    const float stds[3] = {s0, s1, s2};
+    long per = (long)s * (long)s;
+    #pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        int src = bgr ? 2 - c : c;
+        int h_top = ((int)tl[src] * wl + (int)tr[src] * wr + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
+        int h_bot = ((int)bl[src] * wl + (int)br[src] * wr + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
+        int v = (h_top * wt + h_bot * wb + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
+        float fv = (float)v / 255.0f;
+        float outv = (fv - means[c]) / stds[c];
+        out_frame[(long)c * per + (long)y * (long)s + (long)x] = outv;
+    }
+}
+
 // One thread per (frame, y, x). Output plane layout per frame is row-major NCHW:
 // out[frame*3*S*S + c*S*S + y*S + x].
+// Per-frame content sizes (`content_ws`/`content_hs`) carry the fit: a stretch
+// passes `s` for both, a letterbox the frame's own top-left box, outside which
+// every plane pixel gets the constant `pad` — the same layout as the
+// single-frame kernel below.
 extern "C" __global__ void nv12_to_rgb_resize_normalize_kernel(
     const unsigned char* const* y_ptrs,
     const int* y_strides,
@@ -127,13 +180,17 @@ extern "C" __global__ void nv12_to_rgb_resize_normalize_kernel(
     const int* uv_strides,
     const int* widths,
     const int* heights,
+    const int* content_ws,
+    const int* content_hs,
     int n,
     int s,
+    int pad,
     const float* mean,
     const float* stdv,
     float kr,
     float kb,
     int full_range,
+    int bgr,
     float* out)
 {
     long total = (long)n * (long)s * (long)s;
@@ -145,39 +202,62 @@ extern "C" __global__ void nv12_to_rgb_resize_normalize_kernel(
     long rem = idx % per;
     int y = (int)(rem / (long)s);
     int x = (int)(rem % (long)s);
+    int dw = content_ws[frame_i];
+    int dh = content_hs[frame_i];
+    float* out_frame = out + (long)frame_i * 3 * per;
 
-    const unsigned char* yp = y_ptrs[frame_i];
-    const unsigned char* uvp = uv_ptrs[frame_i];
-    int y_stride = y_strides[frame_i];
-    int uv_stride = uv_strides[frame_i];
-    int w = widths[frame_i];
-    int h = heights[frame_i];
-
-    int left, right, wr;
-    nv12_axis_plan(x, w, s, &left, &right, &wr);
-    int wl = WEIGHT_ONE - wr;
-
-    int top, bot, wb;
-    nv12_axis_plan(y, h, s, &top, &bot, &wb);
-    int wt = WEIGHT_ONE - wb;
-
-    // Convert the four source corners to u8 RGB, then blend with the SAME Q8
-    // integer math as resize_rgb (horizontal u8 intermediate, then vertical).
-    unsigned char tl[3], tr[3], bl[3], br[3];
-    nv12_sample_rgb(yp, y_stride, uvp, uv_stride, left, top, kr, kb, full_range, &tl[0], &tl[1], &tl[2]);
-    nv12_sample_rgb(yp, y_stride, uvp, uv_stride, right, top, kr, kb, full_range, &tr[0], &tr[1], &tr[2]);
-    nv12_sample_rgb(yp, y_stride, uvp, uv_stride, left, bot, kr, kb, full_range, &bl[0], &bl[1], &bl[2]);
-    nv12_sample_rgb(yp, y_stride, uvp, uv_stride, right, bot, kr, kb, full_range, &br[0], &br[1], &br[2]);
-
-    #pragma unroll
-    for (int c = 0; c < 3; ++c) {
-        int h_top = ((int)tl[c] * wl + (int)tr[c] * wr + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
-        int h_bot = ((int)bl[c] * wl + (int)br[c] * wr + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
-        int v = (h_top * wt + h_bot * wb + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
-        float fv = (float)v / 255.0f;
-        float outv = (fv - mean[c]) / stdv[c];
-        out[(long)frame_i * 3 * per + (long)c * per + (long)y * (long)s + (long)x] = outv;
+    if (x >= dw || y >= dh) {
+        float fv = (float)pad / 255.0f;
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            out_frame[(long)c * per + (long)y * (long)s + (long)x] = (fv - mean[c]) / stdv[c];
+        }
+        return;
     }
+    nv12_rgb_resize_normalize_pixel(
+        y_ptrs[frame_i], y_strides[frame_i], uv_ptrs[frame_i], uv_strides[frame_i],
+        widths[frame_i], heights[frame_i], dw, dh, s, x, y,
+        mean[0], mean[1], mean[2], stdv[0], stdv[1], stdv[2],
+        kr, kb, full_range, bgr,
+        out_frame);
+}
+
+// Single-frame variant with every descriptor passed BY VALUE. Kernel parameters
+// are captured at launch time, so the caller uploads nothing and needs no host
+// buffer that must outlive an async copy — that is what lets the zero-copy path
+// enqueue on a caller stream and return without any synchronization.
+//
+// Letterbox: the frame is resized into the top-left `dw`×`dh` box and every
+// plane pixel outside it gets the constant `pad` (u8, normalized like any other
+// pixel) — the layout detectors trained with aspect-preserving padding expect.
+// A stretch passes dw = dh = s and never reaches the pad branch.
+extern "C" __global__ void nv12_frame_to_rgb_resize_normalize_kernel(
+    const unsigned char* yp, int y_stride,
+    const unsigned char* uvp, int uv_stride,
+    int w, int h, int dw, int dh, int s, int pad,
+    float m0, float m1, float m2,
+    float s0, float s1, float s2,
+    float kr, float kb, int full_range, int bgr,
+    float* out)
+{
+    long total = (long)s * (long)s;
+    long idx = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
+    if (idx >= total) return;
+    int y = (int)(idx / (long)s);
+    int x = (int)(idx % (long)s);
+    if (x >= dw || y >= dh) {
+        const float means[3] = {m0, m1, m2};
+        const float stds[3] = {s0, s1, s2};
+        float fv = (float)pad / 255.0f;
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            out[(long)c * total + (long)y * (long)s + (long)x] = (fv - means[c]) / stds[c];
+        }
+        return;
+    }
+    nv12_rgb_resize_normalize_pixel(
+        yp, y_stride, uvp, uv_stride, w, h, dw, dh, s, x, y,
+        m0, m1, m2, s0, s1, s2, kr, kb, full_range, bgr, out);
 }
 
 // Plain-C launcher so the Rust FFI never touches the <<<>>> syntax. Launched on
@@ -191,13 +271,17 @@ extern "C" int launch_nv12_to_rgb_resize_normalize(
     const int* uv_strides,
     const int* widths,
     const int* heights,
+    const int* content_ws,
+    const int* content_hs,
     int n,
     int s,
+    int pad,
     const float* mean,
     const float* stdv,
     float kr,
     float kb,
     int full_range,
+    int bgr,
     float* out,
     cudaStream_t stream)
 {
@@ -205,7 +289,39 @@ extern "C" int launch_nv12_to_rgb_resize_normalize(
     int block = 256;
     long grid = (total + block - 1) / block;
     nv12_to_rgb_resize_normalize_kernel<<<(unsigned int)grid, (unsigned int)block, 0, stream>>>(
-        y_ptrs, y_strides, uv_ptrs, uv_strides, widths, heights, n, s, mean, stdv,
-        kr, kb, full_range, out);
+        y_ptrs, y_strides, uv_ptrs, uv_strides, widths, heights, content_ws, content_hs,
+        n, s, pad, mean, stdv, kr, kb, full_range, bgr, out);
+    return (int)cudaGetLastError();
+}
+
+// Launcher for the single-frame by-value kernel; `mean`/`stdv` are HOST arrays
+// of 3 floats read before the launch returns.
+extern "C" int launch_nv12_frame_to_rgb_resize_normalize(
+    const unsigned char* yp,
+    int y_stride,
+    const unsigned char* uvp,
+    int uv_stride,
+    int w,
+    int h,
+    int dw,
+    int dh,
+    int s,
+    int pad,
+    const float* mean,
+    const float* stdv,
+    float kr,
+    float kb,
+    int full_range,
+    int bgr,
+    float* out,
+    cudaStream_t stream)
+{
+    long total = (long)s * (long)s;
+    int block = 256;
+    long grid = (total + block - 1) / block;
+    nv12_frame_to_rgb_resize_normalize_kernel<<<(unsigned int)grid, (unsigned int)block, 0, stream>>>(
+        yp, y_stride, uvp, uv_stride, w, h, dw, dh, s, pad,
+        mean[0], mean[1], mean[2], stdv[0], stdv[1], stdv[2],
+        kr, kb, full_range, bgr, out);
     return (int)cudaGetLastError();
 }

@@ -146,7 +146,7 @@ impl DeviceCropsFrame {
         let caps = self.sample.caps()?;
         let info = gst_video::VideoInfo::from_caps(caps).ok()?;
         let buffer = self.sample.buffer()?;
-        super::gst_cuda_ffi::map_nv12_device(buffer, &info).ok()
+        super::gst_cuda_ffi::map_nv12_device(buffer, &info, false).ok()
     }
 
     /// Cuts ONE detection's crop straight off the device NV12 surface: downloads
@@ -557,7 +557,7 @@ pub(crate) fn build_pipeline_from_description(
         .downcast::<gst_app::AppSink>()
         .map_err(|_| CameraIngestError::PipelineBuild("'sink' is not AppSink".into()))?;
 
-    install_frame_callback(&appsink, camera_id, mailbox, counters);
+    install_frame_callback(&appsink, camera_id, mailbox, Some(counters));
 
     Ok(FakeFilePipeline { pipeline, appsink })
 }
@@ -566,14 +566,19 @@ pub(crate) fn build_pipeline_from_description(
 /// into the shared `FrameMailbox`, `FrameStorage` and `StreamingBus`. Shared by
 /// the parse-launch path (fakefile/local) and the element-built webrtc pipeline
 /// so the frame contract (Branch A) is byte-for-byte identical across sources.
+///
+/// `counters` is `None` when the appsink sees a decimated subset of the stream
+/// (the privacy path downloads ≤ a few fps to host) and the source's real frame
+/// rate is counted upstream instead; counting here would report the decimated
+/// rate as the camera's fps.
 pub(crate) fn install_frame_callback(
     appsink: &gst_app::AppSink,
     camera_id: String,
     mailbox: Arc<FrameMailbox>,
-    counters: Arc<FrameCounters>,
+    counters: Option<Arc<FrameCounters>>,
 ) {
     let mailbox_cb = mailbox.clone();
-    let counters_cb = counters.clone();
+    let counters_cb = counters;
     let camera_id_cb = camera_id;
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
@@ -604,7 +609,9 @@ pub(crate) fn install_frame_callback(
                     format: DetectFrameFormat::Rgb24,
                     device: None,
                 });
-                counters_cb.increment(ts_ms / 1000);
+                if let Some(c) = counters_cb.as_ref() {
+                    c.increment(ts_ms / 1000);
+                }
 
                 let metadata = FrameMetadata {
                     camera_id: camera_id_cb.clone(),
@@ -839,7 +846,7 @@ pub(crate) fn install_detect_frame_callback_cuda(
                 // Bind the match result to a local so the `map_nv12_device`
                 // scrutinee temporary (which borrows `buffer` → `sample`) is
                 // dropped at the end of this statement, before `sample` itself.
-                let outcome = match super::gst_cuda_ffi::map_nv12_device(buffer, &info) {
+                let outcome = match super::gst_cuda_ffi::map_nv12_device(buffer, &info, false) {
                     Ok(map) => {
                         let planes = Nv12DevicePlanes {
                             y_ptr: map.y_device_ptr(),
@@ -1027,7 +1034,15 @@ fn verify_zerocopy(
         h: map.height(),
     };
     let _ = info;
-    match crate::vision::gpu_preprocess::preprocess_nv12_batch_gpu(&[frame], s, mean, stdv, color)
+    match crate::vision::gpu_preprocess::preprocess_nv12_batch_gpu(
+        &[frame],
+        s,
+        mean,
+        stdv,
+        crate::vision::preprocessing::FrameFit::Stretch,
+        crate::vision::preprocessing::ChannelOrder::Rgb,
+        color,
+    )
         .and_then(|b| b.copy_to_host())
     {
         Ok(reference) => {
@@ -1208,7 +1223,7 @@ pub(crate) fn install_frame_callback_crops_cuda(
                 // the zero-copy path. We only need the geometry here; the map
                 // guard drops immediately (the `Sample` keeps the surface alive
                 // for later on-demand crops).
-                let mapped_ok = super::gst_cuda_ffi::map_nv12_device(buffer, &info).is_ok();
+                let mapped_ok = super::gst_cuda_ffi::map_nv12_device(buffer, &info, false).is_ok();
                 if mapped_ok {
                     mailbox.put(LatestFrame {
                         width: info.width(),
@@ -1286,7 +1301,7 @@ pub(crate) fn install_frame_callback_crops_cuda(
 /// colorimetry. Defaults to BT.709 limited (the usual H.264 camera decode) when
 /// the matrix is unknown/unspecified. Shared by the detect and crops NV12
 /// callbacks so both tag a frame identically.
-fn nv12_color_from_info(info: &gst_video::VideoInfo) -> (f32, f32, bool) {
+pub(super) fn nv12_color_from_info(info: &gst_video::VideoInfo) -> (f32, f32, bool) {
     let color = info.colorimetry();
     let (kr, kb) = match color.matrix() {
         gst_video::VideoColorMatrix::Bt601 => (0.299f32, 0.114f32),

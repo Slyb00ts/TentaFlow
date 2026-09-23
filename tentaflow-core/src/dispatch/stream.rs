@@ -1313,8 +1313,23 @@ mod tests {
         // Init frame carries the seeded latest canonical frame.
         match rx.recv().await.unwrap() {
             SubscriptionEvent::Chunk(MessageBody::StreamBody(StreamPayload::Frame(f))) => {
+                use tentaflow_sdk_spec::{
+                    LidarFrameHeader, LIDAR_HEADER_LEN, LIDAR_HOST_SEND_US_OFFSET,
+                };
                 assert!(f.is_init);
-                assert_eq!(f.data, frame.to_vec());
+                // The pump stamps `host_send_us` on the way out, so the frame is
+                // identical to the published one everywhere BUT those 8 bytes.
+                let (head, tail) = (LIDAR_HOST_SEND_US_OFFSET, LIDAR_HOST_SEND_US_OFFSET + 8);
+                assert_eq!(f.data[..head], frame[..head]);
+                assert_eq!(f.data[tail..], frame[tail..]);
+                assert_eq!(f.data.len(), LIDAR_HEADER_LEN + 12);
+                assert!(
+                    LidarFrameHeader::decode_header(&f.data)
+                        .expect("header decodes")
+                        .host_send_us
+                        > 0,
+                    "init frame is stamped on the way out"
+                );
             }
             other => panic!("expected init Frame, got {:?}", other),
         }

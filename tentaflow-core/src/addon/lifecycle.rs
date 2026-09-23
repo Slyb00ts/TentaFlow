@@ -552,6 +552,51 @@ pub fn parse_connection_params(manifest_toml: &str) -> Result<Vec<DeclaredConnec
     Ok(out)
 }
 
+/// Checks a config value about to be saved for a declared connection param:
+/// a `type = "host"` param feeds a network rule host, so it must be a bare
+/// IP/hostname — the same gate install applies. Other keys pass through.
+pub fn validate_connection_param_value(manifest_toml: &str, key: &str, value: &str) -> Result<()> {
+    let is_host = parse_connection_params(manifest_toml)?
+        .iter()
+        .any(|p| p.key == key && p.param_type == "host");
+    if is_host {
+        validate_host_token(key, value.trim())?;
+    }
+    Ok(())
+}
+
+/// Vision engines a package declares it needs: `[[requires.vision_engine]]`
+/// entries with an `engine` id. Empty for packages that declare none.
+pub fn parse_required_vision_engines(manifest_toml: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<toml::Value>(manifest_toml) else {
+        return Vec::new();
+    };
+    value
+        .get("requires")
+        .and_then(|r| r.get("vision_engine"))
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("engine").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `[robot.cloud_account] provider` of a package/instance manifest: the robot
+/// vendor account the install form and settings can sign into to fill the
+/// connection params. `None` for packages without one.
+pub fn parse_cloud_account_provider(manifest_toml: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(manifest_toml).ok()?;
+    value
+        .get("robot")?
+        .get("cloud_account")?
+        .get("provider")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Substitutes `${key}` placeholders in `input` using `config`. Every `${...}`
 /// must resolve — an unresolved placeholder bails so no half-resolved host
 /// (e.g. a literal `${ip}`) is ever persisted. When `validate_host` is set, each
@@ -2286,12 +2331,7 @@ pub fn update_instance(db: &DbPool, addon_id: &str, target_version: &str) -> Res
     // Manifest docelowy = manifest wersji pakietu z tozsamoscia instancji ORAZ
     // podstawionymi ${key} z istniejacej konfiguracji instancji (np. IP robota),
     // zeby update nie zostawil niepodstawionego placeholdera w hostach regul.
-    let config: std::collections::BTreeMap<String, String> =
-        crate::db::repository::list_addon_config_rows(db, addon_id)?
-            .into_iter()
-            .filter(|row| !row.is_secret)
-            .map(|row| (row.key, row.value))
-            .collect();
+    let config = instance_placeholder_config(db, addon_id)?;
     let instance_manifest =
         rewrite_manifest_for_instance(&pkg.manifest_json, addon_id, &display_name, &config)?;
     let new_manifest = parse_manifest_toml(&instance_manifest)
@@ -2311,6 +2351,99 @@ pub fn update_instance(db: &DbPool, addon_id: &str, target_version: &str) -> Res
         &package_id,
         target_version,
     )
+}
+
+/// Non-secret instance config — the values `${key}` placeholders in the
+/// package's network rules resolve against.
+fn instance_placeholder_config(
+    db: &DbPool,
+    addon_id: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    Ok(crate::db::repository::list_addon_config_rows(db, addon_id)?
+        .into_iter()
+        .filter(|row| !row.is_secret)
+        .map(|row| (row.key, row.value))
+        .collect())
+}
+
+/// Re-resolves the instance's network rules after its config changed. The
+/// package manifest's `${key}` hosts (a robot IP entered at install) are
+/// substituted into the instance manifest ONCE, so without this a new IP in
+/// the settings kept the old, approved host and every request to the new one
+/// was refused. Returns the new manifest when a rule target changed, `None`
+/// otherwise (nothing to restart).
+///
+/// A changed target is NOT approved by the manifest (same rule as an upgrade):
+/// it becomes approved only when the admin's network policy for this addon
+/// already allows that host, exactly as the Network tab would decide, and is
+/// then recorded as approved by `acting_admin` (who saved the config).
+pub fn rebind_instance_connection(
+    db: &DbPool,
+    addon_id: &str,
+    acting_admin: Option<&str>,
+) -> Result<Option<AddonManifest>> {
+    let Some((package_id, version)) =
+        crate::db::repository::get_addon_instance_package_ref(db, addon_id)?
+    else {
+        return Ok(None);
+    };
+    let Some(pkg) = crate::db::repository::get_addon_package(db, &package_id, &version)? else {
+        return Ok(None);
+    };
+    if parse_manifest_toml(&pkg.manifest_json)?.is_native() {
+        return Ok(None);
+    }
+    let display_name = crate::db::repository::get_addon(db, addon_id)?
+        .map(|a| a.name)
+        .unwrap_or_else(|| addon_id.to_string());
+    let config = instance_placeholder_config(db, addon_id)?;
+    let instance_manifest =
+        rewrite_manifest_for_instance(&pkg.manifest_json, addon_id, &display_name, &config)?;
+    let manifest = parse_manifest_toml(&instance_manifest)
+        .map_err(|e| anyhow::anyhow!("manifest instancji niepoprawny: {e}"))?;
+
+    let current = crate::db::repository::get_addon_declared_network_rules(db, addon_id)?;
+    let unchanged = manifest.network_rules.len() == current.len()
+        && manifest.network_rules.iter().all(|rule| {
+            current.iter().any(|row| {
+                row.rule_id == rule.id
+                    && row.host == rule.host
+                    && row.port == rule.port as i32
+                    && row.protocol == rule.protocol
+            })
+        });
+    if unchanged {
+        return Ok(None);
+    }
+
+    let policy = crate::db::repository::get_addon_network_config(db, addon_id)?;
+    {
+        let conn = db.write().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE addons SET manifest_json = ?1, updated_at = datetime('now') WHERE addon_id = ?2",
+            rusqlite::params![&instance_manifest, addon_id],
+        )?;
+        sync_network_rules(&tx, addon_id, &manifest.network_rules)?;
+        for rule in &manifest.network_rules {
+            let allowed = policy.allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(&rule.host));
+            let blocked = policy.blocked_hosts.iter().any(|h| h.eq_ignore_ascii_case(&rule.host));
+            if allowed && !blocked {
+                tx.execute(
+                    "UPDATE addon_network_rules \
+                     SET approved = 1, approved_by = ?1, approved_at = datetime('now') \
+                     WHERE addon_id = ?2 AND rule_id = ?3 AND approved = 0",
+                    rusqlite::params![acting_admin, addon_id, &rule.id],
+                )?;
+            }
+        }
+        tx.commit()?;
+    }
+    info!(
+        "Instancja '{}': reguly sieciowe przeliczone po zmianie konfiguracji polaczenia",
+        addon_id
+    );
+    Ok(Some(manifest))
 }
 
 // =============================================================================
@@ -4341,6 +4474,90 @@ mod tests {
         assert_eq!(path_size(&tmp.path().join("missing")), 0);
     }
     use std::io::Write;
+
+    fn rebind_fixture(allowed_hosts: &[&str]) -> (DbPool, &'static str) {
+        const ADDON: &str = "robot-1a2b3c4d";
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let package = "[addon]\nid = \"robot\"\nname = \"Robot\"\nversion = \"1.0.0\"\nwasm_file = \"addon.wasm\"\n\n\
+             [[network_rule]]\nid = \"signaling\"\nhost = \"${ip}\"\nport = 9991\nprotocol = \"tcp\"\n";
+        crate::db::repository::upsert_addon_package(&db, "robot", "1.0.0", "Robot", package, "h", "bundled")
+            .unwrap();
+        let mut config = std::collections::BTreeMap::new();
+        config.insert("ip".to_string(), "192.168.0.190".to_string());
+        let instance = rewrite_manifest_for_instance(package, ADDON, "Pies", &config).unwrap();
+        let manifest = parse_manifest_toml(&instance).unwrap();
+        {
+            let conn = db.write().unwrap();
+            insert_addon_row(&conn, &manifest, &instance, "robot", "1.0.0", 0, "h", None).unwrap();
+            upsert_addon_network_rules(&conn, &manifest).unwrap();
+            conn.execute(
+                "UPDATE addon_network_rules SET approved = 1 WHERE addon_id = ?1",
+                rusqlite::params![ADDON],
+            )
+            .unwrap();
+        }
+        crate::db::repository::set_addon_network_config(
+            &db,
+            ADDON,
+            &crate::db::repository::AddonNetworkConfig {
+                allowed_hosts: allowed_hosts.iter().map(|h| h.to_string()).collect(),
+                blocked_hosts: Vec::new(),
+                mode: "strict".into(),
+            },
+            None,
+        )
+        .unwrap();
+        crate::db::repository::upsert_addon_config_value(&db, ADDON, "ip", "192.168.0.190", false, None)
+            .unwrap();
+        (db, ADDON)
+    }
+
+    fn signaling_rule(db: &DbPool, addon: &str) -> crate::db::repository::AddonDeclaredNetworkRule {
+        crate::db::repository::get_addon_declared_network_rules(db, addon)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    /// A new robot IP in the settings must move the network rule, or the addon
+    /// keeps an approved rule for the old address and every request to the new
+    /// one is refused (http_raw abi error -1).
+    #[test]
+    fn rebind_moves_rule_to_new_ip_and_waits_for_approval() {
+        let (db, addon) = rebind_fixture(&["192.168.0.190"]);
+        assert!(rebind_instance_connection(&db, addon, None).unwrap().is_none(), "unchanged config");
+
+        crate::db::repository::upsert_addon_config_value(&db, addon, "ip", "192.168.50.250", false, None)
+            .unwrap();
+        let manifest = rebind_instance_connection(&db, addon, Some("admin")).unwrap().expect("rule moved");
+        assert_eq!(manifest.network_rules[0].host, "192.168.50.250");
+        let rule = signaling_rule(&db, addon);
+        assert_eq!(rule.host, "192.168.50.250");
+        assert!(!rule.approved, "a moved target is not approved by the save itself");
+        let stored = crate::db::repository::get_addon(&db, addon).unwrap().unwrap().manifest_json;
+        assert!(stored.contains("192.168.50.250") && !stored.contains("192.168.0.190"));
+    }
+
+    #[test]
+    fn rebind_approves_host_already_on_the_allow_list() {
+        let (db, addon) = rebind_fixture(&["192.168.0.190", "192.168.50.250"]);
+        crate::db::repository::upsert_addon_config_value(&db, addon, "ip", "192.168.50.250", false, None)
+            .unwrap();
+        rebind_instance_connection(&db, addon, Some("admin")).unwrap().expect("rule moved");
+        assert!(signaling_rule(&db, addon).approved);
+    }
+
+    #[test]
+    fn rebind_rejects_a_host_carrying_a_port() {
+        let (db, addon) = rebind_fixture(&[]);
+        crate::db::repository::upsert_addon_config_value(&db, addon, "ip", "10.0.0.1:80", false, None)
+            .unwrap();
+        assert!(rebind_instance_connection(&db, addon, None).is_err());
+        assert_eq!(signaling_rule(&db, addon).host, "192.168.0.190", "nothing half-applied");
+    }
 
     /// rewrite_manifest_for_instance nadpisuje [addon].id i [addon].name, a manifest
     /// dalej parsuje sie poprawnie z nowym addon_id == id instancji.

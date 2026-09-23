@@ -267,8 +267,8 @@ struct EventMeta {
 const CLASS_PLATE: &str = "tablica_rejestracyjna";
 /// Detection class carrying ADR placard reads.
 const CLASS_ADR: &str = "tablica_adr";
-/// Detection class of a whole-vehicle box (YOLO vehicle detector). Mirrors
-/// `vision::detector_vehicle::VEHICLE_CLASS`, kept local so this always-compiled
+/// Detection class of a whole-vehicle box (YOLOX COCO detector). Mirrors
+/// `vision::detector_coco::VEHICLE_CLASS`, kept local so this always-compiled
 /// module needs no dependency on the feature-gated detector.
 const VEHICLE_CLASS: &str = "vehicle";
 

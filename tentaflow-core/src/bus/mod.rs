@@ -7693,9 +7693,10 @@ mod tests {
         publish_one(&svc).expect("the default ceiling admits the first publish");
         let one_batch = svc.org_stored_bytes("org-1");
         assert!(
-            one_batch > 512,
-            "the counter must charge the SEGMENT bytes the engine wrote (batch \
-             header + per-record framing), not the 512 payload bytes; got {one_batch}"
+            one_batch > 0 && one_batch != payload.len() as u64,
+            "the counter must charge the SEGMENT bytes the engine wrote (the \
+             encoded batch — framing, and for a compressible payload FEWER \
+             bytes than it), not the 512 payload bytes; got {one_batch}"
         );
 
         // Room for exactly one more record's payload on top of what is

@@ -2,7 +2,7 @@
 // File: services/recording/storage.rs — filesystem layout + hashing helpers
 // =============================================================================
 //
-// All recordings live under `<HOME>/.tentaflow/recordings/<camera_id>/<kind>/`
+// All recordings live under `paths::recordings_dir()/<camera_id>/<kind>/`
 // where `<kind>` is `snapshots` or `segments`. Files are named
 // `<recording_ref>.<ext>` and written atomically (tmp + rename).
 
@@ -133,8 +133,22 @@ mod tests {
 
     #[test]
     fn test_recording_base_dir_uses_home() {
+        // Recordings are a `StorageCategory`, so the base dir is the
+        // installation's TentaFlow home plus that category's leaf — NOT a
+        // hard-coded `~/.tentaflow` (a source checkout resolves home to
+        // `<repo>/.runtime`, and an admin can redirect the category outright).
+        // The home is resolved from process-wide env, so this reads it under
+        // the lock every test that redirects it holds.
+        let _home = crate::addon::fs_sandbox::test_home_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let p = recording_base_dir().expect("home");
-        assert!(p.ends_with(".tentaflow/recordings"));
+        assert!(p.ends_with("recordings"));
+        assert!(
+            crate::paths::category_override(crate::paths::StorageCategory::Recordings).is_some()
+                || p.starts_with(crate::paths::tentaflow_home()),
+            "{p:?} must sit under the TentaFlow home unless redirected"
+        );
     }
 
     #[test]

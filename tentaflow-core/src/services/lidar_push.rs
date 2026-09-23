@@ -426,9 +426,13 @@ mod tests {
             .init_segment()
             .await
             .expect("dynamic init = current latest frame for late joiner");
-        assert_eq!(&late_init[..], &frame1[..]);
+        // `init_segment` goes out through the pump, which stamps
+        // `host_send_us`, so only the body is byte-identical to what was
+        // published.
+        assert_eq!(wire_body(&late_init), wire_body(&frame1));
         let h = LidarFrameHeader::decode_header(&late_init).expect("header decodes");
         assert_eq!(h.frame_seq, 1);
+        assert!(h.host_send_us > 0, "init segment is stamped on the way out");
 
         hub.remove(robot_id);
     }

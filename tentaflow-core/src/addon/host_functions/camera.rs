@@ -314,6 +314,7 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
             owner_addon_id: Some(row.owner_addon_id.clone()),
             credentials_encrypted: row.credentials_encrypted.clone(),
             decoder_override: None,
+            privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
         };
         match sup.add_camera(cfg).await {
             Ok(_) => {
@@ -346,6 +347,34 @@ pub async fn shutdown_camera_supervisor_global() {
     if let Some(sup) = SUPERVISOR.get() {
         sup.drain().await;
     }
+}
+
+/// Apply an addon's CURRENT privacy options to every running camera it owns and
+/// return how many sessions took them. Used when an admin saves the addon
+/// settings: the running pipeline must change with the setting, or "blur on"
+/// would only mean "blur from the next reconnect". A camera that is not running
+/// needs nothing — it reads the options when it registers.
+pub async fn apply_privacy_to_addon_cameras(db: &crate::db::DbPool, addon_id: &str) -> anyhow::Result<u32> {
+    use crate::services::camera_ingest::privacy_options::PrivacyOptions;
+    let options = PrivacyOptions::for_robot_addon(db, addon_id)?;
+    let Some(sup) = SUPERVISOR.get() else {
+        return Ok(0);
+    };
+    let cameras: Vec<String> = list_cameras_for_addon(db, addon_id, None)?
+        .into_iter()
+        .filter(|row| row.vendor == "webrtc")
+        .map(|row| row.camera_id)
+        .collect();
+    let mut applied = 0;
+    for camera_id in cameras {
+        match sup.set_privacy(&camera_id, options).await {
+            Ok(()) => applied += 1,
+            Err(e) => {
+                tracing::debug!(%camera_id, "privacy options not applied live: {e}");
+            }
+        }
+    }
+    Ok(applied)
 }
 
 /// Tear down a backed (WebRTC) camera — called by the webrtc host module when a
@@ -428,6 +457,25 @@ pub fn camera_register_backed_v1(
         }
     };
 
+    // Robot cameras are anonymized per the owning addon's settings; an invalid
+    // setting refuses the camera rather than guessing it means "off".
+    let privacy = match crate::services::camera_ingest::privacy_options::PrivacyOptions::for_robot_addon(
+        &db, &addon_id,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("camera.register_backed: privacy options unreadable: {e}");
+            audit(
+                caller.data(),
+                "camera.register_backed",
+                None,
+                RiskClass::A,
+                "error",
+                Some("privacy_options_invalid"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
     let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
     let cfg = CameraConfig {
         camera_id: camera_id.clone(),
@@ -438,6 +486,7 @@ pub fn camera_register_backed_v1(
         owner_addon_id: Some(addon_id.clone()),
         credentials_encrypted: None,
         decoder_override: None,
+        privacy,
     };
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,
@@ -586,6 +635,25 @@ pub fn camera_register_pushed_v1(
         .clone()
         .unwrap_or_else(|| format!("cam_{}", uuid::Uuid::new_v4()));
 
+    // Robot cameras are anonymized per the owning addon's settings; an invalid
+    // setting refuses the camera rather than guessing it means "off".
+    let privacy = match crate::services::camera_ingest::privacy_options::PrivacyOptions::for_robot_addon(
+        &db, &addon_id,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("camera.register_pushed: privacy options unreadable: {e}");
+            audit(
+                caller.data(),
+                "camera.register_pushed",
+                None,
+                RiskClass::A,
+                "error",
+                Some("privacy_options_invalid"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
     // The H.264 channel: native encoder → FFI → tx → appsrc. A few seconds of access
     // units buffered; latest-wins drop under backpressure (live video).
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(120);
@@ -598,6 +666,7 @@ pub fn camera_register_pushed_v1(
         owner_addon_id: Some(addon_id.clone()),
         credentials_encrypted: None,
         decoder_override: None,
+        privacy,
     };
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,
@@ -1614,6 +1683,7 @@ pub fn camera_add_v1(
         owner_addon_id: Some(addon_id.clone()),
         credentials_encrypted: credentials_blob.clone(),
         decoder_override: None,
+        privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     };
     // Vision-worker sharding: a planned slot routes this camera to a worker —
     // no local session is started; the assignment is committed (and pushed
@@ -4906,6 +4976,7 @@ pub fn camera_credentials_rotate_v1(
         owner_addon_id: Some(addon_id.clone()),
         credentials_encrypted: new_blob.clone(),
         decoder_override: None,
+        privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     };
     // Worker-owned cameras restart on their worker: the fleet re-sends the
     // assignment with the fresh (still-encrypted) blob and the worker session
@@ -5189,6 +5260,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         owner_addon_id: Some(addon_id.clone()),
         credentials_encrypted: credentials_blob.clone(),
         decoder_override: None,
+        privacy: crate::services::camera_ingest::privacy_options::PrivacyOptions::OFF,
     };
     // Vision-worker sharding — same routing as `camera_add_v1`: a planned
     // slot skips the local session; the assignment is committed after the

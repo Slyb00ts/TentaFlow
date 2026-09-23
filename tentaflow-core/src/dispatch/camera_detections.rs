@@ -213,7 +213,11 @@ fn camera_detections_subscribe_handler(
                 crate::services::vision_worker::fleet::is_worker_camera(&camera_id).is_some();
             #[cfg(not(all(unix, feature = "camera", feature = "inference-vision-gpu",)))]
             let worker_owned = false;
-            if !worker_owned {
+            // A privacy-processed camera already publishes its detections from
+            // the privacy probe; a second publisher would fight it on the overlay.
+            let privacy_owned =
+                crate::services::camera_ingest::privacy_options::active_for(&camera_id).is_some();
+            if !worker_owned && !privacy_owned {
                 crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);
             }
         }
