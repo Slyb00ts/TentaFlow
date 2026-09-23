@@ -382,17 +382,28 @@ def stream_cargo(command, arguments, cwd, target):
     artifacts = set()
     on_actions = os.environ.get("GITHUB_ACTIONS") == "true"
     cargo = subprocess.Popen(["cargo", command, "--message-format=json-render-diagnostics", *arguments], cwd=cwd, env=dict(os.environ, TENTAFLOW_PYTHON=sys.executable), stdout=subprocess.PIPE, stderr=subprocess.PIPE if on_actions else None, text=True, encoding="utf-8", errors="replace", bufsize=1)
-    # On GitHub Actions cargo's own stderr (build-script failures are reported
-    # there, outside the JSON stream) is echoed and its tail kept for the
-    # annotation written when cargo fails.
+    # On GitHub Actions cargo's stderr is echoed and mined for the annotations
+    # written when cargo fails: with json-render-diagnostics both rustc errors
+    # and build-script failures are rendered there as text, not as JSON. An
+    # error block runs from a line starting with "error" to the next blank one.
     stderr_tail = collections.deque(maxlen=60)
-    compiler_errors = []
+    error_blocks = []
     echo = None
     if on_actions:
         def forward():
+            block = None
             for line in cargo.stderr:
-                stderr_tail.append(line.rstrip("\n"))
+                text = line.rstrip("\n")
+                stderr_tail.append(text)
                 print(line, end="", file=sys.stderr, flush=True)
+                if block is None and text.startswith("error") and len(error_blocks) < 10:
+                    block = [text]
+                    error_blocks.append(block)
+                elif block is not None:
+                    if not text.strip() or len(block) >= 40:
+                        block = None
+                    else:
+                        block.append(text)
         echo = threading.Thread(target=forward, daemon=True)
         echo.start()
     try:
@@ -409,8 +420,6 @@ def stream_cargo(command, arguments, cwd, target):
                 rendered = event["message"].get("rendered")
                 if rendered:
                     print(rendered, end="", file=sys.stderr, flush=True)
-                    if on_actions and event["message"].get("level") == "error" and len(compiler_errors) < 10:
-                        compiler_errors.append(rendered)
             elif event["reason"] in ("compiler-artifact", "build-script-executed"):
                 paths = event.get("filenames", []) + ([event["out_dir"]] if event.get("out_dir") else [])
                 for name in paths:
@@ -425,8 +434,8 @@ def stream_cargo(command, arguments, cwd, target):
         cargo.wait()
         raise
     if on_actions and code != 0:
-        for rendered in compiler_errors:
-            annotate(f"cargo {command}: compiler error", rendered)
+        for block in error_blocks:
+            annotate(f"cargo {command}: {block[0][:120]}", "\n".join(block))
         annotate(f"cargo {command} exited with {code}", "\n".join(stderr_tail))
     return code, artifacts
 
