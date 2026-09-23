@@ -90,7 +90,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: native-libs/windows-x86_64
-          key: native-libs-windows-x86_64-${{ matrix.backend }}-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh', 'scripts/versions.env', 'scripts/lib/**') }}
+          # The same inputs as the Linux key. scripts/lib/windows.ps1 stays out:
+          # it prepares the environment, and hashing it made every edit there
+          # rebuild four hours of CUDA kernels that come out identical.
+          key: native-libs-windows-x86_64-${{ matrix.backend }}-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh', 'scripts/versions.env', 'scripts/lib/versions.sh') }}
 
       - name: Toolchain (scripts\setup.ps1 ${{ matrix.setup }})
         if: steps.cache.outputs.cache-hit != 'true'
