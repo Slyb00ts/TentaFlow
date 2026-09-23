@@ -46,7 +46,7 @@ def validate(root):
                 continue
             manifest = path / "Cargo.toml"
             if not manifest.is_file():
-                errors.append(f"Członek bez manifestu: {manifest.relative_to(root)}")
+                errors.append(f"Członek bez manifestu: {manifest.relative_to(root).as_posix()}")
                 continue
             members.add(manifest.resolve())
 
@@ -60,8 +60,11 @@ def validate(root):
     used = set()
     forbidden = {"version", "path", "git", "rev", "branch", "tag", "registry", "package"}
     for path in sorted(candidates):
-        relative = path.relative_to(root)
-        if relative.parts[0] in ("vendor", "thirdparty"):
+        # Komunikaty zawsze w zapisie POSIX: na Windows Path wypisuje "\\",
+        # a te same błędy muszą wyglądać identycznie na każdym systemie.
+        relative_path = path.relative_to(root)
+        relative = relative_path.as_posix()
+        if relative_path.parts[0] in ("vendor", "thirdparty"):
             if path.resolve() in members:
                 errors.append(f"Zewnętrzny pakiet nie może być członkiem workspace: {relative}")
             continue

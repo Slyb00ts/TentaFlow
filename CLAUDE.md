@@ -73,6 +73,18 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 - A full-edition binary needs GStreamer's `bin` on PATH (setup adds it; open a new terminal).
 - The firewall self-check runs on its own thread: its UAC prompt waits for a human, and the
   listeners must not.
+- **Release archives** come from `.github/workflows/build-windows.yml` (called by
+  `release.yml`, and run alone when a Windows build input changes on main), which runs the
+  developer scripts themselves — `setup.ps1` → `build-all.ps1` → `build.ps1` — so CI proves
+  them. `full-cuda13` pairs the CUDA llama.cpp/whisper variant with `--features gpu-vulkan`
+  and the CPU ONNX Runtime (`ONNXRUNTIME_GPU=0`, which `build-all.ps1` honours), like the Linux
+  CUDA archives. The ZIP is staged by `scripts/release/stage-windows.py`: it closes the DLL
+  set over the PE import tables and copies app-local what Windows lacks (Visual C++ runtime
+  incl. `VCOMP140` for ggml's OpenMP, cuBLAS + cuBLASLt); an import it cannot place fails the
+  job. GStreamer stays external — the `full` archives carry `REQUIREMENTS.txt` — and
+  `scripts/release/smoke-windows.ps1` starts the extracted archive with only System32 (plus
+  GStreamer) on PATH. pdfium and ONNX Runtime are LoadLibrary'd, so no import table names them;
+  they are listed explicitly in the staging script.
 
 **Host telemetry on Windows.** `tentaflow-core/src/gpu_telemetry/` is the ONE source of GPU
 numbers there (DXGI for adapters, VRAM totals and LUIDs; PDH for dedicated usage and engine

@@ -21,7 +21,8 @@
 # backends build one variant each (native-libs\...\llama-cpp\<backend>), which
 # scripts\build.ps1 -Backend <backend> links. The GPU ONNX Runtime (with the
 # vendored TensorRT/cuDNN/CUDA runtimes) is provisioned when CUDA is requested,
-# or with `auto` on a machine with an NVIDIA GPU.
+# or with `auto` on a machine with an NVIDIA GPU, unless ONNXRUNTIME_GPU says
+# otherwise.
 # =============================================================================
 
 [CmdletBinding()]
@@ -86,7 +87,12 @@ if ($wantsVulkan) {
         throw 'Vulkan backend requested but the Vulkan SDK (VULKAN_SDK, glslc) is missing. Run scripts\setup.ps1.'
     }
 }
-if ($wantsCuda) { $env:ONNXRUNTIME_GPU = '1' } else { $env:ONNXRUNTIME_GPU = '0' }
+# An explicit ONNXRUNTIME_GPU wins, as in build-onnxruntime.sh: the release
+# archives pair CUDA llama.cpp/whisper with the CPU ONNX Runtime, because the
+# vendored TensorRT/cuDNN stack would add gigabytes to every download.
+if (-not $env:ONNXRUNTIME_GPU) {
+    if ($wantsCuda) { $env:ONNXRUNTIME_GPU = '1' } else { $env:ONNXRUNTIME_GPU = '0' }
+}
 
 $platform = 'windows-x86_64'
 $bashArgs = @('--platform', $platform, '--edition', $Edition)
@@ -95,7 +101,7 @@ if ($Only) { $bashArgs += @('--only', $Only) }
 Log-Section "native-libs $platform ($Edition)"
 if ($Edition -eq 'full') {
     Log-Info "Backends:     $env:LLAMA_CPP_BACKENDS"
-    Log-Info "ONNX Runtime: $(if ($wantsCuda) { 'GPU (CUDA/TensorRT)' } else { 'CPU' })"
+    Log-Info "ONNX Runtime: $(if ($env:ONNXRUNTIME_GPU -eq '1') { 'GPU (CUDA/TensorRT)' } else { 'CPU' })"
 }
 Log-Info "Cache:        $env:TENTAFLOW_NATIVE_CACHE"
 Log-Info "Git Bash:     $(Find-GitBash)"
