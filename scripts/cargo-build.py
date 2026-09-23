@@ -6,6 +6,7 @@
 # =============================================================================
 
 import argparse
+import collections
 import contextlib
 import json
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import time
 import stat
 
@@ -369,9 +371,30 @@ def run_cargo(command, arguments, config):
         return code
 
 
+def annotate(title, text):
+    """A GitHub Actions error annotation: the job log of this repository needs
+    admin rights to read, an annotation is what a failed run shows everyone."""
+    body = text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+    print(f"::error title={title}::{body}", flush=True)
+
+
 def stream_cargo(command, arguments, cwd, target):
     artifacts = set()
-    cargo = subprocess.Popen(["cargo", command, "--message-format=json-render-diagnostics", *arguments], cwd=cwd, env=dict(os.environ, TENTAFLOW_PYTHON=sys.executable), stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
+    on_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    cargo = subprocess.Popen(["cargo", command, "--message-format=json-render-diagnostics", *arguments], cwd=cwd, env=dict(os.environ, TENTAFLOW_PYTHON=sys.executable), stdout=subprocess.PIPE, stderr=subprocess.PIPE if on_actions else None, text=True, encoding="utf-8", errors="replace", bufsize=1)
+    # On GitHub Actions cargo's own stderr (build-script failures are reported
+    # there, outside the JSON stream) is echoed and its tail kept for the
+    # annotation written when cargo fails.
+    stderr_tail = collections.deque(maxlen=60)
+    compiler_errors = []
+    echo = None
+    if on_actions:
+        def forward():
+            for line in cargo.stderr:
+                stderr_tail.append(line.rstrip("\n"))
+                print(line, end="", file=sys.stderr, flush=True)
+        echo = threading.Thread(target=forward, daemon=True)
+        echo.start()
     try:
         for line in cargo.stdout:
             try:
@@ -386,6 +409,8 @@ def stream_cargo(command, arguments, cwd, target):
                 rendered = event["message"].get("rendered")
                 if rendered:
                     print(rendered, end="", file=sys.stderr, flush=True)
+                    if on_actions and event["message"].get("level") == "error" and len(compiler_errors) < 10:
+                        compiler_errors.append(rendered)
             elif event["reason"] in ("compiler-artifact", "build-script-executed"):
                 paths = event.get("filenames", []) + ([event["out_dir"]] if event.get("out_dir") else [])
                 for name in paths:
@@ -393,10 +418,16 @@ def stream_cargo(command, arguments, cwd, target):
                     if path.is_relative_to(target):
                         artifacts.add(str(checked_path(target, path).relative_to(target)))
         code = cargo.wait()
+        if echo:
+            echo.join()
     except BaseException:
         cargo.terminate()
         cargo.wait()
         raise
+    if on_actions and code != 0:
+        for rendered in compiler_errors:
+            annotate(f"cargo {command}: compiler error", rendered)
+        annotate(f"cargo {command} exited with {code}", "\n".join(stderr_tail))
     return code, artifacts
 
 
