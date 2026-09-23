@@ -2280,6 +2280,11 @@ pub fn encode_bus_acl_set_request(
             subject_type,
             subject_id,
             access_level,
+            // The browser does not pick an action yet (codec.js sends none), so
+            // this is the protocol's documented default for a payload without
+            // one: '*', every action — exactly what the request meant before
+            // the field existed.
+            action: "*".to_string(),
         },
     }))
     .map_err(|e| JsError::new(&e))
