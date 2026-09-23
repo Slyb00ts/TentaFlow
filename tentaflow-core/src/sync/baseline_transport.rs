@@ -264,6 +264,19 @@ pub async fn run_joiner_session<S: FrameStream>(
 // Strona dawcy
 // =============================================================================
 
+/// How a donor session that did not fail ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DonorOutcome {
+    /// The snapshot went out and the joiner acknowledged every chunk.
+    Donated,
+    /// The requester holds more content, so IT is the rightful donor and this
+    /// node must adopt from it. The caller has to start that pull: the requester
+    /// only ever pulls, so when its request came from epoch reconcile (where the
+    /// epoch winner may be the emptier node) nobody else ever would, and both
+    /// nodes keep refusing each other forever.
+    RequesterIsDonor,
+}
+
 /// Pelna sekwencja dawcy nad jednym akceptowanym strumieniem. `remote_node_id`
 /// to iroh remote_id polaczenia (zweryfikowany przez wywolujacego). Wykonuje:
 /// odbior Elect -> decide_roles potwierdza role dawcy -> begin_adopt_atomic(Donor)
@@ -274,7 +287,7 @@ pub async fn run_donor_session<S: FrameStream>(
     security: &MeshSecurity,
     local_node_id: &str,
     remote_node_id: &str,
-) -> LedgerResult<()> {
+) -> LedgerResult<DonorOutcome> {
     let elect: BaselineElect = read_frame(stream, "elect").await?;
 
     // Anti-spoof: nadawca Elect musi byc tym samym co iroh remote_id streamu.
@@ -384,14 +397,13 @@ pub async fn run_donor_session<S: FrameStream>(
             epoch: 0,
         };
         let _ = write_frame(stream, &nack, "ack").await;
-        return Err(transport_err(
-            "elect",
-            format!(
-                "content election makes peer the donor (donor={donor}, local_ops={local_op_count}, \
-                 peer_ops={}); refusing to donate",
-                elect.sender_op_count
-            ),
-        ));
+        info!(
+            peer = %remote_node_id,
+            local_ops = local_op_count,
+            peer_ops = elect.sender_op_count,
+            "baseline transport: requester holds more content, so it donates to us instead"
+        );
+        return Ok(DonorOutcome::RequesterIsDonor);
     }
     if local_role(local_node_id, &donor) != BaselineRole::Donor {
         return Err(transport_err("elect", "local_role disagrees with election"));
@@ -469,7 +481,7 @@ pub async fn run_donor_session<S: FrameStream>(
         chunks = chunks.len(),
         "baseline transport: donor session completed"
     );
-    Ok(())
+    Ok(DonorOutcome::Donated)
 }
 
 // =============================================================================

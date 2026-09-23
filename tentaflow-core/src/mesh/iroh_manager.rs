@@ -871,7 +871,7 @@ impl IrohMeshManager {
         }
     }
 
-    async fn handle_incoming(&self, incoming: iroh::endpoint::Incoming) -> Result<()> {
+    async fn handle_incoming(self: &Arc<Self>, incoming: iroh::endpoint::Incoming) -> Result<()> {
         let connecting = incoming.accept().context("accept incoming")?;
         let connection = connecting.await.context("finalize connection")?;
         let alpn = connection.alpn();
@@ -947,6 +947,7 @@ impl IrohMeshManager {
                 // polaczenia jest autorytatywnym node_id peera (anti-spoof).
                 let security = Arc::clone(&self.security);
                 let local_node_id = self.node_id();
+                let me = Arc::clone(self);
                 tokio::spawn(async move {
                     let (send, recv) = match connection.accept_bi().await {
                         Ok(v) => v,
@@ -970,7 +971,23 @@ impl IrohMeshManager {
                     // A session that already finished its stream makes this a no-op.
                     let _ = crate::sync::baseline_transport::FrameStream::finish(&mut stream).await;
                     match outcome {
-                        Ok(()) => info!(peer = %remote_hex, "baseline: donor session OK"),
+                        Ok(crate::sync::baseline_transport::DonorOutcome::Donated) => {
+                            info!(peer = %remote_hex, "baseline: donor session OK")
+                        }
+                        Ok(crate::sync::baseline_transport::DonorOutcome::RequesterIsDonor) => {
+                            let epoch_seen = crate::sync::runtime::core_epoch().counter;
+                            match me.pull_baseline_from_donor(&remote_hex, epoch_seen).await {
+                                Ok(()) => info!(
+                                    donor = %remote_hex,
+                                    "baseline: adopted the fuller requester's baseline"
+                                ),
+                                Err(e) => warn!(
+                                    donor = %remote_hex,
+                                    "baseline: adopt from the fuller requester failed: {}",
+                                    e
+                                ),
+                            }
+                        }
                         Err(e) => warn!(peer = %remote_hex, "baseline: donor session blad: {}", e),
                     }
                 });

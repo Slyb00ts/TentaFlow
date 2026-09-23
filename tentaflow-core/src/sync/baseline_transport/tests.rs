@@ -985,3 +985,49 @@ async fn donor_rejects_unstamped_environment_requester() {
         "expected cross-environment error, got: {err}"
     );
 }
+
+/// Epoch reconcile can make the EMPTIER node's epoch the winner, so the fuller
+/// node dials it for a baseline. Content election refuses that donation, and the
+/// refusal must tell the caller to adopt from the requester — otherwise each
+/// node points at the other as the donor and the mesh never converges.
+#[tokio::test]
+async fn donor_hands_the_role_to_a_fuller_requester() {
+    let (joiner_node_id, joiner_pubkey) = gen_identity();
+    let donor_pool = new_pool();
+    seed_donor_org(&donor_pool);
+    let (security, donor_node_id) =
+        donor_security(donor_pool.clone(), &joiner_node_id, &joiner_pubkey);
+
+    let (mut joiner_stream, mut donor_stream) = DuplexFrameStream::pair();
+
+    let donor_task = {
+        let security = Arc::clone(&security);
+        let donor_node_id = donor_node_id.clone();
+        let joiner_node_id = joiner_node_id.clone();
+        tokio::spawn(async move {
+            run_donor_session(
+                &mut donor_stream,
+                &security,
+                &donor_node_id,
+                &joiner_node_id,
+            )
+            .await
+        })
+    };
+
+    let elect = BaselineElect {
+        node_id: joiner_node_id.clone(),
+        proposed_donor: donor_node_id.clone(),
+        epoch_seen: 0,
+        sender_op_count: u64::MAX,
+    };
+    write_frame(&mut joiner_stream, &elect, "elect")
+        .await
+        .unwrap();
+    let ack: BaselineAck = read_frame(&mut joiner_stream, "ack").await.unwrap();
+    assert!(!ack.accepted, "the emptier node must not donate");
+    assert_eq!(ack.donor, joiner_node_id, "the nack names the requester as donor");
+
+    let outcome = donor_task.await.unwrap().expect("a role hand-off is not a failure");
+    assert_eq!(outcome, DonorOutcome::RequesterIsDonor);
+}
