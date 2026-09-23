@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Written by `install.sh` next to the configuration. Field names are the wire
+/// Written by `install.sh` / `install.ps1` next to the configuration. Field names are the wire
 /// contract with the installer: renaming one silently degrades every installed
 /// binary to the no-receipt path, so add fields, never rename them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,13 +30,15 @@ pub struct InstallReceipt {
     pub variant: String,
     /// Rust target triple of the installed artifact.
     pub target: String,
-    /// Install prefix; `<prefix>/current` is the symlink to the live version.
+    /// Install prefix; `<prefix>/current` is the symlink to the live version
+    /// (a directory symbolic link on Windows).
     pub prefix: PathBuf,
     /// Configuration file the service is started with.
     pub config: PathBuf,
     /// `TENTAFLOW_HOME` — data, TLS identity, SQLite.
     pub home: PathBuf,
-    /// `system`, `user`, or `none` when autostart was declined.
+    /// `system`, `user`, or `none` when autostart was declined. On Windows the
+    /// service is always a system one.
     pub service_scope: String,
 }
 
@@ -44,7 +46,16 @@ impl InstallReceipt {
     /// Paths the installer may have written to, most authoritative first: a
     /// system install owns /etc, a user install keeps everything under $HOME.
     fn candidates() -> Vec<PathBuf> {
-        let mut out = vec![PathBuf::from("/etc/tentaflow/install-receipt.json")];
+        let mut out = Vec::new();
+        // install.ps1 keeps configuration and receipt in %ProgramData%\TentaFlow.
+        if let Some(data) = std::env::var_os("ProgramData") {
+            out.push(
+                PathBuf::from(data)
+                    .join("TentaFlow")
+                    .join("install-receipt.json"),
+            );
+        }
+        out.push(PathBuf::from("/etc/tentaflow/install-receipt.json"));
         if let Some(home) = std::env::var_os("HOME") {
             out.push(PathBuf::from(&home).join(".config/tentaflow/install-receipt.json"));
             out.push(PathBuf::from(&home).join(".local/share/tentaflow/install-receipt.json"));

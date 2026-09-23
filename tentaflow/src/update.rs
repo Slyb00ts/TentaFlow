@@ -9,9 +9,9 @@
 // executable leaves it next to the previous release's `libwhisper_tf.so`, which
 // fails at `dlopen` time — after the service was already stopped.
 //
-// Everything here mirrors install.sh on purpose: same asset names, same layout,
-// same atomic symlink rename. The two must stay in step; when one changes, the
-// other is part of that change.
+// Everything here mirrors install.sh and install.ps1 on purpose: same asset
+// names, same layout, same swap of `current`. They must stay in step; when one
+// changes, the others are part of that change.
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +22,41 @@ use crate::receipt::InstallReceipt;
 
 const API: &str = "https://api.github.com";
 const USER_AGENT: &str = concat!("tentaflow/", env!("CARGO_PKG_VERSION"));
+
+/// Release archives are .tar.gz on Linux and macOS and .zip on Windows, where
+/// the system ships an unzip and no tar that would keep the file layout.
+const ARCHIVE_EXT: &str = if cfg!(windows) { "zip" } else { "tar.gz" };
+
+/// What to run for elevated rights: the prefix and the service belong to the
+/// system on every platform.
+const ELEVATE_HINT: &str = if cfg!(windows) {
+    "run this in a terminal started as Administrator"
+} else {
+    "run this under sudo"
+};
+
+/// The installer to fall back to when this binary has no receipt.
+fn installer_command() -> String {
+    let (owner, name) = repo();
+    if cfg!(windows) {
+        format!("irm https://raw.githubusercontent.com/{owner}/{name}/main/scripts/install/install.ps1 | iex")
+    } else {
+        format!("curl -fsSL https://raw.githubusercontent.com/{owner}/{name}/main/scripts/install/install.sh | sh")
+    }
+}
+
+/// The release asset for an installation. The name carries the GPU backend for
+/// `full`, because there is one build per backend and they are not
+/// interchangeable: a CUDA binary will not start without the NVIDIA runtime, and
+/// a Vulkan one leaves an NVIDIA card idle. `slim` has no engines, so it has no
+/// variant.
+fn asset_name(tag: &str, target: &str, edition: &str, variant: &str) -> String {
+    if edition == "slim" {
+        format!("tentaflow-{tag}-{target}-slim.{ARCHIVE_EXT}")
+    } else {
+        format!("tentaflow-{tag}-{target}-{edition}-{variant}.{ARCHIVE_EXT}")
+    }
+}
 
 fn repo() -> (String, String) {
     (
@@ -169,12 +204,26 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Unpacks the archive and returns its single top-level directory.
 fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
-    let file = std::fs::File::open(archive)?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    tar::Archive::new(decoder)
-        .unpack(into)
-        .with_context(|| format!("unpacking {}", archive.display()))?;
+    extract(archive, into).with_context(|| format!("unpacking {}", archive.display()))?;
+    release_dir(into)
+}
 
+#[cfg(unix)]
+fn extract(archive: &Path, into: &Path) -> Result<()> {
+    let decoder = flate2::read::GzDecoder::new(std::fs::File::open(archive)?);
+    tar::Archive::new(decoder).unpack(into)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn extract(archive: &Path, into: &Path) -> Result<()> {
+    // ZipArchive::extract refuses entries that would land outside `into`.
+    zip::ZipArchive::new(std::fs::File::open(archive)?)?.extract(into)?;
+    Ok(())
+}
+
+/// The single `tentaflow-*` directory a release archive unpacks to.
+fn release_dir(into: &Path) -> Result<PathBuf> {
     for entry in std::fs::read_dir(into)? {
         let entry = entry?;
         if entry.file_type()?.is_dir()
@@ -201,14 +250,138 @@ fn swap_current(prefix: &Path, target: &Path) -> Result<()> {
     std::fs::rename(&staged, prefix.join("current")).context("swapping the current symlink")
 }
 
-/// The `versions/<ver>` + `current` layout is created only by install.sh
-/// (Linux, macOS); there is no Windows installer whose layout this could swap.
-#[cfg(not(unix))]
-fn swap_current(prefix: &Path, _target: &Path) -> Result<()> {
-    bail!(
-        "{} is not an installer layout: self-update exists only for installations made by install.sh (Linux, macOS)",
-        prefix.display()
+/// Points `<prefix>\current` at `target`. install.ps1 makes `current` an NTFS
+/// junction, and Windows cannot rename one directory entry over another, so
+/// the new junction goes in beside the old one and the two are exchanged by
+/// two renames; the second failing puts the old one back. The service is
+/// stopped for the swap, so the moment without a `current` has no reader.
+#[cfg(windows)]
+fn swap_current(prefix: &Path, target: &Path) -> Result<()> {
+    let current = prefix.join("current");
+    let staged = prefix.join("current.new");
+    let retired = prefix.join("current.old");
+    for stale in [&staged, &retired] {
+        if std::fs::symlink_metadata(stale).is_ok() {
+            std::fs::remove_dir(stale).with_context(|| format!("removing {}", stale.display()))?;
+        }
+    }
+    junction::create(target, &staged).with_context(|| format!("junction {}", staged.display()))?;
+    let had_current = std::fs::symlink_metadata(&current).is_ok();
+    if had_current {
+        std::fs::rename(&current, &retired).context("moving the current junction aside")?;
+    }
+    if let Err(err) = std::fs::rename(&staged, &current) {
+        if had_current {
+            let _ = std::fs::rename(&retired, &current);
+        }
+        return Err(anyhow!(err).context("putting the new current junction in place"));
+    }
+    if had_current {
+        // remove_dir on a junction deletes the link, never what it points at.
+        std::fs::remove_dir(&retired).context("removing the old current junction")?;
+    }
+    Ok(())
+}
+
+/// The GStreamer runtime a `full` archive links, as its `gstreamer.json` names
+/// it (written by stage-windows.py, read by install.ps1 too).
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+struct GstreamerSpec {
+    version: String,
+    url: String,
+    sha256: String,
+}
+
+/// Within 1.x the GStreamer ABI only grows, so the minor a build linked
+/// against, or a newer one, runs it.
+#[cfg(windows)]
+fn gstreamer_satisfies(installed: &str, wanted: &str) -> bool {
+    let major_minor = |v: &str| -> Option<(u32, u32)> {
+        let mut parts = v.trim().split('.');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    };
+    match (major_minor(installed), major_minor(wanted)) {
+        (Some((have_major, have_minor)), Some((want_major, want_minor))) => {
+            have_major == want_major && have_minor >= want_minor
+        }
+        _ => false,
+    }
+}
+
+/// A new release may link a newer GStreamer than the machine has, and the
+/// service would then fail to load its DLLs after the swap. The runtime is
+/// installed the way install.ps1 installs it: verified against the archive's
+/// checksum, machine-wide into the same directory, so the PATH the installer
+/// gave the service still finds it. Runs with the service stopped — the
+/// installer cannot replace DLLs a running server holds open.
+#[cfg(windows)]
+fn ensure_gstreamer(client: &reqwest::blocking::Client, release: &Path, work: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    let spec_path = release.join("gstreamer.json");
+    if !spec_path.is_file() {
+        return Ok(());
+    }
+    let spec: GstreamerSpec = serde_json::from_str(&std::fs::read_to_string(&spec_path)?)
+        .with_context(|| format!("reading {}", spec_path.display()))?;
+    let root = PathBuf::from(
+        std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into()),
     )
+    .join("gstreamer\\1.0\\msvc_x86_64");
+    let dll = root.join("bin\\gstreamer-1.0-0.dll");
+    if dll.is_file() {
+        // The DLL's version resource is the one version a runtime-only install
+        // carries (no .pc files); PowerShell reads it without a new dependency.
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                "(Get-Item -LiteralPath '{}').VersionInfo.ProductVersion",
+                dll.display()
+            ))
+            .output()
+            .context("reading the GStreamer version")?;
+        let installed = String::from_utf8_lossy(&out.stdout);
+        if gstreamer_satisfies(&installed, &spec.version) {
+            return Ok(());
+        }
+    }
+
+    println!("Installing the GStreamer {} runtime", spec.version);
+    let setup = work.join(format!("gstreamer-{}.exe", spec.version));
+    download(client, &spec.url, &setup)?;
+    let actual = sha256_of(&setup)?;
+    if actual != spec.sha256.to_lowercase() {
+        bail!(
+            "GStreamer installer checksum mismatch (expected {}, got {actual})",
+            spec.sha256
+        );
+    }
+    // raw_arg: Inno Setup wants the quotes of /DIR="..." and /TASKS="" as
+    // written, which argument escaping would mangle.
+    let status = std::process::Command::new(&setup)
+        .args([
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/ALLUSERS",
+            "/TYPE=runtime",
+        ])
+        .raw_arg(format!("/DIR=\"{}\"", root.display()))
+        .raw_arg("/TASKS=\"\"")
+        .status()
+        .context("running the GStreamer installer")?;
+    if !status.success() {
+        bail!("the GStreamer installer failed ({status})");
+    }
+    if !dll.is_file() {
+        bail!(
+            "GStreamer is not in {} after its installer finished",
+            root.display()
+        );
+    }
+    println!("GStreamer {} runtime installed", spec.version);
+    Ok(())
 }
 
 /// Keeps the running version and the one before it — enough to roll back by
@@ -262,24 +435,12 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     let receipt = InstallReceipt::load().ok_or_else(|| {
         anyhow!(
             "No install-receipt.json — this binary did not come from the installer.\n   \
-             Update with: curl -fsSL https://raw.githubusercontent.com/{}/{}/main/scripts/install/install.sh | sh",
-            repo().0,
-            repo().1
+             Update with: {}",
+            installer_command()
         )
     })?;
 
-    // The archive name carries the GPU backend for `full`, because there is one
-    // build per backend and they are not interchangeable: a CUDA binary will not
-    // start without the NVIDIA runtime, and a Vulkan one leaves an NVIDIA card
-    // idle. `slim` has no engines, so it has no variant.
-    let asset = if receipt.edition == "slim" {
-        format!("tentaflow-{tag}-{}-slim.tar.gz", receipt.target)
-    } else {
-        format!(
-            "tentaflow-{tag}-{}-{}-{}.tar.gz",
-            receipt.target, receipt.edition, receipt.variant
-        )
-    };
+    let asset = asset_name(&tag, &receipt.target, &receipt.edition, &receipt.variant);
     let (owner, name) = repo();
     let base = format!("https://github.com/{owner}/{name}/releases/download/{tag}/{asset}");
 
@@ -289,7 +450,7 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     }
     std::fs::create_dir_all(&work).with_context(|| {
         format!(
-            "no write access to {} — run this under sudo",
+            "no write access to {} — {ELEVATE_HINT}",
             receipt.prefix.display()
         )
     })?;
@@ -319,7 +480,15 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     let new_version = tag.trim_start_matches('v').to_string();
     let version_dir = receipt.prefix.join("versions").join(&new_version);
     if version_dir.exists() {
-        std::fs::remove_dir_all(&version_dir)?;
+        // On Windows the running tentaflow.exe keeps its own version directory
+        // open, so `--force` on the installed version cannot replace it.
+        std::fs::remove_dir_all(&version_dir).with_context(|| {
+            format!(
+                "removing {} — to reinstall the version this binary runs from, run the installer: {}",
+                version_dir.display(),
+                installer_command()
+            )
+        })?;
     }
     std::fs::create_dir_all(version_dir.parent().unwrap())?;
     std::fs::rename(&unpacked, &version_dir)
@@ -331,6 +500,16 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     if was_running {
         println!("Stopping the service");
         crate::service::stop()?;
+    }
+
+    #[cfg(windows)]
+    if let Err(err) = ensure_gstreamer(&client, &version_dir, &work) {
+        // Nothing was swapped yet: the old version still matches the runtime
+        // it was installed with, so it goes back up.
+        if was_running {
+            crate::service::start().ok();
+        }
+        return Err(err);
     }
 
     swap_current(&receipt.prefix, &version_dir)?;
@@ -402,6 +581,7 @@ mod tests {
 
     /// Builds an archive shaped like a release asset: one top-level
     /// `tentaflow-*` directory holding the files.
+    #[cfg(unix)]
     fn make_archive(dir: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
         let root = dir.join(name);
         fs::create_dir_all(&root).unwrap();
@@ -418,14 +598,7 @@ mod tests {
         archive
     }
 
-    fn asset_name(tag: &str, target: &str, edition: &str, variant: &str) -> String {
-        if edition == "slim" {
-            format!("tentaflow-{tag}-{target}-slim.tar.gz")
-        } else {
-            format!("tentaflow-{tag}-{target}-{edition}-{variant}.tar.gz")
-        }
-    }
-
+    #[cfg(unix)]
     #[test]
     fn nazwa_archiwum_niesie_wariant_gpu() {
         assert_eq!(
@@ -443,6 +616,81 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn nowszy_minor_gstreamera_wystarcza_starszy_nie() {
+        assert!(gstreamer_satisfies("1.28.6", "1.28.6"));
+        assert!(gstreamer_satisfies("1.30.0\r\n", "1.28.6"));
+        assert!(!gstreamer_satisfies("1.26.9", "1.28.6"));
+        assert!(!gstreamer_satisfies("2.0.0", "1.28.6"));
+        assert!(!gstreamer_satisfies("", "1.28.6"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nazwa_archiwum_windows_to_zip_z_wariantem() {
+        assert_eq!(
+            asset_name("v0.3.0", "x86_64-pc-windows-msvc", "full", "cuda13"),
+            "tentaflow-v0.3.0-x86_64-pc-windows-msvc-full-cuda13.zip"
+        );
+        assert_eq!(
+            asset_name("v0.3.0", "x86_64-pc-windows-msvc", "slim", "none"),
+            "tentaflow-v0.3.0-x86_64-pc-windows-msvc-slim.zip"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rozpakowanie_zip_zwraca_katalog_wydania() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("release.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        let root = "tentaflow-v0.3.0-x86_64-pc-windows-msvc-slim";
+        zip.add_directory(format!("{root}/"), options).unwrap();
+        zip.start_file(format!("{root}/tentaflow.exe"), options)
+            .unwrap();
+        zip.write_all(b"binarka").unwrap();
+        zip.finish().unwrap();
+
+        let into = tmp.path().join("out");
+        fs::create_dir_all(&into).unwrap();
+        let dir = unpack(&archive, &into).unwrap();
+        assert!(dir.join("tentaflow.exe").is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn podmiana_junction_zostawia_current_na_nowej_wersji() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path();
+        let old = prefix.join("versions").join("0.0.1");
+        let new = prefix.join("versions").join("0.0.2");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("marker"), "old").unwrap();
+        fs::write(new.join("marker"), "new").unwrap();
+
+        swap_current(prefix, &old).unwrap();
+        assert_eq!(
+            fs::read_to_string(prefix.join("current").join("marker")).unwrap(),
+            "old"
+        );
+
+        // The second swap replaces an existing junction, and the version it
+        // pointed at must survive: removing a junction never follows it.
+        swap_current(prefix, &new).unwrap();
+        assert_eq!(
+            fs::read_to_string(prefix.join("current").join("marker")).unwrap(),
+            "new"
+        );
+        assert!(old.join("marker").is_file());
+        assert!(fs::symlink_metadata(prefix.join("current.new")).is_err());
+        assert!(fs::symlink_metadata(prefix.join("current.old")).is_err());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn rozpakowanie_zwraca_katalog_wydania() {
         let tmp = tempfile::tempdir().unwrap();
@@ -458,6 +706,7 @@ mod tests {
         assert!(dir.join("libzvec_c_api.so").is_file());
     }
 
+    #[cfg(unix)]
     #[test]
     fn archiwum_bez_katalogu_wydania_jest_odrzucane() {
         let tmp = tempfile::tempdir().unwrap();
@@ -491,6 +740,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn podmiana_symlinku_nigdy_nie_zostawia_pustego_current() {
         let tmp = tempfile::tempdir().unwrap();

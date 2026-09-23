@@ -87,6 +87,13 @@ Najważniejsze zmiany względem ostatniego opublikowanego wydania `0.1.0-beta`.
   w aktywnych UFW/firewalld, zachowując istniejący config i ostrzegając o loopback.
 - Archiwum macOS Metal wymaga Meeting Bota. Przed publikacją workflow sprawdza
   jego obecność, uprawnienia wykonania, architekturę, zależności i start `--help`.
+- Windows x86_64: archiwa `slim`, `full-vulkan` i `full-cuda13` budowane w CI oraz
+  instalator `install.ps1` (PowerShell jako Administrator). Instaluje wersję do
+  `%ProgramFiles%\TentaFlow\versions\<ver>` za junction `current`, dla edycji `full`
+  pobiera i weryfikuje runtime GStreamera, rejestruje usługę Windows `TentaFlow`
+  (konto wirtualne, autostart, restart po awarii) i reguły zapory. Działają
+  `tentaflow start|stop|restart|status` oraz `tentaflow update`; `uninstall.ps1`
+  usuwa instalację (`-Purge` także dane).
 
 ## [0.1.0-beta] - 2026-09-02
 

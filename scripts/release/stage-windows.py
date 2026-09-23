@@ -6,19 +6,22 @@
 #          the PE import tables: every import must be a Windows DLL, a GPU
 #          driver DLL, a file already in the archive, or a file found in one of
 #          the search directories (it is copied in). GStreamer is the one
-#          external runtime and is reported, not bundled. The archive is a ZIP
-#          with a sha256sum-style checksum next to it.
+#          external runtime: it is not bundled, the archive names the exact
+#          installer (gstreamer.json) that install.ps1 downloads, verifies and
+#          runs. The archive is a ZIP with a sha256sum-style checksum next to it.
 #
 # Usage:
 #   python scripts/release/stage-windows.py --tag v0.3.0 --asset full-vulkan \
 #       --edition full --out target_shared/release \
 #       --native native-libs/windows-x86_64 \
 #       --search "<CUDA>/bin/x64" --search "<VC redist CRT>" \
-#       --gstreamer-bin "<GStreamer>/bin" --gstreamer-version 1.28.6 --dest dist
+#       --gstreamer-bin "<GStreamer>/bin" --gstreamer-version 1.28.6 \
+#       --gstreamer-sha256 <sha of the MSVC x86_64 installer> --dest dist
 # =============================================================================
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import struct
@@ -28,6 +31,7 @@ from collections import deque
 from pathlib import Path
 
 TARGET = "x86_64-pc-windows-msvc"
+GSTREAMER_URL = "https://gstreamer.freedesktop.org/data/pkg/windows/{v}/msvc/gstreamer-1.0-msvc-x86_64-{v}.exe"
 
 # DLLs every supported Windows (10 1809+ / Server 2019+) ships in System32.
 # A name missing here fails the staging loudly, which is the point: a DLL the
@@ -175,9 +179,15 @@ def stage(args, read_imports=pe_imports):
     if external:
         if args.edition != "full":
             raise StageError(f"the slim edition must not need GStreamer, but it imports: {', '.join(sorted(external))}")
+        if not args.gstreamer_version or len(args.gstreamer_sha256) != 64:
+            raise StageError("an edition that links GStreamer needs --gstreamer-version and --gstreamer-sha256 for install.ps1")
+        url = GSTREAMER_URL.format(v=args.gstreamer_version)
+        spec = {"version": args.gstreamer_version, "url": url, "sha256": args.gstreamer_sha256.lower()}
+        (root / "gstreamer.json").write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8", newline="\n")
         (root / "REQUIREMENTS.txt").write_text(
             "This edition needs the GStreamer runtime (MSVC x86_64) on PATH:\n"
-            f"GStreamer {args.gstreamer_version}, https://gstreamer.freedesktop.org/download/\n"
+            f"GStreamer {args.gstreamer_version}, {url}\n"
+            "install.ps1 installs it; a manual install needs the runtime type of that installer.\n"
             "The camera and video pipeline links it; the server does not start without it.\n",
             encoding="utf-8",
             newline="\r\n",
@@ -202,6 +212,7 @@ def main(argv=None):
     parser.add_argument("--search", action="append", default=[], help="extra directory to take DLLs from")
     parser.add_argument("--gstreamer-bin", default="")
     parser.add_argument("--gstreamer-version", default="")
+    parser.add_argument("--gstreamer-sha256", default="", help="SHA-256 of the GStreamer MSVC x86_64 installer")
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[2]))
     parser.add_argument("--dest", required=True)
     args = parser.parse_args(argv)

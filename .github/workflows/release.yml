@@ -945,7 +945,7 @@ jobs:
           }
 
       - name: Copy installers next to the archives
-        run: cp scripts/install/install.sh scripts/install/uninstall.sh dist/
+        run: cp scripts/install/install.sh scripts/install/uninstall.sh scripts/install/install.ps1 scripts/install/uninstall.ps1 dist/
 
       - name: Detect pre-release tag
         id: prerelease
@@ -969,6 +969,12 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
             ```
 
+            Windows, in PowerShell started as Administrator:
+
+            ```powershell
+            irm https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.ps1 | iex
+            ```
+
             The installer picks the archive below from the GPU it finds, verifies the
             checksum and registers the service. The rest of this page is for anyone
             who would rather download one by hand.
@@ -990,11 +996,12 @@ jobs:
 
             ### Windows (x86_64)
 
-            `tentaflow-<tag>-x86_64-pc-windows-msvc-{slim,full-vulkan,full-cuda13}.zip` —
-            unzip and run `tentaflow.exe init-config --output config.toml`, then
-            `tentaflow.exe --config config.toml`. The archive carries the Visual C++
+            `tentaflow-<tag>-x86_64-pc-windows-msvc-{slim,full-vulkan,full-cuda13}.zip`.
+            `install.ps1` installs one as the `TentaFlow` Windows service, together with
+            the GStreamer runtime the `full` archives need; `tentaflow update` (as
+            Administrator) moves it to a newer release. The archive carries the Visual C++
             runtime and, for `full-cuda13`, cuBLAS, so the NVIDIA driver is the only
-            CUDA piece the machine needs. The `full` archives need the GStreamer runtime
-            (MSVC x86_64) on `PATH` — `REQUIREMENTS.txt` inside names the version.
-            There is no Windows installer or `tentaflow update` yet.
+            CUDA piece the machine needs. By hand: install the GStreamer runtime named in
+            `REQUIREMENTS.txt`, unzip, run `tentaflow.exe init-config --output config.toml`,
+            then `tentaflow.exe --config config.toml`.
           generate_release_notes: true

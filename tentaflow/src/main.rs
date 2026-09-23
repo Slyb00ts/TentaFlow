@@ -22,6 +22,8 @@ use tentaflow_core::routing::Router;
 mod mlx_swift_init;
 mod receipt;
 mod service;
+#[cfg(windows)]
+mod windows_host;
 mod update;
 
 // =============================================================================
@@ -65,11 +67,16 @@ struct Args {
     /// Verbose logging (ustawia RUST_LOG=debug)
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
+
+    /// Run under the Windows Service Control Manager. install.ps1 puts it in
+    /// the registered service command line; it is not for interactive use.
+    #[arg(long = "windows-service", hide = true)]
+    windows_service: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
 enum Subcommand {
-    /// Uruchamia usluge TentaFlow (systemd / launchd)
+    /// Uruchamia usluge TentaFlow (systemd / launchd / usluga Windows)
     Start,
     /// Zatrzymuje usluge TentaFlow
     Stop,
@@ -169,6 +176,19 @@ fn main() -> Result<()> {
         return run_subcommand(cmd, args.verbose);
     }
 
+    if args.windows_service {
+        #[cfg(windows)]
+        return windows_host::run(args);
+        #[cfg(not(windows))]
+        anyhow::bail!("--windows-service exists only on Windows");
+    }
+    serve(args)
+}
+
+/// Builds the async runtime and runs the server until a shutdown signal. Shared
+/// by the console and the Windows service, which differ only in who asks for
+/// the shutdown.
+fn serve(args: Args) -> Result<()> {
     // Build the runtime honoring `[server].worker_threads` from the config.
     // The full config is loaded inside run_server (async), but the worker-thread
     // count must be known BEFORE the runtime exists, so peek the file here.
@@ -205,16 +225,24 @@ fn peek_worker_threads(config_path: &std::path::Path) -> usize {
 }
 
 async fn run_server(args: Args) -> Result<()> {
-    // Inicjalizacja loggingu
-    setup_logging(args.verbose)?;
+    // Inicjalizacja loggingu. A Windows service has no console and no journal,
+    // so its log goes to daily files under <home>\logs.
+    let log_dir = args
+        .windows_service
+        .then(|| paths::tentaflow_home().join("logs"));
+    setup_logging(args.verbose, log_dir.as_deref())?;
 
     // Windows Firewall self-check — przy braku regul Allow Inbound dla
     // 8090 TCP+UDP odpala UAC z PowerShell New-NetFirewallRule. Blad nie
     // przerywa startu — server moze dzialac lokalnie nawet bez regul.
     // Osobny watek: monit UAC czeka na czlowieka, a listenery nie moga czekac
     // na jego odpowiedz (headless start, usluga, test bez pulpitu).
+    // A service has no desktop to show that prompt on; install.ps1 creates the
+    // rules itself.
     #[cfg(target_os = "windows")]
-    std::thread::spawn(tentaflow_core::firewall_check::ensure_firewall_rules);
+    if !args.windows_service {
+        std::thread::spawn(tentaflow_core::firewall_check::ensure_firewall_rules);
+    }
 
     // Bootstrap Swift MLX bridge (macOS) — musi sie wykonac PRZED router init,
     // zeby InferenceManager::new() zauwazyl ze MlxSwiftEngine jest dostepny i
@@ -1369,9 +1397,24 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        tokio::signal::ctrl_c().await
+        // A service has no console, and a Ctrl+C handler it cannot install must
+        // not read as a shutdown request: it then waits for the SCM alone.
+        let ctrl_c = async {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => info!("Ctrl+C odebrany"),
+                Err(err) => {
+                    warn!("no console Ctrl+C handler ({err}); waiting for a service stop");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = windows_host::stop_requested() => info!("Service Control Manager: stop requested"),
+        }
+        Ok(())
     }
 }
 
@@ -1379,7 +1422,7 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 // Setup loggingu
 // =============================================================================
 
-fn setup_logging(verbose: bool) -> Result<()> {
+fn setup_logging(verbose: bool, log_dir: Option<&std::path::Path>) -> Result<()> {
     use tracing_subscriber::{fmt, EnvFilter};
 
     // Chcemy widziec tylko NASZE logi (iroh_mesh:, mesh:, meeting:, ...), a nic
@@ -1424,7 +1467,19 @@ fn setup_logging(verbose: bool) -> Result<()> {
     // `static` na cale zycie procesu.
     static LOG_WORKER: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
         std::sync::OnceLock::new();
-    let (non_blocking, worker) = tracing_appender::non_blocking(std::io::stdout());
+    let (non_blocking, worker) = match log_dir {
+        // Two weeks of daily files: enough to look back at an incident, bounded
+        // so a long-running service does not fill the disk.
+        Some(dir) => tracing_appender::non_blocking(
+            tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("tentaflow")
+                .filename_suffix("log")
+                .max_log_files(14)
+                .build(dir)?,
+        ),
+        None => tracing_appender::non_blocking(std::io::stdout()),
+    };
     let _ = LOG_WORKER.set(worker);
 
     fmt()
@@ -1433,6 +1488,7 @@ fn setup_logging(verbose: bool) -> Result<()> {
         .with_thread_ids(false)
         .with_file(true)
         .with_line_number(true)
+        .with_ansi(log_dir.is_none())
         .with_writer(non_blocking)
         .init();
 
@@ -1787,7 +1843,7 @@ fn log_config_summary(config: &NodeConfig, db_path: &PathBuf) {
 // =============================================================================
 
 fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
-    setup_logging(verbose)?;
+    setup_logging(verbose, None)?;
     match cmd {
         Subcommand::Start => service::start(),
         Subcommand::Stop => service::stop(),

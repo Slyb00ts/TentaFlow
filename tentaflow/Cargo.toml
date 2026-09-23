@@ -60,8 +60,19 @@ reqwest = { workspace = true, features = ["json", "rustls", "blocking"] }
 # rozpakowanie archiwum do nowego katalogu wersji. Te same wersje co w rdzeniu,
 # wiec nie dokladamy osobnego drzewa zaleznosci.
 sha2 = { workspace = true }
+
+# Linux and macOS releases are .tar.gz archives.
+[target.'cfg(unix)'.dependencies]
 flate2 = { workspace = true, default-features = true }
 tar = { workspace = true }
+
+# Windows releases are .zip archives, `current` is an NTFS junction (no
+# symbolic-link privilege needed), and the server runs as a Windows service
+# (Service Control Manager), which is what starts it with the system.
+[target.'cfg(windows)'.dependencies]
+zip = { workspace = true, features = ["deflate"] }
+windows-service = { workspace = true }
+junction = { workspace = true }
 
 # MLX inference — tylko na macOS. Implementacja przez Swift bridge
 # (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i

@@ -3,9 +3,10 @@
 // =============================================================================
 //
 // A thin, honest wrapper over the platform service manager. TentaFlow runs as a
-// systemd unit (Linux) or a launchd agent (macOS); these subcommands drive that
-// manager rather than reimplementing process supervision, so a service started
-// here is the same service the machine starts at boot.
+// systemd unit (Linux), a launchd daemon (macOS) or a Windows service; these
+// subcommands drive that manager rather than reimplementing process
+// supervision, so a service started here is the same service the machine starts
+// at boot.
 //
 // Scope is discovered from where the unit actually lives — a user install
 // (`systemctl --user`) must not silently fall back to the system manager and
@@ -34,6 +35,10 @@ pub enum Manager {
     LaunchdDaemon,
     /// launchd agent — ~/Library/LaunchAgents/ai.tentaflow.plist (user install)
     LaunchdAgent,
+    /// Windows service `TentaFlow`, registered by install.ps1 with the Service
+    /// Control Manager and started automatically at boot.
+    #[cfg(windows)]
+    WindowsService,
 }
 
 impl Manager {
@@ -66,6 +71,9 @@ fn config_candidates(receipt: Option<&InstallReceipt>) -> Vec<PathBuf> {
         out.push(r.config.clone());
     }
     out.push(PathBuf::from("/etc/tentaflow/config.toml"));
+    if let Some(data) = std::env::var_os("ProgramData") {
+        out.push(PathBuf::from(data).join("TentaFlow").join("config.toml"));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             out.push(dir.join("config.toml"));
@@ -105,6 +113,13 @@ fn launchd_plist_path(manager: Manager) -> Option<PathBuf> {
 }
 
 /// Finds the manager that actually owns this installation.
+#[cfg(windows)]
+pub fn detect() -> Option<Manager> {
+    scm::installed().then_some(Manager::WindowsService)
+}
+
+/// Finds the manager that actually owns this installation.
+#[cfg(not(windows))]
 pub fn detect() -> Option<Manager> {
     if cfg!(target_os = "macos") {
         if launchd_daemon_path().exists() {
@@ -126,7 +141,8 @@ pub fn detect() -> Option<Manager> {
 fn not_installed() -> anyhow::Error {
     anyhow!(
         "TentaFlow is not registered as a service on this machine.\n\
-         Install it with install.sh, or run the server yourself: tentaflow --config <file>"
+         Install it with install.sh (Linux, macOS) or install.ps1 (Windows), or run the \
+         server yourself: tentaflow --config <file>"
     )
 }
 
@@ -179,6 +195,8 @@ pub fn is_active() -> bool {
                 .map(|s| s.success())
                 .unwrap_or(false)
         }
+        #[cfg(windows)]
+        Manager::WindowsService => scm::query().is_ok_and(|s| s.running),
         m => launchd_pid(m).is_some(),
     }
 }
@@ -190,6 +208,11 @@ pub fn start() -> Result<()> {
             if !status.success() {
                 return Err(anyhow!("systemctl start failed ({status})"));
             }
+            println!("TentaFlow started.");
+        }
+        #[cfg(windows)]
+        Manager::WindowsService => {
+            scm::start()?;
             println!("TentaFlow started.");
         }
         m => {
@@ -213,6 +236,11 @@ pub fn stop() -> Result<()> {
             }
             println!("TentaFlow stopped.");
         }
+        #[cfg(windows)]
+        Manager::WindowsService => {
+            scm::stop()?;
+            println!("TentaFlow stopped.");
+        }
         m => {
             let status = launchctl(m, &["bootout", &m.launchd_target()], None)?;
             if !status.success() {
@@ -231,6 +259,13 @@ pub fn restart() -> Result<()> {
             if !status.success() {
                 return Err(anyhow!("systemctl restart failed ({status})"));
             }
+            println!("TentaFlow restarted.");
+            Ok(())
+        }
+        #[cfg(windows)]
+        Manager::WindowsService => {
+            scm::stop()?;
+            scm::start()?;
             println!("TentaFlow restarted.");
             Ok(())
         }
@@ -386,8 +421,32 @@ pub fn status() -> Result<()> {
     }
     match manager {
         None => {
-            println!("  service:   NOT REGISTERED (no systemd unit / launchd agent)");
+            println!(
+                "  service:   NOT REGISTERED (no systemd unit / launchd daemon / Windows service)"
+            );
         }
+        #[cfg(windows)]
+        Some(Manager::WindowsService) => match scm::query() {
+            Ok(state) => {
+                println!(
+                    "  service:   Windows service {}, {}",
+                    windows_host_name(),
+                    state.state
+                );
+                if let Some(pid) = state.pid {
+                    println!("  PID:       {pid}");
+                }
+                println!(
+                    "  autostart: {}",
+                    if state.autostart {
+                        "at system start"
+                    } else {
+                        "off  (will not come up after a reboot)"
+                    }
+                );
+            }
+            Err(err) => println!("  service:   Windows service, state unknown ({err:#})"),
+        },
         Some(m @ (Manager::LaunchdDaemon | Manager::LaunchdAgent)) => {
             let scope = if m == Manager::LaunchdDaemon {
                 "launchd (daemon)"
@@ -454,6 +513,106 @@ pub fn status() -> Result<()> {
         None => println!("  health:    no response"),
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_host_name() -> &'static str {
+    crate::windows_host::SERVICE_NAME
+}
+
+/// The Windows service, through the Service Control Manager. Starting and
+/// stopping need an elevated process (the service's security descriptor grants
+/// them to Administrators); querying does not.
+#[cfg(windows)]
+mod scm {
+    use std::ffi::OsStr;
+    use std::time::{Duration, Instant};
+
+    use anyhow::{anyhow, bail, Context, Result};
+    use windows_service::service::{Service, ServiceAccess, ServiceStartType, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    use crate::windows_host::SERVICE_NAME;
+
+    pub struct State {
+        pub running: bool,
+        pub state: String,
+        pub pid: Option<u32>,
+        pub autostart: bool,
+    }
+
+    fn open(access: ServiceAccess) -> Result<Service> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .context("connecting to the Service Control Manager")?;
+        manager.open_service(SERVICE_NAME, access).map_err(|err| {
+            if matches!(&err, windows_service::Error::Winapi(io)
+                if io.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                anyhow!("access denied to the {SERVICE_NAME} service — run this in a terminal started as Administrator")
+            } else {
+                anyhow!(err).context(format!("opening the {SERVICE_NAME} service"))
+            }
+        })
+    }
+
+    pub fn installed() -> bool {
+        open(ServiceAccess::QUERY_STATUS).is_ok()
+    }
+
+    pub fn query() -> Result<State> {
+        let service = open(ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)?;
+        let status = service
+            .query_status()
+            .context("querying the service state")?;
+        let autostart = service
+            .query_config()
+            .map(|c| c.start_type == ServiceStartType::AutoStart)
+            .unwrap_or(false);
+        Ok(State {
+            running: status.current_state == ServiceState::Running,
+            state: format!("{:?}", status.current_state).to_lowercase(),
+            pid: status.process_id,
+            autostart,
+        })
+    }
+
+    /// Waits for the service to settle, because both verbs only queue a
+    /// request: `update` must not swap the version directory under a process
+    /// that is still shutting down.
+    fn wait_for(service: &Service, want: ServiceState, limit: Duration) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let state = service.query_status()?.current_state;
+            if state == want {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("the service is still {state:?} after {}s", limit.as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    pub fn start() -> Result<()> {
+        let service = open(ServiceAccess::START | ServiceAccess::QUERY_STATUS)?;
+        if service.query_status()?.current_state == ServiceState::Running {
+            return Ok(());
+        }
+        service
+            .start(&[] as &[&OsStr])
+            .context("starting the service")?;
+        wait_for(&service, ServiceState::Running, Duration::from_secs(60))
+    }
+
+    pub fn stop() -> Result<()> {
+        let service = open(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        service.stop().context("stopping the service")?;
+        // The graceful path stops deployed engines and flushes the databases.
+        wait_for(&service, ServiceState::Stopped, Duration::from_secs(180))
+    }
 }
 
 #[cfg(test)]

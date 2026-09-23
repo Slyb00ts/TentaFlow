@@ -14,7 +14,9 @@
 #              Each archive is staged by scripts/release/stage-windows.py, which
 #              closes the DLL set over the PE import tables, then started from
 #              the extracted ZIP with only System32 (plus GStreamer for `full`)
-#              on PATH by scripts/release/smoke-windows.ps1.
+#              on PATH by scripts/release/smoke-windows.ps1. The `install` job
+#              then installs each archive with scripts/install/install.ps1 on a
+#              clean runner and removes it with uninstall.ps1.
 # =============================================================================
 name: build-windows
 
@@ -33,6 +35,8 @@ on:
       - "scripts/native-libs/**"
       - "scripts/build-zvec.sh"
       - "scripts/release/**"
+      - "scripts/install/*.ps1"
+      - "tentaflow/src/{windows_host,service,update,receipt}.rs"
       - "tentaflow/build.rs"
       - "tentaflow-core/build.rs"
       - "tentaflow-zvec-sys/build.rs"
@@ -268,7 +272,8 @@ jobs:
           }
           if ($env:GSTREAMER_1_0_ROOT_MSVC_X86_64) {
             $stageArgs += @('--gstreamer-bin', (Join-Path $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 'bin'),
-                            '--gstreamer-version', $env:GSTREAMER_VERSION)
+                            '--gstreamer-version', $env:GSTREAMER_VERSION,
+                            '--gstreamer-sha256', $env:GSTREAMER_SHA256_WINDOWS_X86_64)
           }
           python scripts\release\stage-windows.py @stageArgs
           exit $LASTEXITCODE
@@ -288,3 +293,82 @@ jobs:
           path: |
             dist/tentaflow-*.zip
             dist/tentaflow-*.zip.sha256
+
+  # ---------------------------------------------------------------------------
+  # The installer, on a runner that never ran setup.ps1: no GStreamer, no
+  # toolchain, so install.ps1 must bring the runtime itself, exactly as on a
+  # user's machine. The second run is an upgrade over a running service (stop,
+  # junction swap, kept config); the CLI then drives the service through the
+  # SCM, and uninstall.ps1 must leave nothing registered.
+  # ---------------------------------------------------------------------------
+  install:
+    name: install (windows-x86_64, ${{ matrix.asset }})
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { asset: slim, edition: slim, variant: "" }
+          - { asset: full-vulkan, edition: full, variant: vulkan }
+          - { asset: full-cuda13, edition: full, variant: cuda13 }
+    env:
+      TENTAFLOW_EDITION: ${{ matrix.edition }}
+      TENTAFLOW_VARIANT: ${{ matrix.variant }}
+    defaults:
+      run:
+        # Windows PowerShell 5.1, the one every Windows ships and the one the
+        # documented `irm | iex` runs in; pwsh forgives things 5.1 does not.
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tentaflow-windows-x86_64-${{ matrix.asset }}
+          path: dist
+
+      - name: Install the way the documented one-liner does
+        run: |
+          $env:TENTAFLOW_ASSET_FILE = (Get-ChildItem dist\*.zip | Select-Object -First 1).FullName
+          # The raw bytes decoded as irm decodes them: a BOM would survive into
+          # the string and break iex on the first line.
+          Invoke-Expression ([Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes("$PWD\scripts\install\install.ps1")))
+
+      - name: Install again over the running service
+        run: |
+          $env:TENTAFLOW_ASSET_FILE = (Get-ChildItem dist\*.zip | Select-Object -First 1).FullName
+          .\scripts\install\install.ps1
+
+      - name: The service and the CLI agree
+        run: |
+          $service = Get-Service TentaFlow
+          if ($service.Status -ne 'Running' -or $service.StartType -ne 'Automatic') {
+            Write-Host "::error::service is $($service.Status)/$($service.StartType), expected Running/Automatic"; exit 1
+          }
+          $exe = Join-Path $env:ProgramFiles 'TentaFlow\current\tentaflow.exe'
+          $status = & $exe status | Out-String
+          Write-Host $status
+          if ($status -notmatch 'health:\s+OK') { Write-Host '::error::tentaflow status does not report a healthy server'; exit 1 }
+          & $exe stop
+          if ($LASTEXITCODE -ne 0 -or (Get-Service TentaFlow).Status -ne 'Stopped') { Write-Host '::error::tentaflow stop'; exit 1 }
+          & $exe start
+          if ($LASTEXITCODE -ne 0 -or (Get-Service TentaFlow).Status -ne 'Running') { Write-Host '::error::tentaflow start'; exit 1 }
+          $versions = @(Get-ChildItem (Join-Path $env:ProgramFiles 'TentaFlow\versions') -Directory)
+          if ($versions.Count -ne 1) { Write-Host "::error::expected one version directory, found $($versions.Count)"; exit 1 }
+
+      - name: Uninstall
+        run: |
+          .\scripts\install\uninstall.ps1 -Purge
+          if (Get-Service TentaFlow -ErrorAction SilentlyContinue) { Write-Host '::error::the service is still registered'; exit 1 }
+          if (Test-Path (Join-Path $env:ProgramFiles 'TentaFlow')) { Write-Host '::error::the prefix is still there'; exit 1 }
+          if (Get-NetFirewallRule -Group TentaFlow -ErrorAction SilentlyContinue) { Write-Host '::error::firewall rules left behind'; exit 1 }
+
+      - name: Service log
+        if: failure()
+        run: |
+          Get-ChildItem (Join-Path $env:ProgramData 'TentaFlow\data\logs') -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "--- $($_.Name)"; Get-Content $_.FullName -Tail 200 }
+          Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, Message

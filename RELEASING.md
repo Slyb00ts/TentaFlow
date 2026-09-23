@@ -48,7 +48,8 @@ The installer:
 2. Downloads the matching archive (`tentaflow-vX.Y.Z-<triple>.tar.gz` / `.zip`).
 3. Verifies SHA-256.
 4. Extracts to `/opt/tentaflow` (Linux), `~/Library/Application Support/TentaFlow` (macOS user install), or `C:\Program Files\TentaFlow` (Windows).
-5. Registers auto-start (systemd unit, launchd agent, or Scheduled Task).
+5. Registers auto-start (systemd unit, launchd daemon, or the `TentaFlow` Windows service;
+   on Windows the `full` edition also gets the GStreamer runtime it links).
 6. Links `tentaflow` into `PATH`.
 
 ## User updates

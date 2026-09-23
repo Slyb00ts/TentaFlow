@@ -71,7 +71,7 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 - `tentanas-helper`'s executing side (root wrapper, configfs, elastic executor) is `cfg(unix)`;
   the catalog compiles everywhere because core links it on Windows too.
 - A full-edition binary needs GStreamer's `bin` on PATH (setup adds it; open a new terminal).
-- The native-libs cache defaults to `%SystemDrive%	entaflow-native`, not a profile path:
+- The native-libs cache defaults to `%SystemDrive%\tentaflow-native`, not a profile path:
   `link.exe` cannot open paths past MAX_PATH (260), and llama.cpp's nested vulkan-shaders-gen
   try-compile adds 165 characters below its build directory, so under `%LOCALAPPDATA%` any
   username longer than ~8 characters failed with LNK1104 on `intermediate.manifest`. The
@@ -89,10 +89,28 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
   CUDA archives. The ZIP is staged by `scripts/release/stage-windows.py`: it closes the DLL
   set over the PE import tables and copies app-local what Windows lacks (Visual C++ runtime
   incl. `VCOMP140` for ggml's OpenMP, cuBLAS + cuBLASLt); an import it cannot place fails the
-  job. GStreamer stays external — the `full` archives carry `REQUIREMENTS.txt` — and
+  job. GStreamer is not bundled: the `full` archives carry `gstreamer.json` (version, official
+  URL, SHA-256 from `GSTREAMER_SHA256_WINDOWS_X86_64`) plus `REQUIREMENTS.txt`, and
   `scripts/release/smoke-windows.ps1` starts the extracted archive with only System32 (plus
   GStreamer) on PATH. pdfium and ONNX Runtime are LoadLibrary'd, so no import table names them;
   they are listed explicitly in the staging script.
+- **Install / service / update** (`scripts/install/install.ps1`, `uninstall.ps1`) keep the
+  install.sh contract: `%ProgramFiles%\TentaFlow\versions\<ver>` behind a `current` NTFS
+  junction, config + `install-receipt.json` in `%ProgramData%\TentaFlow`, home in its `data`.
+  Windows cannot rename an entry over a directory, so installer AND `update.rs` swap the
+  junction by two renames (`current` → `current.old`, `current.new` → `current`, rollback on
+  failure) with the service stopped. The installer runs the GStreamer runtime installer from
+  `gstreamer.json` (checksum-verified, machine-wide — a virtual account cannot see a per-user
+  install). The service `TentaFlow` runs `tentaflow.exe --windows-service` (`windows_host.rs`:
+  SCM dispatcher, Stop/Shutdown → graceful shutdown, logs to `data\logs`) as
+  `NT SERVICE\TentaFlow`, whose PATH is written to the service's own `Environment` value — the
+  SCM keeps its boot-time environment, so a PATH added now reaches it only after a reboot.
+  `%ProgramData%\TentaFlow` drops inherited ACLs (a new ProgramData directory lets every user
+  read it and create files in it); only config and receipt stay readable to Users. Built-in
+  principals go by SID in scripts — their names are localized. `install.ps1` and
+  `uninstall.ps1` are the exception to the BOM rule: they run as `irm … | iex`, and Windows
+  PowerShell 5.1 reads a leading U+FEFF as part of the first command name, so they stay
+  ASCII-only WITHOUT a BOM (the CI `install` job runs them exactly that way).
 
 **Host telemetry on Windows.** `tentaflow-core/src/gpu_telemetry/` is the ONE source of GPU
 numbers there (DXGI for adapters, VRAM totals and LUIDs; PDH for dedicated usage and engine

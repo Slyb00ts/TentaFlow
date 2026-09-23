@@ -8,6 +8,7 @@
 
 import argparse
 import hashlib
+import json
 import importlib.util
 import struct
 import tempfile
@@ -105,7 +106,7 @@ class StageTests(unittest.TestCase):
         return argparse.Namespace(
             tag="v0.3.0", asset=asset, edition=edition, out=str(self.out), native=str(self.native),
             search=[str(self.cuda), str(self.crt)], gstreamer_bin=str(self.gstreamer),
-            gstreamer_version="1.28.6", repo=str(self.repo), dest=str(self.dest),
+            gstreamer_version="1.28.6", gstreamer_sha256="ab" * 32, repo=str(self.repo), dest=str(self.dest),
         )
 
     def full_binaries(self):
@@ -125,6 +126,17 @@ class StageTests(unittest.TestCase):
         self.assertNotIn("vulkan-1.dll", names)
         self.assertEqual(["gstreamer-1.0-0.dll"], external)
         self.assertIn("GStreamer 1.28.6", (root / "REQUIREMENTS.txt").read_text(encoding="utf-8"))
+        spec = json.loads((root / "gstreamer.json").read_text(encoding="utf-8"))
+        self.assertEqual("1.28.6", spec["version"])
+        self.assertEqual("ab" * 32, spec["sha256"])
+        self.assertTrue(spec["url"].endswith("/1.28.6/msvc/gstreamer-1.0-msvc-x86_64-1.28.6.exe"))
+
+    def test_full_without_gstreamer_checksum_is_rejected(self):
+        self.full_binaries()
+        args = self.args()
+        args.gstreamer_sha256 = ""
+        with self.assertRaises(stage_windows.StageError):
+            stage_windows.stage(args)
 
     def test_archive_has_one_root_folder_and_a_matching_checksum(self):
         self.full_binaries()
