@@ -78,7 +78,23 @@ run_step() {
   if [ -n "$ONLY" ] && [ "$ONLY" != "$name" ]; then
     return 0
   fi
-  "$@"
+  if [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+    "$@"
+    return
+  fi
+  # On GitHub Actions the step output is also kept, so a failure can be quoted
+  # in an annotation: reading this repository's job logs needs admin rights.
+  local log code
+  log="$(mktemp)"
+  set +e
+  "$@" 2>&1 | tee "$log"
+  code=${PIPESTATUS[0]}
+  set -e
+  if [ "$code" -ne 0 ]; then
+    echo "::error title=native-libs: $name failed (exit $code)::$(tail -n 30 "$log" | tr -d '\r' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+  fi
+  rm -f "$log"
+  return "$code"
 }
 
 # Kroki per platforma. iOS NIE linkuje whisper.cpp i NIE buduje onnxruntime ze
