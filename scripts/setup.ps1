@@ -485,11 +485,17 @@ function Verify-Installation {
         Log-Error 'LIBCLANG_PATH does not point at libclang.dll'
         $ok = $false
     }
-    $gst = Invoke-NativeCapture { pkg-config --modversion gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 } | Select-Object -First 1
-    if ($LASTEXITCODE -eq 0 -and $gst -eq $env:GSTREAMER_VERSION) {
-        Log-Ok "GStreamer (pkg-config): $gst"
+    # All output first, exit code second: `| Select-Object -First 1` would stop
+    # the pipeline after the first of three lines and kill pkg-config, leaving
+    # a non-zero $LASTEXITCODE whenever the process had not exited yet.
+    $gstModules = @('gstreamer-1.0', 'gstreamer-app-1.0', 'gstreamer-video-1.0')
+    $gstVersions = @(Invoke-NativeCapture { pkg-config --modversion @gstModules })
+    $gstCode = $LASTEXITCODE
+    $gstWrong = @($gstVersions | Where-Object { $_.Trim() -ne $env:GSTREAMER_VERSION })
+    if ($gstCode -eq 0 -and $gstVersions.Count -eq $gstModules.Count -and $gstWrong.Count -eq 0) {
+        Log-Ok "GStreamer (pkg-config): $($gstVersions[0])"
     } else {
-        Log-Error "GStreamer $env:GSTREAMER_VERSION not visible through pkg-config (got '$gst')"
+        Log-Error "GStreamer $env:GSTREAMER_VERSION not visible through pkg-config for $($gstModules -join ', ') (exit $gstCode, got '$($gstVersions -join ', ')')"
         $ok = $false
     }
     $targets = Invoke-NativeCapture { rustup target list --installed } | Out-String
