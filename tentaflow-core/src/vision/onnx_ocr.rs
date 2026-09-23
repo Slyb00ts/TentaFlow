@@ -240,6 +240,7 @@ impl OnnxOcrEngine {
             None,
             n,
             crate::vision::ort_common::ocr_fp16(),
+            crate::vision::ort_common::EpChain::TensorRtFirst,
         )?;
         Ok(Arc::new(pool))
     }
@@ -272,6 +273,7 @@ impl OnnxOcrEngine {
             None,
             n,
             crate::vision::ort_common::ocr_fp16(),
+            crate::vision::ort_common::EpChain::TensorRtFirst,
         )?;
         Ok(Arc::new(pool))
     }
@@ -307,6 +309,7 @@ impl OnnxOcrEngine {
             None,
             n,
             crate::vision::ort_common::ocr_fp16(),
+            crate::vision::ort_common::EpChain::TensorRtFirst,
         )?;
         Ok(Some(Arc::new(pool)))
     }

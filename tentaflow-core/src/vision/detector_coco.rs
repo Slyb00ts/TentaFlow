@@ -140,10 +140,11 @@ impl CocoDetector {
             // FP16 ok — vehicle and person boxes are coarse and robust to it
             // (head regions for the privacy blur carry a generous margin).
             true,
+            crate::vision::ort_common::EpChain::CudaOnly,
         )
         .map_err(|e| anyhow!("building YOLOX ort session pool of {n} session(s): {e:#}"))?;
         info!(
-            "[coco] loaded {} (backend ort TensorRT→CUDA→CPU, pool={} session(s))",
+            "[coco] loaded {} (backend ort CUDA→CPU, pool={} session(s))",
             onnx_path.display(),
             pool.len()
         );

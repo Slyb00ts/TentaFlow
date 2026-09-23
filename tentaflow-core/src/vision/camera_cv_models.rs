@@ -364,6 +364,41 @@ fn progress_for_sink(sink: LogSink, label: String) -> ProgressFn {
     })
 }
 
+/// Where a camera-CV bundle's non-pinned files are pulled from, most specific
+/// first: an explicit per-deploy URL (wizard "Custom" tab), the admin's
+/// `vision_bundle_base_url` setting, then the engine manifest's
+/// `[[model_preset]] repo`. Each may be a plain release directory
+/// (`<base>/<name>`) or a TentaFlow `/models/manifest/` URL. One resolver for
+/// every install path — the deploy wizard and an addon's settings must pull
+/// from the same place, or the same engine installs differently depending on
+/// which button was pressed.
+pub fn resolve_bundle_base_url(
+    explicit: Option<&str>,
+    manifest: &crate::services::manifest::ServiceManifest,
+) -> String {
+    let explicit = explicit
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let setting = || {
+        crate::db::global_pool()
+            .and_then(|pool| {
+                crate::db::repository::get_setting(&pool, "vision_bundle_base_url")
+                    .ok()
+                    .flatten()
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    explicit.or_else(setting).unwrap_or_else(|| {
+        manifest
+            .model_presets
+            .iter()
+            .map(|p| p.repo.clone())
+            .find(|r| r.starts_with("http"))
+            .unwrap_or_default()
+    })
+}
+
 /// Materializes the camera-CV bundle for `engine_id` into `vision_models_dir()`:
 /// downloads the weights and writes the embedded config sidecars. `base_url`
 /// is either the manifest `[[model_preset]] repo` (a release-dir URL serving

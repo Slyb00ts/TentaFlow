@@ -152,6 +152,7 @@ impl PlateOcr {
                 n,
                 // FP32 — fp16 flips plate glyphs (3↔2, 8↔0). See `ocr_fp16`.
                 crate::vision::ort_common::ocr_fp16(),
+                crate::vision::ort_common::EpChain::TensorRtFirst,
             )?;
             info!(
                 "[ocr_plate] loaded {} ({} slots, vocab {}, {}x{}, backend ort TensorRT→CUDA→CPU, pool={} session(s))",

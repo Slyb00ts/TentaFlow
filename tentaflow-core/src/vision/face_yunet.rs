@@ -100,10 +100,11 @@ impl YuNetDetector {
             // FP32: small, distant faces sit near the score floor, and the
             // model is so small that FP16 buys nothing worth that risk.
             false,
+            crate::vision::ort_common::EpChain::CudaOnly,
         )
         .map_err(|e| anyhow!("building YuNet ort session pool of {n} session(s): {e:#}"))?;
         info!(
-            "[yunet] loaded {} (backend ort TensorRT→CUDA→CPU, pool={} session(s))",
+            "[yunet] loaded {} (backend ort CUDA→CPU, pool={} session(s))",
             onnx_path.display(),
             pool.len()
         );

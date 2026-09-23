@@ -228,6 +228,7 @@ impl AdrOcr {
                 n,
                 // FP32 — fp16 corrupts Kemler/UN digit reads (30/1863 → 20/1066).
                 crate::vision::ort_common::ocr_fp16(),
+                crate::vision::ort_common::EpChain::TensorRtFirst,
             )?;
             tracing::info!(
                 "[adr-ocr] loaded {} (alphabet {} chars, backend ort TensorRT→CUDA→CPU, pool={} session(s))",

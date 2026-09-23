@@ -164,6 +164,7 @@ impl RfDetrDetector {
                 n,
                 // Detector keeps FP16 — localization tolerates it, throughput matters.
                 true,
+                crate::vision::ort_common::EpChain::TensorRtFirst,
             )
             .map_err(|e| {
                 anyhow!(

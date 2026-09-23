@@ -31,8 +31,70 @@ pub fn ensure_ort_dylib() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
         let path = locate_ort_dylib().unwrap_or_else(default_ort_dylib);
+        #[cfg(target_os = "linux")]
+        preload_cuda_provider_deps(&path);
         std::env::set_var("ORT_DYLIB_PATH", &path);
     });
+}
+
+/// cuDNN is what the CUDA provider needs and cannot find on its own.
+#[cfg(target_os = "linux")]
+const CUDNN_SONAME: &str = "libcudnn.so.9";
+
+/// Makes the CUDA execution provider loadable without `LD_LIBRARY_PATH`.
+///
+/// ORT and its providers are `dlopen`ed by absolute path, so the binary's
+/// `RUNPATH` (`$ORIGIN`, where `tentaflow/build.rs` copies cuDNN) does not apply
+/// to them, and the prebuilt CUDA provider's own `RUNPATH` is
+/// `/usr/local/cuda/lib64`, where cuDNN is not installed. The provider then
+/// fails to load and ORT registers the CPU EP instead — silently for most
+/// models (slow), and fatally for one whose input is bound as a CUDA device
+/// tensor: the CPU kernel reads the device pointer and segfaults the process.
+///
+/// Loading cuDNN globally first, from the binary's directory or the runtime's,
+/// satisfies the provider's `NEEDED` by soname. cuDNN finds its own sub-libraries
+/// through its `$ORIGIN` rpath. A node without cuDNN anywhere keeps today's
+/// behavior: the provider fails and says why.
+#[cfg(target_os = "linux")]
+fn preload_cuda_provider_deps(ort_path: &std::path::Path) {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+    {
+        dirs.push(exe_dir);
+    }
+    if let Some(ort_dir) = ort_path.parent() {
+        dirs.push(ort_dir.to_path_buf());
+    }
+    let Some(cudnn) = dirs
+        .iter()
+        .map(|d| d.join(CUDNN_SONAME))
+        .find(|p| p.is_file())
+    else {
+        return;
+    };
+    let Ok(c_path) = std::ffi::CString::new(cudnn.to_string_lossy().as_bytes()) else {
+        return;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated path; the handle is kept for
+    // the process lifetime on purpose (the library must stay resident for the
+    // provider), so it is never closed.
+    let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        // SAFETY: dlerror returns a thread-local, NUL-terminated message or null.
+        let reason = unsafe {
+            let e = libc::dlerror();
+            if e.is_null() {
+                String::from("unknown error")
+            } else {
+                std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned()
+            }
+        };
+        warn!("[ort] preloading {} failed: {reason}", cudnn.display());
+    } else {
+        info!("[ort] preloaded {} for the CUDA provider", cudnn.display());
+    }
 }
 
 /// Windows: `onnxruntime.dll` obok binarki (tentaflow/build.rs kopiuje go tam),
@@ -637,6 +699,7 @@ pub fn build_session_pool_from_file(
     trt_profile: Option<&TrtShapeProfile>,
     n: usize,
     fp16: bool,
+    providers: EpChain,
 ) -> Result<SessionPool> {
     let n = n.clamp(1, MAX_SESSIONS_PER_MODEL);
     // Self-heal an ONNX external-data name mismatch before ANY session opens the
@@ -653,13 +716,25 @@ pub fn build_session_pool_from_file(
         move |i: usize| -> Result<ort::session::Session> {
             let device_id = gpus[i % gpus.len()];
             let subdir = session_cache_subdir(device_id, i);
-            build_ort_session(
-                &model_path,
-                &cache_root.join(subdir),
-                trt_profile.as_ref(),
-                device_id,
-                fp16,
-            )
+            match providers {
+                EpChain::TensorRtFirst => build_ort_session(
+                    &model_path,
+                    &cache_root.join(subdir),
+                    trt_profile.as_ref(),
+                    device_id,
+                    fp16,
+                ),
+                EpChain::CudaOnly => session_builder_with_eps(
+                    &cache_root.join(subdir),
+                    None,
+                    device_id,
+                    fp16,
+                    false,
+                    true,
+                )?
+                .commit_from_file(&model_path)
+                .map_err(|e| anyhow!("ort commit_from_file {}: {e}", model_path.display())),
+            }
             .map_err(|e| anyhow!("session slot {i} on GPU device {device_id}: {e:#}"))
         }
     };
@@ -695,6 +770,20 @@ pub fn build_session_pool_from_file(
     })
 }
 
+/// Which execution providers a session pool registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpChain {
+    /// TensorRT → CUDA → CPU: the default for the batch detectors, where an
+    /// engine build pays for itself.
+    TensorRtFirst,
+    /// CUDA → CPU only. For graphs whose input is bound as a CUDA device tensor:
+    /// with TensorRT registered, ORT partitions YOLOX's leading `Slice` (Focus)
+    /// nodes onto the CPU EP, and the CPU kernel then reads the device pointer
+    /// directly — a segfault in `SliceImpl` on GB10, observed on a live robot
+    /// feed. A 416×416 detector also gains little from an engine build.
+    CudaOnly,
+}
+
 /// Buduje sesję `ort` z modelu ONNX, rejestrując łańcuch execution providerów w
 /// kolejności priorytetu z MIĘKKĄ rejestracją (bez `error_on_failure`): jeśli dany
 /// EP jest niedostępny w załadowanym runtime, `ort` loguje ostrzeżenie i przechodzi
@@ -718,7 +807,7 @@ pub fn build_ort_session(
     fp16: bool,
 ) -> Result<ort::session::Session> {
     let build = |with_trt: bool| -> Result<ort::session::Session> {
-        session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16, with_trt)?
+        session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16, with_trt, false)?
             .commit_from_file(model_path)
             .map_err(|e| anyhow!("ort commit_from_file {}: {e}", model_path.display()))
     };
@@ -764,7 +853,7 @@ pub fn build_ort_session_from_memory(
     fp16: bool,
 ) -> Result<ort::session::Session> {
     let build = |with_trt: bool| -> Result<ort::session::Session> {
-        session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16, with_trt)?
+        session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16, with_trt, false)?
             .commit_from_memory(model_bytes)
             .map_err(|e| anyhow!("ort commit_from_memory: {e}"))
     };
@@ -787,6 +876,7 @@ fn session_builder_with_eps(
     device_id: i32,
     fp16: bool,
     with_tensorrt: bool,
+    cuda_required: bool,
 ) -> Result<ort::session::builder::SessionBuilder> {
     use ort::ep::{ExecutionProvider, ExecutionProviderDispatch};
     use ort::session::Session;
@@ -847,11 +937,17 @@ fn session_builder_with_eps(
         // bo poprzedza ją TensorRT. Ten sam `device_id` co TRT, żeby zejście
         // TRT→CUDA zostało na tej samej karcie. Rejestrowana ZAWSZE, także przy
         // ponowieniu bez TensorRT — wtedy jest pierwszym wyborem.
-        eps.push(ort::ep::CUDA::default().with_device_id(device_id).build());
+        let cuda = ort::ep::CUDA::default().with_device_id(device_id).build();
+        // A session whose input is bound as a CUDA device tensor has no other
+        // place to run: if CUDA silently failed to register, ORT would run it on
+        // the CPU EP, which reads the device pointer directly and segfaults the
+        // whole process. For those, fail the session build instead, with ORT's
+        // reason, and let the caller degrade.
+        eps.push(if cuda_required { cuda.error_on_failure() } else { cuda });
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (trt_cache_dir, trt_profile, device_id, with_tensorrt);
+        let _ = (trt_cache_dir, trt_profile, device_id, with_tensorrt, cuda_required);
         // CoreML (Metal/ANE) — akceleracja na Apple Silicon.
         eps.push(ort::ep::CoreML::default().build());
     }

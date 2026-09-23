@@ -85,38 +85,12 @@ impl EmbeddedDeploy {
         // engine, not tract `LoadedEngine`s. Deploy only fetches the bundle into
         // `vision_models_dir()`; the runner loads itself on first camera tick.
         if crate::vision::camera_cv_models::is_camera_cv_engine(&engine_id) {
-            // Pull-source resolution, most specific first:
-            //   1. per-deploy config `vision_bundle_url` (wizard "Custom" tab),
-            //   2. Settings key `vision_bundle_base_url`,
-            //   3. manifest `[[model_preset]] repo`.
-            // Each accepts either a plain release-dir base URL (files at
-            // `<base>/<name>`) or a TentaFlow manifest URL containing
-            // `/models/manifest/` (files pulled via per-file urls + sha256
-            // verify, optionally authenticated with the resolved Bearer key).
             let config_url = self
                 .user_config
                 .get(crate::services::deploy::VISION_BUNDLE_URL_CONFIG_KEY)
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let override_url = config_url.or_else(|| {
-                crate::db::global_pool()
-                    .and_then(|pool| {
-                        crate::db::repository::get_setting(&pool, "vision_bundle_base_url")
-                            .ok()
-                            .flatten()
-                    })
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            });
-            let base_url = override_url.unwrap_or_else(|| {
-                self.manifest
-                    .model_presets
-                    .iter()
-                    .map(|p| p.repo.clone())
-                    .find(|r| r.starts_with("http"))
-                    .unwrap_or_default()
-            });
+                .and_then(|v| v.as_str());
+            let base_url =
+                crate::vision::camera_cv_models::resolve_bundle_base_url(config_url, &self.manifest);
             crate::vision::camera_cv_models::ensure_bundle(
                 &engine_id,
                 &base_url,
