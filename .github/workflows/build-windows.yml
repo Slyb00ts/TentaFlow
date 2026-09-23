@@ -59,9 +59,8 @@ jobs:
   # ---------------------------------------------------------------------------
   native-libs:
     name: native-libs (windows-x86_64, ${{ matrix.backend }})
-    # windows-2025 because it has winget, which setup.ps1 installs through
-    # (windows-2022 has none). Its Visual Studio is 2026; setup.ps1 adds the
-    # 2022 Build Tools beside it, since the scripts build with 2022 only.
+    # windows-2025 because it has winget, which setup.ps1 installs through;
+    # windows-2022 has none.
     runs-on: windows-2025
     timeout-minutes: 360
     strategy:
@@ -151,8 +150,8 @@ jobs:
   build:
     name: build (windows-x86_64, ${{ matrix.asset }})
     needs: native-libs
-    # Same image and toolset as native-libs: the static libraries and the
-    # Rust code must meet one MSVC toolset at link time.
+    # Same image as native-libs: the static libraries and the Rust code must
+    # meet one MSVC toolset at link time.
     runs-on: windows-2025
     timeout-minutes: 360
     strategy:

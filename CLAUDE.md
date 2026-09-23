@@ -63,11 +63,7 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 - `.ps1` files carry a UTF-8 BOM: PowerShell 5.1 reads BOM-less files as ANSI and an em dash
   becomes a quote character. `build.ps1` is deliberately NOT an advanced script — with
   `[CmdletBinding]` cargo's `-p` binds to `-PipelineVariable`.
-- MSVC comes from vswhere (any edition), never from hard-coded paths, and it is VS 2022 even
-  when a newer one is installed (`Get-VsInstallPath` asks for `[17.0,18.0)`; `setup.ps1` adds
-  2022 Build Tools beside a newer VS): CUDA 13.3 is released for it, and on VS 2026 (MSVC
-  14.5x) the try-compile of llama.cpp's nested vulkan-shaders-gen project fails with LNK1104 on
-  its manifest. CI runs on windows-2025 for its winget (windows-2022 has none). Pins are
+- MSVC comes from vswhere (VS 2022+, any edition), never from hard-coded paths. Pins are
   capped by their consumers, not by "newest": CUDA ≤ what `cudarc` knows (13.3), WASI SDK =
   what NativeAOT-LLVM expects (29.0), TensorRT 10 because the ORT EP links `nvinfer_10`.
   `cuda.lib` of CUDA 13.3 requests LIBCMT; `/NODEFAULTLIB:libcmt.lib` goes in the whisper DLL
@@ -75,6 +71,11 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 - `tentanas-helper`'s executing side (root wrapper, configfs, elastic executor) is `cfg(unix)`;
   the catalog compiles everywhere because core links it on Windows too.
 - A full-edition binary needs GStreamer's `bin` on PATH (setup adds it; open a new terminal).
+- The native-libs cache defaults to `%SystemDrive%	entaflow-native`, not a profile path:
+  `link.exe` cannot open paths past MAX_PATH (260), and llama.cpp's nested vulkan-shaders-gen
+  try-compile adds 165 characters below its build directory, so under `%LOCALAPPDATA%` any
+  username longer than ~8 characters failed with LNK1104 on `intermediate.manifest`. The
+  default lives in three places that must agree: `common.sh`, `windows.ps1`, `tentaflow-core/build.rs`.
 - `setup.ps1` pins `PKG_CONFIG` to the pkg-config-lite it installs. The first `pkg-config` on
   PATH is often another one — GitHub's Windows image carries Strawberry Perl's, which answers
   `--modversion a b c` with the first module only — and `gstreamer-sys` would use it.

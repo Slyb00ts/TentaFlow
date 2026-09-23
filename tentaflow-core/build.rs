@@ -591,16 +591,17 @@ fn resolve_wasi_sdk() -> Option<PathBuf> {
     let cache_root = std::env::var("TENTAFLOW_NATIVE_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let base = if cfg!(windows) {
-                PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
+            if cfg!(windows) {
+                let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+                PathBuf::from(format!("{drive}\\")).join("tentaflow-native")
             } else {
                 std::env::var("XDG_CACHE_HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| {
                         PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache")
                     })
-            };
-            base.join("tentaflow-native-libs")
+                    .join("tentaflow-native-libs")
+            }
         });
     let version = pinned_version("WASI_SDK_VERSION")?;
     let prefix = format!("wasi-sdk-{version}-");

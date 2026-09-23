@@ -27,7 +27,12 @@ is_windows_host() {
 # falls back to), never %TEMP%, which Storage Sense empties.
 default_native_cache() {
   if is_windows_host; then
-    printf '%s/tentaflow-native-libs\n' "$(cygpath -u "$LOCALAPPDATA")"
+    # The drive root, not %LOCALAPPDATA%: link.exe cannot open paths past
+    # MAX_PATH (260), and llama.cpp's nested vulkan-shaders-gen try-compile
+    # alone adds 165 characters below the build directory, so a profile path
+    # with a username longer than ~8 characters breaks the Vulkan build.
+    local drive="${SYSTEMDRIVE:-C:}"
+    printf '/%s/tentaflow-native\n' "$(printf '%s' "${drive%:}" | tr 'A-Z' 'a-z')"
   else
     printf '%s/tentaflow-native-libs\n' "${XDG_CACHE_HOME:-$HOME/.cache}"
   fi
