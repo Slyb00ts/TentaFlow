@@ -92,7 +92,12 @@ jobs:
 
       - name: Toolchain (scripts\setup.ps1 ${{ matrix.setup }})
         if: steps.cache.outputs.cache-hit != 'true'
-        run: .\scripts\setup.ps1 ${{ matrix.setup }}
+        run: |
+          # A thrown error becomes an annotation: job logs need admin rights.
+          try { .\scripts\setup.ps1 ${{ matrix.setup }} } catch {
+            Write-Host "::error::setup.ps1: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))"
+            exit 1
+          }
 
       - name: Build native-libs
         if: steps.cache.outputs.cache-hit != 'true'
@@ -102,7 +107,11 @@ jobs:
           ONNXRUNTIME_GPU: "0"
           # A runner has no GPU to detect an architecture from.
           CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda_archs }}
-        run: .\scripts\native-libs\build-all.ps1 -Backend ${{ matrix.backend }}
+        run: |
+          try { .\scripts\native-libs\build-all.ps1 -Backend ${{ matrix.backend }} } catch {
+            Write-Host "::error::build-all.ps1: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))"
+            exit 1
+          }
 
       - name: The requested backend must actually be in the artifact
         run: |
@@ -194,7 +203,11 @@ jobs:
           path: native-libs/windows-x86_64
 
       - name: Toolchain (scripts\setup.ps1 ${{ matrix.setup }})
-        run: .\scripts\setup.ps1 ${{ matrix.setup }}
+        run: |
+          try { .\scripts\setup.ps1 ${{ matrix.setup }} } catch {
+            Write-Host "::error::setup.ps1: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))"
+            exit 1
+          }
 
       - name: Cache cargo
         uses: actions/cache@v4
