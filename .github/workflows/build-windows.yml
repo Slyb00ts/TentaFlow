@@ -59,12 +59,10 @@ jobs:
   # ---------------------------------------------------------------------------
   native-libs:
     name: native-libs (windows-x86_64, ${{ matrix.backend }})
-    # windows-2022, not 2025: the 2025 image ships Visual Studio 2026
-    # (MSVC 14.5x), where the try-compile of llama.cpp's nested
-    # vulkan-shaders-gen project fails to link (LNK1104 on its manifest). The
-    # pinned CUDA 13.3 is released for Visual Studio 2022, which is also the
-    # toolchain every Windows build here was verified with.
-    runs-on: windows-2022
+    # windows-2025 because it has winget, which setup.ps1 installs through
+    # (windows-2022 has none). Its Visual Studio is 2026; setup.ps1 adds the
+    # 2022 Build Tools beside it, since the scripts build with 2022 only.
+    runs-on: windows-2025
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -153,9 +151,9 @@ jobs:
   build:
     name: build (windows-x86_64, ${{ matrix.asset }})
     needs: native-libs
-    # Same image as native-libs: the static libraries and the Rust code must
-    # meet one MSVC toolset at link time.
-    runs-on: windows-2022
+    # Same image and toolset as native-libs: the static libraries and the
+    # Rust code must meet one MSVC toolset at link time.
+    runs-on: windows-2025
     timeout-minutes: 360
     strategy:
       fail-fast: false

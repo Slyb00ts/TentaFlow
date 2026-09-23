@@ -63,10 +63,11 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 - `.ps1` files carry a UTF-8 BOM: PowerShell 5.1 reads BOM-less files as ANSI and an em dash
   becomes a quote character. `build.ps1` is deliberately NOT an advanced script — with
   `[CmdletBinding]` cargo's `-p` binds to `-PipelineVariable`.
-- MSVC comes from vswhere (any edition), never from hard-coded paths. The toolset is VS 2022:
-  CUDA 13.3 is released for it, and on VS 2026 (MSVC 14.5x, e.g. GitHub's windows-2025 image)
-  the try-compile of llama.cpp's nested vulkan-shaders-gen project fails with LNK1104 on its
-  manifest, so CI runs on windows-2022. Pins are
+- MSVC comes from vswhere (any edition), never from hard-coded paths, and it is VS 2022 even
+  when a newer one is installed (`Get-VsInstallPath` asks for `[17.0,18.0)`; `setup.ps1` adds
+  2022 Build Tools beside a newer VS): CUDA 13.3 is released for it, and on VS 2026 (MSVC
+  14.5x) the try-compile of llama.cpp's nested vulkan-shaders-gen project fails with LNK1104 on
+  its manifest. CI runs on windows-2025 for its winget (windows-2022 has none). Pins are
   capped by their consumers, not by "newest": CUDA ≤ what `cudarc` knows (13.3), WASI SDK =
   what NativeAOT-LLVM expects (29.0), TensorRT 10 because the ORT EP links `nvinfer_10`.
   `cuda.lib` of CUDA 13.3 requests LIBCMT; `/NODEFAULTLIB:libcmt.lib` goes in the whisper DLL

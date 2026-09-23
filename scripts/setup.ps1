@@ -175,8 +175,8 @@ function Install-VisualStudio {
         return
     }
     # The VCTools workload brings MSVC and, with recommended components, the
-    # Windows SDK. Visual Studio 2022 is what the CUDA toolkit pinned in
-    # versions.env supports; any newer VS already installed is accepted above.
+    # Windows SDK. Visual Studio 2022 specifically (scripts\lib\windows.ps1
+    # Get-VsInstallPath explains why): installed next to a newer one, too.
     Install-WingetPackage -Id 'Microsoft.VisualStudio.2022.BuildTools' -Label 'Visual Studio 2022 Build Tools' `
         -Override '--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
     if (-not (Get-VsInstallPath)) {

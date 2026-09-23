@@ -127,12 +127,15 @@ function Get-VsWherePath {
     return $null
 }
 
-# Newest Visual Studio 2022+ (any edition, Build Tools included) that has the
-# x64 C++ toolset. Found through vswhere, so the install location is irrelevant.
+# Visual Studio 2022 (any edition, Build Tools included) with the x64 C++
+# toolset, found through vswhere. 2022 and not "the newest": the pinned CUDA
+# toolkit is released for it, and on Visual Studio 2026 (MSVC 14.5x) the
+# try-compile of llama.cpp's nested vulkan-shaders-gen project fails to link.
+# A machine with only a newer one gets 2022 Build Tools from setup.ps1.
 function Get-VsInstallPath {
     $vswhere = Get-VsWherePath
     if (-not $vswhere) { return $null }
-    $path = & $vswhere -latest -products * -version '[17.0,)' `
+    $path = & $vswhere -latest -products * -version '[17.0,18.0)' `
         -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
         -property installationPath 2>$null | Select-Object -First 1
     if ($path -and (Test-Path $path)) { return $path }
@@ -143,13 +146,16 @@ function Get-VsInstallPath {
 # this process. cmake + Ninja and nvcc need cl on PATH; cc-rs would find MSVC
 # through the registry, native CMake builds do not.
 function Enter-VsDevEnvironment {
-    if ($env:VCINSTALLDIR -and (Test-Command 'cl.exe') -and ($env:VSCMD_ARG_TGT_ARCH -eq 'x64')) {
-        Log-Ok "MSVC x64 environment already loaded: $env:VCINSTALLDIR"
-        return
-    }
     $vs = Get-VsInstallPath
     if (-not $vs) {
-        throw 'No Visual Studio 2022+ with the C++ x64 toolset found. Run scripts\setup.ps1.'
+        throw 'No Visual Studio 2022 with the C++ x64 toolset found. Run scripts\setup.ps1.'
+    }
+    # A developer prompt of another Visual Studio would hand its toolset to
+    # every build below, so only an environment of this one is reused.
+    if ($env:VCINSTALLDIR -and $env:VCINSTALLDIR.StartsWith($vs, [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-Command 'cl.exe') -and ($env:VSCMD_ARG_TGT_ARCH -eq 'x64')) {
+        Log-Ok "MSVC x64 environment already loaded: $env:VCINSTALLDIR"
+        return
     }
     $launcher = Join-Path $vs 'Common7\Tools\Launch-VsDevShell.ps1'
     if (-not (Test-Path $launcher)) { throw "Missing $launcher" }
