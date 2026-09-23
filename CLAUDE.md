@@ -71,6 +71,9 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 - `tentanas-helper`'s executing side (root wrapper, configfs, elastic executor) is `cfg(unix)`;
   the catalog compiles everywhere because core links it on Windows too.
 - A full-edition binary needs GStreamer's `bin` on PATH (setup adds it; open a new terminal).
+- `setup.ps1` pins `PKG_CONFIG` to the pkg-config-lite it installs. The first `pkg-config` on
+  PATH is often another one — GitHub's Windows image carries Strawberry Perl's, which answers
+  `--modversion a b c` with the first module only — and `gstreamer-sys` would use it.
 - The firewall self-check runs on its own thread: its UAC prompt waits for a human, and the
   listeners must not.
 - **Release archives** come from `.github/workflows/build-windows.yml` (called by
