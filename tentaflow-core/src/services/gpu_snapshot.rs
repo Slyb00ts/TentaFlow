@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: services/gpu_snapshot.rs
-// Opis: Lekki nvidia-smi snapshot per call. Używany przez Edit Service modal /
+// Opis: Lekki nvidia-smi snapshot per call (Windows: procesy z gpu_telemetry). Używany przez Edit Service modal /
 //       Deploy Wizard Advanced step do pokazywania user'owi co AKTUALNIE
 //       zajmuje GPU (sunshine, chrome itp.) oraz do liczenia recommended
 //       gpu_memory_utilization który *uwzględnia* external usage.
@@ -71,6 +71,12 @@ fn collect_blocking(target_idx: Option<u32>, exclude_pids: &[u32]) -> Vec<GpuVra
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
+    // Under WDDM nvidia-smi prints `[N/A]` for per-process memory and lists only
+    // compute clients, so Windows takes the process list from OS accounting.
+    #[cfg(target_os = "windows")]
+    let procs_by_uuid = windows_processes_by_uuid(&gpus)
+        .unwrap_or_else(|| query_compute_apps().unwrap_or_default());
+    #[cfg(not(target_os = "windows"))]
     let procs_by_uuid = query_compute_apps().unwrap_or_default();
 
     gpus.into_iter()
@@ -170,7 +176,11 @@ fn query_compute_apps() -> Result<Vec<(String, Vec<GpuProcessInfo>)>> {
             continue;
         }
         let process_name = cols[2].to_string();
-        let used_mib: u64 = cols[3].parse().unwrap_or(0);
+        // `[N/A]` = the driver does not account per process; such a row says
+        // nothing about memory and would read as a free GPU.
+        let Ok(used_mib) = cols[3].parse::<u64>() else {
+            continue;
+        };
         map.entry(uuid).or_default().push(GpuProcessInfo {
             pid,
             process_name,
@@ -178,6 +188,51 @@ fn query_compute_apps() -> Result<Vec<(String, Vec<GpuProcessInfo>)>> {
         });
     }
     Ok(map.into_iter().collect())
+}
+
+/// Per-process dedicated VRAM from `gpu_telemetry`, keyed like the nvidia-smi
+/// list. Cards are matched by name and ordinal among same-named cards. `None`
+/// while the sampler has no snapshot yet.
+#[cfg(target_os = "windows")]
+fn windows_processes_by_uuid(
+    gpus: &[GpuInventoryRow],
+) -> Option<Vec<(String, Vec<GpuProcessInfo>)>> {
+    const MIB: u64 = 1024 * 1024;
+    let telemetry = crate::gpu_telemetry::snapshot()?;
+
+    let pids: Vec<sysinfo::Pid> = telemetry
+        .processes
+        .iter()
+        .map(|p| sysinfo::Pid::from_u32(p.pid))
+        .collect();
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for g in gpus {
+        let ordinal = seen.entry(g.name.as_str()).or_insert(0);
+        let adapter = telemetry.adapter_by_name(&g.name, *ordinal);
+        *ordinal += 1;
+        let Some(adapter) = adapter else {
+            continue;
+        };
+        let procs = telemetry
+            .processes
+            .iter()
+            .filter(|p| p.luid == adapter.luid && p.dedicated_bytes >= MIB)
+            .map(|p| GpuProcessInfo {
+                pid: p.pid,
+                process_name: system
+                    .process(sysinfo::Pid::from_u32(p.pid))
+                    .map(|proc_| proc_.name().to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                used_mib: p.dedicated_bytes / MIB,
+            })
+            .collect();
+        out.push((g.uuid.clone(), procs));
+    }
+    Some(out)
 }
 
 #[cfg(test)]

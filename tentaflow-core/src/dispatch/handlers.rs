@@ -269,8 +269,14 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             .map_err(db_err)?
             .ok_or_else(|| ProtocolError::internal("jwt_secret not configured"))?;
 
-    let jwt = auth::generate_jwt(&user.id, &user.username, &jwt_secret, 24, user.must_change_password)
-        .map_err(|e| ProtocolError::internal(format!("jwt generation failed: {}", e)))?;
+    let jwt = auth::generate_jwt(
+        &user.id,
+        &user.username,
+        &jwt_secret,
+        24,
+        user.must_change_password,
+    )
+    .map_err(|e| ProtocolError::internal(format!("jwt generation failed: {}", e)))?;
 
     // Zaktualizuj last_login_at (best effort — log w razie bledu, nie failuj logowania).
     if let Err(e) = repository::update_user_account_last_login(&ctx.state.db, &user.id) {
@@ -318,7 +324,8 @@ pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, 
         .ok_or_else(|| ProtocolError::not_found("user account not found"))?;
 
     Ok(MessageBody::AuthMeResponseBody(AuthMeResponse {
-        must_change_password: user.must_change_password || matches!(&ctx.session, SessionAuth::UserSession { role: Some(role), .. } if role == "password_change_required"),
+        must_change_password: user.must_change_password
+            || matches!(&ctx.session, SessionAuth::UserSession { role: Some(role), .. } if role == "password_change_required"),
         user_id: user_id_bytes,
         username: user.username,
         role: if user.is_admin || user.role == "admin" {
@@ -926,8 +933,7 @@ pub fn model_list_request(
             }
         }
         crate::dispatch::SessionAuth::MeshTrust { .. } => None,
-        crate::dispatch::SessionAuth::Anonymous
-        | crate::dispatch::SessionAuth::ApiKey { .. } => {
+        crate::dispatch::SessionAuth::Anonymous | crate::dispatch::SessionAuth::ApiKey { .. } => {
             return Ok(MessageBody::ModelListResponse { models: Vec::new() });
         }
     };
@@ -2174,7 +2180,6 @@ pub fn cluster_create(
     )
     .map_err(db_err)?;
 
-
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
@@ -2239,7 +2244,6 @@ pub fn cluster_update(
     )
     .map_err(db_err)?;
 
-
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -2283,7 +2287,6 @@ pub fn cluster_delete(
     }
 
     repository::delete_cluster(&ctx.state.db, &payload.cluster_id).map_err(db_err)?;
-
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -2337,7 +2340,6 @@ pub fn cluster_add_member(
     )
     .map_err(db_err)?;
 
-
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -2383,7 +2385,6 @@ pub fn cluster_remove_member(
 
     repository::remove_cluster_member(&ctx.state.db, &payload.cluster_id, &payload.node_id)
         .map_err(db_err)?;
-
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -7977,10 +7978,7 @@ impl<'a> AgentDetail<'a> {
         })?;
         let runtime: serde_json::Value =
             serde_json::from_str(&agent.runtime_json).map_err(|e| {
-                ProtocolError::internal(format!(
-                    "agent {} has invalid runtime_json: {e}",
-                    agent.id
-                ))
+                ProtocolError::internal(format!("agent {} has invalid runtime_json: {e}", agent.id))
             })?;
         Ok(Self {
             id: &agent.id,
@@ -8048,7 +8046,11 @@ struct AgentRunSummary<'a> {
 const PROMPT_EXCERPT_CHARS: usize = 160;
 
 fn prompt_excerpt(prompt: &str) -> String {
-    let line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = prompt
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     if line.chars().count() <= PROMPT_EXCERPT_CHARS {
         return line.to_string();
     }
@@ -8186,10 +8188,16 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         CatalogAddonGroup {
             addon_id: package_id,
             tools,
-            display_name: m.map(|m| m.label.clone()).unwrap_or_else(|| instance_id.clone()),
+            display_name: m
+                .map(|m| m.label.clone())
+                .unwrap_or_else(|| instance_id.clone()),
             description: m.map(|m| m.description.clone()).unwrap_or_default(),
             installed,
-            instance_id: if installed { instance_id } else { String::new() },
+            instance_id: if installed {
+                instance_id
+            } else {
+                String::new()
+            },
             version: m.map(|m| m.version.clone()).unwrap_or_default(),
         }
     };
@@ -9693,9 +9701,7 @@ pub fn addon_ui_dispatch(
         // Superseded by ReqAppsList — the variant stays for wire stability,
         // but no client ships that sends it any more.
         P::ReqApplicationsList => {
-            return Err(ProtocolError::bad_request(
-                "superseded by AppsListRequest",
-            ));
+            return Err(ProtocolError::bad_request("superseded by AppsListRequest"));
         }
 
         // Response variants should not arrive as requests.
@@ -11615,12 +11621,33 @@ pub async fn service_oauth_poll(
     poll_resp(status, account_label, error)
 }
 
+/// PIDs that belong to the service itself, so the VRAM hint counts only
+/// FOREIGN consumers. An embedded engine has no process of its own — its
+/// weights sit in Core's address space, so Core's PID is the one to drop.
+fn service_own_pids(db: &crate::db::DbPool, service_id: i64) -> Vec<u32> {
+    let Ok(conn) = db.read() else {
+        return Vec::new();
+    };
+    let Ok(Some(row)) = crate::services_repo::services::get(&conn, service_id) else {
+        return Vec::new();
+    };
+    let mut pids: Vec<u32> = row
+        .runtime_pid
+        .and_then(|p| u32::try_from(p).ok())
+        .into_iter()
+        .collect();
+    if row.deploy_method == crate::services_repo::services::DeployMethod::NativeEmbedded {
+        pids.push(std::process::id());
+    }
+    pids
+}
+
 #[handler(variant = "ServiceVramHintRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
 pub async fn service_vram_hint(
     req: &MessageBody,
-    _ctx: &HandlerContext,
+    ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqVramHint(p)) => p.clone(),
@@ -11633,10 +11660,10 @@ pub async fn service_vram_hint(
 
     // Mesh forward NIE jest zaimplementowany dla VramHint — wymagałby
     // proxy nvidia-smi przez QUIC. Local only na razie. `node_id` ignored.
-    let exclude_pids: Vec<u32> = Vec::new(); // exclude_service_id mapping na PID
-                                             // wymaga lookup w `services` row → runtime_pid; pomijamy w MVP,
-                                             // własny serwis zwykle nie liczy się jako zaskakujący duży
-                                             // konsument GPU bo jest dopiero startowany lub stopped.
+    let exclude_pids: Vec<u32> = match payload.exclude_service_id {
+        Some(service_id) => service_own_pids(&ctx.state.db, service_id),
+        None => Vec::new(),
+    };
     let snapshot =
         crate::services::gpu_snapshot::collect_vram_snapshot(payload.gpu_index, &exclude_pids)
             .await;
@@ -12115,7 +12142,10 @@ mod node_registry_fill_tests {
         ];
         fill_registry_fields(&db, &mut nodes);
 
-        assert_eq!((nodes[0].node_kind.as_str(), nodes[0].operator), ("server", true));
+        assert_eq!(
+            (nodes[0].node_kind.as_str(), nodes[0].operator),
+            ("server", true)
+        );
         assert_eq!(
             (nodes[1].node_kind.as_str(), nodes[1].operator),
             ("laptop", false)

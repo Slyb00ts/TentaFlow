@@ -27,7 +27,10 @@ z korzenia. Pakiety platformowe budujemy osobno przez `-p` i odpowiedni target.
 ./target_shared/release-fast/tentaflow --config config.toml
 ```
 
-Na Windows odpowiednikami są `scripts\build.ps1` i `scripts\setup.ps1`.
+Na Windows odpowiednikami są `scripts\setup.ps1`, `scripts\native-libs\build-all.ps1`
+(`-Backend cuda|vulkan|cpu`, `-Edition slim`) i `scripts\build.ps1`
+(`-Edition slim|full -Backend cpu|cuda|vulkan`). Wersje bibliotek i toolchainów
+są wyłącznie w `scripts/versions.env`.
 Zwykłe `cargo build -p tentaflow` także korzysta ze wspólnego workspace,
 jednak automatyczna retencja działa przez wrapper. `release` używa ThinLTO,
 `release-fast` wyłącza LTO i włącza incremental, a `release-wasm` optymalizuje rozmiar. Kompilacje
@@ -51,6 +54,45 @@ Outlook, SharePoint RAG i Teams znajdują się w `tentaflow-core/addons/`
 i są jawnymi członkami workspace. Usunięto addon WASM `teams-bot`; natywny
 Meeting Bot w `tentaflow-containers/agents/native/teams-bot/` pozostaje
 osobnym, aktywnym pakietem `tentaflow-teams-bot`.
+
+**Windows traps** (x86_64 only; `setup.ps1` → `native-libs\build-all.ps1 -Backend cuda|vulkan`
+→ `build.ps1 -Edition slim|full -Backend …`, all three editions verified on a clean machine):
+- `.gitattributes` forces LF on `*.sh`: with `core.autocrlf=true` Git Bash dies on
+  `pipefail\r`. `build-all.ps1` runs the same bash scripts, always through Git for Windows'
+  `bin\bash.exe` (a bare `bash` is often WSL's `System32\bash.exe`).
+- `.ps1` files carry a UTF-8 BOM: PowerShell 5.1 reads BOM-less files as ANSI and an em dash
+  becomes a quote character. `build.ps1` is deliberately NOT an advanced script — with
+  `[CmdletBinding]` cargo's `-p` binds to `-PipelineVariable`.
+- MSVC comes from vswhere (VS 2022+, any edition), never from hard-coded paths. Pins are
+  capped by their consumers, not by "newest": CUDA ≤ what `cudarc` knows (13.3), WASI SDK =
+  what NativeAOT-LLVM expects (29.0), TensorRT 10 because the ORT EP links `nvinfer_10`.
+  `cuda.lib` of CUDA 13.3 requests LIBCMT; `/NODEFAULTLIB:libcmt.lib` goes in the whisper DLL
+  link and in `tentaflow/build.rs` (a `-sys` crate's link arg never reaches the binary).
+- `tentanas-helper`'s executing side (root wrapper, configfs, elastic executor) is `cfg(unix)`;
+  the catalog compiles everywhere because core links it on Windows too.
+- A full-edition binary needs GStreamer's `bin` on PATH (setup adds it; open a new terminal).
+- The firewall self-check runs on its own thread: its UAC prompt waits for a human, and the
+  listeners must not.
+
+**Host telemetry on Windows.** `tentaflow-core/src/gpu_telemetry/` is the ONE source of GPU
+numbers there (DXGI for adapters, VRAM totals and LUIDs; PDH for dedicated usage and engine
+utilization, sampled at 1 Hz by a background thread), and node metrics, the service VRAM hint
+and the profiler's `windows.pdh.gpu` all read it — a profile and the dashboard cannot disagree
+about one card. nvidia-smi stays the source for NVIDIA temperature/power/UUID, but per-process
+memory there is `[N/A]` under WDDM, so a row without a parsable number is DROPPED instead of
+counted as 0. Adapter utilization = the busiest engine (summed over processes), like Task
+Manager; a card is matched to a tool's row by NAME + ordinal, never by index — a positional
+match hands an iGPU the discrete card's numbers.
+
+- **Every PDH counter goes through `PdhAddEnglishCounterW`** (`pdh_sys::add_english_counter`)
+  with a `(*)` instance and `instances_double`/`instances_large`. `PdhAddCounterW` and
+  `PdhEnumObjectItemsW` take names in the UI language, so `\PhysicalDisk(…)` silently finds
+  nothing on a Polish or German Windows — the collector then reports no samples at all.
+  Wildcards also pick up disks and processes that appear mid-session.
+- **Interface details are per-platform.** Linux reads `/sys/class/net` + `ip route`; every other
+  platform takes link state, MAC, medium, speed and gateway from `netdev` (already a dependency),
+  keyed by the name sysinfo reports — the friendly name on Windows, the BSD name on macOS.
+  Without it Windows showed every NIC as down with an empty MAC.
 
 **macOS trap.** macOS 26+ (Xcode 26) split the Metal compiler into a separate component.
 Without it `xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model returns gibberish
@@ -812,7 +854,16 @@ also get `compliance.write`.
 
 ## Native libraries
 
-Build: `scripts/native-libs/build-all.sh` (Linux/macOS), `build-all.ps1` (Windows),
+**Versions live in ONE file: `scripts/versions.env`** — every native library ref and its SHA-256
+checksums, the NVIDIA runtime wheels, WASI SDK, GStreamer, CUDA toolkit, Vulkan SDK and the
+NativeAOT-LLVM compiler. bash reads it through `scripts/lib/versions.sh`, PowerShell through
+`scripts/lib/windows.ps1`, the C# addons through `tentaflow-core/addons/Directory.Build.props`.
+No script carries its own default version or checksum table. An env var of the same name
+overrides one run, and an overridden version refuses to download without its overridden
+checksum (`pinned_checksum`). Rust crate versions stay in the root `Cargo.toml`.
+
+Build: `scripts/native-libs/build-all.sh` (Linux/macOS; `--edition slim` = zvec + pdfium only),
+`build-all.ps1` (Windows, see below),
 `build-all-android.sh` (NDK cross-build → `native-libs/android-{arm64,armv7,x86_64}`). Update
 sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`, `lib-dynamic/`,
 `manifest.toml`; static is preferred, dynamic libs are copied next to the binary by
@@ -823,8 +874,8 @@ sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`,
 - Downloaded sources go OUTSIDE the repo to `TENTAFLOW_NATIVE_CACHE` (default
   `${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs`) — **not `/tmp`**: a RAM tmpfs
   truncates extraction on small-RAM machines → CMake "Parse error … bad character".
-- llama.cpp: pinned `LLAMA_CPP_REF=6b80c74f` so everyone shares one prebuilt (`origin/master`
-  for fresh, `vendored` for the old tree). Variant via `LLAMA_CPP_NATIVE_VARIANT` (default
+- llama.cpp: `LLAMA_CPP_REF` from `scripts/versions.env`, so everyone shares one prebuilt
+  (`vendored` builds the old in-tree copy). Variant via `LLAMA_CPP_NATIVE_VARIANT` (default
   `multi` = cuda + vulkan + cpu on a Linux/Windows machine with a VISIBLE NVIDIA GPU, otherwise
   vulkan + cpu). Apple is a separate branch entirely — macOS/iOS resolve to **metal** and nothing
   else, so none of the CUDA/Vulkan rules below apply there.
@@ -836,9 +887,9 @@ sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`,
   a backend with `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan`. The
   build scripts find `nvcc` outside PATH (`/usr/local/cuda`, `CUDA_HOME`)
   and wipe a variant's `lib-static`/`lib-dynamic` dirs before install so a stale
-  `libggml-cuda.a` cannot get linked next to a fresh `libggml-vulkan.a`. Local patches come from
-  `scripts/native-libs/patches/llama-cpp/` (current one turns the fused Gated Delta Net
-  auto-detect `SIGABRT` on Qwen3.6/MTP into a warning).
+  `libggml-cuda.a` cannot get linked next to a fresh `libggml-vulkan.a`. Local patches, when
+  there are any, come from `scripts/native-libs/patches/llama-cpp/`. The Vulkan backend is
+  detected by `glslc` (SDK), never by `vulkaninfo`, which every GPU driver ships.
 - Whisper autodetection on Linux/Windows follows the same rule (`WHISPER_CPP_BACKENDS`); on Apple
   it is metal, and `inference-whisper` is not linked there at all.
 - CUDA NV12/RGB preprocessing for the zero-copy ORT path is opt-in via `gpu-cuda` or

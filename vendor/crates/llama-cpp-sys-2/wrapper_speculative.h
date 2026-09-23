@@ -107,12 +107,6 @@ bool llama_rs_speculative_process(
     llama_rs_speculative * spec,
     const struct llama_batch * batch);
 
-// true, jeśli któraś implementacja wymaga ekstrakcji embeddingów post-norm.
-bool llama_rs_speculative_need_embd(llama_rs_speculative * spec);
-
-// true, jeśli któraś implementacja wymaga ekstrakcji embeddingów nextn (MTP).
-bool llama_rs_speculative_need_embd_nextn(llama_rs_speculative * spec);
-
 // Ustawia parametry draftu dla danej sekwencji i generuje draft.
 // `n_max` może nadpisać limit (-1 = bez nadpisania). `id_last` to ostatni
 // zaakceptowany token, `n_past` to bieżąca pozycja w kontekście, a

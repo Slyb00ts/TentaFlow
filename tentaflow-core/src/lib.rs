@@ -20,6 +20,7 @@ pub mod error;
 pub mod events;
 pub mod flow_engine;
 pub mod flow_runtime;
+pub mod gpu_telemetry;
 pub mod hub;
 pub mod inference;
 pub mod memory;

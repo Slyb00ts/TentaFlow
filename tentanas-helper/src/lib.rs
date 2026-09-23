@@ -62,13 +62,20 @@ pub(crate) fn syslog_notice(message: &str) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn syslog_notice(_message: &str) {}
 
+// The executing side of the channel (the root wrapper: builtins, configfs,
+// the elastic executor) needs POSIX file APIs and only ever runs on the NAS
+// host. The catalog — types, validation, plans — compiles everywhere, because
+// core links it on every platform it builds for (Windows included).
+#[cfg(unix)]
 pub mod actions;
 pub mod block;
 pub mod elastic;
+#[cfg(unix)]
 mod elastic_namespace;
+#[cfg(unix)]
 mod elastic_transfer;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
@@ -4599,6 +4606,7 @@ mod tests {
     /// anything; this is the backstop for an older core, and it must not touch
     /// the executor: no journal is opened, nothing is mounted, nothing is
     /// formatted.
+    #[cfg(unix)]
     #[test]
     fn the_withdrawn_replacement_is_refused_by_the_runner_itself() {
         let command = catalog_examples()

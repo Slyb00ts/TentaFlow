@@ -9,7 +9,6 @@ source "$REPO_ROOT/scripts/native-libs/common.sh"
 CORE_DIR="$MOBILE_ROOT/core"
 JNILIBS_DIR="$ANDROID_SCRIPT_DIR/../app/src/main/jniLibs"
 NATIVE_LIBS_DIR="$NATIVE_ROOT"
-GSTREAMER_ANDROID_VERSION="${GSTREAMER_ANDROID_VERSION:-1.28.3}"
 
 echo "=== Building TentaFlow Mobile (Rust core for Android) ==="
 
@@ -112,7 +111,7 @@ find_gstreamer_android_pkg_config_dir() {
 }
 
 install_gstreamer_android_sdk() {
-    local install_dir="$NATIVE_CACHE/gstreamer/android/$GSTREAMER_ANDROID_VERSION"
+    local install_dir="$NATIVE_CACHE/gstreamer/android/$GSTREAMER_VERSION"
     local marker
     marker="$(find_gstreamer_android_pkg_config_dir 'arm64|aarch64' true "$install_dir" 2>/dev/null || true)"
     if [ -n "$marker" ]; then
@@ -122,13 +121,13 @@ install_gstreamer_android_sdk() {
 
     require_cmd curl tar sha256sum
     mkdir -p "$install_dir" "$NATIVE_CACHE/downloads"
-    local archive="gstreamer-1.0-android-universal-$GSTREAMER_ANDROID_VERSION.tar.xz"
-    local base_url="https://gstreamer.freedesktop.org/data/pkg/android/$GSTREAMER_ANDROID_VERSION"
+    local archive="gstreamer-1.0-android-universal-$GSTREAMER_VERSION.tar.xz"
+    local base_url="https://gstreamer.freedesktop.org/data/pkg/android/$GSTREAMER_VERSION"
     local archive_path="$NATIVE_CACHE/downloads/$archive"
     local sha_path="$archive_path.sha256sum"
 
     if [ ! -f "$archive_path" ]; then
-        echo "Pobieram GStreamer Android SDK $GSTREAMER_ANDROID_VERSION (~939 MB)..." >&2
+        echo "Pobieram GStreamer Android SDK $GSTREAMER_VERSION (~939 MB)..." >&2
         curl -fL --progress-bar -o "$archive_path" "$base_url/$archive"
     fi
     if [ ! -f "$sha_path" ]; then
@@ -147,7 +146,7 @@ configure_gstreamer_android() {
     local arm64 armv7 x64
     local roots=()
     [ -n "${GSTREAMER_ANDROID_ROOT:-}" ] && roots+=("$GSTREAMER_ANDROID_ROOT")
-    roots+=("$NATIVE_CACHE/gstreamer/android/$GSTREAMER_ANDROID_VERSION")
+    roots+=("$NATIVE_CACHE/gstreamer/android/$GSTREAMER_VERSION")
     roots+=("$HOME/Library/GStreamer")
     roots+=("/opt/gstreamer-android")
 

@@ -381,22 +381,28 @@ fn compile_cuda_preprocess(out_dir: &Path) {
         return;
     }
 
+    let windows = target_os.as_deref() == Ok("windows");
     let nvcc = locate_nvcc();
-    // CUDA lib dir is <cuda-root>/lib64 (nvcc lives in <cuda-root>/bin).
+    // CUDA lib dir: <cuda-root>/lib64 on Linux, <cuda-root>\lib\x64 on Windows
+    // (nvcc lives in <cuda-root>/bin).
     let cuda_lib_dir = nvcc
         .parent()
         .and_then(|bin| bin.parent())
-        .map(|root| root.join("lib64"))
+        .map(|root| {
+            if windows {
+                root.join("lib").join("x64")
+            } else {
+                root.join("lib64")
+            }
+        })
         .filter(|p| p.is_dir());
 
     // Each fused kernel compiles to its own static lib in OUT_DIR. `--fmad=false`
     // keeps the shared f64 sampling math bit-for-bit with the CPU `resize_rgb`.
-    for (src, lib) in [
-        ("cuda/crop_resize_normalize.cu", "libtf_crop_resize.a"),
-        (
-            "cuda/nv12_to_rgb_resize_normalize.cu",
-            "libtf_nv12_preprocess.a",
-        ),
+    // MSVC wants <name>.lib and the dynamic CRT Rust links; -fPIC is a GCC flag.
+    for (src, name) in [
+        ("cuda/crop_resize_normalize.cu", "tf_crop_resize"),
+        ("cuda/nv12_to_rgb_resize_normalize.cu", "tf_nv12_preprocess"),
     ] {
         let cu = Path::new(src);
         if !cu.exists() {
@@ -404,11 +410,19 @@ fn compile_cuda_preprocess(out_dir: &Path) {
         }
         println!("cargo:rerun-if-changed={src}");
 
-        let lib_path = out_dir.join(lib);
-        let status = Command::new(&nvcc)
-            .arg("-O3")
-            .arg("-Xcompiler")
-            .arg("-fPIC")
+        let lib_path = if windows {
+            out_dir.join(format!("{name}.lib"))
+        } else {
+            out_dir.join(format!("lib{name}.a"))
+        };
+        let mut cmd = Command::new(&nvcc);
+        cmd.arg("-O3").arg("-Xcompiler");
+        if windows {
+            cmd.arg("/MD");
+        } else {
+            cmd.arg("-fPIC");
+        }
+        let status = cmd
             .arg("--fmad=false")
             .arg("-lib")
             .arg(cu)
@@ -427,17 +441,28 @@ fn compile_cuda_preprocess(out_dir: &Path) {
     if let Some(dir) = &cuda_lib_dir {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
-    // Debian/Ubuntu ship libcudart in the multiarch dir; keep both searchable.
-    println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
     println!("cargo:rustc-link-lib=dylib=cudart");
-    // nvcc-generated host stubs pull the C++ runtime.
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    if !windows {
+        // Debian/Ubuntu ship libcudart in the multiarch dir; keep both searchable.
+        println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+        // nvcc-generated host stubs pull the C++ runtime (MSVC links it by default).
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
 }
 
-/// Locates nvcc: `$NVCC`, then the pinned/standard CUDA install paths, then PATH.
+/// Locates nvcc: `$NVCC`, then the pinned/standard CUDA install paths
+/// (`CUDA_PATH` on Windows), then PATH.
 fn locate_nvcc() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     if let Ok(p) = std::env::var("NVCC") {
         return PathBuf::from(p);
+    }
+    if let Ok(root) = std::env::var("CUDA_PATH") {
+        let cand = Path::new(&root).join("bin").join("nvcc.exe");
+        if cand.exists() {
+            return cand;
+        }
     }
     for cand in ["/usr/local/cuda-13.0/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
         if Path::new(cand).exists() {
@@ -546,8 +571,10 @@ fn list_cs_sources(addon_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Zwraca sciezke do WASI SDK: env WASI_SDK_PATH albo auto-detekcja w cache
-/// natywnym TentaFlow (katalog `wasi-sdk-*` w TENTAFLOW_NATIVE_CACHE).
+/// Zwraca sciezke do WASI SDK: env WASI_SDK_PATH albo przypieta wersja
+/// (`WASI_SDK_VERSION` z scripts/versions.env) w cache natywnym TentaFlow.
+/// Wersja musi byc dokladnie ta, dla ktorej zbudowano NativeAOT-LLVM — nowszy
+/// wasm-ld odrzuca jego flagi, wiec "najnowszy wasi-sdk-* w cache" to za malo.
 fn resolve_wasi_sdk() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("WASI_SDK_PATH") {
         let path = PathBuf::from(p);
@@ -555,30 +582,47 @@ fn resolve_wasi_sdk() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    println!("cargo:rerun-if-env-changed=WASI_SDK_PATH");
+    println!("cargo:rerun-if-env-changed=TENTAFLOW_NATIVE_CACHE");
+    // Same default as scripts/native-libs/common.sh and scripts/lib/windows.ps1.
     let cache_root = std::env::var("TENTAFLOW_NATIVE_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            let base = std::env::var("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache")
-                });
+            let base = if cfg!(windows) {
+                PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
+            } else {
+                std::env::var("XDG_CACHE_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache")
+                    })
+            };
             base.join("tentaflow-native-libs")
         });
-    let entries = std::fs::read_dir(&cache_root).ok()?;
-    let mut candidates: Vec<PathBuf> = entries
+    let version = pinned_version("WASI_SDK_VERSION")?;
+    let prefix = format!("wasi-sdk-{version}-");
+    std::fs::read_dir(&cache_root)
+        .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .map(|n| n.to_string_lossy().starts_with("wasi-sdk-"))
-                    .unwrap_or(false)
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
                 && p.join("share/wasi-sysroot").exists()
         })
-        .collect();
-    candidates.sort();
-    candidates.pop()
+}
+
+/// Value of KEY in scripts/versions.env — the one place toolchain pins live.
+fn pinned_version(key: &str) -> Option<String> {
+    let path = Path::new("../scripts/versions.env");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let content = std::fs::read_to_string(path).ok()?;
+    content.lines().find_map(|line| {
+        line.trim_end()
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::to_string)
+    })
 }
 
 /// Buduje addon .NET przez `dotnet publish -r wasi-wasm` (NativeAOT-LLVM,
@@ -603,8 +647,8 @@ fn build_dotnet_addon(addon_dir: &Path, addon_name: &str) -> Option<PathBuf> {
     let Some(wasi_sdk) = resolve_wasi_sdk() else {
         println!(
             "cargo:warning=Addon '{}' — pomijam: brak WASI SDK \
-             (ustaw WASI_SDK_PATH albo rozpakuj wasi-sdk-25+ do \
-             ~/.cache/tentaflow-native-libs/)",
+             (instaluje go scripts/setup.sh / scripts\\setup.ps1 do cache \
+             native-libs; albo ustaw WASI_SDK_PATH)",
             addon_name
         );
         return None;

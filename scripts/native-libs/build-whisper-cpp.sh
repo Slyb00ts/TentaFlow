@@ -9,7 +9,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 PLATFORM="${1:-$(detect_platform)}"
-WHISPER_CPP_REF="${WHISPER_CPP_REF:-v1.8.3}"
 BACKENDS="${WHISPER_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
@@ -92,17 +91,22 @@ build_isolated_dylib() {
   # ggml-blas auto-wykrytego z Accelerate na macOS) = "Undefined symbols:
   # _ggml_backend_blas_reg". Glob jest odporny na to, ktore backendy cmake
   # faktycznie wlaczyl (czasem wiecej niz w MULTI_BACKENDS).
+  # MSVC names static libraries <name>.lib, everything else lib<name>.a.
+  local archive_prefix="lib" archive_suffix=".a"
+  case "$PLATFORM" in
+    windows-*) archive_prefix="" archive_suffix=".lib" ;;
+  esac
   local archives=() a
-  for a in "$static_dir"/lib*.a; do
+  for a in "$static_dir/$archive_prefix"*"$archive_suffix"; do
     [ -f "$a" ] && archives+=("$a")
   done
   if [ "${#archives[@]}" -eq 0 ]; then
-    echo "[whisper.cpp] brak archiwow .a w $static_dir" >&2
+    echo "[whisper.cpp] brak archiwow $archive_suffix w $static_dir" >&2
     exit 1
   fi
   # Liby systemowe/frameworki dobieramy po OBECNOSCI archiwum backendu, nie po
   # liscie enabled — spojnie z globem powyzej.
-  has_lib() { [ -f "$static_dir/lib$1.a" ]; }
+  has_lib() { [ -f "$static_dir/$archive_prefix$1$archive_suffix" ]; }
 
   case "$PLATFORM" in
     macos-*)
@@ -121,8 +125,49 @@ build_isolated_dylib() {
         "${frameworks[@]}"
       ;;
     windows-*)
-      echo "[whisper.cpp] izolowany dylib na Windows: uzyj build-all.ps1 (.def/__declspec)" >&2
-      return 0
+      # A DLL exports only what its .def lists, so ggml_* stays private to
+      # whisper_tf.dll exactly like the version script does on Linux. The list
+      # is every external whisper_* symbol DEFINED in whisper.lib (dumpbin
+      # SECTn rows; UNDEF rows are imports). -wholearchive mirrors
+      # --whole-archive: backend registrations live in objects nothing else
+      # references. MSVC options use the '-' spelling because Git Bash would
+      # rewrite a leading '/' into a Windows path.
+      local dumpbin link def="$build/whisper_tf.def"
+      dumpbin="$(msvc_tool dumpbin.exe)"
+      link="$(msvc_tool link.exe)"
+      {
+        printf 'LIBRARY whisper_tf\nEXPORTS\n'
+        "$dumpbin" -nologo -symbols "$(cygpath -w "$static_dir/whisper.lib")" \
+          | tr -d '\r' \
+          | awk -F'[|] ' '$1 ~ / SECT[0-9A-F]+ / && $1 ~ / External / { split($2, name, " "); if (name[1] ~ /^whisper_/) print "    " name[1] }' \
+          | sort -u
+      } > "$def"
+      if [ "$(grep -c '^    whisper_' "$def")" -eq 0 ]; then
+        echo "[whisper.cpp] no whisper_* symbols found in whisper.lib" >&2
+        exit 1
+      fi
+      local link_args=(-nologo -dll -machine:x64
+        "-def:$(cygpath -w "$def")"
+        "-out:$(cygpath -w "$out_dir/whisper_tf.dll")"
+        "-implib:$(cygpath -w "$out_dir/whisper_tf.lib")")
+      for a in "${archives[@]}"; do
+        link_args+=("-wholearchive:$(cygpath -w "$a")")
+      done
+      if has_lib ggml-cuda; then
+        [ -n "${CUDA_PATH:-}" ] || { echo "[whisper.cpp] CUDA_PATH is not set" >&2; exit 1; }
+        # cuda.lib of some toolkits (13.3) carries /DEFAULTLIB:LIBCMT although
+        # everything here is built against the DLL CRT (/MD); two CRTs in one
+        # module would each keep their own heap and stdio state.
+        link_args+=("-libpath:$(cygpath -w "$CUDA_PATH")\\lib\\x64" cudart.lib cublas.lib cublasLt.lib cuda.lib -nodefaultlib:libcmt.lib)
+      fi
+      if has_lib ggml-vulkan; then
+        [ -n "${VULKAN_SDK:-}" ] || { echo "[whisper.cpp] VULKAN_SDK is not set" >&2; exit 1; }
+        link_args+=("-libpath:$(cygpath -w "$VULKAN_SDK")\\Lib" vulkan-1.lib)
+      fi
+      link_args+=(advapi32.lib)
+      MSYS2_ARG_CONV_EXCL='*' "$link" "${link_args[@]}"
+      # The import library and the headers are what whisper-rs-sys links.
+      rm -f "$out_dir/whisper_tf.exp"
       ;;
     android-*)
       local map="$build/whisper_exports.map"

@@ -190,8 +190,10 @@ build_backend() {
   # pod `set -o pipefail` `grep -q` zamyka potok po dopasowaniu, cmake dostaje
   # SIGPIPE (exit 141) i pipefail zgłasza błąd całego potoku mimo trafienia.
   local target_help
-  target_help="$(cmake --build "$build" --target help 2>/dev/null)"
-  if grep -q '^... llama-common$' <<<"$target_help"; then
+  # Makefiles list targets as "... llama-common", Ninja as "llama-common: phony";
+  # CR is stripped because Windows tools end lines with CRLF.
+  target_help="$(cmake --build "$build" --target help 2>/dev/null | tr -d '\r')"
+  if grep -qE '^(\.\.\. )?llama-common(:|$)' <<<"$target_help"; then
     targets+=(llama-common)
   else
     targets+=(common)

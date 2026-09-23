@@ -128,6 +128,36 @@ merge_static_archive() {
   rm -f "$mri"
 }
 
+# Windows: the official prebuilt SDK of the same tag. Its zvec_c_api.dll links
+# the CRT statically, imports only system DLLs and exports only zvec_* — the
+# isolation the Linux build gets from its version script — so rebuilding
+# RocksDB/Arrow/protobuf with MSVC here would only reproduce it slower.
+if [ "$PLATFORM" = "windows-x86_64" ]; then
+  require_cmd curl unzip
+  ZVEC_SDK_SHA256="$(pinned_checksum ZVEC_SHA256_WINDOWS_X86_64 ZVEC_REF)"
+  ZVEC_SDK_ZIP="$NATIVE_CACHE/downloads/zvec-sdk-windows-amd64-$ZVEC_REF.zip"
+  mkdir -p "$NATIVE_CACHE/downloads"
+  if [ ! -f "$ZVEC_SDK_ZIP" ] || [ "${TENTAFLOW_NATIVE_UPDATE:-0}" = "1" ]; then
+    curl -fL "$ZVEC_REPO/releases/download/$ZVEC_REF/zvec-sdk-windows-amd64.zip" -o "$ZVEC_SDK_ZIP"
+  fi
+  if [ "$(sha256_of "$ZVEC_SDK_ZIP")" != "$ZVEC_SDK_SHA256" ]; then
+    echo "BLAD: SHA256 $ZVEC_SDK_ZIP nie zgadza sie z ZVEC_SHA256_WINDOWS_X86_64 w scripts/versions.env" >&2
+    rm -f "$ZVEC_SDK_ZIP"
+    exit 1
+  fi
+  ZVEC_SDK_DIR="$NATIVE_CACHE/build/zvec-sdk-windows-amd64"
+  reset_dir "$ZVEC_SDK_DIR"
+  # The archive stores backslash separators; unzip converts them and exits 1
+  # ("warning") for exactly that, anything higher is a real failure.
+  unzip -qqo "$ZVEC_SDK_ZIP" -d "$ZVEC_SDK_DIR" || [ "$?" -eq 1 ]
+  OUT_LIB_DIR="$SYS_CRATE/vendor/lib/$PLATFORM"
+  mkdir -p "$OUT_LIB_DIR" "$VENDOR_INCLUDE"
+  cp -f "$ZVEC_SDK_DIR/lib/zvec_c_api.dll" "$ZVEC_SDK_DIR/lib/zvec_c_api.lib" "$OUT_LIB_DIR/"
+  tr -d '\r' < "$ZVEC_SDK_DIR/include/zvec/c_api.h" > "$VENDOR_INCLUDE/c_api.h"
+  echo "zvec $ZVEC_REF (prebuilt SDK) -> $OUT_LIB_DIR"
+  exit 0
+fi
+
 echo "=========================================="
 echo "  Build zvec static archive (model B)"
 echo "  Platform: $PLATFORM | ref: $ZVEC_REF"

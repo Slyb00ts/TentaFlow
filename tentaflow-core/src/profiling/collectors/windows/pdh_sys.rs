@@ -9,12 +9,12 @@ use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Performance::{
-    PdhAddCounterW, PdhCloseQuery, PdhCollectQueryData, PdhEnumObjectItemsW,
-    PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
-    PERF_DETAIL_WIZARD,
+    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+    PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W,
+    PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
 };
 
-// PDH_FMT_NOCAP100 nie jest exportowane przez windows-sys 0.59. Stala z PDH API
+// PDH_FMT_NOCAP100 nie jest exportowane przez windows-sys. Stala z PDH API
 // (pdhmsg.h): nie capnij wartosci na 100 dla licznikow procentowych.
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 
@@ -43,11 +43,11 @@ pub fn to_wide(s: &str) -> Vec<u16> {
 }
 
 /// Owned PDH query handle. Calls `PdhCloseQuery` on drop.
-pub struct PdhQuery(isize);
+pub struct PdhQuery(PDH_HQUERY);
 
 impl PdhQuery {
     pub fn open() -> Result<Self, PdhError> {
-        let mut h: isize = 0;
+        let mut h: PDH_HQUERY = std::ptr::null_mut();
         // SAFETY: passing a NULL data source (live data), zero reserved arg
         // and a writable handle slot per PdhOpenQueryW contract.
         let st = unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut h) };
@@ -61,17 +61,21 @@ impl PdhQuery {
         }
     }
 
-    pub fn add_counter(&self, path: &str) -> Result<PdhCounter, PdhError> {
+    /// Adds a counter by its English path (`\GPU Engine(*)\Utilization Percentage`).
+    /// `PdhAddCounterW` expects names in the UI language, so the same path
+    /// silently fails on a Polish or German Windows; the English variant works
+    /// everywhere. A `*` instance keeps matching instances that appear later.
+    pub fn add_english_counter(&self, path: &str) -> Result<PdhCounter, PdhError> {
         let wide = to_wide(path);
-        let mut counter: isize = 0;
+        let mut counter: PDH_HCOUNTER = std::ptr::null_mut();
         // SAFETY: `self.0` is a valid query handle; `wide` is NUL-terminated;
         // counter slot is writable.
-        let st = unsafe { PdhAddCounterW(self.0, wide.as_ptr(), 0, &mut counter) };
+        let st = unsafe { PdhAddEnglishCounterW(self.0, wide.as_ptr(), 0, &mut counter) };
         if st as u32 == ERROR_SUCCESS {
             Ok(PdhCounter(counter))
         } else {
             Err(PdhError {
-                op: "PdhAddCounterW",
+                op: "PdhAddEnglishCounterW",
                 status: st as u32,
             })
         }
@@ -93,7 +97,7 @@ impl PdhQuery {
 
 impl Drop for PdhQuery {
     fn drop(&mut self) {
-        if self.0 != 0 {
+        if !self.0.is_null() {
             // SAFETY: `self.0` is a valid query handle owned by this struct.
             unsafe {
                 PdhCloseQuery(self.0);
@@ -104,7 +108,7 @@ impl Drop for PdhQuery {
 
 /// Counter handle. Lifetime is bound to the parent query (which owns it).
 #[derive(Copy, Clone)]
-pub struct PdhCounter(isize);
+pub struct PdhCounter(PDH_HCOUNTER);
 
 impl PdhCounter {
     /// Read the current formatted value as a double. Returns `None` when the
@@ -131,90 +135,85 @@ impl PdhCounter {
             None
         }
     }
-}
 
-/// Enumerate instance names of a PDH performance object (e.g. "PhysicalDisk",
-/// "GPU Engine"). Returns the parsed UTF-16 instance list.
-pub fn enum_instances(object_name: &str) -> Result<Vec<String>, PdhError> {
-    let object_w = to_wide(object_name);
-    let mut counter_buf_len: u32 = 0;
-    let mut instance_buf_len: u32 = 0;
-
-    // First call: query buffer sizes.
-    // SAFETY: passing null buffers with zero lengths is the documented probe
-    // pattern; PDH writes the required sizes back through the length pointers.
-    let st = unsafe {
-        PdhEnumObjectItemsW(
-            std::ptr::null(),
-            std::ptr::null(),
-            object_w.as_ptr(),
-            std::ptr::null_mut(),
-            &mut counter_buf_len,
-            std::ptr::null_mut(),
-            &mut instance_buf_len,
-            PERF_DETAIL_WIZARD,
-            0,
-        )
-    };
-    // PDH_MORE_DATA == 0x800007D2; ERROR_SUCCESS means object exists but is
-    // empty. Anything else is a real failure.
-    const PDH_MORE_DATA: u32 = 0x800007D2;
-    let st_u = st as u32;
-    if st_u != PDH_MORE_DATA && st_u != ERROR_SUCCESS {
-        return Err(PdhError {
-            op: "PdhEnumObjectItemsW(size)",
-            status: st_u,
-        });
+    /// Every instance of a wildcard counter as `(instance name, value)`, read as
+    /// f64. Empty when the counter has no instances yet or no valid data (the
+    /// first sample of a rate counter).
+    pub fn instances_double(&self) -> Vec<(String, f64)> {
+        self.instances(PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, |v| {
+            // SAFETY: PDH_FMT_DOUBLE fills the doubleValue arm.
+            unsafe { v.Anonymous.doubleValue }
+        })
     }
 
-    if instance_buf_len == 0 {
-        return Ok(Vec::new());
+    /// Every instance of a wildcard counter as `(instance name, value)`, read as
+    /// i64 — byte counters such as `GPU Process Memory\Dedicated Usage`.
+    pub fn instances_large(&self) -> Vec<(String, i64)> {
+        self.instances(PDH_FMT_LARGE, |v| {
+            // SAFETY: PDH_FMT_LARGE fills the largeValue arm.
+            unsafe { v.Anonymous.largeValue }
+        })
     }
 
-    let mut counter_buf = vec![0u16; counter_buf_len.max(1) as usize];
-    let mut instance_buf = vec![0u16; instance_buf_len as usize];
-
-    // SAFETY: buffers are sized as reported by the previous call; lengths
-    // passed by mutable pointer.
-    let st = unsafe {
-        PdhEnumObjectItemsW(
-            std::ptr::null(),
-            std::ptr::null(),
-            object_w.as_ptr(),
-            counter_buf.as_mut_ptr(),
-            &mut counter_buf_len,
-            instance_buf.as_mut_ptr(),
-            &mut instance_buf_len,
-            PERF_DETAIL_WIZARD,
-            0,
-        )
-    };
-    if st as u32 != ERROR_SUCCESS {
-        return Err(PdhError {
-            op: "PdhEnumObjectItemsW(read)",
-            status: st as u32,
-        });
-    }
-
-    Ok(parse_multi_sz(&instance_buf))
-}
-
-/// Parse a Windows MULTI_SZ block (sequence of NUL-terminated UTF-16 strings
-/// terminated by an empty string) into owned `String`s.
-fn parse_multi_sz(buf: &[u16]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for i in 0..buf.len() {
-        if buf[i] == 0 {
-            if i == start {
-                // Empty string terminator.
-                break;
-            }
-            out.push(String::from_utf16_lossy(&buf[start..i]));
-            start = i + 1;
+    fn instances<T>(
+        &self,
+        format: u32,
+        read: impl Fn(&PDH_FMT_COUNTERVALUE) -> T,
+    ) -> Vec<(String, T)> {
+        let mut buffer_size: u32 = 0;
+        let mut item_count: u32 = 0;
+        // SAFETY: a null buffer with size 0 is the documented size probe.
+        let st = unsafe {
+            PdhGetFormattedCounterArrayW(
+                self.0,
+                format,
+                &mut buffer_size,
+                &mut item_count,
+                std::ptr::null_mut(),
+            )
+        };
+        const PDH_MORE_DATA: u32 = 0x800007D2;
+        if st as u32 != PDH_MORE_DATA || buffer_size == 0 {
+            return Vec::new();
         }
+        // u64 storage keeps the item array (which starts the buffer) aligned.
+        let mut buffer = vec![0u64; (buffer_size as usize).div_ceil(8)];
+        let items = buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+        // SAFETY: the buffer holds `buffer_size` bytes as PDH asked for.
+        let st = unsafe {
+            PdhGetFormattedCounterArrayW(self.0, format, &mut buffer_size, &mut item_count, items)
+        };
+        if st as u32 != ERROR_SUCCESS {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(item_count as usize);
+        for i in 0..item_count as usize {
+            // SAFETY: PDH wrote `item_count` items; each name points into the
+            // same buffer and is NUL-terminated.
+            let item = unsafe { &*items.add(i) };
+            if item.FmtValue.CStatus != ERROR_SUCCESS {
+                continue;
+            }
+            let name = unsafe { wide_ptr_to_string(item.szName) };
+            out.push((name, read(&item.FmtValue)));
+        }
+        out
     }
-    out
+}
+
+/// Reads a NUL-terminated UTF-16 string.
+///
+/// # Safety
+/// `ptr` must be null or point at a NUL-terminated UTF-16 string.
+unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
 }
 
 #[cfg(test)]
@@ -226,19 +225,5 @@ mod tests {
         let w = to_wide("abc");
         assert_eq!(w.last(), Some(&0u16));
         assert_eq!(w.len(), 4);
-    }
-
-    #[test]
-    fn parse_multi_sz_handles_empty_buffer() {
-        assert!(parse_multi_sz(&[0u16]).is_empty());
-        assert!(parse_multi_sz(&[]).is_empty());
-    }
-
-    #[test]
-    fn parse_multi_sz_two_entries() {
-        // "abc\0de\0\0"
-        let buf: Vec<u16> = "abc\0de\0\0".encode_utf16().collect();
-        let v = parse_multi_sz(&buf);
-        assert_eq!(v, vec!["abc".to_string(), "de".to_string()]);
     }
 }

@@ -60,8 +60,10 @@ const LOG_THRESHOLD_SILENT: u32 = u32::MAX;
 
 // Globalny prog poziomu logow llama.cpp/ggml. Inicjalizowany RAZ z env
 // `TENTAFLOW_LLAMA_LOG_LEVEL`; `LOG_THRESHOLD_SILENT` = pelne wyciszenie.
+// Trzymany jako u32: bindgen daje enum `ggml_log_level` jako u32 na Linuksie i
+// i32 na MSVC, a jego wartosci (0..=5) mieszcza sie w obu.
 #[cfg(feature = "llama")]
-static LOG_THRESHOLD: AtomicU32 = AtomicU32::new(sys::GGML_LOG_LEVEL_WARN);
+static LOG_THRESHOLD: AtomicU32 = AtomicU32::new(sys::GGML_LOG_LEVEL_WARN as u32);
 
 #[cfg(feature = "llama")]
 static LOG_THRESHOLD_INIT: Once = Once::new();
@@ -75,13 +77,13 @@ fn ensure_log_threshold() {
         let threshold = match std::env::var("TENTAFLOW_LLAMA_LOG_LEVEL") {
             Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
                 "none" => LOG_THRESHOLD_SILENT,
-                "error" => sys::GGML_LOG_LEVEL_ERROR,
-                "warn" => sys::GGML_LOG_LEVEL_WARN,
-                "info" => sys::GGML_LOG_LEVEL_INFO,
-                "debug" => sys::GGML_LOG_LEVEL_DEBUG,
-                _ => sys::GGML_LOG_LEVEL_WARN,
+                "error" => sys::GGML_LOG_LEVEL_ERROR as u32,
+                "warn" => sys::GGML_LOG_LEVEL_WARN as u32,
+                "info" => sys::GGML_LOG_LEVEL_INFO as u32,
+                "debug" => sys::GGML_LOG_LEVEL_DEBUG as u32,
+                _ => sys::GGML_LOG_LEVEL_WARN as u32,
             },
-            Err(_) => sys::GGML_LOG_LEVEL_WARN,
+            Err(_) => sys::GGML_LOG_LEVEL_WARN as u32,
         };
         LOG_THRESHOLD.store(threshold, Ordering::Relaxed);
     });
@@ -98,7 +100,7 @@ unsafe extern "C" fn filtered_log(
     _user_data: *mut std::os::raw::c_void,
 ) {
     let threshold = LOG_THRESHOLD.load(Ordering::Relaxed);
-    if threshold == LOG_THRESHOLD_SILENT || level < threshold {
+    if threshold == LOG_THRESHOLD_SILENT || (level as u32) < threshold {
         return;
     }
     if text.is_null() {

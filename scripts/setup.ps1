@@ -1,124 +1,97 @@
 ﻿# =============================================================================
-# Plik: scripts/setup.ps1
-# Opis: Instalator zaleznosci do kompilacji TentaFlow na Windows.
-#       Uzywa winget jako glownego menedzera pakietow, ustawia zmienne
-#       srodowiskowe (LIBCLANG_PATH, PATH) i konfiguruje rustup + targety WASM.
+# File: scripts/setup.ps1
+# Purpose: Installs everything needed to build TentaFlow on Windows x86_64:
+#          Visual Studio C++ Build Tools, Git (Git Bash runs the shared
+#          native-libs scripts), CMake, Ninja, LLVM (libclang for bindgen),
+#          Python, protoc, pkg-config, GStreamer SDK, .NET SDK + WASI SDK
+#          (C# addons), Rust + WASM targets + wasm-bindgen CLI, FFmpeg, and
+#          the GPU toolkits (CUDA when an NVIDIA GPU is present, Vulkan SDK).
 #
-# Uzycie:
-#   PowerShell -ExecutionPolicy Bypass -File scripts/setup.ps1 [-Cuda] [-Vulkan] [-AllGpu]
+# Versions that must match across machines (GStreamer, CUDA, Vulkan SDK,
+# .NET, WASI SDK) come from scripts/versions.env; wasm-bindgen from the root
+# Cargo.toml.
 #
-# Uwagi:
-#   - Nie wymaga uruchomienia jako Administrator (winget pyta o UAC per pakiet).
-#   - Karty AMD i Intel jada na Vulkanie — nie budujemy ani nie instalujemy ROCm/HIP.
+# Usage:
+#   scripts\setup.ps1              # base + CUDA (NVIDIA GPU present) + Vulkan SDK
+#   scripts\setup.ps1 -Cuda        # CUDA even without a visible NVIDIA GPU
+#   scripts\setup.ps1 -NoCuda      # skip CUDA
+#   scripts\setup.ps1 -NoVulkan    # skip the Vulkan SDK
+#   scripts\setup.ps1 -Minimal     # no GPU toolkits (slim / CPU builds)
+#
+# Notes:
+#   - Does not need to run as Administrator: winget asks for elevation (UAC)
+#     per machine-wide installer.
+#   - AMD and Intel GPUs run on Vulkan - there is no ROCm/HIP build.
 # =============================================================================
 
-[CmdletBinding()]
 param(
     [switch]$Cuda,
-    [switch]$Vulkan,
-    [switch]$AllGpu,
+    [switch]$NoCuda,
+    [switch]$NoVulkan,
+    [switch]$Minimal,
     [switch]$Help
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib\windows.ps1')
 
-# PS 5.1 wraps native-command stderr (np. rustup, winget pisza info: na stderr)
-# w NativeCommandError i pod $ErrorActionPreference='Stop' wybucha. Trzymamy
-# Stop dla cmdletow, ale stderr natywnych komend nigdy nie powinien terminowac
-# pipeline'a. Helper Invoke-NativeCapture lapie stdout bez 2>&1.
+$script:Installed = @()
+
+function Show-Usage {
+    @"
+TentaFlow - instalator zaleznosci (Windows x86_64)
+
+Uzycie:
+  scripts\setup.ps1 [-Cuda] [-NoCuda] [-NoVulkan] [-Minimal]
+
+  (domyslnie)  baza + CUDA (gdy widoczne GPU NVIDIA) + Vulkan SDK
+  -Cuda        CUDA toolkit nawet bez widocznego GPU NVIDIA
+  -NoCuda      pomin CUDA toolkit
+  -NoVulkan    pomin Vulkan SDK
+  -Minimal     bez GPU toolkitow (edycja slim / build CPU)
+"@ | Write-Host
+}
+
+if ($Help) { Show-Usage; exit 0 }
+
+# PS 5.1 wraps native-command stderr in NativeCommandError under
+# ErrorActionPreference=Stop (rustup and winget print info to stderr), so
+# native commands whose stderr is noise run through this helper.
 function Invoke-NativeCapture {
     param([Parameter(Mandatory)][scriptblock]$Script)
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        # 2>$null wyrzuca stderr, dzieki czemu nie ma NativeCommandError-a
         & $Script 2>$null
     } finally {
         $ErrorActionPreference = $prev
     }
 }
 
-# Wersja CLI jest odczytywana z głównego Cargo.toml po instalacji Pythona.
-$WasmBindgenVersion = $null
-
-# Lista zainstalowanych komponentow (do podsumowania)
-$script:Installed = @()
-
-# --- Logowanie ---
-
-function Log-Info    { param([string]$Msg) Write-Host "[INFO] $Msg"    -ForegroundColor Blue }
-function Log-Ok      { param([string]$Msg) Write-Host "[OK] $Msg"      -ForegroundColor Green }
-function Log-Warn    { param([string]$Msg) Write-Host "[WARN] $Msg"    -ForegroundColor Yellow }
-function Log-Error   { param([string]$Msg) Write-Host "[ERROR] $Msg"   -ForegroundColor Red }
-function Log-Section { param([string]$Msg) Write-Host "`n=== $Msg ===`n" -ForegroundColor Cyan }
-
-function Show-Usage {
-    @"
-TentaFlow - instalator zaleznosci (Windows)
-
-Uzycie:
-  PowerShell -ExecutionPolicy Bypass -File scripts/setup.ps1 [OPCJE]
-
-Opcje:
-  -Cuda                       Zainstaluj NVIDIA CUDA toolkit (winget Nvidia.CUDA)
-  -Vulkan                     Zainstaluj Vulkan SDK (KhronosGroup.VulkanSDK)
-  -AllGpu                     CUDA + Vulkan
-  -Help                       Pokaz te pomoc
-
-Przyklady:
-  scripts\setup.ps1                                      # Tylko bazowe zaleznosci
-  scripts\setup.ps1 -Cuda                                # Baza + CUDA
-  scripts\setup.ps1 -AllGpu                              # Wszystko (jako Admin)
-"@ | Write-Host
-}
-
-if ($Help) { Show-Usage; exit 0 }
-if ($AllGpu) { $Cuda = $true; $Vulkan = $true }
-
-# --- Helpers ---
-
-function Test-Command {
-    param([string]$Name)
-    $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
-}
-
-function Refresh-Path {
-    # Po kazdym wingetcie scieagamy zaktualizowany PATH z rejestru,
-    # zeby kolejne komendy widzialy nowo zainstalowane narzedzia bez
-    # restartu shella.
-    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $userPath    = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $env:Path = "$machinePath;$userPath"
-}
-
 function Set-PersistentEnv {
     param(
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string]$Value,
-        [ValidateSet('User','Machine')][string]$Scope = 'User'
+        [Parameter(Mandatory)][string]$Value
     )
-    [Environment]::SetEnvironmentVariable($Name, $Value, $Scope)
+    if ([Environment]::GetEnvironmentVariable($Name, 'User') -ne $Value) {
+        [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
+        $script:Installed += "$Name = $Value"
+    }
     Set-Item -Path "Env:$Name" -Value $Value
-    Log-Ok "Ustawiono $Name=$Value (scope: $Scope)"
+    Log-Ok "$Name = $Value"
 }
 
 function Add-PersistentPath {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [ValidateSet('User','Machine')][string]$Scope = 'User'
-    )
+    param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path $Path)) {
-        Log-Warn "Sciezka nie istnieje, pomijam dodanie do PATH: $Path"
+        Log-Warn "Path does not exist, not adding it to PATH: $Path"
         return
     }
-    $current = [Environment]::GetEnvironmentVariable('Path', $Scope)
-    $entries = ($current -split ';') | Where-Object { $_ -and $_.Trim() }
-    if ($entries -contains $Path) {
-        Log-Info "PATH ($Scope) juz zawiera: $Path"
-    } else {
-        $new = ($entries + $Path) -join ';'
-        [Environment]::SetEnvironmentVariable('Path', $new, $Scope)
-        Log-Ok "Dodano do PATH ($Scope): $Path"
+    $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $entries = @(($current -split ';') | Where-Object { $_ -and $_.Trim() })
+    if ($entries -notcontains $Path) {
+        [Environment]::SetEnvironmentVariable('Path', (($entries + $Path) -join ';'), 'User')
+        Log-Ok "Added to PATH (User): $Path"
     }
     if (-not (($env:Path -split ';') -contains $Path)) {
         $env:Path = "$env:Path;$Path"
@@ -128,798 +101,456 @@ function Add-PersistentPath {
 function Add-PersistentPathList {
     param(
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string[]]$Paths,
-        [ValidateSet('User','Machine')][string]$Scope = 'User'
+        [Parameter(Mandatory)][string]$Path
     )
-    $existing = [Environment]::GetEnvironmentVariable($Name, $Scope)
+    $existing = [Environment]::GetEnvironmentVariable($Name, 'User')
     $entries = @()
-    if ($existing) {
-        $entries = ($existing -split ';') | Where-Object { $_ -and $_.Trim() }
-    }
-    foreach ($path in $Paths) {
-        if (-not (Test-Path $path)) {
-            Log-Warn "Sciezka nie istnieje, pomijam $($Name): $path"
-            continue
-        }
-        if ($entries -notcontains $path) {
-            $entries += $path
-        }
-    }
-    if ($entries.Count -eq 0) { return }
-    $value = $entries -join ';'
-    [Environment]::SetEnvironmentVariable($Name, $value, $Scope)
-    Set-Item -Path "Env:$Name" -Value $value
-    Log-Ok "Ustawiono $Name=$value (scope: $Scope)"
+    if ($existing) { $entries = @(($existing -split ';') | Where-Object { $_ -and $_.Trim() }) }
+    if ($entries -notcontains $Path) { $entries += $Path }
+    Set-PersistentEnv -Name $Name -Value ($entries -join ';')
 }
 
-function Winget-Install {
+function Test-WingetPackage {
+    param([string]$Id, [string]$Version = '')
+    $out = Invoke-NativeCapture { winget list --id $Id --exact --accept-source-agreements --disable-interactivity } | Out-String
+    if (-not ($out -match [regex]::Escape($Id))) { return $false }
+    if (-not $Version) { return $true }
+    return ($out -match "\s$([regex]::Escape($Version))(\s|$)")
+}
+
+# Installs a winget package unless present. With -Version the exact version is
+# required (a different installed version is upgraded/replaced).
+function Install-WingetPackage {
     param(
         [Parameter(Mandatory)][string]$Id,
-        [string]$Label = $null,
-        # Extra arguments appended to the underlying installer command line
-        # (winget --custom). For MSI packages these are msiexec properties,
-        # e.g. 'ADDLOCAL=ALL'.
-        [string]$CustomArgs = $null
+        [string]$Label = '',
+        [string]$Version = '',
+        [string]$Custom = '',
+        [string]$Override = '',
+        [ValidateSet('', 'user', 'machine')][string]$Scope = ''
     )
     if (-not $Label) { $Label = $Id }
-
-    if (-not (Test-Command 'winget')) {
-        Log-Error "winget nie jest dostepny. Zainstaluj 'App Installer' z Microsoft Store i uruchom ponownie."
-        exit 1
+    if (Test-WingetPackage -Id $Id -Version $Version) {
+        Log-Ok "$Label already installed ($Id $Version)"
+        return
     }
-
-    # Sprawdz czy juz zainstalowane (silent, exit 0 = znalezione)
-    $listOut = Invoke-NativeCapture { winget list --id $Id --accept-source-agreements } | Out-String
-    if ($LASTEXITCODE -eq 0 -and $listOut -match [regex]::Escape($Id)) {
-        Log-Ok "$Label juz zainstalowany (winget: $Id)"
-        return $false
-    }
-
-    Log-Info "Instalacja $Label przez winget ($Id)..."
-    $wingetArgs = @('install', '--id', $Id, '--exact', '--silent', '--accept-source-agreements', '--accept-package-agreements')
-    if ($CustomArgs) { $wingetArgs += @('--custom', $CustomArgs) }
+    $wingetArgs = @('install', '--id', $Id, '--exact', '--silent', '--accept-source-agreements',
+        '--accept-package-agreements', '--disable-interactivity')
+    if ($Version) { $wingetArgs += @('--version', $Version, '--force') }
+    if ($Custom) { $wingetArgs += @('--custom', $Custom) }
+    if ($Override) { $wingetArgs += @('--override', $Override) }
+    if ($Scope) { $wingetArgs += @('--scope', $Scope) }
+    Log-Info "Installing $Label ($Id $Version)..."
     & winget @wingetArgs
-    if ($LASTEXITCODE -ne 0) {
-        # winget zwraca rozne kody bledow. Sprawdz czy mimo to pakiet jest dostepny.
-        Refresh-Path
-        $reCheck = Invoke-NativeCapture { winget list --id $Id } | Out-String
-        if ($reCheck -match [regex]::Escape($Id)) {
-            Log-Ok "$Label zainstalowany (winget zwrocil exit code $LASTEXITCODE, ale pakiet jest obecny)"
-        } else {
-            Log-Warn "winget install $Id zwrocil exit code $LASTEXITCODE — sprawdz recznie."
-            return $false
-        }
-    } else {
-        Log-Ok "$Label zainstalowany"
+    $code = $LASTEXITCODE
+    Update-SessionEnvironment
+    if ($code -ne 0 -and -not (Test-WingetPackage -Id $Id -Version $Version)) {
+        throw "winget install $Id failed (exit $code)."
     }
-    Refresh-Path
-    $script:Installed += $Label
-    return $true
+    Log-Ok "$Label installed"
+    $script:Installed += "$Label $Version"
 }
 
-# --- Sprawdzenia wstepne ---
+# --- Checks ------------------------------------------------------------------
 
 function Check-Prereqs {
-    Log-Section "Sprawdzenie wstepnych wymagan"
-
-    if (-not (Test-Command 'winget')) {
-        Log-Error "Brak winget. Zainstaluj 'App Installer' ze sklepu Microsoft Store:"
-        Log-Error "  https://apps.microsoft.com/detail/9NBLGGH4NNS1"
-        exit 1
+    Log-Section 'Prerequisites'
+    if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+        throw 'Only Windows x86_64 is supported.'
     }
-    Log-Ok "winget: $(Invoke-NativeCapture { winget --version } | Select-Object -First 1)"
-
-    $psVer = $PSVersionTable.PSVersion
-    Log-Info "PowerShell: $psVer"
-    Log-Info "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+    if (-not (Test-Command 'winget')) {
+        throw "winget is missing. Install 'App Installer' from the Microsoft Store: https://apps.microsoft.com/detail/9NBLGGH4NNS1"
+    }
+    Log-Ok "winget $(Invoke-NativeCapture { winget --version } | Select-Object -First 1)"
+    Log-Info "PowerShell $($PSVersionTable.PSVersion), $((Get-CimInstance Win32_OperatingSystem).Caption)"
 }
 
-# --- Bazowe narzedzia buildu ---
+# --- Visual Studio C++ toolset -------------------------------------------------
+
+function Install-VisualStudio {
+    Log-Section 'Visual Studio C++ Build Tools'
+    $vs = Get-VsInstallPath
+    if ($vs) {
+        Log-Ok "C++ x64 toolset found: $vs"
+        return
+    }
+    # The VCTools workload brings MSVC and, with recommended components, the
+    # Windows SDK. Visual Studio 2022 is what the CUDA toolkit pinned in
+    # versions.env supports; any newer VS already installed is accepted above.
+    Install-WingetPackage -Id 'Microsoft.VisualStudio.2022.BuildTools' -Label 'Visual Studio 2022 Build Tools' `
+        -Override '--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+    if (-not (Get-VsInstallPath)) {
+        throw 'Visual Studio Build Tools installed, but vswhere does not report the C++ x64 toolset. A reboot may be pending.'
+    }
+}
+
+# --- Base tools ------------------------------------------------------------------
+
+function Find-LlvmBin {
+    foreach ($dir in @("$env:ProgramFiles\LLVM\bin", "${env:ProgramFiles(x86)}\LLVM\bin")) {
+        if (Test-Path (Join-Path $dir 'libclang.dll')) { return $dir }
+    }
+    return $null
+}
 
 function Find-ProtocExe {
-    # 1) Get-Command (jak juz w PATH)
     $cmd = Get-Command 'protoc.exe' -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-
-    # 2) winget package dir (Google.Protobuf instaluje tutaj, dodaje alias do
-    #    %LOCALAPPDATA%\Microsoft\WinGet\Links ale env var PROTOC nie jest
-    #    ustawiana — a build.rs czyta wlasnie ja).
-    $wingetPkgs = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
-    if (Test-Path $wingetPkgs) {
-        $found = Get-ChildItem $wingetPkgs -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^Google\.Protobuf' } |
+    # winget's Google.Protobuf only adds a link under WinGet\Links; build.rs of
+    # prost-build reads PROTOC, so the real executable is located here.
+    $packages = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    if (Test-Path $packages) {
+        $found = Get-ChildItem $packages -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'Google.Protobuf*' } |
             ForEach-Object { Get-ChildItem $_.FullName -Recurse -Filter 'protoc.exe' -ErrorAction SilentlyContinue } |
             Select-Object -First 1
         if ($found) { return $found.FullName }
     }
-
-    # 3) chocolatey / scoop typowe lokalizacje
-    foreach ($p in @(
-        "$env:ProgramData\chocolatey\bin\protoc.exe",
-        "$env:USERPROFILE\scoop\shims\protoc.exe"
-    )) {
-        if (Test-Path $p) { return $p }
-    }
-
     return $null
 }
 
-function Configure-Protoc {
+function Install-BaseTools {
+    Log-Section 'Base tools'
+    Install-WingetPackage -Id 'Git.Git' -Label 'Git for Windows'
+    Install-WingetPackage -Id 'Kitware.CMake' -Label 'CMake'
+    Install-WingetPackage -Id 'Ninja-build.Ninja' -Label 'Ninja'
+    Install-WingetPackage -Id 'LLVM.LLVM' -Label 'LLVM/Clang'
+    Install-WingetPackage -Id 'Google.Protobuf' -Label 'protoc'
+    # pkgconf has no Windows installer in winget; pkg-config-lite has no glib
+    # dependency. gstreamer-sys finds the SDK through it.
+    Install-WingetPackage -Id 'bloodrock.pkg-config-lite' -Label 'pkg-config-lite'
+    # ML Studio decodes recording segments with the ffmpeg CLI at runtime.
+    Install-WingetPackage -Id 'Gyan.FFmpeg' -Label 'FFmpeg'
+
+    $llvm = Find-LlvmBin
+    if (-not $llvm) { throw 'libclang.dll not found after installing LLVM.' }
+    Set-PersistentEnv -Name 'LIBCLANG_PATH' -Value $llvm
+    Add-PersistentPath -Path $llvm
+
     $protoc = Find-ProtocExe
-    if (-not $protoc) {
-        Log-Warn "protoc.exe nie znalezione — tentaflow-voice build.rs wymaga env var PROTOC."
-        return
-    }
-
-    Log-Ok "Znaleziono protoc: $protoc"
-
-    # build.rs sprawdza tylko obecnosc env var PROTOC. PATH alias nie wystarczy.
-    $userProtoc = [Environment]::GetEnvironmentVariable('PROTOC', 'User')
-    if ($userProtoc -ne $protoc) {
-        Set-PersistentEnv -Name 'PROTOC' -Value $protoc -Scope 'User'
-        $script:Installed += "PROTOC = $protoc"
-    } else {
-        Log-Ok "PROTOC juz ustawione na $userProtoc"
-    }
-
-    # Dorzucamy tez bin do PATH zeby `protoc --version` dzialal w shellu.
-    $protocBin = Split-Path -Parent $protoc
-    Add-PersistentPath -Path $protocBin -Scope 'User'
+    if (-not $protoc) { throw 'protoc.exe not found after installing Google.Protobuf.' }
+    Set-PersistentEnv -Name 'PROTOC' -Value $protoc
+    Add-PersistentPath -Path (Split-Path -Parent $protoc)
 }
 
 function Install-Python {
-    for ($attempt = 0; $attempt -lt 2; $attempt++) {
-        foreach ($candidate in @('python', 'py', 'python3')) {
-            if (-not (Test-Command $candidate)) { continue }
-            $pythonPath = Invoke-NativeCapture { & $candidate -c 'import sys; sys.exit(1) if sys.version_info < (3, 11) else print(sys.executable)' }
-            if ($LASTEXITCODE -eq 0 -and $pythonPath) {
-                $env:TENTAFLOW_PYTHON = "$pythonPath".Trim()
-                Log-Ok "Python 3.11+: $env:TENTAFLOW_PYTHON"
-                return
-            }
-        }
-        if ($attempt -eq 0) {
-            [void](Winget-Install -Id 'Python.Python.3.12' -Label 'Python 3.12')
-        }
+    Log-Section 'Python 3.11+'
+    $python = Find-Python
+    if (-not $python) {
+        Install-WingetPackage -Id 'Python.Python.3.13' -Label 'Python 3.13'
+        $python = Find-Python
     }
-    throw 'Python 3.11+ nie jest dostepny po instalacji. Otworz nowy PowerShell i uruchom setup ponownie.'
+    if (-not $python) {
+        throw 'Python 3.11+ still not found. Open a new PowerShell and run setup again.'
+    }
+    $env:TENTAFLOW_PYTHON = $python
+    Log-Ok "Python: $python"
 }
 
-function Install-Base {
-    Log-Section "Bazowe narzedzia (VS Build Tools, CMake, LLVM, Git, pkg-config)"
+# --- GStreamer ---------------------------------------------------------------------
 
-    # Visual Studio Build Tools 2022 — MSVC + Windows SDK. Bez tego rustup-init
-    # przy stable-x86_64-pc-windows-msvc zglosi 'link.exe not found'.
-    # Workload Microsoft.VisualStudio.Workload.VCTools dociaga MSVC + SDK.
-    if (-not (Test-Path 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools') -and
-        -not (Test-Path 'C:\Program Files\Microsoft Visual Studio\2022\BuildTools') -and
-        -not (Test-Path 'C:\Program Files\Microsoft Visual Studio\2022\Community') -and
-        -not (Test-Path 'C:\Program Files\Microsoft Visual Studio\2022\Professional') -and
-        -not (Test-Path 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise')) {
-        Log-Info "Instalacja Visual Studio 2022 Build Tools z workloadem C++..."
-        # winget ma override do dodania workloadu VCTools.
-        & winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --silent `
-            --accept-source-agreements --accept-package-agreements `
-            --override "--quiet --wait --norestart --nocache --installPath `"C:\BuildTools`" --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"
-        if ($LASTEXITCODE -ne 0) {
-            Log-Warn "winget VS BuildTools zwrocil exit code $LASTEXITCODE — moze byc juz zainstalowane lub wymagac restartu."
-        } else {
-            $script:Installed += "VS 2022 Build Tools (VCTools + Win11 SDK)"
-        }
-        Refresh-Path
-    } else {
-        Log-Ok "Visual Studio 2022 (Build Tools / Community / Pro / Enterprise) juz obecne"
-    }
-
-    # CMake
-    Winget-Install -Id 'Kitware.CMake' -Label 'CMake' | Out-Null
-
-    # LLVM (dostarcza clang.exe + libclang.dll potrzebne dla bindgen w whisper-rs-sys)
-    $llvmInstalled = Winget-Install -Id 'LLVM.LLVM' -Label 'LLVM/Clang'
-
-    # Ustaw LIBCLANG_PATH (wymagane dla bindgen — whisper-rs-sys, llama-cpp itd.)
-    $llvmBin = 'C:\Program Files\LLVM\bin'
-    if (Test-Path (Join-Path $llvmBin 'libclang.dll')) {
-        if (-not $env:LIBCLANG_PATH -or $env:LIBCLANG_PATH -ne $llvmBin) {
-            Set-PersistentEnv -Name 'LIBCLANG_PATH' -Value $llvmBin -Scope 'User'
-            $script:Installed += "LIBCLANG_PATH = $llvmBin"
-        } else {
-            Log-Ok "LIBCLANG_PATH juz ustawione na $llvmBin"
-        }
-        Add-PersistentPath -Path $llvmBin -Scope 'User'
-    } else {
-        Log-Warn "Nie znaleziono libclang.dll w $llvmBin — ustaw LIBCLANG_PATH recznie po instalacji LLVM."
-    }
-
-    # Git
-    Winget-Install -Id 'Git.Git' -Label 'Git' | Out-Null
-
-    # Git LFS — natywne biblioteki w native-libs/ sa wersjonowane przez LFS.
-    Winget-Install -Id 'GitHub.GitLFS' -Label 'Git LFS' | Out-Null
-
-    # pkg-config-lite — pkgconf.pkgconf nie ma Windows installera w winget,
-    # bloodrock.pkg-config-lite tak (wersja 0.28 bez zaleznosci glib).
-    Winget-Install -Id 'bloodrock.pkg-config-lite' -Label 'pkg-config-lite' | Out-Null
-
-    # Ninja (przyspiesza CMake builds, uzywany przez wiele *-sys cratow)
-    Winget-Install -Id 'Ninja-build.Ninja' -Label 'Ninja' | Out-Null
-
-    # protoc (Protocol Buffers compiler) — wymagany przez tentaflow-voice/build.rs
-    # i kazdy crate uzywajacy prost-build / tonic-build do generowania kodu z .proto.
-    Winget-Install -Id 'Google.Protobuf' -Label 'protoc (Protocol Buffers)' | Out-Null
-    Configure-Protoc
-
-    Configure-CmakeGenerator
-    Configure-Gstreamer
-
-    Refresh-Path
-    Log-Ok "Bazowe narzedzia zainstalowane"
-}
-
-function Install-GitLfs {
-    Log-Section "Git LFS"
-
-    Refresh-Path
-    if (-not (Test-Command 'git')) {
-        Log-Error "git nie jest dostepny — Git LFS wymaga Git."
-        exit 1
-    }
-
-    $version = Invoke-NativeCapture { git lfs version } | Select-Object -First 1
-    if ($LASTEXITCODE -ne 0 -or -not $version) {
-        Log-Error "Git LFS nie jest dostepny mimo instalacji. Otworz nowy PowerShell albo zainstaluj GitHub.GitLFS recznie."
-        exit 1
-    }
-
-    Invoke-NativeCapture { git lfs install } | Out-Host
-    Log-Ok "Git LFS: $version"
-    $script:Installed += 'git lfs install'
-
-    # Materializuj artefakty LFS (prebuilt native-libs/*.a|*.lib|*.dll). Jesli
-    # repo sklonowano ZANIM git-lfs byl zainstalowany, pliki sa pointerami a
-    # `git lfs install` rejestruje tylko filtry. Bez `git lfs pull` build.rs
-    # pada na brakujace native-libs.
-    $repoRoot = (Invoke-NativeCapture { git rev-parse --show-toplevel } | Select-Object -First 1)
-    if ($repoRoot) {
-        Log-Info 'Pobieranie artefaktow Git LFS (prebuilt native-libs)...'
-        Invoke-NativeCapture { git -C "$repoRoot" lfs pull } | Out-Host
-        Log-Ok 'Git LFS: artefakty pobrane'
-        $script:Installed += 'git lfs pull'
-    }
-}
-
-function Configure-CmakeGenerator {
-    # Domyslny generator cmake na Windows to "Visual Studio 17 2022" + MSBuild.
-    # Trzy realne problemy:
-    # 1. ExternalProject_Add (np. vulkan-shaders-gen w llama.cpp) odpala
-    #    zagniezdzony cmake ktory NIE dziedziczy ustawien kompilatora —
-    #    pada na "No CMAKE_C_COMPILER could be found".
-    # 2. MSBuild w polskiej / non-English wersji Windowsa wybucha na
-    #    "The system cannot find the batch label specified - VCEnd"
-    #    przy custom build steps wywolujacych vcvarsall.bat.
-    # 3. MSBuild jest po prostu wolny i nieczytelny w logach.
-    #
-    # Ninja flat-buduje wszystko w jednym procesie cmake, korzysta z auto-
-    # detekcji MSVC przez `cc` crate (rejestr + vswhere), wiec dziala bez
-    # Developer PowerShella i omija wszystkie powyzsze pulapki.
-    if (-not (Test-Command 'ninja')) {
-        Log-Warn "Ninja nie znalezione — pomijam ustawienie CMAKE_GENERATOR."
-        return
-    }
-    $current = [Environment]::GetEnvironmentVariable('CMAKE_GENERATOR', 'User')
-    if ($current -eq 'Ninja') {
-        Log-Ok "CMAKE_GENERATOR juz ustawione na Ninja"
-        if ($env:CMAKE_GENERATOR -ne 'Ninja') { $env:CMAKE_GENERATOR = 'Ninja' }
-        return
-    }
-    Set-PersistentEnv -Name 'CMAKE_GENERATOR' -Value 'Ninja' -Scope 'User'
-    $script:Installed += 'CMAKE_GENERATOR = Ninja (omija MSBuild bug VCEnd)'
-}
-
-function Find-GstreamerInstall {
+function Find-GstreamerRoot {
+    # Per-user install (what setup does: no UAC) lands in {autopf} of the
+    # user, i.e. %LOCALAPPDATA%\Programs; a machine-wide one in Program Files.
     $roots = @(
-        'C:\gstreamer\1.0\msvc_x86_64',
-        'C:\gstreamer\1.0\mingw_x86_64',
-        "$env:ProgramFiles\gstreamer\1.0\msvc_x86_64",
-        "$env:ProgramFiles\gstreamer\1.0\mingw_x86_64",
-        "${env:ProgramFiles(x86)}\gstreamer\1.0\msvc_x86_64",
-        "${env:ProgramFiles(x86)}\gstreamer\1.0\mingw_x86_64"
-    ) | Where-Object { $_ -and (Test-Path $_) }
-
+        (Join-Path $env:LOCALAPPDATA 'Programs\gstreamer\1.0\msvc_x86_64'),
+        (Join-Path $env:ProgramFiles 'gstreamer\1.0\msvc_x86_64'),
+        'C:\gstreamer\1.0\msvc_x86_64'
+    )
     foreach ($root in $roots) {
-        $pc = Join-Path $root 'lib\pkgconfig\gstreamer-1.0.pc'
-        if (Test-Path $pc) { return $root }
+        if (Test-Path (Join-Path $root 'lib\pkgconfig\gstreamer-1.0.pc')) { return $root }
     }
-
-    foreach ($base in @('C:\gstreamer', $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-        if (-not $base -or -not (Test-Path $base)) { continue }
-        $pc = Get-ChildItem $base -Recurse -Filter 'gstreamer-1.0.pc' -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($pc) {
-            return (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $pc.FullName)))
-        }
-    }
-
     return $null
 }
 
-function Configure-Gstreamer {
-    Log-Section "GStreamer SDK (kamera, RTSP, file, lokalne zrodla wideo)"
-
-    $root = Find-GstreamerInstall
-    if (-not $root) {
-        Log-Info "Nie znaleziono GStreamer SDK, probuje instalacji przez winget..."
-        # ADDLOCAL=ALL: silent MSI defaults to the Typical feature set, which
-        # skips part of the plugin catalog. Camera ingest resolves elements at
-        # runtime (souphttpsrc/multipartdemux/jpegdec — good, jpegparse/
-        # h264parse — bad, x264enc — ugly, avdec_h264 — libav), so we need the
-        # complete install; a missing plugin fails the pipeline build per
-        # camera ("Failed to find element factory").
-        Winget-Install -Id 'gstreamerproject.gstreamer' -Label 'GStreamer SDK' -CustomArgs 'ADDLOCAL=ALL' | Out-Null
-        Refresh-Path
-        $root = Find-GstreamerInstall
-    }
-
-    if (-not $root) {
-        Log-Error "Nie znaleziono GStreamer SDK."
-        Log-Error "Zainstaluj runtime + development files ze strony:"
-        Log-Error "  https://gstreamer.freedesktop.org/download/#windows"
-        Log-Error "Wybierz wariant MSVC x86_64 i upewnij sie, ze istnieje lib\pkgconfig\gstreamer-1.0.pc."
-        return
-    }
-
-    $pkgConfigDir = Join-Path $root 'lib\pkgconfig'
-    $binDir = Join-Path $root 'bin'
-    Add-PersistentPathList -Name 'PKG_CONFIG_PATH' -Paths @($pkgConfigDir) -Scope 'User'
-    Add-PersistentPath -Path $binDir -Scope 'User'
-    Set-PersistentEnv -Name 'GSTREAMER_1_0_ROOT_MSVC_X86_64' -Value "$root\" -Scope 'User'
-    $script:Installed += "GStreamer SDK = $root"
+function Get-GstreamerVersion {
+    param([string]$Root)
+    $pc = Join-Path $Root 'lib\pkgconfig\gstreamer-1.0.pc'
+    $line = Get-Content $pc | Where-Object { $_ -like 'Version:*' } | Select-Object -First 1
+    if ($line) { return $line.Substring(8).Trim() }
+    return $null
 }
 
-# --- zvec (wbudowana baza wektorowa — natywna biblioteka per platforma) ---
-
-# zvec FTS/hybrid-search API (zvec_fts_*, reranker, multi_query) wszedl po tagu
-# v0.4.0 (commit 02bfb31 #408) i nie ma go w zadnym tagu. Wrapper tentaflow-zvec
-# go uzywa, wiec pinujemy konkretny commit main, ktorego c_api.h zgadza sie z
-# zwendorowanym naglowkiem. Musi byc zgodny z ZVEC_REF w scripts/build-zvec.sh.
-$ZvecRef = 'f562bdd636d454f18128cb18b41578128d1415a4'
-
-function Install-Zvec {
-    Log-Section "zvec (wbudowana baza wektorowa)"
-
-    # Windows buduje tylko x86_64-pc-windows-msvc -> katalog windows-x86_64.
-    $platform = 'windows-x86_64'
-    $repoRoot = Split-Path -Parent $PSScriptRoot
-    $sysCrate = Join-Path $repoRoot 'tentaflow-zvec-sys'
-    $libDir   = Join-Path $sysCrate "vendor\lib\$platform"
-    $includeDir = Join-Path $sysCrate 'vendor\include\zvec'
-    $importLib = Join-Path $libDir 'zvec_c_api.lib'
-
-    # Skip jezeli import lib juz zwendorowany (jak w bash install_zvec).
-    if (Test-Path $importLib) {
-        Log-Ok "zvec juz zbudowany ($platform) — pomijam"
-        return
+function Install-Gstreamer {
+    Log-Section "GStreamer SDK $env:GSTREAMER_VERSION (camera, RTSP, video)"
+    $root = Find-GstreamerRoot
+    $current = $null
+    if ($root) { $current = Get-GstreamerVersion -Root $root }
+    if ($current -ne $env:GSTREAMER_VERSION) {
+        if ($current) { Log-Info "Installed GStreamer $current, required $env:GSTREAMER_VERSION" }
+        # Since 1.28 the SDK is one Inno Setup installer. The `devel` type is
+        # runtime + headers/pkg-config files with every plugin set (good, bad,
+        # ugly, libav) the camera pipeline resolves at runtime.
+        Install-WingetPackage -Id 'gstreamerproject.gstreamer' -Label 'GStreamer SDK' -Version $env:GSTREAMER_VERSION `
+            -Scope user -Custom '/TYPE=devel /TASKS=environment_variables,registry_install_dir'
+        $root = Find-GstreamerRoot
     }
-
-    # zvec linkuje sie MSVC-em (cl.exe). cl jest w PATH tylko w "x64 Native
-    # Tools Command Prompt" / Developer PowerShell for VS. Bez tego CMake pada
-    # na "No CMAKE_C_COMPILER could be found" — dajemy czytelny blad.
-    if (-not (Test-Command 'cl')) {
-        Log-Error "cl.exe (kompilator MSVC) nie jest w PATH — nie moge zbudowac zvec."
-        Log-Error "Uruchom setup.ps1 z 'x64 Native Tools Command Prompt for VS 2022'"
-        Log-Error "albo z 'Developer PowerShell for VS 2022', potem ponow."
-        return
+    if (-not $root -or (Get-GstreamerVersion -Root $root) -ne $env:GSTREAMER_VERSION) {
+        throw "GStreamer $env:GSTREAMER_VERSION (MSVC x86_64, with development files) not found after installation."
     }
-    foreach ($tool in 'cmake','ninja','git') {
-        if (-not (Test-Command $tool)) {
-            Log-Error "$tool nie znalezione — wymagane do budowy zvec. Uruchom Install-Base najpierw."
-            return
-        }
-    }
-
-    $srcDir = Join-Path $env:TEMP 'zvec-build'
-    Log-Info "Buduje zvec ($platform) — dlugi build (RocksDB+Arrow), jednorazowo na maszyne..."
-
-    try {
-        # 1. Zrodlo + submodule (RocksDB/Arrow/protobuf/...) na przypietym commicie.
-        if (-not (Test-Path (Join-Path $srcDir '.git'))) {
-            & git clone 'https://github.com/alibaba/zvec' $srcDir
-            if ($LASTEXITCODE -ne 0) { throw "git clone zvec nieudany (exit $LASTEXITCODE)" }
-        }
-        Push-Location $srcDir
-        try {
-            & git fetch origin
-            & git checkout $ZvecRef
-            if ($LASTEXITCODE -ne 0) { throw "git checkout $ZvecRef nieudany" }
-            & git submodule update --init --recursive --depth 1
-            if ($LASTEXITCODE -ne 0) { throw "git submodule update nieudany" }
-        } finally {
-            Pop-Location
-        }
-
-        # 2. CMake (Ninja + MSVC) — buduje samowystarczalny zvec_c_api.dll + import .lib.
-        $buildDir = Join-Path $srcDir 'build_zvec'
-        if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
-        New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
-        # zvec submoduly (googletest/RocksDB/Arrow) wymagaja CMake<4: CMake 4 usunal
-        # kompatybilnosc z cmake_minimum_required<3.5, a wymuszenie starej polityki psuje
-        # eksport include-dirs Arrow. Pinujemy cmake 3.x w lokalnym venv (jak Linux w Dockerze).
-        $python = $null
-        foreach ($cand in 'python','py') {
-            if (Test-Command $cand) { $python = $cand; break }
-        }
-        if (-not $python) {
-            throw "python/py nie znaleziony — wymagany do przypiecia cmake<4 dla buildu zvec."
-        }
-        $cmakePin = Join-Path $srcDir '.cmake-pin'
-        $cmakePinScripts = Join-Path $cmakePin 'Scripts'
-        if (-not (Test-Path (Join-Path $cmakePinScripts 'cmake.exe'))) {
-            & $python -m venv $cmakePin
-            if ($LASTEXITCODE -ne 0) { throw "python -m venv ($cmakePin) nieudany (exit $LASTEXITCODE)" }
-            & (Join-Path $cmakePinScripts 'pip.exe') install -q "cmake<4"
-            if ($LASTEXITCODE -ne 0) { throw "pip install 'cmake<4' nieudany (exit $LASTEXITCODE)" }
-        }
-        $prevPath = $env:Path
-        $env:Path = "$cmakePinScripts;$env:Path"
-        Push-Location $buildDir
-        try {
-            & cmake -G Ninja -DCMAKE_BUILD_TYPE=Release `
-                -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
-                -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_C_BINDINGS=ON ..
-            if ($LASTEXITCODE -ne 0) { throw "cmake configure zvec nieudany (exit $LASTEXITCODE)" }
-            & ninja zvec_c_api
-            if ($LASTEXITCODE -ne 0) { throw "ninja zvec_c_api nieudany (exit $LASTEXITCODE)" }
-        } finally {
-            Pop-Location
-            $env:Path = $prevPath
-        }
-
-        # 3. Zwendoruj dll + import lib + naglowek (jak build-zvec.sh).
-        New-Item -ItemType Directory -Path $libDir -Force | Out-Null
-        New-Item -ItemType Directory -Path $includeDir -Force | Out-Null
-
-        $builtDll = Get-ChildItem -Path $buildDir -Recurse -Filter 'zvec_c_api.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
-        $builtLib = Get-ChildItem -Path $buildDir -Recurse -Filter 'zvec_c_api.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $builtDll -or -not $builtLib) {
-            throw "ninja zakonczyl OK, ale brak zvec_c_api.dll/.lib w $buildDir"
-        }
-        Copy-Item $builtDll.FullName (Join-Path $libDir 'zvec_c_api.dll') -Force
-        Copy-Item $builtLib.FullName $importLib -Force
-        Copy-Item (Join-Path $srcDir 'src\include\zvec\c_api.h') (Join-Path $includeDir 'c_api.h') -Force
-
-        Log-Ok "zvec zbudowany ($platform): $libDir"
-        $script:Installed += "zvec ($platform dll + import lib)"
-    } catch {
-        Log-Warn "Build zvec nieudany: $_"
-        Log-Warn "Sprobuj recznie z 'x64 Native Tools Command Prompt for VS 2022'."
-    }
+    Add-PersistentPathList -Name 'PKG_CONFIG_PATH' -Path (Join-Path $root 'lib\pkgconfig')
+    Add-PersistentPath -Path (Join-Path $root 'bin')
+    Set-PersistentEnv -Name 'GSTREAMER_1_0_ROOT_MSVC_X86_64' -Value "$root\"
 }
 
-# --- Rust toolchain ---
+# --- Rust ------------------------------------------------------------------------------
 
 function Install-Rust {
-    Log-Section "Rust toolchain (rustup + stable msvc)"
-
-    if (Test-Command 'rustup') {
-        Log-Ok "rustup juz zainstalowany: $(Invoke-NativeCapture { rustup --version } | Select-Object -First 1)"
-        Log-Info "Aktualizacja stable toolchaina..."
-        Invoke-NativeCapture { rustup update stable --no-self-update } | Out-Host
-    } else {
-        # Rustlang.Rustup z winget instaluje rustup + stable-msvc.
-        Winget-Install -Id 'Rustlang.Rustup' -Label 'rustup' | Out-Null
-        Refresh-Path
-        if (-not (Test-Command 'rustup')) {
-            Log-Error "rustup nadal nie jest w PATH po instalacji. Otworz nowy PowerShell i uruchom skrypt ponownie."
-            exit 1
+    Log-Section 'Rust (rustup, stable MSVC, WASM targets)'
+    if (-not (Test-Command 'rustup')) {
+        Install-WingetPackage -Id 'Rustlang.Rustup' -Label 'rustup'
+    }
+    if (-not (Test-Command 'rustup')) {
+        throw 'rustup is not on PATH after installation. Open a new PowerShell and run setup again.'
+    }
+    Invoke-NativeCapture { rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy } | Out-Host
+    $default = Invoke-NativeCapture { rustup default } | Out-String
+    if ($default -notmatch 'windows-msvc') {
+        Invoke-NativeCapture { rustup default stable-x86_64-pc-windows-msvc } | Out-Host
+    }
+    $installed = Invoke-NativeCapture { rustup target list --installed } | Out-String
+    foreach ($target in @('wasm32-wasip1', 'wasm32-unknown-unknown')) {
+        if ($installed -notmatch [regex]::Escape($target)) {
+            Invoke-NativeCapture { rustup target add $target } | Out-Host
+            $script:Installed += $target
         }
     }
-
-    Invoke-NativeCapture { rustup default stable-x86_64-pc-windows-msvc } | Out-Host
-    Log-Ok "Rust: $(Invoke-NativeCapture { rustc --version } | Select-Object -First 1)"
-    $script:Installed += 'rust-stable (msvc)'
+    Log-Ok "$(Invoke-NativeCapture { rustc --version } | Select-Object -First 1)"
 }
-
-# --- WASM targets ---
-
-function Install-WasmTargets {
-    Log-Section "WASM targety (wasm32-wasip1 + wasm32-unknown-unknown)"
-
-    $installed = Invoke-NativeCapture { rustup target list --installed }
-
-    if ($installed -match 'wasm32-wasip1') {
-        Log-Ok "wasm32-wasip1 juz zainstalowany"
-    } else {
-        Log-Info "Dodawanie targetu wasm32-wasip1..."
-        Invoke-NativeCapture { rustup target add wasm32-wasip1 } | Out-Host
-        $script:Installed += 'wasm32-wasip1'
-    }
-
-    if ($installed -match 'wasm32-unknown-unknown') {
-        Log-Ok "wasm32-unknown-unknown juz zainstalowany"
-    } else {
-        Log-Info "Dodawanie targetu wasm32-unknown-unknown..."
-        Invoke-NativeCapture { rustup target add wasm32-unknown-unknown } | Out-Host
-        $script:Installed += 'wasm32-unknown-unknown'
-    }
-}
-
-# --- wasm-bindgen CLI ---
 
 function Install-WasmBindgenCli {
-    $WasmBindgenVersion = & $env:TENTAFLOW_PYTHON (Join-Path $PSScriptRoot 'workspace-version.py') 'wasm-bindgen'
-    if ($LASTEXITCODE -ne 0) { throw 'Nie można odczytać wersji wasm-bindgen z workspace.' }
-    Log-Section "wasm-bindgen CLI (v$WasmBindgenVersion)"
-
+    $version = & $env:TENTAFLOW_PYTHON (Join-Path $PSScriptRoot 'workspace-version.py') 'wasm-bindgen'
+    if ($LASTEXITCODE -ne 0 -or -not $version) { throw 'Cannot read the wasm-bindgen version from Cargo.toml.' }
+    $version = "$version".Trim()
+    Log-Section "wasm-bindgen CLI $version"
     if (Test-Command 'wasm-bindgen') {
-        $current = (Invoke-NativeCapture { wasm-bindgen --version } | Select-Object -First 1) -split '\s+' | Select-Object -Last 1
-        if ($current -eq $WasmBindgenVersion) {
-            Log-Ok "wasm-bindgen $current juz zainstalowany"
+        $current = ((Invoke-NativeCapture { wasm-bindgen --version } | Select-Object -First 1) -split '\s+')[-1]
+        if ($current -eq $version) {
+            Log-Ok "wasm-bindgen $current already installed"
             return
         }
-        Log-Warn "wasm-bindgen $current != wymagana $WasmBindgenVersion — reinstaluje"
+        Log-Info "wasm-bindgen $current != $version - reinstalling"
     }
-
-    Log-Info "Kompilacja wasm-bindgen-cli (moze potrwac kilka minut)..."
-    & cargo install wasm-bindgen-cli --version $WasmBindgenVersion --locked
-    if ($LASTEXITCODE -ne 0) {
-        Log-Error "cargo install wasm-bindgen-cli failed (exit $LASTEXITCODE)"
-        exit 1
-    }
-    $script:Installed += "wasm-bindgen-cli $WasmBindgenVersion"
+    & cargo install wasm-bindgen-cli --version $version --locked
+    if ($LASTEXITCODE -ne 0) { throw "cargo install wasm-bindgen-cli $version failed." }
+    $script:Installed += "wasm-bindgen-cli $version"
 }
 
-# --- CUDA (opcjonalne) ---
+# --- .NET + WASI SDK (C# addons) -------------------------------------------------------
+
+function Install-DotnetSdk {
+    $major = ($env:DOTNET_SDK_CHANNEL -split '\.')[0]
+    Log-Section ".NET $env:DOTNET_SDK_CHANNEL SDK (C# addons)"
+    $sdks = ''
+    if (Test-Command 'dotnet') { $sdks = Invoke-NativeCapture { dotnet --list-sdks } | Out-String }
+    if ($sdks -match "(?m)^$major\.") {
+        Log-Ok ".NET $major SDK present"
+        return
+    }
+    Install-WingetPackage -Id "Microsoft.DotNet.SDK.$major" -Label ".NET $major SDK"
+}
+
+function Install-WasiSdk {
+    $version = $env:WASI_SDK_VERSION
+    $name = "wasi-sdk-$version-x86_64-windows"
+    $cache = Get-NativeCacheDir
+    $target = Join-Path $cache $name
+    Log-Section "WASI SDK $version (C# addons)"
+    if (-not (Test-Path (Join-Path $target 'share\wasi-sysroot'))) {
+        New-Item -ItemType Directory -Force -Path $cache | Out-Null
+        $archive = Join-Path $cache "$name.tar.gz"
+        $major = ($version -split '\.')[0]
+        $url = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$major/$name.tar.gz"
+        Log-Info "Downloading $url"
+        $progress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+        $ProgressPreference = $progress
+        $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+        if ($actual -ne $env:WASI_SDK_SHA256_WINDOWS_X86_64) {
+            Remove-Item $archive -Force
+            throw "WASI SDK checksum mismatch: $actual (scripts/versions.env: $env:WASI_SDK_SHA256_WINDOWS_X86_64)"
+        }
+        # The system bsdtar, not Git's GNU tar: it takes native paths as-is.
+        & "$env:SystemRoot\System32\tar.exe" -xzf $archive -C $cache
+        if ($LASTEXITCODE -ne 0) { throw "Extracting $archive failed." }
+        Remove-Item $archive -Force
+        $script:Installed += "WASI SDK $version"
+    }
+    # Compile + link catches a missing sysroot or a wrong host binary.
+    $probe = Join-Path ([IO.Path]::GetTempPath()) "tentaflow-wasi-$PID"
+    New-Item -ItemType Directory -Force -Path $probe | Out-Null
+    try {
+        Set-Content -Path (Join-Path $probe 'check.c') -Value 'int main(void) { return 0; }' -Encoding ascii
+        & (Join-Path $target 'bin\clang.exe') "--sysroot=$(Join-Path $target 'share\wasi-sysroot')" (Join-Path $probe 'check.c') -o (Join-Path $probe 'check.wasm')
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $probe 'check.wasm'))) {
+            throw "WASI SDK in $target cannot compile a test program."
+        }
+    } finally {
+        Remove-Item $probe -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Log-Ok "WASI SDK: $target"
+}
+
+# --- GPU toolkits -------------------------------------------------------------------------
 
 function Install-Cuda {
-    Log-Section "NVIDIA CUDA toolkit"
-
-    if (Test-Command 'nvcc') {
-        Log-Ok "CUDA juz zainstalowane: $(Invoke-NativeCapture { nvcc --version } | Select-Object -Last 1)"
-        return
+    $version = $env:CUDA_TOOLKIT_VERSION
+    Log-Section "NVIDIA CUDA Toolkit $version"
+    $pathVar = 'CUDA_PATH_V' + ($version -replace '\.', '_')
+    $root = [Environment]::GetEnvironmentVariable($pathVar, 'Machine')
+    if (-not ($root -and (Test-Path (Join-Path $root 'bin\nvcc.exe')))) {
+        Install-WingetPackage -Id 'Nvidia.CUDA' -Label 'CUDA Toolkit' -Version $version
+        $root = [Environment]::GetEnvironmentVariable($pathVar, 'Machine')
     }
-
-    # Nvidia.CUDA dostarcza pelny toolkit (nvcc + cuBLAS + cuDNN nie wchodzi w sklad).
-    Winget-Install -Id 'Nvidia.CUDA' -Label 'CUDA Toolkit' | Out-Null
+    if (-not ($root -and (Test-Path (Join-Path $root 'bin\nvcc.exe')))) {
+        throw "CUDA $version not found after installation ($pathVar)."
+    }
+    # Several toolkits can live side by side; builds use the pinned one
+    # (scripts\lib\windows.ps1 Use-PinnedCuda puts it first). A bin of another
+    # version that setup added to the user PATH earlier goes away.
+    Set-PersistentEnv -Name 'CUDA_PATH' -Value $root
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $pinnedBin = (Join-Path $root 'bin').TrimEnd('\')
+    $kept = @(($userPath -split ';') | Where-Object {
+        $isCudaBin = $_ -match '\\NVIDIA GPU Computing Toolkit\\CUDA\\v[0-9.]+\\bin\\?$'
+        $_ -and -not ($isCudaBin -and ($_.TrimEnd('\') -ine $pinnedBin))
+    })
+    [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
+    Add-PersistentPath -Path (Join-Path $root 'bin')
+    Log-Ok "nvcc: $(Invoke-NativeCapture { & (Join-Path $root 'bin\nvcc.exe') --version } | Select-Object -Last 2 | Select-Object -First 1)"
 }
-
-# --- Vulkan SDK (opcjonalne) ---
 
 function Install-Vulkan {
-    Log-Section "Vulkan SDK (LunarG, full SDK z validation layers)"
-
-    if (Test-Command 'vulkaninfo') {
-        Log-Ok "Vulkan SDK juz zainstalowane: $(Invoke-NativeCapture { vulkaninfo --summary } | Select-Object -First 3)"
-        return
+    $version = $env:VULKAN_SDK_VERSION
+    Log-Section "Vulkan SDK $version"
+    # vulkaninfo alone ships with every GPU driver (System32); the SDK is what
+    # provides glslc, headers and vulkan-1.lib for ggml-vulkan.
+    $root = Join-Path 'C:\VulkanSDK' $version
+    if (-not (Test-Path (Join-Path $root 'Bin\glslc.exe'))) {
+        Install-WingetPackage -Id 'KhronosGroup.VulkanSDK' -Label 'Vulkan SDK' -Version $version
     }
-
-    Winget-Install -Id 'KhronosGroup.VulkanSDK' -Label 'Vulkan SDK' | Out-Null
-    Refresh-Path
-
-    # LunarG SDK ustawia VULKAN_SDK na Machine scope w trakcie instalacji.
-    # Foldery w C:\VulkanSDK maja atrybut System+Hidden — bez -Force
-    # Get-ChildItem zwraca pusta liste mimo ze foldery istnieja. Czytamy
-    # najpierw env var z rejestru.
-    $machineVulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
-    if ($machineVulkan -and (Test-Path $machineVulkan)) {
-        Log-Ok "VULKAN_SDK juz ustawione (Machine): $machineVulkan"
-        if (-not $env:VULKAN_SDK) { $env:VULKAN_SDK = $machineVulkan }
-        Add-PersistentPath -Path (Join-Path $machineVulkan 'Bin') -Scope 'User'
-    } else {
-        $candidate = Get-ChildItem 'C:\VulkanSDK' -Directory -Force -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending | Select-Object -First 1
-        if ($candidate) {
-            Set-PersistentEnv -Name 'VULKAN_SDK' -Value $candidate.FullName -Scope 'User'
-            Add-PersistentPath -Path (Join-Path $candidate.FullName 'Bin') -Scope 'User'
-        } else {
-            Log-Warn "Nie znaleziono katalogu C:\VulkanSDK\* — ustaw VULKAN_SDK recznie."
-        }
+    if (-not (Test-Path (Join-Path $root 'Bin\glslc.exe'))) {
+        throw "Vulkan SDK $version not found in $root after installation."
     }
+    Set-PersistentEnv -Name 'VULKAN_SDK' -Value $root
+    Add-PersistentPath -Path (Join-Path $root 'Bin')
 }
 
-# --- Silero VAD (teams-bot asset) ---
+# --- Teams bot asset --------------------------------------------------------------------
 
 function Get-SileroVad {
-    Log-Section "Pobieranie assetow teams-bot (Silero VAD)"
-
-    $repoRoot = Split-Path -Parent $PSScriptRoot
-    $modelDir = Join-Path $repoRoot 'tentaflow-containers\agents\native\teams-bot\models'
+    Log-Section 'teams-bot assets (Silero VAD)'
+    $modelDir = Join-Path $script:TentaflowRoot 'tentaflow-containers\agents\native\teams-bot\models'
     $modelFile = Join-Path $modelDir 'silero_vad.onnx'
-    $sileroUrl = 'https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx'
-
     if (Test-Path $modelFile) {
-        $size = '{0:N1} MB' -f ((Get-Item $modelFile).Length / 1MB)
-        Log-Ok "Silero VAD juz istnieje ($size)"
+        Log-Ok 'Silero VAD present'
         return
     }
-
-    if (-not (Test-Path $modelDir)) {
-        New-Item -ItemType Directory -Path $modelDir -Force | Out-Null
-    }
-
-    Log-Info "Pobieram Silero VAD: $sileroUrl"
+    New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
+    $url = 'https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx'
     try {
-        $progressBackup = $ProgressPreference
+        $progress = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $sileroUrl -OutFile $modelFile -UseBasicParsing
-        $ProgressPreference = $progressBackup
-        $size = '{0:N1} MB' -f ((Get-Item $modelFile).Length / 1MB)
-        Log-Ok "Silero VAD pobrany ($size)"
+        Invoke-WebRequest -Uri $url -OutFile $modelFile -UseBasicParsing
+        $ProgressPreference = $progress
+        Log-Ok 'Silero VAD downloaded'
         $script:Installed += 'silero_vad.onnx (teams-bot)'
     } catch {
-        Log-Warn "Nie udalo sie pobrac Silero VAD: $_"
-        Log-Warn "Bot uzyje fallback RMS (gorsza jakosc VAD)."
+        Log-Warn "Silero VAD download failed: $_ - the bot falls back to RMS VAD."
         if (Test-Path $modelFile) { Remove-Item $modelFile -Force }
     }
 }
 
-# --- Weryfikacja ---
+# --- Verification ------------------------------------------------------------------------
 
 function Verify-Installation {
-    Log-Section "Weryfikacja instalacji"
-    Refresh-Path
-
+    param([bool]$WithCuda, [bool]$WithVulkan)
+    Log-Section 'Verification'
+    Update-SessionEnvironment
     $ok = $true
-
-    function Check-Tool {
-        param([string]$Cmd, [string]$Label, [scriptblock]$VersionScript, [switch]$Required)
-        if (Test-Command $Cmd) {
-            $ver = Invoke-NativeCapture $VersionScript | Select-Object -First 1
-            Log-Ok "${Label}: $ver"
+    foreach ($tool in @('git', 'cmake', 'ninja', 'clang', 'protoc', 'pkg-config', 'cargo', 'rustc', 'wasm-bindgen', 'dotnet', 'ffmpeg')) {
+        if (Test-Command $tool) {
+            Log-Ok "$tool"
         } else {
-            if ($Required) { Log-Error "${Label}: NIE ZNALEZIONO"; $script:ok = $false }
-            else { Log-Warn "${Label}: NIE ZNALEZIONO" }
-        }
-    }
-
-    Check-Tool 'cmake'      'cmake'      { & cmake --version }      -Required
-    Check-Tool 'clang'      'clang'      { & clang --version }      -Required
-    Check-Tool 'rustc'      'rustc'      { & rustc --version }      -Required
-    Check-Tool 'cargo'      'cargo'      { & cargo --version }      -Required
-    if (Test-Command 'pkg-config') {
-        Check-Tool 'pkg-config' 'pkg-config' { & pkg-config --version }
-    } else {
-        Check-Tool 'pkgconf'    'pkgconf'    { & pkgconf --version }
-    }
-    Check-Tool 'ninja'      'ninja'      { & ninja --version }
-    Check-Tool 'protoc'     'protoc'     { & protoc --version }     -Required
-    Check-Tool 'git'        'git'        { & git --version }        -Required
-    if (Test-Command 'git') {
-        $gitLfsVersion = Invoke-NativeCapture { git lfs version } | Select-Object -First 1
-        if ($LASTEXITCODE -eq 0 -and $gitLfsVersion) {
-            Log-Ok "git-lfs: $gitLfsVersion"
-        } else {
-            Log-Error "git-lfs: NIE ZNALEZIONO"
+            Log-Error "${tool}: NOT FOUND"
             $ok = $false
         }
     }
-    Check-Tool 'wasm-bindgen' 'wasm-bindgen' { & wasm-bindgen --version }
-
-    # zvec — binarka tentaflow zawsze wlacza feature `vector`, wiec natywna
-    # biblioteka jest obowiazkowa do kazdego buildu serwera.
-    $zvecLibDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'tentaflow-zvec-sys\vendor\lib\windows-x86_64'
-    $zvecLib = Join-Path $zvecLibDir 'zvec_c_api.lib'
-    $zvecDll = Join-Path $zvecLibDir 'zvec_c_api.dll'
-    if ((Test-Path $zvecLib) -and (Test-Path $zvecDll)) {
-        Log-Ok "zvec: zwendorowany (zvec_c_api.lib + zvec_c_api.dll)"
-    } else {
-        Log-Error "zvec: BRAK zvec_c_api.lib/.dll w $zvecLibDir — feature `vector` nie zlinkuje"
-        $ok = $false
-    }
-
+    try { [void](Find-GitBash); Log-Ok 'Git Bash' } catch { Log-Error $_; $ok = $false }
+    if (Get-VsInstallPath) { Log-Ok "MSVC x64: $(Get-VsInstallPath)" } else { Log-Error 'MSVC x64 toolset: NOT FOUND'; $ok = $false }
     if ($env:LIBCLANG_PATH -and (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
-        Log-Ok "LIBCLANG_PATH: $env:LIBCLANG_PATH (libclang.dll obecny)"
+        Log-Ok "LIBCLANG_PATH: $env:LIBCLANG_PATH"
     } else {
-        Log-Error "LIBCLANG_PATH nie wskazuje na katalog z libclang.dll — bindgen nie zadziala"
+        Log-Error 'LIBCLANG_PATH does not point at libclang.dll'
         $ok = $false
     }
-
-    if (Test-Command 'pkg-config') {
-        Invoke-NativeCapture { pkg-config --exists 'gstreamer-1.0 >= 1.14' 'gstreamer-app-1.0 >= 1.14' } | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            $gstCore = Invoke-NativeCapture { pkg-config --modversion gstreamer-1.0 } | Select-Object -First 1
-            $gstApp = Invoke-NativeCapture { pkg-config --modversion gstreamer-app-1.0 } | Select-Object -First 1
-            Log-Ok "gstreamer-1.0: $gstCore"
-            Log-Ok "gstreamer-app-1.0: $gstApp"
-        } else {
-            Log-Error "GStreamer nie jest widoczny przez pkg-config."
-            Log-Error "Sprawdz PKG_CONFIG_PATH oraz instalacje GStreamer SDK z development files."
-            $ok = $false
-        }
+    $gst = Invoke-NativeCapture { pkg-config --modversion gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 } | Select-Object -First 1
+    if ($LASTEXITCODE -eq 0 -and $gst -eq $env:GSTREAMER_VERSION) {
+        Log-Ok "GStreamer (pkg-config): $gst"
     } else {
-        Log-Error "Brak pkg-config — gstreamer-sys nie znajdzie GStreamer SDK."
+        Log-Error "GStreamer $env:GSTREAMER_VERSION not visible through pkg-config (got '$gst')"
         $ok = $false
     }
-
-    $rustTargets = Invoke-NativeCapture { rustup target list --installed }
-    foreach ($t in 'wasm32-wasip1','wasm32-unknown-unknown') {
-        if ($rustTargets -match $t) {
-            Log-Ok "$t : zainstalowany"
-        } else {
-            Log-Error "$t : BRAK"
-            $ok = $false
-        }
+    $targets = Invoke-NativeCapture { rustup target list --installed } | Out-String
+    foreach ($target in @('wasm32-wasip1', 'wasm32-unknown-unknown')) {
+        if ($targets -match [regex]::Escape($target)) { Log-Ok $target } else { Log-Error "${target}: MISSING"; $ok = $false }
     }
-
-    if ($Cuda) {
-        if (Test-Command 'nvcc') {
-            Log-Ok "nvcc (CUDA): $(Invoke-NativeCapture { nvcc --version } | Select-Object -Last 1)"
-        } else {
-            Log-Warn "nvcc (CUDA): NIE ZNALEZIONO (uruchom nowy shell po instalacji CUDA)"
-        }
+    if ($WithCuda) {
+        if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin\nvcc.exe'))) { Log-Ok "CUDA_PATH: $env:CUDA_PATH" } else { Log-Error 'CUDA toolkit: NOT FOUND'; $ok = $false }
     }
-
-    if ($Vulkan) {
-        if (Test-Command 'vulkaninfo') {
-            Log-Ok "vulkaninfo: dostepny"
-        } else {
-            Log-Warn "vulkaninfo: NIE ZNALEZIONO (otworz nowy shell — VULKAN_SDK ladowane przy starcie)"
-        }
+    if ($WithVulkan) {
+        if ($env:VULKAN_SDK -and (Test-Path (Join-Path $env:VULKAN_SDK 'Bin\glslc.exe'))) { Log-Ok "VULKAN_SDK: $env:VULKAN_SDK" } else { Log-Error 'Vulkan SDK: NOT FOUND'; $ok = $false }
     }
-
-
-    Write-Host ''
-    if ($ok) {
-        Log-Ok 'Wszystkie wymagane zaleznosci sa dostepne.'
-    } else {
-        Log-Error 'Brakuje niektorych wymaganych zaleznosci. Otworz NOWY PowerShell i sprobuj ponownie.'
-        return $false
+    if (-not $ok) {
+        throw 'Some required dependencies are missing (see above).'
     }
-    return $true
+    Log-Ok 'All required dependencies are available.'
 }
-
-# --- Podsumowanie ---
 
 function Print-Summary {
-    Log-Section 'Podsumowanie'
-
+    param([bool]$WithCuda, [bool]$WithVulkan)
+    Log-Section 'Summary'
     if ($script:Installed.Count -eq 0) {
-        Log-Info 'Wszystko bylo juz zainstalowane, nic nie zmieniono.'
+        Log-Info 'Everything was already installed.'
     } else {
-        Log-Info 'Zainstalowane / zaktualizowane komponenty:'
-        foreach ($item in $script:Installed) {
-            Write-Host "  + $item" -ForegroundColor Green
-        }
+        foreach ($item in $script:Installed) { Write-Host "  + $item" -ForegroundColor Green }
     }
-
+    $backend = 'cpu'
+    if ($WithVulkan) { $backend = 'vulkan' }
+    if ($WithCuda) { $backend = 'cuda' }
     Write-Host ''
-    Log-Warn 'WAZNE: zamknij to okno PowerShella i otworz NOWE,'
-    Log-Warn 'zeby aktywowac LIBCLANG_PATH i zaktualizowane PATH.'
-    Write-Host ''
-    Log-Info 'Potem zbuduj TentaFlow:'
-    Write-Host '  scripts\build.bat --release' -ForegroundColor White
+    Log-Warn 'Open a NEW terminal so it sees the updated PATH and variables, then:'
+    Write-Host "  1. scripts\native-libs\build-all.ps1 -Backend $backend     # native libraries (not in the repo)" -ForegroundColor White
+    Write-Host "  2. scripts\build.ps1 -Edition full -Backend $backend --release" -ForegroundColor White
+    Write-Host '     (slim: build-all.ps1 -Edition slim, then build.ps1 -Edition slim --release)' -ForegroundColor White
     Write-Host ''
 }
 
-# --- Main ---
+# --- Main ------------------------------------------------------------------------------------
 
-function Main {
-    Write-Host ''
-    Write-Host '  _____          _        _____ _               ' -ForegroundColor Cyan
-    Write-Host ' |_   _|__ _ __ | |_ __ _|  ___| | _____      __' -ForegroundColor Cyan
-    Write-Host '   | |/ _ \ ''_ \| __/ _` | |_  | |/ _ \ \ /\ / /' -ForegroundColor Cyan
-    Write-Host '   | |  __/ | | | || (_| |  _| | | (_) \ V  V / ' -ForegroundColor Cyan
-    Write-Host '   |_|\___|_| |_|\__\__,_|_|   |_|\___/ \_/\_/  ' -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host 'Instalator zaleznosci (Windows)' -ForegroundColor White
-    Write-Host ''
+Check-Prereqs
+Update-SessionEnvironment
+[void](Import-TentaflowVersions)
 
-    Check-Prereqs
-
-    Get-SileroVad
-
-    Install-Base
-    Install-Python
-    Install-GitLfs
-    Install-Zvec
-    Install-Rust
-    Install-WasmTargets
-    Install-WasmBindgenCli
-
-    if ($Cuda)   { Install-Cuda }
-    if ($Vulkan) { Install-Vulkan }
-
-    [void](Verify-Installation)
-    Print-Summary
+$withCuda = $false
+if (-not $Minimal -and -not $NoCuda) {
+    $withCuda = $Cuda -or (Test-NvidiaGpu)
 }
+$withVulkan = -not $Minimal -and -not $NoVulkan
 
-Main
+Get-SileroVad
+Install-VisualStudio
+Install-BaseTools
+Install-Python
+Install-Gstreamer
+Install-Rust
+Install-WasmBindgenCli
+Install-DotnetSdk
+Install-WasiSdk
+Set-PersistentEnv -Name 'TENTAFLOW_NATIVE_CACHE' -Value (Get-NativeCacheDir)
+if ($withCuda) { Install-Cuda } else { Log-Info 'CUDA skipped (no NVIDIA GPU, -NoCuda or -Minimal).' }
+if ($withVulkan) { Install-Vulkan } else { Log-Info 'Vulkan SDK skipped (-NoVulkan or -Minimal).' }
+
+Verify-Installation -WithCuda $withCuda -WithVulkan $withVulkan
+Print-Summary -WithCuda $withCuda -WithVulkan $withVulkan

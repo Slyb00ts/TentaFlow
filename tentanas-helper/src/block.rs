@@ -28,6 +28,7 @@
 // =============================================================================
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -2802,6 +2803,7 @@ pub fn validate_nvmet(spec: &NvmetSubsystemSpec) -> Result<(), CatalogError> {
 /// does not help either, because it goes to `simple_setattr`. Clearing a
 /// credential is `ConfigfsStep::Clear`, which carries the subsystem's own
 /// sentinel — this refusal is what stops that rule being bypassed by accident.
+#[cfg(unix)]
 fn write_attr(path: &Path, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!(
@@ -2857,6 +2859,7 @@ fn write_attr(path: &Path, value: &str) -> Result<(), String> {
 /// apply — a target that stops serving is not the right answer to a file mode
 /// — but the divergence is reported, which is the difference between an admin
 /// who knows and one who does not.
+#[cfg(unix)]
 fn protect_attr(path: &Path) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
@@ -2888,6 +2891,7 @@ fn protect_attr(path: &Path) -> Option<String> {
     })
 }
 
+#[cfg(unix)]
 fn mkdir(path: &Path) -> Result<(), String> {
     match std::fs::create_dir(path) {
         Ok(()) => Ok(()),
@@ -2898,6 +2902,7 @@ fn mkdir(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn link(link_path: &Path, target: &Path) -> Result<(), String> {
     if let Ok(existing) = std::fs::read_link(link_path) {
         if existing == target {
@@ -2923,6 +2928,7 @@ fn link(link_path: &Path, target: &Path) -> Result<(), String> {
 /// A warning is not an error on purpose: a target that refuses to serve is the
 /// wrong answer to a file mode, and an admin who is not told is worse than one
 /// who is told late.
+#[cfg(unix)]
 pub fn apply_plan(steps: &[ConfigfsStep]) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
     for (n, step) in steps.iter().enumerate() {
@@ -2975,6 +2981,7 @@ pub fn apply_plan(steps: &[ConfigfsStep]) -> Result<Vec<String>, String> {
     Ok(warnings)
 }
 
+#[cfg(unix)]
 fn unlink(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -2989,6 +2996,7 @@ fn unlink(path: &Path) -> Result<(), String> {
 /// teardown walkers: configfs deletes an item's attribute files with the item,
 /// so it never happens there, while an ordinary filesystem — the one the tests
 /// build their trees on — keeps them as real files.
+#[cfg(unix)]
 fn remove_object(path: &Path) -> Result<(), String> {
     match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
@@ -3053,6 +3061,7 @@ fn is_mapped_lun(name: &str) -> bool {
 /// (`clear_plain_children`) removes a non-empty one too — so a fixture cannot
 /// make the wrong version fail, whatever shape it is given. A test that reads
 /// this list can, and does.
+#[cfg(unix)]
 fn acl_children_to_remove(acl: &Path) -> Vec<PathBuf> {
     entries(acl)
         .into_iter()
@@ -3076,6 +3085,7 @@ fn acl_children_to_remove(acl: &Path) -> Vec<PathBuf> {
 ///
 /// `false` means the object is still there. Callers must carry that up.
 #[must_use]
+#[cfg(unix)]
 fn rmdir(path: &Path, log: &mut Vec<String>) -> bool {
     match std::fs::remove_dir(path) {
         Ok(()) => true,
@@ -3101,6 +3111,7 @@ fn rmdir(path: &Path, log: &mut Vec<String>) -> bool {
 
 /// The attribute files and default groups of one object, on a filesystem that
 /// keeps them as ordinary entries.
+#[cfg(unix)]
 fn clear_plain_children(path: &Path) {
     for entry in entries(path) {
         if entry.is_dir() && !entry.is_symlink() {
@@ -3118,6 +3129,7 @@ fn clear_plain_children(path: &Path) {
 /// keeps it. The backstores are found by reading the LUN symlinks rather than
 /// by reconstructing their names, so a target created by an older build is
 /// still removed completely.
+#[cfg(unix)]
 pub fn remove_iscsi(root: &Path, iqn: &str) -> Result<Vec<String>, String> {
     validate_iqn(iqn).map_err(|e| e.to_string())?;
     let target = root.join("iscsi").join(iqn);
@@ -3216,6 +3228,7 @@ pub fn remove_iscsi(root: &Path, iqn: &str) -> Result<Vec<String>, String> {
 /// subsystem still answers there would take a target down that nobody asked
 /// about. A HOST object is removed on the same rule — it may be on the
 /// allowlist of a second subsystem.
+#[cfg(unix)]
 pub fn remove_nvmet(root: &Path, nqn: &str) -> Result<Vec<String>, String> {
     validate_nqn(nqn).map_err(|e| e.to_string())?;
     let sub = root.join("subsystems").join(nqn);
@@ -3386,6 +3399,7 @@ impl NvmetSessions {
 /// plan instead of touching the kernel directly.
 ///
 /// A tree that is not there is reported as unavailable, never as "no sessions".
+#[cfg(unix)]
 pub fn read_nvmet_sessions(root: &Path) -> NvmetSessions {
     if !root.is_dir() {
         return NvmetSessions::unavailable(format!(
@@ -3474,6 +3488,7 @@ pub fn read_nvmet_sessions(root: &Path) -> NvmetSessions {
 /// One debugfs attribute, or an empty string. A file the running kernel does
 /// not publish is a missing field, not a failed read: this tree grew its
 /// attributes over several releases.
+#[cfg(unix)]
 fn debugfs_attr(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name))
         .unwrap_or_default()
@@ -3481,7 +3496,8 @@ fn debugfs_attr(dir: &Path, name: &str) -> String {
         .to_string()
 }
 
-#[cfg(test)]
+// The executor tests build fake configfs trees out of POSIX symlinks and modes.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

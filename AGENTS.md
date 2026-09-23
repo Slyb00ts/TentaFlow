@@ -25,7 +25,10 @@ z korzenia. Pakiety platformowe budujemy osobno przez `-p` i odpowiedni target.
 ./target_shared/release-fast/tentaflow --config config.toml
 ```
 
-Na Windows odpowiednikami są `scripts\build.ps1` i `scripts\setup.ps1`.
+Na Windows odpowiednikami są `scripts\setup.ps1`, `scripts\native-libs\build-all.ps1`
+(`-Backend cuda|vulkan|cpu`, `-Edition slim`) i `scripts\build.ps1`
+(`-Edition slim|full -Backend cpu|cuda|vulkan`). Wersje bibliotek i toolchainów
+są wyłącznie w `scripts/versions.env`.
 Zwykłe `cargo build -p tentaflow` także korzysta ze wspólnego workspace,
 jednak automatyczna retencja działa przez wrapper. `release` używa ThinLTO,
 `release-fast` wyłącza LTO i włącza incremental, a `release-wasm` optymalizuje rozmiar. Kompilacje

@@ -35,12 +35,15 @@ swoje `--features` i target. Linux/macOS:
 ./scripts/build.sh test -p tentaflow-core --lib --locked --no-default-features --features gpu-vulkan
 ```
 
-PowerShell:
+PowerShell (ładuje środowisko MSVC x64, Ninja i zmienne z `scripts\setup.ps1`;
+`-Edition`/`-Backend` odpowiadają macierzy wydań i wariantom
+`scripts\native-libs\build-all.ps1 -Backend`):
 
 ```powershell
-.\scripts\build.ps1 --profile release-fast --locked --no-default-features --features gpu-vulkan
-.\scripts\build.ps1 --release --locked --no-default-features --features gpu-vulkan
-.\scripts\build.ps1 -Cmd test --package tentaflow-core --lib --locked --no-default-features --features gpu-vulkan
+.\scripts\build.ps1 -Edition slim --profile release-fast --locked
+.\scripts\build.ps1 -Edition full -Backend vulkan --release --locked
+.\scripts\build.ps1 -Edition full -Backend cuda --release --locked
+.\scripts\build.ps1 -Cmd test -p tentaflow-core --lib --locked --no-default-features --features gpu-vulkan
 ```
 
 Wybór `--profile release-fast` nie zmienia ustawień produkcyjnego `release`.

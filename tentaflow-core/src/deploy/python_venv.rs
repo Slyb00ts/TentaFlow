@@ -595,7 +595,7 @@ fn pbs_triple() -> Option<&'static str> {
         ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
         ("macos", "x86_64") => Some("x86_64-apple-darwin"),
-        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc-shared"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
         _ => None,
     }
 }

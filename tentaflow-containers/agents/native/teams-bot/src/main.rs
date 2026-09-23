@@ -297,24 +297,9 @@ async fn main() -> Result<()> {
     {
         let sig_page_slot = page_slot.clone();
         tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("SIGTERM signal setup failed: {}", e);
-                    return;
-                }
-            };
-            let mut intr = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("SIGINT signal setup failed: {}", e);
-                    return;
-                }
-            };
-            tokio::select! {
-                _ = term.recv() => tracing::info!("SIGTERM otrzymany — leave-first shutdown"),
-                _ = intr.recv() => tracing::info!("SIGINT otrzymany — leave-first shutdown"),
+            if let Err(e) = wait_for_shutdown_signal().await {
+                tracing::warn!("signal setup failed: {}", e);
+                return;
             }
             let page = {
                 let guard = sig_page_slot.lock().await;
@@ -1117,4 +1102,26 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(true);
     tracing::info!("Sidecar meeting bot zakonczony");
     Ok(())
+}
+
+/// Czeka na SIGTERM (`docker stop`) albo SIGINT; pierwszy wygrywa. Windows nie
+/// ma SIGTERM, a natywny bot uruchomiony przez core konczy sie tam przez Ctrl+C.
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut intr = signal(SignalKind::interrupt())?;
+        tokio::select! {
+            _ = term.recv() => tracing::info!("SIGTERM otrzymany — leave-first shutdown"),
+            _ = intr.recv() => tracing::info!("SIGINT otrzymany — leave-first shutdown"),
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("Ctrl+C otrzymany — leave-first shutdown");
+        Ok(())
+    }
 }

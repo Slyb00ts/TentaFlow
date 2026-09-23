@@ -5,8 +5,8 @@
 //     zapełniany przez lokalne pętle treningu (recognition/classifier) tuż po
 //     starcie jobu i czyszczony po jego zakończeniu. Pozwala handlerom odpytać
 //     serwis `/status/{job_id}` o pola live-view (eta/elapsed/gpu_mem/stage).
-//  2. Odczyt statystyk GPU węzła przez `nvidia-smi` (tolerancyjny — brak
-//     narzędzia = zera, nigdy błąd).
+//  2. Odczyt statystyk GPU węzła przez wspólny kolektor noda (tolerancyjny —
+//     brak karty = zera, nigdy błąd).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -201,40 +201,23 @@ pub async fn fetch_local_live_view(run_id: &str) -> LiveView {
         .unwrap_or_default()
 }
 
-/// Statystyki GPU pierwszej karty przez `nvidia-smi`. Gdy narzędzie niedostępne
-/// lub odpowiedź nie da się sparsować → wszystkie pola zerowe (bez błędu).
+/// Statystyki GPU pierwszej karty. Zrodlem jest wspolny kolektor noda
+/// (nvidia-smi, DXGI/PDH na Windows, sysfs/ioreg), wiec trening widzi te same
+/// liczby co dashboard, takze na kartach AMD/Intel. Bez karty → pola zerowe.
 pub fn gpu_stats() -> tentaflow_protocol::GpuStats {
-    let zero = tentaflow_protocol::GpuStats {
-        name: String::new(),
-        mem_used_mb: 0,
-        mem_total_mb: 0,
-        util_pct: 0,
+    let gpus = crate::mesh::node_info_collector::detect_gpus_cached();
+    let Some(gpu) = gpus.first() else {
+        return tentaflow_protocol::GpuStats {
+            name: String::new(),
+            mem_used_mb: 0,
+            mem_total_mb: 0,
+            util_pct: 0,
+        };
     };
-    let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,memory.used,memory.total,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
-    let Ok(out) = output else {
-        return zero;
-    };
-    if !out.status.success() {
-        return zero;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let Some(first) = stdout.lines().next() else {
-        return zero;
-    };
-    // Format CSV: "NazwaGPU, 1234, 24576, 57"
-    let cols: Vec<&str> = first.split(',').map(|c| c.trim()).collect();
-    if cols.len() < 4 {
-        return zero;
-    }
     tentaflow_protocol::GpuStats {
-        name: cols[0].to_string(),
-        mem_used_mb: cols[1].parse().unwrap_or(0),
-        mem_total_mb: cols[2].parse().unwrap_or(0),
-        util_pct: cols[3].parse().unwrap_or(0),
+        name: gpu.name.clone(),
+        mem_used_mb: gpu.vram_used_mb.min(i32::MAX as u64) as i32,
+        mem_total_mb: gpu.vram_total_mb.min(i32::MAX as u64) as i32,
+        util_pct: gpu.usage_percent.round().clamp(0.0, 100.0) as i32,
     }
 }

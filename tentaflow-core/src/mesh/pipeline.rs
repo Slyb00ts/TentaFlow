@@ -3399,6 +3399,108 @@ fn spawn_robot_advertiser(
 /// - Pre-alokowany bufor serializacji (reuse miedzy iteracjami)
 /// - Metryki klonowane raz zamiast 3 razy (gpus, containers, networks)
 /// - Serializacja RAZ, potem broadcast do wszystkich peerow
+/// Samples everything the local node reports about itself (CPU, RAM, GPU,
+/// containers, networks, profiling capabilities). Shared by the mesh heartbeat
+/// and by the mesh-less refresher, so a node without a mesh shows the same live
+/// numbers in its own dashboard.
+struct LocalMetricsSampler {
+    docker_cache: Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>>,
+    // Probe cache for `CollectorRegistry::probe_available_ids`: raw probes
+    // shell out (`which`, `--version`) per collector, so calling all 17
+    // every 500 ms heartbeat = ~34 syscalls/s of pure noise. We refresh
+    // at most once every 30 s; capability changes propagate next epoch.
+    probe_cache: Option<(std::time::Instant, Vec<String>)>,
+}
+
+impl LocalMetricsSampler {
+    const PROBE_TTL: Duration = Duration::from_secs(30);
+
+    fn new(
+        docker_cache: Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>>,
+    ) -> Self {
+        Self {
+            docker_cache,
+            probe_cache: None,
+        }
+    }
+
+    async fn sample(&mut self, connected_peers: Vec<String>) -> Option<HeartbeatMetrics> {
+        let m = tokio::task::spawn_blocking(node_info_collector::collect_fast_metrics)
+            .await
+            .ok()?;
+        let containers = self.docker_cache.read().await.clone();
+
+        // Snapshot licznikow routingu — uzywane do wyswietlenia
+        // "aktywne" i tok/s w Mesh UI per-node.
+        let (active_requests, tokens_per_sec) = routing_metrics_snapshot();
+
+        // Capability nsys propagujemy w kazdym heartbeacie: peerzy
+        // przy reconnect powinni miec aktualny stan. Detekcja jest
+        // cache'owana (~5s) wewnatrz detect_capability, wiec wolanie z petli
+        // 2 Hz nie odpala kosztownego `which`/`--version` w kazdym ticku.
+        let nsys_cap = crate::profiling::detect_capability().await;
+
+        // Multi-source profiling capability. The discover() set is
+        // static, but probe() per collector can shell out, so we only
+        // refresh when the cached snapshot is older than PROBE_TTL.
+        // Probe runs on the blocking pool — never block the heartbeat
+        // task on `which`/binary detection.
+        let cached = self
+            .probe_cache
+            .as_ref()
+            .filter(|(t, _)| t.elapsed() < Self::PROBE_TTL)
+            .map(|(_, ids)| ids.clone());
+        let profiling_collectors_available = match cached {
+            Some(ids) => ids,
+            None => {
+                let ids = tokio::task::spawn_blocking(|| {
+                    crate::profiling::collectors::CollectorRegistry::probe_available_ids(
+                        &crate::profiling::COLLECTOR_REGISTRY,
+                    )
+                })
+                .await
+                .unwrap_or_default();
+                self.probe_cache = Some((std::time::Instant::now(), ids.clone()));
+                ids
+            }
+        };
+
+        Some(HeartbeatMetrics {
+            cpu_usage_percent: m.cpu_usage_percent,
+            ram_used_mb: m.ram_used_mb,
+            gpus: m.gpus,
+            containers,
+            networks: m.networks,
+            platform: node_info_collector::detect_platform(),
+            cpu_temperature_c: m.cpu_temperature_c,
+            swap_total_mb: m.swap_total_mb,
+            swap_used_mb: m.swap_used_mb,
+            connected_peers,
+            active_requests,
+            tokens_per_sec,
+            nsys_available: nsys_cap.available,
+            nsys_version: nsys_cap.version,
+            profiling_collectors_available,
+        })
+    }
+}
+
+/// Keeps the local node's live metrics fresh in `peer_store` when no mesh runs
+/// (mesh disabled in config or failed to start). With a mesh, the heartbeat
+/// sender does this as part of broadcasting.
+pub fn spawn_local_metrics_refresher(peer_store: MeshPeerStore, local_node_id: String) {
+    let mut sampler = LocalMetricsSampler::new(spawn_docker_cache());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            if let Some(hb) = sampler.sample(Vec::new()).await {
+                peer_store.update_metrics(&local_node_id, &hb);
+            }
+        }
+    });
+}
+
 fn spawn_heartbeat_sender(
     quic_mesh: Arc<IrohMeshManager>,
     peer_store: MeshPeerStore,
@@ -3407,79 +3509,14 @@ fn spawn_heartbeat_sender(
     db_pool: Option<crate::db::DbPool>,
     mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) {
+    let mut sampler = LocalMetricsSampler::new(docker_cache);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         let mut heartbeat_count: u64 = 0;
-        // Probe cache for `CollectorRegistry::probe_available_ids`: raw probes
-        // shell out (`which`, `--version`) per collector, so calling all 17
-        // every 500 ms heartbeat = ~34 syscalls/s of pure noise. We refresh
-        // at most once every 30 s; capability changes propagate next epoch.
-        const PROBE_TTL: Duration = Duration::from_secs(30);
-        let mut probe_cache: Option<(std::time::Instant, Vec<String>)> = None;
         loop {
             interval.tick().await;
-            let metrics =
-                tokio::task::spawn_blocking(|| node_info_collector::collect_fast_metrics()).await;
-            if let Ok(m) = metrics {
-                let containers = docker_cache.read().await.clone();
-                let connected_peers = quic_mesh.connected_peer_ids().await;
-
-                // [OPT] Buduj HeartbeatMetrics najpierw, potem aktualizuj store
-                // z referencji — unika podwojnego klonowania gpus/containers/networks
-                // Snapshot licznikow routingu — uzywane do wyswietlenia
-                // "aktywne" i tok/s w Mesh UI per-node.
-                let (active_requests, tokens_per_sec) = routing_metrics_snapshot();
-
-                // Capability nsys propagujemy w kazdym heartbeacie: peerzy
-                // przy reconnect powinni miec aktualny stan. Detekcja jest
-                // cache'owana (~5s) wewnatrz detect_capability, wiec wolanie z petli
-                // 2 Hz nie odpala kosztownego `which`/`--version` w kazdym ticku.
-                let nsys_cap = crate::profiling::detect_capability().await;
-
-                // Multi-source profiling capability. The discover() set is
-                // static, but probe() per collector can shell out, so we only
-                // refresh when the cached snapshot is older than PROBE_TTL.
-                // Probe runs on the blocking pool — never block the heartbeat
-                // task on `which`/binary detection.
-                let profiling_collectors_available = {
-                    let cached = probe_cache
-                        .as_ref()
-                        .filter(|(t, _)| t.elapsed() < PROBE_TTL)
-                        .map(|(_, ids)| ids.clone());
-                    match cached {
-                        Some(ids) => ids,
-                        None => {
-                            let ids = tokio::task::spawn_blocking(|| {
-                                crate::profiling::collectors::CollectorRegistry::probe_available_ids(
-                                    &crate::profiling::COLLECTOR_REGISTRY,
-                                )
-                            })
-                            .await
-                            .unwrap_or_default();
-                            probe_cache = Some((std::time::Instant::now(), ids.clone()));
-                            ids
-                        }
-                    }
-                };
-
-                let hb = HeartbeatMetrics {
-                    cpu_usage_percent: m.cpu_usage_percent,
-                    ram_used_mb: m.ram_used_mb,
-                    gpus: m.gpus,
-                    containers,
-                    networks: m.networks,
-                    platform: node_info_collector::detect_platform(),
-                    cpu_temperature_c: m.cpu_temperature_c,
-                    swap_total_mb: m.swap_total_mb,
-                    swap_used_mb: m.swap_used_mb,
-                    connected_peers: connected_peers.clone(),
-                    active_requests,
-                    tokens_per_sec,
-                    nsys_available: nsys_cap.available,
-                    nsys_version: nsys_cap.version,
-                    profiling_collectors_available,
-                };
-
+            let connected_peers = quic_mesh.connected_peer_ids().await;
+            if let Some(hb) = sampler.sample(connected_peers.clone()).await {
                 // Aktualizuj metryki lokalnego noda w store — pojedyncze klonowanie
                 // wewnatrz update_metrics zamiast czterokrotnego u callera.
                 peer_store.update_metrics(&local_node_id, &hb);

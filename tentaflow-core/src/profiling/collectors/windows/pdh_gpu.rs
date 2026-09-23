@@ -1,9 +1,8 @@
 // =============================================================================
-// File: collectors/windows/pdh_gpu.rs — Vendor-neutral Windows PDH GPU
-// collector at 1 Hz. Counters:
-//   \GPU Engine(*)\Utilization Percentage      (sum per LUID, capped at 100%)
-//   \GPU Process Memory(*)\Local Usage         (sum per LUID -> mem_used_bytes)
-//   \GPU Adapter Memory(*)\Total Committed     (per LUID -> denominator for mem_pct)
+// File: collectors/windows/pdh_gpu.rs — Vendor-neutral Windows GPU collector at
+// 1 Hz on top of `crate::gpu_telemetry` (DXGI adapters + PDH usage counters),
+// the same source the node metrics and the VRAM hint use, so a profile and the
+// dashboard cannot disagree about one adapter.
 // PDH does not expose GPU power on Windows; power must come from vendor SDK
 // collectors (e.g. NVML, ROCm-SMI), so this collector emits only GpuUtilSample
 // and GpuMemSample.
@@ -68,10 +67,10 @@ impl ProfileCollector for WindowsPdhGpuCollector {
 
     #[cfg(target_os = "windows")]
     fn probe(&self) -> ProbeResult {
-        match windows_impl::probe_open() {
+        match windows_impl::probe_available() {
             Ok(()) => ProbeResult::Available { version: None },
             Err(e) => ProbeResult::Unavailable {
-                reason: format!("PDH unavailable: {e}"),
+                reason: format!("GPU telemetry unavailable: {e}"),
             },
         }
     }
@@ -122,7 +121,7 @@ impl RunningCollector for WindowsPdhGpuRunning {
         let mut metadata: HashMap<String, String> = HashMap::new();
         metadata.insert(
             "source".into(),
-            "PDH \\GPU Engine(*) + \\GPU Process Memory(*)".into(),
+            "DXGI adapters + PDH \\GPU Engine(*) + \\GPU Adapter Memory(*)".into(),
         );
         metadata.insert("sample_period_ms".into(), "1000".into());
         metadata.insert("power".into(), "not available via PDH".into());
@@ -158,31 +157,30 @@ impl RunningCollector for WindowsPdhGpuRunning {
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
-    use crate::profiling::collectors::windows::pdh_sys::{
-        enum_instances, PdhCounter, PdhError, PdhQuery,
-    };
-    use std::collections::BTreeMap;
+    use crate::gpu_telemetry;
     use std::io::Write;
     use std::thread;
     use std::time::{Duration, Instant};
 
     const SAMPLE_PERIOD: Duration = Duration::from_millis(1000);
+    /// The sampler publishes its first snapshot right after it starts.
+    const FIRST_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 
-    pub fn probe_open() -> Result<(), PdhError> {
-        let _q = PdhQuery::open()?;
-        Ok(())
+    pub fn probe_available() -> Result<(), String> {
+        wait_for_snapshot().map(|_| ())
     }
 
-    /// Extract the LUID portion from an instance name like
-    /// `pid_1234_luid_0x00000000_0x0000C0FE_phys_0_eng_0_engtype_3D`.
-    /// Returns the `luid_*` substring (stable per adapter) or `None`.
-    fn extract_luid(instance: &str) -> Option<String> {
-        let idx = instance.find("luid_")?;
-        let tail = &instance[idx + "luid_".len()..];
-        // LUID is two hex words separated by `_`. Capture up to the next
-        // `_phys` or end of string.
-        let end = tail.find("_phys").unwrap_or(tail.len());
-        Some(tail[..end].to_string())
+    fn wait_for_snapshot() -> Result<std::sync::Arc<gpu_telemetry::GpuTelemetry>, String> {
+        let deadline = Instant::now() + FIRST_SNAPSHOT_TIMEOUT;
+        loop {
+            if let Some(snapshot) = gpu_telemetry::snapshot() {
+                return Ok(snapshot);
+            }
+            if Instant::now() >= deadline {
+                return Err("no GPU telemetry snapshot".into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub fn start_session(ctx: SessionCtx) -> Result<Box<dyn RunningCollector>, CollectorError> {
@@ -224,103 +222,35 @@ mod windows_impl {
         let mut file = fs::File::create(&csv_path)?;
         writeln!(
             file,
-            "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes"
+            "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes,mem_total_bytes"
         )?;
 
-        let query =
-            PdhQuery::open().map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
-
-        // Engine util counters (one per engine instance), grouped by LUID.
-        let engine_instances = enum_instances("GPU Engine").unwrap_or_default();
-        let mut util_by_luid: BTreeMap<String, Vec<PdhCounter>> = BTreeMap::new();
-        for inst in &engine_instances {
-            let Some(luid) = extract_luid(inst) else {
-                continue;
-            };
-            let path = format!("\\GPU Engine({inst})\\Utilization Percentage");
-            if let Ok(c) = query.add_counter(&path) {
-                util_by_luid.entry(luid).or_default().push(c);
-            }
-        }
-
-        // Process memory (Local Usage) — sum per LUID.
-        let mem_instances = enum_instances("GPU Process Memory").unwrap_or_default();
-        let mut mem_by_luid: BTreeMap<String, Vec<PdhCounter>> = BTreeMap::new();
-        for inst in &mem_instances {
-            let Some(luid) = extract_luid(inst) else {
-                continue;
-            };
-            let path = format!("\\GPU Process Memory({inst})\\Local Usage");
-            if let Ok(c) = query.add_counter(&path) {
-                mem_by_luid.entry(luid).or_default().push(c);
-            }
-        }
-
-        // Adapter total committed — denominator for mem_pct, one per adapter.
-        let adapter_instances = enum_instances("GPU Adapter Memory").unwrap_or_default();
-        let mut adapter_total_by_luid: BTreeMap<String, PdhCounter> = BTreeMap::new();
-        for inst in &adapter_instances {
-            let Some(luid) = extract_luid(inst) else {
-                continue;
-            };
-            let path = format!("\\GPU Adapter Memory({inst})\\Total Committed");
-            if let Ok(c) = query.add_counter(&path) {
-                adapter_total_by_luid.insert(luid, c);
-            }
-        }
-
-        // Stable mapping LUID -> u32 device_id assigned in iteration order.
-        let mut device_ids: BTreeMap<String, u32> = BTreeMap::new();
-        let mut next_id: u32 = 0;
-        for luid in util_by_luid
-            .keys()
-            .chain(mem_by_luid.keys())
-            .chain(adapter_total_by_luid.keys())
-        {
-            if !device_ids.contains_key(luid) {
-                device_ids.insert(luid.clone(), next_id);
-                next_id += 1;
-            }
-        }
-
-        query
-            .collect()
-            .map_err(|e| CollectorError::Custom(format!("first collect: {e}")))?;
+        // Device ids are the adapter's position in the first snapshot, so a
+        // card that disappears mid-profile does not renumber the others.
+        let first = wait_for_snapshot().map_err(CollectorError::Custom)?;
+        let luids: Vec<u64> = first.adapters.iter().map(|a| a.luid).collect();
 
         while !stop_flag.load(Ordering::Relaxed) {
             thread::sleep(SAMPLE_PERIOD);
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
-            if let Err(e) = query.collect() {
-                eprintln!("PdhCollectQueryData: {e}");
+            let Some(snapshot) = gpu_telemetry::snapshot() else {
                 continue;
-            }
+            };
             let ts_ns = started_at.elapsed().as_nanos() as u64;
-            for (luid, dev_id) in &device_ids {
-                let compute_pct = util_by_luid
-                    .get(luid)
-                    .map(|cs| {
-                        cs.iter()
-                            .filter_map(|c| c.value_double())
-                            .sum::<f64>()
-                            .clamp(0.0, 100.0) as f32
-                    })
-                    .unwrap_or(0.0);
-                let mem_used = mem_by_luid
-                    .get(luid)
-                    .map(|cs| {
-                        cs.iter()
-                            .filter_map(|c| c.value_double())
-                            .map(|v| v.max(0.0))
-                            .sum::<f64>() as u64
-                    })
-                    .unwrap_or(0);
-                let mem_total = adapter_total_by_luid
-                    .get(luid)
-                    .and_then(|c| c.value_double())
-                    .map(|v| v.max(0.0) as u64)
-                    .unwrap_or(0);
+            for (device_id, luid) in luids.iter().enumerate() {
+                let Some(adapter) = snapshot.adapters.iter().find(|a| a.luid == *luid) else {
+                    continue;
+                };
+                // A rate needs two samples and memory needs one: both stay out
+                // of the CSV until measured, instead of being logged as zero.
+                let (Some(compute_pct), Some(mem_used)) =
+                    (adapter.utilization_percent, adapter.dedicated_used_bytes)
+                else {
+                    continue;
+                };
+                let mem_total = adapter.dedicated_total_bytes;
                 let mem_pct = if mem_total > 0 {
                     ((mem_used as f64 / mem_total as f64) * 100.0).clamp(0.0, 100.0) as f32
                 } else {
@@ -328,29 +258,13 @@ mod windows_impl {
                 };
                 writeln!(
                     file,
-                    "{ts_ns},{dev_id},{compute_pct:.4},{mem_pct:.4},{mem_used}"
+                    "{ts_ns},{device_id},{compute_pct:.4},{mem_pct:.4},{mem_used},{mem_total}"
                 )?;
                 samples_observed.fetch_add(1, Ordering::Relaxed);
             }
         }
         file.flush()?;
         Ok(())
-    }
-
-    #[cfg(test)]
-    mod inner_tests {
-        use super::*;
-
-        #[test]
-        fn extract_luid_parses_typical_instance() {
-            let inst = "pid_1234_luid_0x00000000_0x0000C0FE_phys_0_eng_0_engtype_3D";
-            assert_eq!(extract_luid(inst).as_deref(), Some("0x00000000_0x0000C0FE"));
-        }
-
-        #[test]
-        fn extract_luid_returns_none_when_missing() {
-            assert!(extract_luid("nothing_here").is_none());
-        }
     }
 }
 
@@ -377,7 +291,7 @@ impl CollectorParser for WindowsPdhGpuParser {
                 continue;
             }
             let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() < 5 {
+            if cols.len() < 6 {
                 continue;
             }
             let Ok(ts) = cols[0].parse::<u64>() else {
@@ -393,6 +307,9 @@ impl CollectorParser for WindowsPdhGpuParser {
                 continue;
             };
             let Ok(mem_used_bytes) = cols[4].parse::<u64>() else {
+                continue;
+            };
+            let Ok(mem_total_bytes) = cols[5].parse::<u64>() else {
                 continue;
             };
             let lane = device_id as u16;
@@ -411,9 +328,6 @@ impl CollectorParser for WindowsPdhGpuParser {
                     temp_c: 0.0,
                 },
             });
-            // GpuMemSample: PDH does not surface free bytes directly; we
-            // record allocated_bytes = mem_used_bytes and free_bytes = 0
-            // (consumer derives total from adapter info if needed).
             events.push(TimelineEvent {
                 source_idx: 0,
                 t_start_ns: ts,
@@ -423,7 +337,7 @@ impl CollectorParser for WindowsPdhGpuParser {
                 payload: EventPayload::GpuMemSample {
                     device_id,
                     allocated_bytes: mem_used_bytes,
-                    free_bytes: 0,
+                    free_bytes: mem_total_bytes.saturating_sub(mem_used_bytes),
                 },
             });
         }
@@ -499,7 +413,7 @@ mod tests {
         let csv = dir.path().join("gpu.csv");
         fs::write(
             &csv,
-            "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes\n",
+            "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes,mem_total_bytes\n",
         )
         .unwrap();
         let raw = RawCapture {
@@ -524,9 +438,9 @@ mod tests {
     fn gpu_parser_emits_events() {
         let dir = TempDir::new().unwrap();
         let csv = dir.path().join("gpu.csv");
-        let body = "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes\n\
-                    1000,0,42.5000,60.0000,6442450944\n\
-                    1000,1,10.0000,15.0000,2147483648\n";
+        let body = "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes,mem_total_bytes\n\
+                    1000,0,42.5000,60.0000,6442450944,10737418240\n\
+                    1000,1,10.0000,15.0000,2147483648,4294967296\n";
         fs::write(&csv, body).unwrap();
         let raw = RawCapture {
             artifacts: vec![csv],
@@ -571,7 +485,7 @@ mod tests {
             } => {
                 assert_eq!(*device_id, 0);
                 assert_eq!(*allocated_bytes, 6_442_450_944);
-                assert_eq!(*free_bytes, 0);
+                assert_eq!(*free_bytes, 10_737_418_240 - 6_442_450_944);
             }
             _ => panic!("wrong payload"),
         }

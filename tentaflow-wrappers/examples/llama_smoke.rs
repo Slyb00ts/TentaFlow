@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         max_tokens: args.max_tokens,
         stop_sequences: vec!["</s>".to_string()],
+        grammar: None,
     };
 
     println!("--- output ---");
@@ -134,12 +135,9 @@ fn run_speculative_probe() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let n_max = unsafe { sys::llama_rs_speculative_n_max(spec) };
-    let need_embd = unsafe { sys::llama_rs_speculative_need_embd(spec) };
-    let need_embd_nextn = unsafe { sys::llama_rs_speculative_need_embd_nextn(spec) };
 
     println!("spec_probe: init OK (type=ngram-simple, n_seq=1)");
     println!("spec_probe: n_max={n_max}");
-    println!("spec_probe: need_embd={need_embd} need_embd_nextn={need_embd_nextn}");
 
     unsafe { sys::llama_rs_speculative_free(spec) };
     println!("spec_probe: free OK");

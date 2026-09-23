@@ -211,8 +211,10 @@ async fn run_server(args: Args) -> Result<()> {
     // Windows Firewall self-check — przy braku regul Allow Inbound dla
     // 8090 TCP+UDP odpala UAC z PowerShell New-NetFirewallRule. Blad nie
     // przerywa startu — server moze dzialac lokalnie nawet bez regul.
+    // Osobny watek: monit UAC czeka na czlowieka, a listenery nie moga czekac
+    // na jego odpowiedz (headless start, usluga, test bez pulpitu).
     #[cfg(target_os = "windows")]
-    tentaflow_core::firewall_check::ensure_firewall_rules();
+    std::thread::spawn(tentaflow_core::firewall_check::ensure_firewall_rules);
 
     // Bootstrap Swift MLX bridge (macOS) — musi sie wykonac PRZED router init,
     // zeby InferenceManager::new() zauwazyl ze MlxSwiftEngine jest dostepny i
@@ -1146,6 +1148,16 @@ async fn run_server(args: Args) -> Result<()> {
     collector
         .start(router.service_manager().shutdown_rx.clone())
         .await;
+
+    // Without a running mesh (disabled in config or failed to start) nothing
+    // refreshes the local node's live metrics: the heartbeat sender does it only
+    // as part of broadcasting. The dashboard must show them either way.
+    if quic_mesh_for_server.is_none() {
+        tentaflow_core::mesh::pipeline::spawn_local_metrics_refresher(
+            mesh_peer_store.clone(),
+            local_node_id_str.clone(),
+        );
+    }
 
     // Sprzątanie ephemeral kontenerów Meeting Bot po unclean shutdown — stare wiersze
     // meeting_sessions ze status=active/joining dostają ended_at, porty sa zwalniane,

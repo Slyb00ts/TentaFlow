@@ -160,9 +160,7 @@ impl RunningCollector for WindowsPdhDiskRunning {
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
-    use crate::profiling::collectors::windows::pdh_sys::{
-        enum_instances, PdhCounter, PdhError, PdhQuery,
-    };
+    use crate::profiling::collectors::windows::pdh_sys::{PdhCounter, PdhError, PdhQuery};
     use std::io::Write;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -175,12 +173,27 @@ mod windows_impl {
     }
 
     struct DiskCounters {
-        device: String,
         read_bps: PdhCounter,
         write_bps: PdhCounter,
         iops_r: PdhCounter,
         iops_w: PdhCounter,
         await_s: Option<PdhCounter>,
+    }
+
+    fn english(query: &PdhQuery, path: &str) -> Result<PdhCounter, CollectorError> {
+        query
+            .add_english_counter(path)
+            .map_err(|e| CollectorError::Custom(format!("{path}: {e}")))
+    }
+
+    /// Current values of a wildcard counter, keyed by instance. Negative
+    /// readings (PDH's way of saying "not computable yet") are clamped to 0.
+    fn by_instance(counter: &PdhCounter) -> HashMap<String, f64> {
+        counter
+            .instances_double()
+            .into_iter()
+            .map(|(instance, value)| (instance, value.max(0.0)))
+            .collect()
     }
 
     pub fn start_session(ctx: SessionCtx) -> Result<Box<dyn RunningCollector>, CollectorError> {
@@ -230,47 +243,21 @@ mod windows_impl {
             "timestamp_ns,device,read_bps,write_bps,iops_r,iops_w,await_ms"
         )?;
 
-        let instances = enum_instances("PhysicalDisk").unwrap_or_default();
         let query =
             PdhQuery::open().map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
 
-        let mut disks: Vec<DiskCounters> = Vec::new();
-        for inst in instances {
-            if inst == "_Total" {
-                continue;
-            }
-            let read_bps =
-                match query.add_counter(&format!("\\PhysicalDisk({inst})\\Disk Read Bytes/sec")) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-            let write_bps =
-                match query.add_counter(&format!("\\PhysicalDisk({inst})\\Disk Write Bytes/sec")) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-            let iops_r = match query.add_counter(&format!("\\PhysicalDisk({inst})\\Disk Reads/sec"))
-            {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let iops_w =
-                match query.add_counter(&format!("\\PhysicalDisk({inst})\\Disk Writes/sec")) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-            let await_s = query
-                .add_counter(&format!("\\PhysicalDisk({inst})\\Avg. Disk sec/Transfer"))
-                .ok();
-            disks.push(DiskCounters {
-                device: sanitize_device(&inst),
-                read_bps,
-                write_bps,
-                iops_r,
-                iops_w,
-                await_s,
-            });
-        }
+        // One wildcard counter per metric: PDH expands `(*)` at every collect,
+        // so a disk attached mid-profile is sampled too, and the English
+        // counter names work on a localized Windows.
+        let counters = DiskCounters {
+            read_bps: english(&query, r"\PhysicalDisk(*)\Disk Read Bytes/sec")?,
+            write_bps: english(&query, r"\PhysicalDisk(*)\Disk Write Bytes/sec")?,
+            iops_r: english(&query, r"\PhysicalDisk(*)\Disk Reads/sec")?,
+            iops_w: english(&query, r"\PhysicalDisk(*)\Disk Writes/sec")?,
+            await_s: query
+                .add_english_counter(r"\PhysicalDisk(*)\Avg. Disk sec/Transfer")
+                .ok(),
+        };
 
         query
             .collect()
@@ -286,21 +273,30 @@ mod windows_impl {
                 continue;
             }
             let ts_ns = started_at.elapsed().as_nanos() as u64;
-            for d in &disks {
-                let r_bps = d.read_bps.value_double().unwrap_or(0.0).max(0.0) as u64;
-                let w_bps = d.write_bps.value_double().unwrap_or(0.0).max(0.0) as u64;
-                let r_iops = d.iops_r.value_double().unwrap_or(0.0).max(0.0) as u32;
-                let w_iops = d.iops_w.value_double().unwrap_or(0.0).max(0.0) as u32;
-                let await_ms = d
-                    .await_s
-                    .as_ref()
-                    .and_then(|c| c.value_double())
-                    .map(|v| (v.max(0.0) * 1000.0) as f32)
-                    .unwrap_or(0.0);
+            let read_bps = by_instance(&counters.read_bps);
+            let write_bps = by_instance(&counters.write_bps);
+            let iops_r = by_instance(&counters.iops_r);
+            let iops_w = by_instance(&counters.iops_w);
+            let await_s = counters
+                .await_s
+                .as_ref()
+                .map(by_instance)
+                .unwrap_or_default();
+            for (instance, r_bps) in &read_bps {
+                // `_Total` is the sum PDH adds on top of the real disks.
+                if instance == "_Total" {
+                    continue;
+                }
+                let value = |m: &HashMap<String, f64>| m.get(instance).copied().unwrap_or(0.0);
+                let w_bps = value(&write_bps) as u64;
+                let r_iops = value(&iops_r) as u32;
+                let w_iops = value(&iops_w) as u32;
+                let await_ms = (value(&await_s) * 1000.0) as f32;
+                let device = sanitize_device(instance);
+                let r_bps = *r_bps as u64;
                 writeln!(
                     file,
-                    "{ts_ns},{},{r_bps},{w_bps},{r_iops},{w_iops},{await_ms:.4}",
-                    d.device
+                    "{ts_ns},{device},{r_bps},{w_bps},{r_iops},{w_iops},{await_ms:.4}"
                 )?;
                 samples_observed.fetch_add(1, Ordering::Relaxed);
             }

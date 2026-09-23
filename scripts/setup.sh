@@ -6,6 +6,9 @@
 # =============================================================================
 set -euo pipefail
 
+# Toolchain pins shared with the Windows setup and the native-libs scripts.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/versions.sh"
+
 # Kolory
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -338,7 +341,6 @@ install_base() {
                 clang
                 lld
                 git
-                git-lfs
                 jdk17-openjdk
                 unzip
                 pkg-config
@@ -388,7 +390,7 @@ install_base() {
                 run_privileged pacman -S --needed --noconfirm protobuf
                 INSTALLED+=("protobuf")
             fi
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "git-lfs" "jdk17-openjdk" "unzip" "glib2" "gstreamer" "gst-plugins-base-libs" "gst-plugins-good" "gst-plugins-bad" "gst-plugins-ugly" "gst-libav" "ffmpeg" "vulkan-loader" "sqlite" "perf" "sysstat")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "jdk17-openjdk" "unzip" "glib2" "gstreamer" "gst-plugins-base-libs" "gst-plugins-good" "gst-plugins-bad" "gst-plugins-ugly" "gst-libav" "ffmpeg" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -400,7 +402,6 @@ install_base() {
                 clang
                 lld
                 git
-                git-lfs
                 openjdk-17-jdk
                 unzip
                 pkg-config
@@ -445,7 +446,7 @@ install_base() {
             fi
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "openjdk-17-jdk" "unzip" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "gstreamer1.0-plugins-good" "gstreamer1.0-plugins-bad" "gstreamer1.0-plugins-ugly" "gstreamer1.0-libav" "ffmpeg" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "openjdk-17-jdk" "unzip" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "gstreamer1.0-plugins-good" "gstreamer1.0-plugins-bad" "gstreamer1.0-plugins-ugly" "gstreamer1.0-libav" "ffmpeg" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
@@ -456,7 +457,6 @@ install_base() {
                 clang
                 lld
                 git
-                git-lfs
                 # System JDK, only needed to build the Android APK (Gradle). The
                 # repo-local gradlew bootstrap downloads its own Temurin 17 when
                 # the system Java is too new, so the exact version here doesn't
@@ -513,7 +513,7 @@ install_base() {
             # --skip-unavailable: nie przerywaj calej transakcji gdy jeden pakiet
             # zniknal w danej wersji Fedory (np. java-17 na F44) — reszta wchodzi.
             run_privileged dnf install -y --skip-unavailable "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-latest-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "gstreamer1-plugins-good" "gstreamer1-plugins-bad-free" "gstreamer1-plugins-ugly (RPM Fusion)" "gstreamer1-libav (RPM Fusion)" "ffmpeg (RPM Fusion)" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "java-latest-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "gstreamer1-plugins-good" "gstreamer1-plugins-bad-free" "gstreamer1-plugins-ugly (RPM Fusion)" "gstreamer1-libav (RPM Fusion)" "ffmpeg (RPM Fusion)" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -530,7 +530,6 @@ install_base() {
                 ninja
                 llvm
                 git
-                git-lfs
                 openjdk@17
                 unzip
                 pkg-config
@@ -552,42 +551,11 @@ install_base() {
             brew install "${pkgs[@]}"
             configure_macos_gstreamer_pkg_config
             ensure_macos_metal_toolchain
-            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "git" "git-lfs" "openjdk@17" "unzip" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "ffmpeg" "openssl@3" "sqlite")
+            INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "git" "openjdk@17" "unzip" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "ffmpeg" "openssl@3" "sqlite")
             ;;
     esac
 
     log_ok "Bazowe zaleznosci zainstalowane"
-}
-
-install_git_lfs() {
-    log_section "Git LFS"
-
-    if ! command -v git-lfs &>/dev/null && ! git lfs version &>/dev/null; then
-        log_error "Git LFS nie jest dostepny mimo instalacji pakietow bazowych."
-        log_error "Zainstaluj recznie pakiet git-lfs dla swojego systemu i uruchom setup ponownie."
-        exit 1
-    fi
-
-    git lfs install
-    log_ok "Git LFS: $(git lfs version)"
-    INSTALLED+=("git lfs install")
-
-    # Materializuj artefakty LFS (prebuilt native-libs/*.a|*.so). Jesli repo
-    # sklonowano ZANIM git-lfs byl w systemie, te pliki sa tekstowymi pointerami
-    # — `git lfs install` rejestruje tylko filtry i NIE sciaga juz
-    # wyewidencjonowanych pointerow. Bez `git lfs pull` build.rs pada na
-    # "brak native-libs" (linkuje pointer zamiast biblioteki).
-    local repo_root
-    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    if [[ -n "$repo_root" ]]; then
-        log_info "Pobieranie artefaktow Git LFS (prebuilt native-libs)..."
-        if git -C "$repo_root" lfs pull; then
-            log_ok "Git LFS: artefakty pobrane"
-            INSTALLED+=("git lfs pull")
-        else
-            log_warn "git lfs pull nieudane — uruchom recznie w repo: git lfs pull"
-        fi
-    fi
 }
 
 # --- Docker (wymagany przez TentaFlow runtime + build zvec) ---
@@ -850,7 +818,7 @@ install_rust() {
 # --- .NET and WASI SDKs ---
 
 has_dotnet_sdk() {
-    command -v dotnet &>/dev/null && dotnet --list-sdks | grep -q '^10\.'
+    command -v dotnet &>/dev/null && dotnet --list-sdks | grep -q "^${DOTNET_SDK_CHANNEL%%.*}\."
 }
 
 install_dotnet_sdk() {
@@ -867,7 +835,7 @@ install_dotnet_sdk() {
         log_error "Nie udalo sie pobrac instalatora .NET SDK"
         return 1
     fi
-    if ! bash "$installer" --channel 10.0 --install-dir "$HOME/.dotnet" --no-path; then
+    if ! bash "$installer" --channel "$DOTNET_SDK_CHANNEL" --install-dir "$HOME/.dotnet" --no-path; then
         rm -f "$installer"
         log_error "Instalacja .NET 10 SDK nie powiodla sie"
         return 1
@@ -897,20 +865,39 @@ install_dotnet_sdk() {
     log_ok ".NET 10 SDK gotowy (nowe terminale zaladuja ~/.dotnet/env)"
 }
 
+# Host part of the WASI SDK archive name: <arch>-<os> (e.g. x86_64-linux).
+wasi_sdk_host() {
+    local arch os
+    case "$(uname -m)" in
+        x86_64) arch=x86_64 ;;
+        arm64|aarch64) arch=arm64 ;;
+        *) log_error "WASI SDK: nieobslugiwana architektura $(uname -m)"; return 1 ;;
+    esac
+    case "$(uname -s)" in
+        Darwin) os=macos ;;
+        Linux) os=linux ;;
+        *) log_error "WASI SDK: nieobslugiwany system $(uname -s)"; return 1 ;;
+    esac
+    printf '%s-%s\n' "$arch" "$os"
+}
+
+wasi_sdk_cache() {
+    printf '%s\n' "${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
+}
+
+# The pinned WASI SDK (scripts/versions.env) in the native cache. build.rs of
+# tentaflow-core picks the newest wasi-sdk-* there, which is this one.
 wasi_sdk_path() {
     if [[ -n "${WASI_SDK_PATH:-}" ]]; then
         printf '%s\n' "$WASI_SDK_PATH"
         return
     fi
-    # Match tentaflow-core/build.rs discovery, including its sorted selection.
-    local cache="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
-    local candidate selected=""
-    for candidate in "$cache"/wasi-sdk-*; do
-        [[ -d "$candidate/share/wasi-sysroot" ]] || continue
-        selected="$candidate"
-    done
-    [[ -n "$selected" ]] || return 1
-    printf '%s\n' "$selected"
+    local host
+    host="$(wasi_sdk_host)" || return 1
+    local sdk
+    sdk="$(wasi_sdk_cache)/wasi-sdk-$WASI_SDK_VERSION-$host"
+    [[ -d "$sdk/share/wasi-sysroot" ]] || return 1
+    printf '%s\n' "$sdk"
 }
 
 verify_wasi_sdk() (
@@ -936,26 +923,27 @@ install_wasi_sdk() {
         return
     fi
 
-    local arch os
-    case "$(uname -m)" in
-        x86_64) arch=x86_64 ;;
-        arm64|aarch64) arch=arm64 ;;
-        *) log_error "WASI SDK: nieobslugiwana architektura $(uname -m)"; return 1 ;;
-    esac
-    case "$(uname -s)" in
-        Darwin) os=macos ;;
-        Linux) os=linux ;;
-        *) log_error "WASI SDK: nieobslugiwany system $(uname -s)"; return 1 ;;
-    esac
-    local version=25.0
-    local name="wasi-sdk-$version-$arch-$os"
-    local cache="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
+    local host
+    host="$(wasi_sdk_host)" || return 1
+    local version="$WASI_SDK_VERSION"
+    local name="wasi-sdk-$version-$host"
+    local checksum_key
+    checksum_key="WASI_SDK_SHA256_$(printf '%s' "${host#*-}_${host%%-*}" | tr 'a-z' 'A-Z')"
+    local expected
+    expected="$(pinned_checksum "$checksum_key" WASI_SDK_VERSION)" || return 1
+    local cache
+    cache="$(wasi_sdk_cache)"
     local work
     mkdir -p "$cache"
     work=$(mktemp -d "$cache/.wasi-install.XXXXXX")
     (
         trap 'rm -rf "$work"' EXIT
         curl -fL --retry 3 "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${version%%.*}/$name.tar.gz" -o "$work/sdk.tar.gz" || exit 1
+        actual="$( (sha256sum "$work/sdk.tar.gz" 2>/dev/null || shasum -a 256 "$work/sdk.tar.gz") | awk '{print $1}')"
+        if [[ "$actual" != "$expected" ]]; then
+            log_error "WASI SDK: SHA256 $actual nie zgadza sie z $checksum_key w scripts/versions.env"
+            exit 1
+        fi
         tar -xzf "$work/sdk.tar.gz" -C "$work" || exit 1
         if ! verify_wasi_sdk "$work/$name"; then
             log_error "Pobrany WASI SDK nie przeszedl testu kompilacji"
@@ -1245,7 +1233,7 @@ install_ios_gstreamer_xcframework() {
 
     log_section "GStreamer iOS xcframework (camera feature)"
 
-    local gst_version="1.28.3"
+    local gst_version="$GSTREAMER_VERSION"
     local archive_url="https://gstreamer.freedesktop.org/data/pkg/ios/${gst_version}/gstreamer-${gst_version}-xcframework.tar.xz"
     local repo_root
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -1289,7 +1277,7 @@ install_ios_gstreamer_xcframework() {
     mkdir -p "$pkgconfig_dir"
     local headers="$xcframework_dir/ios-arm64/Headers"
     local libdir="$xcframework_dir/ios-arm64"
-    local glib_version="2.84.0"
+    local glib_version="$GSTREAMER_IOS_GLIB_VERSION"
 
     local pc_entries=(
         "glib-2.0:$glib_version"
@@ -1341,7 +1329,7 @@ find_gstreamer_android_pkg_config_dir() {
 install_android_gstreamer_sdk() {
     log_section "GStreamer Android SDK"
 
-    local gst_version="1.28.3"
+    local gst_version="$GSTREAMER_VERSION"
     local cache_dir="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
     local target_dir="$cache_dir/gstreamer/android/$gst_version"
     local existing
@@ -1420,7 +1408,7 @@ install_android_gradle_runner() {
 # build llama.cpp na `Unsupported gpu architecture 'compute_103'`.
 CUDA_MIN_MAJOR=12
 CUDA_MIN_MINOR=9
-CUDA_TARGET_PKG="cuda-toolkit-13-0"
+CUDA_TARGET_PKG="cuda-toolkit-${CUDA_TOOLKIT_VERSION//./-}"
 
 # Wypisuje "MAJOR MINOR" zainstalowanego nvcc (PATH oraz /usr/local/cuda), nic gdy brak.
 detect_nvcc_version() {
@@ -1512,7 +1500,7 @@ install_cuda() {
             if curl -fsSL "${repo_base}/cuda-keyring_1.1-1_all.deb" -o "$keyring"; then
                 run_privileged dpkg -i "$keyring"
                 run_privileged apt-get update
-                # Najpierw celowana 13.0; jak brak dla tej wersji Ubuntu — najnowszy meta-pakiet.
+                # Najpierw celowana wersja z versions.env; jak brak dla tej wersji Ubuntu — najnowszy meta-pakiet.
                 if run_privileged apt-get install -y "${CUDA_TARGET_PKG}"; then
                     INSTALLED+=("${CUDA_TARGET_PKG}")
                 elif run_privileged apt-get install -y cuda-toolkit; then
@@ -1774,14 +1762,6 @@ verify_installation() {
         log_ok "cargo: $(cargo --version)"
     else
         log_error "cargo: NIE ZNALEZIONO"
-        ok=false
-    fi
-
-    # git lfs
-    if git lfs version &>/dev/null; then
-        log_ok "git-lfs: $(git lfs version)"
-    else
-        log_error "git-lfs: NIE ZNALEZIONO"
         ok=false
     fi
 
@@ -2095,7 +2075,6 @@ main() {
     install_base
     TENTAFLOW_PYTHON=$(bash "$(dirname "${BASH_SOURCE[0]}")/ensure-python.sh" --install)
     export TENTAFLOW_PYTHON
-    install_git_lfs
     ensure_docker
     # Rust + WASM toolchain FIRST: it is foundational (native builds may use cargo)
     # and must never be skipped by a `set -e` abort in a later fragile native step.
