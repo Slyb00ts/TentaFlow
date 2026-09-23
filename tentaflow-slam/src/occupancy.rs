@@ -465,6 +465,76 @@ impl OccupancyGrid {
         CellId { chunk, index }
     }
 
+    /// Inverse of `cell_id`.
+    pub fn cell_of_id(&self, id: CellId) -> Cell {
+        let edge = CHUNK_EDGE as u32;
+        let (x, y, z) = (id.index % edge, (id.index / edge) % edge, id.index / (edge * edge));
+        [
+            id.chunk.0 * CHUNK_EDGE + x as i32,
+            id.chunk.1 * CHUNK_EDGE + y as i32,
+            id.chunk.2 * CHUNK_EDGE + z as i32,
+        ]
+    }
+
+    /// Centres of every visible cell, in the scene frame. This is the geometry
+    /// relocalization aligns against: cells still waiting for the persistence
+    /// gate are exactly the ones that may be a person, so they stay out.
+    pub fn stable_points(&self) -> Vec<[f32; 3]> {
+        let mut out = Vec::new();
+        for key in self.chunk_keys() {
+            let chunk = &self.chunks[&key];
+            for index in chunk.stable_cells() {
+                let cell = self.cell_of_id(CellId { chunk: key, index });
+                out.push(self.cell_center(cell));
+            }
+        }
+        out
+    }
+
+    /// Adopts one cell of a provisional submap (a session that started outside
+    /// the known map) once that session has been placed.
+    ///
+    /// The evidence comes along — hits and confidence add up — but the age
+    /// restarts here: the submap's revisions count another clock. A cell that
+    /// was VISIBLE in the submap stays visible: it already passed the
+    /// persistence gate in the submap's own time, and the robot that saw it is
+    /// usually somewhere else by the time the merge happens, so waiting for a
+    /// fresh hit would leave it invisible for good.
+    pub fn merge_cell(
+        &mut self,
+        stamp: FrameStamp,
+        cell: Cell,
+        hits: u8,
+        log_odds: i8,
+        was_stable: bool,
+    ) -> Option<CellId> {
+        let id = self.cell_id(cell);
+        let entry_is_new = !self.cell_exists(id);
+        if entry_is_new && self.materialized >= self.max_voxels {
+            self.dropped_at_cap += 1;
+            return None;
+        }
+        let (block_idx, cell_idx) = split_index(id.index);
+        let i = cell_idx as usize;
+        let chunk = self.chunks.entry(id.chunk).or_default();
+        let block = chunk.blocks.entry(block_idx).or_insert_with(Block::new);
+        let visible_before = block.flags[i] & flags::STABLE != 0;
+        block.log_odds[i] = clamp_log_odds(block.log_odds[i].saturating_add(log_odds));
+        block.hits[i] = block.hits[i].saturating_add(hits);
+        block.last_seen_rev[i] = stamp.revision as u32;
+        if entry_is_new {
+            block.first_seen_delta[i] = 0;
+            self.materialized += 1;
+        }
+        if was_stable {
+            block.flags[i] |= flags::STABLE;
+            block.flags[i] &= !flags::REMOVED_PENDING;
+        }
+        chunk.dirty = true;
+        chunk.revision = stamp.revision;
+        (!visible_before && block.flags[i] & flags::STABLE != 0).then_some(id)
+    }
+
     /// True when the cell is part of the visible map.
     pub fn is_stable(&self, cell: Cell) -> bool {
         let id = self.cell_id(cell);

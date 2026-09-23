@@ -20,6 +20,7 @@ pub mod mapping;
 pub mod occupancy;
 pub mod optimize;
 pub mod pose;
+pub mod reloc;
 pub mod service;
 pub mod submap;
 pub mod voxel_map;

@@ -36,7 +36,14 @@ trwałości 3 trafienia w ≥1 s, usunięcie dopiero przy progu pewności ORAZ d
 ≥0,3 m od siebie, scena przy limicie odmawia zamiast eksmitować), `carve.rs` (DDA zatrzymywane na
 pierwszej powierzchni klatki, window-diff ograniczony do części wspólnej okien, wykluczenia działające
 i na punkty, i na promień) oraz `chunk_io.rs` (`.tfmc`, WAL, kompakcja, kwarantanna uszkodzonego
-snapshotu). Zostaje `reloc.rs` (BnB + ICP) i benchmarki, których progi są zablokowane pomiarem P0.5.
+snapshotu) oraz `reloc.rs` (BnB po (x, y, yaw) na przekroju 2-D z piramidą max-pool, potem ICP; odmowa
+przy drugim, wyraźnie innym kandydacie ≥ 70 % wyniku najlepszego; `ConfirmationGate` wymaga drugiej,
+zgodnej odpowiedzi ≥ 1 s później; `merge_submap` scala prowizoryczną submapę przez placement).
+Zostają benchmarki na nagraniu z Go2 — progi są zablokowane pomiarem P0.5. Test syntetyczny: pokój w
+kształcie L, cała scena przeszukana, błąd < 5 cm / < 1°, całość w release < 0,25 s — to nie jest pomiar
+wydajności na prawdziwych danych. Prostokątny pokój z drobnymi elementami wychodzi jako niejednoznaczny
+(obrót o 180° daje 86 % wyniku) — to zamierzone zachowanie, w praktyce rozstrzyga je potwierdzenie albo
+ręczne umieszczenie.
 
 Nie zrobione w P0 i nieudawane: widok 3D (`tf-map-view`), strumień `map:`, umieszczanie i
 relokalizacja urządzeń, `SceneClearRegionRequest`, przejęcie właściciela od nieosiągalnego węzła
