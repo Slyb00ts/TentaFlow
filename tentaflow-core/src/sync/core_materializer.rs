@@ -2429,6 +2429,13 @@ fn apply_sync_explicit_share(
 /// FK to `flows(id)` means a snapshot landing before its parent flow is a
 /// causal-ordering gap — surfaced as DeferredOrdering so the inbox retries it
 /// until the flow arrives (mirrors `apply_skill_file`).
+///
+/// `version_num` is allocated per node as `MAX + 1`, so two nodes that edited
+/// the same flow independently each hold a DIFFERENT snapshot under the same
+/// number. The number is only a display ordinal (every reference goes by id),
+/// so a snapshot whose number is taken locally by another id is kept under the
+/// next free number instead of being rejected, and a row that already exists
+/// keeps the number this node gave it.
 fn apply_flow_version(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
@@ -2451,19 +2458,39 @@ fn apply_flow_version(
                     "flow_versions target flow not found: {flow_id}"
                 )));
             }
+            let wanted = field_i64_or(operation, "version_num", 0)?;
+            let taken_by_other: bool = tx
+                .query_row(
+                    "SELECT 1 FROM flow_versions WHERE flow_id = ?1 AND version_num = ?2 AND id != ?3",
+                    rusqlite::params![flow_id, wanted, id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .unwrap_or(false);
+            let version_num = if taken_by_other {
+                tx.query_row(
+                    "SELECT COALESCE(MAX(version_num), 0) + 1 FROM flow_versions WHERE flow_id = ?1",
+                    rusqlite::params![flow_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(sql_error)?
+            } else {
+                wanted
+            };
             tx.execute(
                 "INSERT INTO flow_versions \
                  (id, flow_id, version_num, name, description, status, created_by, flow_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(id) DO UPDATE SET \
-                 flow_id = excluded.flow_id, version_num = excluded.version_num, \
+                 flow_id = excluded.flow_id, \
                  name = excluded.name, description = excluded.description, \
                  status = excluded.status, created_by = excluded.created_by, \
                  flow_json = excluded.flow_json",
                 rusqlite::params![
                     id,
                     flow_id,
-                    field_i64_or(operation, "version_num", 0)?,
+                    version_num,
                     field_string(operation, "name")?,
                     field_optional_string(operation, "description")?,
                     field_string(operation, "status")?,
@@ -5144,6 +5171,60 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    fn flow_version_operation(id: &str, flow_id: &str, version_num: i64) -> SyncOperation {
+        let mut op = rollup_operation(
+            id,
+            field_map(&[
+                ("flow_id", FieldValue::String(flow_id.into())),
+                ("version_num", FieldValue::I64(version_num)),
+                ("name", FieldValue::String("remote edit".into())),
+                ("status", FieldValue::String("active".into())),
+                ("flow_json", FieldValue::String("{}".into())),
+            ]),
+        );
+        op.body.resource_type = "core.flow_version".to_string();
+        op.body.table_name = "flow_versions".to_string();
+        op
+    }
+
+    /// Two nodes that edited one flow independently each numbered their own
+    /// snapshot `MAX + 1`, so the peer's snapshot arrives under a number this
+    /// node already used for a different one. It used to fail the UNIQUE
+    /// (flow_id, version_num) constraint and was lost as a terminal conflict.
+    #[test]
+    fn a_flow_version_colliding_on_its_number_is_kept_under_the_next_one() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO flows (id, name, flow_json, status) VALUES ('f-1', 'F', '{}', 'active')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO flow_versions (id, flow_id, version_num, flow_json, name) \
+             VALUES ('v-local', 'f-1', 2, '{}', 'local edit')",
+            [],
+        )
+        .unwrap();
+
+        apply_flow_version(&tx, &flow_version_operation("v-remote", "f-1", 2)).unwrap();
+        let number_of = |id: &str| -> i64 {
+            tx.query_row(
+                "SELECT version_num FROM flow_versions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(number_of("v-local"), 2, "the local snapshot keeps its number");
+        assert_eq!(number_of("v-remote"), 3, "the remote one takes the next free number");
+
+        // A re-delivery of the same snapshot keeps the number it was given here.
+        apply_flow_version(&tx, &flow_version_operation("v-remote", "f-1", 2)).unwrap();
+        assert_eq!(number_of("v-remote"), 3);
     }
 
     /// A registry row for a node this installation has never paired with must
