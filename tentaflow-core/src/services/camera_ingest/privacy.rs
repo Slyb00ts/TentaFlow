@@ -48,17 +48,33 @@ use crate::vision::gpu_preprocess::{
 use crate::vision::runners::{get_coco_detector, get_face_detector, CocoHandle, FaceHandle};
 use crate::vision::{detector_coco, face_yunet};
 
-/// Head = the top fraction of a person box. A standing person's head is the top
-/// ~15 %; 30 % also covers bowed heads and people seen from a low robot camera.
-const HEAD_FRACTION: f32 = 0.30;
+/// Head height as a fraction of a WHOLE person box. An adult's head is ~1/7.5
+/// of their height (0.13); 0.16 leaves room for a bowed head and hair.
+const HEAD_OF_BODY: f32 = 0.16;
+/// Head height as a fraction of the box WIDTH, used when the box is cut off by
+/// the bottom of the frame (a person close to a low robot camera): the visible
+/// height then says nothing about the head, but the shoulders still do — a
+/// head is about half the shoulder width tall.
+const HEAD_OF_SHOULDERS: f32 = 0.55;
+/// A box whose bottom edge is this close to the frame's bottom is cut off.
+const CUT_OFF_BOTTOM: f32 = 0.98;
+/// A face counts as belonging to a person when its centre lies in the top
+/// fraction of that person's box.
+const FACE_ZONE_OF_BODY: f32 = 0.40;
 /// Margin added on every side of a head or face region, as a fraction of its size.
 const REGION_MARGIN: f32 = 0.25;
 /// Smallest region in luma pixels: a distant face must still vanish.
 const REGION_MIN_PX: f32 = 24.0;
-/// Person score the probe accepts. Lower than the detector's default
-/// (`PERSON_SCORE_THRESHOLD`, tuned for clean detections): here a missed person
-/// is a leaked face, while a false positive only pixelates a patch of scenery.
-const PRIVACY_PERSON_SCORE: f32 = 0.2;
+/// Person score below which a box does not even get a head estimate. Faces
+/// are found by YuNet on their own, so a person box only matters for a head the
+/// face detector cannot see (turned away, profile, far): 0.35 keeps those while
+/// dropping the chair legs, jackets and shadows a low robot camera turns into
+/// "people" at 0.2 — and a false positive now costs one head-sized square.
+const PRIVACY_PERSON_SCORE: f32 = 0.35;
+/// Person score for what is SHOWN as a detection. The overlay is a statement to
+/// the operator ("there is a person"), not a safety margin, so it only carries
+/// confident detections.
+const PUBLISH_PERSON_SCORE: f32 = 0.5;
 /// Period of the per-camera summary log line.
 const SUMMARY_EVERY_FRAMES: u64 = 500;
 
@@ -160,6 +176,7 @@ impl Drop for ProbeState {
 impl ProbeState {
     fn process(&mut self, buffer: &gst::BufferRef, video_info: &gst_video::VideoInfo) -> Result<()> {
         let started = Instant::now();
+        crate::services::pipeline_rate::note("camera.privacy_frame", &self.camera_id, 1);
         let ts_ms = unix_ms();
         self.counters.increment_public(ts_ms / 1000);
 
@@ -212,21 +229,7 @@ impl ProbeState {
         if self.options.face_blur {
             let mode = match analysis.as_ref() {
                 Some(found) => {
-                    // Faces FIRST, heads after: where the two overlap the later
-                    // region wins, and the head band is both larger and coarser
-                    // — a face must never end up less pixelated than the head
-                    // around it.
-                    let current: Vec<BlurRect> = found
-                        .faces
-                        .iter()
-                        .map(|f| face_region(f.bbox, width, height))
-                        .chain(
-                            found
-                                .persons
-                                .iter()
-                                .map(|p| head_region(p.bbox, width, height)),
-                        )
-                        .collect();
+                    let current = blur_regions(&found.faces, &found.persons, width, height);
                     let mut regions = current.clone();
                     regions.extend_from_slice(&self.prev_regions);
                     self.prev_regions = current;
@@ -255,7 +258,11 @@ impl ProbeState {
 
         let work_ms = started.elapsed().as_secs_f64() * 1000.0;
         if self.options.person_detect {
-            if let Some(Analysis { mut persons, .. }) = analysis {
+            if let Some(Analysis { persons, .. }) = analysis {
+                let mut persons: Vec<Detection> = persons
+                    .into_iter()
+                    .filter(|p| p.score >= PUBLISH_PERSON_SCORE)
+                    .collect();
                 let pts_ns = buffer.pts().map(|t| t.nseconds());
                 let key = super::tracker::key(&self.camera_id, "persons");
                 super::tracker::update(&key, &mut persons, pts_ns);
@@ -375,9 +382,66 @@ fn analyse(
 }
 
 /// Head region of a person box (`bbox` normalized `[x, y, w, h]`) in luma
-/// pixels: the top `HEAD_FRACTION` of the box, widened by `REGION_MARGIN`.
+/// pixels: a head-sized square at the top centre of the box (sized from the body
+/// height, or from the shoulders when the box is cut off by the frame), widened
+/// by `REGION_MARGIN`.
 pub(super) fn head_region(bbox: [f32; 4], width: u32, height: u32) -> BlurRect {
-    expanded_region([bbox[0], bbox[1], bbox[2], bbox[3] * HEAD_FRACTION], width, height)
+    let [x, y, w, h] = bbox;
+    let (fw, fh) = (width as f32, height as f32);
+    let cut_off = y + h >= CUT_OFF_BOTTOM;
+    // In pixels: a person box is not square, so the proportions only mean
+    // something once both sides are in the same unit.
+    let head_px = if cut_off {
+        (w * fw * HEAD_OF_SHOULDERS).min(h * fh)
+    } else {
+        h * fh * HEAD_OF_BODY
+    };
+    // A head is roughly as wide as it is tall; never wider than the person.
+    let head_w_px = head_px.min(w * fw);
+    let centre_x = (x + w / 2.0) * fw;
+    expanded_region(
+        [
+            (centre_x - head_w_px / 2.0) / fw,
+            y,
+            head_w_px / fw,
+            head_px / fh,
+        ],
+        width,
+        height,
+    )
+}
+
+/// What gets pixelated in one frame. A detected face is pixelated as the face
+/// itself — its person's head estimate is then redundant and much larger, which
+/// is what made the blur cover shoulders and chest. A person WITHOUT a detected
+/// face (turned away, in profile, too small for the face detector) still gets
+/// its head estimate: the face detector missing a face must never leak one.
+/// Faces come first, so where regions overlap the later (coarser) one wins and
+/// a face is never less pixelated than the head around it.
+pub(super) fn blur_regions(
+    faces: &[face_yunet::FaceBox],
+    persons: &[Detection],
+    width: u32,
+    height: u32,
+) -> Vec<BlurRect> {
+    let has_face = |p: &Detection| {
+        let [px, py, pw, ph] = p.bbox;
+        faces.iter().any(|f| {
+            let cx = f.bbox[0] + f.bbox[2] / 2.0;
+            let cy = f.bbox[1] + f.bbox[3] / 2.0;
+            cx >= px && cx <= px + pw && cy >= py && cy <= py + ph * FACE_ZONE_OF_BODY
+        })
+    };
+    faces
+        .iter()
+        .map(|f| face_region(f.bbox, width, height))
+        .chain(
+            persons
+                .iter()
+                .filter(|p| !has_face(p))
+                .map(|p| head_region(p.bbox, width, height)),
+        )
+        .collect()
 }
 
 /// A detected face widened by `REGION_MARGIN` (the detector's box is tight;
@@ -415,16 +479,69 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn person(bbox_px: [f32; 4]) -> Detection {
+        Detection {
+            klasa: "person".into(),
+            bbox: [
+                bbox_px[0] / 1280.0,
+                bbox_px[1] / 720.0,
+                bbox_px[2] / 1280.0,
+                bbox_px[3] / 720.0,
+            ],
+            score: 0.9,
+            stan: Vec::new(),
+            tekst: None,
+            tekst_conf: None,
+            tekst_thumb_ref: None,
+            track_id: 0,
+            vehicle_id: 0,
+            vx: 0.,
+            vy: 0.,
+        }
+    }
+
+    /// A standing person: the head estimate is a head-sized square at the top
+    /// centre — not the whole top of the silhouette, which covered shoulders
+    /// and chest.
     #[test]
-    fn head_region_covers_the_top_of_the_box_with_margin() {
-        // A 100×400 px person at (500, 100) in a 1280×720 frame.
-        let r = head_region([500.0 / 1280.0, 100.0 / 720.0, 100.0 / 1280.0, 400.0 / 720.0], 1280, 720);
-        // Head band = top 120 px; with 25 % margin each side: 180 px tall, 150 px wide
-        // (sizes round UP — a region may only err towards covering more).
-        assert!((150..=151).contains(&r.w) && (180..=181).contains(&r.h), "{r:?}");
-        assert_eq!((r.x, r.y), (475, 70));
-        // The band starts above the box top and reaches past the head band.
-        assert!(r.y < 100 && r.y + r.h > 100 + 120);
+    fn a_standing_persons_head_region_is_head_sized() {
+        // 100×400 px person at (500, 100) in a 1280×720 frame.
+        let r = head_region(person([500.0, 100.0, 100.0, 400.0]).bbox, 1280, 720);
+        // Head = 16 % of 400 = 64 px square, +25 % margin per side = 96 px.
+        assert!((96..=97).contains(&r.w) && (96..=97).contains(&r.h), "{r:?}");
+        // Centred on the person, starting just above the box top.
+        assert_eq!((r.x, r.y), (502, 84));
+        // It ends well above the shoulders (~25 % down the body).
+        assert!(r.y + r.h < 100 + 100, "{r:?} reaches the chest");
+    }
+
+    /// A person cut off by the bottom of the frame (close to a low robot): the
+    /// head is sized from the shoulders, not from a visible height that says
+    /// nothing about the body.
+    #[test]
+    fn a_cut_off_persons_head_is_sized_from_the_shoulders() {
+        // 400 px wide upper body, 500 px visible, touching the frame bottom.
+        let r = head_region(person([400.0, 220.0, 400.0, 500.0]).bbox, 1280, 720);
+        // Head = 0.55 × 400 = 220 px, +25 % margin per side = 330 px.
+        assert!((330..=331).contains(&r.w), "{r:?}");
+        // Centred on the shoulders, not spanning them.
+        assert!(r.x > 400 && r.x + r.w < 800 + 1, "{r:?}");
+    }
+
+    /// A detected face is pixelated as itself, and its person's much larger
+    /// head estimate is dropped; a person with no detected face keeps it.
+    #[test]
+    fn a_detected_face_replaces_its_persons_head_estimate() {
+        let with_face = person([200.0, 100.0, 120.0, 480.0]);
+        let turned_away = person([800.0, 100.0, 120.0, 480.0]);
+        let face = face_yunet::FaceBox {
+            bbox: [240.0 / 1280.0, 110.0 / 720.0, 40.0 / 1280.0, 50.0 / 720.0],
+            score: 0.9,
+        };
+        let regions = blur_regions(&[face], &[with_face.clone(), turned_away.clone()], 1280, 720);
+        assert_eq!(regions.len(), 2, "{regions:?}");
+        assert_eq!(regions[0], face_region(face.bbox, 1280, 720));
+        assert_eq!(regions[1], head_region(turned_away.bbox, 1280, 720));
     }
 
     #[test]

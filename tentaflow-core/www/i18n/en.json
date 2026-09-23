@@ -5657,7 +5657,10 @@
     "requirement_installed": "installed",
     "requirement_missing": "missing — the options will not work",
     "requirement_unsupported_host": "unavailable on this node",
-    "requirement_install": "Install"
+    "requirement_install": "Install",
+    "requirement_install_done": "Model {engine} installed — the camera picks it up within 30 s",
+    "requirement_install_incomplete": "Downloaded, but {engine} is still incomplete on disk",
+    "requirement_install_failed": "Installing {engine} failed: {error}"
   },
   "addon_logs": {
     "title": "Add-on logs",

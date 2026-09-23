@@ -3198,6 +3198,9 @@ export const encode = {
       String(payload.subjectType ?? payload.subject_type ?? 'user'),
       String(payload.subjectId ?? payload.subject_id ?? ''),
       String(payload.accessLevel ?? payload.access_level ?? 'allow'),
+      // '*' is what the core assumes for a caller that names no action, so an
+      // omitted action here means exactly what it meant before actions existed.
+      String(payload.action ?? '*'),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -5609,6 +5612,17 @@ export const encode = {
   },
 
   /** MessageBody::AddonConfigSetRequest — zapisuje wartosci konfiguracji. */
+  /** Installs one engine the addon declares as required, from its settings. */
+  // wire: AddonRequirementInstallRequestBody
+  addonRequirementInstallRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonRequirementInstallRequest(
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.engineId ?? payload.engine_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   addonConfigSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     // payload.values = { key: value } lub tablica [[k,v],...] — normalizujemy.

@@ -2264,7 +2264,8 @@ pub fn encode_bus_acl_list_request(instance_id: String, topic: String) -> Result
     .map_err(|e| JsError::new(&e))
 }
 
-/// `access_level` is 'allow' | 'deny' | 'clear' (see `bus.rs`'s doc).
+/// `access_level` is 'allow' | 'deny' | 'clear'; `action` is 'read' | 'write'
+/// | 'admin' | '*' (see `bus.rs`'s doc).
 #[wasm_bindgen(js_name = encodeBusAclSetRequest)]
 pub fn encode_bus_acl_set_request(
     instance_id: String,
@@ -2272,6 +2273,7 @@ pub fn encode_bus_acl_set_request(
     subject_type: String,
     subject_id: String,
     access_level: String,
+    action: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
         instance_id,
@@ -2280,6 +2282,7 @@ pub fn encode_bus_acl_set_request(
             subject_type,
             subject_id,
             access_level,
+            action,
         },
     }))
     .map_err(|e| JsError::new(&e))
@@ -10104,6 +10107,23 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "cloudAccountProvider", provider.into());
             }
         }
+        MessageBody::AddonRequirementInstallRequestBody(r) => {
+            set(&obj, "variant", "AddonRequirementInstallRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "engineId", r.engine_id.into());
+        }
+        MessageBody::AddonRequirementInstallResponseBody(r) => {
+            set(&obj, "variant", "AddonRequirementInstallResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            let reqs = js_sys::Array::new();
+            for req in r.requirements {
+                let ro = js_sys::Object::new();
+                set(&ro, "engineId", req.engine_id.into());
+                set(&ro, "status", req.status.into());
+                reqs.push(&ro.into());
+            }
+            set(&obj, "requirements", reqs.into());
+        }
         MessageBody::AddonConfigSetResponseBody(r) => {
             set(&obj, "variant", "AddonConfigSetResponse".into());
             set(&obj, "ok", r.ok.into());
@@ -16778,6 +16798,21 @@ pub fn encode_addon_teardown_plan_request(addon_id: String) -> Result<Vec<u8>, J
 pub fn encode_addon_config_get_request(addon_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonConfigGetRequestBody(
         AddonConfigGetRequest { addon_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// Installs one engine the addon declares as required (addon settings).
+#[wasm_bindgen(js_name = encodeAddonRequirementInstallRequest)]
+pub fn encode_addon_requirement_install_request(
+    addon_id: String,
+    engine_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonRequirementInstallRequestBody(
+        tentaflow_protocol::AddonRequirementInstallRequest {
+            addon_id,
+            engine_id,
+        },
     ))
     .map_err(|e| JsError::new(&e))
 }

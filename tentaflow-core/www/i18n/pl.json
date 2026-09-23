@@ -5708,7 +5708,10 @@
     "requirement_installed": "zainstalowane",
     "requirement_missing": "brak — opcje nie zadziałają",
     "requirement_unsupported_host": "niedostępne na tym węźle",
-    "requirement_install": "Zainstaluj"
+    "requirement_install": "Zainstaluj",
+    "requirement_install_done": "Model {engine} zainstalowany — kamera użyje go w ciągu 30 s",
+    "requirement_install_incomplete": "Pobrano, ale {engine} nadal niekompletny na dysku",
+    "requirement_install_failed": "Instalacja {engine} nie powiodła się: {error}"
   },
   "addon_logs": {
     "title": "Logi dodatku",

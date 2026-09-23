@@ -3554,7 +3554,10 @@
     "requirement_installed": "installés",
     "requirement_missing": "absents — les options ne fonctionneront pas",
     "requirement_unsupported_host": "indisponible sur ce nœud",
-    "requirement_install": "Installer"
+    "requirement_install": "Installer",
+    "requirement_install_done": "Modèle {engine} installé — la caméra l’utilisera sous 30 s",
+    "requirement_install_incomplete": "Téléchargé, mais {engine} est encore incomplet sur le disque",
+    "requirement_install_failed": "Échec de l’installation de {engine} : {error}"
   },
   "addon_logs": {
     "title": "Journaux de l'extension",

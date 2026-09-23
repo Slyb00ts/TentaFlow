@@ -1639,6 +1639,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AddonTeardownPlanResponseBody(_) => "AddonTeardownPlanResponse",
         MessageBody::AddonConfigGetRequestBody(_) => "AddonConfigGetRequest",
         MessageBody::AddonConfigGetResponseBody(_) => "AddonConfigGetResponse",
+        MessageBody::AddonRequirementInstallRequestBody(_) => "AddonRequirementInstallRequest",
+        MessageBody::AddonRequirementInstallResponseBody(_) => "AddonRequirementInstallResponse",
         MessageBody::AddonConfigSetRequestBody(_) => "AddonConfigSetRequest",
         MessageBody::AddonConfigSetResponseBody(_) => "AddonConfigSetResponse",
         MessageBody::AddonLogsRequestBody(_) => "AddonLogsRequest",

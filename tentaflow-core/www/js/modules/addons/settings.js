@@ -11,7 +11,6 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { Router } from '/js/router.js';
 import { confirmDialog } from '/js/lib/confirm-dialog.js';
 import { openRobotCloudDialog, robotCloudFieldValues, robotCloudVendorName } from '/js/modules/addons/robot-cloud-dialog.js';
 
@@ -106,11 +105,7 @@ function render(container) {
   container.querySelector('#addon-settings-save')?.addEventListener('click', () => onSave(container));
   container.querySelector('#addon-settings-reload')?.addEventListener('click', () => onReload());
   container.querySelectorAll('[data-install-engine]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      // The catalog is where an engine is deployed; the settings form only
-      // reports what this node has.
-      Router.navigate('catalog', { engine: btn.getAttribute('data-install-engine') });
-    });
+    btn.addEventListener('click', () => onInstallRequirement(container, btn));
   });
   container.querySelector('#addon-settings-robot-cloud')?.addEventListener('click', () => {
     openRobotCloudDialog({
@@ -146,6 +141,33 @@ function renderRequirement(req) {
       <div class="tf-toolbar-spacer"></div>
       ${action}
     </div>`;
+}
+
+/// Installs a required model in place. The server only installs what this
+/// addon declares, and answers with the requirements as they are on disk
+/// afterwards — the chip is redrawn from that answer, never assumed.
+async function onInstallRequirement(container, btn) {
+  const engineId = btn.getAttribute('data-install-engine');
+  btn.setAttribute('loading', '');
+  btn.setAttribute('disabled', '');
+  try {
+    const resp = await ApiBinary.one('addonRequirementInstallRequest', {
+      addonId: currentAddonId,
+      engineId,
+    });
+    requirements = Array.isArray(resp.requirements) ? resp.requirements : requirements;
+    const done = requirements.some((r) =>
+      String(r.engineId ?? r.engine_id) === engineId && String(r.status) === 'installed');
+    toast(
+      I18n.t(done ? 'addon_settings.requirement_install_done' : 'addon_settings.requirement_install_incomplete', { engine: engineId }),
+      done ? 'success' : 'warning',
+    );
+    render(container);
+  } catch (e) {
+    toast(I18n.t('addon_settings.requirement_install_failed', { engine: engineId, error: e?.message ?? String(e) }), 'error');
+    btn.removeAttribute('loading');
+    btn.removeAttribute('disabled');
+  }
 }
 
 function renderField(field) {

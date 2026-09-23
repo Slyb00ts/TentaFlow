@@ -3554,7 +3554,10 @@
     "requirement_installed": "installiert",
     "requirement_missing": "fehlt — die Optionen funktionieren nicht",
     "requirement_unsupported_host": "auf diesem Knoten nicht verfügbar",
-    "requirement_install": "Installieren"
+    "requirement_install": "Installieren",
+    "requirement_install_done": "Modell {engine} installiert — die Kamera übernimmt es innerhalb von 30 s",
+    "requirement_install_incomplete": "Heruntergeladen, aber {engine} ist auf der Festplatte noch unvollständig",
+    "requirement_install_failed": "Installation von {engine} fehlgeschlagen: {error}"
   },
   "addon_logs": {
     "title": "Addon-Protokolle",

@@ -6430,6 +6430,24 @@ pub struct AddonRequirement {
     pub status: String,
 }
 
+/// Install one engine an addon declares as required (`[[requires.vision_engine]]`)
+/// straight from that addon's settings. The addon id is part of the request so
+/// the handler installs only what THAT addon needs — the settings screen is
+/// not a general model installer.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonRequirementInstallRequest {
+    pub addon_id: String,
+    pub engine_id: String,
+}
+
+/// The addon's requirements after the install, so the screen shows what is on
+/// disk now rather than what the button hoped for.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonRequirementInstallResponse {
+    pub addon_id: String,
+    pub requirements: Vec<AddonRequirement>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonConfigSetRequest {
     pub addon_id: String,
@@ -8424,6 +8442,10 @@ pub enum MessageBody {
     // which scene. Geometry never travels here — it goes over the `map:`
     // stream and the mesh chunk pull.
     MapBody(crate::map::MapPayload),
+    // ----- Addon requirement install (addon settings) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME).
+    AddonRequirementInstallRequestBody(AddonRequirementInstallRequest),
+    AddonRequirementInstallResponseBody(AddonRequirementInstallResponse),
 }
 
 // =============================================================================

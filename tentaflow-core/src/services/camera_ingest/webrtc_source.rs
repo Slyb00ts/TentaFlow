@@ -561,6 +561,22 @@ pub(super) fn attach_mp4_branch_webrtc(
     Ok(state)
 }
 
+/// Average and peak rate of the re-encoded (anonymized) stream, kbit/s.
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+))]
+const ENCODED_BITRATE_KBPS: u32 = 8_000;
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "inference-vision-gpu",
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+))]
+const ENCODED_MAX_BITRATE_KBPS: u32 = 12_000;
+
 /// Attach Branch B behind the privacy probe: `tee_cuda → queue → nvcudah264enc
 /// → h264parse → mp4mux → appsink`. The encoder consumes the anonymized CUDA
 /// frames directly (no download), and its settings keep the stream MSE-friendly
@@ -588,17 +604,24 @@ pub(super) fn attach_mp4_branch_webrtc_encoded(
         .build()
         .map_err(|e| format!("queue build: {e}"))?;
     queue.set_property_from_str("leaky", "downstream");
+    // Quality over the last millisecond: this is a SECOND generation of the
+    // robot's already-compressed video, so a fast preset at a low constant rate
+    // visibly smears detail. VBR at ~8 Mbit/s (12 peak) and preset p5 cost a
+    // few ms on NVENC for one 720p stream and a local-network viewer carries
+    // the rate easily; `low-latency` keeps the frame-by-frame delivery MSE
+    // needs without the quality floor of `ultra-low-latency`.
     let encoder = gst::ElementFactory::make("nvcudah264enc")
         .property("name", "nvenc_branch_b")
         .property("zero-reorder-delay", true)
         .property("b-frames", 0u32)
-        .property("bitrate", 4000u32)
+        .property("bitrate", ENCODED_BITRATE_KBPS)
+        .property("max-bitrate", ENCODED_MAX_BITRATE_KBPS)
         .property("gop-size", super::rtsp::transcoder_key_int_max(source_fps) as i32)
         .build()
         .map_err(|e| format!("nvcudah264enc build: {e}"))?;
-    encoder.set_property_from_str("preset", "p3");
-    encoder.set_property_from_str("tune", "ultra-low-latency");
-    encoder.set_property_from_str("rate-control", "cbr");
+    encoder.set_property_from_str("preset", "p5");
+    encoder.set_property_from_str("tune", "low-latency");
+    encoder.set_property_from_str("rate-control", "vbr");
     let parse = gst::ElementFactory::make("h264parse")
         .property_from_str("config-interval", "-1")
         .build()
@@ -815,8 +838,14 @@ pub(super) fn detach_mp4_branch_webrtc(
 /// Pump Annex-B chunks from the channel into the current appsrc until the stream
 /// ends (sender dropped) or the pipeline rejects a push (torn down). Sends EOS
 /// on exit so the pipeline can shut down cleanly.
-pub async fn webrtc_pump(mut rx: mpsc::Receiver<bytes::Bytes>, appsrc: Arc<AppSrcSlot>) {
+pub async fn webrtc_pump(
+    camera_id: String,
+    mut rx: mpsc::Receiver<bytes::Bytes>,
+    appsrc: Arc<AppSrcSlot>,
+) {
     while let Some(chunk) = rx.recv().await {
+        crate::services::pipeline_rate::note("camera.webrtc_au_in", &camera_id, 1);
+        crate::services::pipeline_rate::note("camera.webrtc_kbit_in", &camera_id, (chunk.len() as u64 * 8) / 1000);
         let buffer = gst::Buffer::from_slice(chunk);
         // The slot is swapped when the session rebuilds the pipeline (privacy
         // options changed): the robot's stream keeps flowing into whatever
@@ -1022,7 +1051,19 @@ mod privacy_path_tests {
             let before = edge_energy(&reference, x, y, w, h);
             let after = edge_energy(&blurred, x, y, w, h);
             println!("head {w}x{h}: edge energy {before:.0} -> {after:.0}");
-            assert!(after < before * 0.35, "head region is pixelated");
+            // The probe pixelates the FACE when it finds one and the head
+            // estimate only when it does not, so this square is covered by the
+            // face (plus its margin) or wholly: either way most of its detail is
+            // gone, while an unblurred head keeps ~90 % through NVENC.
+            assert!(after < before * 0.6, "the head is not pixelated");
+            // The chest stays sharp: the blur is a head, not the top of a body.
+            let [px, py, pw, ph] = p.bbox;
+            let (tx, ty) = ((px * W as f32) as usize, ((py + ph * 0.35) * H as f32) as usize);
+            let (tw, th) = ((pw * W as f32) as usize, (ph * 0.15 * H as f32) as usize);
+            let torso_before = edge_energy(&reference, tx, ty, tw, th);
+            let torso_after = edge_energy(&blurred, tx, ty, tw, th);
+            println!("torso {tw}x{th}: edge energy {torso_before:.0} -> {torso_after:.0}");
+            assert!(torso_after > torso_before * 0.6, "the chest must not be pixelated");
         }
 
         // Far from every person (the top-left corner is sky/building in bus.jpg
@@ -1114,7 +1155,7 @@ mod privacy_path_tests {
             let before = edge_energy(&sharp, x, y, w, h);
             let after = edge_energy(&blurred, x, y, w, h);
             println!("live switch, head {w}x{h}: edge energy {before:.0} -> {after:.0}");
-            assert!(after < before * 0.35, "head pixelated after the live switch");
+            assert!(after < before * 0.6, "the head is not pixelated after the live switch");
         }
 
         feeder.abort();

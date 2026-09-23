@@ -460,7 +460,11 @@ async fn run_session(
                 Ok((p, appsrc, fanout)) => {
                     let slot = Arc::new(super::webrtc_source::AppSrcSlot::new(appsrc));
                     webrtc_appsrc = Some(slot.clone());
-                    webrtc_pump = Some(tokio::spawn(super::webrtc_source::webrtc_pump(rx, slot)));
+                    webrtc_pump = Some(tokio::spawn(super::webrtc_source::webrtc_pump(
+                        cam_id.clone(),
+                        rx,
+                        slot,
+                    )));
                     webrtc_fanout = Some(fanout);
                     Ok(p)
                 }

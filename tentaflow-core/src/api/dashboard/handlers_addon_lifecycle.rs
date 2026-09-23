@@ -605,20 +605,7 @@ pub fn addon_config_get(
     let manifest = parse_manifest(&addon.manifest_json);
     let schema = extract_config_schema(&manifest);
 
-    // Read from the PACKAGE, not the instance manifest: the declaration belongs
-    // to the package and an instance installed before it was added still gets
-    // the vendor-account fill without a reinstall.
-    let package_manifest =
-        match repository::get_addon_instance_package_ref(&ctx.state.db, &payload.addon_id)
-            .map_err(db_err)?
-        {
-            Some((package_id, version)) => {
-                repository::get_addon_package(&ctx.state.db, &package_id, &version)
-                    .map_err(db_err)?
-                    .map(|pkg| pkg.manifest_json)
-            }
-            None => None,
-        };
+    let package_manifest = package_manifest_json(ctx, &payload.addon_id)?;
     let cloud_account_provider = package_manifest
         .as_deref()
         .and_then(crate::addon::lifecycle::parse_cloud_account_provider);
@@ -653,6 +640,93 @@ pub fn addon_config_get(
             values,
             requirements,
             cloud_account_provider,
+        },
+    ))
+}
+
+/// The manifest of the PACKAGE an addon instance was installed from. Read from
+/// the package, not the instance manifest: declarations (requirements, vendor
+/// account) belong to the package, and an instance installed before one was
+/// added still gets it without a reinstall.
+fn package_manifest_json(
+    ctx: &HandlerContext,
+    addon_id: &str,
+) -> Result<Option<String>, ProtocolError> {
+    Ok(
+        match repository::get_addon_instance_package_ref(&ctx.state.db, addon_id)
+            .map_err(db_err)?
+        {
+            Some((package_id, version)) => {
+                repository::get_addon_package(&ctx.state.db, &package_id, &version)
+                    .map_err(db_err)?
+                    .map(|pkg| pkg.manifest_json)
+            }
+            None => None,
+        },
+    )
+}
+
+// =============================================================================
+// AddonRequirementInstallRequest — Admin
+// =============================================================================
+
+/// Installs one engine the addon declares as required, from the addon's own
+/// settings. Refuses an engine the package does not declare: this screen
+/// installs what THIS addon needs, it is not a general model installer. The
+/// files land where the deploy wizard would put them (`ensure_bundle`, same
+/// source resolution), so a running camera picks the model up on its own —
+/// the loaders retry a missing model every 30 s.
+#[handler(variant = "AddonRequirementInstallRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn addon_requirement_install(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AddonRequirementInstallRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonRequirementInstallRequestBody",
+            ))
+        }
+    };
+    validate_addon_id(&payload.addon_id)?;
+    let manifest = package_manifest_json(ctx, &payload.addon_id)?
+        .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
+    let declared = crate::addon::lifecycle::parse_required_vision_engines(&manifest);
+    if !declared.iter().any(|e| e == &payload.engine_id) {
+        return Err(ProtocolError::bad_request(format!(
+            "addon {} does not declare '{}' as a requirement",
+            payload.addon_id, payload.engine_id
+        )));
+    }
+    if !gpu_vision_available() {
+        return Err(ProtocolError::bad_request(
+            "this node cannot run the GPU vision path, installing the model would not help",
+        ));
+    }
+    let engine = crate::services::manifest::registry()
+        .by_id(&payload.engine_id)
+        .ok_or_else(|| ProtocolError::not_found("engine is not in this build's catalog"))?;
+    let base_url = crate::vision::camera_cv_models::resolve_bundle_base_url(None, engine);
+    crate::vision::camera_cv_models::ensure_bundle(&payload.engine_id, &base_url, None, None)
+        .await
+        .map_err(|e| {
+            ProtocolError::new(
+                tentaflow_protocol::ProtocolErrorCode::Internal,
+                format!("install {}: {e:#}", payload.engine_id),
+            )
+        })?;
+    tracing::info!(
+        addon_id = %payload.addon_id,
+        engine_id = %payload.engine_id,
+        "addon requirement installed"
+    );
+    Ok(MessageBody::AddonRequirementInstallResponseBody(
+        tentaflow_protocol::AddonRequirementInstallResponse {
+            addon_id: payload.addon_id.clone(),
+            requirements: vision_engine_requirements(&manifest),
         },
     ))
 }

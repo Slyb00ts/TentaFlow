@@ -3554,7 +3554,10 @@
     "requirement_installed": "instalados",
     "requirement_missing": "faltan: las opciones no funcionarán",
     "requirement_unsupported_host": "no disponible en este nodo",
-    "requirement_install": "Instalar"
+    "requirement_install": "Instalar",
+    "requirement_install_done": "Modelo {engine} instalado: la cámara lo usará en 30 s",
+    "requirement_install_incomplete": "Descargado, pero {engine} sigue incompleto en el disco",
+    "requirement_install_failed": "Error al instalar {engine}: {error}"
   },
   "addon_logs": {
     "title": "Registros del complemento",

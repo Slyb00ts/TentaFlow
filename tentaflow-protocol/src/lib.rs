@@ -108,6 +108,8 @@ pub use message_body::{
     AddonApplicationInfo,
     AddonConfigField,
     AddonRequirement,
+    AddonRequirementInstallRequest,
+    AddonRequirementInstallResponse,
     AddonConfigGetRequest,
     AddonConfigGetResponse,
     AddonConfigSetRequest,
