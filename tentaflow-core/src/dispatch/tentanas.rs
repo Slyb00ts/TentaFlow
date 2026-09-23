@@ -2356,7 +2356,9 @@ async fn share_delete(
 
 async fn share_browse(ctx: &HandlerContext, path: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let (path, entries) = tentanas::shares::browse(&g.db, path)
+    // Pools for everybody, Elastic unions of the asking organisation only —
+    // the same set `share_create` resolves a source against.
+    let (path, entries) = tentanas::shares::browse(&g.db, &elastic_owner(&g), path)
         .await
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     Ok(tn(P::ShareBrowseResponse { path, entries }))
@@ -3224,7 +3226,7 @@ async fn config_import_plan(ctx: &HandlerContext, json: &str) -> Result<MessageB
     let g = gate(ctx, PERM_READ)?;
     let document =
         tentanas::config_io::parse(json).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    let live = tentanas::config_io::live_state(&g.db)
+    let live = tentanas::config_io::live_state(&g.db, &elastic_owner(&g))
         .await
         .map_err(|e| internal("config import", e))?;
     let (items, warnings) = tentanas::config_io::plan(&document, &live);
@@ -3249,7 +3251,7 @@ async fn config_import_apply(
     // An import that only creates what is missing is not a red path; one that
     // replaces a schedule already running here is (§5.10).
     if origin == Origin::Direct {
-        let live = tentanas::config_io::live_state(&g.db)
+        let live = tentanas::config_io::live_state(&g.db, &elastic_owner(&g))
             .await
             .map_err(|e| internal("config import", e))?;
         let (items, _) = tentanas::config_io::plan(&document, &live);
@@ -3270,10 +3272,12 @@ async fn config_import_apply(
     }
     let explicit = secret.map(token);
     let main_db = ctx.state.db.clone();
-    let addon_id = g.addon_id.clone();
+    // The importing organisation: only its own Elastic unions may receive a
+    // share from the document (`config_io::live_state`).
+    let owner = elastic_owner(&g);
     let job = tentanas::jobs::spawn(&g.db, "config_import", &subject, &g.user_id, None, None, move |h| async move {
         let outcome =
-            tentanas::config_io::apply(&h, &main_db, &addon_id, document, explicit.as_deref()).await;
+            tentanas::config_io::apply(&h, &main_db, &owner, document, explicit.as_deref()).await;
         drop(explicit);
         outcome
     })
@@ -4747,9 +4751,11 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::NodesListRequest {} => {
             let g = gate(ctx, PERM_READ)?;
             let mut nodes = tentanas::fleet::nodes(ctx, &g.addon_id);
-            // The published summary counts node-wide alerts only; this node's
-            // row becomes what this tenant's alert list shows.
+            // The published summary counts node-wide alerts and pools only;
+            // this node's row becomes what this tenant's alert list shows,
+            // plus this tenant's own Elastic Arrays.
             tentanas::fleet::scope_local_alerts(&mut nodes, &g.db, &g.org_id);
+            tentanas::fleet::scope_local_arrays(&mut nodes, &g.db, &g.org_id);
             Ok(tn(P::NodesListResponse {
                 local_node_id: ctx.state.local_node_id.to_string(),
                 nodes,
@@ -6630,7 +6636,7 @@ mod registration_tests {
         // Nothing here is a red path: no approval was parked, no job started
         // (only the create that `settled_array` wrote stands) and the
         // privilege channel was never armed.
-        assert!(store::list_approvals(&g.db, true).unwrap().is_empty());
+        assert!(store::list_approvals(&g.db, &g.org_id, true).unwrap().is_empty());
         assert_eq!(
             store::list_jobs(&g.db, 100)
                 .unwrap()
@@ -6940,13 +6946,12 @@ mod registration_tests {
                 },
             };
             assert_eq!(payload, expected, "{} parks its own variant", task.kind());
-            assert!(
-                store::elastic_schedule(&g.db, &spec.array_id, task)
-                    .unwrap()
-                    .is_none(),
-                "{} armed nothing while parked",
-                task.kind()
-            );
+            // A scrub row exists from creation: every array with parity gets the
+            // monthly default in the same transaction as the array itself. What
+            // parking must not do is arm anything BEYOND that default.
+            let stored = store::elastic_schedule(&g.db, &spec.array_id, task).unwrap();
+            let expected = (task == store::ElasticTask::Scrub).then(store::default_elastic_scrub_schedule);
+            assert_eq!(stored.map(|row| row.schedule), expected, "{} armed nothing while parked", task.kind());
         }
 
         // `enabled: false` is NOT a free pass. n15's dialog sends the three

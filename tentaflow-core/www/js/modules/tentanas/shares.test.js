@@ -384,3 +384,24 @@ test('an unchanged poll leaves the hint lines and the block-services note alone'
   assert.equal(body.querySelector('#nas-sh-filter') === filter, true, 'nor the protocol filter');
   screen.dispose();
 });
+
+// tf-table honours only its own breakpoint scale (480 640 720 900 1024 1180
+// 1280); `hide-below="1000"` on the sessions column was silently
+// dropped, so those columns never hid on a narrow window.
+const hiddenBreakpoints = (table) => [...table.shadowRoot.querySelectorAll('thead th')].flatMap((th) => [...th.classList]
+  .filter((c) => c.startsWith('tf-table__col--hide-below-')).map((c) => c.slice('tf-table__col--hide-below-'.length)));
+
+test('every hide-below on the shares table is a breakpoint tf-table honours', async () => {
+  const screen = screenWith({ tentaNasSharesListRequest: listResponse });
+  try {
+    const body = host();
+    await drawShares(screen, body);
+    await flush();
+    const table = body.querySelector('#nas-sh-table');
+    const wanted = [...table.querySelectorAll('tf-column[hide-below]')].map((c) => c.getAttribute('hide-below'));
+    assert.ok(wanted.includes('1024'), 'the sessions column hides below 1024');
+    assert.deepEqual(hiddenBreakpoints(table), wanted);
+  } finally {
+    screen.dispose();
+  }
+});

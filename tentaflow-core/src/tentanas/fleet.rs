@@ -55,16 +55,24 @@ pub struct NodeSummary {
     /// read side by side, never one minus the other.
     #[serde(default)]
     pub disks_critical: u32,
-    /// Elastic Arrays this node has recorded, counted BESIDE `pools_total`
-    /// rather than folded into it — a node whose only storage is an array
-    /// reported zero pools, and the two kinds of storage are answered by
-    /// different tools with different vocabularies.
+    /// Elastic Arrays, counted BESIDE `pools_total` rather than folded into
+    /// it — a node whose only storage is an array reported zero pools, and
+    /// the two kinds of storage are answered by different tools with
+    /// different vocabularies.
+    ///
+    /// ALWAYS 0 in a PUBLISHED summary, like the array share of the two byte
+    /// figures: an array belongs to one organisation and this row is read by
+    /// every tenant of every node, so counting arrays here told each tenant
+    /// how many arrays the others had and how big they were. The asking
+    /// tenant's own arrays are added to THIS node's row at read time
+    /// (`scope_local_arrays`). Kept as a field so an older build's row still
+    /// deserializes.
     #[serde(default)]
     pub arrays_total: u32,
     /// Arrays left OUT of `capacity_bytes` and `used_bytes` because this node
     /// could not measure them. Non-zero means the two byte figures are
     /// PARTIAL, and the row says so instead of presenting a total that is
-    /// quietly missing a disk shelf.
+    /// quietly missing a disk shelf. Per tenant, like `arrays_total`.
     #[serde(default)]
     pub arrays_unmeasured: u32,
 }
@@ -105,7 +113,7 @@ fn feature_labels(env: Option<&tentaflow_protocol::tentanas::NasEnvironment>) ->
         .collect()
 }
 
-/// What the node's Elastic Arrays add to the fleet row's two byte figures.
+/// What a set of Elastic Arrays adds to the fleet row's two byte figures.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct ArrayBytes {
     capacity: u64,
@@ -175,7 +183,8 @@ async fn branch_usage(arrays: &[super::elastic::ElasticArrayRow]) -> BTreeMap<St
     }
 }
 
-/// Sums the node's arrays, ALL OR NOTHING per array.
+/// One array's (capacity, used), ALL OR NOTHING: `None` unless every data
+/// branch was measured.
 ///
 /// Capacity is the DATA branches and nothing else — parity adds no capacity
 /// and the cache is a staging area — and it is summed PER BRANCH, never off
@@ -187,23 +196,27 @@ async fn branch_usage(arrays: &[super::elastic::ElasticArrayRow]) -> BTreeMap<St
 /// with a single branch missing goes into neither. Capacity is not the safer
 /// half of that pair to keep: capacity without usage understates how full the
 /// node is, which is the defect this pairing exists to prevent.
-fn array_bytes(
-    arrays: &[super::elastic::ElasticArrayRow],
+fn one_array_bytes(
+    array: &super::elastic::ElasticArrayRow,
     measured: &BTreeMap<String, (u64, u64)>,
-) -> ArrayBytes {
+) -> Option<(u64, u64)> {
+    let branches = data_branch_paths(array);
+    if branches.is_empty() {
+        return None;
+    }
+    branches.iter().try_fold((0u64, 0u64), |(cap, used), path| {
+        measured
+            .get(path)
+            .map(|(size, branch_used)| (cap + size, used + branch_used))
+    })
+}
+
+/// Sums `readings` — one entry per array, `None` for an array nobody
+/// measured — into the row's figures.
+fn sum_arrays<'a>(readings: impl IntoIterator<Item = Option<&'a (u64, u64)>>) -> ArrayBytes {
     let mut out = ArrayBytes::default();
-    for array in arrays {
-        let branches = data_branch_paths(array);
-        let sum = if branches.is_empty() {
-            None
-        } else {
-            branches.iter().try_fold((0u64, 0u64), |(cap, used), path| {
-                measured
-                    .get(path)
-                    .map(|(size, branch_used)| (cap + size, used + branch_used))
-            })
-        };
-        match sum {
+    for reading in readings {
+        match reading {
             Some((cap, used)) => {
                 out.capacity += cap;
                 out.used += used;
@@ -212,6 +225,33 @@ fn array_bytes(
         }
     }
     out
+}
+
+/// A set of arrays measured by one `df` — the per-array rule and the sum
+/// together, which is what the measurement tests below hold to.
+#[cfg(test)]
+fn array_bytes(
+    arrays: &[super::elastic::ElasticArrayRow],
+    measured: &BTreeMap<String, (u64, u64)>,
+) -> ArrayBytes {
+    let readings: Vec<Option<(u64, u64)>> =
+        arrays.iter().map(|a| one_array_bytes(a, measured)).collect();
+    sum_arrays(readings.iter().map(Option::as_ref))
+}
+
+/// Every array of THIS node by name, with its (capacity, used) from the last
+/// published summary's `df`, or `None` when that pass could not measure it.
+///
+/// Held in the process rather than published: it is per array, so per
+/// organisation, and the published row is read by every tenant. The read
+/// path (`scope_local_arrays`) picks the asking tenant's arrays out of it,
+/// which costs no `df` per request — the figures are exactly as fresh as the
+/// rest of the row they are added to. Names key it because an array's name is
+/// unique on a node (its union is `/mnt/<name>`).
+fn local_array_readings() -> &'static parking_lot::RwLock<BTreeMap<String, Option<(u64, u64)>>> {
+    static READINGS: std::sync::OnceLock<parking_lot::RwLock<BTreeMap<String, Option<(u64, u64)>>>> =
+        std::sync::OnceLock::new();
+    READINGS.get_or_init(Default::default)
 }
 
 /// Warnings and failures of the node's disks, counted APART. `health` below
@@ -226,11 +266,17 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
     let (disks, _) = super::disks::snapshot();
     let env = super::environment::cached_or_probe(db).await.ok();
     let (disks_warning, disks_critical) = disk_counts(&disks);
-    // Elastic Arrays are storage this node serves, so they belong in the same
-    // two byte figures the pools do. Which filesystems they are comes from the
-    // node's own rows; how full they are from one `df` over those branches.
+    // Elastic Arrays are storage this node serves, but each belongs to ONE
+    // organisation, so they are measured here and NOT published: which
+    // filesystems they are comes from the node's own rows, how full they are
+    // from one `df` over those branches, and the result waits in the process
+    // for `scope_local_arrays` to add the asking tenant's own to its row.
     let arrays = super::db::elastic_arrays_all(db).unwrap_or_default();
-    let array_sums = array_bytes(&arrays, &branch_usage(&arrays).await);
+    let measured = branch_usage(&arrays).await;
+    *local_array_readings().write() = arrays
+        .iter()
+        .map(|a| (a.name.clone(), one_array_bytes(a, &measured)))
+        .collect();
     // One `zpool list` is enough for the fleet row: the full pool view costs a
     // `zpool status` per pool and the header only needs counts and states.
     let pools = super::pools::list_rows().await.unwrap_or_default();
@@ -273,10 +319,11 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         // pools, so the percentage compared a pool's allocation against disks
         // that were never in a pool — every free disk, every system disk and
         // every parity disk made the node look emptier than it was. What is
-        // summed now is the storage the node actually serves: its ZFS pools
-        // plus the Elastic Arrays it could measure.
-        capacity_bytes: pools.iter().map(|p| p.size_bytes).sum::<u64>() + array_sums.capacity,
-        used_bytes: pools.iter().map(|p| p.alloc_bytes).sum::<u64>() + array_sums.used,
+        // summed is the storage the node actually serves: here its ZFS pools
+        // (node hardware, every tenant's to see), and at read time the asking
+        // tenant's own measured Elastic Arrays (`scope_local_arrays`).
+        capacity_bytes: pools.iter().map(|p| p.size_bytes).sum::<u64>(),
+        used_bytes: pools.iter().map(|p| p.alloc_bytes).sum::<u64>(),
         features: feature_labels(env.as_ref()),
         // Host facts of the node card's subtitle come from the environment
         // probe, the one source the Environment tab already reads them from.
@@ -285,8 +332,9 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         ram_bytes: env.as_ref().map(|e| e.ram_bytes).unwrap_or(0),
         uptime_secs: env.as_ref().map(|e| e.uptime_secs).unwrap_or(0),
         disks_critical,
-        arrays_total: arrays.len() as u32,
-        arrays_unmeasured: array_sums.unmeasured,
+        // Per tenant, so never published (see the field).
+        arrays_total: 0,
+        arrays_unmeasured: 0,
         updated_at: super::db::now(),
     }
 }
@@ -323,6 +371,42 @@ pub fn scope_local_alerts(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) 
     };
     for node in nodes.iter_mut().filter(|n| n.is_local) {
         node.alerts_active = count;
+    }
+}
+
+/// Adds the asking organisation's own Elastic Arrays to THIS node's row:
+/// their count, and their measured bytes on top of the pools' — the array
+/// half of the figures the published summary leaves out.
+///
+/// The same shape as `scope_local_alerts`, for the same reason: the published
+/// row is read by every tenant of every node, so it carries node-wide figures
+/// only (pools), and only the local row can be completed, because only this
+/// node's database knows whose arrays are whose. A remote row keeps its
+/// pools-only figures — it undercounts the tenant's arrays there but never
+/// reveals another tenant's. A failed read adds nothing, for the same reason.
+pub fn scope_local_arrays(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) {
+    if org_id.is_empty() {
+        return;
+    }
+    let Ok(own) = super::db::elastic_array_names_of_org(db, org_id) else {
+        return;
+    };
+    add_own_arrays(nodes, &own, &local_array_readings().read());
+}
+
+/// `scope_local_arrays` over what it read. An own array missing from the
+/// readings (created after the last summary) is unmeasured, never zero bytes.
+fn add_own_arrays(
+    nodes: &mut [NasNodeInfo],
+    own: &std::collections::BTreeSet<String>,
+    readings: &BTreeMap<String, Option<(u64, u64)>>,
+) {
+    let sums = sum_arrays(own.iter().map(|name| readings.get(name).and_then(Option::as_ref)));
+    for node in nodes.iter_mut().filter(|n| n.is_local) {
+        node.arrays_total = own.len() as u32;
+        node.arrays_unmeasured = sums.unmeasured;
+        node.capacity_bytes += sums.capacity;
+        node.used_bytes += sums.used;
     }
 }
 
@@ -561,6 +645,85 @@ mod tests {
         assert_eq!(s.disks_critical, 0);
         assert_eq!(s.arrays_total, 0);
         assert_eq!(s.arrays_unmeasured, 0);
+    }
+
+    /// The published row carries pools only; THIS node's row gets the asking
+    /// tenant's own arrays added — their count, their measured bytes, and
+    /// how many of them nobody measured — and never another tenant's. A
+    /// remote row is left exactly as it was published.
+    #[test]
+    fn the_local_row_adds_only_the_asking_tenants_arrays() {
+        let readings: BTreeMap<String, Option<(u64, u64)>> = [
+            ("alpha".to_string(), Some((100, 40))),
+            ("alpha-cold".to_string(), None),
+            ("bravo".to_string(), Some((9_000, 8_000))),
+        ]
+        .into_iter()
+        .collect();
+        let fleet = || {
+            vec![
+                NasNodeInfo {
+                    node_id: "local".into(),
+                    is_local: true,
+                    capacity_bytes: 1_000,
+                    used_bytes: 500,
+                    ..Default::default()
+                },
+                NasNodeInfo {
+                    node_id: "peer".into(),
+                    capacity_bytes: 7,
+                    used_bytes: 3,
+                    ..Default::default()
+                },
+            ]
+        };
+        let set = |names: &[&str]| -> std::collections::BTreeSet<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        // `alpha-new` was created after the last summary: unmeasured, not 0 B.
+        for (org, own, expected) in [
+            ("org-a", set(&["alpha", "alpha-cold", "alpha-new"]), (3, 2, 1_100, 540)),
+            ("org-b", set(&["bravo"]), (1, 0, 10_000, 8_500)),
+            ("org-c", set(&[]), (0, 0, 1_000, 500)),
+        ] {
+            let mut nodes = fleet();
+            add_own_arrays(&mut nodes, &own, &readings);
+            let local = &nodes[0];
+            assert_eq!(
+                (local.arrays_total, local.arrays_unmeasured, local.capacity_bytes, local.used_bytes),
+                expected,
+                "{org}"
+            );
+            let peer = &nodes[1];
+            assert_eq!(
+                (peer.arrays_total, peer.arrays_unmeasured, peer.capacity_bytes, peer.used_bytes),
+                (0, 0, 7, 3),
+                "{org}: a remote row is not this node's to complete"
+            );
+        }
+    }
+
+    /// Which arrays are the tenant's comes from this node's own rows, by
+    /// organisation; a caller with no organisation gets nothing added.
+    #[test]
+    fn the_local_row_counts_the_arrays_the_asking_org_owns_on_this_node() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at) VALUES
+               ('arr-a','org-a','nas','fleet-scope-alpha','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z'),
+               ('arr-b','org-b','nas','fleet-scope-bravo','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z'),
+               ('arr-c','org-b','nas','fleet-scope-charlie','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z');",
+        )
+        .unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let local = || vec![NasNodeInfo { node_id: "local".into(), is_local: true, ..Default::default() }];
+        for (org, total) in [("org-a", 1), ("org-b", 2), ("org-c", 0), ("", 0)] {
+            let mut nodes = local();
+            scope_local_arrays(&mut nodes, &db, org);
+            assert_eq!(nodes[0].arrays_total, total, "{org:?}");
+        }
     }
 
     /// The fleet badge of THIS node, per tenant: node-wide alerts plus the

@@ -202,25 +202,39 @@ pub fn stable_device_path(kernel_name: &str) -> String {
     best.map(|(_, p)| p).unwrap_or(fallback)
 }
 
-/// The kernel name behind a vdev path or leaf name. `zpool status -P` prints
-/// whole paths, which may be a by-id link, a partition of one, or a bare
-/// `/dev` node; the disks inventory is keyed by kernel name.
+/// The kernel name behind a vdev path or leaf name, for DISPLAY. `zpool
+/// status -P` prints whole paths, which may be a by-id link, a partition of
+/// one, or a bare `/dev` node; the disks inventory is keyed by kernel name.
+///
+/// A path that no longer resolves falls back to its basename, so the pool
+/// view can still say which leaf is missing. That fallback is a guess and
+/// must never bind the leaf to a disk: use `resolved_kernel_name` for that.
 pub fn kernel_name_of(vdev_path: &str) -> String {
-    let resolved = if vdev_path.starts_with('/') {
-        std::fs::canonicalize(vdev_path)
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| {
-                vdev_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(vdev_path)
-                    .to_string()
-            })
-    } else {
-        vdev_path.to_string()
-    };
-    strip_partition_suffix(&resolved)
+    resolved_kernel_name(vdev_path).unwrap_or_else(|| {
+        strip_partition_suffix(vdev_path.rsplit('/').next().unwrap_or(vdev_path))
+    })
+}
+
+/// The kernel name a vdev path resolves to RIGHT NOW, or `None` when the path
+/// names a device node that is gone.
+///
+/// WHY no basename fallback here: a pool built on `/dev/sdb` shows its
+/// whole-disk leaf as `/dev/sdb1`. When that disk dies and a new, blank disk
+/// is enumerated as `sdb`, `/dev/sdb1` no longer exists, and the basename
+/// `sdb1` folds back to `sdb` — the NEW disk. Binding on that guess pinned the
+/// dead leaf's FAULTED/UNAVAIL state (an "Awaria" grade, an alert, a pool
+/// wizard refusal) and its pool membership on a disk that never was a member.
+/// A leaf whose node is gone has no disk in the inventory to describe anyway.
+///
+/// A bare name (no `/`) is taken as it is: that is how `zpool status` without
+/// `-P` prints leaves, and a missing leaf's GUID matches no kernel name.
+pub fn resolved_kernel_name(vdev_path: &str) -> Option<String> {
+    if !vdev_path.starts_with('/') {
+        return Some(strip_partition_suffix(vdev_path));
+    }
+    let resolved = std::fs::canonicalize(vdev_path).ok()?;
+    let name = resolved.file_name()?.to_string_lossy().into_owned();
+    Some(strip_partition_suffix(&name))
 }
 
 /// `sda1` → `sda`, `nvme0n1p2` → `nvme0n1`, `mmcblk0p1` → `mmcblk0`. Only the
@@ -300,6 +314,34 @@ mod tests {
         assert_eq!(strip_partition_suffix("nvme0n1"), "nvme0n1");
         assert_eq!(strip_partition_suffix("mmcblk0p1"), "mmcblk0");
         assert_eq!(kernel_name_of("/dev/disk/by-id/ata-ST8000_ZR9"), "ata-ST8000_ZR9");
+    }
+
+    /// A dead whole-disk leaf is printed as its partition (`/dev/sdb1`). Once
+    /// that node is gone, its basename folds back to `sdb` — which a NEW disk
+    /// may be called now. The display name keeps the guess; the binding name
+    /// refuses it, so the dead leaf's state is never pinned on the new disk.
+    #[test]
+    fn a_leaf_path_that_no_longer_resolves_binds_to_no_disk() {
+        // A device node no host has: the shape of a pulled disk's partition.
+        let gone = "/dev/tentanas-test-gone-sdzz1";
+        assert!(std::fs::symlink_metadata(gone).is_err(), "the fixture path must not exist");
+        assert_eq!(kernel_name_of(gone), "tentanas-test-gone-sdzz1");
+        assert_eq!(resolved_kernel_name(gone), None);
+        // The same guess for a partition of a kernel-named disk.
+        let tmp = std::env::temp_dir().join("tentanas-test-gone-dir").join("sdzz1");
+        let tmp = tmp.to_string_lossy();
+        assert_eq!(kernel_name_of(&tmp), "sdzz");
+        assert_eq!(resolved_kernel_name(&tmp), None);
+        // A path that does resolve still names its kernel device; a bare
+        // leaf name (no `-P`) is taken as printed.
+        assert_eq!(resolved_kernel_name("/"), None, "the root has no file name");
+        assert_eq!(resolved_kernel_name("sda1").as_deref(), Some("sda"));
+        let dir = std::env::temp_dir().join(format!("tentanas-zfs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = dir.join("sdzz");
+        std::fs::write(&node, b"").unwrap();
+        assert_eq!(resolved_kernel_name(&node.to_string_lossy()).as_deref(), Some("sdzz"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

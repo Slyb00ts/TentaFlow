@@ -11,7 +11,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel,
+  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, localizedReason,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
 import '/js/components/tf-window.js';
@@ -246,8 +246,17 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       </div>`;
   };
 
+  // A critical disk's reason is the node's English (`score_health`): the
+  // picker shows it in the reader's language (`localizedReason`) and keeps
+  // the sentence for the tooltip only (`pickTitle`).
+  function criticalReason(d) {
+    return localizedReason(d.healthReason, d.health).text || T('wizard_pool.elastic_unavailable');
+  }
+  function pickTitle(d, reason) {
+    return d.health === 'critical' && reason === criticalReason(d) && d.healthReason ? d.healthReason : reason;
+  }
   const parityReason = (d) => {
-    if (d.health === 'critical') return d.healthReason || T('wizard_pool.elastic_unavailable');
+    if (d.health === 'critical') return criticalReason(d);
     if (!state.capabilities?.snapraid) return T('wizard_pool.elastic_no_snapraid');
     if (Number(d.sizeBytes) < Math.max(...picked().map((disk) => Number(disk.sizeBytes)))) return T('wizard_pool.elastic_small_parity');
     if (!state.parityIds.has(d.diskId) && (state.parityIds.size >= 2 || state.diskIds.size + state.parityIds.size >= 32)) return T('wizard_pool.elastic_parity_limit');
@@ -255,7 +264,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   };
   const cacheReason = (d) => {
     if (state.parityIds.has(d.diskId) || state.diskIds.has(d.diskId)) return T('wizard_pool.elastic_role_taken');
-    if (d.health === 'critical') return d.healthReason || T('wizard_pool.elastic_unavailable');
+    if (d.health === 'critical') return criticalReason(d);
     return '';
   };
   const cacheNvme = () => state.elasticDisks.filter((d) => d.kind === 'nvme' && !state.diskIds.has(d.diskId) && !state.parityIds.has(d.diskId));
@@ -264,7 +273,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.elastic_parity_sub'))}</p>
     <div class="disk-cells" id="nas-pw-parity">${state.elasticDisks.filter((d) => !state.diskIds.has(d.diskId) && !state.cacheIds.has(d.diskId)).map((d) => {
       const reason = parityReason(d);
-      return `<div class="disk-cell parity-pick ${state.parityIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(reason)}">
+      return `<div class="disk-cell parity-pick ${state.parityIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(pickTitle(d, reason))}">
         <tf-checkbox ${state.parityIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}></tf-checkbox>
         <div class="dc-main"><div class="dc-name mono">${escapeHtml(d.name)}</div><div class="dc-sub">${escapeHtml(`${fmtBytes(d.sizeBytes)} · ${d.serial || '—'}`)}${reason ? ` · ${escapeHtml(reason)}` : ''}</div></div></div>`;
     }).join('')}</div>
@@ -273,7 +282,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     <label class="toggle-row mt-md" title="${escapeAttr(cacheNvme().length ? T('wizard_pool.elastic_cache_toggle') : T('wizard_pool.elastic_cache_no_nvme'))}"><span>${escapeHtml(T('wizard_pool.elastic_cache_toggle'))}</span><tf-toggle id="nas-pw-cache-toggle" ${state.cacheEnabled ? 'checked' : ''} ${cacheNvme().length ? '' : 'disabled'}></tf-toggle>${cacheNvme().length ? '' : `<span class="text-xs text-3">${escapeHtml(T('wizard_pool.elastic_cache_no_nvme'))}</span>`}</label>
     <div class="disk-cells" id="nas-pw-cache">${state.cacheEnabled ? cacheNvme().filter((d) => !state.diskIds.has(d.diskId) && !state.parityIds.has(d.diskId)).map((d) => {
       const reason = cacheReason(d);
-      return `<div class="disk-cell cache-pick ${state.cacheIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(reason)}">
+      return `<div class="disk-cell cache-pick ${state.cacheIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(pickTitle(d, reason))}">
         <tf-checkbox ${state.cacheIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}></tf-checkbox>
         <div class="dc-main"><div class="dc-name mono">${escapeHtml(d.name)}</div><div class="dc-sub">${escapeHtml(`${fmtBytes(d.sizeBytes)} · ${d.serial || '—'}`)}${reason ? ` · ${escapeHtml(reason)}` : ''}</div></div></div>`;
     }).join('') : ''}</div>

@@ -5725,6 +5725,7 @@
       "disks_special": "{n} special",
       "disks_log": "{n} log",
       "disks_cache": "{n} cache",
+      "disks_parity": "{n} de paridad",
       "disks_spare": "spare",
       "free_unused": "sin usar",
       "layout_chip": "ZFS {layout}",
@@ -6237,7 +6238,8 @@
       "iops_delta": "{pct}% frente a la media horaria",
       "throughput_suffix": "MB/s R",
       "throughput_delta": "{w} MB/s W · latencia media {lat} ms",
-      "iops_avg": "media horaria {n} IOPS"
+      "iops_avg": "media horaria {n} IOPS",
+      "capacity_no_pools": "sin pools ni arrays"
     },
     "wizard": {
       "step_restore": "Restaurar desde copia",
@@ -6542,7 +6544,8 @@
       "segment_import": "Importar",
       "preview_explain": "La exportación contiene el <b>estado deseado</b>: disposición de pools y vdevs, datasets con propiedades, recursos SMB/NFS, usuarios de recursos y programaciones. <b>No contiene secretos</b> (contraseñas de usuarios de recursos, que hay que volver a definir tras importar) ni datos de usuario.",
       "preview": "Vista previa (fragmento)",
-      "download": "Descargar archivo"
+      "download": "Descargar archivo",
+      "kind_target": "Target"
     },
     "title": "TentaNas",
     "load_failed": "No se pudo cargar TentaNas",
@@ -6654,7 +6657,20 @@
       "legend_ok": "sin síntomas en ninguna fuente",
       "legend_warn": "un síntoma que exige seguimiento o decisión (nuevas reasignaciones, temperatura)",
       "legend_crit": "disco FAULTED/UNAVAIL — requiere sustitución",
-      "legend_note": "Las métricas llegan por push; el minigráfico cubre los últimos {w}"
+      "legend_note": "Las métricas llegan por push; el minigráfico cubre los últimos {w}",
+      "locate_failed": "LED de {name}: el comando falló — {error}",
+      "reason_realloc": "{n} realoc.",
+      "reason_realloc_growing": "realoc. {from} → {to}",
+      "reason_pending": "{n} sect. pend.",
+      "reason_media": "{n} err. de medio",
+      "reason_crc": "{n} CRC",
+      "reason_wear": "desgaste {n}%",
+      "reason_smart_failed": "SMART: fallo",
+      "reason_self_test_failed": "autotest fallido",
+      "reason_temp_over": "{t}°C, por encima del límite de {limit}°C",
+      "reason_zfs_faulted": "ZFS: averiado (FAULTED)",
+      "reason_zfs_unavail": "ZFS: no disponible (UNAVAIL)",
+      "reason_no_smart": "sin datos SMART"
     },
     "disk": {
       "identification": "Identificación física",
@@ -6719,7 +6735,15 @@
       "st_status_running": "en curso",
       "st_status_unknown": "desconocido",
       "edit_schedule": "Editar la planificación",
-      "health_chip": "{status}: {reason}"
+      "health_chip": "{status}: {reason}",
+      "smart_busy": "Ya hay una prueba SMART en curso en este disco — inicia otra cuando termine",
+      "array_title": "Elastic Array ({array})",
+      "other_org_array_title": "Array de otra organización",
+      "other_org_array_info": "Este disco pertenece a un Elastic Array de otra organización de este nodo. Su nombre y estado no son visibles desde esta organización: lo gestiona aquella organización.",
+      "array_name": "Array",
+      "array_part": "Rol en el array",
+      "array_replace_withdrawn": "Es una rama de un Elastic Array, no un miembro de un pool ZFS: no tiene contadores READ/WRITE/CKSUM. Sustituir un disco del array no está disponible en esta versión: el array sigue sirviendo desde los discos que tiene y la reparación desde paridad funciona para los discos presentes en el nodo.",
+      "array_open": "Abrir el array {array}"
     },
     "elevation": {
       "title": "Canal de privilegios del sistema",
@@ -6893,7 +6917,6 @@
       "chip_warnings": "{n} {n|advertencia|advertencias} ({nodes})",
       "chip_ok": "Sin advertencias",
       "chip_services": "Servicios activos",
-      "chip_services_down": "Servicios inactivos",
       "badge_nas": "{n}× NAS: {nodes}",
       "badge_channels": "Canales de privilegios: {parts}",
       "badge_channel_part": "{n}× {mode}",
@@ -6931,7 +6954,11 @@
       "severity_critical": "crítico",
       "severity_warning": "advertencia",
       "severity_info": "información",
-      "act_array": "Matriz"
+      "act_array": "Matriz",
+      "head_versions": "TentaNas: {list}",
+      "chip_services_down_list": "Servicios detenidos: {list}",
+      "chip_services_unknown": "Servicios: sin respuesta de {nodes}",
+      "chip_services_none": "Sin servicios de compartición"
     },
     "node": {
       "head_sub_node": "nodo {name}",
@@ -7079,7 +7106,12 @@
       "spare_ready": "el pool tiene un spare listo para relevarlo",
       "no_spare": "no hay spare en el pool: ten preparado un disco de recambio",
       "disk_urgent": "Sustituye este disco ahora: {reason}. {spare}.",
-      "disk_advice": "Planifica la sustitución de este disco: {reason}. {spare}."
+      "disk_advice": "Planifica la sustitución de este disco: {reason}. {spare}.",
+      "severity_other": "recomendado",
+      "reason_grew": "los sectores reasignados pasaron de {from} a {to} en 7 días",
+      "reason_for_days": "{status} desde hace {days} {days|día|días}",
+      "reason_other": "el nodo recomienda sustituir este disco",
+      "disk_other": "El nodo recomienda sustituir este disco. {spare}."
     },
     "targets": {
       "sessions_unmeasured": "Desconocido no significa cero",

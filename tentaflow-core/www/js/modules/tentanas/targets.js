@@ -226,7 +226,7 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
           <tf-column key="protocol" label="${escapeAttr(T('targets.col_protocol'))}" renderer="html" nowrap></tf-column>
           <tf-column key="source" label="${escapeAttr(T('targets.col_source'))}" renderer="html" hide-below="900"></tf-column>
           <tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html" nowrap></tf-column>
-          <tf-column key="portal" label="${escapeAttr(T('targets.col_portal'))}" renderer="html" hide-below="1000"></tf-column>
+          <tf-column key="portal" label="${escapeAttr(T('targets.col_portal'))}" renderer="html" hide-below="1024"></tf-column>
         </tf-table>`;
     if (patchHtml(list, shell)) {
       const table = list.querySelector('#nas-tg-table');

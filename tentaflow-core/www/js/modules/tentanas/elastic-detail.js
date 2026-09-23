@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { T, sprite, fmtOptionalBytes, fmtBytes, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
@@ -106,6 +106,35 @@ function repairEvidence(array) {
   return '';
 }
 
+// Why a SnapRAID sync or scrub cannot be started on this array right now, or
+// '' when it can. ONE rule for the detail pane's "Sync teraz"/"Scrub teraz"
+// and the n05 card's "Sync teraz", so the two buttons can never disagree.
+//
+// A SYNC AND A FULL SCRUB ARE WHAT SETTLE a parity run that ended without
+// success, so they are offered on the array such a run left behind —
+// `parityRunAvailable` is the node's own admission rule, and reading `state`
+// plus `unresolvedOperation` here instead disabled the one action that
+// resolves that state (W5/W6 of the fourth review).
+export function elasticMaintenanceBlocker(array, admin) {
+  return !admin ? T('elevation.admin_only')
+    : !(array?.parityDisks || []).length ? T('elastic.no_parity')
+      : !array.enabled || !array.parityRunAvailable ? T('elastic.maintenance_not_ready')
+        : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running') : '';
+}
+
+// The card's Dyski row (n05): "3 danych + 1 Parity (SnapRAID) + 1 cache".
+// Counted from the array's own member lists; the ZFS card's row uses the same
+// data/cache phrases.
+export function elasticDisksText(array) {
+  const parity = (array.parityDisks || []).length;
+  const cache = (array.cacheDisks || []).length;
+  return [
+    T('pools.disks_data', { n: (array.dataDisks || []).length }),
+    ...(parity ? [T('pools.disks_parity', { n: parity })] : []),
+    ...(cache ? [T('pools.disks_cache', { n: cache })] : []),
+  ].join(' + ');
+}
+
 export function elasticState(array) {
   const labels = { active: T('elastic.active'), pending: T('elastic.pending'), creating: T('elastic.creating'), needs_attention: T('elastic.error'), error: T('elastic.error'), disabled: T('elastic.disabled'), unknown: T('elastic.unknown') };
   return { label: labels[array.state] || labels.unknown, tone: array.state === 'active' ? 'ok' : ['error', 'needs_attention'].includes(array.state) ? 'err' : 'warn' };
@@ -155,7 +184,10 @@ export function elasticCardSkeletonHtml(array) {
         <tf-chip status="accent" label="Elastic Array"></tf-chip>
         <div class="pc-desc" data-f="desc"></div>
       </div>
-      <div class="pc-actions"><tf-button variant="secondary" size="sm" icon="external-link" data-act="array-details">${escapeHtml(T('elastic.details'))}</tf-button></div>
+      <div class="pc-actions">
+        <tf-button variant="secondary" size="sm" icon="external-link" data-act="array-details">${escapeHtml(T('elastic.details'))}</tf-button>
+        <tf-button variant="ghost" size="sm" icon="refresh" data-act="array-sync">${escapeHtml(T('elastic.sync_now'))}</tf-button>
+      </div>
     </div>
     <div class="pc-body">
       <div>
@@ -168,7 +200,7 @@ export function elasticCardSkeletonHtml(array) {
         </div>
         <div ${SLOT} data-slot="unmeasured"></div>
       </div>
-      <div class="stat-rows">${rowSkel(T('elastic.mountpoint'), 'mountpoint')}${rowSkel(T('elastic.last_sync'), 'last-sync')}${rowSkel(T('elastic.protection'), 'protection')}</div>
+      <div class="stat-rows">${rowSkel(T('pools.row_disks'), 'disks')}${rowSkel(T('elastic.mountpoint'), 'mountpoint')}${rowSkel(T('elastic.last_sync'), 'last-sync')}${rowSkel(T('elastic.protection'), 'protection')}</div>
     </div>
     <div ${SLOT} data-slot="reason"></div>
   </div>`;
@@ -179,7 +211,10 @@ export function elasticCardSkeletonHtml(array) {
 // open `tf-menu` has no place on this card, but the "Szczegóły" button does,
 // and it survives every one of these calls exactly like a ZFS card's does
 // (`paintPoolCard`).
-export function paintElasticCard(card, array) {
+//
+// `admin` and `syncBusy` (a sync request of this card is in flight) only
+// decide whether "Sync teraz" is enabled; the reason it is not is its tooltip.
+export function paintElasticCard(card, array, { admin = false, syncBusy = false } = {}) {
   if (!card) return;
   const state = elasticState(array);
   const c = elasticCapacity(array);
@@ -190,7 +225,11 @@ export function paintElasticCard(card, array) {
   setAttr(stateChip, 'label', state.label);
   setText(field(card, 'desc'), T('elastic.topology', { data: (array.dataDisks || []).length, parity: (array.parityDisks || []).length, fs: String(array.filesystem || '').toUpperCase() }));
 
-  setText(field(card, 'cap-value'), `${fmtOptionalBytes(array.usedBytes)} / ${fmtOptionalBytes(array.usableBytes)}`);
+  // The same "used / usable (pct%)" line a ZFS card has; an unmeasured array
+  // has no percentage to show, so it keeps the two dashes.
+  setText(field(card, 'cap-value'), c.measured
+    ? T('pools.capacity_value', { used: fmtBytes(array.usedBytes), usable: fmtBytes(array.usableBytes), pct: pct(array.usedBytes, array.usableBytes) })
+    : `${fmtOptionalBytes(array.usedBytes)} / ${fmtOptionalBytes(array.usableBytes)}`);
 
   // Fixed 3 spans (data/free/parity) throughout, so the "measured" and
   // "unmeasured" states differ only by a class and by whether each span
@@ -210,12 +249,18 @@ export function paintElasticCard(card, array) {
 
   slotEl(card.querySelector('[data-slot="unmeasured"]'), !widths, 'unmeasured', `<div class="hint">${escapeHtml(T('elastic.unmeasured'))}</div>`);
 
+  setText(field(card, 'disks'), elasticDisksText(array));
   setText(field(card, 'mountpoint'), array.unionPath || '—');
   setText(field(card, 'last-sync'), fmtDate(array.protection?.protectedAsOf));
   setText(field(card, 'protection'), protectionLabel(array));
 
   const reason = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(array.stateDetail), 'reason', '<div class="pc-reason"></div>');
   if (reason) setText(reason, array.stateDetail);
+
+  const syncBlocked = elasticMaintenanceBlocker(array, admin);
+  const sync = card.querySelector('[data-act="array-sync"]');
+  setAttr(sync, 'disabled', syncBusy || Boolean(syncBlocked));
+  setAttr(sync, 'title', syncBlocked || T('elastic.sync_now'));
 }
 
 // ---------------------------------------------------------------------------
@@ -999,15 +1044,7 @@ export async function drawElasticDetail(screen, body) {
   const expanded = new Set();
   const canRestore = () => array && array.enabled && !['active', 'creating'].includes(array.state)
     && !(array.snapraid?.history || []).some((run) => ['sync', 'scrub'].includes(run.kind) && ['running', 'failed', 'needs_attention'].includes(run.outcome));
-  // A SYNC AND A FULL SCRUB ARE WHAT SETTLE a parity run that ended without
-  // success, so they are offered on the array such a run left behind —
-  // `parityRunAvailable` is the node's own admission rule, and reading `state`
-  // plus `unresolvedOperation` here instead disabled the one action that
-  // resolves that state (W5/W6 of the fourth review).
-  const maintenanceReason = () => !screen.isAdmin ? T('elevation.admin_only')
-    : !(array?.parityDisks || []).length ? T('elastic.no_parity')
-      : !array.enabled || !array.parityRunAvailable ? T('elastic.maintenance_not_ready')
-        : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running') : '';
+  const maintenanceReason = () => elasticMaintenanceBlocker(array, screen.isAdmin);
   // The mover needs no parity — the helper skips the coupled sync on an array
   // without one — but it does need something to move, so a cacheless array is
   // refused outright rather than offered a run that would walk nothing.

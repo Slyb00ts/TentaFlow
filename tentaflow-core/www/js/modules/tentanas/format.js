@@ -136,13 +136,29 @@ export function fmtOptionalBytes(n) {
   return n == null || !Number.isFinite(Number(n)) || Number(n) < 0 ? '—' : fmtBytes(n);
 }
 
+// THE one rule for a job's Cancel button, used by every job renderer (the
+// shared running-job row in tasks.js, which n02 and n15 both draw).
+//
+// Cancel is offered only where cancelling really stops the work — an
+// ALLOWLIST, so a new job kind starts without a button instead of with one
+// that lies. Cancelling a job drops its future (`jobs.rs`); what that leaves
+// running decides:
+// - `pool_scrub` — a guard issues `zpool scrub -s` on drop (`pools.rs`
+//   StopScrubOnCancel): the scrub really stops.
+// - every `elastic_*` run carries an intent and the server refuses to cancel
+//   it at all, so the click could only ever error (A2).
+// - `smart_test` — the drive keeps testing; there is no abort command, and
+//   the job would read "cancelled" while the test runs on (A3).
+// - `disk_wipe` — the helper is already erasing; the server refuses it.
+// - every other privileged job (TRIM, pool create/replace/add vdev, dataset
+//   destroy, share/target apply, config import, packages, helper
+//   provisioning) runs its command through the root helper, which the drop
+//   does not stop: cancel would only stop TRACKING the work and still write
+//   "cancelled" (A5). That is not an action worth a button.
+const CANCELLABLE_KINDS = new Set(['pool_scrub']);
+
 export function jobCanCancel(job) {
-  // `disk_wipe` is here for a different reason than the elastic runs: those
-  // cannot be interrupted safely, this one cannot be interrupted AT ALL — the
-  // helper is already erasing, so the button could only ever lie about what it
-  // did. The server refuses it too (`jobs.rs`); this keeps the button away
-  // from the admin in the first place.
-  return !['elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'disk_wipe'].includes(job.kind);
+  return CANCELLABLE_KINDS.has(job?.kind);
 }
 
 export function fmtMBps(bps) {
@@ -167,6 +183,113 @@ export function healthClass(h) {
 export function healthChip(h) {
   const map = { ok: 'ok', warning: 'warn', critical: 'err', unknown: 'info' };
   return { status: map[h] || 'info', label: T('health.' + (h || 'unknown')), dot: true };
+}
+
+// ----- Disk health reasons, in the reader's language -----------------------
+//
+// ONE copy for every surface that shows a disk's reason: the n03 row chip,
+// the n04 chip and "why" box, the n02 tile, the replacement advice and the
+// pool wizard's disk pickers.
+//
+// The short cause a problem row of n03 carries ("3 realok.", "54°C"). The
+// node grades a disk in `score_health` and `grade_disk_health`
+// (tentanas/disks.rs) and joins the symptoms of the winning grade with "; ",
+// so the FIRST one is the reason the disk is in that state. Its fixed English
+// wording is mapped to a short localized word here — one pattern for every
+// sentence those two functions can write:
+//   "SMART overall status FAILED", "last self-test failed",
+//   "{n} pending sectors", "{n} media errors",
+//   "reallocated sectors growing ({old} → {n} in 7 days)",
+//   "{n} reallocated sectors", "{t}°C (over the {limit}°C limit)", "{t}°C",
+//   "{n} UDMA CRC errors (cable/backplane)", "{n}% worn",
+//   "ZFS reports this disk FAULTED", "ZFS reports this disk UNAVAIL".
+// "no SMART data" is the `unknown` grade's: an unknown disk gets no chip, but
+// the n04 "why" box still names it.
+// A sentence this build has no word for is NOT shown as the chip: English is
+// not a label in four of the five locales, so the chip falls back to the
+// translated grade and the node's sentence stays in the tooltip. Only a
+// warning or a failure gets a chip — "no SMART data" on an unknown disk is not
+// a problem the row should shout about.
+const REASON_PATTERNS = [
+  [/^(-?\d+)°C \(over the (-?\d+)°C limit\)$/, (m) => T('disks.reason_temp_over', { t: Number(m[1]), limit: Number(m[2]) })],
+  [/^(-?\d+)°C$/, (m) => `${m[1]}°C`],
+  [/^(\d+) reallocated sectors$/, (m) => T('disks.reason_realloc', { n: Number(m[1]) })],
+  [/^reallocated sectors growing \((\d+) → (\d+)/, (m) => T('disks.reason_realloc_growing', { from: Number(m[1]), to: Number(m[2]) })],
+  [/^(\d+) pending sectors$/, (m) => T('disks.reason_pending', { n: Number(m[1]) })],
+  [/^(\d+) media errors$/, (m) => T('disks.reason_media', { n: Number(m[1]) })],
+  [/^(\d+) UDMA CRC errors/, (m) => T('disks.reason_crc', { n: Number(m[1]) })],
+  [/^(\d+)% worn$/, (m) => T('disks.reason_wear', { n: Number(m[1]) })],
+  [/^SMART overall status FAILED$/, () => T('disks.reason_smart_failed')],
+  [/^last self-test failed$/, () => T('disks.reason_self_test_failed')],
+  [/^ZFS reports this disk FAULTED$/, () => T('disks.reason_zfs_faulted')],
+  [/^ZFS reports this disk UNAVAIL$/, () => T('disks.reason_zfs_unavail')],
+  [/^no SMART data$/, () => T('disks.reason_no_smart')],
+];
+
+// The localized short word for ONE symptom of the node's reason, or null when
+// this build has no pattern for it.
+export function reasonLabel(symptom) {
+  const text = String(symptom || '').trim();
+  for (const [re, fmt] of REASON_PATTERNS) {
+    const m = re.exec(text);
+    if (m) return fmt(m);
+  }
+  return null;
+}
+
+// The node's whole reason in the reader's language, for the places that show
+// every symptom (the n04 "why" box, the n02 disk-health tile): each "; "-
+// joined symptom through `reasonLabel`. A symptom this build has no word for
+// is left out of the text — never printed in English — and when none is
+// known the text is the translated grade. `title` is the node's sentence,
+// whole, for the tooltip. Both are '' when the node gave no reason.
+export function localizedReason(full, health) {
+  const raw = String(full || '').trim();
+  if (!raw) return { text: '', title: '' };
+  const words = raw.split(';').map(reasonLabel).filter(Boolean);
+  return { text: words.length ? words.join('; ') : T('health.' + (health || 'unknown')), title: raw };
+}
+
+// The replacement advice (§5.10) in the reader's language. The node writes
+// `advice.reason` in `replacement_advice` (tentanas/disks.rs) as "; "-joined
+// English from exactly three parts, and each is rebuilt here from structured
+// data instead:
+//   "reallocated sectors grew from {old} to {now} in the last 7 days"
+//       — present when `reallocated` > `reallocatedWeekAgo`; from those two;
+//   "{health} for {days} days"
+//       — the disk's grade word and `warningDays`; from `disk.health` and
+//         `warningDays` (said whenever the node counted a whole day);
+//   the disk's whole `health_reason`
+//       — every symptom through `reasonLabel`; the growth symptom is dropped
+//         when the growth part above already says it.
+// `disk` is the advised disk as the same response lists it (n03: looked up
+// by `diskId`; n04: the detail's disk). An advice kind other than `urgent` /
+// `advice`, or one with no disk to read, gets the generic translated
+// recommendation. `title` is always the node's sentence, whole — the English
+// never reaches the text.
+export const ADVICE_KINDS = new Set(['urgent', 'advice']);
+
+export function replacementAdviceText(advice, disk) {
+  const title = String(advice?.reason || '').trim();
+  if (!ADVICE_KINDS.has(advice?.severity) || !disk) {
+    return { known: false, text: T('replace_advice.reason_other'), title };
+  }
+  const parts = [];
+  const now = advice.reallocated;
+  const old = advice.reallocatedWeekAgo;
+  const growing = now != null && old != null && Number(now) > Number(old);
+  if (growing) parts.push(T('replace_advice.reason_grew', { from: Number(old), to: Number(now) }));
+  const days = Number(advice.warningDays) || 0;
+  if ((disk.health === 'warning' || disk.health === 'critical') && days > 0) {
+    parts.push(T('replace_advice.reason_for_days', { status: T('health.' + disk.health), days }));
+  }
+  for (const symptom of String(disk.healthReason || '').split(';')) {
+    if (growing && /^\s*reallocated sectors growing/.test(symptom)) continue;
+    const word = reasonLabel(symptom);
+    if (word) parts.push(word);
+  }
+  if (!parts.length) parts.push(T('health.' + (disk.health || 'unknown')));
+  return { known: true, text: parts.join('; '), title };
 }
 
 // zpool device/pool states: only 'online' is healthy, 'degraded' still

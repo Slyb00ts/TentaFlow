@@ -22,6 +22,20 @@ use super::jobs::ElasticJobIntent;
 
 const APP: &str = "tentanas";
 
+/// The scrub cadence every Elastic Array with parity is given (owner decision
+/// 2026-09-22), spelled ONCE as the JSON `nas_elastic_schedules.schedule_json`
+/// holds, because two writers need it and one of them is SQL: migration 19
+/// backfills it and `insert_default_scrub_schedule` writes it for a new or
+/// adopted array. A macro and not a `const`, so `concat!` can put it inside
+/// the migration's string literal; `default_elastic_scrub_schedule` is the
+/// same value as a struct, and a test pins the two to each other byte for
+/// byte (`serde_json` writes the fields in declaration order).
+macro_rules! default_elastic_scrub_schedule_json {
+    () => {
+        r#"{"every":"monthly","hour":4,"minute":0,"weekday":0,"day":15}"#
+    };
+}
+
 /// Append-only. A released step is never edited: the runner records applied
 /// versions per file and only executes the ones above the recorded maximum.
 const MIGRATIONS: &[(i64, &str)] = &[(
@@ -684,6 +698,42 @@ const MIGRATIONS: &[(i64, &str)] = &[(
     UPDATE nas_alerts SET org_id = COALESCE(
             (SELECT p.org_id FROM nas_pending_approvals p WHERE p.request_id = nas_alerts.subject_id), '')
      WHERE subject_kind = 'approval';",
+), (
+    19,
+    // SCRUB IS ON BY DEFAULT (owner decision 2026-09-22), and this is the
+    // one-time half of it: every array that EXISTS when a node upgrades gets
+    // the default monthly scrub, the same row a new array now gets at creation
+    // (`insert_default_scrub_schedule`). Parity SYNC already happens without
+    // anyone (the mover's coupled sync); what never happened unless an admin
+    // armed it is the scrub — the read of every block against parity that is
+    // the only thing finding silent corruption before a disk has to be rebuilt
+    // from it.
+    //
+    // ONCE, BECAUSE IT IS A MIGRATION. The runner records version 19 and never
+    // runs it again, so a schedule an admin later disables or changes is never
+    // touched by it; `INSERT OR IGNORE` on the `(array_id, kind)` key means an
+    // array that ALREADY has a scrub row — armed, disabled or re-timed by
+    // somebody — keeps it exactly as it is, even here. No marker row of its
+    // own: `app_schema_version` already is that marker, and a second one
+    // could only disagree with it.
+    //
+    // Only arrays WITH PARITY: SnapRAID has nothing to compare against on an
+    // array without a parity disk, and `insert_job` refuses its scrub
+    // ("Macierz bez parity nie wykonuje SnapRAID") — a default there would be
+    // a row that fails every month.
+    //
+    // `next_run_at` stays NULL: the scheduler computes it on its next tick
+    // and never fires retroactively (`scheduler::is_due`), so an upgrade does
+    // not start a scrub on every array at once.
+    concat!(
+        "INSERT OR IGNORE INTO nas_elastic_schedules (array_id, kind, enabled, schedule_json)
+        SELECT a.array_id, 'scrub', 1, '",
+        default_elastic_scrub_schedule_json!(),
+        "'
+          FROM nas_elastic_arrays a
+         WHERE EXISTS (SELECT 1 FROM nas_elastic_disks d
+                        WHERE d.array_id = a.array_id AND d.role = 'parity');"
+    ),
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -1204,6 +1254,20 @@ pub fn resolve_alert(pool: &DbPool, dedupe_key: &str) -> Result<()> {
     Ok(())
 }
 
+/// The severity of the OPEN alert under `dedupe_key`, `None` when none is
+/// open. The disk health alert moves FROM this rather than from a grade held
+/// in memory, which a restart or a failed write leaves out of step with it.
+pub fn open_alert_severity(pool: &DbPool, dedupe_key: &str) -> Result<Option<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT severity FROM nas_alerts WHERE dedupe_key = ?1 AND resolved_at IS NULL",
+            params![dedupe_key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 pub fn ack_alert(pool: &DbPool, alert_id: &str) -> Result<bool> {
     let conn = write(pool)?;
     let n = conn.execute(
@@ -1627,6 +1691,9 @@ pub fn insert_job_owned(
                     params![spec.array_id,spec.owner.org_id,spec.owner.addon_id,spec.name,
                         spec.filesystem.as_str(),job.started_at])?;
                 insert_elastic_disks(&tx, spec)?;
+                // In the transaction that writes the array row, so there is no
+                // array without its default scrub for the scheduler to find.
+                insert_default_scrub_schedule(&tx, &spec.array_id)?;
                 (&spec.array_id, &spec.operation_id, "create", serde_json::to_string(spec)?)
             }
             ElasticJobIntent::Restore { owner, array_id, operation_id } => {
@@ -3301,6 +3368,10 @@ pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, started_by: &str)
         params![spec.array_id,spec.owner.org_id,spec.owner.addon_id,spec.name,
             spec.filesystem.as_str(),at])?;
     insert_elastic_disks(&tx, spec)?;
+    // An adopted array is a new row to THIS node — its old record, and any
+    // schedule an admin set there, is exactly what was lost — so it gets the
+    // default a created one gets.
+    insert_default_scrub_schedule(&tx, &spec.array_id)?;
     // The origin operation (migration 14): `elastic_spec` reads the persisted
     // intention from it, so an adopted array without this row could not be
     // read back at all.
@@ -3484,6 +3555,101 @@ pub fn set_pool_schedule(
     Ok(())
 }
 
+/// Gives a schedule row its first `next_run_at`, and ONLY that — the
+/// scheduler's first tick over a row nobody has armed yet.
+///
+/// WHY not the upsert (`set_pool_schedule` & co.): the tick read the row a
+/// moment earlier, and writing that copy back rewrote `enabled` and the
+/// cadence as they were THEN. An admin who switched the schedule off (or
+/// changed it, or — for snapshots — deleted it) in between had the change
+/// silently undone: re-enabled, the old cadence restored, a deleted row
+/// re-inserted. So this is a compare-and-set against the row as it is NOW:
+/// it reads the row's current cadence, computes the slot from THAT with
+/// `next_of`, and writes only while the row is still enabled, still unarmed
+/// and still on the cadence the slot was computed from (the very text just
+/// read, so no re-serialisation can make it differ). Returns whether it armed.
+///
+/// `key` is the row's WHERE over `?1..?n`, bound from `key_params`.
+fn arm_schedule_row(
+    pool: &DbPool,
+    table: &str,
+    key: &str,
+    key_params: &[&dyn rusqlite::ToSql],
+    next_of: impl FnOnce(&NasSchedule) -> Option<String>,
+) -> Result<bool> {
+    let conn = write(pool)?;
+    let json: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT schedule_json FROM {table}
+                 WHERE {key} AND enabled = 1 AND next_run_at IS NULL"
+            ),
+            key_params,
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(json) = json else {
+        return Ok(false);
+    };
+    let schedule: NasSchedule = serde_json::from_str(&json).unwrap_or_default();
+    let Some(next) = next_of(&schedule) else {
+        return Ok(false);
+    };
+    let (next_at, json_at) = (key_params.len() + 1, key_params.len() + 2);
+    let mut bound: Vec<&dyn rusqlite::ToSql> = key_params.to_vec();
+    bound.push(&next);
+    bound.push(&json);
+    let armed = conn.execute(
+        &format!(
+            "UPDATE {table} SET next_run_at = ?{next_at}
+             WHERE {key} AND enabled = 1 AND next_run_at IS NULL AND schedule_json = ?{json_at}"
+        ),
+        bound.as_slice(),
+    )?;
+    Ok(armed == 1)
+}
+
+/// `arm_schedule_row` for a pool's scrub or trim.
+pub fn arm_pool_schedule(
+    pool: &DbPool,
+    task: PoolTask,
+    name: &str,
+    next_of: impl FnOnce(&NasSchedule) -> Option<String>,
+) -> Result<bool> {
+    arm_schedule_row(pool, task.table(), "pool = ?1", &[&name as &dyn rusqlite::ToSql], next_of)
+}
+
+/// `arm_schedule_row` for one of an Elastic Array's cadences.
+pub fn arm_elastic_schedule(
+    pool: &DbPool,
+    array_id: &str,
+    task: ElasticTask,
+    next_of: impl FnOnce(&NasSchedule) -> Option<String>,
+) -> Result<bool> {
+    arm_schedule_row(
+        pool,
+        "nas_elastic_schedules",
+        "array_id = ?1 AND kind = ?2",
+        &[&array_id as &dyn rusqlite::ToSql, &task.kind() as &dyn rusqlite::ToSql],
+        next_of,
+    )
+}
+
+/// `arm_schedule_row` for a snapshot schedule.
+pub fn arm_snapshot_schedule(
+    pool: &DbPool,
+    schedule_id: &str,
+    next_of: impl FnOnce(&NasSchedule) -> Option<String>,
+) -> Result<bool> {
+    arm_schedule_row(
+        pool,
+        "nas_snapshot_schedules",
+        "schedule_id = ?1",
+        &[&schedule_id as &dyn rusqlite::ToSql],
+        next_of,
+    )
+}
+
 pub fn record_pool_schedule_run(
     pool: &DbPool,
     task: PoolTask,
@@ -3628,6 +3794,63 @@ pub fn set_elastic_schedule(
             serde_json::to_string(schedule)?,
             next_run_at
         ],
+    )?;
+    Ok(())
+}
+
+/// The default scrub cadence as the struct the protocol carries — the value of
+/// `default_elastic_scrub_schedule_json!`.
+///
+/// MONTHLY, as the owner decided; the rest is chosen against what the product
+/// already schedules:
+/// - 04:00 local: the hour n11's scrub dialog proposes (`elastic-detail.js`
+///   `scrub: { hour: 4 }`), one hour after the 03:00 it proposes for a sync —
+///   the quiet part of the night, and not on top of a sync an admin arms.
+/// - the 15th, not the 1st: the Tasks tab proposes the monthly LONG SMART
+///   self-test for the 1st at 04:00 (`tasks.js`). Both read every sector of
+///   the same disks; stacked, each slows the other and a long test can be
+///   aborted by the load. Half a month apart they never meet.
+/// - `weekday` is unused by a monthly cadence; 0 is what every other default
+///   in the product carries there.
+///
+/// No scrub percentage or age goes with it: the product runs every scrub as
+/// `snapraid -p full scrub` (`tentanas_helper::elastic::snapraid_args`), so
+/// `scrub_percent` / `scrub_older_than_days` are not arguments of any run, and
+/// a FULL monthly scrub is what reads every block once a month. It is also the
+/// run that settles an earlier unresolved scrub or repair
+/// (`UNRESOLVED_ELASTIC_OPERATION`), which a partial one could not.
+pub fn default_elastic_scrub_schedule() -> NasSchedule {
+    NasSchedule {
+        every: "monthly".to_string(),
+        hour: 4,
+        minute: 0,
+        weekday: 0,
+        day: 15,
+    }
+}
+
+/// Gives one array its default scrub, inside the caller's transaction — the
+/// one that writes the array row and its member rows, which must already be
+/// in it: the parity check below reads them.
+///
+/// `INSERT OR IGNORE`, never an upsert: whatever scrub row the array already
+/// has is somebody's decision and is left alone. Nothing but the array row's
+/// own creation calls this, so a schedule an admin disables is never
+/// re-armed; there is no path that deletes one short of dissolving the array
+/// (`delete_elastic_array`).
+///
+/// An array without parity gets nothing — see migration 19.
+fn insert_default_scrub_schedule(tx: &Connection, array_id: &str) -> Result<()> {
+    tx.execute(
+        concat!(
+            "INSERT OR IGNORE INTO nas_elastic_schedules (array_id, kind, enabled, schedule_json)
+             SELECT ?1, ?2, 1, '",
+            default_elastic_scrub_schedule_json!(),
+            "'
+              WHERE EXISTS (SELECT 1 FROM nas_elastic_disks
+                             WHERE array_id = ?1 AND role = 'parity')"
+        ),
+        params![array_id, ElasticTask::Scrub.kind()],
     )?;
     Ok(())
 }
@@ -4171,18 +4394,25 @@ pub fn approval(pool: &DbPool, request_id: &str) -> Result<Option<ApprovalRow>> 
         .optional()?)
 }
 
-/// The open operations, newest first; `include_closed` appends the decided
-/// and expired ones so the list can show what happened to a request.
-pub fn list_approvals(pool: &DbPool, include_closed: bool) -> Result<Vec<ApprovalRow>> {
+/// One organisation's approvals, newest first: the open ones, plus — with
+/// `include_closed` — the decided and expired ones, so the list can show
+/// what happened to a request. The organisation is part of the QUERY, not a
+/// filter applied afterwards: the list is capped, and with the cap first
+/// another tenant's requests could fill it and push the caller's own out of
+/// view. An empty `org_id` owns nothing and gets nothing.
+pub fn list_approvals(pool: &DbPool, org_id: &str, include_closed: bool) -> Result<Vec<ApprovalRow>> {
+    if org_id.is_empty() {
+        return Ok(Vec::new());
+    }
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let sql = format!(
-        "SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals {} \
+        "SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals WHERE org_id = ?1 {} \
          ORDER BY requested_at DESC LIMIT 200",
-        if include_closed { "" } else { "WHERE status = 'pending'" }
+        if include_closed { "" } else { "AND status = 'pending'" }
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map([], approval_from_row)?
+        .query_map(params![org_id], approval_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -4540,15 +4770,23 @@ pub struct ForwardRow {
     pub detail: String,
 }
 
-/// Alerts that have not been forwarded yet, oldest first. An alert is
-/// forwarded when it is RAISED, so a row already acknowledged is still sent:
-/// the external collector's job is to see what happened, not what the admin
-/// has since read.
+/// NODE-WIDE alerts (`org_id IS NULL`) that have not been forwarded yet,
+/// oldest first. An alert is forwarded when it is RAISED, so a row already
+/// acknowledged is still sent: the external collector's job is to see what
+/// happened, not what the admin has since read.
+///
+/// An organisation's alert (an Elastic Array's, a parked request's, or ''
+/// for an owner that is gone — migration 18) never reaches the shared
+/// target, and the filter is part of THIS query on purpose: the owner is
+/// stamped in the statement that inserts the row (`raise_alert`), so no row
+/// can be selected here without its owner. Reading the owned ids first and
+/// the batch second let an owned alert raised in between slip into the batch.
 pub fn unforwarded_alerts(pool: &DbPool, limit: u32) -> Result<Vec<ForwardRow>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut stmt = conn.prepare_cached(
         "SELECT alert_id, raised_at, severity, subject_kind, subject_id, title, detail
-           FROM nas_alerts WHERE forwarded_at IS NULL ORDER BY raised_at LIMIT ?1",
+           FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL
+          ORDER BY raised_at LIMIT ?1",
     )?;
     let rows = stmt
         .query_map(params![limit], |r| {
@@ -4614,13 +4852,30 @@ pub fn mark_forwarded(pool: &DbPool, rows: &[ForwardRow]) -> Result<()> {
     Ok(())
 }
 
-/// How many rows still wait, so the settings card can show a backlog instead
-/// of a silent stall. `include_access` mirrors the setting: rows the admin did
-/// not ask to forward are not pending.
+/// Settles every organisation's alert still in the queue, in one statement:
+/// they are never sent (`unforwarded_alerts`), and left unmarked they would
+/// sit in the queue for good. Returns how many were settled.
+pub fn settle_withheld_alerts(pool: &DbPool) -> Result<usize> {
+    let conn = write(pool)?;
+    Ok(conn.execute(
+        "UPDATE nas_alerts SET forwarded_at = ?1 WHERE forwarded_at IS NULL AND org_id IS NOT NULL",
+        params![now()],
+    )?)
+}
+
+/// How many rows still wait to be SENT, so the settings card can show a
+/// backlog instead of a silent stall. `include_access` mirrors the setting:
+/// rows the admin did not ask to forward are not pending.
+///
+/// An organisation's alert is never sent, so it is not pending: counting it
+/// would show every tenant a backlog of other tenants' alerts that never
+/// drains while forwarding is off. Counted here, in SQL, rather than by
+/// loading every such id — a set that grew without bound for as long as
+/// forwarding stayed off.
 pub fn forward_pending(pool: &DbPool, include_access: bool) -> Result<u32> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM nas_alerts WHERE forwarded_at IS NULL",
+        "SELECT COUNT(*) FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL",
         [],
         |r| r.get(0),
     )?;
@@ -6855,7 +7110,8 @@ mod tests {
         for (table, expected) in [
             ("nas_elastic_disks", 2),
             ("nas_elastic_disk_aliases", 6),
-            ("nas_elastic_schedules", 0),
+            // The other array's default scrub, and nothing of this one's.
+            ("nas_elastic_schedules", 1),
             ("nas_elastic_mover_settings", 0),
         ] {
             let left: i64 = p
@@ -7737,6 +7993,168 @@ mod tests {
         assert_eq!(stored, 1, "domyślna polityka nie zostawia wiersza");
     }
 
+    /// The one spelling of the default scrub the migration uses and the one
+    /// the create path uses are the same schedule, byte for byte — a drift
+    /// would give upgraded arrays and new arrays different defaults.
+    #[test]
+    fn the_default_scrub_json_is_the_default_scrub_schedule() {
+        assert_eq!(
+            serde_json::to_string(&default_elastic_scrub_schedule()).unwrap(),
+            default_elastic_scrub_schedule_json!()
+        );
+        let schedule = default_elastic_scrub_schedule();
+        assert_eq!(schedule.every, "monthly");
+        // A day every month has, so the cadence never skips a month.
+        assert!((1..=28).contains(&schedule.day));
+    }
+
+    /// Owner decision 2026-09-22: a NEW array is scrubbed monthly without
+    /// anyone arming it — the row is written with the array row itself.
+    #[test]
+    fn new_array_gets_the_default_scrub_schedule() {
+        let p = pool();
+        let spec = super::super::elastic::tests::create_spec("media");
+        insert_job(&p, &elastic_job(&spec), Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        // Already while the create runs: same transaction as the array row.
+        let row = elastic_schedule(&p, &spec.array_id, ElasticTask::Scrub).unwrap().expect("default scrub");
+        assert!(row.enabled);
+        assert_eq!(row.schedule, default_elastic_scrub_schedule());
+        // Never fires retroactively: the scheduler computes the first slot.
+        assert_eq!(row.next_run_at, None);
+        assert!(row.last_run_at.is_none());
+        // Only the scrub: sync is already coupled to the mover, and the mover
+        // cadence is the admin's.
+        for task in [ElasticTask::Mover, ElasticTask::Sync] {
+            assert!(elastic_schedule(&p, &spec.array_id, task).unwrap().is_none(), "{}", task.kind());
+        }
+
+        // An array WITHOUT parity has nothing to scrub against, and `insert_job`
+        // would refuse the run every month — so it gets no default.
+        let mut bare = super::super::elastic::tests::create_spec("bare");
+        bare.parity.clear();
+        insert_job(&p, &elastic_job(&bare), Some(&ElasticJobIntent::Create(bare.clone()))).unwrap();
+        assert!(elastic_schedule(&p, &bare.array_id, ElasticTask::Scrub).unwrap().is_none());
+    }
+
+    /// An ADOPTED array is a new row to this node, and gets what a created
+    /// one gets.
+    #[test]
+    fn adopted_array_gets_the_default_scrub_schedule() {
+        let p = pool();
+        let spec = super::super::elastic::tests::create_spec("media");
+        elastic_import(&p, &spec, "admin").unwrap();
+        let row = elastic_schedule(&p, &spec.array_id, ElasticTask::Scrub).unwrap().expect("default scrub");
+        assert!(row.enabled);
+        assert_eq!(row.schedule, default_elastic_scrub_schedule());
+    }
+
+    /// Migration 19: an array that existed before the upgrade and has no scrub
+    /// schedule gets the default ONCE. One whose admin already decided keeps
+    /// the decision, one without parity gets nothing, and a default that is
+    /// later removed is not recreated by any later start of the node.
+    #[test]
+    fn existing_array_without_scrub_gets_the_default_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..18]).unwrap();
+        let array = |id: &str, name: &str, roles: &[&str]| {
+            conn.execute(
+                "INSERT INTO nas_elastic_arrays
+                 (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+                 VALUES (?1,'org','addon',?2,'xfs','active','','now','now')",
+                params![id, name],
+            )
+            .unwrap();
+            for role in roles {
+                conn.execute(
+                    "INSERT INTO nas_elastic_disks
+                     (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+                     VALUES (?1,?2,1,?3,NULL,?3,1024,?4)",
+                    params![id, role, format!("{name}-{role}"), uuid::Uuid::new_v4().to_string()],
+                )
+                .unwrap();
+            }
+        };
+        // `produkt` on rig11: data + parity + cache, no scrub schedule at all.
+        array("a-plain", "produkt", &["data", "parity", "cache"]);
+        // An admin already chose: scrub switched OFF, weekly.
+        array("a-chosen", "chosen", &["data", "parity"]);
+        let weekly = r#"{"every":"weekly","hour":3,"minute":0,"weekday":3,"day":1}"#;
+        conn.execute(
+            "INSERT INTO nas_elastic_schedules (array_id,kind,enabled,schedule_json)
+             VALUES ('a-chosen','scrub',0,?1)",
+            params![weekly],
+        )
+        .unwrap();
+        // No parity: nothing to scrub against.
+        array("a-bare", "bare", &["data"]);
+
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+
+        let scrub = |conn: &Connection, id: &str| -> Option<(i64, String, Option<String>)> {
+            conn.query_row(
+                "SELECT enabled, schedule_json, next_run_at FROM nas_elastic_schedules
+                 WHERE array_id=?1 AND kind='scrub'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(
+            scrub(&conn, "a-plain"),
+            Some((1, default_elastic_scrub_schedule_json!().to_string(), None)),
+            "the array without a scrub gets the default, not yet armed with a slot"
+        );
+        assert_eq!(
+            scrub(&conn, "a-chosen"),
+            Some((0, weekly.to_string(), None)),
+            "an admin's decision is never overwritten"
+        );
+        assert_eq!(scrub(&conn, "a-bare"), None, "no parity, no default");
+        // Nothing but scrub rows was written.
+        let others: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nas_elastic_schedules WHERE kind<>'scrub'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(others, 0);
+
+        // A DELETED DEFAULT IS NOT RECREATED: the node starts again (the same
+        // migration runner every open goes through) and the row stays gone —
+        // version 19 is recorded and never runs twice.
+        conn.execute("DELETE FROM nas_elastic_schedules WHERE array_id='a-plain'", []).unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(scrub(&conn, "a-plain"), None, "a removed default must stay removed");
+        assert_eq!(scrub(&conn, "a-chosen"), Some((0, weekly.to_string(), None)));
+    }
+
+    /// The admin's later choice sticks: a default switched off or re-timed is
+    /// never re-armed — not by a restart of the node, and not by anything else
+    /// that reads or writes the array.
+    #[test]
+    fn a_disabled_default_scrub_is_not_rearmed() {
+        let p = pool();
+        let spec = completed_array(&p, "media");
+        let weekly = NasSchedule { every: "weekly".into(), hour: 2, minute: 0, weekday: 6, day: 1 };
+        set_elastic_schedule(&p, &spec.array_id, ElasticTask::Scrub, false, &weekly, None).unwrap();
+        // A second array created afterwards gets ITS default and touches
+        // nobody else's row.
+        let other = completed_array(&p, "foto");
+        migrate(&p.write().unwrap()).unwrap();
+
+        let row = elastic_schedule(&p, &spec.array_id, ElasticTask::Scrub).unwrap().unwrap();
+        assert!(!row.enabled, "switched off stays off");
+        assert_eq!(row.schedule, weekly, "re-timed stays re-timed");
+        let array = elastic_arrays(&p, &spec.owner)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "media")
+            .unwrap();
+        assert!(!array.snapraid.scrub_enabled);
+        assert_eq!(array.snapraid.scrub_schedule, Some(weekly));
+        assert!(elastic_schedule(&p, &other.array_id, ElasticTask::Scrub).unwrap().unwrap().enabled);
+    }
+
     /// Dissolving an array takes its folder policies with it. A leftover row
     /// holds the array's foreign key, so the next `delete` of an array that
     /// reused the id would be refused by the key rather than by anything that
@@ -8134,16 +8552,24 @@ mod tests {
         .unwrap();
         finish_job(&p, &job.job_id, "succeeded", None).unwrap();
 
-        // Nothing configured: no cadence, nothing armed, no decision claimed.
+        // Nothing configured by anyone: no mover or sync cadence, no decision
+        // claimed — and the one default the product arms by itself, the
+        // monthly scrub (owner decision 2026-09-22).
         let before = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
         assert!(!before.mover.configured);
         assert!(!before.mover.schedule_enabled, "no row means no restriction on automatic moves");
         assert_eq!(before.mover.schedule, None);
         assert_eq!(before.snapraid.sync_schedule, None);
-        assert_eq!(before.snapraid.scrub_schedule, None);
+        assert_eq!(before.snapraid.scrub_schedule, Some(default_elastic_scrub_schedule()));
+        assert!(before.snapraid.scrub_enabled);
 
         for task in ElasticTask::ALL {
-            assert!(elastic_schedule(&p, &spec.array_id, task).unwrap().is_none());
+            assert_eq!(
+                elastic_schedule(&p, &spec.array_id, task).unwrap().is_some(),
+                task == ElasticTask::Scrub,
+                "{}",
+                task.kind()
+            );
             set_elastic_schedule(
                 &p,
                 &spec.array_id,
@@ -8335,7 +8761,7 @@ mod tests {
         insert_approval(&p, &row("r-open", "2999-01-01T00:00:00Z")).unwrap();
         insert_approval(&p, &row("r-late", "2020-01-01T00:00:00Z")).unwrap();
 
-        assert_eq!(list_approvals(&p, false).unwrap().len(), 2);
+        assert_eq!(list_approvals(&p, "org-1", false).unwrap().len(), 2);
         let due = approvals_past_ttl(&p, &now()).unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].approval.request_id, "r-late");
@@ -8356,11 +8782,42 @@ mod tests {
         );
         // Only the still-open one is listed by default; both show with history.
         assert_eq!(
-            list_approvals(&p, false).unwrap().into_iter().map(|r| r.approval.request_id).collect::<Vec<_>>(),
+            list_approvals(&p, "org-1", false).unwrap().into_iter().map(|r| r.approval.request_id).collect::<Vec<_>>(),
             vec!["r-late"]
         );
-        assert_eq!(list_approvals(&p, true).unwrap().len(), 2);
+        assert_eq!(list_approvals(&p, "org-1", true).unwrap().len(), 2);
         assert!(approval(&p, "nie-ma").unwrap().is_none());
+    }
+
+    #[test]
+    fn the_approval_list_is_one_organisations_and_capped_after_the_filter() {
+        // The organisation is part of the query: with the cap applied first,
+        // another tenant's requests could fill it and hide the caller's own.
+        let p = pool();
+        let row = |request_id: &str, org: &str, at: &str| ApprovalRow {
+            approval: tentaflow_protocol::tentanas::NasPendingApproval {
+                request_id: request_id.to_string(),
+                operation: "pool_destroy".to_string(),
+                subject: "tank".to_string(),
+                status: "pending".to_string(),
+                requested_by: "u-anna".to_string(),
+                requested_at: at.to_string(),
+                expires_at: "2999-01-01T00:00:00Z".to_string(),
+                ..Default::default()
+            },
+            payload_json: "{}".to_string(),
+            org_id: org.to_string(),
+            addon_id: "tentanas-1".to_string(),
+        };
+        // The caller's one request is OLDER than 200 newer ones of another org.
+        insert_approval(&p, &row("mine", "org-1", "2026-09-01T00:00:00Z")).unwrap();
+        for i in 0..200 {
+            insert_approval(&p, &row(&format!("theirs-{i}"), "org-2", "2026-09-02T00:00:00Z")).unwrap();
+        }
+        let mine = list_approvals(&p, "org-1", true).unwrap();
+        assert_eq!(mine.iter().map(|r| r.approval.request_id.as_str()).collect::<Vec<_>>(), vec!["mine"]);
+        assert!(list_approvals(&p, "org-2", true).unwrap().iter().all(|r| r.org_id == "org-2"));
+        assert!(list_approvals(&p, "", true).unwrap().is_empty(), "an empty org owns nothing");
     }
 
     #[test]

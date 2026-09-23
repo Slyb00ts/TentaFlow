@@ -174,3 +174,18 @@ test('deleting a user asks for confirmation and sends ShareUserDelete through su
   assert.equal(win.querySelector('#nas-su-table').rows.length, 1);
   screen.dispose();
 });
+
+// `hide-below="600"` is not on tf-table's breakpoint scale and was silently
+// ignored; the created column now hides below 640.
+test('the created column hides on a breakpoint tf-table honours', async () => {
+  const screen = fakeScreen({}, { admin: false });
+  try {
+    const win = openShareUsersDialog(screen, { users });
+    await flush();
+    const table = win.querySelector('#nas-su-table');
+    const classes = [...table.shadowRoot.querySelectorAll('thead th')].flatMap((th) => [...th.classList]);
+    assert.ok(classes.includes('tf-table__col--hide-below-640'));
+  } finally {
+    screen.dispose();
+  }
+});

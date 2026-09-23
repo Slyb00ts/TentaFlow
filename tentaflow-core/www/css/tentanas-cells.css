@@ -127,3 +127,13 @@
 .fw-700 { font-weight: 700; }
 .fw-800 { font-weight: 800; }
 .mb-sm { margin-bottom: 8px; }
+
+/* Problem rows (n03 `warn-row`). tf-table puts a row's `_class` on its <tr>,
+ * and that <tr> lives in the table's shadow root — which is why these rules
+ * exist ONLY here: a copy in tentanas.css would match nothing. They come after
+ * controls.css in adoptedStyleSheets, so at equal specificity they win over
+ * its plain hover; a selected row keeps the selection tint. */
+.tf-table tbody tr.row-warn:not(.selected) { background: color-mix(in srgb, var(--warning) 6%, transparent); }
+.tf-table tbody tr.row-warn:not(.selected):hover { background: color-mix(in srgb, var(--warning) 12%, transparent); }
+.tf-table tbody tr.row-danger:not(.selected) { background: color-mix(in srgb, var(--danger) 7%, transparent); }
+.tf-table tbody tr.row-danger:not(.selected):hover { background: color-mix(in srgb, var(--danger) 13%, transparent); }

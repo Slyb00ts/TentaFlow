@@ -5725,6 +5725,7 @@
       "disks_special": "{n} special",
       "disks_log": "{n} log",
       "disks_cache": "{n} cache",
+      "disks_parity": "{n} parité",
       "disks_spare": "spare",
       "free_unused": "inutilisé",
       "layout_chip": "ZFS {layout}",
@@ -6237,7 +6238,8 @@
       "iops_delta": "{pct}% vs moyenne horaire",
       "throughput_suffix": "Mo/s R",
       "throughput_delta": "{w} Mo/s W · latence moy. {lat} ms",
-      "iops_avg": "moyenne horaire {n} IOPS"
+      "iops_avg": "moyenne horaire {n} IOPS",
+      "capacity_no_pools": "aucun pool ni matrice"
     },
     "wizard": {
       "step_restore": "Restaurer depuis une sauvegarde",
@@ -6542,7 +6544,8 @@
       "segment_import": "Import",
       "preview_explain": "L’export contient l’<b>état souhaité</b> (desired state) : disposition des pools et vdevs, datasets avec leurs propriétés, partages SMB/NFS, utilisateurs de partage et planifications. Il <b>ne contient aucun secret</b> (mots de passe des utilisateurs de partage — à redéfinir après l’import) ni données utilisateur.",
       "preview": "Aperçu (extrait)",
-      "download": "Télécharger le fichier"
+      "download": "Télécharger le fichier",
+      "kind_target": "Cible"
     },
     "title": "TentaNas",
     "load_failed": "Impossible de charger TentaNas",
@@ -6654,7 +6657,20 @@
       "legend_ok": "aucun symptôme dans aucune source",
       "legend_warn": "un symptôme qui demande surveillance ou décision (nouvelles réallocations, température)",
       "legend_crit": "disque FAULTED/UNAVAIL — remplacement nécessaire",
-      "legend_note": "Les métriques arrivent en push ; la sparkline couvre les dernières {w}"
+      "legend_note": "Les métriques arrivent en push ; la sparkline couvre les dernières {w}",
+      "locate_failed": "LED de {name} : la commande a échoué — {error}",
+      "reason_realloc": "{n} réalloc.",
+      "reason_realloc_growing": "réalloc. {from} → {to}",
+      "reason_pending": "{n} sect. en attente",
+      "reason_media": "{n} err. support",
+      "reason_crc": "{n} CRC",
+      "reason_wear": "usure {n} %",
+      "reason_smart_failed": "SMART : échec",
+      "reason_self_test_failed": "autotest échoué",
+      "reason_temp_over": "{t}°C, au-delà de la limite de {limit}°C",
+      "reason_zfs_faulted": "ZFS : en panne (FAULTED)",
+      "reason_zfs_unavail": "ZFS : indisponible (UNAVAIL)",
+      "reason_no_smart": "aucune donnée SMART"
     },
     "disk": {
       "identification": "Identification physique",
@@ -6719,7 +6735,15 @@
       "st_status_running": "en cours",
       "st_status_unknown": "inconnu",
       "edit_schedule": "Modifier la planification",
-      "health_chip": "{status} : {reason}"
+      "health_chip": "{status} : {reason}",
+      "smart_busy": "Un test SMART de ce disque est déjà en cours — lancez-en un autre une fois celui-ci terminé",
+      "array_title": "Elastic Array ({array})",
+      "other_org_array_title": "Matrice d'une autre organisation",
+      "other_org_array_info": "Ce disque appartient à un Elastic Array d'une autre organisation de ce nœud. Son nom et son état ne sont pas visibles depuis cette organisation — c'est elle qui le gère.",
+      "array_name": "Matrice",
+      "array_part": "Rôle dans la matrice",
+      "array_replace_withdrawn": "C'est une branche d'un Elastic Array, pas un membre d'un pool ZFS — il n'a pas de compteurs READ/WRITE/CKSUM. Le remplacement d'un disque de matrice n'est pas disponible dans cette version : la matrice continue de servir depuis les disques qu'elle a, et la réparation depuis la parité fonctionne pour les disques présents sur le nœud.",
+      "array_open": "Ouvrir la matrice {array}"
     },
     "elevation": {
       "title": "Canal de privilèges système",
@@ -6893,7 +6917,6 @@
       "chip_warnings": "{n} {n|avertissement|avertissements} ({nodes})",
       "chip_ok": "Aucun avertissement",
       "chip_services": "Services actifs",
-      "chip_services_down": "Services arrêtés",
       "badge_nas": "{n}× NAS : {nodes}",
       "badge_channels": "Canaux de privilèges : {parts}",
       "badge_channel_part": "{n}× {mode}",
@@ -6931,7 +6954,11 @@
       "severity_critical": "critique",
       "severity_warning": "avertissement",
       "severity_info": "information",
-      "act_array": "Matrice"
+      "act_array": "Matrice",
+      "head_versions": "TentaNas : {list}",
+      "chip_services_down_list": "Services arrêtés : {list}",
+      "chip_services_unknown": "Services : aucune réponse de {nodes}",
+      "chip_services_none": "Aucun service de partage"
     },
     "node": {
       "head_sub_node": "nœud {name}",
@@ -7079,7 +7106,12 @@
       "spare_ready": "le pool a un spare prêt à prendre le relais",
       "no_spare": "aucun spare dans le pool — prévoyez un disque de rechange",
       "disk_urgent": "Remplacez ce disque maintenant : {reason}. {spare}.",
-      "disk_advice": "Planifiez le remplacement de ce disque : {reason}. {spare}."
+      "disk_advice": "Planifiez le remplacement de ce disque : {reason}. {spare}.",
+      "severity_other": "recommandé",
+      "reason_grew": "secteurs réalloués passés de {from} à {to} en 7 jours",
+      "reason_for_days": "{status} depuis {days} {days|jour|jours}",
+      "reason_other": "le nœud recommande de remplacer ce disque",
+      "disk_other": "Le nœud recommande de remplacer ce disque. {spare}."
     },
     "targets": {
       "sessions_unmeasured": "Inconnu ne signifie pas zéro",

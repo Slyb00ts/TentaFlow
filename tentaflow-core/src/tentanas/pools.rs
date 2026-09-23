@@ -97,6 +97,21 @@ pub struct StatusReport {
     pub errors_line: String,
     /// Permanent data errors the pool reports (0 for "No known data errors").
     pub data_errors: u64,
+    /// Every physical leaf as the disks inventory binds it, in config order.
+    pub leaves: Vec<LeafSeen>,
+}
+
+/// One physical leaf of `zpool status`, as the disks inventory needs it: the
+/// disk it is on, the vdev it serves, and the state that disk is graded by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeafSeen {
+    /// `zfs::resolved_kernel_name` of the leaf, `None` when its device node is
+    /// gone — such a leaf must bind to no disk (see that function).
+    pub kernel_name: Option<String>,
+    pub role: String,
+    pub kind: String,
+    /// `leaf_grading_state` of the printed state word.
+    pub state: &'static str,
 }
 
 /// Section keywords that switch the role of the vdevs that follow.
@@ -130,8 +145,10 @@ fn group_kind(name: &str) -> Option<&'static str> {
     }
 }
 
-fn normalize_state(raw: &str) -> String {
-    match raw.to_ascii_uppercase().as_str() {
+/// A state word `zpool status`/`zpool list` prints, normalised, or `None` for
+/// one this parser does not know (a new OpenZFS state, an empty column).
+fn recognized_state(raw: &str) -> Option<&'static str> {
+    Some(match raw.to_ascii_uppercase().as_str() {
         // A spare is ONLINE and idle (AVAIL) or ONLINE and substituting (INUSE).
         "ONLINE" | "AVAIL" | "INUSE" => "online",
         "DEGRADED" => "degraded",
@@ -139,9 +156,24 @@ fn normalize_state(raw: &str) -> String {
         "OFFLINE" => "offline",
         "REMOVED" => "removed",
         "UNAVAIL" | "SUSPENDED" => "unavail",
-        _ => "unavail",
-    }
-    .to_string()
+        _ => return None,
+    })
+}
+
+/// The state the pool VIEW shows. An unrecognised word reads as `unavail`
+/// there on purpose: the pool card, its health score and the fleet header
+/// all treat `unavail` as "not serving", and a pool or vdev in a state
+/// nobody can interpret must not look healthy on those.
+fn normalize_state(raw: &str) -> String {
+    recognized_state(raw).unwrap_or("unavail").to_string()
+}
+
+/// The state a DISK is graded by (`disks::grade_disk_health`). Unlike
+/// `normalize_state`, an unrecognised or empty word is `unknown`: the disk
+/// grade turns `faulted`/`unavail` into "Awaria" plus a critical alert, and
+/// a word the parser cannot read is not evidence that the disk failed.
+pub fn leaf_grading_state(raw: &str) -> &'static str {
+    recognized_state(raw).unwrap_or("unknown")
 }
 
 pub fn fault_tolerance_of(kind: &str, leaves: usize) -> u8 {
@@ -244,6 +276,7 @@ fn apply_config_row(report: &mut StatusReport, row: &ConfigRow<'_>, role: &mut S
         let kind = group_kind(row.name).unwrap_or("disk");
         if kind == "disk" {
             // A bare leaf at top level: a single-disk vdev of its own.
+            report.leaves.push(leaf_seen(row, role.as_str(), "disk"));
             report.vdevs.push(NasVdev {
                 id: row.name.to_string(),
                 role: role.clone(),
@@ -272,6 +305,16 @@ fn apply_config_row(report: &mut StatusReport, row: &ConfigRow<'_>, role: &mut S
     if let Some(vdev) = report.vdevs.last_mut() {
         vdev.disks.push(leaf(row));
         vdev.fault_tolerance = fault_tolerance_of(&vdev.kind, vdev.disks.len());
+        report.leaves.push(leaf_seen(row, &vdev.role, &vdev.kind));
+    }
+}
+
+fn leaf_seen(row: &ConfigRow<'_>, role: &str, kind: &str) -> LeafSeen {
+    LeafSeen {
+        kernel_name: zfs::resolved_kernel_name(row.name),
+        role: role.to_string(),
+        kind: kind.to_string(),
+        state: leaf_grading_state(row.state),
     }
 }
 
@@ -772,6 +815,12 @@ fn assemble(
     let mut vdevs = status.vdevs;
     for vdev in vdevs.iter_mut() {
         for leaf in vdev.disks.iter_mut() {
+            // `leaf.name` is the display guess; a leaf whose node is gone
+            // would otherwise be linked to the NEW disk that took its kernel
+            // name (`zfs::resolved_kernel_name`).
+            if !leaf.path.is_empty() && zfs::resolved_kernel_name(&leaf.path).is_none() {
+                continue;
+            }
             if let Some((disk_id, size)) = disks.get(&leaf.name) {
                 leaf.disk_id = Some(disk_id.clone());
                 leaf.size_bytes = *size;
@@ -1411,6 +1460,53 @@ errors: No known data errors\n";
         assert_eq!(data_disks, 3);
         assert_eq!(tolerance, 1);
         assert_eq!(layout_summary(&s.vdevs), "raidz1");
+    }
+
+    /// A leaf state word the parser does not know, or none at all, is not a
+    /// failure: the disk it is graded by reads `unknown`, while the pool view
+    /// still shows `unavail` (its card and the fleet header must not call an
+    /// uninterpretable vdev healthy). Only a real FAULTED/UNAVAIL grades
+    /// `faulted`/`unavail`.
+    #[test]
+    fn an_unrecognised_leaf_state_grades_unknown_not_unavail() {
+        let text = "  pool: tank\n\
+ state: DEGRADED\n\
+config:\n\
+\n\
+\tNAME        STATE     READ WRITE CKSUM\n\
+\ttank        DEGRADED     0     0     0\n\
+\t  mirror-0  DEGRADED     0     0     0\n\
+\t    sda     FAULTED      3     0     0\n\
+\t    sdb     UNAVAIL      0     0     0\n\
+\t    sdc     SPLIT        0     0     0\n\
+\t  sdd\n\
+\n\
+errors: No known data errors\n";
+        let s = parse_status(text);
+        let graded: Vec<(Option<&str>, &str, &str, &str)> = s
+            .leaves
+            .iter()
+            .map(|l| (l.kernel_name.as_deref(), l.state, l.role.as_str(), l.kind.as_str()))
+            .collect();
+        assert_eq!(
+            graded,
+            [
+                (Some("sda"), "faulted", "data", "mirror"),
+                (Some("sdb"), "unavail", "data", "mirror"),
+                (Some("sdc"), "unknown", "data", "mirror"),
+                (Some("sdd"), "unknown", "data", "disk"),
+            ]
+        );
+        // The pool view keeps its conservative reading of the same words.
+        let shown: Vec<&str> = s
+            .vdevs
+            .iter()
+            .flat_map(|v| &v.disks)
+            .map(|d| d.state.as_str())
+            .collect();
+        assert_eq!(shown, ["faulted", "unavail", "unavail", "unavail"]);
+        assert_eq!(leaf_grading_state(""), "unknown");
+        assert_eq!(leaf_grading_state("avail"), "online");
     }
 
     #[test]

@@ -373,3 +373,93 @@ test('two polls with changed used bytes, last sync and state keep the Elastic Ar
   assert.notEqual(card.querySelector('[data-f="last-sync"]').textContent, lastSyncBefore, 'the last-sync date actually updated');
   screen.dispose();
 });
+
+// M9 (critic-mockups-n01-n10-2026-09-21.md, n05:267,273,286): the Elastic
+// card lacked the usage percentage, the Dyski row and "Sync teraz". The mover
+// has no pill or button here on purpose (owner decision: moving is automatic).
+test('the Elastic card shows the usage percentage and the Dyski row, and no mover', async () => {
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: { pools: [], freeDisks: [] },
+    tentaNasElasticArraysListRequest: { arrays: [elasticArray({ cacheDisks: [{ sizeBytes: GiB }] })] },
+    tentaNasDisksListRequest: { disks: [] },
+  });
+  screen.later = () => {};
+  try {
+    const body = mount();
+    await drawPools(screen, body);
+    await flush();
+    const card = body.querySelector('.pool-card[data-array="media"]');
+    assert.equal(card.querySelector('[data-f="cap-value"]').textContent, '5.0 GiB / 20 GiB użyteczne (25%)');
+    assert.equal(card.querySelector('[data-f="disks"]').textContent, '2 danych + 1 parity + 1 cache');
+    assert.doesNotMatch(card.textContent, /Mover/i);
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('"Sync teraz" on the Elastic card sends one sync through sudo, locks while in flight and follows the job', async () => {
+  let release;
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: { pools: [], freeDisks: [] },
+    tentaNasElasticArraysListRequest: { arrays: [elasticArray({ enabled: true, parityRunAvailable: true })] },
+    tentaNasDisksListRequest: { disks: [] },
+    tentaNasElasticArraySyncRequest: () => new Promise((resolve) => { release = resolve; }),
+  });
+  screen.later = () => {};
+  try {
+    const body = mount();
+    await drawPools(screen, body);
+    await flush();
+    const card = body.querySelector('.pool-card[data-array="media"]');
+    const sync = card.querySelector('[data-act="array-sync"]');
+    assert.equal(sync.hasAttribute('disabled'), false);
+    let opened = null;
+    screen.openArray = (name) => { opened = name; };
+    click(sync);
+    await flush();
+    assert.equal(opened, null, 'the button does not open the detail');
+    assert.equal(sync.hasAttribute('disabled'), true, 'locked while the request is in flight');
+    click(sync);
+    await flush();
+    const sent = screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest');
+    assert.equal(sent.length, 1, 'a second click in flight sends nothing');
+    assert.deepEqual(sent[0].payload, { name: 'media', sudoPassword: 'hunter2' });
+    release({ job: { jobId: 'sync-1' } });
+    await flush(); await flush();
+    assert.equal(screen.jobLogs[0].jobId, 'sync-1');
+    assert.ok(body.querySelector('.pool-card[data-array="media"] [data-act="array-sync"]') === sync, 'the button survives');
+    assert.equal(sync.hasAttribute('disabled'), false, 'unlocked again');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('"Sync teraz" is disabled with the reason as its tooltip where the node would refuse it', async () => {
+  const cases = [
+    [elasticArray({ enabled: true, parityRunAvailable: true }), { admin: false }, /administrator/i],
+    [elasticArray({ enabled: true, parityRunAvailable: true, parityDisks: [] }), {}, /Bez ochrony parity/],
+    [elasticArray({ enabled: true, parityRunAvailable: false }), {}, /aktywna, włączona macierz/],
+    [elasticArray({ enabled: true, parityRunAvailable: true, snapraid: { history: [{ kind: 'sync', outcome: 'running' }] } }), {}, /W toku/],
+  ];
+  for (const [array, options, reason] of cases) {
+    const screen = fakeScreen({
+      tentaNasPoolsListRequest: { pools: [], freeDisks: [] },
+      tentaNasElasticArraysListRequest: { arrays: [array] },
+      tentaNasDisksListRequest: { disks: [] },
+    }, options);
+    screen.later = () => {};
+    try {
+      const body = mount();
+      await drawPools(screen, body);
+      await flush();
+      const sync = body.querySelector('[data-act="array-sync"]');
+      assert.equal(sync.hasAttribute('disabled'), true, String(reason));
+      assert.match(sync.getAttribute('title'), reason);
+      click(sync);
+      await flush();
+      assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest').length, 0);
+    } finally {
+      screen.dispose();
+    }
+  }
+});

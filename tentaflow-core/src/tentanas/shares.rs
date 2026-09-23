@@ -1203,12 +1203,44 @@ pub fn holds_data(source_path: &str) -> bool {
 // =============================================================================
 
 /// The share source browser. An empty `path` lists the pool mountpoints and
-/// the Elastic Array unions; any other path must be one of them or below it,
-/// so the browser can never walk out of the node's storage.
-pub async fn browse(db: &DbPool, path: &str) -> Result<(String, Vec<NasDirEntry>)> {
+/// the ASKING ORGANISATION'S Elastic Array unions; any other path must be one
+/// of them or below it, so the browser can never walk out of the node's
+/// storage — nor into another tenant's.
+///
+/// WHY `owner`: the node's database holds every tenant's arrays, and this used
+/// to read them all (`elastic_arrays_all`), so the wizard of org B listed org
+/// A's array names and browsed A's files. Pools stay listed for everybody —
+/// they are node hardware every node admin sees — and another organisation's
+/// union answers exactly like a path that is on no pool at all. The share
+/// CREATE path resolves against the same set (`share_create`), so the browser
+/// never offers a place the create would refuse.
+pub async fn browse(
+    db: &DbPool,
+    owner: &tentanas_helper::elastic::ElasticOwner,
+    path: &str,
+) -> Result<(String, Vec<NasDirEntry>)> {
     let datasets = super::datasets::list("").await.map_err(|e| anyhow!("{e}"))?;
-    let arrays = store::elastic_arrays_all(db)?;
+    let own = store::elastic_arrays(db, owner)?;
+    let foreign: Vec<String> = store::elastic_arrays_all(db)?
+        .iter()
+        .filter(|a| !own.iter().any(|o| o.name == a.name))
+        .map(|a| a.union_path())
+        .collect();
     let shares = store::list_shares(db)?;
+    browse_in(&datasets, &own, &foreign, &shares, path)
+}
+
+/// `browse` over what it read, so a fixture can decide every answer.
+/// `foreign_unions` are the unions of every OTHER organisation's arrays on
+/// the node: never listed, never entered, even where a pool's mountpoint
+/// happens to contain them.
+fn browse_in(
+    datasets: &[NasDataset],
+    arrays: &[ElasticArrayRow],
+    foreign_unions: &[String],
+    shares: &[ShareRow],
+    path: &str,
+) -> Result<(String, Vec<NasDirEntry>)> {
     let shared_as = |p: &str| -> Vec<String> {
         shares
             .iter()
@@ -1222,6 +1254,7 @@ pub async fn browse(db: &DbPool, path: &str) -> Result<(String, Vec<NasDirEntry>
             .find(|d| d.mountpoint.as_deref() == Some(p))
             .map(|d| d.name.clone())
     };
+    let foreign = |p: &str| foreign_unions.iter().any(|u| at_or_below(u, p));
     if path.is_empty() {
         let mut entries: Vec<NasDirEntry> = datasets
             .iter()
@@ -1249,7 +1282,14 @@ pub async fn browse(db: &DbPool, path: &str) -> Result<(String, Vec<NasDirEntry>
         }));
         return Ok((String::new(), entries));
     }
-    let source = resolve_source(&datasets, &arrays, path)?;
+    // Refused with the very sentence a path on no pool gets from
+    // `source_owner`, so the answer does not confirm the union exists.
+    if foreign(path) {
+        return Err(anyhow!(
+            "'{path}' is not under a pool mountpoint or an Elastic Array union of this node"
+        ));
+    }
+    let source = resolve_source(datasets, arrays, path)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&source.path)
         .map_err(|e| anyhow!("'{}' cannot be listed: {e}", source.path))?
@@ -1265,6 +1305,12 @@ pub async fn browse(db: &DbPool, path: &str) -> Result<(String, Vec<NasDirEntry>
             continue;
         }
         let child = format!("{}/{name}", source.path.trim_end_matches('/'));
+        // Another tenant's union, and the branch root that holds every
+        // array's disks by name, are left out even when a pool's mountpoint
+        // is their parent directory.
+        if foreign(&child) || tentanas_helper::elastic::is_branch_path(&format!("{child}/")) {
+            continue;
+        }
         entries.push(NasDirEntry {
             dataset: dataset_at(&child),
             shared_as: shared_as(&child),
@@ -1990,6 +2036,38 @@ mod tests {
             state: state.to_string(),
             ..Default::default()
         }
+    }
+
+    /// The browser lists the pools (node hardware, everybody's) and the
+    /// ASKING organisation's arrays — never another tenant's — and entering
+    /// another tenant's union answers with the sentence a path on no pool
+    /// gets, even on a node whose pool is mounted at `/mnt` itself and would
+    /// otherwise contain that union.
+    #[test]
+    fn the_source_browser_shows_only_the_asking_tenants_arrays() {
+        let datasets = vec![dataset("tank", "/mnt/tank", true)];
+        let own = vec![array("alpha", "active")];
+        let foreign = vec![array("bravo", "active").union_path()];
+        let (path, entries) = browse_in(&datasets, &own, &foreign, &[], "").expect("root");
+        assert_eq!(path, "");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["tank", "alpha"]);
+        let listed = serde_json::to_string(&entries).expect("json");
+        assert!(!listed.contains("bravo"), "{listed}");
+
+        let refusal = |datasets: &[NasDataset], path: &str| {
+            browse_in(datasets, &own, &foreign, &[], path)
+                .expect_err(path)
+                .to_string()
+                .replace(path, "<path>")
+        };
+        let nowhere = refusal(&datasets, "/mnt/nothing");
+        assert_eq!(refusal(&datasets, &foreign[0]), nowhere);
+        assert_eq!(refusal(&datasets, &format!("{}/filmy", foreign[0])), nowhere);
+        // A pool mounted at `/mnt` would make `/mnt/bravo` a directory of the
+        // pool; the other tenant's union is still refused, the same way.
+        let at_mnt = vec![dataset("big", "/mnt", true)];
+        assert_eq!(refusal(&at_mnt, &foreign[0]), nowhere);
     }
 
     #[test]

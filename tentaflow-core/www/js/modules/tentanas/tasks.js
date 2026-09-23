@@ -62,6 +62,58 @@ export function jobSubject(j) {
   return { text: subject, title: '' };
 }
 
+// ===== A schedule's last outcome (n15 B2).
+//
+// The scheduler does not store an outcome: it stores its own sentence,
+// `started job <uuid>` or `failed to start: <error>` (scheduler.rs, for the
+// pool, Elastic and snapshot cadences alike). Feeding that sentence to
+// `schedules.result_*` printed the raw key with the UUID glued on, and no
+// "failed" chip could ever fire. The real outcome is the named job's status,
+// so it is resolved from the job itself; the job id never becomes text.
+//
+// Every sentence the scheduler stores (scheduler.rs; `last_result` is
+// written nowhere else):
+// - `started job <uuid>` — the pool scrub/TRIM, Elastic and snapshot
+//   cadences, when the spawn worked;
+// - `failed to start: <error>` — the same cadences, when it was refused;
+// - `pominięto: <why>` — a scheduled Elastic Sync skipped because parity
+//   errors await a repair (`elastic::scheduled_sync_blocker`). No job exists
+//   for it, and it is not a failure: the slot was declined on purpose;
+// - '' — never ran, and always for the SMART pair (dispatch sends none).
+// The bare words in RESULT_WORDS are an older stored form, still read.
+//
+// `statusOf(jobId)` returns the job's status, or null while it is not known
+// (not loaded yet, or the job is gone). Returns `{ label, failed, skipped,
+// title }`, or null when there is no outcome to show — never a raw key.
+const RESULT_WORDS = new Set(['ok', 'succeeded', 'failed', 'skipped']);
+const STARTED_JOB = /^started job (\S+)$/;
+const FAILED_TO_START = /^failed to start:?\s*/;
+const SKIPPED = /^pominięto:?\s*/;
+const JOB_STATUSES = new Set(['queued', 'running', 'succeeded', 'done', 'failed', 'blocked', 'cancelled']);
+// The statuses a job never leaves: only these may be cached for good.
+const FINISHED_JOB_STATUSES = new Set(['succeeded', 'done', 'failed', 'cancelled']);
+
+export function scheduleOutcome(lastResult, statusOf = () => null) {
+  const raw = String(lastResult || '').trim();
+  if (!raw) return null;
+  if (RESULT_WORDS.has(raw)) return { label: T('schedules.result_' + raw), failed: raw === 'failed', skipped: raw === 'skipped', title: '' };
+  if (FAILED_TO_START.test(raw)) {
+    return { label: T('schedules.result_failed'), failed: true, skipped: false, title: raw.replace(FAILED_TO_START, '') };
+  }
+  // The reason is the node's own sentence: it belongs in the tooltip, and
+  // the row itself reads the translated word.
+  if (SKIPPED.test(raw)) {
+    return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: raw.replace(SKIPPED, '') };
+  }
+  const started = STARTED_JOB.exec(raw);
+  const status = started ? statusOf(started[1]) : null;
+  if (!JOB_STATUSES.has(status)) return null;
+  if (status === 'succeeded' || status === 'failed') {
+    return { label: T('schedules.result_' + status), failed: status === 'failed', skipped: false, title: '' };
+  }
+  return { label: T('jobs.status_' + status), failed: false, skipped: false, title: '' };
+}
+
 function titleAttr(title) {
   return title ? ` title="${escapeAttr(title)}"` : '';
 }
@@ -157,13 +209,50 @@ export async function drawTasks(screen, body) {
           <tf-column key="task" label="${escapeAttr(T('jobs.col_task'))}" renderer="html" fill></tf-column>
           <tf-column key="node" label="${escapeAttr(T('jobs.col_node'))}" renderer="html" nowrap hide-below="900"></tf-column>
           <tf-column key="startedAt" label="${escapeAttr(T('jobs.col_started'))}" renderer="html" nowrap></tf-column>
-          <tf-column key="duration" label="${escapeAttr(T('jobs.col_duration'))}" renderer="html" nowrap hide-below="1000"></tf-column>
+          <tf-column key="duration" label="${escapeAttr(T('jobs.col_duration'))}" renderer="html" nowrap hide-below="1024"></tf-column>
           <tf-column key="result" label="${escapeAttr(T('jobs.col_result'))}" renderer="html"></tf-column>
         </tf-table>
       </div>
     </div>`;
 
   const state = { jobs: [], done: [], filter: 'all', schedules: null, snapshotSchedules: [] };
+  // Statuses of jobs a schedule row names but the jobs list (newest
+  // JOBS_LIMIT) no longer carries. A FINISHED status is fetched once and kept
+  // for good; one that can still move (queued, running, blocked) is only the
+  // answer of that moment, so every schedules poll marks it for one more read
+  // (`rereadUnfinishedJobs`) until it finishes. A job that cannot be read at
+  // all is remembered as unknown (null) and never asked for again.
+  const namedJobs = new Map();
+  const jobsToReread = new Set();
+  const jobsInFlight = new Set();
+  function statusOf(jobId) {
+    const listed = state.jobs.find((j) => j.jobId === jobId);
+    if (listed) return listed.status;
+    // Before the first jobs list arrives, most named jobs are simply in it.
+    if (!state.jobsLoaded) return null;
+    const known = namedJobs.has(jobId);
+    const last = known ? namedJobs.get(jobId) : null;
+    if ((known && !jobsToReread.has(jobId)) || jobsInFlight.has(jobId)) return last;
+    jobsToReread.delete(jobId);
+    jobsInFlight.add(jobId);
+    // The last status read stays on screen while the next one is out.
+    namedJobs.set(jobId, last);
+    screen.nas('tentaNasJobGetRequest', { jobId }).then((res) => {
+      jobsInFlight.delete(jobId);
+      if (screen.disposed || !body.isConnected || !res?.job?.status) return;
+      if (namedJobs.get(jobId) === res.job.status) return;
+      namedJobs.set(jobId, res.job.status);
+      paintSchedules();
+      paintProtection();
+    }, () => { jobsInFlight.delete(jobId); });
+    return last;
+  }
+  function rereadUnfinishedJobs() {
+    for (const [jobId, status] of namedJobs) {
+      if (status !== null && !FINISHED_JOB_STATUSES.has(status)) jobsToReread.add(jobId);
+    }
+  }
+  const outcomeOf = (row) => scheduleOutcome(row?.lastResult, statusOf);
   // A parked red-path operation is a task of this node like any other, so the
   // list sits with the jobs and shares their refresh cadence.
   const approvals = wireApprovals(screen, body, { onExecuted: () => refreshJobs() });
@@ -244,6 +333,7 @@ export async function drawTasks(screen, body) {
       const res = await screen.nas('tentaNasJobsListRequest', { limit: JOBS_LIMIT });
       if (screen.disposed || !body.isConnected) return;
       state.jobs = res.jobs || [];
+      state.jobsLoaded = true;
       const running = state.jobs.filter((j) => j.status === 'running' || j.status === 'queued');
       state.done = state.jobs.filter((j) => !running.includes(j));
       if (!running.length) {
@@ -258,6 +348,10 @@ export async function drawTasks(screen, body) {
       }
       setAttr(body.querySelector('#nas-jobs-count'), 'label', String(running.length));
       paintHistory();
+      // A schedule row's outcome IS its job's status: a scheduled scrub that
+      // finishes turns its row from "w toku" to OK/błąd on this poll, not 30 s
+      // later. Both painters write only what changed.
+      if (state.schedules) { paintSchedules(); paintProtection(); }
     } catch (e) {
       if (screen.disposed || !body.isConnected) return;
       toast(T('jobs.failed', { error: errMessage(e) }), 'error');
@@ -287,6 +381,7 @@ export async function drawTasks(screen, body) {
       if (screen.disposed || !body.isConnected) return;
       state.schedules = all;
       state.snapshotSchedules = snaps.schedules || [];
+      rereadUnfinishedJobs();
       paintSchedules();
       paintProtection();
     } catch (e) {
@@ -310,7 +405,7 @@ export async function drawTasks(screen, body) {
     const left = snaps.length ? snaps.map((r) => `
       <div class="sr"><span class="k">${sprite('save')} ${escapeHtml(T('schedules.prot_snapshots_of', { dataset: r.subject }))}</span><span class="v">${
         !r.enabled ? chip('warn', T('schedule.off'))
-          : r.lastResult === 'failed' ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(r.lastRunAt) }))
+          : outcomeOf(r)?.failed ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(r.lastRunAt) }))
             : r.lastRunAt ? chip('ok', T('schedules.prot_last', { t: fmtAgo(r.lastRunAt) })) : chip('info', T('schedules.prot_pending', { t: fmtIn(r.nextRunAt) }))}${
         protectDays(r.subject) ? ` ${chip('ok', T('schedules.prot_protected', { n: protectDays(r.subject) }))}` : ''}</span></div>`).join('')
       : `<div class="sr"><span class="k">${sprite('save')} ${escapeHtml(T('schedules.prot_snapshots'))}</span><span class="v">${chip('warn', T('schedules.prot_none'))}</span></div>`;
@@ -318,7 +413,7 @@ export async function drawTasks(screen, body) {
       ...(scrub.length ? scrub.map((r) => `
         <div class="sr"><span class="k">${sprite('refresh')} ${escapeHtml(T('schedules.prot_scrub_of', { pool: r.subject }))}</span><span class="v">${
           !r.enabled ? chip('warn', T('schedule.off'))
-            : r.lastResult === 'failed' ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(r.lastRunAt) }))
+            : outcomeOf(r)?.failed ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(r.lastRunAt) }))
               : escapeHtml(r.nextRunAt ? T('schedules.prot_next', { t: fmtIn(r.nextRunAt), when: fmtSchedule(r.schedule) }) : '—')}</span></div>`)
         : [`<div class="sr"><span class="k">${sprite('refresh')} ${escapeHtml(T('schedules.prot_scrub'))}</span><span class="v">${chip('warn', T('schedules.prot_none'))}</span></div>`]),
       // The wire has NO real pass/fail for SMART here: `smart` (NasSmartSchedule)
@@ -332,7 +427,7 @@ export async function drawTasks(screen, body) {
         return `<div class="sr"><span class="k">${sprite('cylinder')} ${escapeHtml(T('schedules.prot_smart'))}</span><span class="v">${
           !smart.enabled ? chip('warn', T('schedule.off'))
             : !smart.lastShortAt ? chip('info', T('schedules.prot_pending', { t: fmtIn(smart.nextShortAt) }))
-              : shortRow?.lastResult === 'failed' ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(smart.lastShortAt) }))
+              : outcomeOf(shortRow)?.failed ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(smart.lastShortAt) }))
                 : chip('info', T('schedules.prot_last', { t: fmtAgo(smart.lastShortAt) }))}</span></div>`;
       })(),
     ].join('');
@@ -392,7 +487,9 @@ export async function drawTasks(screen, body) {
     patchKeyedList(list, items.map((it) => ({ key: scheduleKey(it), html: scheduleSkeleton(it) })));
     items.forEach((it, i) => {
       const rowEl = list.children[i];
-      setText(rowEl.querySelector('[data-role="sub"]'), it.sub);
+      const sub = rowEl.querySelector('[data-role="sub"]');
+      setText(sub, it.sub);
+      setAttr(sub, 'title', it.subTitle || '');
       const toggle = rowEl.querySelector('[data-act="toggle"]');
       setAttr(toggle, 'checked', it.enabled);
       setAttr(toggle, 'title', it.enabled ? T('schedule.on') : T('schedule.off'));
@@ -421,22 +518,25 @@ export async function drawTasks(screen, body) {
   const scheduleItem = (r) => {
     // The three Elastic cadences (§5.3). `subject` is the ARRAY, and the kind
     // is prefixed so an array's scrub is never mistaken for a pool's.
+    const outcome = outcomeOf(r);
+    const subTitle = r.lastRunAt ? outcome?.title || '' : '';
     if (r.kind.startsWith('elastic_')) {
       const verb = r.kind.slice('elastic_'.length);
       return {
+        subTitle,
         kind: r.kind, row: r, verb, enabled: r.enabled,
         icon: verb === 'mover' ? 'transform' : verb === 'sync' ? 'refresh' : 'search',
         name: T('schedules.elastic_' + verb + '_name', { array: r.subject }),
         pills: [fmtSchedule(r.schedule)],
         // The stored result is the scheduler's own sentence ("started job …"),
-        // not one of the `result_*` labels, so the row says WHEN it last ran
-        // and leaves the outcome to the job the log links to.
+        // so the outcome shown is the named job's status (`scheduleOutcome`).
         //
         // The mover row is not a cadence the array needs: moving is automatic,
         // and this row exists only because an admin saved a WINDOW that
         // restricts it. So it also says what its switch means for the files.
         sub: [
           r.lastRunAt ? T('schedules.last_run', { t: fmtAgo(r.lastRunAt) }) : T('schedules.never_ran'),
+          ...(r.lastRunAt && outcome ? [outcome.label] : []),
           ...(verb === 'mover' ? [T(r.enabled ? 'schedules.elastic_mover_window_on' : 'schedules.elastic_mover_window_off')] : []),
         ].join(' · '),
       };
@@ -448,7 +548,11 @@ export async function drawTasks(screen, body) {
         kind: r.kind, row: r, icon: r.kind === 'trim' ? 'zap' : 'refresh', enabled: r.enabled,
         name: T('schedules.' + r.kind + '_name', { pool: r.subject }),
         pills: [fmtSchedule(r.schedule)],
-        sub: r.lastRunAt ? T('schedules.scrub_sub', { date: fmtDate(r.lastRunAt), result: T('schedules.result_' + (r.lastResult || 'unknown')) }) : T('schedules.never_ran'),
+        subTitle,
+        // No outcome known (yet) → only WHEN it ran, never a guessed result.
+        sub: !r.lastRunAt ? T('schedules.never_ran')
+          : outcome ? T('schedules.scrub_sub', { date: fmtDate(r.lastRunAt), result: outcome.label })
+            : T('schedules.last_run', { t: fmtDate(r.lastRunAt) }),
       };
     }
     const full = state.snapshotSchedules.find((s) => s.dataset === r.subject) || null;
@@ -471,8 +575,8 @@ export async function drawTasks(screen, body) {
         T('schedules.smart_pill_long', { when: fmtSchedule(smart.long || long?.schedule) }),
       ],
       sub: T('schedules.smart_sub', {
-        short: smart.lastShortAt ? `${fmtAgo(smart.lastShortAt)} · ${T('schedules.result_' + (short?.lastResult || 'unknown'))}` : T('never'),
-        long: smart.lastLongAt ? `${fmtDate(smart.lastLongAt)} · ${T('schedules.result_' + (long?.lastResult || 'unknown'))}` : T('never'),
+        short: smart.lastShortAt ? `${fmtAgo(smart.lastShortAt)} · ${outcomeOf(short)?.label ?? T('schedules.result_unknown')}` : T('never'),
+        long: smart.lastLongAt ? `${fmtDate(smart.lastLongAt)} · ${outcomeOf(long)?.label ?? T('schedules.result_unknown')}` : T('never'),
       }),
     };
   };

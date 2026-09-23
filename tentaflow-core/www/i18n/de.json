@@ -5725,6 +5725,7 @@
       "disks_special": "{n} special",
       "disks_log": "{n} log",
       "disks_cache": "{n} cache",
+      "disks_parity": "{n} Parität",
       "disks_spare": "spare",
       "free_unused": "ungenutzt",
       "layout_chip": "ZFS {layout}",
@@ -6237,7 +6238,8 @@
       "iops_delta": "{pct}% zum Stundenmittel",
       "throughput_suffix": "MB/s R",
       "throughput_delta": "{w} MB/s W · Latenz Ø {lat} ms",
-      "iops_avg": "Stundenmittel {n} IOPS"
+      "iops_avg": "Stundenmittel {n} IOPS",
+      "capacity_no_pools": "keine Pools oder Arrays"
     },
     "wizard": {
       "step_restore": "Aus Sicherung wiederherstellen",
@@ -6542,7 +6544,8 @@
       "segment_import": "Import",
       "preview_explain": "Der Export enthält den <b>Sollzustand</b> (desired state): Aufbau der Pools und vdevs, Datasets mit Eigenschaften, SMB/NFS-Freigaben, Freigabe-Benutzer und Zeitpläne. Er <b>enthält keine Geheimnisse</b> (Passwörter der Freigabe-Benutzer — nach dem Import neu zu setzen) und keine Nutzdaten.",
       "preview": "Vorschau (Ausschnitt)",
-      "download": "Datei herunterladen"
+      "download": "Datei herunterladen",
+      "kind_target": "Target"
     },
     "title": "TentaNas",
     "load_failed": "TentaNas konnte nicht geladen werden",
@@ -6654,7 +6657,20 @@
       "legend_ok": "kein Symptom in irgendeiner Quelle",
       "legend_warn": "ein Symptom, das Beobachtung oder eine Entscheidung braucht (neue Reallokationen, Temperatur)",
       "legend_crit": "Festplatte FAULTED/UNAVAIL — Austausch erforderlich",
-      "legend_note": "Metriken kommen per Push; die Sparkline zeigt die letzten {w}"
+      "legend_note": "Metriken kommen per Push; die Sparkline zeigt die letzten {w}",
+      "locate_failed": "LED von {name}: Befehl fehlgeschlagen — {error}",
+      "reason_realloc": "{n} realloz.",
+      "reason_realloc_growing": "realloz. {from} → {to}",
+      "reason_pending": "{n} ausst. Sekt.",
+      "reason_media": "{n} Medienfehler",
+      "reason_crc": "{n} CRC",
+      "reason_wear": "{n}% verschlissen",
+      "reason_smart_failed": "SMART: Fehler",
+      "reason_self_test_failed": "Selbsttest fehlgeschlagen",
+      "reason_temp_over": "{t}°C, über dem Limit von {limit}°C",
+      "reason_zfs_faulted": "ZFS: ausgefallen (FAULTED)",
+      "reason_zfs_unavail": "ZFS: nicht verfügbar (UNAVAIL)",
+      "reason_no_smart": "keine SMART-Daten"
     },
     "disk": {
       "identification": "Physische Identifikation",
@@ -6719,7 +6735,15 @@
       "st_status_running": "läuft",
       "st_status_unknown": "unbekannt",
       "edit_schedule": "Zeitplan bearbeiten",
-      "health_chip": "{status}: {reason}"
+      "health_chip": "{status}: {reason}",
+      "smart_busy": "Auf dieser Festplatte läuft bereits ein SMART-Test — ein weiterer kann nach dessen Ende gestartet werden",
+      "array_title": "Elastic Array ({array})",
+      "other_org_array_title": "Array einer anderen Organisation",
+      "other_org_array_info": "Diese Festplatte gehört zu einem Elastic Array einer anderen Organisation auf diesem Node. Name und Zustand sind aus dieser Organisation nicht sichtbar — jene Organisation verwaltet es.",
+      "array_name": "Array",
+      "array_part": "Rolle im Array",
+      "array_replace_withdrawn": "Dies ist ein Zweig eines Elastic Array, kein Mitglied eines ZFS-Pools — es gibt keine READ/WRITE/CKSUM-Zähler. Das Ersetzen einer Array-Festplatte ist in dieser Version nicht verfügbar: Das Array bedient weiter aus den vorhandenen Festplatten, und eine Reparatur aus der Parität funktioniert für Festplatten, die am Node vorhanden sind.",
+      "array_open": "Array {array} öffnen"
     },
     "elevation": {
       "title": "Systemrechtekanal",
@@ -6893,7 +6917,6 @@
       "chip_warnings": "{n} {n|Warnung|Warnungen} ({nodes})",
       "chip_ok": "Keine Warnungen",
       "chip_services": "Dienste laufen",
-      "chip_services_down": "Dienste gestoppt",
       "badge_nas": "{n}× NAS: {nodes}",
       "badge_channels": "Rechtekanäle: {parts}",
       "badge_channel_part": "{n}× {mode}",
@@ -6931,7 +6954,11 @@
       "severity_critical": "kritisch",
       "severity_warning": "warnung",
       "severity_info": "hinweis",
-      "act_array": "Array"
+      "act_array": "Array",
+      "head_versions": "TentaNas: {list}",
+      "chip_services_down_list": "Dienste gestoppt: {list}",
+      "chip_services_unknown": "Dienste: keine Antwort von {nodes}",
+      "chip_services_none": "Keine Freigabedienste"
     },
     "node": {
       "head_sub_node": "Knoten {name}",
@@ -7079,7 +7106,12 @@
       "spare_ready": "der Pool hat ein Spare bereit",
       "no_spare": "kein Spare im Pool — halten Sie eine Ersatzplatte bereit",
       "disk_urgent": "Tauschen Sie diese Platte jetzt: {reason}. {spare}.",
-      "disk_advice": "Planen Sie den Tausch dieser Platte: {reason}. {spare}."
+      "disk_advice": "Planen Sie den Tausch dieser Platte: {reason}. {spare}.",
+      "severity_other": "Empfehlung",
+      "reason_grew": "reallozierte Sektoren stiegen in 7 Tagen von {from} auf {to}",
+      "reason_for_days": "{status} seit {days} {days|Tag|Tagen}",
+      "reason_other": "der Knoten empfiehlt, diese Platte zu tauschen",
+      "disk_other": "Der Knoten empfiehlt, diese Platte zu tauschen. {spare}."
     },
     "targets": {
       "sessions_unmeasured": "Unbekannt bedeutet nicht null",

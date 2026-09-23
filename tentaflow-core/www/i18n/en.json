@@ -6505,7 +6505,8 @@
       "iops_delta": "{pct}% vs hourly average",
       "throughput_suffix": "MB/s R",
       "throughput_delta": "{w} MB/s W · avg latency {lat} ms",
-      "iops_avg": "hourly average {n} IOPS"
+      "iops_avg": "hourly average {n} IOPS",
+      "capacity_no_pools": "no pools or arrays"
     },
     "overview": {
       "io_title": "IO throughput — all pools",
@@ -6601,7 +6602,20 @@
       "legend_ok": "no symptom in any source",
       "legend_warn": "a symptom that needs watching or a decision (new reallocations, temperature)",
       "legend_crit": "disk FAULTED/UNAVAIL — replacement required",
-      "legend_note": "Metrics arrive by push; the sparkline covers the last {w}"
+      "legend_note": "Metrics arrive by push; the sparkline covers the last {w}",
+      "locate_failed": "{name} LED: the command failed — {error}",
+      "reason_realloc": "{n} realloc.",
+      "reason_realloc_growing": "realloc. {from} → {to}",
+      "reason_pending": "{n} pending sect.",
+      "reason_media": "{n} media err.",
+      "reason_crc": "{n} CRC",
+      "reason_wear": "{n}% worn",
+      "reason_smart_failed": "SMART: failed",
+      "reason_self_test_failed": "self-test failed",
+      "reason_temp_over": "{t}°C, over the {limit}°C limit",
+      "reason_zfs_faulted": "ZFS: faulted (FAULTED)",
+      "reason_zfs_unavail": "ZFS: unavailable (UNAVAIL)",
+      "reason_no_smart": "no SMART data"
     },
     "disk": {
       "identification": "Physical identification",
@@ -6666,7 +6680,15 @@
       "st_status_running": "in progress",
       "st_status_unknown": "unknown",
       "edit_schedule": "Edit schedule",
-      "health_chip": "{status}: {reason}"
+      "health_chip": "{status}: {reason}",
+      "smart_busy": "A SMART test of this disk is already running — start another once it finishes",
+      "array_title": "Elastic Array ({array})",
+      "other_org_array_title": "Another organisation's array",
+      "other_org_array_info": "This disk belongs to an Elastic Array of another organisation on this node. Its name and state are not visible from this organisation — that organisation manages it.",
+      "array_name": "Array",
+      "array_part": "Role in the array",
+      "array_replace_withdrawn": "This is a branch of an Elastic Array, not a member of a ZFS pool — it has no READ/WRITE/CKSUM counters. Replacing an array disk is not available in this version: the array keeps serving from the disks it has, and a repair from parity works for disks present on the node.",
+      "array_open": "Open array {array}"
     },
     "jobs": {
       "history": "Run history",
@@ -7340,6 +7362,7 @@
       "disks_special": "{n} special",
       "disks_log": "{n} log",
       "disks_cache": "{n} cache",
+      "disks_parity": "{n} parity",
       "disks_spare": "spare",
       "free_unused": "unused",
       "layout_chip": "ZFS {layout}",
@@ -8092,7 +8115,8 @@
       "segment_import": "Import",
       "preview_explain": "The export holds the <b>desired state</b>: pool and vdev layout, datasets with properties, SMB/NFS shares, share users and schedules. It <b>contains no secrets</b> (share user passwords — to be set again after import) and no user data.",
       "preview": "Preview (excerpt)",
-      "download": "Download file"
+      "download": "Download file",
+      "kind_target": "Target"
     },
     "refreshed": "last refresh {t}",
     "duration": {
@@ -8109,7 +8133,6 @@
       "chip_warnings": "{n} {n|warning|warnings} ({nodes})",
       "chip_ok": "No warnings",
       "chip_services": "Services running",
-      "chip_services_down": "Services down",
       "badge_nas": "{n}× NAS: {nodes}",
       "badge_channels": "Permission channels: {parts}",
       "badge_channel_part": "{n}× {mode}",
@@ -8147,7 +8170,11 @@
       "severity_critical": "critical",
       "severity_warning": "warning",
       "severity_info": "info",
-      "act_array": "Array"
+      "act_array": "Array",
+      "head_versions": "TentaNas: {list}",
+      "chip_services_down_list": "Services down: {list}",
+      "chip_services_unknown": "Services: no answer from {nodes}",
+      "chip_services_none": "No sharing services"
     },
     "node": {
       "head_sub_node": "node {name}",
@@ -8295,7 +8322,12 @@
       "spare_ready": "the pool has a spare ready to take over",
       "no_spare": "no spare in the pool — get a replacement disk ready",
       "disk_urgent": "Replace this disk now: {reason}. {spare}.",
-      "disk_advice": "Plan a replacement for this disk: {reason}. {spare}."
+      "disk_advice": "Plan a replacement for this disk: {reason}. {spare}.",
+      "severity_other": "recommended",
+      "reason_grew": "reallocated sectors grew from {from} to {to} in 7 days",
+      "reason_for_days": "{status} for {days} {days|day|days}",
+      "reason_other": "the node recommends replacing this disk",
+      "disk_other": "The node recommends replacing this disk. {spare}."
     },
     "targets": {
       "sessions_unmeasured": "Unknown does not mean zero",

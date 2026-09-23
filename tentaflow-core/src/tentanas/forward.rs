@@ -14,6 +14,15 @@
 //       a way for the two to disagree. Delivery is AT LEAST ONCE on purpose —
 //       the mark happens after the send, so a crash in between repeats a line
 //       instead of dropping it.
+//
+//       ONLY NODE-WIDE ALERTS LEAVE. The target is one fleet-wide setting
+//       that any organisation's admin may point anywhere, and `tentanas.db`
+//       holds every tenant's alerts (it is one per node, shared by every
+//       organisation). An alert that belongs to an organisation — an Elastic
+//       Array's, which names the array, or a parked red-path request's — is
+//       therefore never sent to it: it would land in whatever collector the
+//       OTHER tenant configured. Hardware alerts (disks, pools) are node-wide
+//       and every node admin may read them, so they still go.
 // =============================================================================
 
 use std::time::Duration;
@@ -61,7 +70,7 @@ fn stored(main_db: &DbPool, addon_id: &str) -> Option<Stored> {
 pub fn settings(main_db: &DbPool, nas_db: &DbPool, addon_id: &str) -> NasForwardSettings {
     let s = stored(main_db, addon_id).unwrap_or_default();
     NasForwardSettings {
-        pending: store::forward_pending(nas_db, s.include_access).unwrap_or(0),
+        pending: pending(nas_db, s.include_access).unwrap_or(0),
         last_sent_at: store::setting(nas_db, store::SETTING_FORWARD_SENT_AT)
             .ok()
             .flatten(),
@@ -222,6 +231,14 @@ pub fn webhook_body(rows: &[ForwardRow], hostname: &str, node_id: &str) -> serde
     })
 }
 
+// ----- what may leave ---------------------------------------------------------------
+
+/// What still waits to be SENT (`store::forward_pending`): an organisation's
+/// alert never is, so it is never counted.
+fn pending(nas_db: &DbPool, include_access: bool) -> Result<u32> {
+    store::forward_pending(nas_db, include_access)
+}
+
 // ----- one pass ---------------------------------------------------------------------
 
 /// Forwards one batch if forwarding is on and something is waiting. Called
@@ -245,6 +262,9 @@ pub async fn forward_tick(main_db: &DbPool, nas_db: &DbPool) {
 }
 
 async fn forward_once(nas_db: &DbPool, s: &Stored) -> Result<usize> {
+    // Node-wide alerts only: the owner filter is part of the batch query
+    // itself, so an organisation's alert raised during this pass cannot slip
+    // in between two reads (`store::unforwarded_alerts`).
     let mut rows = store::unforwarded_alerts(nas_db, BATCH)?;
     if s.include_access {
         rows.extend(store::unforwarded_access_events(
@@ -252,22 +272,24 @@ async fn forward_once(nas_db: &DbPool, s: &Stored) -> Result<usize> {
             BATCH.saturating_sub(rows.len() as u32).max(1),
         )?);
     }
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let hostname = hostname();
-    let node_id = crate::sync::runtime::local_node_id().unwrap_or_else(|| "local".to_string());
+    if !rows.is_empty() {
+        let hostname = hostname();
+        let node_id = crate::sync::runtime::local_node_id().unwrap_or_else(|| "local".to_string());
 
-    if !s.syslog_target.is_empty() {
-        send_syslog(&s.syslog_target, &rows, &hostname, &node_id).await?;
+        if !s.syslog_target.is_empty() {
+            send_syslog(&s.syslog_target, &rows, &hostname, &node_id).await?;
+        }
+        if !s.webhook_url.is_empty() {
+            send_webhook(&s.webhook_url, &rows, &hostname, &node_id).await?;
+        }
+        // Marked only now: both transports agreed the batch left the node.
+        store::mark_forwarded(nas_db, &rows)?;
+        store::set_setting(nas_db, store::SETTING_FORWARD_SENT_AT, &store::now())?;
+        store::set_setting(nas_db, store::SETTING_FORWARD_ERROR, "")?;
     }
-    if !s.webhook_url.is_empty() {
-        send_webhook(&s.webhook_url, &rows, &hostname, &node_id).await?;
-    }
-    // Marked only now: both transports agreed the batch left the node.
-    store::mark_forwarded(nas_db, &rows)?;
-    store::set_setting(nas_db, store::SETTING_FORWARD_SENT_AT, &store::now())?;
-    store::set_setting(nas_db, store::SETTING_FORWARD_ERROR, "")?;
+    // An organisation's alert is WITHHELD and settled like a sent one, all of
+    // them in one statement: left in the queue they would only pile up.
+    store::settle_withheld_alerts(nas_db)?;
     Ok(rows.len())
 }
 
@@ -333,6 +355,57 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         store::migrate(&conn).expect("migrate");
         Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    /// Every alert row still unmarked, owned or not — what the queue holds.
+    fn unforwarded_alert_rows(p: &DbPool) -> i64 {
+        p.read()
+            .expect("read")
+            .query_row("SELECT COUNT(*) FROM nas_alerts WHERE forwarded_at IS NULL", [], |r| r.get(0))
+            .expect("count")
+    }
+
+    /// An organisation's alert is never in a batch the query hands out — the
+    /// owner is filtered in the SAME statement that selects the batch, so one
+    /// raised mid-pass cannot slip through. However many pile up while
+    /// forwarding is off (more than a batch here), none of them counts as
+    /// pending, and the first pass settles all of them at once.
+    #[tokio::test]
+    async fn owned_alerts_are_never_batched_and_settle_in_one_pass_however_many() {
+        let p = db();
+        {
+            let conn = p.write().expect("write");
+            conn.execute_batch(
+                "INSERT INTO nas_elastic_arrays
+                   (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at) VALUES
+                   ('arr-a','org-a','nas','alpha','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z');",
+            )
+            .expect("array");
+        }
+        let owned = BATCH as usize + 50;
+        for i in 0..owned {
+            store::raise_alert(&p, &format!("elastic:alpha:{i}"), "warning", "elastic-array", "alpha", "Macierz alpha", "")
+                .expect("alert");
+        }
+        store::raise_alert(&p, "disk:a:health", "warning", "disk", "a", "Disk sda: warning", "")
+            .expect("alert");
+
+        // The batch query itself holds only the node-wide alert.
+        let batch = store::unforwarded_alerts(&p, BATCH).expect("batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].subject, "disk:a");
+        assert_eq!(pending(&p, true).expect("pending"), 1, "owned alerts are not a backlog");
+        assert_eq!(unforwarded_alert_rows(&p), owned as i64 + 1);
+
+        let collector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("collector socket");
+        let settings = Stored {
+            enabled: true,
+            syslog_target: collector.local_addr().expect("addr").to_string(),
+            ..Default::default()
+        };
+        assert_eq!(forward_once(&p, &settings).await.expect("pass"), 1);
+        assert_eq!(unforwarded_alert_rows(&p), 0, "every withheld alert settled in one pass");
+        assert_eq!(pending(&p, true).expect("pending"), 0);
     }
 
     #[test]
@@ -444,6 +517,59 @@ mod tests {
         // A replayed mark changes nothing.
         store::mark_forwarded(&p, &batch).expect("mark again");
         assert_eq!(store::forward_pending(&p, true).expect("pending"), 0);
+    }
+
+    /// Two tenants' alerts wait next to a disk alert. The fleet-wide target —
+    /// which ANY organisation's admin may have pointed at its own collector —
+    /// receives the disk alert and nothing that belongs to an organisation;
+    /// the withheld alerts leave the queue all the same, so they neither show
+    /// as a backlog nor come back on the next pass.
+    #[tokio::test]
+    async fn only_node_wide_alerts_reach_the_shared_target() {
+        let p = db();
+        {
+            let conn = p.write().expect("write");
+            conn.execute_batch(
+                "INSERT INTO nas_elastic_arrays
+                   (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at) VALUES
+                   ('arr-a','org-a','nas','alpha','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z'),
+                   ('arr-b','org-b','nas','bravo','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z');",
+            )
+            .expect("arrays");
+        }
+        store::raise_alert(&p, "elastic:alpha:sync", "warning", "elastic-array", "alpha", "Macierz alpha: sync failed", "")
+            .expect("alert");
+        store::raise_alert(&p, "elastic:bravo:sync", "critical", "elastic-array", "bravo", "Macierz bravo: disk missing", "")
+            .expect("alert");
+        store::raise_alert(&p, "disk:a:health", "warning", "disk", "a", "Disk sda: warning", "2 reallocated sectors")
+            .expect("alert");
+        assert_eq!(pending(&p, false).expect("pending"), 1, "only the disk alert waits to be sent");
+
+        let collector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("collector socket");
+        let settings = Stored {
+            enabled: true,
+            syslog_target: collector.local_addr().expect("addr").to_string(),
+            ..Default::default()
+        };
+        assert_eq!(forward_once(&p, &settings).await.expect("pass"), 1);
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), collector.recv(&mut buf))
+            .await
+            .expect("no timeout")
+            .expect("datagram");
+        let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(line.contains("Disk sda: warning"), "{line}");
+        // Nothing else arrives: no second datagram naming either array.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), collector.recv(&mut buf)).await.is_err(),
+            "an organisation's alert reached the shared target"
+        );
+
+        assert_eq!(unforwarded_alert_rows(&p), 0, "withheld rows settled");
+        assert_eq!(pending(&p, false).expect("pending"), 0);
+        // A second pass has nothing to send and sends nothing.
+        assert_eq!(forward_once(&p, &settings).await.expect("pass"), 0);
     }
 
     /// The syslog transport against a REAL socket: the collector is a UDP

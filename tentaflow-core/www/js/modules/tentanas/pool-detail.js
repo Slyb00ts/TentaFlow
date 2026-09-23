@@ -35,7 +35,6 @@ import '/js/components/tf-input.js';
 import '/js/components/tf-checkbox.js';
 import '/js/components/tf-option-row.js';
 import '/js/components/tf-alert.js';
-import '/js/components/tf-breadcrumb.js';
 
 const INNER_TABS = ['topology', 'datasets', 'snapshots', 'stats', 'properties'];
 
@@ -59,10 +58,17 @@ const DATASET_PROPS = {
   acltype: ['posix', 'nfsv4', 'off'],
 };
 
+// How often the replace wizard reads the pool's scan while it follows a
+// replacement (see `pollJob` in openReplaceWizard).
+export const REPLACE_SCAN_EVERY_MS = 5000;
+
 export async function drawPoolDetail(screen, body) {
   const name = screen.pool;
   if (!INNER_TABS.includes(screen.poolTab)) screen.poolTab = 'topology';
   body.innerHTML = `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`;
+  // "Pule › tank" goes into the shell's own breadcrumb, making it the one bar
+  // of the screen: "TentaNas › helios › Pule › tank" (m26).
+  setCrumbs(screen, name);
   const state = { name, res: null, disks: [], freeDisks: [], live: null, ioSamples: [] };
   try {
     [state.res, state.disks] = await Promise.all([
@@ -74,17 +80,14 @@ export async function drawPoolDetail(screen, body) {
     if (screen.disposed || !body.isConnected) return;
     body.innerHTML = `
       <div class="stack">
-        ${crumbs(name)}
         <tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>
       </div>`;
-    wireBack(screen, body);
     return;
   }
   if (screen.disposed || !body.isConnected) return;
 
   body.innerHTML = `
     <div class="stack">
-      ${crumbs(name)}
       <div class="kpi" id="nas-pool-kpi"></div>
       <tf-tabs variant="underline" value="${escapeAttr(screen.poolTab)}" id="nas-pool-tabs">
         <tf-tab id="topology" icon="layers">${escapeHtml(T('pool.tab_topology'))}</tf-tab>
@@ -95,7 +98,6 @@ export async function drawPoolDetail(screen, body) {
       </tf-tabs>
       <div id="nas-pool-tab-body"></div>
     </div>`;
-  wireBack(screen, body);
 
   const refresh = async () => {
     if (screen.disposed || !body.isConnected) return;
@@ -151,25 +153,14 @@ async function loadDisks(screen) {
 }
 const freeOf = (disks) => disks.filter((d) => d.role === 'free');
 
-// The shell's own breadcrumb already says "TentaNas › node"; this one adds
-// the "Pule › tank" tail the mockup shows above the pool header.
-const crumbs = (name) => `
-  <tf-breadcrumb class="nas-crumbs">
-    <tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item>
-    <tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item>
-  </tf-breadcrumb>`;
-
-function wireBack(screen, body) {
-  body.querySelector('.nas-crumbs').addEventListener('click', (e) => {
-    const a = e.target.closest('a');
-    if (!a) return;
-    e.preventDefault();
-    screen.pool = null;
-    screen.dataset = null;
-    screen.clearTimers();
-    screen.setLocation();
-    screen.drawTab();
-  });
+// The shell owns the one breadcrumb of the node view; this view only names
+// its tail. The "Pule" level walks back to the pool list through the shell's
+// `pools` crumb action.
+function setCrumbs(screen, name) {
+  screen.setCrumbTail?.([
+    { label: T('tabs.pools'), act: 'pools', query: `node=${screen.nodeId}&tab=pools` },
+    { label: name },
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1503,6 +1494,11 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   // resilver runs, the rail moves to step 3 and shows its progress and ETA
   // while the job's log keeps growing underneath. A failed PoolGet here is
   // not the job's failure — the job stays the authority, the rail just waits.
+  //
+  // The job is asked every tick (1.5 s: its log is what the admin watches),
+  // the pool only every REPLACE_SCAN_EVERY_MS. A `zpool status` per 1.5 s tick
+  // for the whole of a resilver that runs for hours was pure load on the node
+  // for a rail step and an ETA that do not move that fast.
   const pollJob = async () => {
     if (!win.isConnected || !state.job) return;
     try {
@@ -1521,14 +1517,17 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     if (!win.isConnected) return;
     const s = state.job.status;
     if (s === 'running' || s === 'queued') {
-      try {
-        const r = await screen.nas('tentaNasPoolGetRequest', { name: pool.name });
-        const scan = r.pool?.scan || null;
-        if (resilverActive(scan)) {
-          state.scan = scan;
-          state.step = 2;
-        }
-      } catch { /* the job decides; the rail only waits for the next tick */ }
+      if (Date.now() - (state.scanReadAt || 0) >= REPLACE_SCAN_EVERY_MS) {
+        state.scanReadAt = Date.now();
+        try {
+          const r = await screen.nas('tentaNasPoolGetRequest', { name: pool.name });
+          const scan = r.pool?.scan || null;
+          if (resilverActive(scan)) {
+            state.scan = scan;
+            state.step = 2;
+          }
+        } catch { /* the job decides; the rail only waits for the next read */ }
+      }
       if (!win.isConnected) return;
       paint();
       state.timer = setTimeout(pollJob, POLL_JOB_MODAL_MS);
@@ -1547,7 +1546,8 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   };
 
   // After the job, `PoolGet` is read until the scan is no longer a running
-  // resilver (a job without a follower, or one that returned early).
+  // resilver (a job without a follower, or one that returned early). With no
+  // job left to follow, the pool is the only thing asked, at the pool cadence.
   const pollResilver = async () => {
     if (!win.isConnected) return;
     try {
@@ -1562,7 +1562,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     if (!win.isConnected) return;
     if (resilverActive(state.scan)) {
       paint();
-      state.timer = setTimeout(pollResilver, POLL_JOB_MODAL_MS);
+      state.timer = setTimeout(pollResilver, REPLACE_SCAN_EVERY_MS);
       return;
     }
     const failed = state.scan.kind === 'resilver' && Number(state.scan.errors) > 0;

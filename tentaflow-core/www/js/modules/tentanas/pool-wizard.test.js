@@ -304,3 +304,51 @@ test('a cancelled sudo prompt leaves the summary step armed and sends nothing', 
   win.remove();
   screen.dispose();
 });
+
+// critic-round2-wave2-iter2 MINOR 3: a critical free disk's reason is the
+// node's English (`score_health`). The Elastic parity and cache pickers
+// printed it as the cell's visible text; it now goes through the shared
+// `localizedReason` (format.js) and the sentence is only the cell's tooltip.
+test('the Elastic parity and cache pickers name a critical disk\'s reason in the reader\'s language', async () => {
+  const GB = 1024 ** 3;
+  const elastic = [
+    disk('sda', { sizeBytes: 64 * GB }),
+    disk('sdb', { sizeBytes: 64 * GB }),
+    disk('sdc', { sizeBytes: 64 * GB, health: 'critical', healthReason: 'SMART overall status FAILED; 2 pending sectors' }),
+    disk('sde', { sizeBytes: 64 * GB, health: 'critical', healthReason: 'spindle motor stalled' }),
+    disk('nvme0n1', { kind: 'nvme', sizeBytes: 64 * GB, health: 'critical', healthReason: 'last self-test failed' }),
+  ];
+  const screen = fakeScreen({ tentaNasElasticCapabilitiesRequest: { capabilities: { mergerfs: true, snapraid: true, filesystems: ['xfs'], detail: '' }, freeDisks: elastic } });
+  screen.nodeId = 'node-orion';
+  screen.tab = 'pools';
+  const win = openPoolWizard(screen, {});
+  try {
+    await flush();
+    win.querySelector('#nas-pw-kind').dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'elastic' } }));
+    click(nextBtn(win));
+    for (const id of ['sda', 'sdb']) {
+      const cb = win.querySelector(`#nas-pw-disks [data-disk="${id}"] tf-checkbox`);
+      cb.checked = true;
+      cb.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { checked: true } }));
+    }
+    click(nextBtn(win));
+    await flush();
+    const cell = (host, id) => win.querySelector(`#nas-pw-${host} [data-disk="${id}"]`);
+    const sub = (host, id) => cell(host, id).querySelector('.dc-sub').textContent;
+
+    assert.match(sub('parity', 'sdc'), / · SMART: awaria; 2 oczek\. sekt\.$/);
+    assert.equal(cell('parity', 'sdc').getAttribute('title'), 'SMART overall status FAILED; 2 pending sectors', 'the node\'s sentence is the tooltip');
+    assert.ok(cell('parity', 'sdc').querySelector('tf-checkbox').hasAttribute('disabled'), 'a critical disk stays unpickable');
+    assert.match(sub('parity', 'sde'), / · Awaria$/, 'a sentence this build cannot name falls back to the grade');
+    assert.equal(cell('parity', 'sde').getAttribute('title'), 'spindle motor stalled');
+    assert.ok(!/SMART overall|pending sectors|spindle/.test(win.querySelector('#nas-pw-parity').textContent), 'no English reason is visible text');
+
+    const toggle = win.querySelector('#nas-pw-cache-toggle');
+    toggle.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { checked: true } }));
+    await flush();
+    assert.match(sub('cache', 'nvme0n1'), / · self-test niezaliczony$/);
+    assert.equal(cell('cache', 'nvme0n1').getAttribute('title'), 'last self-test failed');
+  } finally {
+    screen.dispose();
+  }
+});

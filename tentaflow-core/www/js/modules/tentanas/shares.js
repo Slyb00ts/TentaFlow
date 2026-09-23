@@ -252,7 +252,7 @@ export async function drawShares(screen, body) {
           <tf-column key="protocol" label="${escapeAttr(T('shares.col_protocol'))}" renderer="html" nowrap></tf-column>
           <tf-column key="source" label="${escapeAttr(T('shares.col_source'))}" renderer="html" hide-below="900"></tf-column>
           <tf-column key="fleet" label="${escapeAttr(T('shares.col_fleet'))}" renderer="html" nowrap></tf-column>
-          <tf-column key="sessions" label="${escapeAttr(T('shares.col_sessions'))}" renderer="num" hide-below="1000"></tf-column>
+          <tf-column key="sessions" label="${escapeAttr(T('shares.col_sessions'))}" renderer="num" hide-below="1024"></tf-column>
         </tf-table>`;
     if (patchHtml(list, shell)) {
       const table = list.querySelector('#nas-sh-table');
