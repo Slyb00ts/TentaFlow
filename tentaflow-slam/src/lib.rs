@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod carve;
+pub mod chunk_io;
 pub mod eskf;
 pub mod frame;
 pub mod geo;
@@ -15,6 +17,7 @@ pub mod graph;
 pub mod lidar;
 pub mod loop_closure;
 pub mod mapping;
+pub mod occupancy;
 pub mod optimize;
 pub mod pose;
 pub mod service;

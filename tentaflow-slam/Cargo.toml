@@ -12,6 +12,12 @@ nalgebra = { workspace = true }
 tentaflow-sdk-spec = { workspace = true }
 # LZ4 block decode for compressed canonical lidar bodies (matches host encoder).
 lz4_flex = { workspace = true, features = ["safe-decode"] }
+# On-disk map chunks (.tfmc): zstd for the SoA payload, a 32-bit checksum for
+# the footer, thiserror for the reader's refusal reasons.
+zstd = { workspace = true }
+crc32c = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+tempfile = { workspace = true }
