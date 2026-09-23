@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import textwrap
@@ -140,9 +141,14 @@ class LinuxPackagingTests(unittest.TestCase):
         sha256sum = self.commands / "sha256sum"
         sha256sum.write_text('#!/bin/sh\nprintf "%s  %s\n" fixture "$1"\n', encoding="utf-8")
         sha256sum.chmod(0o755)
+        # The stage step pipes cargo metadata into python3. On Windows that name
+        # resolves to the Microsoft Store alias, not an interpreter.
+        python3 = self.commands / "python3"
+        python3.write_text(f'#!/bin/sh\nexec "{Path(sys.executable).as_posix()}" "$@"\n', encoding="utf-8")
+        python3.chmod(0o755)
         for name in ("tentaflow", "tentaflow-meeting", "libwhisper_tf.so"):
             (self.output / name).write_bytes(name.encode())
-        for name in ("libzvec_c_api.so", "libpdfium.so", "libonnxruntime.so.1.26.0"):
+        for name in ("libzvec_c_api.so", "libpdfium.so", "libonnxruntime.so.1.30.0"):
             (self.directory / "native-libs/linux-x86_64/lib-dynamic" / name).write_bytes(name.encode())
         for name in ("LICENSE", "README.md", "scripts/install/tentaflow.service.in"):
             (self.directory / name).write_bytes(b"fixture")
@@ -177,6 +183,20 @@ class LinuxPackagingTests(unittest.TestCase):
         result = self.stage_archive()
         self.assertNotEqual(0, result.returncode)
         self.assertIn("missing required artifact", result.stdout + result.stderr)
+        self.assertFalse((self.directory / (self.stage + ".tar.gz")).exists())
+
+    def test_onnxruntime_is_taken_by_pattern_not_by_a_pinned_version(self):
+        result = self.stage_archive()
+        self.assertEqual(0, result.returncode, result.stderr)
+        with tarfile.open(self.directory / (self.stage + ".tar.gz")) as archive:
+            self.assertTrue(archive.getmember(self.stage + "/libonnxruntime.so.1.30.0").isfile())
+
+    def test_two_onnxruntime_versions_fail_instead_of_shipping_either(self):
+        stale = self.directory / "native-libs/linux-x86_64/lib-dynamic/libonnxruntime.so.1.26.0"
+        stale.write_bytes(b"stale")
+        result = self.stage_archive()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("exactly one libonnxruntime", result.stdout + result.stderr)
         self.assertFalse((self.directory / (self.stage + ".tar.gz")).exists())
 
 

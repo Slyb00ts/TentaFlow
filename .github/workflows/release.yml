@@ -15,9 +15,10 @@
 #              out Debian 12 (2.36), which install.sh claims to support.
 #
 #              macOS (Apple Silicon, Metal/MLX) builds in build-macos, `full`
-#              only — see that job for why there is no macOS slim. Linux aarch64
-#              and Windows are not built here yet; they come back one at a time,
-#              each with a verified build, rather than as untested matrix rows.
+#              only — see that job for why there is no macOS slim. Windows
+#              x86_64 (`slim`, `full-vulkan`, `full-cuda13`) builds in
+#              build-windows.yml, called below and also run on its own when a
+#              Windows build input changes.
 # =============================================================================
 name: release
 
@@ -557,7 +558,15 @@ jobs:
           # it is running from a source checkout, which an installation is not.
           if [ "${{ matrix.edition }}" = "full" ]; then
             require "$OUT/libwhisper_tf.so"
-            require "native-libs/${{ matrix.platform }}/lib-dynamic/libonnxruntime.so.1.26.0"
+            # The version comes from scripts/versions.env, so it is matched, not
+            # named. build-onnxruntime.sh removes the previous one before it
+            # unpacks: two files mean a stale cache, none means no ONNX Runtime.
+            set -- native-libs/${{ matrix.platform }}/lib-dynamic/libonnxruntime.so.[0-9]*.[0-9]*.[0-9]*
+            if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+              echo "::error::expected exactly one libonnxruntime.so.<version>, found: $*"
+              exit 1
+            fi
+            require "$1"
           fi
 
           tar -czf "$STAGE.tar.gz" "$STAGE"
@@ -904,8 +913,12 @@ jobs:
           ! systemctl is-enabled tentaflow.service 2>/dev/null
           test ! -e /opt/tentaflow
 
+  build-windows:
+    name: build (windows)
+    uses: ./.github/workflows/build-windows.yml
+
   publish:
-    needs: [build, build-macos, verify]
+    needs: [build, build-macos, build-windows, verify]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -972,6 +985,16 @@ jobs:
 
             Linux builds ship for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`;
             macOS for `aarch64-apple-darwin`. Every archive has a `.sha256` next to it.
-            A CUDA archive needs the CUDA runtime present — with the driver alone, take
-            `full-vulkan`, which runs on NVIDIA too.
+            A Linux CUDA archive needs the CUDA runtime present — with the driver alone,
+            take `full-vulkan`, which runs on NVIDIA too.
+
+            ### Windows (x86_64)
+
+            `tentaflow-<tag>-x86_64-pc-windows-msvc-{slim,full-vulkan,full-cuda13}.zip` —
+            unzip and run `tentaflow.exe init-config --output config.toml`, then
+            `tentaflow.exe --config config.toml`. The archive carries the Visual C++
+            runtime and, for `full-cuda13`, cuBLAS, so the NVIDIA driver is the only
+            CUDA piece the machine needs. The `full` archives need the GStreamer runtime
+            (MSVC x86_64) on `PATH` — `REQUIREMENTS.txt` inside names the version.
+            There is no Windows installer or `tentaflow update` yet.
           generate_release_notes: true

@@ -1,0 +1,283 @@
+# =============================================================================
+# File:        .github/workflows/build-windows.yml
+# Description: Builds the Windows x86_64 release archives — `slim`,
+#              `full-vulkan` and `full-cuda13` — through the same three scripts
+#              a developer runs on a clean machine: scripts\setup.ps1,
+#              scripts\native-libs\build-all.ps1 and scripts\build.ps1. A CI
+#              that provisioned its own way would prove nothing about them.
+#
+#              release.yml calls this workflow on a v* tag and publishes what it
+#              uploads. It also runs on its own when a Windows build input
+#              changes on main, so a broken Windows build shows up the day it
+#              breaks instead of on the next tag.
+#
+#              Each archive is staged by scripts/release/stage-windows.py, which
+#              closes the DLL set over the PE import tables, then started from
+#              the extracted ZIP with only System32 (plus GStreamer for `full`)
+#              on PATH by scripts/release/smoke-windows.ps1.
+# =============================================================================
+name: build-windows
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-windows.yml"
+      - "scripts/setup.ps1"
+      - "scripts/build.ps1"
+      - "scripts/cargo-build.py"
+      - "scripts/lib/**"
+      - "scripts/versions.env"
+      - "scripts/native-libs/**"
+      - "scripts/build-zvec.sh"
+      - "scripts/release/**"
+      - "tentaflow/build.rs"
+      - "tentaflow-core/build.rs"
+      - "tentaflow-zvec-sys/build.rs"
+      - "vendor/crates/*/build.rs"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  PYTHONUTF8: 1
+
+defaults:
+  run:
+    # Windows PowerShell 5.1, the shell the scripts are written for and the
+    # one a user's machine is guaranteed to have.
+    shell: powershell
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # native-libs — one per backend. `slim` links only zvec + pdfium, which the
+  # vulkan artifact carries too, so it needs no build of its own.
+  # ---------------------------------------------------------------------------
+  native-libs:
+    name: native-libs (windows-x86_64, ${{ matrix.backend }})
+    runs-on: windows-2025
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: vulkan
+            setup: -NoCuda
+            cuda_archs: ""
+          # CUDA 13 dropped everything below sm_75. sm_103 (B300) and sm_121
+          # (GB10 / DGX Spark) are Linux-only hardware and stay out of this
+          # list; 120-virtual keeps newer consumer cards working through PTX.
+          - backend: cuda
+            setup: -Cuda
+            cuda_archs: "75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache native-libs output
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: native-libs/windows-x86_64
+          key: native-libs-windows-x86_64-${{ matrix.backend }}-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh', 'scripts/versions.env', 'scripts/lib/**') }}
+
+      - name: Toolchain (scripts\setup.ps1 ${{ matrix.setup }})
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # A thrown error becomes an annotation: job logs need admin rights.
+          try { .\scripts\setup.ps1 ${{ matrix.setup }} } catch {
+            Write-Host "::error::setup.ps1: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))"
+            exit 1
+          }
+
+      - name: Build native-libs
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          # The CPU ONNX Runtime, as on Linux: the GPU one vendors TensorRT and
+          # cuDNN, gigabytes the CUDA archive does not need for llama.cpp.
+          ONNXRUNTIME_GPU: "0"
+          # A runner has no GPU to detect an architecture from.
+          CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda_archs }}
+        run: |
+          try { .\scripts\native-libs\build-all.ps1 -Backend ${{ matrix.backend }} } catch {
+            Write-Host "::error::build-all.ps1: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))"
+            exit 1
+          }
+
+      - name: The requested backend must actually be in the artifact
+        run: |
+          # An artifact named cuda holding only ggml-cpu.lib is the silent
+          # failure this job exists to catch.
+          $root = 'native-libs\windows-x86_64'
+          $want = @(
+            "$root\lib-static\llama-cpp\${{ matrix.backend }}\ggml-${{ matrix.backend }}.lib",
+            "$root\lib-static\whisper-cpp\${{ matrix.backend }}\ggml-${{ matrix.backend }}.lib",
+            "$root\lib-dynamic\whisper-cpp\${{ matrix.backend }}\whisper_tf.dll",
+            "$root\lib-dynamic\zvec_c_api.dll",
+            "$root\lib-dynamic\pdfium.dll",
+            "$root\lib-dynamic\onnxruntime.dll"
+          )
+          $missing = @($want | Where-Object { -not (Test-Path $_) })
+          if ($missing) {
+            foreach ($file in $missing) { Write-Host "::error::native-libs is missing $file" }
+            exit 1
+          }
+          Get-Item $want | Format-Table Name, Length -AutoSize
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-windows-x86_64-${{ matrix.backend }}
+          path: native-libs/windows-x86_64
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # build — one per archive. The CUDA archive links the CUDA llama.cpp/whisper
+  # variant with the portable `gpu-vulkan` features, exactly like the Linux
+  # full-cuda archives: CUDA for the language and speech models, WGPU for
+  # vision, and no TensorRT/cuDNN in the download.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (windows-x86_64, ${{ matrix.asset }})
+    needs: native-libs
+    runs-on: windows-2025
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: slim
+            edition: slim
+            nl_backend: vulkan
+            setup: -Minimal
+            cargo_flags: "--no-default-features"
+          - asset: full-vulkan
+            edition: full
+            nl_backend: vulkan
+            setup: -NoCuda
+            cargo_flags: "--features gpu-vulkan"
+          - asset: full-cuda13
+            edition: full
+            nl_backend: cuda
+            setup: -Cuda
+            cargo_flags: "--features gpu-vulkan"
+    env:
+      # Which native-libs variant the vendored -sys crates link. Unused by slim.
+      LLAMA_CPP_NATIVE_VARIANT: ${{ matrix.nl_backend }}
+      WHISPER_CPP_NATIVE_VARIANT: ${{ matrix.nl_backend }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Packaging contract (fail fast, before hours of Rust)
+        run: python scripts/release/test-stage-windows.py
+
+      - name: Disk must hold a release build
+        run: |
+          # target\ reaches ~10 GB and the toolkits another ~10; a job that runs
+          # out of disk two hours in wastes the whole run.
+          $drive = (Get-Item $env:GITHUB_WORKSPACE).PSDrive
+          $freeGb = [math]::Floor($drive.Free / 1GB)
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Floor($_.Free/1GB)}}, @{n='UsedGB';e={[math]::Floor($_.Used/1GB)}} -AutoSize
+          if ($freeGb -lt 40) {
+            Write-Host "::error::only $freeGb GB free on $($drive.Name): - a release build needs about 40"
+            exit 1
+          }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-libs-windows-x86_64-${{ matrix.nl_backend }}
+          path: native-libs/windows-x86_64
+
+      - name: Toolchain (scripts\setup.ps1 ${{ matrix.setup }})
+        run: |
+          try { .\scripts\setup.ps1 ${{ matrix.setup }} } catch {
+            Write-Host "::error::setup.ps1: $($_.Exception.Message) ($($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))"
+            exit 1
+          }
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-windows-x86_64-${{ matrix.asset }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-windows-x86_64-${{ matrix.asset }}-
+            cargo-windows-x86_64-
+
+      - name: Meeting sidecar (fail fast, before hours of Rust)
+        env:
+          # tentaflow\build.rs builds it into this directory too and reuses it.
+          CARGO_TARGET_DIR: ${{ github.workspace }}\target-meeting-bot
+        run: .\scripts\build.ps1 build -p tentaflow-teams-bot --bin tentaflow-meeting --release --locked
+
+      - name: Coding-agent bridge (fail fast, before hours of Rust)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}\target-coding-agent-bridge
+        run: .\scripts\build.ps1 build -p tentaflow-coding-agent-bridge --release --locked
+
+      - name: Build
+        run: .\scripts\build.ps1 build -p tentaflow --release --locked ${{ matrix.cargo_flags }}
+
+      - name: Stage archive
+        id: stage
+        run: |
+          . .\scripts\lib\windows.ps1
+          Update-SessionEnvironment
+          [void](Import-TentaflowVersions)
+          # Resolved, never hardcoded: .cargo\config.toml redirects the target
+          # directory, and a hardcoded path would stage nothing.
+          $target = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
+          $vs = Get-VsInstallPath
+          $redist = Get-ChildItem (Join-Path $vs 'VC\Redist\MSVC') -Directory |
+            Where-Object { Test-Path (Join-Path $_.FullName 'x64\Microsoft.VC143.CRT') } |
+            Sort-Object Name | Select-Object -Last 1
+          if (-not $redist) { Write-Host "::error::no Visual C++ redistributable under $vs"; exit 1 }
+          # App-local Visual C++ runtime, OpenMP included: ggml links VCOMP140.
+          $stageArgs = @(
+            '--tag', $env:GITHUB_REF_NAME, '--asset', '${{ matrix.asset }}', '--edition', '${{ matrix.edition }}',
+            '--out', (Join-Path $target 'release'), '--native', 'native-libs\windows-x86_64',
+            '--search', (Join-Path $redist.FullName 'x64\Microsoft.VC143.CRT'),
+            '--search', (Join-Path $redist.FullName 'x64\Microsoft.VC143.OpenMP'),
+            '--dest', 'dist'
+          )
+          if ($env:CUDA_PATH) {
+            $stageArgs += @('--search', (Join-Path $env:CUDA_PATH 'bin\x64'), '--search', (Join-Path $env:CUDA_PATH 'bin'))
+          }
+          if ($env:GSTREAMER_1_0_ROOT_MSVC_X86_64) {
+            $stageArgs += @('--gstreamer-bin', (Join-Path $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 'bin'),
+                            '--gstreamer-version', $env:GSTREAMER_VERSION)
+          }
+          python scripts\release\stage-windows.py @stageArgs
+          exit $LASTEXITCODE
+
+      - name: The archive must start on its own
+        run: |
+          . .\scripts\lib\windows.ps1
+          Update-SessionEnvironment
+          $zip = Get-ChildItem dist\*.zip | Select-Object -First 1
+          $gst = ''
+          if ($env:GSTREAMER_1_0_ROOT_MSVC_X86_64) { $gst = Join-Path $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 'bin' }
+          .\scripts\release\smoke-windows.ps1 -Archive $zip.FullName -GstreamerBin $gst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tentaflow-windows-x86_64-${{ matrix.asset }}
+          path: |
+            dist/tentaflow-*.zip
+            dist/tentaflow-*.zip.sha256

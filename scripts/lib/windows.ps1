@@ -9,7 +9,13 @@ $script:TentaflowRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 function Log-Info    { param([string]$Msg) Write-Host "[INFO] $Msg" -ForegroundColor Blue }
 function Log-Ok      { param([string]$Msg) Write-Host "[OK] $Msg" -ForegroundColor Green }
 function Log-Warn    { param([string]$Msg) Write-Host "[WARN] $Msg" -ForegroundColor Yellow }
-function Log-Error   { param([string]$Msg) Write-Host "[ERROR] $Msg" -ForegroundColor Red }
+# On GitHub Actions an error also becomes an annotation: job logs need admin
+# rights to read, annotations are what a failed run shows everyone else.
+function Log-Error {
+    param([string]$Msg)
+    Write-Host "[ERROR] $Msg" -ForegroundColor Red
+    if ($env:GITHUB_ACTIONS -eq 'true') { Write-Host "::error::$Msg" }
+}
 function Log-Section { param([string]$Msg) Write-Host "`n=== $Msg ===`n" -ForegroundColor Cyan }
 
 function Test-Command {
