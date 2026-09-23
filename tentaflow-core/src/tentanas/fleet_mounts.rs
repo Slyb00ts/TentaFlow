@@ -24,6 +24,27 @@
 // rows go with the instance's config partition — an offline node still shows
 // its last known mount state. The uninstall cascade drops them with the rest
 // of the instance's scoped tables; a deleted share purges its own.
+//
+// THE ROWS ARE READABLE BY EVERY TENANT (migration 20). The instance is one
+// per node for every organisation, and its `addon_config` rows come back
+// whole from a generic config read. So the registry publishes as little as
+// the mount needs, and every TentaNas view reads it through the owner:
+//
+//   * ONLY SHARES MARKED "MOUNT ON EVERY NODE" ARE PUBLISHED. A share the
+//     owner kept to its own node used to travel fleet-wide with its name
+//     and path for nothing — nobody mounts it. It no longer leaves the node.
+//   * A PUBLISHED ROW STILL CARRIES THE NAME AND THE PATH, because the
+//     mounting node cannot do without them: the mountpoint the product
+//     promises is `/mnt/tentanas/<name>`, and `mount` needs the export path.
+//     There is no fleet secret to seal them with (§3.4 forbids distributing
+//     one). What stays visible is what the owner chose to put on every
+//     node's filesystem anyway — the name is a directory on every host.
+//   * THE ROW CARRIES `owner_org`, an organisation ID (never a name). The
+//     fleet-mount list shows the caller's organisation's rows only, and the
+//     retry refuses another organisation's share with the answer a missing
+//     one gets. A row without an owner (a peer that predates the field, or
+//     a share published a moment ago) belongs to nobody: it is mounted —
+//     that is node work — but listed to no tenant.
 // =============================================================================
 
 use std::collections::BTreeMap;
@@ -71,6 +92,18 @@ pub struct SharePublication {
     /// also what every peer that predates the field says.
     #[serde(default)]
     pub rdma_addresses: Vec<String>,
+    /// The organisation that owns the share (migration 20): its ID, which
+    /// names nothing. Every node filters its views by it, because only the
+    /// SOURCE node's database knows whose share this is. Empty on a row from
+    /// a peer that predates the field — and an empty owner is nobody's.
+    #[serde(default)]
+    pub owner_org: String,
+}
+
+/// Whether `row` belongs to `org_id`. An empty org id matches nothing, never
+/// the unowned rows — the same rule as `store::list_shares_of_org`.
+pub fn owned_by(row: &SharePublication, org_id: &str) -> bool {
+    !org_id.is_empty() && row.owner_org == org_id
 }
 
 /// What one node did about one share.
@@ -221,8 +254,23 @@ fn local_rdma_addresses(shares: &[ShareRow]) -> Vec<String> {
     }
 }
 
-/// Publishes this node's shares and drops the rows of shares it no longer has.
-pub fn publish_shares(db: &DbPool, addon_id: &str, shares: &[ShareRow]) {
+/// Publishes this node's fleet-mounted shares and drops every other row this
+/// node published — a deleted share's, and one whose owner took it off the
+/// fleet (module header: a share nobody mounts does not travel).
+///
+/// `owners` is the local database's `share_id → org_id` (`store::share_owners`):
+/// a new share's row is written ONCE, already stamped. It used to be written
+/// with an empty owner and stamped by the next reconcile — two replicated
+/// writes, and a window in which the owner could neither see nor retry its
+/// own share. A share `owners` does not know (the read failed, or it raced
+/// a write) keeps the owner its previous version was stamped with; the
+/// reconcile's `own_row_fixes` still corrects anything left.
+pub fn publish_shares(
+    db: &DbPool,
+    addon_id: &str,
+    shares: &[ShareRow],
+    owners: &std::collections::HashMap<String, String>,
+) {
     let node = local_node_id();
     let addresses = local_addresses();
     // Only the shares that are actually in the config can be mounted, so only
@@ -234,30 +282,86 @@ pub fn publish_shares(db: &DbPool, addon_id: &str, shares: &[ShareRow]) {
         .collect();
     let rdma = local_rdma_addresses(&active);
     let now = store::now();
-    for share in shares {
+    let published = published_shares(db, addon_id);
+    let stamped: BTreeMap<&str, &str> = published
+        .iter()
+        .filter(|(source, _, _)| *source == node)
+        .map(|(_, id, row)| (id.as_str(), row.owner_org.as_str()))
+        .collect();
+    for share in shares.iter().filter(|s| s.fleet_mount) {
+        let owner = owners
+            .get(&share.share_id)
+            .map(String::as_str)
+            .or_else(|| stamped.get(share.share_id.as_str()).copied())
+            .unwrap_or_default();
         put(
             db,
             addon_id,
             &format!("{SHARE_KEY_PREFIX}{node}/{}", share.share_id),
-            &SharePublication {
-                name: share.name.clone(),
-                protocol: share.protocol.clone(),
-                source_path: share.source_path.clone(),
-                export_path: share.source_path.clone(),
-                fleet_mount: share.fleet_mount,
-                enabled: share.enabled && share.state != "error",
-                addresses: addresses.clone(),
-                rdma_addresses: share_rdma_addresses(share, &rdma),
-                updated_at: now.clone(),
-            },
+            &publication_of(share, owner, &addresses, &rdma, &now),
         );
     }
-    let live: Vec<&str> = shares.iter().map(|s| s.share_id.as_str()).collect();
-    for (source, share_id, _) in published_shares(db, addon_id) {
-        if source == node && !live.contains(&share_id.as_str()) {
-            purge_share(db, addon_id, &share_id);
+    let live = fleet_share_ids(shares);
+    for (source, share_id, _) in &published {
+        if *source == node && !live.contains(&share_id.as_str()) {
+            purge_share(db, addon_id, share_id);
         }
     }
+}
+
+/// The ids of the shares that belong in the registry: the fleet-mounted ones.
+fn fleet_share_ids(shares: &[ShareRow]) -> Vec<&str> {
+    shares
+        .iter()
+        .filter(|s| s.fleet_mount)
+        .map(|s| s.share_id.as_str())
+        .collect()
+}
+
+/// The registry row of one local share.
+fn publication_of(
+    share: &ShareRow,
+    owner_org: &str,
+    addresses: &[String],
+    rdma: &[String],
+    now: &str,
+) -> SharePublication {
+    SharePublication {
+        name: share.name.clone(),
+        protocol: share.protocol.clone(),
+        source_path: share.source_path.clone(),
+        export_path: share.source_path.clone(),
+        fleet_mount: share.fleet_mount,
+        enabled: share.enabled && share.state != "error",
+        addresses: addresses.to_vec(),
+        rdma_addresses: share_rdma_addresses(share, rdma),
+        updated_at: now.to_string(),
+        owner_org: owner_org.to_string(),
+    }
+}
+
+/// What the reconcile has to fix in THIS node's own rows: `(share_id, Some(owner))`
+/// for a row whose owner is missing or stale, `(share_id, None)` for a row
+/// that must go — a share taken off the fleet, or one a pre-migration-20
+/// version published although nobody mounts it. `owners` is the local
+/// database's `share_id → org_id`; a share missing from it is left to the
+/// apply's purge, which knows whether it was deleted.
+fn own_row_fixes(
+    published: &[(String, String, SharePublication)],
+    node: &str,
+    owners: &std::collections::HashMap<String, String>,
+) -> Vec<(String, Option<String>)> {
+    published
+        .iter()
+        .filter(|(source, _, _)| source == node)
+        .filter_map(|(_, share_id, row)| {
+            if !row.fleet_mount {
+                return Some((share_id.clone(), None));
+            }
+            let owner = owners.get(share_id)?;
+            (row.owner_org != *owner).then(|| (share_id.clone(), Some(owner.clone())))
+        })
+        .collect()
 }
 
 /// Drops the desired-state row of a deleted share and every mount status any
@@ -456,6 +560,26 @@ pub async fn reconcile(main_db: &DbPool, addon_id: &str, db: &DbPool, only: Opti
         },
     );
 
+    // This node's own rows first: stamp the owner the apply could not name,
+    // and withdraw what must not travel (module header). Only this node's
+    // database knows whose share is whose, so no peer can do it for us.
+    // A failed read changes nothing — the rows stay as the apply wrote them.
+    if let Ok(owners) = store::share_owners(db) {
+        let before = published_shares(main_db, addon_id);
+        for (share_id, fix) in own_row_fixes(&before, &node, &owners) {
+            let key = format!("{SHARE_KEY_PREFIX}{node}/{share_id}");
+            match fix {
+                None => purge_share(main_db, addon_id, &share_id),
+                Some(owner) => {
+                    let row = before.iter().find(|(s, id, _)| *s == node && *id == share_id);
+                    if let Some((_, _, row)) = row {
+                        let stamped = SharePublication { owner_org: owner, ..row.clone() };
+                        put(main_db, addon_id, &key, &stamped);
+                    }
+                }
+            }
+        }
+    }
     let published = published_shares(main_db, addon_id);
     let armed = super::broker::channel_available(db).await;
     let platform = blocked();
@@ -739,8 +863,43 @@ pub fn mounts_for(
         .collect()
 }
 
-/// The shares of OTHER nodes as this node sees them — the compute node's view.
-pub fn fleet_mounts(ctx: &HandlerContext, addon_id: &str) -> Vec<NasFleetMount> {
+/// Whether `org_id` may ask this node to retry the mount of `share_id`: the
+/// share has to be one of its own — a published row it owns, or a share of
+/// its own in this node's database (a row published a moment ago carries no
+/// owner until the next reconcile stamps it). Another organisation's share
+/// answers exactly what an id that exists nowhere answers.
+pub fn may_retry(main_db: &DbPool, addon_id: &str, db: &DbPool, org_id: &str, share_id: &str) -> bool {
+    publishes_share_of(&published_shares(main_db, addon_id), org_id, share_id)
+        || store::share(db, org_id, share_id).ok().flatten().is_some()
+}
+
+fn publishes_share_of(
+    published: &[(String, String, SharePublication)],
+    org_id: &str,
+    share_id: &str,
+) -> bool {
+    published
+        .iter()
+        .any(|(_, id, row)| id == share_id && owned_by(row, org_id))
+}
+
+/// The registry rows the fleet-mount list may show `org_id`: its own shares
+/// on OTHER nodes that are marked for the fleet. Another organisation's row
+/// is not in the answer at all — not even as a nameless line, which would
+/// still tell the tenant that something is mounted there.
+fn listed_for<'a>(
+    published: &'a [(String, String, SharePublication)],
+    node: &'a str,
+    org_id: &'a str,
+) -> impl Iterator<Item = &'a (String, String, SharePublication)> + 'a {
+    published
+        .iter()
+        .filter(move |(source, _, row)| source != node && row.fleet_mount && owned_by(row, org_id))
+}
+
+/// The shares of OTHER nodes as this node sees them — the compute node's
+/// view, narrowed to the asking organisation's own shares (module header).
+pub fn fleet_mounts(ctx: &HandlerContext, addon_id: &str, org_id: &str) -> Vec<NasFleetMount> {
     let node = local_node_id();
     let names: BTreeMap<String, String> = super::fleet::nodes(ctx, addon_id)
         .into_iter()
@@ -752,9 +911,9 @@ pub fn fleet_mounts(ctx: &HandlerContext, addon_id: &str) -> Vec<NasFleetMount> 
             .filter(|((_, _, client), _)| *client == node)
             .map(|((source, share_id, _), row)| ((source, share_id), row))
             .collect();
-    let mut out: Vec<NasFleetMount> = published_shares(&ctx.state.db, addon_id)
-        .into_iter()
-        .filter(|(source, _, row)| *source != node && row.fleet_mount)
+    let published = published_shares(&ctx.state.db, addon_id);
+    let mut out: Vec<NasFleetMount> = listed_for(&published, &node, org_id)
+        .cloned()
         .map(|(source, share_id, row)| {
             let status = reported.get(&(source.clone(), share_id.clone()));
             NasFleetMount {
@@ -851,6 +1010,7 @@ mod tests {
             addresses: vec!["192.168.1.5".into(), "10.10.0.5".into()],
             rdma_addresses: rdma.iter().map(|s| s.to_string()).collect(),
             updated_at: "2026-09-03T10:00:00Z".into(),
+            owner_org: "org-a".into(),
         }
     }
 
@@ -937,5 +1097,204 @@ mod tests {
             "checked_at":"2026-09-01T14:00:00Z"}"#;
         let mount: MountPublication = serde_json::from_str(old_mount).expect("decode");
         assert!(mount.transport.is_empty());
+    }
+
+    // ----- ownership (migration 20) -------------------------------------------
+
+    /// The main database with just what the registry touches: `addon_config`,
+    /// and the two tables the syncable check joins — left empty, so the test
+    /// instance is not syncable and no capture row is written.
+    fn main_db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(
+            "CREATE TABLE addon_config (addon_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                 updated_at TEXT NOT NULL DEFAULT (datetime('now')), is_secret INTEGER NOT NULL DEFAULT 0,
+                 updated_by TEXT, PRIMARY KEY (addon_id, key));
+             CREATE TABLE addons (addon_id TEXT, package_id TEXT, package_version TEXT);
+             CREATE TABLE addon_packages (package_id TEXT, version TEXT);",
+        )
+        .expect("schema");
+        std::sync::Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    fn nas_db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        store::migrate(&conn).expect("migrate");
+        std::sync::Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    fn owned(name: &str, owner: &str) -> SharePublication {
+        SharePublication {
+            name: name.into(),
+            source_path: format!("/mnt/tank/{name}"),
+            export_path: format!("/mnt/tank/{name}"),
+            owner_org: owner.into(),
+            ..publication(&[])
+        }
+    }
+
+    fn row(source: &str, id: &str, publication: SharePublication) -> (String, String, SharePublication) {
+        (source.to_string(), id.to_string(), publication)
+    }
+
+    fn share_row(id: &str, name: &str, fleet_mount: bool) -> ShareRow {
+        ShareRow {
+            share_id: id.into(),
+            name: name.into(),
+            protocol: "smb".into(),
+            source_path: format!("/mnt/tank/{name}"),
+            enabled: true,
+            fleet_mount,
+            smb: Some(tentaflow_protocol::tentanas::NasSmbOptions::default()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_tenant_lists_only_its_own_fleet_shares_on_other_nodes() {
+        let mut kept_home = owned("archiwum", "org-a");
+        kept_home.fleet_mount = false;
+        let published = vec![
+            row("node-b", "s-a", owned("projekty", "org-a")),
+            row("node-b", "s-b", owned("kadry", "org-b")),
+            row("node-c", "s-old", owned("stary", "")),
+            row("node-b", "s-home", kept_home),
+            row("node-a", "s-own-local", owned("lokalny", "org-a")),
+        ];
+        let names = |org: &str| -> Vec<String> {
+            listed_for(&published, "node-a", org).map(|(_, _, r)| r.name.clone()).collect()
+        };
+        assert_eq!(names("org-a"), vec!["projekty".to_string()], "own remote fleet share only");
+        assert_eq!(names("org-b"), vec!["kadry".to_string()], "org-b never sees projekty");
+        // An empty org id is nobody's, not the owner of the unowned rows.
+        assert!(names("").is_empty());
+        assert!(names("org-c").is_empty());
+    }
+
+    #[test]
+    fn another_organisations_share_is_refused_like_a_missing_one() {
+        let main = main_db();
+        let nas = nas_db();
+        put(&main, "nas", &format!("{SHARE_KEY_PREFIX}node-b/s-a"), &owned("projekty", "org-a"));
+        put(&main, "nas", &format!("{SHARE_KEY_PREFIX}node-b/s-b"), &owned("kadry", "org-b"));
+        put(&main, "nas", &format!("{SHARE_KEY_PREFIX}node-c/s-old"), &owned("stary", ""));
+        // A local share of org-a whose row has not been stamped yet.
+        nas.write()
+            .expect("write")
+            .execute_batch(
+                "INSERT INTO nas_shares (share_id,name,protocol,source_path,created_at,updated_at,org_id)
+                 VALUES ('s-new','nowy','smb','/mnt/tank/nowy','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','org-a');",
+            )
+            .expect("share");
+
+        assert!(may_retry(&main, "nas", &nas, "org-a", "s-a"), "its own remote share");
+        assert!(may_retry(&main, "nas", &nas, "org-a", "s-new"), "its own share not stamped yet");
+        // Another tenant's share and an id that exists nowhere: one answer.
+        assert_eq!(
+            may_retry(&main, "nas", &nas, "org-a", "s-b"),
+            may_retry(&main, "nas", &nas, "org-a", "s-nowhere"),
+        );
+        assert!(!may_retry(&main, "nas", &nas, "org-a", "s-b"));
+        assert!(!may_retry(&main, "nas", &nas, "org-b", "s-a"));
+        assert!(!may_retry(&main, "nas", &nas, "org-b", "s-new"));
+        assert!(may_retry(&main, "nas", &nas, "org-b", "s-b"));
+        // A row without an owner belongs to nobody.
+        assert!(!may_retry(&main, "nas", &nas, "org-a", "s-old"));
+        assert!(!may_retry(&main, "nas", &nas, "", "s-old"));
+    }
+
+    #[test]
+    fn a_share_kept_to_its_node_is_not_published_fleet_wide() {
+        let main = main_db();
+        let node = local_node_id();
+        publish_shares(
+            &main,
+            "nas",
+            &[share_row("s-fleet", "projekty", true), share_row("s-home", "kadry", false)],
+            &Default::default(),
+        );
+        let rows = published_shares(&main, "nas");
+        let ids: Vec<&str> = rows.iter().map(|(_, id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["s-fleet"], "only the fleet-mounted share travels");
+        let raw: String = crate::db::repository::list_addon_config_prefixed(&main, "nas", "")
+            .expect("rows")
+            .into_iter()
+            .map(|(k, v, _)| format!("{k}={v}\n"))
+            .collect();
+        assert!(!raw.contains("kadry"), "no registry row names the share kept home: {raw}");
+
+        // Taking the share off the fleet withdraws its row and the mount
+        // status every node published for it.
+        put(
+            &main,
+            "nas",
+            &format!("{MOUNT_KEY_PREFIX}{node}/s-fleet/node-b"),
+            &MountPublication { state: "mounted".into(), ..Default::default() },
+        );
+        publish_shares(&main, "nas", &[share_row("s-fleet", "projekty", false)], &Default::default());
+        assert!(published_shares(&main, "nas").is_empty());
+        assert!(published_mounts(&main, "nas").is_empty());
+    }
+
+    #[test]
+    fn a_new_fleet_share_is_published_once_already_stamped_with_its_owner() {
+        // The critic's wave-3 nit: the row went out with an empty owner and
+        // the reconcile rewrote it stamped — two replicated writes, and a
+        // window in which the owner could neither list nor retry its share.
+        let main = main_db();
+        let node = local_node_id();
+        let owners = std::collections::HashMap::from([("s-fleet".to_string(), "org-a".to_string())]);
+        publish_shares(&main, "nas", &[share_row("s-fleet", "projekty", true)], &owners);
+        let first = published_shares(&main, "nas");
+        assert_eq!(first[0].2.owner_org, "org-a", "stamped on its first write");
+        assert!(own_row_fixes(&first, &node, &owners).is_empty(), "the reconcile has nothing to rewrite");
+
+        // An apply whose owner read failed keeps the stamp the row already has
+        // rather than blanking it.
+        publish_shares(&main, "nas", &[share_row("s-fleet", "projekty-2", true)], &Default::default());
+        let again = published_shares(&main, "nas");
+        assert_eq!(again[0].2.name, "projekty-2");
+        assert_eq!(again[0].2.owner_org, "org-a");
+        assert!(own_row_fixes(&again, &node, &owners).is_empty(), "nothing left to fix");
+    }
+
+    #[test]
+    fn the_reconcile_withdraws_a_row_that_must_not_travel_and_leaves_peers_alone() {
+        let mut home = owned("kadry", "org-b");
+        home.fleet_mount = false;
+        let published = vec![
+            // Written by a pre-migration-20 version: every share went out.
+            row("node-a", "s-home", home.clone()),
+            row("node-a", "s-stale", owned("projekty", "org-x")),
+            row("node-a", "s-gone", owned("usuniety", "")),
+            // A peer's rows are its own business.
+            row("node-b", "s-peer", owned("obcy", "")),
+            row("node-b", "s-peer-home", home),
+        ];
+        let owners = std::collections::HashMap::from([
+            ("s-home".to_string(), "org-b".to_string()),
+            ("s-stale".to_string(), "org-a".to_string()),
+        ]);
+        let mut fixes = own_row_fixes(&published, "node-a", &owners);
+        fixes.sort();
+        assert_eq!(
+            fixes,
+            vec![
+                ("s-home".to_string(), None),
+                ("s-stale".to_string(), Some("org-a".to_string())),
+            ],
+            "a deleted share (s-gone) is the apply's purge, not a guess"
+        );
+    }
+
+    #[test]
+    fn a_row_from_a_peer_that_predates_the_owner_belongs_to_nobody() {
+        let old = r#"{"name":"projekty","protocol":"nfs","source_path":"/mnt/tank/projekty",
+            "export_path":"/mnt/tank/projekty","fleet_mount":true,"enabled":true,
+            "addresses":["10.10.0.5"],"updated_at":"2026-09-01T14:00:00Z"}"#;
+        let row: SharePublication = serde_json::from_str(old).expect("decode");
+        assert!(row.owner_org.is_empty());
+        assert!(!owned_by(&row, "org-a"));
+        assert!(!owned_by(&row, ""));
     }
 }

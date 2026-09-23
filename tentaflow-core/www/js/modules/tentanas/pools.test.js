@@ -96,7 +96,7 @@ test('wolny ZFS nie blokuje Elastic, a spóźniona lista nie odmalowuje nowej po
 test('renders one card per pool with chips, capacity split and the free-disk strip', async () => {
   const screen = fakeScreen({
     tentaNasPoolsListRequest: {
-      pools: [pool({ vdevs: tankVdevs }), pool({ name: 'backup', health: 'warning', healthReason: 'one disk reports pending sectors', state: 'degraded', layout: 'mirror', dataDisks: 2, scan: { kind: 'scrub', status: 'running', progressPct: 37, errors: 0 } })],
+      pools: [pool({ vdevs: tankVdevs }), pool({ name: 'backup', health: 'warning', healthReason: 'pool is degraded; 1 degraded disks', healthReasons: [{ code: 'pool_state', params: { state: 'degraded' } }, { code: 'degraded_disks', params: { count: '1' } }], state: 'degraded', layout: 'mirror', dataDisks: 2, scan: { kind: 'scrub', status: 'running', progressPct: 37, errors: 0 } })],
       freeDisks: [freeDisk],
     },
     tentaNasDisksListRequest: inventory,
@@ -121,7 +121,10 @@ test('renders one card per pool with chips, capacity split and the free-disk str
   assert.ok(tank.querySelector('[data-act="more"]'), 'card offers the more menu');
 
   const backup = cards[1];
-  assert.match(backup.querySelector('.pc-reason').textContent, /pending sectors/);
+  // The reason is worded from the pool's codes; the node's English is only
+  // the tooltip (backlog M1).
+  assert.equal(backup.querySelector('.pc-reason').textContent.trim(), 'stan puli: Zdegradowana; 1 dysk zdegradowany');
+  assert.equal(backup.querySelector('.pc-reason').getAttribute('title'), 'pool is degraded; 1 degraded disks');
   assert.ok(backup.querySelector('[data-act="pause"]'), 'running scrub offers pause');
   assert.ok([...backup.querySelectorAll('tf-chip')].some((c) => /37%/.test(c.getAttribute('label') || '')), 'scan progress chip');
 
@@ -461,5 +464,58 @@ test('"Sync teraz" is disabled with the reason as its tooltip where the node wou
     } finally {
       screen.dispose();
     }
+  }
+});
+
+// Backlog M1: the n05 card printed `pools::score_health`'s English ("pool is
+// degraded", "93% full"). The line is worded from the codes, follows the poll
+// on the SAME element, and never shows the node's sentence as text — not for
+// an unknown code, and not from an older node that sends no codes at all.
+test('the pool card reason is worded from codes and follows the poll in place', async () => {
+  let current = { health: 'critical', healthReason: 'pool is faulted; 93% full', healthReasons: [{ code: 'pool_state', params: { state: 'faulted' } }, { code: 'capacity', params: { pct: '93' } }] };
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: () => ({ pools: [pool({ state: 'faulted', ...current })], freeDisks: [] }),
+    tentaNasDisksListRequest: inventory,
+  });
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  // One poll: the newest armed callback, run and settled.
+  async function poll() {
+    const next = scheduled.pop();
+    assert.ok(next, 'the tab armed its poll');
+    await next();
+    await flush();
+  }
+  try {
+    const body = mount();
+    await drawPools(screen, body);
+    await flush();
+    const line = () => body.querySelector('.pool-card[data-pool="tank"] .pc-reason');
+    const first = line();
+    assert.equal(first.textContent.trim(), 'stan puli: Uszkodzona; zapełniona w 93%');
+    assert.equal(first.getAttribute('title'), 'pool is faulted; 93% full');
+    assert.ok(first.classList.contains('err'), 'a critical reason is painted as one');
+
+    current = { health: 'warning', healthReason: 'last scrub found 3 errors', healthReasons: [{ code: 'scrub_found_errors', params: { count: '3', kind: 'scrub' } }] };
+    await poll();
+    assert.ok(line() === first, 'the same line, patched');
+    assert.equal(first.textContent.trim(), 'ostatni scrub znalazł 3 błędy');
+    assert.equal(first.getAttribute('title'), 'last scrub found 3 errors');
+
+    for (const next of [
+      { health: 'warning', healthReason: 'pool is suspended', healthReasons: [{ code: 'pool_suspended', params: {} }] },
+      { health: 'warning', healthReason: 'pool is suspended' },
+    ]) {
+      current = next;
+      await poll();
+      assert.equal(first.textContent.trim(), 'Uwaga', 'no word for it: the grade, never the English');
+      assert.equal(first.getAttribute('title'), 'pool is suspended');
+    }
+
+    current = { health: 'ok', healthReason: '', healthReasons: [] };
+    await poll();
+    assert.equal(line(), null, 'a healthy pool has no reason line');
+  } finally {
+    screen.dispose();
   }
 });

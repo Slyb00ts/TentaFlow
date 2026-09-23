@@ -65,6 +65,27 @@ fn validate_addon_id(addon_id: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Key prefix of the rows the PLATFORM (not the admin form) keeps in an app's
+/// `addon_config`: `__vector_config`, `__node_status/<node>`, and TentaNas's
+/// `__share/`, `__mount/`, `__addr/`, `__nas_summary/`, `__nas_alert_forward`,
+/// `__nas_four_eyes/<org>`.
+const INTERNAL_CONFIG_KEY_PREFIX: &str = "__";
+
+/// True for a platform-internal `addon_config` key, which the generic
+/// config read/write must never serve or accept.
+///
+/// Why: a singleton app such as TentaNas is shared by every organisation on a
+/// node and keeps per-organisation state in these rows (share registry with
+/// export paths and owner org, alert-forward target, four-eyes settings per
+/// org). The generic `AddonConfigGet/Set` requests are gated only by the admin
+/// role, with no organisation check, so serving these rows there would hand one
+/// tenant another tenant's data and let it forge or overwrite it. Internal rows
+/// are reached only through their dedicated, scoped paths (the TentaNas
+/// handlers, `AddonDetail`'s node statuses, the vector-backend picker).
+pub(crate) fn is_internal_config_key(key: &str) -> bool {
+    key.starts_with(INTERNAL_CONFIG_KEY_PREFIX)
+}
+
 /// Pobiera numeryczne user_id z kontekstu (dla audytu).
 fn current_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
@@ -122,6 +143,11 @@ fn extract_config_schema(manifest: &toml::Value) -> Vec<AddonConfigField> {
     };
     let mut out = Vec::with_capacity(schema_tbl.len());
     for (id, def) in schema_tbl.iter() {
+        // A manifest cannot turn an internal key into a form field: the field
+        // would make the generic read show it and the generic write accept it.
+        if is_internal_config_key(id) {
+            continue;
+        }
         let label = def
             .get("label")
             .and_then(|v| v.as_str())
@@ -618,8 +644,11 @@ pub fn addon_config_get(
         .filter(|f| f.secret)
         .map(|f| f.id.as_str())
         .collect();
+    // Internal rows are dropped entirely (not masked like secrets): their keys
+    // alone name another organisation's shares and nodes.
     let values: Vec<(String, String)> = rows
         .into_iter()
+        .filter(|r| !is_internal_config_key(&r.key))
         .map(|r| {
             if secret_ids.contains(r.key.as_str()) || r.is_secret {
                 (r.key, String::new())
@@ -807,6 +836,14 @@ pub async fn addon_config_set(
 
     // Walidacja: kazde pole musi istniec w schema. Puste value dla secret — pomijamy (nie nadpisujemy).
     for (k, v) in payload.values.iter() {
+        // Checked on its own, before the schema, so the refusal does not hinge
+        // on what some manifest declares: the whole request is rejected before
+        // anything is written.
+        if is_internal_config_key(k) {
+            return Err(ProtocolError::bad_request(format!(
+                "internal configuration key cannot be set: {k}"
+            )));
+        }
         if !schema_map.contains_key(k.as_str()) {
             return Err(ProtocolError::bad_request(format!(
                 "nieznane pole konfiguracji: {}",
@@ -2369,5 +2406,217 @@ mod declared_status_tests {
         assert_eq!(out[0].status, "covered");
         assert_eq!(out[1].status, "conflicting");
         assert_eq!(out[2].status, "missing");
+    }
+}
+
+#[cfg(test)]
+mod internal_config_key_tests {
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use std::sync::Arc;
+    use tentaflow_protocol::{AddonConfigGetRequest, AddonConfigSetRequest, ProtocolErrorCode};
+
+    const ADDON: &str = "cfg-shared";
+
+    /// A manifest that declares one ordinary field, one secret, and one field
+    /// whose id uses the internal prefix — the last must never become usable.
+    const MANIFEST: &str = r#"
+[addon]
+id = "cfg-shared"
+name = "cfg-shared"
+version = "1.0.0"
+
+[config.schema.host]
+label = "Host"
+type = "text"
+
+[config.schema.api_key]
+label = "API key"
+type = "password"
+
+[config.schema."__nas_alert_forward"]
+label = "Declared internal"
+type = "text"
+"#;
+
+    /// An org admin of SOME organisation: the role the generic handlers accept,
+    /// with nothing tying it to the organisations whose rows are seeded below.
+    fn org_admin_ctx(state: &Arc<AppState>) -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [9u8; 16],
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: Some(crate::services::rbac::OrgContext {
+                user_id: uuid::Uuid::from_bytes([9u8; 16]).to_string(),
+                org_id: "org-a".to_string(),
+                role_id: "role-admin".to_string(),
+                permissions: Default::default(),
+            }),
+        }
+    }
+
+    /// One shared app instance whose config already holds what TentaNas keeps
+    /// there for several organisations, next to its ordinary settings.
+    fn seeded_state() -> Arc<AppState> {
+        let state = AppState::for_test();
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "INSERT INTO addons \
+                 (addon_id, name, version, package_id, package_version, runtime, is_enabled, \
+                  manifest_json) \
+                 VALUES (?1, ?1, '1.0.0', ?1, '1.0.0', 'native', 1, ?2)",
+                rusqlite::params![ADDON, MANIFEST],
+            )
+            .expect("test addon row");
+        let db = &state.db;
+        for (key, value, secret) in [
+            ("host", "10.0.0.5", false),
+            ("api_key", "s3cret", true),
+            ("__share/node-b/share-9", r#"{"name":"finance","org":"org-b"}"#, false),
+            ("__nas_alert_forward", r#"{"target":"org-b-hook"}"#, false),
+            ("__nas_four_eyes/org-b", r#"{"enabled":true}"#, false),
+            ("__node_status/node-b", r#"{"status":"ok"}"#, false),
+        ] {
+            repository::upsert_addon_config_value(db, ADDON, key, value, secret, None)
+                .expect("seed config row");
+        }
+        state
+    }
+
+    fn stored(state: &Arc<AppState>, key: &str) -> Option<String> {
+        repository::list_addon_config_rows(&state.db, ADDON)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.key == key)
+            .map(|r| r.value)
+    }
+
+    fn get(state: &Arc<AppState>) -> AddonConfigGetResponse {
+        let req = MessageBody::AddonConfigGetRequestBody(AddonConfigGetRequest {
+            addon_id: ADDON.to_string(),
+        });
+        match addon_config_get(&req, &org_admin_ctx(state)).expect("config get") {
+            MessageBody::AddonConfigGetResponseBody(r) => r,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    async fn set(
+        state: &Arc<AppState>,
+        values: &[(&str, &str)],
+    ) -> Result<MessageBody, ProtocolError> {
+        let req = MessageBody::AddonConfigSetRequestBody(AddonConfigSetRequest {
+            addon_id: ADDON.to_string(),
+            values: values
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        });
+        addon_config_set(&req, &org_admin_ctx(state)).await
+    }
+
+    #[test]
+    fn internal_prefix_is_what_marks_a_key_internal() {
+        for key in [
+            "__share/n/s",
+            "__mount/n/s",
+            "__addr/n",
+            "__nas_summary/n",
+            "__nas_alert_forward",
+            "__nas_four_eyes/org",
+            "__node_status/n",
+            "__vector_config",
+        ] {
+            assert!(is_internal_config_key(key), "{key} must be internal");
+        }
+        for key in ["host", "api_key", "_single", "a__b", ""] {
+            assert!(!is_internal_config_key(key), "{key} must not be internal");
+        }
+    }
+
+    #[test]
+    fn org_admin_generic_read_returns_no_internal_row() {
+        let state = seeded_state();
+        let resp = get(&state);
+        let leaked: Vec<&String> = resp
+            .values
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| is_internal_config_key(k))
+            .collect();
+        assert!(leaked.is_empty(), "internal rows leaked: {leaked:?}");
+        assert!(
+            resp.schema.iter().all(|f| !is_internal_config_key(&f.id)),
+            "a manifest-declared internal field must not reach the form"
+        );
+    }
+
+    #[test]
+    fn generic_read_still_returns_ordinary_values_and_masks_secrets() {
+        let state = seeded_state();
+        let resp = get(&state);
+        let mut values = resp.values.clone();
+        values.sort();
+        assert_eq!(
+            values,
+            vec![
+                ("api_key".to_string(), String::new()),
+                ("host".to_string(), "10.0.0.5".to_string()),
+            ]
+        );
+        let mut ids: Vec<&str> = resp.schema.iter().map(|f| f.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["api_key", "host"]);
+    }
+
+    #[tokio::test]
+    async fn generic_write_of_an_internal_key_is_refused_and_writes_nothing() {
+        let state = seeded_state();
+        for key in [
+            "__nas_alert_forward",
+            "__nas_four_eyes/org-b",
+            "__share/node-b/forged",
+        ] {
+            // The ordinary key rides along to prove the request is refused as a
+            // whole, not applied up to the bad key.
+            let err = set(&state, &[("host", "10.9.9.9"), (key, "{}")])
+                .await
+                .expect_err("internal key must be refused");
+            assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{key}");
+        }
+        assert_eq!(stored(&state, "host").as_deref(), Some("10.0.0.5"));
+        assert_eq!(
+            stored(&state, "__nas_alert_forward").as_deref(),
+            Some(r#"{"target":"org-b-hook"}"#)
+        );
+        assert_eq!(
+            stored(&state, "__nas_four_eyes/org-b").as_deref(),
+            Some(r#"{"enabled":true}"#)
+        );
+        assert_eq!(stored(&state, "__share/node-b/forged"), None);
+    }
+
+    #[tokio::test]
+    async fn generic_write_of_ordinary_keys_still_works() {
+        let state = seeded_state();
+        set(&state, &[("host", "10.0.0.7"), ("api_key", "rotated")])
+            .await
+            .expect("ordinary write");
+        assert_eq!(stored(&state, "host").as_deref(), Some("10.0.0.7"));
+        assert_eq!(stored(&state, "api_key").as_deref(), Some("rotated"));
+        // Internal rows are untouched by an ordinary save.
+        assert_eq!(
+            stored(&state, "__share/node-b/share-9").as_deref(),
+            Some(r#"{"name":"finance","org":"org-b"}"#)
+        );
     }
 }

@@ -186,8 +186,23 @@ async fn local_properties() -> BTreeMap<String, BTreeMap<String, String>> {
     out
 }
 
-/// The node's whole desired state.
+/// The node's whole desired state — every organisation's shares, accounts
+/// and targets. Only for the uninstall backup (§5.8 step 5), the operator's
+/// copy of the node written outside the instance directory; a tenant's
+/// download is `export_for_org`.
 pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
+    export_scoped(db, None).await
+}
+
+/// The desired state as one organisation may take it away: the node's
+/// hardware (pools, datasets, schedules) and ITS OWN shares, share accounts
+/// and targets (migration 20). Another tenant's are not in the document at
+/// all — not even by name.
+pub async fn export_for_org(db: &DbPool, org_id: &str) -> Result<ConfigDocument> {
+    export_scoped(db, Some(org_id)).await
+}
+
+async fn export_scoped(db: &DbPool, org_id: Option<&str>) -> Result<ConfigDocument> {
     let pools = super::pools::collect(db).await.unwrap_or_default();
     let inventory = super::disks::snapshot().0;
     let serial_of = |name: &str| -> String {
@@ -229,7 +244,11 @@ pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
         })
         .collect();
 
-    let shares = store::list_shares(db)?
+    let shares = match org_id {
+        Some(org) => store::list_shares_of_org(db, org)?,
+        None => store::list_shares(db)?,
+    };
+    let shares = shares
         .into_iter()
         .map(|s| ShareConfig {
             name: s.name,
@@ -242,13 +261,16 @@ pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
         })
         .collect();
 
-    let share_users = store::list_share_users(db)?
-        .into_iter()
-        .map(|u| ShareUserConfig {
-            name: u.name,
-            description: u.description,
-        })
-        .collect();
+    let share_users = match org_id {
+        Some(org) => store::list_share_users(db, org)?
+            .into_iter()
+            .map(|u| ShareUserConfig {
+                name: u.name,
+                description: u.description,
+            })
+            .collect(),
+        None => all_share_users(db)?,
+    };
 
     let pool_tasks = |task: store::PoolTask| -> Result<Vec<PoolTaskConfig>> {
         Ok(store::list_pool_schedules(db, task)?
@@ -265,7 +287,11 @@ pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
 
     // The four secret columns of `nas_targets` are not read here at all: the
     // export carries the method and the user names, never a key.
-    let targets = store::list_targets(db)?
+    let targets = match org_id {
+        Some(org) => store::list_targets_of_org(db, org)?,
+        None => store::list_targets(db)?,
+    };
+    let targets = targets
         .into_iter()
         .map(|t| TargetConfig {
             name: t.name,
@@ -301,6 +327,23 @@ pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
             trim,
         },
     })
+}
+
+/// Every share account of the node, for the uninstall backup only. Read
+/// here rather than offered by the store: the store's list is per
+/// organisation, and a node-wide account list has exactly this one reader.
+fn all_share_users(db: &DbPool) -> Result<Vec<ShareUserConfig>> {
+    let conn = db.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare("SELECT name, description FROM nas_share_users ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ShareUserConfig {
+                name: r.get(0)?,
+                description: r.get(1)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// `tentanas-<node>-<YYYYMMDD-HHMMSS>.json` — the name the download and the
@@ -366,9 +409,21 @@ pub struct LiveState {
     /// `apply_with` then skipped creating it. Another tenant's union is not in
     /// here (see `live_state`).
     pub array_unions: Vec<String>,
+    /// Every OTHER organisation's union: refused as a share source even when
+    /// a pool mounted at `/mnt` contains it (the `source_owner` rule).
+    pub foreign_unions: Vec<String>,
+    /// The importing organisation — the owner every created row is stamped
+    /// with (migration 20).
+    pub org_id: String,
+    /// The importing organisation's shares, targets and accounts.
     pub shares: Vec<ShareRow>,
     pub targets: Vec<store::TargetRow>,
     pub share_users: Vec<String>,
+    /// Everyone else's, still judged against — a node-wide name, WWN, source
+    /// or zvol is taken whoever took it — but never NAMED in the plan.
+    pub foreign_shares: Vec<ShareRow>,
+    pub foreign_targets: Vec<store::TargetRow>,
+    pub foreign_share_users: Vec<String>,
     pub scrub_pools: Vec<String>,
     pub trim_pools: Vec<String>,
     pub snapshot_datasets: Vec<String>,
@@ -389,6 +444,15 @@ pub async fn live_state(
     owner: &tentanas_helper::elastic::ElasticOwner,
 ) -> Result<LiveState> {
     let datasets = super::datasets::list("").await.unwrap_or_default();
+    let share_owners = store::share_owners(db)?;
+    let target_owners = store::target_owners(db)?;
+    let (shares, foreign_shares): (Vec<ShareRow>, Vec<ShareRow>) = store::list_shares(db)?
+        .into_iter()
+        .partition(|s| share_owners.get(&s.share_id) == Some(&owner.org_id));
+    let (targets, foreign_targets): (Vec<store::TargetRow>, Vec<store::TargetRow>) = store::list_targets(db)?
+        .into_iter()
+        .partition(|t| target_owners.get(&t.target_id) == Some(&owner.org_id));
+    let (share_users, foreign_share_users) = share_user_names(db, &owner.org_id)?;
     Ok(LiveState {
         pools: super::pools::list_rows()
             .await
@@ -411,13 +475,15 @@ pub async fn live_state(
             .into_iter()
             .map(|a| a.union_path())
             .collect(),
+        foreign_unions: super::shares::foreign_unions(db, owner)?,
+        org_id: owner.org_id.clone(),
         datasets: datasets.into_iter().map(|d| d.name).collect(),
-        shares: store::list_shares(db)?,
-        targets: store::list_targets(db)?,
-        share_users: store::list_share_users(db)?
-            .into_iter()
-            .map(|u| u.name)
-            .collect(),
+        shares,
+        targets,
+        share_users,
+        foreign_shares,
+        foreign_targets,
+        foreign_share_users,
         scrub_pools: store::list_pool_schedules(db, store::PoolTask::Scrub)?
             .into_iter()
             .map(|s| s.pool)
@@ -433,6 +499,25 @@ pub async fn live_state(
         smart_enabled: store::smart_schedule(db)?.enabled,
     })
 }
+
+/// The account names on the node: `org_id`'s own, and everyone else's.
+fn share_user_names(db: &DbPool, org_id: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let conn = db.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare("SELECT name, org_id FROM nas_share_users ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let (own, foreign): (Vec<_>, Vec<_>) =
+        rows.into_iter().partition(|(_, owner)| !org_id.is_empty() && owner == org_id);
+    Ok((
+        own.into_iter().map(|(name, _)| name).collect(),
+        foreign.into_iter().map(|(name, _)| name).collect(),
+    ))
+}
+
+/// The one sentence for a name another organisation already holds on this
+/// node: the name is taken, and nothing says by whom.
+const TAKEN_ON_THIS_NODE: &str = "the name is already in use on this node";
 
 fn item(kind: &str, name: &str, action: &str, detail: impl Into<String>) -> NasConfigImportItem {
     NasConfigImportItem {
@@ -526,6 +611,8 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
     for user in &document.share_users {
         if live.share_users.contains(&user.name) {
             items.push(item("share_user", &user.name, "skip", "already exists"));
+        } else if live.foreign_share_users.contains(&user.name) {
+            items.push(item("share_user", &user.name, "conflict", TAKEN_ON_THIS_NODE));
         } else {
             items.push(item(
                 "share_user",
@@ -546,6 +633,10 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
             items.push(item("share", &share.name, "skip", detail));
             continue;
         }
+        if live.foreign_shares.iter().any(|s| s.name == share.name) {
+            items.push(item("share", &share.name, "conflict", TAKEN_ON_THIS_NODE));
+            continue;
+        }
         if let Some(other) = live
             .shares
             .iter()
@@ -559,6 +650,15 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
             ));
             continue;
         }
+        if live.foreign_shares.iter().any(|s| s.source_path == share.source_path) {
+            items.push(item(
+                "share",
+                &share.name,
+                "conflict",
+                format!("{} is already exported on this node", share.source_path),
+            ));
+            continue;
+        }
         // Either owner counts. The trailing slash is what keeps the boundary
         // honest: `/mnt/media-old` is not inside `/mnt/media`.
         let owned_by = |roots: &[String]| {
@@ -566,7 +666,20 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
                 .iter()
                 .any(|m| share.source_path == *m || share.source_path.starts_with(&format!("{m}/")))
         };
-        if owned_by(&live.pool_mountpoints) || owned_by(&live.array_unions) {
+        // Another tenant's union FIRST, with the sentence a path on no pool
+        // gets: a pool mounted at `/mnt` would otherwise make it "under a
+        // pool mountpoint" and the import would export it.
+        if owned_by(&live.foreign_unions) {
+            items.push(item(
+                "share",
+                &share.name,
+                "conflict",
+                format!(
+                    "{} is under neither a pool mountpoint nor an Elastic Array union of this node",
+                    share.source_path
+                ),
+            ));
+        } else if owned_by(&live.pool_mountpoints) || owned_by(&live.array_unions) {
             items.push(item("share", &share.name, "create", &share.protocol));
         } else {
             items.push(item(
@@ -587,6 +700,19 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
     for target in &document.targets {
         if live.targets.iter().any(|t| t.name == target.name) {
             items.push(item("target", &target.name, "skip", "already exists"));
+            continue;
+        }
+        if live.foreign_targets.iter().any(|t| t.name == target.name) {
+            items.push(item("target", &target.name, "conflict", TAKEN_ON_THIS_NODE));
+            continue;
+        }
+        if live.foreign_targets.iter().any(|t| t.wwn == target.wwn) {
+            items.push(item(
+                "target",
+                &target.name,
+                "conflict",
+                format!("{} is already published on this node", target.wwn),
+            ));
             continue;
         }
         if let Some(other) = live.targets.iter().find(|t| t.wwn == target.wwn) {
@@ -615,16 +741,26 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
             ));
             continue;
         }
-        if let Some(other) = live.targets.iter().find(|t| {
+        let exports_it = |t: &store::TargetRow| {
             t.luns
                 .iter()
                 .any(|l| target.luns.iter().any(|n| n.source == l.source))
-        }) {
+        };
+        if let Some(other) = live.targets.iter().find(|&t| exports_it(t)) {
             items.push(item(
                 "target",
                 &target.name,
                 "conflict",
                 format!("'{}' already exports that volume", other.name),
+            ));
+            continue;
+        }
+        if live.foreign_targets.iter().any(|t| exports_it(t)) {
+            items.push(item(
+                "target",
+                &target.name,
+                "conflict",
+                "that volume is already exported on this node",
             ));
             continue;
         }
@@ -858,7 +994,8 @@ pub async fn apply_with(
 
     for user in &document.share_users {
         if action_of("share_user", &user.name) == "create" {
-            store::upsert_share_user(&db, &user.name, &user.description)?;
+            // Owned by the importing organisation, like everything it creates.
+            store::upsert_share_user(&db, &live.org_id, &user.name, &user.description)?;
             handle.log(format!(
                 "share user {}: created — set a password before it can connect",
                 user.name
@@ -877,6 +1014,25 @@ pub async fn apply_with(
             continue;
         }
         let now = store::now();
+        // A grant may only name an account of the importing organisation —
+        // the accounts above were just created under it, or already were its
+        // own. A grant to another tenant's account would let that tenant's
+        // user into this share, so it is dropped and the log says so.
+        let mut smb = share.smb.clone();
+        if let Some(options) = smb.as_mut() {
+            let mut kept = Vec::new();
+            for grant in std::mem::take(&mut options.users) {
+                if store::share_user_exists(&db, &live.org_id, &grant.user)? {
+                    kept.push(grant);
+                } else {
+                    handle.log(format!(
+                        "share {}: the grant to '{}' was left out — it is not a share user of this organisation",
+                        share.name, grant.user
+                    ));
+                }
+            }
+            options.users = kept;
+        }
         let row = ShareRow {
             share_id: uuid::Uuid::now_v7().to_string(),
             name: share.name.clone(),
@@ -885,14 +1041,14 @@ pub async fn apply_with(
             dataset: None,
             enabled: share.enabled,
             fleet_mount: share.fleet_mount,
-            smb: share.smb.clone(),
+            smb,
             nfs: share.nfs.clone(),
             state: "disabled".to_string(),
             state_detail: String::new(),
             created_at: now.clone(),
             updated_at: now,
         };
-        store::upsert_share(&db, &row)?;
+        store::upsert_share(&db, &live.org_id, &row)?;
         shares_changed = true;
         handle.log(format!("share {}: created", share.name));
         step(handle, &mut done);
@@ -924,8 +1080,15 @@ pub async fn apply_with(
     };
     // Read ONCE and grown as rows land, not re-read per document target: the
     // list only changes here, and the query was inside the loop — O(n²)
-    // database reads for a document with n targets.
-    let mut imported = store::list_targets(&db).unwrap_or_default();
+    // database reads for a document with n targets. Every target of the node
+    // is judged against, another organisation's without its name
+    // (`targets::seen_by`), so neither a refusal nor the host-collision
+    // report below names it.
+    let mut imported = super::targets::seen_by(
+        store::list_targets(&db).unwrap_or_default(),
+        &store::target_owners(&db).unwrap_or_default(),
+        &live.org_id,
+    );
     for target in &document.targets {
         if action_of("target", &target.name) != "create" {
             handle.log(format!("target {}: skipped", target.name));
@@ -1016,7 +1179,7 @@ pub async fn apply_with(
             step(handle, &mut done);
             continue;
         }
-        store::upsert_target(&db, &row)?;
+        store::upsert_target(&db, &live.org_id, &row)?;
         imported.push(row.clone());
         targets_changed = true;
         handle.log(format!(
@@ -1097,9 +1260,19 @@ pub async fn apply_with(
         step(handle, &mut done);
     }
 
+    // Both applies below are NODE-WIDE and speak about every tenant's rows;
+    // this job is the importing organisation's, so their lines are scoped
+    // (`shares::scope_log`, `targets::apply_for_org`). Owners that cannot be
+    // read withhold the log.
     if shares_changed {
-        for line in super::shares::apply(&db, main_db, addon_id, explicit, super::shares::ApplyTrigger::Change).await? {
-            handle.log(line);
+        let lines = super::shares::apply(&db, main_db, addon_id, explicit, super::shares::ApplyTrigger::Change).await?;
+        match super::shares::foreign_share_markers(&db, &live.org_id) {
+            Ok(markers) => {
+                for line in super::shares::scope_log(lines, &markers) {
+                    handle.log(line);
+                }
+            }
+            Err(e) => handle.log(format!("the share apply log is withheld: {e}")),
         }
     }
     if targets_changed {
@@ -1107,8 +1280,10 @@ pub async fn apply_with(
         // exactly those into the kernel; the rest wait for their secret.
         let cipher = SettingsCipher::new(&crate::crypto::load_or_create_master_key()?);
         // Node-wide: an import can create, change and drop several targets at
-        // once, so there is no single row to scope to.
-        for line in super::targets::apply(&db, &cipher, explicit, None).await? {
+        // once, so there is no single row to scope to. Its log AND its error
+        // are the importing organisation's (`apply_for_org`): another
+        // tenant's failing target is counted, never named.
+        for line in super::targets::apply_for_org(&db, &cipher, explicit, None, &live.org_id).await? {
             handle.log(line);
         }
     }
@@ -1318,7 +1493,127 @@ mod tests {
             trim_pools: vec![],
             snapshot_datasets: vec![],
             smart_enabled: false,
+            foreign_unions: Vec::new(),
+            org_id: "org-a".into(),
+            foreign_shares: Vec::new(),
+            foreign_targets: Vec::new(),
+            foreign_share_users: Vec::new(),
         }
+    }
+
+    /// Another organisation's rows are judged against — a name, a source, a
+    /// WWN, a zvol and an account name are taken on the node whoever took
+    /// them — but the plan never NAMES them and never skips a document entry
+    /// as "already exists" because someone else has one like it.
+    #[test]
+    fn the_plan_refuses_another_organisations_rows_without_naming_them() {
+        let mut live = live();
+        live.share_users = Vec::new();
+        live.foreign_share_users = vec!["anna".to_string()];
+        live.foreign_shares = vec![
+            ShareRow { share_id: "b1".into(), name: "projekty".into(), source_path: "/mnt/tank/b".into(), ..Default::default() },
+            ShareRow { share_id: "b2".into(), name: "kadry-b".into(), source_path: "/mnt/tank/backups-b".into(), ..Default::default() },
+        ];
+        live.foreign_targets = vec![store::TargetRow {
+            target_id: "tb".into(),
+            name: "tajny-b".into(),
+            wwn: "iqn.2026-09.local.tentaflow:helios.vm-store".into(),
+            ..Default::default()
+        }];
+        let mut doc = document();
+        doc.shares[1].source_path = "/mnt/tank/backups-b".into();
+        let (items, _) = plan(&doc, &live);
+        let dump = format!("{items:?}");
+        for secret in ["kadry-b", "tajny-b"] {
+            assert!(!dump.contains(secret), "another organisation's name leaked into the plan: {dump}");
+        }
+        let anna = find(&items, "share_user", "anna");
+        assert_eq!((anna.action.as_str(), anna.detail.as_str()), ("conflict", TAKEN_ON_THIS_NODE));
+        let projekty = find(&items, "share", "projekty");
+        assert_eq!((projekty.action.as_str(), projekty.detail.as_str()), ("conflict", TAKEN_ON_THIS_NODE));
+        let archiwum = find(&items, "share", "archiwum");
+        assert_eq!(archiwum.action, "conflict");
+        assert!(archiwum.detail.contains("already exported on this node"), "{}", archiwum.detail);
+        let vm = find(&items, "target", "vm-store");
+        assert_eq!(vm.action, "conflict");
+        assert!(vm.detail.contains("already published on this node"), "{}", vm.detail);
+
+        // A zvol another organisation's target exports is taken, unnamed.
+        live.foreign_targets[0].wwn = "iqn.other".into();
+        live.foreign_targets[0].luns = vec![NasTargetLun {
+            source: "tank/vm-store".into(),
+            source_kind: "zvol".into(),
+            ..Default::default()
+        }];
+        let (items, _) = plan(&document(), &live);
+        let vm = find(&items, "target", "vm-store");
+        assert_eq!((vm.action.as_str(), vm.detail.as_str()), ("conflict", "that volume is already exported on this node"));
+    }
+
+    /// A pool mounted at `/mnt` itself put every union "under a pool
+    /// mountpoint": the import accepted another tenant's union there. Now it
+    /// is a conflict with the sentence a path on no pool gets.
+    #[test]
+    fn a_pool_at_mnt_does_not_let_an_import_use_another_organisations_union() {
+        let mut live = live();
+        live.pool_mountpoints = vec!["/mnt".to_string()];
+        live.foreign_unions = vec!["/mnt/bravo".to_string()];
+        let planned = |source: &str| {
+            let mut doc = document();
+            doc.shares[0].name = "wspolny".into();
+            doc.shares[0].source_path = source.into();
+            let (items, _) = plan(&doc, &live);
+            let item = find(&items, "share", "wspolny").clone();
+            (item.action, item.detail.replace(source, "<path>"))
+        };
+        let foreign = planned("/mnt/bravo");
+        assert_eq!(foreign.0, "conflict");
+        assert_eq!(planned("/mnt/bravo/filmy"), foreign);
+        assert_eq!(foreign.1, "<path> is under neither a pool mountpoint nor an Elastic Array union of this node");
+        assert_eq!(planned("/mnt/bravo-old").0, "create", "a real directory of the pool");
+    }
+
+    /// Everything an import creates belongs to the importing organisation,
+    /// and a share's grant to an account that is not that organisation's is
+    /// left out (and logged) rather than written.
+    #[tokio::test]
+    async fn an_import_creates_its_rows_owned_by_the_importing_organisation() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        store::upsert_share_user(&db, "org-b", "obcy", "").expect("foreign account");
+        let handle = super::super::jobs::JobHandle::for_test(&db, "job-import-owner");
+
+        let mut doc = document();
+        doc.pools.clear();
+        doc.datasets.clear();
+        doc.targets.clear();
+        doc.shares.truncate(1);
+        doc.shares[0].smb = Some(NasSmbOptions {
+            users: vec![
+                tentaflow_protocol::tentanas::NasShareAccess { user: "jan".into(), mode: "rw".into() },
+                tentaflow_protocol::tentanas::NasShareAccess { user: "obcy".into(), mode: "rw".into() },
+            ],
+            ..Default::default()
+        });
+        let mut live = live();
+        live.shares = Vec::new();
+        live.share_users = Vec::new();
+        live.foreign_share_users = vec!["obcy".to_string()];
+        live.org_id = "org-a".into();
+        // The node-wide share apply at the end needs `zfs`; whether it runs
+        // here or not, the rows are written before it.
+        let _ = apply_with(&handle, &db, "tentanas", doc, None, live, None).await;
+
+        let shares = store::list_shares_of_org(&db, "org-a").expect("shares");
+        assert_eq!(shares.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["projekty"]);
+        let grants: Vec<String> = shares[0].smb.as_ref().unwrap().users.iter().map(|g| g.user.clone()).collect();
+        assert_eq!(grants, vec!["jan".to_string()], "the foreign account's grant was left out");
+        assert!(store::list_shares_of_org(&db, "org-b").expect("shares").is_empty());
+        let users: Vec<String> = store::list_share_users(&db, "org-a").expect("users").into_iter().map(|u| u.name).collect();
+        assert_eq!(users, vec!["anna".to_string(), "jan".to_string()]);
+        let log = store::job(&db, "job-import-owner").expect("read").expect("job").log;
+        assert!(log.iter().any(|l| l.contains("'obcy' was left out")), "{log:#?}");
     }
 
     fn find<'a>(items: &'a [NasConfigImportItem], kind: &str, name: &str) -> &'a NasConfigImportItem {
@@ -1642,6 +1937,124 @@ mod tests {
         assert!(collision.contains(esx), "{collision}");
         assert!(collision.contains("vm-a"), "{collision}");
         assert!(collision.contains("only one of these two targets can be applied"), "{collision}");
+    }
+
+    #[tokio::test]
+    async fn an_import_never_names_another_organisations_failing_target_in_its_error() {
+        // The import's target apply is node-wide, so it reconciles EVERY
+        // tenant's rows — and a failure of one of them used to come back as
+        // this job's error with the other organisation's target name in it.
+        // The log was scoped by hand; the error was not.
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let handle = super::super::jobs::JobHandle::for_test(&db, "job-import-foreign-failure");
+
+        // org-b's target: enabled, its "volume" present (`/dev/null`), no
+        // portal to drift — so it is judged `Apply` wherever the kernel can
+        // serve iSCSI, and its apply fails: a test host has no privilege
+        // channel, and even with one its secret cannot be decrypted.
+        let foreign = store::TargetRow {
+            target_id: "0191f2c0-0000-7000-8000-0000000000f1".into(),
+            name: "obcy-vm".into(),
+            protocol: "iscsi".into(),
+            wwn: super::super::targets::wwn_for("iscsi", "helios", "obcy-vm"),
+            enabled: true,
+            luns: vec![NasTargetLun {
+                index: 0,
+                source: "tank/obcy-vm".into(),
+                source_kind: "zvol".into(),
+                device_path: "/dev/null".into(),
+                size_bytes: 1024,
+                thin: true,
+                uuid: "uuid-obcy-vm".into(),
+                ..Default::default()
+            }],
+            auth_method: "chap".into(),
+            auth_username: "obcy".into(),
+            auth_secret: "encb:not-a-ciphertext".into(),
+            ..Default::default()
+        };
+        store::upsert_target(&db, "org-b", &foreign).expect("foreign target");
+
+        // org-a imports one target of its own, which arrives disabled (it
+        // authenticates), so the import has a target change to apply.
+        let own = TargetConfig {
+            name: "vm-a".to_string(),
+            protocol: "nvmet".to_string(),
+            wwn: super::super::targets::wwn_for("nvmet", "helios", "vm-a"),
+            enabled: true,
+            luns: vec![NasTargetLun {
+                index: 1,
+                source: "tank/vm-a".to_string(),
+                source_kind: "zvol".to_string(),
+                device_path: "/dev/zvol/tank/vm-a".to_string(),
+                size_bytes: 1024,
+                thin: true,
+                uuid: "uuid-vm-a".to_string(),
+                group_id: 1,
+                ..Default::default()
+            }],
+            portals: vec![NasTargetPortal {
+                interface: "storage0".to_string(),
+                address: "10.10.0.5".to_string(),
+                port: 4420,
+                transport: "tcp".to_string(),
+            }],
+            port_groups: super::super::targets::default_port_groups(),
+            initiators: vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".to_string()],
+            auth_method: "dhchap".to_string(),
+            auth_username: String::new(),
+            auth_mutual_username: String::new(),
+            dhchap_hash: "hmac(sha256)".to_string(),
+            dhchap_dhgroup: "null".to_string(),
+        };
+        let mut document = document();
+        document.targets = vec![own];
+        document.shares.clear();
+        document.datasets.clear();
+        document.pools.clear();
+        let mut live = live();
+        live.datasets = vec!["tank/vm-a".to_string()];
+        live.targets = Vec::new();
+        live.shares = Vec::new();
+        live.org_id = "org-a".into();
+        let caps = NasBlockCapabilities {
+            iscsi: true,
+            nvmet: true,
+            dhchap: true,
+            ..Default::default()
+        };
+
+        let outcome = apply_with(&handle, &db, "tentanas", document, None, live, Some(caps)).await;
+
+        let rows = store::list_targets(&db).expect("targets");
+        assert_eq!(rows.len(), 2, "the import's own row landed: {rows:?}");
+        let log = store::job(&db, "job-import-foreign-failure")
+            .expect("read")
+            .expect("the job row")
+            .log;
+        assert!(
+            !log.iter().any(|l| l.contains("obcy-vm")),
+            "the job log names another organisation's target:\n{log:#?}"
+        );
+        // Whether org-b's row is judged `Apply` is this host's kernel's
+        // answer (`kernel_support`), not something a unit test can inject from
+        // here. Where it is, the reconcile MUST fail, and the error is the
+        // assertion that matters.
+        if super::super::targets::kernel_support("iscsi").0 {
+            let error = outcome
+                .expect_err("org-b's target cannot be applied on a test host")
+                .to_string();
+            assert!(!error.contains("obcy-vm"), "{error}");
+            // Counted, not named. Not pinned to "1": on a node that serves
+            // real targets their kernel objects are orphans to this
+            // in-memory database, and they are counted the same way.
+            assert!(error.contains("other target(s) on this node could not be reconciled"), "{error}");
+        } else {
+            eprintln!("NOTE: this host cannot serve iSCSI; the foreign failure is not reached here");
+            outcome.expect("nothing failed");
+        }
     }
 
     #[test]

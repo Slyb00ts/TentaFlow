@@ -9,6 +9,7 @@ import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS,
   fmtDate, fmtIn, fmtBytes, fmtRatio, pct, healthClass, healthChip, errMessage, layoutLabel, stateTone, stateLabel, fmtSchedule,
+  poolReasonsText,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl } from '/js/modules/tentanas/dom-patch.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
@@ -363,11 +364,15 @@ function paintPoolCard(card, p) {
   }
   setText(card.querySelector('[data-f="desc"]'), poolDescription(p));
 
-  const reasonEl = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(p.healthReason), 'reason',
+  // The pool's reasons worded from its codes (`poolReasonsText`); the
+  // node's English sentence is only the tooltip.
+  const why = poolReasonsText(p);
+  const reasonEl = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(why.text), 'reason',
     `<div class="pc-reason">${sprite('alert')} <span data-f="text"></span></div>`);
   if (reasonEl) {
     setAttr(reasonEl, 'class', ('pc-reason ' + healthClass(p.health)).trim());
-    setText(reasonEl.querySelector('[data-f="text"]'), p.healthReason);
+    setAttr(reasonEl, 'title', why.title || null);
+    setText(reasonEl.querySelector('[data-f="text"]'), why.text);
   }
 
   // The scan-status button (Skanuj teraz/Wstrzymaj/Wznow) is its own keyed

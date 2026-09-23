@@ -734,7 +734,106 @@ const MIGRATIONS: &[(i64, &str)] = &[(
          WHERE EXISTS (SELECT 1 FROM nas_elastic_disks d
                         WHERE d.array_id = a.array_id AND d.role = 'parity');"
     ),
+), (
+    20,
+    // WHICH ORGANISATION a share, a share account and a block target belong
+    // to (owner decision 2026-09-22): the organisation that created it, and
+    // only that one sees and manages it. Pools and disks stay node hardware.
+    // `nas_access_events` carries the owner too, stamped from the share when
+    // the line is COLLECTED: a deleted share's log keeps its owner, and a
+    // later share of another organisation under the same name never inherits
+    // it. Share grants and target allowlists are children reached only
+    // through their parent's id, so they need no column of their own.
+    //
+    // NOT NULL DEFAULT '': every write path stamps the owner; a row that
+    // somehow arrives without one is '' — owned but unknown — and is shown to
+    // NO organisation (the `''` rule of migration 18). Failing closed is the
+    // point: a forgotten stamp hides a row, it never hands it to a tenant.
+    //
+    // THE BACKFILL. Every existing row was created before ownership existed,
+    // by an admin of SOME organisation of this node, and all of them were
+    // visible to every tenant until now. Two rules, in this order:
+    //
+    //   1. A share whose source is an Elastic Array union (or a folder in it)
+    //      belongs to that array's organisation. The array IS owned, and until
+    //      this migration only that organisation could create a share on it
+    //      (wave 2 made `share_create` resolve against the caller's arrays),
+    //      so this is the one owner the rows can prove. An array whose own
+    //      owner is EMPTY proves nothing, so its shares fall to rule 2: ''
+    //      would hide a live export from every tenant (see below). No code
+    //      path is known to write such an array; the fallback is for the one
+    //      nobody knows about.
+    //   2. Everything else — shares on pool datasets, every block target —
+    //      goes to the node's DEFAULT organisation ('org-default',
+    //      `services::org::DEFAULT_ORG_ID`, pinned by a test). It is the org
+    //      the platform's own migration v32 backfilled every historical row
+    //      to, the org this singleton's database lives under
+    //      (`app_db::data_dir_org`), and on a node with a single organisation
+    //      it IS that organisation — rig11 on 2026-09-23 has exactly one.
+    //
+    // WHY NOT '' (hidden) for rule 2, as migration 18 did for jobs of a gone
+    // array: a job is history, a share is a LIVE export. A share nobody can
+    // see is still served by smbd, still mounted fleet-wide, and cannot be
+    // paused, edited or deleted from any tenant's UI — the least manageable
+    // state there is. And rule 2 reveals nothing new: every tenant could read
+    // and change these rows before this migration; after it, the other
+    // tenants lose that access and the default organisation keeps it.
+    //
+    // Share accounts follow their grants: an account granted ONLY on shares
+    // of one organisation is that organisation's; one with no grants, or with
+    // grants in more than one organisation, is the default organisation's.
+    // Access events follow their share by name; a line of a share that no
+    // longer exists goes to the default organisation, the rule-2 owner of a
+    // share nobody can attribute. Share, target and import JOBS follow the
+    // same rows by subject name, and only a row that already existed when the
+    // job started is taken (the name-reuse guard of migration 18); a target's
+    // alerts follow the target the same way.
+    "ALTER TABLE nas_shares ADD COLUMN org_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE nas_share_users ADD COLUMN org_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE nas_targets ADD COLUMN org_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE nas_access_events ADD COLUMN org_id TEXT NOT NULL DEFAULT '';
+    UPDATE nas_shares SET org_id = COALESCE(
+            (SELECT NULLIF(a.org_id, '') FROM nas_elastic_arrays a
+              WHERE nas_shares.source_path = '/mnt/' || a.name
+                 OR substr(nas_shares.source_path, 1, length(a.name) + 6) = '/mnt/' || a.name || '/'),
+            'org-default');
+    UPDATE nas_share_users SET org_id = COALESCE(
+            (SELECT MIN(s.org_id) FROM nas_share_grants g
+               JOIN nas_shares s ON s.share_id = g.share_id
+              WHERE g.user = nas_share_users.name
+             HAVING COUNT(DISTINCT s.org_id) = 1),
+            'org-default');
+    UPDATE nas_targets SET org_id = 'org-default';
+    UPDATE nas_access_events SET org_id = COALESCE(
+            (SELECT s.org_id FROM nas_shares s WHERE s.name = nas_access_events.share),
+            'org-default');
+    UPDATE nas_jobs SET org_id = COALESCE(
+            (SELECT s.org_id FROM nas_shares s
+              WHERE s.name = nas_jobs.subject AND s.created_at <= nas_jobs.started_at),
+            'org-default')
+     WHERE kind IN ('share_create', 'share_update', 'share_delete') AND org_id IS NULL;
+    UPDATE nas_jobs SET org_id = COALESCE(
+            (SELECT t.org_id FROM nas_targets t
+              WHERE t.name = nas_jobs.subject AND t.created_at <= nas_jobs.started_at),
+            'org-default')
+     WHERE kind IN ('target_create', 'target_update', 'target_delete') AND org_id IS NULL;
+    UPDATE nas_jobs SET org_id = 'org-default' WHERE kind = 'config_import' AND org_id IS NULL;
+    UPDATE nas_alerts SET org_id = COALESCE(
+            (SELECT t.org_id FROM nas_targets t
+              WHERE t.name = nas_alerts.subject_id AND t.created_at <= nas_alerts.raised_at),
+            'org-default')
+     WHERE subject_kind = 'target';
+    CREATE INDEX nas_shares_org ON nas_shares(org_id);
+    CREATE INDEX nas_share_users_org ON nas_share_users(org_id);
+    CREATE INDEX nas_targets_org ON nas_targets(org_id);
+    CREATE INDEX nas_access_events_org ON nas_access_events(org_id, at DESC);",
 )];
+
+/// The owner migration 20 gives a legacy share, target or account it cannot
+/// attribute. Spelled here once for the test that pins the migration's SQL
+/// literal to the platform constant.
+#[cfg(test)]
+const LEGACY_OWNER: &str = "org-default";
 
 /// How far back a disk's health history reaches, and how much of it keeps
 /// minute resolution. Both are answers the frontend labels its charts with,
@@ -1133,11 +1232,16 @@ const ALERT_COLUMNS: &str = "alert_id, severity, subject_kind, subject_id, title
 /// A function over the placeholders rather than one constant because the
 /// insert and the refresh of `raise_alert` bind their parameters in different
 /// positions, and both must stamp the owner with the very same rule.
+///
+/// A block TARGET is owned since migration 20: its portal-drift alert names
+/// the target and describes its network, so it goes to the target's
+/// organisation (subject = the target's name, unique on the node).
 fn alert_owner_sql(kind: &str, subject: &str) -> String {
     format!(
         "CASE {kind} \
          WHEN 'elastic-array' THEN COALESCE((SELECT org_id FROM nas_elastic_arrays WHERE name = {subject}), '') \
          WHEN 'approval' THEN COALESCE((SELECT org_id FROM nas_pending_approvals WHERE request_id = {subject}), '') \
+         WHEN 'target' THEN COALESCE((SELECT org_id FROM nas_targets WHERE name = {subject}), '') \
          END"
     )
 }
@@ -1254,6 +1358,21 @@ pub fn resolve_alert(pool: &DbPool, dedupe_key: &str) -> Result<()> {
     Ok(())
 }
 
+/// The dedupe keys of the OPEN alerts whose key matches the SQL `LIKE`
+/// pattern `like`. For a raiser that owns a family of per-subject keys and
+/// has to close the members it no longer raises — including those of a
+/// subject that has since disappeared, which it cannot name any more.
+pub fn open_alert_keys_like(pool: &DbPool, like: &str) -> Result<Vec<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT dedupe_key FROM nas_alerts WHERE resolved_at IS NULL AND dedupe_key LIKE ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![like], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// The severity of the OPEN alert under `dedupe_key`, `None` when none is
 /// open. The disk health alert moves FROM this rather than from a grade held
 /// in memory, which a restart or a failed write leaves out of step with it.
@@ -1337,7 +1456,8 @@ pub fn alerts_for_subject(pool: &DbPool, kind: &str, subject_id: &str) -> Result
 }
 
 /// Open, unacknowledged NODE-WIDE alerts (`org_id IS NULL`: disks, pools,
-/// targets). This is the figure the node publishes in its fleet summary,
+/// the node's own channel — a target's alert is its organisation's since
+/// migration 20). This is the figure the node publishes in its fleet summary,
 /// which lands in the instance's `addon_config` and is read by every tenant
 /// of every node: a count that included a tenant's own alerts would tell the
 /// others that it has some. Each tenant's own alerts are added at read time
@@ -4622,6 +4742,14 @@ fn access_event_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasAccessEve
 /// Appends one collection's worth of parsed audit lines. One transaction: a
 /// partially inserted batch whose cursor was already stored would lose the
 /// remainder for good.
+///
+/// Each line is stamped with the organisation that owns its share AT THE
+/// MOMENT IT IS COLLECTED (migration 20), in the INSERT itself: the log then
+/// keeps its owner after the share is deleted, and a later share of another
+/// organisation that takes the same name never inherits the old lines. A
+/// line whose share has no row gets '' and is shown to nobody — the
+/// collector only keeps lines of shares it audits, so that is a share deleted
+/// between the read and the write, not a normal case.
 pub fn insert_access_events(pool: &DbPool, events: &[NasAccessEvent]) -> Result<usize> {
     if events.is_empty() {
         return Ok(0);
@@ -4631,8 +4759,9 @@ pub fn insert_access_events(pool: &DbPool, events: &[NasAccessEvent]) -> Result<
     {
         let mut stmt = tx.prepare(
             "INSERT INTO nas_access_events
-                (at, share, user, client, operation, result, target, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (at, share, user, client, operation, result, target, detail, org_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                     COALESCE((SELECT org_id FROM nas_shares WHERE name = ?2), ''))",
         )?;
         for e in events {
             stmt.execute(params![
@@ -4664,26 +4793,40 @@ pub struct AccessFilter<'a> {
     pub limit: u32,
 }
 
+/// The rows of the access log one organisation may read: the lines of its
+/// own shares (migration 20). An empty org id matches nothing — never the
+/// unowned '' rows — for the same reason `VISIBLE_TO_ORG_SQL` guards it.
+const ACCESS_OF_ORG_SQL: &str = "(org_id = ?6 AND ?6 <> '')";
+
 /// The filtered page plus how many rows the filter matched in total, so the
 /// view can say "1000 z 4213" instead of pretending the page is everything.
+///
+/// `org_id` is the asking organisation: the log names shares, accounts,
+/// client addresses and file paths, so another tenant's lines are not in the
+/// page, not in the total and not in the facets.
 pub fn access_events(
     pool: &DbPool,
+    org_id: &str,
     filter: &AccessFilter<'_>,
 ) -> Result<(Vec<NasAccessEvent>, u32)> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     // Every clause is a bound parameter with a fixed SQL shape; only the LIMIT
     // is interpolated, and it is a u32 this function clamps itself.
-    let where_sql = "WHERE (?1 = '' OR share = ?1)
-                       AND (?2 = '' OR user = ?2)
-                       AND (?3 = '' OR operation = ?3)
-                       AND (?4 = '' OR result = ?4)
-                       AND (?5 = '' OR at >= ?5)";
+    let where_sql = format!(
+        "WHERE (?1 = '' OR share = ?1)
+           AND (?2 = '' OR user = ?2)
+           AND (?3 = '' OR operation = ?3)
+           AND (?4 = '' OR result = ?4)
+           AND (?5 = '' OR at >= ?5)
+           AND {ACCESS_OF_ORG_SQL}"
+    );
     let args = params![
         filter.share,
         filter.user,
         filter.operation,
         filter.result,
-        filter.since
+        filter.since,
+        org_id
     ];
     let total: i64 = conn.query_row(
         &format!("SELECT COUNT(*) FROM nas_access_events {where_sql}"),
@@ -4702,17 +4845,19 @@ pub fn access_events(
 }
 
 /// The distinct shares, users and operations present in the retained window,
-/// so the view's filters offer what the node actually logged.
-pub fn access_facets(pool: &DbPool) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+/// so the view's filters offer what the node actually logged — for the
+/// asking organisation's own lines only: a facet list is as much a leak of
+/// another tenant's share and account names as the rows are.
+pub fn access_facets(pool: &DbPool, org_id: &str) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut out = Vec::new();
     for column in ["share", "user", "operation"] {
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT DISTINCT {column} FROM nas_access_events
-              WHERE {column} <> '' ORDER BY {column} LIMIT 200"
+              WHERE {column} <> '' AND org_id = ?1 AND ?1 <> '' ORDER BY {column} LIMIT 200"
         ))?;
         out.push(
-            stmt.query_map([], |r| r.get::<_, String>(0))?
+            stmt.query_map(params![org_id], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         );
     }
@@ -4724,11 +4869,15 @@ pub fn access_facets(pool: &DbPool) -> Result<(Vec<String>, Vec<String>, Vec<Str
     ))
 }
 
-pub fn access_event_count(pool: &DbPool) -> Result<u32> {
+/// How many lines of the log belong to `org_id` — the figure under the
+/// audit card, which would otherwise tell a tenant how busy the others are.
+pub fn access_event_count(pool: &DbPool, org_id: &str) -> Result<u32> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    Ok(conn.query_row("SELECT COUNT(*) FROM nas_access_events", [], |r| {
-        r.get::<_, i64>(0)
-    })? as u32)
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM nas_access_events WHERE org_id = ?1 AND ?1 <> ''",
+        params![org_id],
+        |r| r.get::<_, i64>(0),
+    )? as u32)
 }
 
 /// Retention of the access log: rows older than `ACCESS_LOG_DAYS` go, and so
@@ -4804,33 +4953,6 @@ pub fn unforwarded_alerts(pool: &DbPool, limit: u32) -> Result<Vec<ForwardRow>> 
     Ok(rows)
 }
 
-pub fn unforwarded_access_events(pool: &DbPool, limit: u32) -> Result<Vec<ForwardRow>> {
-    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {ACCESS_COLUMNS} FROM nas_access_events
-          WHERE forwarded_at IS NULL ORDER BY event_id LIMIT ?1"
-    ))?;
-    let rows = stmt
-        .query_map(params![limit], access_event_from_row)?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|e| ForwardRow {
-            kind: "access",
-            id: e.event_id.to_string(),
-            at: e.at,
-            // A refused access is the one worth waking a collector for.
-            severity: if e.result == "fail" { "warning" } else { "info" }.to_string(),
-            subject: format!("share:{}", e.share),
-            summary: format!(
-                "{} {} {} on {} by {}",
-                e.operation, e.result, e.target, e.share, e.user
-            ),
-            detail: e.detail,
-        })
-        .collect();
-    Ok(rows)
-}
-
 /// Marks what actually left the node. Called AFTER a successful send, so a
 /// crash in between replays a row instead of dropping it.
 pub fn mark_forwarded(pool: &DbPool, rows: &[ForwardRow]) -> Result<()> {
@@ -4855,37 +4977,49 @@ pub fn mark_forwarded(pool: &DbPool, rows: &[ForwardRow]) -> Result<()> {
 /// Settles every organisation's alert still in the queue, in one statement:
 /// they are never sent (`unforwarded_alerts`), and left unmarked they would
 /// sit in the queue for good. Returns how many were settled.
+///
+/// Every file-access line is settled here too. Since migration 20 each one
+/// belongs to the organisation that owns its share — it names that tenant's
+/// share, account, client address and file — and the forwarding target is
+/// ONE fleet-wide setting any organisation's admin may point at its own
+/// collector, so an access line is withheld exactly like an owned alert
+/// until targets are per organisation (backlog). No
+/// `unforwarded_access_events` exists any more for the same reason
+/// `unforwarded_alerts` filters in its own statement: a query that can hand
+/// out a tenant's line is one caller away from sending it.
 pub fn settle_withheld_alerts(pool: &DbPool) -> Result<usize> {
-    let conn = write(pool)?;
-    Ok(conn.execute(
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    let stamp = now();
+    let alerts = tx.execute(
         "UPDATE nas_alerts SET forwarded_at = ?1 WHERE forwarded_at IS NULL AND org_id IS NOT NULL",
-        params![now()],
-    )?)
+        params![stamp],
+    )?;
+    let access = tx.execute(
+        "UPDATE nas_access_events SET forwarded_at = ?1 WHERE forwarded_at IS NULL",
+        params![stamp],
+    )?;
+    tx.commit()?;
+    Ok(alerts + access)
 }
 
 /// How many rows still wait to be SENT, so the settings card can show a
-/// backlog instead of a silent stall. `include_access` mirrors the setting:
-/// rows the admin did not ask to forward are not pending.
+/// backlog instead of a silent stall.
 ///
 /// An organisation's alert is never sent, so it is not pending: counting it
 /// would show every tenant a backlog of other tenants' alerts that never
 /// drains while forwarding is off. Counted here, in SQL, rather than by
 /// loading every such id — a set that grew without bound for as long as
-/// forwarding stayed off.
-pub fn forward_pending(pool: &DbPool, include_access: bool) -> Result<u32> {
+/// forwarding stayed off. File-access lines are never pending for the same
+/// reason (each belongs to an organisation, `settle_withheld_alerts`), so the
+/// access switch no longer adds anything to this figure.
+pub fn forward_pending(pool: &DbPool) -> Result<u32> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let mut total: i64 = conn.query_row(
+    let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL",
         [],
         |r| r.get(0),
     )?;
-    if include_access {
-        total += conn.query_row(
-            "SELECT COUNT(*) FROM nas_access_events WHERE forwarded_at IS NULL",
-            [],
-            |r| r.get::<_, i64>(0),
-        )?;
-    }
     Ok(total.max(0) as u32)
 }
 
@@ -4965,6 +5099,10 @@ fn fill_grants(pool: &DbPool, share: &mut ShareRow) -> Result<()> {
     Ok(())
 }
 
+/// EVERY share of the node, whoever owns it. For the node's own work only —
+/// the generated smb/exports documents, the fleet mount registry, the audit
+/// collector, the source-overlap checks — which must see every export this
+/// node serves. Anything answering a tenant reads `list_shares_of_org`.
 pub fn list_shares(pool: &DbPool) -> Result<Vec<ShareRow>> {
     let mut shares = {
         let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
@@ -4981,12 +5119,48 @@ pub fn list_shares(pool: &DbPool) -> Result<Vec<ShareRow>> {
     Ok(shares)
 }
 
-pub fn share(pool: &DbPool, share_id: &str) -> Result<Option<ShareRow>> {
+/// The rows of one organisation (migration 20). An empty org id matches
+/// nothing, never the unowned '' rows.
+const OWNED_BY_SQL: &str = "org_id = ?1 AND ?1 <> ''";
+
+/// The shares `org_id` owns — the only list a tenant is ever shown.
+pub fn list_shares_of_org(pool: &DbPool, org_id: &str) -> Result<Vec<ShareRow>> {
+    let mut shares = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {SHARE_COLUMNS} FROM nas_shares WHERE {OWNED_BY_SQL} ORDER BY name"
+        ))?;
+        let rows = stmt
+            .query_map(params![org_id], share_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for share in shares.iter_mut() {
+        fill_grants(pool, share)?;
+    }
+    Ok(shares)
+}
+
+/// Every share's owner, keyed by share id — for the node-wide checks that
+/// must see every share (a source already exported, a name already taken)
+/// and still may not NAME another organisation's share in their answer.
+pub fn share_owners(pool: &DbPool) -> Result<std::collections::HashMap<String, String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT share_id, org_id FROM nas_shares")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// One share of `org_id`. Another organisation's share answers `None`,
+/// exactly like an id that does not exist, so the answer confirms nothing.
+pub fn share(pool: &DbPool, org_id: &str, share_id: &str) -> Result<Option<ShareRow>> {
     let row = {
         let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
         conn.query_row(
-            &format!("SELECT {SHARE_COLUMNS} FROM nas_shares WHERE share_id = ?1"),
-            params![share_id],
+            &format!("SELECT {SHARE_COLUMNS} FROM nas_shares WHERE {OWNED_BY_SQL} AND share_id = ?2"),
+            params![org_id, share_id],
             share_from_row,
         )
         .optional()?
@@ -5027,7 +5201,13 @@ fn options_json(share: &ShareRow) -> Result<String> {
 /// Writes the share and replaces its grants in one transaction: a share whose
 /// section names a user that is not in `nas_share_grants` would export access
 /// nobody granted.
-pub fn upsert_share(pool: &DbPool, share: &ShareRow) -> Result<()> {
+///
+/// `org_id` is the OWNER: stamped on insert, never changed by an update, and
+/// an update of a row another organisation owns writes nothing and fails —
+/// the grants are only replaced after the share row itself was accepted, in
+/// the same transaction, so a refused write leaves both untouched.
+pub fn upsert_share(pool: &DbPool, org_id: &str, share: &ShareRow) -> Result<()> {
+    anyhow::ensure!(!org_id.is_empty(), "a share needs an owning organisation");
     let options = options_json(share)?;
     let grants = share
         .smb
@@ -5036,16 +5216,17 @@ pub fn upsert_share(pool: &DbPool, share: &ShareRow) -> Result<()> {
         .unwrap_or_default();
     let mut conn = write(pool)?;
     let tx = conn.transaction()?;
-    tx.execute(
+    let written = tx.execute(
         "INSERT INTO nas_shares (share_id, name, protocol, source_path, dataset, enabled,
                                  fleet_mount, options_json, state, state_detail, created_at,
-                                 updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                 updated_at, org_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(share_id) DO UPDATE SET
             source_path = excluded.source_path, dataset = excluded.dataset,
             enabled = excluded.enabled, fleet_mount = excluded.fleet_mount,
             options_json = excluded.options_json, state = excluded.state,
-            state_detail = excluded.state_detail, updated_at = excluded.updated_at",
+            state_detail = excluded.state_detail, updated_at = excluded.updated_at
+         WHERE nas_shares.org_id = excluded.org_id",
         params![
             share.share_id,
             share.name,
@@ -5058,9 +5239,13 @@ pub fn upsert_share(pool: &DbPool, share: &ShareRow) -> Result<()> {
             share.state,
             share.state_detail,
             share.created_at,
-            share.updated_at
+            share.updated_at,
+            org_id
         ],
     )?;
+    // Dropping the transaction rolls it back: nothing of the refused write
+    // lands, and the grants below are never reached.
+    anyhow::ensure!(written == 1, "share not found");
     tx.execute(
         "DELETE FROM nas_share_grants WHERE share_id = ?1",
         params![share.share_id],
@@ -5086,14 +5271,21 @@ pub fn set_share_state(pool: &DbPool, share_id: &str, state: &str, detail: &str)
     Ok(())
 }
 
-pub fn delete_share(pool: &DbPool, share_id: &str) -> Result<bool> {
+/// Deletes one share of `org_id` and its grants. Another organisation's
+/// share is not touched and answers `false`, like a missing one.
+pub fn delete_share(pool: &DbPool, org_id: &str, share_id: &str) -> Result<bool> {
     let mut conn = write(pool)?;
     let tx = conn.transaction()?;
-    tx.execute(
-        "DELETE FROM nas_share_grants WHERE share_id = ?1",
-        params![share_id],
+    let removed = tx.execute(
+        &format!("DELETE FROM nas_shares WHERE {OWNED_BY_SQL} AND share_id = ?2"),
+        params![org_id, share_id],
     )?;
-    let removed = tx.execute("DELETE FROM nas_shares WHERE share_id = ?1", params![share_id])?;
+    if removed == 1 {
+        tx.execute(
+            "DELETE FROM nas_share_grants WHERE share_id = ?1",
+            params![share_id],
+        )?;
+    }
     tx.commit()?;
     Ok(removed == 1)
 }
@@ -5187,6 +5379,10 @@ pub fn target_initiators(pool: &DbPool, target_id: &str) -> Result<Vec<String>> 
     Ok(rows)
 }
 
+/// EVERY target of the node, whoever owns it. For the node's own work only —
+/// the configfs reconcile, the restore after a reboot, the zvol and host-NQN
+/// collision checks — which must see every object in the kernel. Anything
+/// answering a tenant reads `list_targets_of_org`.
 pub fn list_targets(pool: &DbPool) -> Result<Vec<TargetRow>> {
     let mut targets = {
         let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
@@ -5203,12 +5399,41 @@ pub fn list_targets(pool: &DbPool) -> Result<Vec<TargetRow>> {
     Ok(targets)
 }
 
-pub fn target(pool: &DbPool, target_id: &str) -> Result<Option<TargetRow>> {
+/// The targets `org_id` owns — the only list a tenant is ever shown.
+pub fn list_targets_of_org(pool: &DbPool, org_id: &str) -> Result<Vec<TargetRow>> {
+    let mut targets = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {TARGET_COLUMNS} FROM nas_targets WHERE {OWNED_BY_SQL} ORDER BY name"
+        ))?;
+        let rows = stmt
+            .query_map(params![org_id], target_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for target in targets.iter_mut() {
+        target.initiators = target_initiators(pool, &target.target_id)?;
+    }
+    Ok(targets)
+}
+
+/// Every target's owner, keyed by target id — see `share_owners`.
+pub fn target_owners(pool: &DbPool) -> Result<std::collections::HashMap<String, String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT target_id, org_id FROM nas_targets")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// One target of `org_id`; another organisation's answers `None`.
+pub fn target(pool: &DbPool, org_id: &str, target_id: &str) -> Result<Option<TargetRow>> {
     let row = {
         let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
         conn.query_row(
-            &format!("SELECT {TARGET_COLUMNS} FROM nas_targets WHERE target_id = ?1"),
-            params![target_id],
+            &format!("SELECT {TARGET_COLUMNS} FROM nas_targets WHERE {OWNED_BY_SQL} AND target_id = ?2"),
+            params![org_id, target_id],
             target_from_row,
         )
         .optional()?
@@ -5236,7 +5461,12 @@ pub fn target_by_name(pool: &DbPool, name: &str) -> Result<Option<TargetRow>> {
 /// Writes the target and replaces its allowlist in one transaction. `name`,
 /// `protocol` and `wwn` are set on insert and never updated: an initiator
 /// identifies the disk by the WWN, so changing it is a new target.
-pub fn upsert_target(pool: &DbPool, target: &TargetRow) -> Result<()> {
+///
+/// `org_id` is the OWNER, with the rule `upsert_share` has: stamped on
+/// insert, never moved, and an update of another organisation's row writes
+/// nothing — neither the row nor its allowlist — and fails.
+pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<()> {
+    anyhow::ensure!(!org_id.is_empty(), "a target needs an owning organisation");
     let spec = serde_json::to_string(&TargetSpec {
         luns: target.luns.clone(),
         portals: target.portals.clone(),
@@ -5244,12 +5474,13 @@ pub fn upsert_target(pool: &DbPool, target: &TargetRow) -> Result<()> {
     })?;
     let mut conn = write(pool)?;
     let tx = conn.transaction()?;
-    tx.execute(
+    let written = tx.execute(
         "INSERT INTO nas_targets (target_id, name, protocol, wwn, enabled, spec_json,
                                   auth_method, auth_username, auth_secret,
                                   auth_mutual_username, auth_mutual_secret, dhchap_hash,
-                                  dhchap_dhgroup, state, state_detail, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                                  dhchap_dhgroup, state, state_detail, created_at, updated_at,
+                                  org_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(target_id) DO UPDATE SET
             enabled = excluded.enabled, spec_json = excluded.spec_json,
             auth_method = excluded.auth_method, auth_username = excluded.auth_username,
@@ -5258,7 +5489,8 @@ pub fn upsert_target(pool: &DbPool, target: &TargetRow) -> Result<()> {
             auth_mutual_secret = excluded.auth_mutual_secret,
             dhchap_hash = excluded.dhchap_hash, dhchap_dhgroup = excluded.dhchap_dhgroup,
             state = excluded.state, state_detail = excluded.state_detail,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at
+         WHERE nas_targets.org_id = excluded.org_id",
         params![
             target.target_id,
             target.name,
@@ -5276,9 +5508,11 @@ pub fn upsert_target(pool: &DbPool, target: &TargetRow) -> Result<()> {
             target.state,
             target.state_detail,
             target.created_at,
-            target.updated_at
+            target.updated_at,
+            org_id
         ],
     )?;
+    anyhow::ensure!(written == 1, "target not found");
     tx.execute(
         "DELETE FROM nas_target_initiators WHERE target_id = ?1",
         params![target.target_id],
@@ -5304,57 +5538,69 @@ pub fn set_target_state(pool: &DbPool, target_id: &str, state: &str, detail: &st
     Ok(())
 }
 
-pub fn delete_target(pool: &DbPool, target_id: &str) -> Result<bool> {
+/// Deletes one target of `org_id` and its allowlist; another organisation's
+/// target is not touched and answers `false`.
+pub fn delete_target(pool: &DbPool, org_id: &str, target_id: &str) -> Result<bool> {
     let mut conn = write(pool)?;
     let tx = conn.transaction()?;
-    tx.execute(
-        "DELETE FROM nas_target_initiators WHERE target_id = ?1",
-        params![target_id],
-    )?;
     let removed = tx.execute(
-        "DELETE FROM nas_targets WHERE target_id = ?1",
-        params![target_id],
+        &format!("DELETE FROM nas_targets WHERE {OWNED_BY_SQL} AND target_id = ?2"),
+        params![org_id, target_id],
     )?;
+    if removed == 1 {
+        tx.execute(
+            "DELETE FROM nas_target_initiators WHERE target_id = ?1",
+            params![target_id],
+        )?;
+    }
     tx.commit()?;
     Ok(removed == 1)
 }
 
-/// Total targets and how many the last apply left in `error` — the pair the
-/// node's fleet row carries next to the share counts.
-pub fn target_counts(pool: &DbPool) -> Result<(u32, u32)> {
+/// Total targets of `org_id` and how many the last apply left in `error`.
+pub fn target_counts(pool: &DbPool, org_id: &str) -> Result<(u32, u32)> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     Ok(conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(state = 'error'), 0) FROM nas_targets",
-        [],
+        &format!("SELECT COUNT(*), COALESCE(SUM(state = 'error'), 0) FROM nas_targets WHERE {OWNED_BY_SQL}"),
+        params![org_id],
         |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
     )?)
 }
 
-/// Total shares and how many of them the last apply left in `error` — the two
-/// numbers the fleet row of this node carries.
-pub fn share_counts(pool: &DbPool) -> Result<(u32, u32)> {
+/// Total shares of `org_id` and how many of them the last apply left in
+/// `error` — what this node's fleet row shows THAT tenant
+/// (`fleet::scope_local_shares`). There is deliberately no node-wide
+/// variant: the published row is read by every tenant of every node, so it
+/// carries no share count at all.
+pub fn share_counts(pool: &DbPool, org_id: &str) -> Result<(u32, u32)> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     Ok(conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(state = 'error'), 0) FROM nas_shares",
-        [],
+        &format!("SELECT COUNT(*), COALESCE(SUM(state = 'error'), 0) FROM nas_shares WHERE {OWNED_BY_SQL}"),
+        params![org_id],
         |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
     )?)
 }
 
 // ----- share users ---------------------------------------------------------------
 
-pub fn list_share_users(pool: &DbPool) -> Result<Vec<NasShareUser>> {
+/// The share accounts of `org_id` (migration 20), each with the names of
+/// the shares OF THAT ORGANISATION that grant it. A share account is a node
+/// account (Samba's passdb maps it to a POSIX user), so its NAME is unique on
+/// the node; everything else about it — that it exists, its description,
+/// where it is granted — is its organisation's business.
+pub fn list_share_users(pool: &DbPool, org_id: &str) -> Result<Vec<NasShareUser>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut stmt = conn.prepare_cached(
         "SELECT u.name, u.description, u.created_at,
                 COALESCE(GROUP_CONCAT(s.name, char(10)), '')
          FROM nas_share_users u
          LEFT JOIN nas_share_grants g ON g.user = u.name
-         LEFT JOIN nas_shares s ON s.share_id = g.share_id
+         LEFT JOIN nas_shares s ON s.share_id = g.share_id AND s.org_id = u.org_id
+         WHERE u.org_id = ?1 AND ?1 <> ''
          GROUP BY u.name ORDER BY u.name",
     )?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params![org_id], |r| {
             let shares: String = r.get(3)?;
             Ok(NasShareUser {
                 name: r.get(0)?,
@@ -5367,35 +5613,106 @@ pub fn list_share_users(pool: &DbPool) -> Result<Vec<NasShareUser>> {
     Ok(rows)
 }
 
-pub fn share_user_exists(pool: &DbPool, name: &str) -> Result<bool> {
+/// Who owns the share account `name`, if it exists at all. Three answers the
+/// callers need apart: `None` (free), the caller's own org (theirs to
+/// change), anything else (taken on this node by another organisation — its
+/// password must never be set from here).
+pub fn share_user_owner(pool: &DbPool, name: &str) -> Result<Option<String>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     Ok(conn
         .query_row(
-            "SELECT 1 FROM nas_share_users WHERE name = ?1",
+            "SELECT org_id FROM nas_share_users WHERE name = ?1",
             params![name],
-            |r| r.get::<_, i64>(0),
+            |r| r.get::<_, String>(0),
         )
-        .optional()?
-        .is_some())
+        .optional()?)
 }
 
-pub fn upsert_share_user(pool: &DbPool, name: &str, description: &str) -> Result<()> {
+/// Whether `name` is a share account of `org_id`.
+pub fn share_user_exists(pool: &DbPool, org_id: &str, name: &str) -> Result<bool> {
+    Ok(share_user_owner(pool, name)?.is_some_and(|owner| !owner.is_empty() && owner == org_id))
+}
+
+/// Creates the account for `org_id` or updates ITS description. An account
+/// another organisation owns is never touched: the conflict update carries
+/// the owner in its WHERE, and a write that changed nothing is an error.
+pub fn upsert_share_user(pool: &DbPool, org_id: &str, name: &str, description: &str) -> Result<()> {
+    anyhow::ensure!(!org_id.is_empty(), "a share user needs an owning organisation");
     let conn = write(pool)?;
-    conn.execute(
-        "INSERT INTO nas_share_users (name, description, created_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(name) DO UPDATE SET description = excluded.description",
-        params![name, description, now()],
+    let written = conn.execute(
+        "INSERT INTO nas_share_users (name, description, created_at, org_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(name) DO UPDATE SET description = excluded.description
+         WHERE nas_share_users.org_id = excluded.org_id",
+        params![name, description, now(), org_id],
     )?;
+    anyhow::ensure!(written == 1, "this account name is already in use on this node");
     Ok(())
 }
 
-/// Removes the user and every grant naming it — a grant to an account that no
-/// longer exists would keep appearing in the generated `valid users` line.
-pub fn delete_share_user(pool: &DbPool, name: &str) -> Result<bool> {
+/// The sentence a delete of a still-granted account is refused with. It
+/// names neither the share nor its organisation: the asking tenant may not
+/// learn either, only that the account is not free to go.
+pub const SHARE_USER_IN_USE_ELSEWHERE: &str = "this account is still in use on this node";
+
+/// `?1` = account name, `?2` = the org asking. One statement for the
+/// read-only check and the in-transaction guard, so they cannot disagree.
+const GRANTED_ELSEWHERE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM nas_share_grants g
+                         JOIN nas_shares s ON s.share_id = g.share_id
+                        WHERE g.user = ?1 AND s.org_id <> ?2)";
+
+/// Whether a share of an organisation OTHER than `org_id` still grants the
+/// account `name`.
+///
+/// WHY it exists: migration 20 gave an account granted in two organisations
+/// to the default one (the only owner it could prove nothing against), and
+/// the account IS one node account — a POSIX user and a Samba passdb entry.
+/// Deleting it from the default organisation would silently take the other
+/// organisation's users off their own shares and remove the system account
+/// they log in with. Such an account can only go once nobody else uses it.
+pub fn share_user_granted_elsewhere(pool: &DbPool, org_id: &str, name: &str) -> Result<bool> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn.query_row(
+        GRANTED_ELSEWHERE_SQL,
+        params![name, org_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Removes `org_id`'s account and every grant naming it — a grant to an
+/// account that no longer exists would keep appearing in the generated
+/// `valid users` line. Another organisation's account answers `false`.
+///
+/// An account a share of ANOTHER organisation still grants is refused with
+/// `SHARE_USER_IN_USE_ELSEWHERE` (`share_user_granted_elsewhere`), checked in
+/// the same transaction as the delete so a grant written in between cannot
+/// slip past it. The caller checks it too, BEFORE the system account is
+/// removed; this is the guard that holds when a caller forgets.
+pub fn delete_share_user(pool: &DbPool, org_id: &str, name: &str) -> Result<bool> {
     let mut conn = write(pool)?;
     let tx = conn.transaction()?;
-    tx.execute("DELETE FROM nas_share_grants WHERE user = ?1", params![name])?;
-    let removed = tx.execute("DELETE FROM nas_share_users WHERE name = ?1", params![name])?;
+    // Ownership first: another organisation's account answers `false` like a
+    // missing one, and never with the refusal below, which would confirm it.
+    let ours: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_share_users WHERE name = ?1 AND org_id = ?2 AND ?2 <> '')",
+        params![name, org_id],
+        |r| r.get(0),
+    )?;
+    if !ours {
+        return Ok(false);
+    }
+    let elsewhere: bool = tx.query_row(
+        GRANTED_ELSEWHERE_SQL,
+        params![name, org_id],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(!elsewhere, SHARE_USER_IN_USE_ELSEWHERE);
+    let removed = tx.execute(
+        "DELETE FROM nas_share_users WHERE name = ?1 AND org_id = ?2 AND ?2 <> ''",
+        params![name, org_id],
+    )?;
+    if removed == 1 {
+        tx.execute("DELETE FROM nas_share_grants WHERE user = ?1", params![name])?;
+    }
     tx.commit()?;
     Ok(removed == 1)
 }
@@ -7907,7 +8224,17 @@ mod tests {
 
         crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
 
-        assert_eq!(snapshot(&conn), before, "migracja 16 zmieniła istniejące dane");
+        // What migration 16 must not do is change what EXISTED: every index
+        // that was there must still be there, and the rows must be untouched.
+        // Later migrations are free to ADD indexes (migration 20 adds the
+        // owner indexes), so the index list is compared as a superset, not
+        // for equality — equality made this test fail on every new index.
+        let (indexes_after, settings_after, operations_after) = snapshot(&conn);
+        let (indexes_before, settings_before, operations_before) = before;
+        let lost: Vec<&String> = indexes_before.iter().filter(|i| !indexes_after.contains(i)).collect();
+        assert!(lost.is_empty(), "migracja 16 usunęła istniejące indeksy: {lost:?}");
+        assert_eq!(settings_after, settings_before, "migracja 16 zmieniła istniejące dane");
+        assert_eq!(operations_after, operations_before, "migracja 16 zmieniła istniejące dane");
         conn.execute(
             "INSERT INTO nas_elastic_folder_cache (array_id,folder,cache_policy)
              VALUES (?1,'foto','only')",
@@ -8277,9 +8604,9 @@ mod tests {
             created_at: now(),
             updated_at: now(),
         };
-        upsert_target(&p, &row).unwrap();
+        upsert_target(&p, "org-a", &row).unwrap();
 
-        let back = target(&p, "t1").unwrap().expect("target");
+        let back = target(&p, "org-a", "t1").unwrap().expect("target");
         assert_eq!(back.luns, row.luns);
         assert_eq!(back.portals, row.portals);
         // The ALUA/ANA port group state survives the database (R8).
@@ -8297,9 +8624,9 @@ mod tests {
 
         set_target_state(&p, "t1", "active", "").unwrap();
         assert_eq!(list_targets(&p).unwrap()[0].state, "active");
-        assert_eq!(target_counts(&p).unwrap(), (1, 0));
+        assert_eq!(target_counts(&p, "org-a").unwrap(), (1, 0));
         set_target_state(&p, "t1", "error", "nvmet missing").unwrap();
-        assert_eq!(target_counts(&p).unwrap(), (1, 1));
+        assert_eq!(target_counts(&p, "org-a").unwrap(), (1, 1));
 
         // A second target may not claim the same name or the same WWN: both
         // are also configfs object names.
@@ -8307,10 +8634,10 @@ mod tests {
             target_id: "t2".into(),
             ..row.clone()
         };
-        assert!(upsert_target(&p, &clash).is_err());
+        assert!(upsert_target(&p, "org-a", &clash).is_err());
 
-        assert!(delete_target(&p, "t1").unwrap());
-        assert!(target(&p, "t1").unwrap().is_none());
+        assert!(delete_target(&p, "org-a", "t1").unwrap());
+        assert!(target(&p, "org-a", "t1").unwrap().is_none());
         assert!(target_initiators(&p, "t1").unwrap().is_empty());
     }
 
@@ -8412,9 +8739,9 @@ mod tests {
             created_at: now(),
             updated_at: now(),
         };
-        upsert_share_user(&p, "anna", "projekt lead").unwrap();
-        upsert_share_user(&p, "jan", "").unwrap();
-        upsert_share(&p, &share).unwrap();
+        upsert_share_user(&p, "org-a", "anna", "projekt lead").unwrap();
+        upsert_share_user(&p, "org-a", "jan", "").unwrap();
+        upsert_share(&p, "org-a", &share).unwrap();
         let back = list_shares(&p).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].smb.as_ref().unwrap().users.len(), 2);
@@ -8429,24 +8756,24 @@ mod tests {
 
         // A rewrite replaces the grants instead of adding to them.
         share.smb.as_mut().unwrap().users.pop();
-        upsert_share(&p, &share).unwrap();
+        upsert_share(&p, "org-a", &share).unwrap();
         assert_eq!(share_grants(&p, "s1").unwrap().len(), 1);
 
-        let users = list_share_users(&p).unwrap();
+        let users = list_share_users(&p, "org-a").unwrap();
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].name, "anna");
         assert_eq!(users[0].shares, vec!["projekty".to_string()]);
         assert!(users[1].shares.is_empty(), "jan lost his grant");
 
         // Deleting a user takes its grants with it.
-        assert!(delete_share_user(&p, "anna").unwrap());
+        assert!(delete_share_user(&p, "org-a", "anna").unwrap());
         assert!(share_grants(&p, "s1").unwrap().is_empty());
-        assert!(!delete_share_user(&p, "anna").unwrap());
+        assert!(!delete_share_user(&p, "org-a", "anna").unwrap());
 
         set_share_state(&p, "s1", "error", "source path is not mounted").unwrap();
-        assert_eq!(share_counts(&p).unwrap(), (1, 1));
-        assert!(delete_share(&p, "s1").unwrap());
-        assert_eq!(share_counts(&p).unwrap(), (0, 0));
+        assert_eq!(share_counts(&p, "org-a").unwrap(), (1, 1));
+        assert!(delete_share(&p, "org-a", "s1").unwrap());
+        assert_eq!(share_counts(&p, "org-a").unwrap(), (0, 0));
         assert!(share_by_name(&p, "projekty").unwrap().is_none());
     }
 
@@ -9203,5 +9530,326 @@ mod tests {
         assert_eq!(elastic_array_names_of_org(&p, "org-a").unwrap(),
             ["alpha"].map(String::from).into_iter().collect());
         assert!(elastic_array_names_of_org(&p, "org-c").unwrap().is_empty());
+    }
+
+
+    // ----- ownership of shares, targets, accounts and the access log (migration 20)
+
+    fn owned_share(id: &str, name: &str, source_path: &str) -> ShareRow {
+        ShareRow {
+            share_id: id.into(),
+            name: name.into(),
+            protocol: "smb".into(),
+            source_path: source_path.into(),
+            smb: Some(NasSmbOptions::default()),
+            state: "active".into(),
+            created_at: now(),
+            updated_at: now(),
+            ..Default::default()
+        }
+    }
+
+    fn owned_target(id: &str, name: &str) -> TargetRow {
+        TargetRow {
+            target_id: id.into(),
+            name: name.into(),
+            protocol: "iscsi".into(),
+            wwn: format!("iqn.2026-09.pl.test:node.{name}"),
+            auth_method: "none".into(),
+            state: "disabled".into(),
+            created_at: now(),
+            updated_at: now(),
+            ..Default::default()
+        }
+    }
+
+    /// Org B's share is not in org A's list, not readable by id, cannot be
+    /// overwritten by an upsert carrying its id (neither the row nor its
+    /// grants), and cannot be deleted — every answer is the one a missing
+    /// share gets. The node-wide list the smb/exports generator reads still
+    /// holds both, because the node serves both.
+    #[test]
+    fn another_orgs_share_is_invisible_and_refused() {
+        let p = pool();
+        let mut theirs = owned_share("s-b", "ksiegowosc", "/mnt/tank/ksiegowosc");
+        theirs.smb.as_mut().unwrap().users = vec![NasShareAccess { user: "bogna".into(), mode: "rw".into() }];
+        upsert_share(&p, "org-b", &theirs).unwrap();
+        upsert_share(&p, "org-a", &owned_share("s-a", "projekty", "/mnt/tank/projekty")).unwrap();
+
+        let names = |org: &str| -> Vec<String> {
+            list_shares_of_org(&p, org).unwrap().into_iter().map(|s| s.name).collect()
+        };
+        assert_eq!(names("org-a"), vec!["projekty".to_string()]);
+        assert_eq!(names("org-b"), vec!["ksiegowosc".to_string()]);
+        assert!(names("").is_empty(), "an empty org id is nobody");
+        assert_eq!(list_shares(&p).unwrap().len(), 2, "the node serves both");
+        assert!(share(&p, "org-a", "s-b").unwrap().is_none());
+        assert!(share(&p, "org-b", "s-b").unwrap().is_some());
+
+        // A write carrying org B's id under org A's name changes nothing.
+        let mut hijack = theirs.clone();
+        hijack.source_path = "/mnt/tank/elsewhere".into();
+        hijack.smb.as_mut().unwrap().users = vec![NasShareAccess { user: "adam".into(), mode: "rw".into() }];
+        assert!(upsert_share(&p, "org-a", &hijack).is_err());
+        let kept = share(&p, "org-b", "s-b").unwrap().unwrap();
+        assert_eq!(kept.source_path, "/mnt/tank/ksiegowosc");
+        assert_eq!(share_grants(&p, "s-b").unwrap(), theirs.smb.as_ref().unwrap().users);
+
+        assert!(!delete_share(&p, "org-a", "s-b").unwrap());
+        assert!(share(&p, "org-b", "s-b").unwrap().is_some());
+        assert_eq!(share_counts(&p, "org-a").unwrap(), (1, 0));
+        assert!(upsert_share(&p, "", &owned_share("s-x", "x", "/mnt/tank/x")).is_err(), "no owner, no row");
+    }
+
+    /// The same four answers for a block target.
+    #[test]
+    fn another_orgs_target_is_invisible_and_refused() {
+        let p = pool();
+        let mut theirs = owned_target("t-b", "vm-b");
+        theirs.initiators = vec!["iqn.1998-01.com.vmware:esx-b".into()];
+        upsert_target(&p, "org-b", &theirs).unwrap();
+        upsert_target(&p, "org-a", &owned_target("t-a", "vm-a")).unwrap();
+
+        let names: Vec<String> = list_targets_of_org(&p, "org-a").unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["vm-a".to_string()]);
+        assert_eq!(list_targets(&p).unwrap().len(), 2, "the kernel reconcile sees both");
+        assert!(target(&p, "org-a", "t-b").unwrap().is_none());
+
+        let mut hijack = theirs.clone();
+        hijack.enabled = true;
+        hijack.initiators = vec!["iqn.1998-01.com.vmware:esx-a".into()];
+        assert!(upsert_target(&p, "org-a", &hijack).is_err());
+        let kept = target(&p, "org-b", "t-b").unwrap().unwrap();
+        assert!(!kept.enabled);
+        assert_eq!(kept.initiators, theirs.initiators);
+
+        assert!(!delete_target(&p, "org-a", "t-b").unwrap());
+        assert!(target(&p, "org-b", "t-b").unwrap().is_some());
+        assert_eq!(target_counts(&p, "org-a").unwrap(), (1, 0));
+        assert_eq!(target_owners(&p).unwrap().get("t-b").map(String::as_str), Some("org-b"));
+    }
+
+    /// A share account is a node account: its NAME is taken for everybody,
+    /// but only its organisation lists it, changes it or deletes it — and the
+    /// shares listed under it are that organisation's only.
+    #[test]
+    fn another_orgs_share_account_is_neither_listed_nor_changed() {
+        let p = pool();
+        upsert_share_user(&p, "org-b", "bogna", "kadry").unwrap();
+        upsert_share_user(&p, "org-a", "anna", "").unwrap();
+        let mut theirs = owned_share("s-b", "kadry", "/mnt/tank/kadry");
+        theirs.smb.as_mut().unwrap().users = vec![NasShareAccess { user: "anna".into(), mode: "ro".into() }];
+        upsert_share(&p, "org-b", &theirs).unwrap();
+
+        let a = list_share_users(&p, "org-a").unwrap();
+        assert_eq!(a.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(), vec!["anna"]);
+        assert!(a[0].shares.is_empty(), "org B's share name is not listed under org A's account");
+        assert!(share_user_exists(&p, "org-a", "anna").unwrap());
+        assert!(!share_user_exists(&p, "org-a", "bogna").unwrap());
+        assert_eq!(share_user_owner(&p, "bogna").unwrap().as_deref(), Some("org-b"));
+
+        assert!(upsert_share_user(&p, "org-a", "bogna", "przejęte").is_err());
+        assert!(!delete_share_user(&p, "org-a", "bogna").unwrap());
+        let b = list_share_users(&p, "org-b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].description, "kadry");
+    }
+
+    /// The access log is scoped to the asking organisation's shares: rows,
+    /// the total, the facets and the count. A line keeps the owner its share
+    /// had when it was collected, so a deleted share's log stays with its
+    /// organisation and another organisation's new share of the same name
+    /// does not inherit it.
+    #[test]
+    fn the_access_log_is_scoped_to_the_callers_shares() {
+        let p = pool();
+        upsert_share(&p, "org-a", &owned_share("s-a", "projekty", "/mnt/tank/projekty")).unwrap();
+        upsert_share(&p, "org-b", &owned_share("s-b", "kadry", "/mnt/tank/kadry")).unwrap();
+        let event = |share: &str, user: &str| NasAccessEvent {
+            at: now(),
+            share: share.into(),
+            user: user.into(),
+            client: "10.0.0.9".into(),
+            operation: "openat".into(),
+            result: "ok".into(),
+            target: "plik.txt".into(),
+            detail: String::new(),
+            event_id: 0,
+        };
+        insert_access_events(&p, &[event("projekty", "anna"), event("kadry", "bogna"), event("kadry", "bogna")])
+            .unwrap();
+
+        let (rows, total) = access_events(&p, "org-a", &AccessFilter { limit: 100, ..Default::default() }).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.iter().map(|e| e.share.as_str()).collect::<Vec<_>>(), vec!["projekty"]);
+        // Asking for the other tenant's share by name finds nothing either.
+        let (rows, total) =
+            access_events(&p, "org-a", &AccessFilter { share: "kadry", limit: 100, ..Default::default() }).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(total, 0);
+        let (shares, users, _) = access_facets(&p, "org-a").unwrap();
+        assert_eq!(shares, vec!["projekty".to_string()]);
+        assert_eq!(users, vec!["anna".to_string()]);
+        assert_eq!(access_event_count(&p, "org-a").unwrap(), 1);
+        assert_eq!(access_event_count(&p, "org-b").unwrap(), 2);
+        assert_eq!(access_event_count(&p, "").unwrap(), 0);
+
+        // Org B deletes `kadry`, org A creates its own `kadry`: B's old
+        // lines stay B's.
+        assert!(delete_share(&p, "org-b", "s-b").unwrap());
+        upsert_share(&p, "org-a", &owned_share("s-a2", "kadry", "/mnt/tank/kadry-a")).unwrap();
+        assert_eq!(access_event_count(&p, "org-a").unwrap(), 1);
+        assert_eq!(access_event_count(&p, "org-b").unwrap(), 2);
+        insert_access_events(&p, &[event("kadry", "anna")]).unwrap();
+        assert_eq!(access_event_count(&p, "org-a").unwrap(), 2, "a NEW line follows the share's owner now");
+    }
+
+    /// A target's portal-drift alert names the target and its network, so it
+    /// belongs to the target's organisation, not to every node admin.
+    #[test]
+    fn a_targets_alert_belongs_to_the_targets_organisation() {
+        let p = pool();
+        upsert_target(&p, "org-a", &owned_target("t-a", "vm-a")).unwrap();
+        raise_alert(&p, "target:t-a:drift", "warning", "target", "vm-a", "Target vm-a: the portal address moved", "")
+            .unwrap();
+        assert_eq!(list_alerts_for_org(&p, "org-a", false).unwrap().len(), 1);
+        assert!(list_alerts_for_org(&p, "org-b", false).unwrap().is_empty());
+        assert_eq!(count_open_node_alerts(&p).unwrap(), 0, "not published node-wide");
+    }
+
+    /// Migration 20's owner for what it cannot attribute is the platform's
+    /// default organisation, spelled as a literal in the SQL; this pins the
+    /// literal to the constant so the two can never drift apart.
+    #[test]
+    fn the_legacy_owner_is_the_platform_default_organisation() {
+        assert_eq!(LEGACY_OWNER, crate::services::org::DEFAULT_ORG_ID);
+        let (version, sql) = MIGRATIONS[19];
+        assert_eq!(version, 20);
+        assert!(sql.contains(&format!("'{LEGACY_OWNER}'")));
+    }
+
+    /// A share on the union of an array whose own owner is EMPTY (critic
+    /// wave 3, MINOR 2) would inherit '' — served by smbd, listed to nobody,
+    /// manageable by nobody. It falls to the default organisation instead, and
+    /// the account granted only there and the share's job follow it.
+    #[test]
+    fn migration_20_gives_a_share_on_an_ownerless_array_to_the_default_org() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..19]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at) VALUES
+               ('arr-x','','nas','sierota','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z');
+             INSERT INTO nas_shares (share_id,name,protocol,source_path,created_at,updated_at) VALUES
+               ('s7','sierota','smb','/mnt/sierota','2026-09-02T00:00:00Z','2026-09-02T00:00:00Z');
+             INSERT INTO nas_share_users (name,description,created_at) VALUES
+               ('onlyorphan','','2026-09-02T00:00:00Z');
+             INSERT INTO nas_share_grants (share_id,user,mode) VALUES ('s7','onlyorphan','rw');
+             INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at) VALUES
+               ('j7','share_create','sierota','ok','u','2026-09-02T00:00:00Z');",
+        )
+        .unwrap();
+
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+
+        let owner = |sql: &str, id: &str| -> Option<String> {
+            conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(owner("SELECT org_id FROM nas_shares WHERE share_id=?1", "s7").as_deref(), Some(LEGACY_OWNER));
+        assert_eq!(
+            owner("SELECT org_id FROM nas_share_users WHERE name=?1", "onlyorphan").as_deref(),
+            Some(LEGACY_OWNER)
+        );
+        assert_eq!(owner("SELECT org_id FROM nas_jobs WHERE job_id=?1", "j7").as_deref(), Some(LEGACY_OWNER));
+    }
+
+    /// Migration 20 on rows written before ownership existed: a share on an
+    /// Elastic union (or a folder in it) goes to the array's organisation,
+    /// everything else to the default organisation; an account follows its
+    /// grants when they agree on one organisation; access lines, jobs and
+    /// target alerts follow their share/target by name, and a job older than
+    /// the share now holding its name does not take that share's owner.
+    #[test]
+    fn migration_20_backfills_owners_from_the_union_else_the_default_org() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..19]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at) VALUES
+               ('arr-b','org-b','nas','media','xfs','active','','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z');
+             INSERT INTO nas_shares (share_id,name,protocol,source_path,created_at,updated_at) VALUES
+               ('s-union','filmy','smb','/mnt/media','2026-09-02T00:00:00Z','2026-09-02T00:00:00Z'),
+               ('s-folder','zdjecia','nfs','/mnt/media/zdjecia','2026-09-02T00:00:00Z','2026-09-02T00:00:00Z'),
+               ('s-lookalike','stare','smb','/mnt/media-old','2026-09-02T00:00:00Z','2026-09-02T00:00:00Z'),
+               ('s-pool','projekty','smb','/mnt/tank/projekty','2026-09-10T00:00:00Z','2026-09-10T00:00:00Z');
+             INSERT INTO nas_share_users (name,description,created_at) VALUES
+               ('bogna','','2026-09-02T00:00:00Z'),
+               ('mixed','','2026-09-02T00:00:00Z'),
+               ('idle','','2026-09-02T00:00:00Z');
+             INSERT INTO nas_share_grants (share_id,user,mode) VALUES
+               ('s-union','bogna','rw'),('s-union','mixed','rw'),('s-pool','mixed','ro');
+             INSERT INTO nas_targets (target_id,name,protocol,wwn,created_at,updated_at) VALUES
+               ('t1','vm','iscsi','iqn.2026-09.pl.test:n.vm','2026-09-02T00:00:00Z','2026-09-02T00:00:00Z');
+             INSERT INTO nas_access_events (at,share,user,client,operation,result,target) VALUES
+               ('2026-09-03T00:00:00Z','filmy','bogna','c','openat','ok','a'),
+               ('2026-09-03T00:00:00Z','usuniety','x','c','openat','ok','b');
+             INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at) VALUES
+               ('j-union','share_create','filmy','ok','u','2026-09-02T00:00:00Z'),
+               ('j-old','share_delete','projekty','ok','u','2026-09-05T00:00:00Z'),
+               ('j-target','target_create','vm','ok','u','2026-09-02T00:00:01Z'),
+               ('j-import','config_import','node','ok','u','2026-09-02T00:00:00Z'),
+               ('j-pool','pool_scrub','tank','ok','u','2026-09-02T00:00:00Z');
+             INSERT INTO nas_alerts (alert_id,severity,subject_kind,subject_id,title,detail,raised_at,dedupe_key) VALUES
+               ('a-t','warning','target','vm','drift','','2026-09-03T00:00:00Z','target:t1:drift'),
+               ('a-d','warning','disk','sda','hot','','2026-09-03T00:00:00Z','disk:sda:temp');",
+        )
+        .unwrap();
+
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+
+        let owner = |sql: &str, id: &str| -> Option<String> {
+            conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+        };
+        let share_owner = |id: &str| owner("SELECT org_id FROM nas_shares WHERE share_id=?1", id);
+        assert_eq!(share_owner("s-union").as_deref(), Some("org-b"));
+        assert_eq!(share_owner("s-folder").as_deref(), Some("org-b"));
+        assert_eq!(share_owner("s-lookalike").as_deref(), Some("org-default"), "/mnt/media-old is not in /mnt/media");
+        assert_eq!(share_owner("s-pool").as_deref(), Some("org-default"));
+
+        let user_owner = |id: &str| owner("SELECT org_id FROM nas_share_users WHERE name=?1", id);
+        assert_eq!(user_owner("bogna").as_deref(), Some("org-b"));
+        assert_eq!(user_owner("mixed").as_deref(), Some("org-default"), "grants in two organisations");
+        assert_eq!(user_owner("idle").as_deref(), Some("org-default"), "no grants at all");
+
+        assert_eq!(owner("SELECT org_id FROM nas_targets WHERE target_id=?1", "t1").as_deref(), Some("org-default"));
+
+        let event_owner = |share: &str| owner("SELECT org_id FROM nas_access_events WHERE share=?1", share);
+        assert_eq!(event_owner("filmy").as_deref(), Some("org-b"));
+        assert_eq!(event_owner("usuniety").as_deref(), Some("org-default"));
+
+        let job_owner = |id: &str| owner("SELECT org_id FROM nas_jobs WHERE job_id=?1", id);
+        assert_eq!(job_owner("j-union").as_deref(), Some("org-b"));
+        // `projekty` was created on 09-10, AFTER this job ran: whatever the
+        // job was about, it was not that share.
+        assert_eq!(job_owner("j-old").as_deref(), Some("org-default"));
+        assert_eq!(job_owner("j-target").as_deref(), Some("org-default"));
+        assert_eq!(job_owner("j-import").as_deref(), Some("org-default"));
+        assert_eq!(job_owner("j-pool"), None, "a pool job stays node-wide");
+
+        let alert_owner = |id: &str| owner("SELECT org_id FROM nas_alerts WHERE alert_id=?1", id);
+        assert_eq!(alert_owner("a-t").as_deref(), Some("org-default"));
+        assert_eq!(alert_owner("a-d"), None, "a disk alert stays node-wide");
+
+        let unowned: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM nas_shares WHERE org_id='')
+                      + (SELECT COUNT(*) FROM nas_share_users WHERE org_id='')
+                      + (SELECT COUNT(*) FROM nas_targets WHERE org_id='')
+                      + (SELECT COUNT(*) FROM nas_access_events WHERE org_id='')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unowned, 0, "every legacy row has an owner that can manage it");
     }
 }

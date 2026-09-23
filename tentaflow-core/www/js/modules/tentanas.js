@@ -21,7 +21,7 @@ import {
   T, sprite, channelMode, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
   layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
-  reasonLabel, localizedReason, replacementAdviceText, ADVICE_KINDS,
+  firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
 import { nodeT, nodeHeadSub } from '/js/modules/tentanas/node-phrase.js';
@@ -425,12 +425,14 @@ const TentaNasScreen = {
   tabsHtml(active, node) {
     const n = node || {};
     const running = Number(this.runningJobs) || 0;
+    const counts = nodeTabCounts(n, this.fleet?.rows);
+    const title = (t) => (t ? ` title="${escapeAttr(t)}"` : '');
     return `
       <tf-tabs variant="underline" value="${escapeAttr(active || '')}" id="nas-tabs">
         <tf-tab id="overview" icon="bar-chart">${escapeHtml(T('tabs.overview'))}</tf-tab>
         <tf-tab id="disks" icon="cylinder" count="${Number(n.disksTotal) || 0}">${escapeHtml(T('tabs.disks'))}</tf-tab>
-        <tf-tab id="pools" icon="layers" count="${(Number(n.poolsTotal) || 0) + (Number(n.arraysTotal) || 0)}">${escapeHtml(T('tabs.pools'))}</tf-tab>
-        <tf-tab id="shares" icon="share" count="${Number(n.sharesTotal) || 0}">${escapeHtml(T('tabs.shares'))}</tf-tab>
+        <tf-tab id="pools" icon="layers" count="${escapeAttr(counts.pools)}"${title(counts.poolsTitle)}>${escapeHtml(T('tabs.pools'))}</tf-tab>
+        <tf-tab id="shares" icon="share" count="${escapeAttr(counts.shares)}"${title(counts.sharesTitle)}>${escapeHtml(T('tabs.shares'))}</tf-tab>
         <tf-tab id="jobs" icon="list" ${running ? `count="${running}" count-tone="accent"` : ''}>${escapeHtml(T('tabs.jobs'))}</tf-tab>
         <tf-tab id="environment" icon="os">${escapeHtml(T('tabs.environment'))}</tf-tab>
       </tf-tabs>`;
@@ -671,7 +673,12 @@ const TentaNasScreen = {
     const pools = nodes.reduce((a, n) => a + n.poolsTotal, 0);
     const arrays = nodes.reduce((a, n) => a + n.arraysTotal, 0);
     const unmeasured = nodes.reduce((a, n) => a + n.arraysUnmeasured, 0);
-    const nasNodes = ready.filter((n) => n.poolsTotal + n.arraysTotal > 0);
+    // A NAS node is one that serves storage. On a remote row only the ZFS
+    // pools are published, so a remote node with none is NOT a client on that
+    // evidence: its Elastic Arrays were never counted, and the badge says so.
+    const nasNodes = ready.filter((n) => n.poolsTotal + (perOrgCounted(n) ? n.arraysTotal : 0) > 0);
+    const arraysUncounted = ready.filter((n) => !perOrgCounted(n) && n.poolsTotal === 0);
+    const poolsOnly = ready.filter((n) => !perOrgCounted(n));
     const unarmed = ready.filter((n) => channelMode(n.elevationMode) === 'unarmed');
     const shares = this.fleetShares();
     const loaded = Boolean(this.fleet);
@@ -707,9 +714,15 @@ const TentaNasScreen = {
     ].filter(Boolean).join(' · '));
 
     patchHtml(root.querySelector('#nas-fleet-badges'), [
-      `<tf-chip status="accent" label="${escapeAttr(T('fleet.badge_nas', { n: nasNodes.length, nodes: nasNodes.map(nodeLabel).join(' · ') }))}"></tf-chip>`,
+      `<tf-chip status="accent" label="${escapeAttr([
+        T('fleet.badge_nas', { n: nasNodes.length, nodes: nasNodes.map(nodeLabel).join(' · ') }),
+        arraysUncounted.length ? T('fleet.badge_nas_uncounted', { nodes: arraysUncounted.map(nodeLabel).join(', ') }) : null,
+      ].filter(Boolean).join(' · '))}"${arraysUncounted.length ? ` title="${escapeAttr(T('fleet.arrays_not_counted_hint'))}"` : ''}></tf-chip>`,
       `<tf-chip status="${unarmed.length ? 'warn' : 'ok'}" icon="shield" label="${escapeAttr(T('fleet.badge_channels', { parts: channelParts || '—' }))}"></tf-chip>`,
-      `<tf-chip label="${escapeAttr(T('fleet.badge_pools', { n: pools + arrays, capacity: fmtBytes(cap) }))}"></tf-chip>`,
+      `<tf-chip label="${escapeAttr([
+        T('fleet.badge_pools', { n: pools + arrays, capacity: fmtBytes(cap) }),
+        poolsOnly.length ? T('kpi.capacity_pools_only', { n: poolsOnly.length }) : null,
+      ].filter(Boolean).join(' · '))}"${poolsOnly.length ? ` title="${escapeAttr(T('fleet.arrays_not_counted_hint'))}"` : ''}></tf-chip>`,
       `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: nodes.length }))}"></tf-chip>`,
     ].join(''));
 
@@ -723,6 +736,8 @@ const TentaNasScreen = {
         delta: [
           T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools + arrays }),
           unmeasured ? T('kpi.capacity_unmeasured', { n: unmeasured }) : null,
+          // Remote rows carry their ZFS pools only (see `perOrgCounted`).
+          poolsOnly.length ? T('kpi.capacity_pools_only', { n: poolsOnly.length }) : null,
         ].filter(Boolean).join(' · '),
       } },
       { key: 'health', className: 'clickable', attrs: {
@@ -777,8 +792,14 @@ const TentaNasScreen = {
     setAttr(root.querySelector('#nas-fleet-res-table'), 'empty-message', loaded ? T('fleet.resources_none') : I18n.t('common.loading'));
 
     const first = ready[0] || {};
+    const counts = nodeTabCounts(first, this.fleet?.rows);
     setAttr(root.querySelector('#nas-tabs tf-tab#disks'), 'count', String(Number(first.disksTotal) || 0));
-    setAttr(root.querySelector('#nas-tabs tf-tab#shares'), 'count', String(Number(first.sharesTotal) || 0));
+    const poolsTab = root.querySelector('#nas-tabs tf-tab#pools');
+    setAttr(poolsTab, 'count', counts.pools);
+    setAttr(poolsTab, 'title', counts.poolsTitle);
+    const sharesTab = root.querySelector('#nas-tabs tf-tab#shares');
+    setAttr(sharesTab, 'count', counts.shares);
+    setAttr(sharesTab, 'title', counts.sharesTitle);
 
     this.paintFleetAlerts();
     this.paintFleetResources();
@@ -856,11 +877,17 @@ const TentaNasScreen = {
     const unsupported = n.instanceStatus !== 'ready';
     const cls = ['node-card', unsupported ? 'unsupported' : '', !n.online ? 'offline' : ''].filter(Boolean).join(' ');
     const usedPct = pct(n.usedBytes, n.capacityBytes);
+    // Shares and arrays belong to organisations; a remote row does not carry
+    // them (see `perOrgCounted`), so they read "—" with the reason, and the
+    // capacity says it is the pools' alone.
+    const counted = perOrgCounted(n);
+    const shares = nodeShares(n, this.fleet?.rows);
+    const health = nodeCardHealth(n, shares);
     const statusChip = unsupported
       ? `<tf-chip status="warn" label="${escapeAttr(T('instance.' + n.instanceStatus))}"></tf-chip>`
       : !n.online
         ? `<tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`
-        : `<tf-chip status="${healthChip(n.health).status}" dot label="${escapeAttr(healthChip(n.health).label)}"></tf-chip>`;
+        : `<tf-chip status="${healthChip(health).status}" dot label="${escapeAttr(healthChip(health).label)}"></tf-chip>`;
     // n01:197 — "CachyOS · OpenZFS 2.3.1 · 128 GB RAM · uptime 41 dni". RAM
     // and uptime come from the node's own summary row, so a node that has not
     // published one yet simply drops them instead of showing zeros.
@@ -874,26 +901,29 @@ const TentaNasScreen = {
     // A node whose only storage is an Elastic Array serves the fleet exactly
     // as a node with a ZFS pool does; reading `poolsTotal` alone called it a
     // client.
+    // A remote row's zero arrays is "not counted", so with no ZFS pool either
+    // the card names what it does not know instead of calling it a client.
     const role = unsupported ? T('fleet.role_unsupported')
-      : n.poolsTotal + n.arraysTotal ? T('fleet.role_nas') : T('fleet.role_client');
+      : n.poolsTotal + (counted ? n.arraysTotal : 0) ? T('fleet.role_nas')
+        : counted ? T('fleet.role_client') : T('fleet.role_uncounted');
     const kv = (k, v) => `<span class="kv-inline"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></span>`;
     return `
       <div class="${cls}" data-node="${escapeAttr(n.nodeId)}">
         <div class="nc-head">
-          <span class="health-dot ${healthClass(unsupported || !n.online ? 'unknown' : n.health)}"></span>
+          <span class="health-dot ${healthClass(unsupported || !n.online ? 'unknown' : health)}"></span>
           <div style="flex:1;min-width:0">
             <div class="nc-name" title="${escapeAttr(n.nodeId)}">${escapeHtml(nodeLabel(n))}</div>
             <div class="nc-sub">${escapeHtml(sub)}</div>
           </div>
           ${statusChip}
         </div>
-        <div class="split-bar" title="${escapeAttr([usedPct + '%', n.arraysUnmeasured ? T('kpi.capacity_unmeasured', { n: n.arraysUnmeasured }) : null].filter(Boolean).join(' · '))}"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
+        <div class="split-bar" title="${escapeAttr([usedPct + '%', n.arraysUnmeasured ? T('kpi.capacity_unmeasured', { n: n.arraysUnmeasured }) : null, counted ? null : T('fleet.pools_only')].filter(Boolean).join(' · '))}"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
         <div class="nc-stats">
-          ${kv(T('kpi.capacity_total'), `${escapeHtml(fmtBytes(n.usedBytes))} / ${escapeHtml(fmtBytes(n.capacityBytes))}`)}
+          ${kv(T('kpi.capacity_total'), `${escapeHtml(fmtBytes(n.usedBytes))} / ${escapeHtml(fmtBytes(n.capacityBytes))}${counted ? '' : ` <span class="text-3" data-pools-only title="${escapeAttr(T('fleet.arrays_not_counted_hint'))}">${escapeHtml(T('fleet.pools_only'))}</span>`}`)}
           ${kv(T('kpi.disks'), `${n.disksTotal}${n.disksCritical ? ` · <span class="num-err">${n.disksCritical}!</span>` : ''}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}`)}
           ${kv(T('kpi.pools'), String(n.poolsTotal))}
-          ${n.arraysTotal ? kv('Elastic Array', String(n.arraysTotal)) : ''}
-          ${kv(T('kpi.shares'), String(n.sharesTotal))}
+          ${!counted ? kv('Elastic Array', notCountedHtml(T('fleet.arrays_not_counted_hint'))) : n.arraysTotal ? kv('Elastic Array', String(n.arraysTotal)) : ''}
+          ${kv(T('kpi.shares'), shares ? String(shares.total) : notCountedHtml(T('fleet.not_counted_hint')))}
         </div>
         <div class="nc-foot">
           <tf-chip size="sm" status="${channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok'}" icon="${channelMode(n.elevationMode) === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('elevation.short_' + channelMode(n.elevationMode)))}"></tf-chip>
@@ -1043,6 +1073,13 @@ const TentaNasScreen = {
         T('refreshed', { t: fmtAgo(env.probedAt) }),
       ];
       this.root.querySelector('#nas-head-sub').textContent = sub.filter(Boolean).join(' · ');
+      // The node's own share list, answered for this organisation, is the
+      // count its Shares tab has; a remote row alone has none (`nodeShares`).
+      if (Array.isArray(sharesRes?.shares)) {
+        const tab = this.root.querySelector('#nas-tabs tf-tab#shares');
+        setAttr(tab, 'count', String(sharesRes.shares.length));
+        setAttr(tab, 'title', null);
+      }
     } catch (e) {
       if (this.disposed) return;
       // A FAILED probe is a fact the tab body has to state. This used to only
@@ -1553,10 +1590,10 @@ const TentaNasScreen = {
         // word is silently dropped and the tile renders with no accent at all,
         // which is how a red state would quietly become an ordinary one.
         accent: critical.length ? 'danger' : warnings.length ? 'warning' : null,
-        // Each disk's reason in the reader's language (`localizedReason`);
-        // the node's own sentences are the tile's tooltip.
+        // Each disk's reason in the reader's language, from its codes
+        // (`diskReasonsText`); the node's own sentences are the tooltip.
         delta: warned.length
-          ? warned.slice(0, 3).map((d) => `${d.name}: ${localizedReason(d.healthReason, d.health).text}`).join(' · ')
+          ? warned.slice(0, 3).map((d) => `${d.name}: ${diskReasonsText(d).text || T('health.' + d.health)}`).join(' · ')
           : T('kpi.disk_health_ok'),
         title: warned.length
           ? warned.slice(0, 3).filter((d) => d.healthReason).map((d) => `${d.name}: ${d.healthReason}`).join(' · ') || null
@@ -2121,10 +2158,8 @@ const TentaNasScreen = {
   paintReplacementAdvice(host, advice) {
     if (!host) return;
     if (!advice.length) { patchHtml(host, ''); return; }
-    // The node's `reason` is English with the disk's whole health reason in
-    // it; the text is rebuilt from the advice's fields and the disk this same
-    // response lists (`replacementAdviceText`), the sentence is the tooltip.
-    const diskById = new Map((this.disks || []).map((d) => [d.diskId, d]));
+    // The text is worded from the advice's codes (`replacementAdviceText`);
+    // the node's English `reason` is only the tooltip.
     const html = `
       <div class="section-card">
         <div class="section-card-head">
@@ -2132,7 +2167,7 @@ const TentaNasScreen = {
           <span class="hint">${escapeHtml(T('replace_advice.hint'))}</span>
         </div>
         <div class="stat-rows">${advice.map((a) => {
-          const why = replacementAdviceText(a, diskById.get(a.diskId));
+          const why = replacementAdviceText(a);
           const kind = ADVICE_KINDS.has(a.severity) ? a.severity : 'other';
           return `
           <div class="sr" data-advice="${escapeAttr(a.diskId)}">
@@ -2506,18 +2541,18 @@ const TentaNasScreen = {
     const advice = res.advice || null;
     const setField = (id, value) => setText(body.querySelector(`[data-f="${id}"]`), value);
 
-    // n04:175 names the symptom next to the status ("Uwaga: realokacje"). The
-    // core joins several symptoms with "; " — only the first one fits a chip,
-    // the whole list stays in the "Dlaczego status…" box below. The symptom
-    // goes through the same localized words as the n03 row chip; one this
-    // build cannot translate leaves the chip at the status alone, with the
-    // node's sentence in the tooltip (and in the box below).
+    // n04:175 names the symptom next to the status ("Uwaga: realokacje").
+    // Only the first reason fits a chip; the whole list stays in the
+    // "Dlaczego status…" box below. The chip is worded like the n03 row chip
+    // (`diskHealthChipLabel`); a first reason this build has no word for
+    // leaves the chip at the status alone, with the node's sentence in the
+    // tooltip.
     const health = healthChip(d.health);
     const chip = body.querySelector('#nas-dd-health');
-    const symptom = reasonLabel(String(d.healthReason || '').split(';')[0]);
+    const chipLabel = diskHealthChipLabel(d);
     setAttr(chip, 'status', health.status);
-    setAttr(chip, 'label', symptom ? T('disk.health_chip', { status: health.label, reason: symptom }) : health.label);
-    setAttr(chip, 'title', d.healthReason || null);
+    setAttr(chip, 'label', chipLabel.label);
+    setAttr(chip, 'title', chipLabel.title);
 
     setField('device', d.name);
     setField('serial', d.serial || '—');
@@ -2536,16 +2571,16 @@ const TentaNasScreen = {
     setField('wear', d.wearPct == null ? '—' : `${d.wearPct}%`);
 
     setText(body.querySelector('#nas-dd-why-title'), T('disk.why_title', { status: health.label }));
-    // The whole list, symptom by symptom in the reader's language; the node's
-    // own sentence is the tooltip (see `localizedReason`).
+    // The whole list, reason by reason in the reader's language; the node's
+    // own sentence is the tooltip (see `diskReasonsText`).
     const why = body.querySelector('#nas-dd-why');
-    const whyText = localizedReason(d.healthReason, d.health);
+    const whyText = diskReasonsText(d);
     setText(why, whyText.text || T('disk.why_ok'));
     setAttr(why, 'title', whyText.title || null);
     // The advice in the reader's language (`replacementAdviceText`); the
     // node's English sentence is only the tooltip.
     const adviceHost = body.querySelector('#nas-dd-advice');
-    const adviceWhy = advice ? replacementAdviceText(advice, d) : null;
+    const adviceWhy = advice ? replacementAdviceText(advice) : null;
     patchHtml(adviceHost, advice
       ? warningHtml(advice.severity === 'urgent' ? 'danger' : 'info', T('replace_advice.disk_' + (adviceWhy.known ? advice.severity : 'other'), {
         reason: adviceWhy.text,
@@ -3766,14 +3801,18 @@ function patchReasonChips(table, disks) {
   }
 }
 
+// The n03 row's reason chip: only for a warning or a failure, and only when
+// the node gave a reason (codes, or at least its sentence). The label is the
+// first reason in the reader's language (`firstDiskReasonWord`), or the
+// grade when this build has no word for it; the sentence is the tooltip.
 function diskReasonChip(d) {
   if (d?.health !== 'warning' && d?.health !== 'critical') return null;
   const full = String(d.healthReason || '').trim();
-  const first = full.split(';')[0].trim();
-  if (!first) return null;
+  const coded = Array.isArray(d.healthReasons) && d.healthReasons.length > 0;
+  if (!coded && !full) return null;
   return {
     status: d.health === 'critical' ? 'err' : 'warn',
-    label: reasonLabel(first) ?? T('health.' + d.health),
+    label: firstDiskReasonWord(d) ?? T('health.' + d.health),
     title: full,
   };
 }
@@ -3817,6 +3856,56 @@ function normalizeNode(n) {
     usedBytes: Number(n.usedBytes) || 0,
     ramBytes: Number(n.ramBytes) || 0,
     uptimeSecs: Number(n.uptimeSecs) || 0,
+  };
+}
+
+// Per-organisation figures (shares, Elastic Arrays and the arrays' bytes) are
+// NOT in the summary a node publishes: every tenant of every node reads that
+// row, so fleet.rs publishes them as 0 and fills them in only on the row of
+// the node that answered the list, with the asking organisation's own
+// figures — and says so with `perOrgCounted` (`scope_local_org_figures`),
+// which is false when either scoped read failed. `isLocal` alone could not
+// tell a real 0 from a read that gave up. Wherever it is not set, those
+// zeros mean "not counted", never "none" — the local row included.
+function perOrgCounted(n) {
+  return Boolean(n && n.isLocal && n.perOrgCounted === true);
+}
+
+// The organisation's shares on one node, as far as this screen knows them:
+// the local row's scoped figure (its share errors are already in its
+// `health`), or, for a remote node, the share list that node answered itself
+// for this organisation on the fleet poll. Null when nobody counted them.
+function nodeShares(n, fleetRows) {
+  if (!n) return null;
+  if (perOrgCounted(n)) return { total: n.sharesTotal, errors: 0 };
+  const row = (fleetRows || []).find((r) => r.node && r.node.nodeId === n.nodeId);
+  const list = row && row.shares && typeof row.shares === 'object' ? row.shares.shares : null;
+  if (!Array.isArray(list)) return null;
+  return { total: list.length, errors: list.filter((s) => s.state === 'error').length };
+}
+
+// The node card's grade: a remote node's own broken share makes it a warning,
+// as fleet.rs does for the local row (`add_own_shares`).
+function nodeCardHealth(n, shares) {
+  return shares && shares.errors > 0 && n.health === 'ok' ? 'warning' : n.health;
+}
+
+// "—" for a figure nobody counted, with the reason as its tooltip.
+function notCountedHtml(hint) {
+  return `<span class="text-3" data-not-counted title="${escapeAttr(hint)}">—</span>`;
+}
+
+// The Pools and Shares badges of the tab strip for one node. The Pools count
+// is ZFS pools plus Elastic Arrays, so on a remote row (arrays not counted)
+// any number would be the ZFS half passed off as the whole.
+function nodeTabCounts(n, fleetRows) {
+  const shares = nodeShares(n, fleetRows);
+  const counted = perOrgCounted(n);
+  return {
+    pools: counted ? String((Number(n.poolsTotal) || 0) + (Number(n.arraysTotal) || 0)) : '—',
+    poolsTitle: counted ? null : T('fleet.arrays_not_counted_hint'),
+    shares: shares ? String(shares.total) : '—',
+    sharesTitle: shares ? null : T('fleet.not_counted_hint'),
   };
 }
 

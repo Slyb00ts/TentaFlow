@@ -23,6 +23,13 @@
 //       therefore never sent to it: it would land in whatever collector the
 //       OTHER tenant configured. Hardware alerts (disks, pools) are node-wide
 //       and every node admin may read them, so they still go.
+//
+//       NO FILE-ACCESS LINE LEAVES EITHER (migration 20). Every audited
+//       share belongs to one organisation, and its lines name that tenant's
+//       share, accounts, client addresses and files — the same reason as an
+//       owned alert, so the same answer: withheld and settled, until the
+//       target is per organisation. The `include_access` switch is kept in
+//       the stored setting so a per-organisation target can honour it again.
 // =============================================================================
 
 use std::time::Duration;
@@ -70,7 +77,7 @@ fn stored(main_db: &DbPool, addon_id: &str) -> Option<Stored> {
 pub fn settings(main_db: &DbPool, nas_db: &DbPool, addon_id: &str) -> NasForwardSettings {
     let s = stored(main_db, addon_id).unwrap_or_default();
     NasForwardSettings {
-        pending: pending(nas_db, s.include_access).unwrap_or(0),
+        pending: pending(nas_db).unwrap_or(0),
         last_sent_at: store::setting(nas_db, store::SETTING_FORWARD_SENT_AT)
             .ok()
             .flatten(),
@@ -234,9 +241,9 @@ pub fn webhook_body(rows: &[ForwardRow], hostname: &str, node_id: &str) -> serde
 // ----- what may leave ---------------------------------------------------------------
 
 /// What still waits to be SENT (`store::forward_pending`): an organisation's
-/// alert never is, so it is never counted.
-fn pending(nas_db: &DbPool, include_access: bool) -> Result<u32> {
-    store::forward_pending(nas_db, include_access)
+/// alert and a file-access line never are, so they are never counted.
+fn pending(nas_db: &DbPool) -> Result<u32> {
+    store::forward_pending(nas_db)
 }
 
 // ----- one pass ---------------------------------------------------------------------
@@ -265,13 +272,9 @@ async fn forward_once(nas_db: &DbPool, s: &Stored) -> Result<usize> {
     // Node-wide alerts only: the owner filter is part of the batch query
     // itself, so an organisation's alert raised during this pass cannot slip
     // in between two reads (`store::unforwarded_alerts`).
-    let mut rows = store::unforwarded_alerts(nas_db, BATCH)?;
-    if s.include_access {
-        rows.extend(store::unforwarded_access_events(
-            nas_db,
-            BATCH.saturating_sub(rows.len() as u32).max(1),
-        )?);
-    }
+    // File-access lines are never in the batch, whatever `include_access`
+    // says: each belongs to its share's organisation (module header).
+    let rows = store::unforwarded_alerts(nas_db, BATCH)?;
     if !rows.is_empty() {
         let hostname = hostname();
         let node_id = crate::sync::runtime::local_node_id().unwrap_or_else(|| "local".to_string());
@@ -287,8 +290,9 @@ async fn forward_once(nas_db: &DbPool, s: &Stored) -> Result<usize> {
         store::set_setting(nas_db, store::SETTING_FORWARD_SENT_AT, &store::now())?;
         store::set_setting(nas_db, store::SETTING_FORWARD_ERROR, "")?;
     }
-    // An organisation's alert is WITHHELD and settled like a sent one, all of
-    // them in one statement: left in the queue they would only pile up.
+    // An organisation's alert — and every file-access line — is WITHHELD and
+    // settled like a sent one, in one transaction: left in the queue they
+    // would only pile up.
     store::settle_withheld_alerts(nas_db)?;
     Ok(rows.len())
 }
@@ -394,7 +398,7 @@ mod tests {
         let batch = store::unforwarded_alerts(&p, BATCH).expect("batch");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].subject, "disk:a");
-        assert_eq!(pending(&p, true).expect("pending"), 1, "owned alerts are not a backlog");
+        assert_eq!(pending(&p).expect("pending"), 1, "owned alerts are not a backlog");
         assert_eq!(unforwarded_alert_rows(&p), owned as i64 + 1);
 
         let collector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("collector socket");
@@ -405,7 +409,7 @@ mod tests {
         };
         assert_eq!(forward_once(&p, &settings).await.expect("pass"), 1);
         assert_eq!(unforwarded_alert_rows(&p), 0, "every withheld alert settled in one pass");
-        assert_eq!(pending(&p, true).expect("pending"), 0);
+        assert_eq!(pending(&p).expect("pending"), 0);
     }
 
     #[test]
@@ -467,12 +471,21 @@ mod tests {
         assert_eq!(body["events"][0]["detail"], "NT_STATUS_ACCESS_DENIED");
     }
 
-    /// The queue is the rows: an alert and an access event are pending until
-    /// they are marked, the access half only counts when the admin asked for
-    /// it, and marking is idempotent.
-    #[test]
-    fn only_unforwarded_rows_are_pending_and_marking_clears_them() {
+    /// The queue is the rows: an alert is pending until it is marked, and
+    /// marking is idempotent. A file-access line is NEVER pending and never in
+    /// a batch — it belongs to its share's organisation (migration 20) — even
+    /// with the access switch on, and the pass settles it without sending it.
+    #[tokio::test]
+    async fn an_access_line_is_withheld_and_only_alerts_are_pending() {
         let p = db();
+        {
+            let conn = p.write().expect("write");
+            conn.execute_batch(
+                "INSERT INTO nas_shares (share_id,name,protocol,source_path,created_at,updated_at,org_id)
+                 VALUES ('s1','projekty','smb','/mnt/tank/projekty','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','org-a');",
+            )
+            .expect("share");
+        }
         store::raise_alert(&p, "disk:a:health", "warning", "disk", "a", "Disk sda: warning", "2 reallocated sectors")
             .expect("alert");
         store::insert_access_events(
@@ -491,8 +504,7 @@ mod tests {
         )
         .expect("event");
 
-        assert_eq!(store::forward_pending(&p, false).expect("pending"), 1);
-        assert_eq!(store::forward_pending(&p, true).expect("pending"), 2);
+        assert_eq!(store::forward_pending(&p).expect("pending"), 1, "the access line is no backlog");
 
         let alerts = store::unforwarded_alerts(&p, 10).expect("alerts");
         assert_eq!(alerts.len(), 1);
@@ -500,23 +512,34 @@ mod tests {
         assert_eq!(alerts[0].severity, "warning");
         assert_eq!(alerts[0].subject, "disk:a");
 
-        let events = store::unforwarded_access_events(&p, 10).expect("events");
-        assert_eq!(events.len(), 1);
-        // A refused access is worth a warning to the collector.
-        assert_eq!(events[0].severity, "warning");
-        assert!(events[0].summary.contains("unlinkat fail raport.xlsx"));
-
-        let mut batch = alerts;
-        batch.extend(events);
-        store::mark_forwarded(&p, &batch).expect("mark");
-        assert_eq!(store::forward_pending(&p, true).expect("pending"), 0);
+        store::mark_forwarded(&p, &alerts).expect("mark");
+        assert_eq!(store::forward_pending(&p).expect("pending"), 0);
         assert!(store::unforwarded_alerts(&p, 10).expect("alerts").is_empty());
-        assert!(store::unforwarded_access_events(&p, 10)
-            .expect("events")
-            .is_empty());
         // A replayed mark changes nothing.
-        store::mark_forwarded(&p, &batch).expect("mark again");
-        assert_eq!(store::forward_pending(&p, true).expect("pending"), 0);
+        store::mark_forwarded(&p, &alerts).expect("mark again");
+        assert_eq!(store::forward_pending(&p).expect("pending"), 0);
+
+        // A pass with the access switch ON sends nothing (the alert already
+        // went) and settles the access line: it never comes back.
+        let collector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("collector socket");
+        let settings = Stored {
+            enabled: true,
+            syslog_target: collector.local_addr().expect("addr").to_string(),
+            include_access: true,
+            ..Default::default()
+        };
+        assert_eq!(forward_once(&p, &settings).await.expect("pass"), 0);
+        let mut buf = vec![0u8; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), collector.recv(&mut buf)).await.is_err(),
+            "a tenant's file-access line reached the shared target"
+        );
+        let unsent: i64 = p
+            .read()
+            .expect("read")
+            .query_row("SELECT COUNT(*) FROM nas_access_events WHERE forwarded_at IS NULL", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(unsent, 0, "the withheld line is settled");
     }
 
     /// Two tenants' alerts wait next to a disk alert. The fleet-wide target —
@@ -543,7 +566,7 @@ mod tests {
             .expect("alert");
         store::raise_alert(&p, "disk:a:health", "warning", "disk", "a", "Disk sda: warning", "2 reallocated sectors")
             .expect("alert");
-        assert_eq!(pending(&p, false).expect("pending"), 1, "only the disk alert waits to be sent");
+        assert_eq!(pending(&p).expect("pending"), 1, "only the disk alert waits to be sent");
 
         let collector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("collector socket");
         let settings = Stored {
@@ -567,7 +590,7 @@ mod tests {
         );
 
         assert_eq!(unforwarded_alert_rows(&p), 0, "withheld rows settled");
-        assert_eq!(pending(&p, false).expect("pending"), 0);
+        assert_eq!(pending(&p).expect("pending"), 0);
         // A second pass has nothing to send and sends nothing.
         assert_eq!(forward_once(&p, &settings).await.expect("pass"), 0);
     }

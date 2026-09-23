@@ -11,7 +11,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, localizedReason,
+  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, diskReasonsText,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
 import '/js/components/tf-window.js';
@@ -246,11 +246,11 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       </div>`;
   };
 
-  // A critical disk's reason is the node's English (`score_health`): the
-  // picker shows it in the reader's language (`localizedReason`) and keeps
-  // the sentence for the tooltip only (`pickTitle`).
+  // A critical disk's reason, worded from the node's codes
+  // (`diskReasonsText`); the node's English sentence is the tooltip only
+  // (`pickTitle`).
   function criticalReason(d) {
-    return localizedReason(d.healthReason, d.health).text || T('wizard_pool.elastic_unavailable');
+    return diskReasonsText(d).text || T('wizard_pool.elastic_unavailable');
   }
   function pickTitle(d, reason) {
     return d.health === 'critical' && reason === criticalReason(d) && d.healthReason ? d.healthReason : reason;

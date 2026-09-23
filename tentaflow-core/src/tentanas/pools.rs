@@ -18,12 +18,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tentaflow_protocol::tentanas::{
-    NasDisk, NasImportablePool, NasJob, NasPool, NasPoolIo, NasPoolLayoutOption, NasPoolScan,
-    NasVdev, NasVdevDisk,
+    NasDisk, NasHealthReason, NasImportablePool, NasJob, NasPool, NasPoolIo, NasPoolLayoutOption,
+    NasPoolScan, NasVdev, NasVdevDisk,
 };
 use tentanas_helper::HelperCommand;
 
 use super::broker::BrokerError;
+use super::disks::{coded_reason, reason_param};
 use super::db as store;
 use super::zfs;
 use crate::db::DbPool;
@@ -518,21 +519,25 @@ pub fn parse_import_scan(text: &str) -> Vec<NasImportablePool> {
 /// The one status of the pool card. Capacity counts: a pool over 90 % full is
 /// as much an operator problem as a degraded vdev, and it is the failure the
 /// admin can still act on.
-pub fn score_health(pool: &NasPool, errors_line: &str, data_errors: u64) -> (&'static str, String) {
+///
+/// The reasons come back as codes (`NasHealthReason`, pool codes), critical
+/// ones first; `pool_reasons_text` is their English sentence for the
+/// tooltip. The front end words the codes, so nothing here is display text.
+pub fn score_health(pool: &NasPool, errors_line: &str, data_errors: u64) -> (&'static str, Vec<NasHealthReason>) {
     let mut critical = Vec::new();
     let mut warning = Vec::new();
+    let state = || coded_reason("pool_state", &[("state", pool.state.clone())]);
     match pool.state.as_str() {
-        "faulted" | "unavail" | "removed" => {
-            critical.push(format!("pool is {}", pool.state));
-        }
-        "degraded" => warning.push("pool is degraded".to_string()),
-        "offline" => warning.push("pool is offline".to_string()),
+        "faulted" | "unavail" | "removed" => critical.push(state()),
+        "degraded" | "offline" => warning.push(state()),
         _ => {}
     }
     if data_errors > 0 {
-        critical.push(format!("{data_errors} permanent data errors"));
+        critical.push(coded_reason("permanent_data_errors", &[("count", data_errors.to_string())]));
     } else if !errors_line.is_empty() && !errors_line.starts_with("No known data errors") {
-        critical.push(errors_line.to_string());
+        // zpool reported errors in words this parser could not count. Its own
+        // line rides along for the tooltip; the screen words the code.
+        critical.push(coded_reason("data_errors_reported", &[("detail", errors_line.to_string())]));
     }
     let mut bad_leaves = 0;
     let mut soft_leaves = 0;
@@ -546,10 +551,10 @@ pub fn score_health(pool: &NasPool, errors_line: &str, data_errors: u64) -> (&'s
         }
     }
     if bad_leaves > 0 {
-        critical.push(format!("{bad_leaves} unusable disks"));
+        critical.push(coded_reason("unusable_disks", &[("count", bad_leaves.to_string())]));
     }
     if soft_leaves > 0 {
-        warning.push(format!("{soft_leaves} degraded disks"));
+        warning.push(coded_reason("degraded_disks", &[("count", soft_leaves.to_string())]));
     }
     let error_disks = pool
         .vdevs
@@ -558,23 +563,59 @@ pub fn score_health(pool: &NasPool, errors_line: &str, data_errors: u64) -> (&'s
         .filter(|d| d.read_errors + d.write_errors + d.cksum_errors > 0)
         .count();
     if error_disks > 0 {
-        warning.push(format!("{error_disks} disks with I/O or checksum errors"));
+        warning.push(coded_reason("disks_with_errors", &[("count", error_disks.to_string())]));
     }
     if pool.scan.errors > 0 {
-        warning.push(format!("last {} found {} errors", pool.scan.kind, pool.scan.errors));
+        // One code per scan kind, so the screen never has to translate a
+        // wire word inside a sentence; `scan_found_errors` for a kind the
+        // parser did not recognise (`parse_scan`'s "none").
+        let code = match pool.scan.kind.as_str() {
+            "scrub" => "scrub_found_errors",
+            "resilver" => "resilver_found_errors",
+            _ => "scan_found_errors",
+        };
+        warning.push(coded_reason(
+            code,
+            &[("count", pool.scan.errors.to_string()), ("kind", pool.scan.kind.clone())],
+        ));
     }
+    let capacity = || coded_reason("capacity", &[("pct", pool.capacity_pct.to_string())]);
     if pool.capacity_pct >= CAPACITY_CRITICAL_PCT {
-        critical.push(format!("{}% full", pool.capacity_pct));
+        critical.push(capacity());
     } else if pool.capacity_pct >= CAPACITY_WARNING_PCT {
-        warning.push(format!("{}% full", pool.capacity_pct));
+        warning.push(capacity());
     }
     if !critical.is_empty() {
-        ("critical", critical.join("; "))
+        ("critical", critical)
     } else if !warning.is_empty() {
-        ("warning", warning.join("; "))
+        ("warning", warning)
     } else {
-        ("ok", String::new())
+        ("ok", Vec::new())
     }
+}
+
+/// The node's English sentence for one pool reason — `NasPool::health_reason`,
+/// word for word what this card said before the codes existed, for a tooltip.
+pub fn pool_reason_sentence(reason: &NasHealthReason) -> String {
+    let p = |key| reason_param(reason, key);
+    match reason.code.as_str() {
+        "pool_state" => format!("pool is {}", p("state")),
+        "permanent_data_errors" => format!("{} permanent data errors", p("count")),
+        "data_errors_reported" => p("detail").to_string(),
+        "unusable_disks" => format!("{} unusable disks", p("count")),
+        "degraded_disks" => format!("{} degraded disks", p("count")),
+        "disks_with_errors" => format!("{} disks with I/O or checksum errors", p("count")),
+        "scrub_found_errors" | "resilver_found_errors" | "scan_found_errors" => {
+            format!("last {} found {} errors", p("kind"), p("count"))
+        }
+        "capacity" => format!("{}% full", p("pct")),
+        other => other.to_string(),
+    }
+}
+
+/// The whole English sentence of a pool's reasons, "; "-joined.
+pub fn pool_reasons_text(reasons: &[NasHealthReason]) -> String {
+    reasons.iter().map(pool_reason_sentence).collect::<Vec<_>>().join("; ")
 }
 
 /// The redundancy word on the card: the kind shared by every data vdev, or
@@ -850,6 +891,7 @@ fn assemble(
         },
         health: String::new(),
         health_reason: String::new(),
+        health_reasons: Vec::new(),
         size_bytes: row.size_bytes,
         alloc_bytes: row.alloc_bytes,
         free_bytes: row.free_bytes,
@@ -902,9 +944,10 @@ fn assemble(
         cksum_errors,
         vdevs,
     };
-    let (health, reason) = score_health(&pool, &status.errors_line, status.data_errors);
+    let (health, reasons) = score_health(&pool, &status.errors_line, status.data_errors);
     pool.health = health.to_string();
-    pool.health_reason = reason;
+    pool.health_reason = pool_reasons_text(&reasons);
+    pool.health_reasons = reasons;
     pool
 }
 
@@ -1643,6 +1686,95 @@ errors: No known data errors\n";
         assert!(vdev_groups(tentanas_helper::VdevRole::Data, "anyraid", &devices).is_err());
     }
 
+    /// `score_health` with its reasons as the card's English sentence.
+    fn scored(pool: &NasPool, errors_line: &str, data_errors: u64) -> (&'static str, String) {
+        let (health, reasons) = score_health(pool, errors_line, data_errors);
+        (health, pool_reasons_text(&reasons))
+    }
+
+    /// Every pool reason reaches the wire as a code with its numbers and wire
+    /// words as parameters, critical ones first, and the English sentence is
+    /// built from those same codes — so the tooltip and the screen's words
+    /// cannot say two different things.
+    #[test]
+    fn every_pool_reason_travels_as_a_code_with_its_parameters() {
+        let codes = |reasons: &[NasHealthReason]| -> Vec<(String, Vec<(String, String)>)> {
+            reasons.iter().map(|r| (r.code.clone(), r.params.clone().into_iter().collect())).collect()
+        };
+        let code = |c: &str, params: &[(&str, &str)]| -> (String, Vec<(String, String)>) {
+            (c.to_string(), params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+        };
+        let leaf = |state: &str, cksum: u64| NasVdevDisk { state: state.to_string(), cksum_errors: cksum, ..Default::default() };
+        let pool = NasPool {
+            state: "degraded".to_string(),
+            capacity_pct: 93,
+            vdevs: vec![NasVdev {
+                kind: "raidz2".to_string(),
+                disks: vec![leaf("faulted", 0), leaf("offline", 0), leaf("online", 4)],
+                ..Default::default()
+            }],
+            scan: NasPoolScan { kind: "scrub".to_string(), errors: 3, ..Default::default() },
+            ..Default::default()
+        };
+        let (health, reasons) = score_health(&pool, "7 data errors, use '-v' for a list", 7);
+        assert_eq!(health, "critical");
+        // A critical pool names its critical reasons only, as the card
+        // always did.
+        assert_eq!(
+            codes(&reasons),
+            vec![
+                code("permanent_data_errors", &[("count", "7")]),
+                code("unusable_disks", &[("count", "1")]),
+                code("capacity", &[("pct", "93")]),
+            ]
+        );
+        assert_eq!(pool_reasons_text(&reasons), "7 permanent data errors; 1 unusable disks; 93% full");
+
+        // The same pool with the faulted leaf back and room to spare: every
+        // warning, in order.
+        let mut warned = pool.clone();
+        warned.vdevs[0].disks[0].state = "online".to_string();
+        warned.capacity_pct = 85;
+        let (health, reasons) = score_health(&warned, "No known data errors", 0);
+        assert_eq!(health, "warning");
+        assert_eq!(
+            codes(&reasons),
+            vec![
+                code("pool_state", &[("state", "degraded")]),
+                code("degraded_disks", &[("count", "1")]),
+                code("disks_with_errors", &[("count", "1")]),
+                code("scrub_found_errors", &[("count", "3"), ("kind", "scrub")]),
+                code("capacity", &[("pct", "85")]),
+            ]
+        );
+        assert_eq!(
+            pool_reasons_text(&reasons),
+            "pool is degraded; 1 degraded disks; 1 disks with I/O or checksum errors; \
+             last scrub found 3 errors; 85% full"
+        );
+        warned.scan.kind = "resilver".to_string();
+        assert_eq!(score_health(&warned, "", 0).1[3].code, "resilver_found_errors");
+        warned.scan.kind = "none".to_string();
+        assert_eq!(score_health(&warned, "", 0).1[3].code, "scan_found_errors");
+
+        // A faulted pool, and an errors line zpool wrote without a count: its
+        // own words stay a parameter, for the tooltip only.
+        let pool = NasPool { state: "faulted".to_string(), ..Default::default() };
+        let (health, reasons) = score_health(&pool, "list of errors unavailable", 0);
+        assert_eq!(health, "critical");
+        assert_eq!(
+            codes(&reasons),
+            vec![
+                code("pool_state", &[("state", "faulted")]),
+                code("data_errors_reported", &[("detail", "list of errors unavailable")]),
+            ]
+        );
+        assert_eq!(pool_reasons_text(&reasons), "pool is faulted; list of errors unavailable");
+        // A healthy pool has no codes and no sentence.
+        let (health, reasons) = score_health(&NasPool { state: "online".to_string(), ..Default::default() }, "No known data errors", 0);
+        assert_eq!((health, reasons.len()), ("ok", 0));
+    }
+
     #[test]
     fn health_folds_state_errors_and_capacity_into_one_status() {
         let mut pool = NasPool {
@@ -1650,15 +1782,15 @@ errors: No known data errors\n";
             capacity_pct: 54,
             ..Default::default()
         };
-        assert_eq!(score_health(&pool, "No known data errors", 0).0, "ok");
+        assert_eq!(scored(&pool, "No known data errors", 0).0, "ok");
 
         pool.capacity_pct = 84;
-        let (health, reason) = score_health(&pool, "No known data errors", 0);
+        let (health, reason) = scored(&pool, "No known data errors", 0);
         assert_eq!(health, "warning");
         assert!(reason.contains("84% full"));
 
         pool.capacity_pct = 92;
-        assert_eq!(score_health(&pool, "No known data errors", 0).0, "critical");
+        assert_eq!(scored(&pool, "No known data errors", 0).0, "critical");
 
         pool.capacity_pct = 10;
         pool.state = "degraded".to_string();
@@ -1677,19 +1809,19 @@ errors: No known data errors\n";
             ],
             ..Default::default()
         }];
-        let (health, reason) = score_health(&pool, "No known data errors", 0);
+        let (health, reason) = scored(&pool, "No known data errors", 0);
         assert_eq!(health, "critical");
         assert!(reason.contains("1 unusable disks"), "{reason}");
 
         pool.vdevs[0].disks[1].state = "online".to_string();
-        let (health, reason) = score_health(&pool, "No known data errors", 0);
+        let (health, reason) = scored(&pool, "No known data errors", 0);
         assert_eq!(health, "warning");
         assert!(reason.contains("pool is degraded"));
         assert!(reason.contains("checksum errors"));
 
         pool.state = "online".to_string();
         pool.vdevs.clear();
-        let (health, reason) = score_health(&pool, "12 data errors, use '-v' for a list", 12);
+        let (health, reason) = scored(&pool, "12 data errors, use '-v' for a list", 12);
         assert_eq!(health, "critical");
         assert!(reason.contains("12 permanent data errors"));
     }

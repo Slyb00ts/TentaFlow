@@ -18,6 +18,7 @@ const {
   sharedWithoutAuth, AUTH_METHODS, defaultTransport, defaultMethod, parseHostNqns, WWN_AUTHORITY,
   primaryAddress, sharedHostTargets, sharedHostNqns, sharedHostNeighbours, sharedHostWarning,
   authenticates, bindableAddresses, ALL_INTERFACES_ADDRESS, invalidHostNqns, iqnHostPart,
+  VOLUME_TAKEN_BY_OTHER_ORG,
 } = await import('./target-wizard.js');
 
 const { parseInitiators } = await import('./targets.js');
@@ -221,6 +222,28 @@ test('the volume picker disables a zvol another target already exports', async (
   // Two targets on one zvol is two clients writing one raw disk, so the taken
   // one cannot be picked at all.
   assert.deepEqual(disabledValues(select), ['tank/vm-store']);
+  screen.dispose();
+});
+
+test('a zvol another organisation exports is disabled and names no target', async () => {
+  // The server sends `*` for a volume whose target belongs to ANOTHER
+  // organisation (`targets::EXPORTED_BY_OTHER_ORG`): taken, and whose target
+  // holds it is not this tenant's to know. It must never be printed as if it
+  // were a target called "*".
+  const screen = fakeScreen({});
+  const volumes = [
+    { name: 'tank/wolny', pool: 'tank', sizeBytes: 1099511627776, thin: true, devicePath: '/dev/zvol/tank/wolny', exportedBy: '' },
+    { name: 'tank/obcy', pool: 'tank', sizeBytes: 1099511627776, thin: true, devicePath: '/dev/zvol/tank/obcy', exportedBy: VOLUME_TAKEN_BY_OTHER_ORG },
+  ];
+  const win = await toStepTwo(screen, { capabilities: caps({ volumes }) });
+  const select = win.querySelector('#nas-tw-volume');
+  const labels = selectLabels(select);
+  assert.deepEqual(disabledValues(select), ['tank/obcy']);
+  assert.ok(!labels.some((l) => l.includes('*')), JSON.stringify(labels));
+  // No target NAME: the own-organisation form is "(target {target})". The
+  // other-organisation sentence may say "target" as a noun — it names none.
+  assert.ok(!labels.some((l) => l.includes('(target ')), JSON.stringify(labels));
+  assert.ok(labels.some((l) => l === 'tank/obcy — już wyeksportowany przez target innej organizacji'), JSON.stringify(labels));
   screen.dispose();
 });
 

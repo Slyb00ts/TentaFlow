@@ -399,6 +399,14 @@ enum SourceOwner<'a> {
 
 /// The pool or Elastic Array `raw` belongs to, or the sentence that refuses it.
 ///
+/// `foreign_unions` are the unions of every OTHER organisation's arrays on
+/// the node (`foreign_unions`). They are refused with the very sentence a
+/// path on no pool gets, so the answer does not confirm the union exists —
+/// and they are refused BEFORE the pool rule, because a pool mounted at
+/// `/mnt` itself makes every union a path "under a pool mountpoint": the
+/// browser already refused another tenant's union there, while the create
+/// and the config import accepted it as a pool path and exported it.
+///
 /// `arrays` is passed in rather than read from the database for the same
 /// reason `datasets` is: the rule is then decided entirely by its arguments,
 /// and the fixtures below exercise every verdict on a host that has neither a
@@ -409,6 +417,7 @@ enum SourceOwner<'a> {
 fn source_owner<'a>(
     datasets: &[NasDataset],
     arrays: &'a [ElasticArrayRow],
+    foreign_unions: &[String],
     raw: &str,
 ) -> Result<SourceOwner<'a>> {
     // An Elastic Array BRANCH is a valid path under /mnt and is the one thing
@@ -424,6 +433,9 @@ fn source_owner<'a>(
              mountpoint instead, or the mover will make files appear and disappear under \
              the client"
         ));
+    }
+    if foreign_unions.iter().any(|u| at_or_below(u, raw)) {
+        return Err(not_on_this_node(raw));
     }
     // And the union itself, which is what that sentence sends the admin to.
     // The address is taken from the array's own accessor, never rebuilt from
@@ -464,24 +476,48 @@ fn source_owner<'a>(
         .filter_map(|d| d.mountpoint.as_deref())
         .collect();
     if !pool_roots.iter().any(|m| at_or_below(m, raw)) {
-        return Err(anyhow!(
-            "'{raw}' is not under a pool mountpoint or an Elastic Array union of this node"
-        ));
+        return Err(not_on_this_node(raw));
     }
     Ok(SourceOwner::Pool)
+}
+
+/// The one refusal for a path that is on none of the asking organisation's
+/// storage — spelled once, because another tenant's union must get exactly
+/// this sentence and nothing that tells the two cases apart.
+fn not_on_this_node(raw: &str) -> anyhow::Error {
+    anyhow!("'{raw}' is not under a pool mountpoint or an Elastic Array union of this node")
+}
+
+/// The union paths of every Elastic Array on the node that `owner` does NOT
+/// own: the places a share of `owner` may never be sourced from, nor its
+/// browser enter. Read with `?`: an unreadable table must refuse, not leave
+/// every other tenant's union looking like an ordinary directory of a pool.
+pub fn foreign_unions(db: &DbPool, owner: &tentanas_helper::elastic::ElasticOwner) -> Result<Vec<String>> {
+    let own = store::elastic_arrays(db, owner)?;
+    Ok(store::elastic_arrays_all(db)?
+        .iter()
+        .filter(|a| !own.iter().any(|o| o.name == a.name))
+        .map(|a| a.union_path())
+        .collect())
 }
 
 /// Validates a share source: it must be an existing directory under a POOL
 /// mountpoint or on an Elastic Array's union, and the canonical path must
 /// equal what was asked for — a symlink under the pool that points at `/etc`
 /// would otherwise export `/etc`.
+///
+/// `arrays` are the unions the share may sit on (the caller's own, or every
+/// array for the node's own apply), `foreign_unions` the ones it may not
+/// (another organisation's; empty for the node's own apply, which judges
+/// shares that already exist).
 pub fn resolve_source(
     datasets: &[NasDataset],
     arrays: &[ElasticArrayRow],
+    foreign_unions: &[String],
     raw: &str,
 ) -> Result<Source> {
     tentanas_helper::validate_share_path(raw).map_err(|e| anyhow!(e.to_string()))?;
-    let owner = source_owner(datasets, arrays, raw)?;
+    let owner = source_owner(datasets, arrays, foreign_unions, raw)?;
     let path = Path::new(raw);
     if !path.is_dir() {
         return Err(anyhow!("'{raw}' is not a directory on this node"));
@@ -722,7 +758,7 @@ pub async fn apply(
     let computed: Vec<(&'static str, String)> = shares
         .iter()
         .map(|share| {
-            let source = resolve_source(&datasets, &arrays, &share.source_path);
+            let source = resolve_source(&datasets, &arrays, &[], &share.source_path);
             share_state(share, &source, &service_installed, refusal.as_deref())
         })
         .collect();
@@ -857,7 +893,14 @@ pub async fn apply(
         log.push(format!("audit watches not installed: {e}"));
     }
 
-    super::fleet_mounts::publish_shares(main_db, addon_id, &shares);
+    // The owners go with the rows so a new fleet share is published once,
+    // already stamped. A failed read is not fatal: `publish_shares` keeps
+    // each row's previous stamp and the reconcile fixes the rest.
+    let owners = store::share_owners(db).unwrap_or_else(|e| {
+        tracing::warn!("tentanas: share owners not read for the fleet registry: {e}");
+        Default::default()
+    });
+    super::fleet_mounts::publish_shares(main_db, addon_id, &shares, &owners);
     super::fleet_mounts::request_reconcile();
     Ok(log)
 }
@@ -1221,12 +1264,12 @@ pub async fn browse(
 ) -> Result<(String, Vec<NasDirEntry>)> {
     let datasets = super::datasets::list("").await.map_err(|e| anyhow!("{e}"))?;
     let own = store::elastic_arrays(db, owner)?;
-    let foreign: Vec<String> = store::elastic_arrays_all(db)?
-        .iter()
-        .filter(|a| !own.iter().any(|o| o.name == a.name))
-        .map(|a| a.union_path())
-        .collect();
-    let shares = store::list_shares(db)?;
+    let foreign = foreign_unions(db, owner)?;
+    // `shared_as` names the shares already on a directory, so it is read
+    // from the asking organisation's shares only (migration 20): another
+    // tenant's share on a pool directory is not named, and the directory
+    // looks as free to this tenant as it is to this tenant's share list.
+    let shares = store::list_shares_of_org(db, &owner.org_id)?;
     browse_in(&datasets, &own, &foreign, &shares, path)
 }
 
@@ -1289,7 +1332,7 @@ fn browse_in(
             "'{path}' is not under a pool mountpoint or an Elastic Array union of this node"
         ));
     }
-    let source = resolve_source(datasets, arrays, path)?;
+    let source = resolve_source(datasets, arrays, foreign_unions, path)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&source.path)
         .map_err(|e| anyhow!("'{}' cannot be listed: {e}", source.path))?
@@ -1320,6 +1363,56 @@ fn browse_in(
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((source.path, entries))
+}
+
+// =============================================================================
+// job logs of node-wide applies
+// =============================================================================
+
+/// The lines of a node-wide apply that the asking organisation may read.
+///
+/// `apply` (and the targets' node-wide apply) rewrites the WHOLE node, so its
+/// log speaks about every share and target on it: "<name>: <detail>", the
+/// `$ helper …` plan with a source path, whatever the helper printed. The job
+/// that carries that log belongs to one organisation, so every line that
+/// mentions another organisation's share or target — its name, its path, its
+/// WWN — is dropped. `markers` are those identifiers.
+///
+/// A marker counts only as a whole token (the characters around it are not
+/// name characters), so a foreign share `a` does not erase every line with
+/// the letter a, while `/mnt/tank/b` still matches `/mnt/tank/b/x`. Dropping
+/// one of the caller's own lines that happens to contain a foreign token is
+/// the accepted cost: a shorter log is a nuisance, a leaked name is not.
+pub fn scope_log(lines: Vec<String>, markers: &[String]) -> Vec<String> {
+    let markers: Vec<&str> = markers.iter().map(String::as_str).filter(|m| !m.is_empty()).collect();
+    if markers.is_empty() {
+        return lines;
+    }
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let mentions = |line: &str, marker: &str| {
+        line.match_indices(marker).any(|(at, _)| {
+            let before = line[..at].chars().next_back();
+            let after = line[at + marker.len()..].chars().next();
+            // A path marker ends at a separator by itself; a trailing '/'
+            // after it is a deeper path of the same share.
+            !before.is_some_and(name_char) && !after.is_some_and(name_char)
+        })
+    };
+    lines
+        .into_iter()
+        .filter(|line| !markers.iter().any(|m| mentions(line.as_str(), *m)))
+        .collect()
+}
+
+/// The identifiers of every share NOT owned by `org_id`: name and source
+/// path, the two things an apply log line can carry. See `scope_log`.
+pub fn foreign_share_markers(db: &DbPool, org_id: &str) -> Result<Vec<String>> {
+    let owners = store::share_owners(db)?;
+    Ok(store::list_shares(db)?
+        .into_iter()
+        .filter(|s| owners.get(&s.share_id).map(String::as_str) != Some(org_id))
+        .flat_map(|s| [s.name, s.source_path])
+        .collect())
 }
 
 // =============================================================================
@@ -1486,7 +1579,7 @@ mod tests {
         store::migrate(&conn).expect("migrate");
         let db = std::sync::Arc::new(crate::db::Db::from_connection(conn));
         let share = smb_share(NasSmbOptions::default());
-        store::upsert_share(&db, &share).expect("share");
+        store::upsert_share(&db, "org-a", &share).expect("share");
         let error = apply(&db, &db, "addontentanas", None, ApplyTrigger::Startup)
             .await
             .expect_err("an unreadable node is not an empty node");
@@ -2070,19 +2163,90 @@ mod tests {
         assert_eq!(refusal(&at_mnt, &foreign[0]), nowhere);
     }
 
+    /// The create and the config import resolve a share source through
+    /// `source_owner`; a POOL mounted at `/mnt` itself made another tenant's
+    /// union "a directory of the pool" there, so both accepted it while the
+    /// browser refused it. The union is now refused first, with the exact
+    /// sentence a path on no pool gets — and a real pool directory beside it,
+    /// and the caller's own union, are still accepted.
+    #[test]
+    fn a_pool_at_mnt_does_not_make_another_tenants_union_a_share_source() {
+        let at_mnt = vec![dataset("big", "/mnt", true)];
+        let own = vec![array("alpha", "active")];
+        let foreign = vec![array("bravo", "active").union_path()];
+        let nowhere = |path: &str| not_on_this_node(path).to_string();
+        for path in [foreign[0].clone(), format!("{}/filmy", foreign[0])] {
+            let err = source_owner(&at_mnt, &own, &foreign, &path).expect_err(&path);
+            assert_eq!(err.to_string(), nowhere(&path));
+        }
+        // `/mnt/bravo-old` is a directory of the pool, not the union.
+        assert_eq!(source_owner(&at_mnt, &own, &foreign, "/mnt/bravo-old").expect("pool"), SourceOwner::Pool);
+        assert!(matches!(
+            source_owner(&at_mnt, &own, &foreign, &own[0].union_path()).expect("own union"),
+            SourceOwner::Array(_)
+        ));
+        // The full resolution refuses it before touching the filesystem.
+        let err = resolve_source(&at_mnt, &own, &foreign, &foreign[0]).expect_err("foreign union");
+        assert_eq!(err.to_string(), nowhere(&foreign[0]));
+    }
+
+    /// A node-wide apply log handed to one organisation's job keeps that
+    /// organisation's lines and drops every line naming another's share —
+    /// by name or by path — without eating lines that merely contain the
+    /// foreign name as part of a longer word.
+    #[test]
+    fn a_node_wide_apply_log_is_scoped_to_the_callers_shares() {
+        let lines = vec![
+            "projekty: SMB Direct refused on this node".to_string(),
+            "kadry: source path is not mounted".to_string(),
+            "$ tentanas-helper share-chown /mnt/tank/kadry".to_string(),
+            "$ tentanas-helper share-chown /mnt/tank/kadry/2026".to_string(),
+            "$ tentanas-helper share-chown /mnt/tank/kadry-archiwum".to_string(),
+            "channel: helper".to_string(),
+        ];
+        let markers = vec!["kadry".to_string(), "/mnt/tank/kadry".to_string()];
+        assert_eq!(
+            scope_log(lines.clone(), &markers),
+            vec![
+                "projekty: SMB Direct refused on this node".to_string(),
+                "$ tentanas-helper share-chown /mnt/tank/kadry-archiwum".to_string(),
+                "channel: helper".to_string(),
+            ]
+        );
+        assert_eq!(scope_log(lines.clone(), &[]), lines, "nothing foreign, nothing dropped");
+    }
+
+    /// The markers are every share the organisation does NOT own.
+    #[test]
+    fn the_foreign_markers_are_other_organisations_names_and_paths() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        store::migrate(&conn).expect("migrate");
+        let db = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let mut theirs = smb_share(NasSmbOptions::default());
+        theirs.share_id = "s-b".into();
+        theirs.name = "kadry".into();
+        theirs.source_path = "/mnt/tank/kadry".into();
+        store::upsert_share(&db, "org-a", &smb_share(NasSmbOptions::default())).expect("own");
+        store::upsert_share(&db, "org-b", &theirs).expect("theirs");
+        assert_eq!(
+            foreign_share_markers(&db, "org-a").expect("markers"),
+            vec!["kadry".to_string(), "/mnt/tank/kadry".to_string()]
+        );
+    }
+
     #[test]
     fn a_source_outside_every_pool_is_refused_before_anything_is_written() {
         let datasets = vec![dataset("tank", "/mnt/tank", true)];
         let arrays = vec![array("media", "active")];
-        assert!(resolve_source(&datasets, &arrays, "/etc/samba").is_err());
-        assert!(resolve_source(&datasets, &arrays, "/mnt/other/x").is_err());
-        assert!(resolve_source(&datasets, &arrays, "/mnt/../etc").is_err());
+        assert!(resolve_source(&datasets, &arrays, &[], "/etc/samba").is_err());
+        assert!(resolve_source(&datasets, &arrays, &[], "/mnt/other/x").is_err());
+        assert!(resolve_source(&datasets, &arrays, &[], "/mnt/../etc").is_err());
         // `/mnt/<something>` is not an address on its own: with no row for it,
         // an array name this node never created is just a directory on the
         // root filesystem, and a share there would serve the rootfs.
-        assert!(source_owner(&datasets, &arrays, "/mnt/archiwum").is_err());
+        assert!(source_owner(&datasets, &arrays, &[], "/mnt/archiwum").is_err());
         // And a name that merely starts like the union is not the union.
-        assert!(source_owner(&datasets, &arrays, "/mnt/media-old").is_err());
+        assert!(source_owner(&datasets, &arrays, &[], "/mnt/media-old").is_err());
     }
 
     /// The union is the array's address, so it is a share source — the case
@@ -2093,17 +2257,17 @@ mod tests {
         let arrays = vec![array("media", "active")];
         let union = arrays[0].union_path();
         assert_eq!(
-            source_owner(&datasets, &arrays, &union).expect("the union is shareable"),
+            source_owner(&datasets, &arrays, &[], &union).expect("the union is shareable"),
             SourceOwner::Array(&arrays[0])
         );
         assert_eq!(
-            source_owner(&datasets, &arrays, &format!("{union}/filmy"))
+            source_owner(&datasets, &arrays, &[], &format!("{union}/filmy"))
                 .expect("a folder of the array is shareable"),
             SourceOwner::Array(&arrays[0])
         );
         // The pools answer exactly as they did before.
         assert_eq!(
-            source_owner(&datasets, &arrays, "/mnt/tank/projekty").expect("pool source"),
+            source_owner(&datasets, &arrays, &[], "/mnt/tank/projekty").expect("pool source"),
             SourceOwner::Pool
         );
         // And the union resolves MOUNTED. Without that, `share_state` keeps
@@ -2126,7 +2290,7 @@ mod tests {
             let mut arrays = vec![array("media", state)];
             arrays[0].state_detail = "branch sdg is present and not mounted yet".to_string();
             let union = arrays[0].union_path();
-            let err = source_owner(&datasets, &arrays, &union)
+            let err = source_owner(&datasets, &arrays, &[], &union)
                 .expect_err("a union that is not mounted is not a share source")
                 .to_string();
             assert!(err.contains(state), "the state has to be in the sentence: {err}");
@@ -2145,7 +2309,7 @@ mod tests {
         let datasets = vec![dataset("tank", "/mnt/tank", true)];
         let arrays = vec![array("fixture-absent-union", "active")];
         let union = arrays[0].union_path();
-        let err = resolve_source(&datasets, &arrays, &union)
+        let err = resolve_source(&datasets, &arrays, &[], &union)
             .expect_err("no such directory on the host running these tests")
             .to_string();
         assert!(
@@ -2170,20 +2334,20 @@ mod tests {
         // is the array's, not a side effect of some other check.
         assert!(tentanas_helper::validate_share_path(&branch).is_ok());
         let arrays = vec![array("media", "active")];
-        let err = resolve_source(&datasets, &arrays, &branch)
+        let err = resolve_source(&datasets, &arrays, &[], &branch)
             .expect_err("a branch of an Elastic Array is not shareable")
             .to_string();
         assert!(err.contains("union"), "the fix has to be in the sentence: {err}");
         assert!(err.contains("mover"), "{err}");
         // Knowing the array does not soften the branch rule: the row that
         // makes the union shareable is the same row the branch belongs to.
-        assert!(source_owner(&datasets, &arrays, &branch).is_err());
+        assert!(source_owner(&datasets, &arrays, &[], &branch).is_err());
         // The union the sentence sends the admin to is not a branch, and this
         // node accepts it — that is the whole point of the refusal above.
         let union = arrays[0].union_path();
         assert!(!tentanas_helper::elastic::is_branch_path(&union));
         assert_eq!(
-            source_owner(&datasets, &arrays, &union).expect("the union is the array's address"),
+            source_owner(&datasets, &arrays, &[], &union).expect("the union is the array's address"),
             SourceOwner::Array(&arrays[0])
         );
     }

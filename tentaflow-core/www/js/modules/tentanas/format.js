@@ -185,111 +185,162 @@ export function healthChip(h) {
   return { status: map[h] || 'info', label: T('health.' + (h || 'unknown')), dot: true };
 }
 
-// ----- Disk health reasons, in the reader's language -----------------------
+// ----- Health reasons, in the reader's language ----------------------------
 //
-// ONE copy for every surface that shows a disk's reason: the n03 row chip,
-// the n04 chip and "why" box, the n02 tile, the replacement advice and the
-// pool wizard's disk pickers.
+// ONE place words every health reason the node sends: the n03 row chip, the
+// n04 chip, "why" box and advice, the n02 disk tile, the n03 advice card, the
+// pool wizard's disk pickers, the n06 member chips and the n05 pool card.
 //
-// The short cause a problem row of n03 carries ("3 realok.", "54°C"). The
-// node grades a disk in `score_health` and `grade_disk_health`
-// (tentanas/disks.rs) and joins the symptoms of the winning grade with "; ",
-// so the FIRST one is the reason the disk is in that state. Its fixed English
-// wording is mapped to a short localized word here — one pattern for every
-// sentence those two functions can write:
-//   "SMART overall status FAILED", "last self-test failed",
-//   "{n} pending sectors", "{n} media errors",
-//   "reallocated sectors growing ({old} → {n} in 7 days)",
-//   "{n} reallocated sectors", "{t}°C (over the {limit}°C limit)", "{t}°C",
-//   "{n} UDMA CRC errors (cable/backplane)", "{n}% worn",
-//   "ZFS reports this disk FAULTED", "ZFS reports this disk UNAVAIL".
-// "no SMART data" is the `unknown` grade's: an unknown disk gets no chip, but
-// the n04 "why" box still names it.
-// A sentence this build has no word for is NOT shown as the chip: English is
-// not a label in four of the five locales, so the chip falls back to the
-// translated grade and the node's sentence stays in the tooltip. Only a
-// warning or a failure gets a chip — "no SMART data" on an unknown disk is not
-// a problem the row should shout about.
-const REASON_PATTERNS = [
-  [/^(-?\d+)°C \(over the (-?\d+)°C limit\)$/, (m) => T('disks.reason_temp_over', { t: Number(m[1]), limit: Number(m[2]) })],
-  [/^(-?\d+)°C$/, (m) => `${m[1]}°C`],
-  [/^(\d+) reallocated sectors$/, (m) => T('disks.reason_realloc', { n: Number(m[1]) })],
-  [/^reallocated sectors growing \((\d+) → (\d+)/, (m) => T('disks.reason_realloc_growing', { from: Number(m[1]), to: Number(m[2]) })],
-  [/^(\d+) pending sectors$/, (m) => T('disks.reason_pending', { n: Number(m[1]) })],
-  [/^(\d+) media errors$/, (m) => T('disks.reason_media', { n: Number(m[1]) })],
-  [/^(\d+) UDMA CRC errors/, (m) => T('disks.reason_crc', { n: Number(m[1]) })],
-  [/^(\d+)% worn$/, (m) => T('disks.reason_wear', { n: Number(m[1]) })],
-  [/^SMART overall status FAILED$/, () => T('disks.reason_smart_failed')],
-  [/^last self-test failed$/, () => T('disks.reason_self_test_failed')],
-  [/^ZFS reports this disk FAULTED$/, () => T('disks.reason_zfs_faulted')],
-  [/^ZFS reports this disk UNAVAIL$/, () => T('disks.reason_zfs_unavail')],
-  [/^no SMART data$/, () => T('disks.reason_no_smart')],
-];
+// The node sends a reason as a CODE with parameters (`NasHealthReason`,
+// tentaflow-protocol/src/tentanas.rs, which lists every code): disks in
+// `healthReasons`, a replacement advice in `reasons`, a pool in
+// `healthReasons`. The sentence is composed here from i18n; the node's
+// English (`healthReason`, `advice.reason`) is never parsed and never shown
+// as text — only as a tooltip. A code this build does not know is left out
+// of the text, and when nothing is left the text is the translated grade.
+//
+// Every numeric parameter must read as a finite number, or the code counts as
+// unknown: "NaN realok." is no better than English.
 
-// The localized short word for ONE symptom of the node's reason, or null when
-// this build has no pattern for it.
-export function reasonLabel(symptom) {
-  const text = String(symptom || '').trim();
-  for (const [re, fmt] of REASON_PATTERNS) {
-    const m = re.exec(text);
-    if (m) return fmt(m);
+function numParams(params, keys) {
+  const out = {};
+  for (const key of keys) {
+    const raw = params?.[key];
+    const n = raw == null || raw === '' ? NaN : Number(raw);
+    if (!Number.isFinite(n)) return null;
+    out[key] = n;
   }
-  return null;
+  return out;
 }
 
-// The node's whole reason in the reader's language, for the places that show
-// every symptom (the n04 "why" box, the n02 disk-health tile): each "; "-
-// joined symptom through `reasonLabel`. A symptom this build has no word for
-// is left out of the text — never printed in English — and when none is
-// known the text is the translated grade. `title` is the node's sentence,
-// whole, for the tooltip. Both are '' when the node gave no reason.
-export function localizedReason(full, health) {
-  const raw = String(full || '').trim();
-  if (!raw) return { text: '', title: '' };
-  const words = raw.split(';').map(reasonLabel).filter(Boolean);
-  return { text: words.length ? words.join('; ') : T('health.' + (health || 'unknown')), title: raw };
+// The grades a replacement advice can be "for N days" in.
+const UNHEALTHY = new Set(['warning', 'critical']);
+
+// code -> [numeric parameter names, words(numbers, params)]. A Map, not an
+// object literal, so a code like `constructor` is unknown and not a
+// prototype method.
+const DISK_REASON_WORDS = new Map([
+  ['smart_failed', [[], () => T('disks.reason_smart_failed')]],
+  ['self_test_failed', [[], () => T('disks.reason_self_test_failed')]],
+  ['pending_sectors', [['count'], (n) => T('disks.reason_pending', { n: n.count })]],
+  ['media_errors', [['count'], (n) => T('disks.reason_media', { n: n.count })]],
+  ['reallocated_growing', [['from', 'to'], (n) => T('disks.reason_realloc_growing', { from: n.from, to: n.to })]],
+  ['reallocated', [['count'], (n) => T('disks.reason_realloc', { n: n.count })]],
+  ['temperature_over_limit', [['celsius', 'limit'], (n) => T('disks.reason_temp_over', { t: n.celsius, limit: n.limit })]],
+  ['temperature_high', [['celsius'], (n) => T('disks.reason_temp', { t: n.celsius })]],
+  ['crc_errors', [['count'], (n) => T('disks.reason_crc', { n: n.count })]],
+  ['wear', [['pct'], (n) => T('disks.reason_wear', { n: n.pct })]],
+  ['no_smart_data', [[], () => T('disks.reason_no_smart')]],
+  ['zfs_faulted', [[], () => T('disks.reason_zfs_faulted')]],
+  ['zfs_unavail', [[], () => T('disks.reason_zfs_unavail')]],
+  // The two codes only a replacement advice carries, ahead of the disk's own.
+  ['reallocated_grew', [['from', 'to'], (n) => T('replace_advice.reason_grew', { from: n.from, to: n.to })]],
+  ['unhealthy_for_days', [['days'], (n, p) => (UNHEALTHY.has(p.health)
+    ? T('replace_advice.reason_for_days', { status: T('health.' + p.health), days: n.days })
+    : null)]],
+]);
+
+// A pool state inside a sentence is the same word the state chip shows; one
+// this build has no word for makes the code unknown instead of printing the
+// wire spelling.
+function poolStateWord(state) {
+  const key = 'state.' + String(state || '');
+  const label = T(key);
+  return label === 'tentanas.' + key ? null : label;
 }
 
-// The replacement advice (§5.10) in the reader's language. The node writes
-// `advice.reason` in `replacement_advice` (tentanas/disks.rs) as "; "-joined
-// English from exactly three parts, and each is rebuilt here from structured
-// data instead:
-//   "reallocated sectors grew from {old} to {now} in the last 7 days"
-//       — present when `reallocated` > `reallocatedWeekAgo`; from those two;
-//   "{health} for {days} days"
-//       — the disk's grade word and `warningDays`; from `disk.health` and
-//         `warningDays` (said whenever the node counted a whole day);
-//   the disk's whole `health_reason`
-//       — every symptom through `reasonLabel`; the growth symptom is dropped
-//         when the growth part above already says it.
-// `disk` is the advised disk as the same response lists it (n03: looked up
-// by `diskId`; n04: the detail's disk). An advice kind other than `urgent` /
-// `advice`, or one with no disk to read, gets the generic translated
-// recommendation. `title` is always the node's sentence, whole — the English
-// never reaches the text.
+const POOL_REASON_WORDS = new Map([
+  ['pool_state', [[], (n, p) => {
+    const state = poolStateWord(p.state);
+    return state ? T('pools.reason_pool_state', { state }) : null;
+  }]],
+  ['permanent_data_errors', [['count'], (n) => T('pools.reason_permanent_data_errors', { count: n.count })]],
+  // `detail` is zpool's own English line: the tooltip has it, the text not.
+  ['data_errors_reported', [[], () => T('pools.reason_data_errors_reported')]],
+  ['unusable_disks', [['count'], (n) => T('pools.reason_unusable_disks', { count: n.count })]],
+  ['degraded_disks', [['count'], (n) => T('pools.reason_degraded_disks', { count: n.count })]],
+  ['disks_with_errors', [['count'], (n) => T('pools.reason_disks_with_errors', { count: n.count })]],
+  ['scrub_found_errors', [['count'], (n) => T('pools.reason_scrub_found_errors', { count: n.count })]],
+  ['resilver_found_errors', [['count'], (n) => T('pools.reason_resilver_found_errors', { count: n.count })]],
+  ['scan_found_errors', [['count'], (n) => T('pools.reason_scan_found_errors', { count: n.count })]],
+  ['capacity', [['pct'], (n) => T('pools.reason_capacity', { pct: n.pct })]],
+]);
+
+function wordOf(table, reason) {
+  const entry = table.get(String(reason?.code || ''));
+  if (!entry) return null;
+  const [keys, words] = entry;
+  const params = reason.params || {};
+  const numbers = numParams(params, keys);
+  return numbers ? words(numbers, params) || null : null;
+}
+
+// The words of every known reason, in the node's order (worst first).
+function wordsOf(table, reasons) {
+  return (Array.isArray(reasons) ? reasons : []).map((r) => wordOf(table, r)).filter(Boolean);
+}
+
+// The localized words for ONE disk reason code, or null for a code this
+// build does not know.
+export function diskReasonWord(reason) {
+  return wordOf(DISK_REASON_WORDS, reason);
+}
+
+// The short cause a problem chip carries (n03 row, n04 header, n06 member):
+// the FIRST reason, which is the one the disk is in that state for. null
+// when the first reason is not one this build can word — the chip then
+// shows the grade alone rather than skip to a lesser reason.
+export function firstDiskReasonWord(disk) {
+  const first = Array.isArray(disk?.healthReasons) ? disk.healthReasons[0] : null;
+  return first ? diskReasonWord(first) : null;
+}
+
+// A disk's whole reason in the reader's language, for the places that show
+// every symptom (the n04 "why" box, the n02 disk-health tile, the pool
+// wizard): `{ text, title }`. `title` is the node's sentence for the
+// tooltip. Both are '' when the node gave no reason at all; with a reason
+// but no word this build knows, the text is the translated grade.
+export function diskReasonsText(disk) {
+  const title = String(disk?.healthReason || '').trim();
+  const reasons = Array.isArray(disk?.healthReasons) ? disk.healthReasons : [];
+  if (!reasons.length && !title) return { text: '', title: '' };
+  const words = wordsOf(DISK_REASON_WORDS, reasons);
+  return { text: words.length ? words.join('; ') : T('health.' + (disk?.health || 'unknown')), title };
+}
+
+// The chip label "Uwaga: realok. 0 → 3" — or the grade alone when the first
+// reason has no word here. `title` is the node's sentence, or null.
+export function diskHealthChipLabel(disk) {
+  const health = healthChip(disk?.health);
+  const word = firstDiskReasonWord(disk);
+  return {
+    label: word ? T('disk.health_chip', { status: health.label, reason: word }) : health.label,
+    title: String(disk?.healthReason || '').trim() || null,
+  };
+}
+
+// The replacement advice (§5.10) in the reader's language, from the codes
+// in `advice.reasons` (`replacement_advice`, tentanas/disks.rs): the growth,
+// the days unhealthy, then the disk's own reasons. An advice kind other than
+// `urgent` / `advice`, or one whose codes this build cannot word (an older
+// node sends none), is `known: false` with the generic recommendation.
+// `title` is always the node's sentence.
 export const ADVICE_KINDS = new Set(['urgent', 'advice']);
 
-export function replacementAdviceText(advice, disk) {
+export function replacementAdviceText(advice) {
   const title = String(advice?.reason || '').trim();
-  if (!ADVICE_KINDS.has(advice?.severity) || !disk) {
-    return { known: false, text: T('replace_advice.reason_other'), title };
-  }
-  const parts = [];
-  const now = advice.reallocated;
-  const old = advice.reallocatedWeekAgo;
-  const growing = now != null && old != null && Number(now) > Number(old);
-  if (growing) parts.push(T('replace_advice.reason_grew', { from: Number(old), to: Number(now) }));
-  const days = Number(advice.warningDays) || 0;
-  if ((disk.health === 'warning' || disk.health === 'critical') && days > 0) {
-    parts.push(T('replace_advice.reason_for_days', { status: T('health.' + disk.health), days }));
-  }
-  for (const symptom of String(disk.healthReason || '').split(';')) {
-    if (growing && /^\s*reallocated sectors growing/.test(symptom)) continue;
-    const word = reasonLabel(symptom);
-    if (word) parts.push(word);
-  }
-  if (!parts.length) parts.push(T('health.' + (disk.health || 'unknown')));
-  return { known: true, text: parts.join('; '), title };
+  const words = ADVICE_KINDS.has(advice?.severity) ? wordsOf(DISK_REASON_WORDS, advice.reasons) : [];
+  if (!words.length) return { known: false, text: T('replace_advice.reason_other'), title };
+  return { known: true, text: words.join('; '), title };
+}
+
+// A pool's reason for the n05 card, `{ text, title }` as `diskReasonsText`.
+export function poolReasonsText(pool) {
+  const title = String(pool?.healthReason || '').trim();
+  const reasons = Array.isArray(pool?.healthReasons) ? pool.healthReasons : [];
+  if (!reasons.length && !title) return { text: '', title: '' };
+  const words = wordsOf(POOL_REASON_WORDS, reasons);
+  return { text: words.length ? words.join('; ') : T('health.' + (pool?.health || 'unknown')), title };
 }
 
 // zpool device/pool states: only 'online' is healthy, 'degraded' still

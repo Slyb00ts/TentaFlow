@@ -21,7 +21,7 @@ use parking_lot::RwLock;
 use serde_json::Value;
 use tentaflow_protocol::tentanas::{
     NasDisk, NasDiskIo, NasDiskWipeJournalClaim, NasDiskWipePlan, NasDiskWipeRefusal,
-    NasReplacementAdvice, NasSmartAttribute, NasSmartSelfTest, NasTelemetryState,
+    NasHealthReason, NasReplacementAdvice, NasSmartAttribute, NasSmartSelfTest, NasTelemetryState,
 };
 use tentanas_helper::HelperCommand;
 
@@ -236,6 +236,7 @@ pub fn disk_from_lsblk(node: &Value) -> Option<NasDisk> {
         member_of,
         health: "unknown".to_string(),
         health_reason: String::new(),
+        health_reasons: Vec::new(),
         temperature_c: None,
         power_on_hours: None,
         reallocated_sectors: None,
@@ -350,8 +351,9 @@ pub const ROLE_OTHER_ORG_ARRAY: &str = "other_org_array";
 /// (`health`, `temperature_c`, `power_on_hours`, `reallocated_sectors`,
 /// `pending_sectors`, `crc_errors`, `media_errors`, `wear_pct`,
 /// `smart_available`, `smart_passed`, `smart_read_at`), `health_reason`
-/// (built by `score_health` from SMART counters, plus `grade_disk_health`'s
-/// FAULTED/UNAVAIL sentence, which names no pool) and the I/O figures
+/// and `health_reasons` (built by `score_health` from SMART counters, plus
+/// `grade_disk_health`'s FAULTED/UNAVAIL code, which names no pool; no code
+/// carries a pool or array name as a parameter either) and the I/O figures
 /// (`io`, `io_history_bps`: numbers). `role` stays, rewritten to
 /// `ROLE_OTHER_ORG_ARRAY`.
 pub fn hide_other_org_array(disk: &mut NasDisk, own_arrays: &std::collections::BTreeSet<String>) {
@@ -1437,58 +1439,137 @@ pub fn smart_self_tests(doc: &Value) -> Vec<NasSmartSelfTest> {
 ///
 /// FAULTED/UNAVAIL itself is not SMART's to know; `grade_disk_health` adds it
 /// from the pool's leaf state.
-pub fn score_health(s: &SmartSummary, kind: &str, reallocated_week_ago: Option<i64>) -> (&'static str, String) {
+pub fn score_health(
+    s: &SmartSummary,
+    kind: &str,
+    reallocated_week_ago: Option<i64>,
+) -> (&'static str, Vec<NasHealthReason>) {
     let mut critical = Vec::new();
     let mut warning = Vec::new();
     if s.passed == Some(false) {
-        critical.push("SMART overall status FAILED".to_string());
+        critical.push(coded_reason("smart_failed", &[]));
     }
     if s.self_test_failed {
-        critical.push("last self-test failed".to_string());
+        critical.push(coded_reason("self_test_failed", &[]));
     }
     if let Some(p) = s.pending.filter(|v| *v > 0) {
-        warning.push(format!("{p} pending sectors"));
+        warning.push(coded_reason("pending_sectors", &[("count", p.to_string())]));
     }
     if let Some(m) = s.media_errors.filter(|v| *v > 0) {
-        warning.push(format!("{m} media errors"));
+        warning.push(coded_reason("media_errors", &[("count", m.to_string())]));
     }
     if let Some(r) = s.reallocated.filter(|v| *v > 0) {
         match reallocated_week_ago {
-            Some(old) if (r as i64) > old => warning.push(format!(
-                "reallocated sectors growing ({old} → {r} in 7 days)"
+            Some(old) if (r as i64) > old => warning.push(coded_reason(
+                "reallocated_growing",
+                &[("from", old.to_string()), ("to", r.to_string())],
             )),
-            _ => warning.push(format!("{r} reallocated sectors")),
+            _ => warning.push(coded_reason("reallocated", &[("count", r.to_string())])),
         }
     }
     let temp_warn = if kind == "hdd" { 50 } else { 65 };
     let temp_limit = if kind == "hdd" { 60 } else { 75 };
     if let Some(t) = s.temperature_c {
         if t >= temp_limit {
-            warning.push(format!("{t}°C (over the {temp_limit}°C limit)"));
+            warning.push(coded_reason(
+                "temperature_over_limit",
+                &[("celsius", t.to_string()), ("limit", temp_limit.to_string())],
+            ));
         } else if t >= temp_warn {
-            warning.push(format!("{t}°C"));
+            warning.push(coded_reason("temperature_high", &[("celsius", t.to_string())]));
         }
     }
     if let Some(c) = s.crc_errors.filter(|v| *v > 0) {
-        warning.push(format!("{c} UDMA CRC errors (cable/backplane)"));
+        warning.push(coded_reason("crc_errors", &[("count", c.to_string())]));
     }
     if let Some(w) = s.wear_pct {
         if w >= 85 {
-            warning.push(format!("{w}% worn"));
+            warning.push(coded_reason("wear", &[("pct", w.to_string())]));
         }
     }
     if !critical.is_empty() {
         // The symptoms travel with the verdict: a failing drive that is also
-        // hot or reallocating says so in the same sentence.
+        // hot or reallocating says so in the same list.
         critical.extend(warning);
-        ("critical", critical.join("; "))
+        ("critical", critical)
     } else if !warning.is_empty() {
-        ("warning", warning.join("; "))
+        ("warning", warning)
     } else if s.passed.is_some() {
-        ("ok", String::new())
+        ("ok", Vec::new())
     } else {
-        ("unknown", "no SMART data".to_string())
+        ("unknown", vec![coded_reason("no_smart_data", &[])])
     }
+}
+
+/// One reason as the wire carries it (`NasHealthReason`): a code, and its
+/// parameters in their decimal or wire spelling. Shared with the pool grade
+/// (`pools::score_health`).
+pub fn coded_reason(code: &str, params: &[(&str, String)]) -> NasHealthReason {
+    NasHealthReason {
+        code: code.to_string(),
+        params: params.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+    }
+}
+
+/// One parameter of a reason, for the English sentence. A missing one reads
+/// "?" rather than panicking: the sentence is a tooltip and an alert text,
+/// and a gap in it must not take the inventory pass down.
+pub fn reason_param<'a>(reason: &'a NasHealthReason, key: &str) -> &'a str {
+    reason.params.get(key).map_or("?", String::as_str)
+}
+
+/// The node's English sentence for one disk reason — what
+/// `NasDisk::health_reason` and the disk's health alert carry.
+///
+/// Word for word what `score_health` and `grade_disk_health` wrote before
+/// the codes existed. WHY it must not drift: the alert rows in `nas_alerts`
+/// still store this text (their own codes need a schema change), and an
+/// alert that is refreshed in place — same severity — would otherwise have
+/// its detail reworded by nothing but an upgrade. The screens do not read it
+/// any more; they word the codes themselves.
+pub fn disk_reason_sentence(reason: &NasHealthReason) -> String {
+    let p = |key| reason_param(reason, key);
+    match reason.code.as_str() {
+        "smart_failed" => "SMART overall status FAILED".to_string(),
+        "self_test_failed" => "last self-test failed".to_string(),
+        "pending_sectors" => format!("{} pending sectors", p("count")),
+        "media_errors" => format!("{} media errors", p("count")),
+        "reallocated_growing" => format!(
+            "reallocated sectors growing ({} → {} in 7 days)",
+            p("from"),
+            p("to")
+        ),
+        "reallocated" => format!("{} reallocated sectors", p("count")),
+        "temperature_over_limit" => format!("{}°C (over the {}°C limit)", p("celsius"), p("limit")),
+        "temperature_high" => format!("{}°C", p("celsius")),
+        "crc_errors" => format!("{} UDMA CRC errors (cable/backplane)", p("count")),
+        "wear" => format!("{}% worn", p("pct")),
+        "no_smart_data" => "no SMART data".to_string(),
+        "zfs_faulted" => "ZFS reports this disk FAULTED".to_string(),
+        "zfs_unavail" => "ZFS reports this disk UNAVAIL".to_string(),
+        "reallocated_grew" => format!(
+            "reallocated sectors grew from {} to {} in the last 7 days",
+            p("from"),
+            p("to")
+        ),
+        "unhealthy_for_days" => format!("{} for {} days", p("health"), p("days")),
+        other => other.to_string(),
+    }
+}
+
+/// The whole English sentence of a list of disk reasons, "; "-joined as
+/// `health_reason` always was.
+pub fn disk_reasons_text(reasons: &[NasHealthReason]) -> String {
+    reasons.iter().map(disk_reason_sentence).collect::<Vec<_>>().join("; ")
+}
+
+/// The health a disk shows, in both forms: the codes the screens word and
+/// the English sentence the alert and the tooltip keep.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiskGrade {
+    pub health: String,
+    pub reason: String,
+    pub reasons: Vec<NasHealthReason>,
 }
 
 /// The health the Disks tab shows: SMART's verdict, raised to `critical` when
@@ -1508,27 +1589,50 @@ pub fn score_health(s: &SmartSummary, kind: &str, reallocated_week_ago: Option<i
 /// also complains about says both. No pool name goes into the reason: the
 /// health text is shown to every tenant of the node (`hide_other_org_array`
 /// keeps it), and the membership is already a column of its own.
+///
+/// SMART's sentence and its codes come in apart (`smart_reason`,
+/// `smart_reasons`) because they can disagree for one reason only: after a
+/// restart the codes are re-derived from the stored SMART document, and when
+/// that does not reproduce the stored sentence the codes stay empty rather
+/// than claim something the node did not measure (`live_from_persisted`).
 pub fn grade_disk_health(
     smart_health: &str,
     smart_reason: &str,
+    smart_reasons: &[NasHealthReason],
     leaf_state: Option<&str>,
-) -> (String, String) {
+) -> DiskGrade {
     let pool_verdict = match leaf_state {
-        Some("faulted") => Some("ZFS reports this disk FAULTED"),
-        Some("unavail") => Some("ZFS reports this disk UNAVAIL"),
+        Some("faulted") => Some(coded_reason("zfs_faulted", &[])),
+        Some("unavail") => Some(coded_reason("zfs_unavail", &[])),
         _ => None,
     };
     match pool_verdict {
         Some(verdict) => {
+            let sentence = disk_reason_sentence(&verdict);
             let reason = if smart_reason.is_empty() {
-                verdict.to_string()
+                sentence
             } else {
-                format!("{verdict}; {smart_reason}")
+                format!("{sentence}; {smart_reason}")
             };
-            ("critical".to_string(), reason)
+            let mut reasons = vec![verdict];
+            reasons.extend_from_slice(smart_reasons);
+            DiskGrade { health: "critical".to_string(), reason, reasons }
         }
-        None => (smart_health.to_string(), smart_reason.to_string()),
+        None => DiskGrade {
+            health: smart_health.to_string(),
+            reason: smart_reason.to_string(),
+            reasons: smart_reasons.to_vec(),
+        },
     }
+}
+
+/// Puts a grade on the disk the screens read, and returns the health and the
+/// sentence its alert is written with.
+fn show_grade(disk: &mut NasDisk, grade: DiskGrade) -> (String, String) {
+    disk.health = grade.health.clone();
+    disk.health_reason = grade.reason.clone();
+    disk.health_reasons = grade.reasons;
+    (grade.health, grade.reason)
 }
 
 // ----- proactive replacement (§5.10, research R5) -----------------------------------
@@ -1588,27 +1692,48 @@ pub fn replacement_advice(
     } else {
         "advice"
     };
+    // The English sentence (tooltip, deprecated for display) and the codes
+    // the screens word are built side by side. They differ on purpose in two
+    // places, both in favour of the reader: the codes say "for N days" from
+    // the first whole day (the sentence only from `ADVICE_AFTER_DAYS`, which
+    // an urgent growth does not wait for), and they leave out the disk's own
+    // "reallocated sectors growing" when the growth part already says it.
     let mut reason = Vec::new();
+    let mut reasons = Vec::new();
     if growing {
         let (now, old) = (
             disk.reallocated_sectors.unwrap_or(0),
             reallocated_week_ago.unwrap_or(0),
         );
-        reason.push(format!(
-            "reallocated sectors grew from {old} to {now} in the last 7 days"
-        ));
+        let grew = coded_reason("reallocated_grew", &[("from", old.to_string()), ("to", now.to_string())]);
+        reason.push(disk_reason_sentence(&grew));
+        reasons.push(grew);
     }
-    if long_enough {
-        reason.push(format!("{} for {days} days", disk.health));
+    if days >= 1 {
+        let unhealthy = coded_reason(
+            "unhealthy_for_days",
+            &[("health", disk.health.clone()), ("days", days.to_string())],
+        );
+        if long_enough {
+            reason.push(disk_reason_sentence(&unhealthy));
+        }
+        reasons.push(unhealthy);
     }
     if !disk.health_reason.is_empty() {
         reason.push(disk.health_reason.clone());
     }
+    reasons.extend(
+        disk.health_reasons
+            .iter()
+            .filter(|r| !(growing && r.code == "reallocated_growing"))
+            .cloned(),
+    );
     Some(NasReplacementAdvice {
         disk_id: disk.disk_id.clone(),
         name: disk.name.clone(),
         severity: severity.to_string(),
         reason: reason.join("; "),
+        reasons,
         warning_days: days.min(i64::from(u32::MAX)) as u32,
         reallocated: disk.reallocated_sectors,
         reallocated_week_ago,
@@ -1677,6 +1802,9 @@ struct Live {
     /// after the pool took the disk back.
     smart_health: String,
     smart_reason: String,
+    /// SMART's verdict as codes, beside `smart_reason` (see
+    /// `grade_disk_health` for when the two can disagree).
+    smart_reasons: Vec<NasHealthReason>,
     /// The disk's leaf state in `zpool status`, `None` for no ZFS leaf.
     leaf_state: Option<String>,
     /// Whether this process has written the disk's health alert against its
@@ -1902,6 +2030,15 @@ type InventoryRead = (
     Option<HashMap<String, String>>,
 );
 
+/// The disks of an inventory read that the live state does not hold yet —
+/// the only ones whose persisted health has to be read (`inventory_pass`).
+fn first_seen<'a>(
+    found: &'a [NasDisk],
+    known: &'a std::collections::HashSet<String>,
+) -> impl Iterator<Item = &'a NasDisk> + 'a {
+    found.iter().filter(move |d| !known.contains(&d.disk_id))
+}
+
 /// `refresh_inventory` over an injected read, state and gate, so the
 /// serialisation of passes can be exercised without lsblk or `zpool status`
 /// and without the process-wide state other tests share.
@@ -1944,10 +2081,26 @@ where
     }
     // Health persisted from the previous process lifetime, so a restart does
     // not show every disk as "unknown" until the first SMART pass.
+    //
+    // Read ONLY for a disk this process has not seen yet: a disk already in
+    // the live state keeps its live record (the `Some` arm below) and never
+    // looks at the row. Reading every disk's row and week-old sample on every
+    // pass was two queries per disk on the pass that holds the health gate,
+    // for an answer thrown away. The live set is stable while the gate is
+    // held: only this pass replaces `st.disks`.
+    let known: std::collections::HashSet<String> = cell.read().disks.keys().cloned().collect();
     let mut persisted = HashMap::new();
-    for d in &found {
+    for d in first_seen(&found, &known) {
         if let Some(row) = store::disk_row(db, &d.disk_id)? {
-            persisted.insert(d.disk_id.clone(), row);
+            // The week-old sample re-derives the reason codes from the stored
+            // SMART document (`live_from_persisted`); only a row with a
+            // document has codes to re-derive.
+            let week_ago = if row.smart_json.is_some() {
+                store::attribute_week_ago(db, &d.disk_id, "reallocated").unwrap_or(None)
+            } else {
+                None
+            };
+            persisted.insert(d.disk_id.clone(), (row, week_ago));
         }
     }
     let mut st = cell.write();
@@ -1962,6 +2115,7 @@ where
                 // and I/O from the live record.
                 d.health = old.disk.health.clone();
                 d.health_reason = old.disk.health_reason.clone();
+                d.health_reasons = old.disk.health_reasons.clone();
                 d.temperature_c = old.disk.temperature_c;
                 d.power_on_hours = old.disk.power_on_hours;
                 d.reallocated_sectors = old.disk.reallocated_sectors;
@@ -1980,8 +2134,11 @@ where
                 old
             }
             None => {
-                let row = persisted.get(&d.disk_id);
-                live_from_persisted(d, row)
+                let (row, week_ago) = match persisted.get(&d.disk_id) {
+                    Some((row, week_ago)) => (Some(row), *week_ago),
+                    None => (None, None),
+                };
+                live_from_persisted(d, row, week_ago)
             }
         };
         regrades.extend(regrade_leaf(&mut live, leaf_states.as_ref()));
@@ -2016,7 +2173,21 @@ where
 /// until the first SMART pass. The persisted health is SMART's verdict
 /// (`refresh_smart` stores it before the leaf state is applied), so it seeds
 /// `smart_health` as it is.
-fn live_from_persisted(mut d: NasDisk, row: Option<&store::DiskRow>) -> Live {
+///
+/// The row keeps SMART's sentence but not its codes (`nas_disks` has no
+/// column for them). They are re-derived by grading the stored SMART
+/// document again (`score_health`, with the reallocated sample of a week
+/// ago as the SMART pass reads it) and taken ONLY when that reproduces the
+/// stored grade and sentence exactly. When it does not — the week-old sample
+/// has moved on since, or the row predates the document — the disk shows no
+/// codes until its next SMART read, and a screen falls back to the
+/// translated grade with the stored sentence as its tooltip: an honest gap,
+/// never a reason the node did not measure.
+fn live_from_persisted(
+    mut d: NasDisk,
+    row: Option<&store::DiskRow>,
+    reallocated_week_ago: Option<i64>,
+) -> Live {
     let mut smart = SmartSummary::default();
     if let Some(row) = row {
         d.health = row.health.clone();
@@ -2029,11 +2200,16 @@ fn live_from_persisted(mut d: NasDisk, row: Option<&store::DiskRow>) -> Live {
         {
             smart = summarize_smart(&doc);
             apply_summary(&mut d, &smart);
+            let (health, reasons) = score_health(&smart, &d.kind, reallocated_week_ago);
+            if health == row.health && disk_reasons_text(&reasons) == row.health_reason {
+                d.health_reasons = reasons;
+            }
         }
     }
     Live {
         smart_health: d.health.clone(),
         smart_reason: d.health_reason.clone(),
+        smart_reasons: d.health_reasons.clone(),
         disk: d,
         history: VecDeque::with_capacity(HISTORY_POINTS),
         smart,
@@ -2084,10 +2260,13 @@ fn regrade_leaf(
         return None;
     }
     live.alert_settled = true;
-    let (health, reason) =
-        grade_disk_health(&live.smart_health, &live.smart_reason, leaf.as_deref());
-    live.disk.health = health.clone();
-    live.disk.health_reason = reason.clone();
+    let grade = grade_disk_health(
+        &live.smart_health,
+        &live.smart_reason,
+        &live.smart_reasons,
+        leaf.as_deref(),
+    );
+    let (health, reason) = show_grade(&mut live.disk, grade);
     let prior_leaf = std::mem::replace(&mut live.leaf_state, leaf.clone());
     Some(LeafRegrade {
         disk_id: live.disk.disk_id.clone(),
@@ -2105,13 +2284,13 @@ fn roll_back_leaf(live: &mut Live, regrade: &LeafRegrade) {
     if live.leaf_state != regrade.leaf {
         return;
     }
-    let (health, reason) = grade_disk_health(
+    let grade = grade_disk_health(
         &live.smart_health,
         &live.smart_reason,
+        &live.smart_reasons,
         regrade.prior_leaf.as_deref(),
     );
-    live.disk.health = health;
-    live.disk.health_reason = reason;
+    show_grade(&mut live.disk, grade);
     live.leaf_state = regrade.prior_leaf.clone();
     // Also what makes a first-sight settle (no leaf change to find again)
     // retried: the alert table is not known to match any grade now.
@@ -2225,11 +2404,11 @@ pub async fn refresh_smart(db: &DbPool) -> Result<()> {
             Ok(doc) => {
                 let summary = summarize_smart(&doc);
                 let week_ago = store::attribute_week_ago(db, &id, "reallocated").unwrap_or(None);
-                let (smart_health, smart_reason) = score_health(&summary, &kind, week_ago);
+                let (smart_health, smart_reasons) = score_health(&summary, &kind, week_ago);
                 // Not across an inventory pass: its alert writes and this
                 // one would otherwise land in either order (`health_gate`).
                 let _pass = health_gate().lock().await;
-                settle_smart_read(db, state(), &id, &doc, summary, smart_health, smart_reason);
+                settle_smart_read(db, state(), &id, &doc, summary, smart_health, smart_reasons);
             }
             Err(e) => failures.push(format!("{path}: {e}")),
         }
@@ -2266,11 +2445,13 @@ fn settle_smart_read(
     doc: &Value,
     summary: SmartSummary,
     smart_health: &str,
-    smart_reason: String,
+    smart_reasons: Vec<NasHealthReason>,
 ) {
     // SMART's verdict is what persists: the leaf state is re-read on every
     // inventory pass, and a stored FAULTED would outlive the fault across a
-    // restart.
+    // restart. Its sentence, not its codes: `nas_disks` has no column for
+    // them, and `live_from_persisted` re-derives them from this document.
+    let smart_reason = disk_reasons_text(&smart_reasons);
     if let Err(e) = store::store_smart(db, id, &doc.to_string(), smart_health, &smart_reason) {
         tracing::warn!("tentanas: SMART verdict of disk {id} not stored: {e}");
     }
@@ -2280,7 +2461,7 @@ fn settle_smart_read(
         apply_summary(&mut live.disk, &summary);
         live.disk.smart_read_at = Some(store::now());
         live.smart = summary;
-        apply_smart_verdict(live, smart_health, smart_reason)
+        apply_smart_verdict(live, smart_health, smart_reasons)
     };
     if let Err(e) = write_health_alert(db, id, &health, &reason) {
         tracing::warn!("tentanas: health alert of disk {id} not written, retried next pass: {e}");
@@ -2292,13 +2473,17 @@ fn settle_smart_read(
 
 /// Records SMART's own verdict on a live disk and re-grades it against the
 /// leaf state it already has. Returns the shown health and reason.
-fn apply_smart_verdict(live: &mut Live, smart_health: &str, smart_reason: String) -> (String, String) {
-    let (health, reason) = grade_disk_health(smart_health, &smart_reason, live.leaf_state.as_deref());
+fn apply_smart_verdict(
+    live: &mut Live,
+    smart_health: &str,
+    smart_reasons: Vec<NasHealthReason>,
+) -> (String, String) {
+    let smart_reason = disk_reasons_text(&smart_reasons);
+    let grade = grade_disk_health(smart_health, &smart_reason, &smart_reasons, live.leaf_state.as_deref());
     live.smart_health = smart_health.to_string();
     live.smart_reason = smart_reason;
-    live.disk.health = health.clone();
-    live.disk.health_reason = reason.clone();
-    (health, reason)
+    live.smart_reasons = smart_reasons;
+    show_grade(&mut live.disk, grade)
 }
 
 /// One `smartctl --json=c -x` run. smartctl's exit code is a bitmask; only
@@ -2516,6 +2701,20 @@ pub fn request_smart_refresh() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `score_health` with its reasons as the English sentence the alert and
+    /// the tooltip carry — what every grading test below was written against.
+    fn scored(s: &SmartSummary, kind: &str, week_ago: Option<i64>) -> (&'static str, String) {
+        let (health, reasons) = score_health(s, kind, week_ago);
+        (health, disk_reasons_text(&reasons))
+    }
+
+    /// `grade_disk_health` over a SMART sentence alone, as the tuple the
+    /// grading tests compare.
+    fn graded(smart_health: &str, smart_reason: &str, leaf: Option<&str>) -> (String, String) {
+        let g = grade_disk_health(smart_health, smart_reason, &[], leaf);
+        (g.health, g.reason)
+    }
 
     /// `smartctl --json=c -x /dev/sdb` of a TOSHIBA MG07SCA14TE behind a SAS
     /// expander, copied byte for byte off the node this fix was measured on.
@@ -3445,7 +3644,7 @@ mod tests {
         let reserved = nvme(serde_json::json!([nvme_entry(12), nvme_entry(6)]));
         assert!(reserved.self_test_failed, "a reserved code is not a verdict");
         assert_eq!(
-            score_health(&reserved, "ssd", None),
+            scored(&reserved, "ssd", None),
             ("critical", "last self-test failed".to_string())
         );
 
@@ -3468,7 +3667,7 @@ mod tests {
             nvme_entry(6),
         ]));
         assert!(!cleared.self_test_failed, "the newest verdict is a pass");
-        assert_eq!(score_health(&cleared, "ssd", None).0, "ok");
+        assert_eq!(scored(&cleared, "ssd", None).0, "ok");
 
         // SCSI: the same shape, newest first as numbered top-level keys.
         let scsi_entry = |value: u64| {
@@ -3491,7 +3690,7 @@ mod tests {
             incomplete.self_test_failed,
             "SPC 3 (unknown error, incomplete) is not a verdict"
         );
-        assert_eq!(score_health(&incomplete, "hdd", None).0, "critical");
+        assert_eq!(scored(&incomplete, "hdd", None).0, "critical");
         assert!(scsi(8, 5).self_test_failed, "an SPC reserved code is not a verdict");
         assert!(!scsi(0, 5).self_test_failed, "a pass on top clears it");
     }
@@ -3557,7 +3756,7 @@ mod tests {
         // A controller reset on top of a failed segment: the failure stands.
         let reset = nvme(serde_json::json!([nvme_entry(2), nvme_entry(6)]));
         assert!(reset.self_test_failed, "a controller reset is not a verdict");
-        assert_eq!(score_health(&reset, "ssd", None).0, "critical");
+        assert_eq!(scored(&reset, "ssd", None).0, "critical");
 
         // A sanitize abort on top of it, likewise.
         let sanitize = nvme(serde_json::json!([nvme_entry(9), nvme_entry(6)]));
@@ -3567,7 +3766,7 @@ mod tests {
         // never invents a failure either.
         let clean = nvme(serde_json::json!([nvme_entry(2), nvme_entry(9), nvme_entry(0)]));
         assert!(!clean.self_test_failed, "the newest verdict is still the pass");
-        assert_eq!(score_health(&clean, "ssd", None).0, "ok");
+        assert_eq!(scored(&clean, "ssd", None).0, "ok");
 
         // A fresh PASS above the abort is what clears the failure.
         let retested = nvme(serde_json::json!([
@@ -3655,12 +3854,12 @@ mod tests {
         assert_eq!(s.reallocated, Some(8));
         assert_eq!(s.crc_errors, Some(3));
         assert_eq!(s.temperature_c, Some(41));
-        let (h, reason) = score_health(&s, "hdd", Some(8));
+        let (h, reason) = scored(&s, "hdd", Some(8));
         assert_eq!(h, "warning");
         assert!(reason.contains("8 reallocated"));
         // Growth is still SAID ("growing"), but graded `warning`: the SPEC's
         // sdd, "+3 realokacje w 7 dni", is "Uwaga", not "Awaria".
-        let (h, reason) = score_health(&s, "hdd", Some(2));
+        let (h, reason) = scored(&s, "hdd", Some(2));
         assert_eq!(h, "warning");
         assert!(reason.contains("growing"));
         assert_eq!(smart_attributes(&doc).len(), 3);
@@ -3681,12 +3880,12 @@ mod tests {
             crc_errors: Some(0),
             ..Default::default()
         };
-        let (health, reason) = score_health(&sdd, "hdd", Some(0));
+        let (health, reason) = scored(&sdd, "hdd", Some(0));
         assert_eq!(health, "warning");
         assert_eq!(reason, "reallocated sectors growing (0 → 3 in 7 days)");
         // Unchanged over the week it is still a symptom, just not a moving one.
         assert_eq!(
-            score_health(&sdd, "hdd", Some(3)),
+            scored(&sdd, "hdd", Some(3)),
             ("warning", "3 reallocated sectors".to_string())
         );
     }
@@ -3707,7 +3906,7 @@ mod tests {
             wear_pct: Some(97),
             ..Default::default()
         };
-        let (health, reason) = score_health(&worn, "hdd", Some(10));
+        let (health, reason) = scored(&worn, "hdd", Some(10));
         assert_eq!(health, "warning");
         assert_eq!(
             reason,
@@ -3716,13 +3915,13 @@ mod tests {
         );
         // The same disk once the drive itself says it is failing.
         let failing = SmartSummary { passed: Some(false), self_test_failed: true, ..worn.clone() };
-        let (health, reason) = score_health(&failing, "hdd", Some(10));
+        let (health, reason) = scored(&failing, "hdd", Some(10));
         assert_eq!(health, "critical");
         assert!(reason.starts_with("SMART overall status FAILED; last self-test failed; 2 pending sectors"), "{reason}");
         // Below the warning limits there is nothing to say.
         let calm = SmartSummary { passed: Some(true), temperature_c: Some(49), wear_pct: Some(84), ..Default::default() };
-        assert_eq!(score_health(&calm, "hdd", None), ("ok", String::new()));
-        assert_eq!(score_health(&SmartSummary::default(), "hdd", None).0, "unknown");
+        assert_eq!(scored(&calm, "hdd", None), ("ok", String::new()));
+        assert_eq!(scored(&SmartSummary::default(), "hdd", None).0, "unknown");
     }
 
     /// "Awaria" is a disk its pool reports FAULTED or UNAVAIL — whatever SMART
@@ -3735,11 +3934,11 @@ mod tests {
             ("unavail", "ZFS reports this disk UNAVAIL"),
         ] {
             assert_eq!(
-                grade_disk_health("ok", "", Some(state)),
+                graded("ok", "", Some(state)),
                 ("critical".to_string(), sentence.to_string())
             );
             assert_eq!(
-                grade_disk_health("warning", "3 reallocated sectors", Some(state)),
+                graded("warning", "3 reallocated sectors", Some(state)),
                 ("critical".to_string(), format!("{sentence}; 3 reallocated sectors"))
             );
         }
@@ -3748,7 +3947,7 @@ mod tests {
         // verdict on the hardware.
         for state in [Some("online"), Some("degraded"), Some("offline"), Some("removed"), None] {
             assert_eq!(
-                grade_disk_health("warning", "47°C", state),
+                graded("warning", "47°C", state),
                 ("warning".to_string(), "47°C".to_string()),
                 "{state:?}"
             );
@@ -3756,9 +3955,132 @@ mod tests {
         // And a pool that still reads the disk does not soften SMART's own
         // verdict either.
         assert_eq!(
-            grade_disk_health("critical", "SMART overall status FAILED", Some("online")),
+            graded("critical", "SMART overall status FAILED", Some("online")),
             ("critical".to_string(), "SMART overall status FAILED".to_string())
         );
+    }
+
+    /// The codes and parameters a screen words, as `(code, [(key, value)])`.
+    fn codes(reasons: &[NasHealthReason]) -> Vec<(String, Vec<(String, String)>)> {
+        reasons
+            .iter()
+            .map(|r| (r.code.clone(), r.params.clone().into_iter().collect()))
+            .collect()
+    }
+
+    fn code(c: &str, params: &[(&str, &str)]) -> (String, Vec<(String, String)>) {
+        (c.to_string(), params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    }
+
+    /// Every symptom `score_health` can find reaches the wire as a code with
+    /// its numbers as parameters — in the same order as the sentence, the
+    /// drive's own verdict first — so a screen never has to parse English.
+    #[test]
+    fn every_smart_symptom_travels_as_a_code_with_its_numbers() {
+        let failing = SmartSummary {
+            passed: Some(false),
+            self_test_failed: true,
+            temperature_c: Some(61),
+            reallocated: Some(40),
+            pending: Some(2),
+            media_errors: Some(1),
+            crc_errors: Some(5),
+            wear_pct: Some(97),
+            ..Default::default()
+        };
+        let (health, reasons) = score_health(&failing, "hdd", Some(10));
+        assert_eq!(health, "critical");
+        assert_eq!(
+            codes(&reasons),
+            vec![
+                code("smart_failed", &[]),
+                code("self_test_failed", &[]),
+                code("pending_sectors", &[("count", "2")]),
+                code("media_errors", &[("count", "1")]),
+                code("reallocated_growing", &[("from", "10"), ("to", "40")]),
+                code("temperature_over_limit", &[("celsius", "61"), ("limit", "60")]),
+                code("crc_errors", &[("count", "5")]),
+                code("wear", &[("pct", "97")]),
+            ]
+        );
+        // The reallocated count without growth, and a temperature over the
+        // warning limit only — an SSD, whose limits are 65/75.
+        let warm = SmartSummary { passed: Some(true), temperature_c: Some(70), reallocated: Some(3), ..Default::default() };
+        let (health, reasons) = score_health(&warm, "ssd", Some(3));
+        assert_eq!(health, "warning");
+        assert_eq!(
+            codes(&reasons),
+            vec![code("reallocated", &[("count", "3")]), code("temperature_high", &[("celsius", "70")])]
+        );
+        assert_eq!(disk_reasons_text(&reasons), "3 reallocated sectors; 70°C");
+        // No verdict at all is a code too; a healthy drive has none.
+        let (health, reasons) = score_health(&SmartSummary::default(), "hdd", None);
+        assert_eq!((health, codes(&reasons)), ("unknown", vec![code("no_smart_data", &[])]));
+        assert_eq!(disk_reasons_text(&reasons), "no SMART data");
+        let calm = SmartSummary { passed: Some(true), ..Default::default() };
+        assert!(score_health(&calm, "hdd", None).1.is_empty());
+    }
+
+    /// A pool's verdict leads the codes as it leads the sentence, and SMART's
+    /// codes follow unchanged; no parameter names the pool.
+    #[test]
+    fn a_faulted_or_unavail_leaf_leads_the_codes_and_names_no_pool() {
+        let smart = vec![coded_reason("reallocated", &[("count", "3".to_string())])];
+        for (state, lead) in [("faulted", "zfs_faulted"), ("unavail", "zfs_unavail")] {
+            let g = grade_disk_health("warning", "3 reallocated sectors", &smart, Some(state));
+            assert_eq!(g.health, "critical");
+            assert_eq!(codes(&g.reasons), vec![code(lead, &[]), code("reallocated", &[("count", "3")])]);
+            assert_eq!(g.reason, disk_reasons_text(&g.reasons), "the sentence is the codes' sentence");
+            assert!(g.reasons[0].params.is_empty(), "no pool name rides along");
+        }
+        let g = grade_disk_health("warning", "3 reallocated sectors", &smart, Some("online"));
+        assert_eq!((g.health.as_str(), g.reasons), ("warning", smart));
+    }
+
+    /// A restart has the stored sentence but no stored codes. They come back
+    /// from the stored SMART document only when grading it again says
+    /// exactly what the row says; otherwise the disk carries no codes (the
+    /// screen shows the grade) rather than codes the node did not measure.
+    #[test]
+    fn a_restart_rederives_the_codes_only_when_they_reproduce_the_stored_sentence() {
+        let doc = serde_json::json!({
+            "smart_status": {"passed": true},
+            "temperature": {"current": 41},
+            "ata_smart_attributes": {"table": [
+                {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100, "thresh": 10, "when_failed": "", "raw": {"value": 8, "string": "8"}},
+                {"id": 199, "name": "UDMA_CRC_Error_Count", "value": 200, "worst": 200, "thresh": 0, "when_failed": "", "raw": {"value": 3, "string": "3"}}
+            ]}
+        });
+        let row = store::DiskRow {
+            disk_id: "wwn-leaf".to_string(),
+            first_seen_at: "2026-09-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-09-22T00:00:00Z".to_string(),
+            smart_json: Some(doc.to_string()),
+            smart_read_at: Some("2026-09-22T00:00:00Z".to_string()),
+            health: "warning".to_string(),
+            health_reason: "8 reallocated sectors; 3 UDMA CRC errors (cable/backplane)".to_string(),
+        };
+        let disk = || NasDisk { disk_id: "wwn-leaf".to_string(), name: "sde".to_string(), ..used_disk() };
+
+        let live = live_from_persisted(disk(), Some(&row), Some(8));
+        assert_eq!(
+            codes(&live.disk.health_reasons),
+            vec![code("reallocated", &[("count", "8")]), code("crc_errors", &[("count", "3")])]
+        );
+        assert_eq!(live.smart_reasons, live.disk.health_reasons, "SMART's codes are kept for the regrade");
+
+        // The week-old sample moved on since the row was written: grading the
+        // document again would say "growing", which the row does not.
+        let moved = live_from_persisted(disk(), Some(&row), Some(2));
+        assert!(moved.disk.health_reasons.is_empty(), "{:?}", moved.disk.health_reasons);
+        assert_eq!(moved.disk.health_reason, row.health_reason, "the stored sentence stays the tooltip");
+        assert_eq!(moved.disk.health, "warning");
+
+        // And a FAULTED regrade on top of no codes still leads with its own.
+        let mut moved = moved;
+        let regrade = regrade_leaf(&mut moved, Some(&leaves("faulted"))).expect("a change");
+        assert_eq!(regrade.reason, format!("ZFS reports this disk FAULTED; {}", row.health_reason));
+        assert_eq!(codes(&moved.disk.health_reasons), vec![code("zfs_faulted", &[])]);
     }
 
     // ----- regrading by the ZFS leaf state -----------------------------------------
@@ -3776,7 +4098,7 @@ mod tests {
             health: smart_health.to_string(),
             health_reason: smart_reason.to_string(),
         };
-        live_from_persisted(disk, Some(&row))
+        live_from_persisted(disk, Some(&row), None)
     }
 
     fn leaves(state: &str) -> HashMap<String, String> {
@@ -3826,7 +4148,7 @@ mod tests {
 
         // SMART now finds nothing wrong; the pool still does not read the disk.
         let previous = live.disk.health.clone();
-        let (health, reason) = apply_smart_verdict(&mut live, "ok", String::new());
+        let (health, reason) = apply_smart_verdict(&mut live, "ok", Vec::new());
         assert_eq!((previous.as_str(), health.as_str()), ("critical", "critical"));
         assert_eq!(reason, "ZFS reports this disk FAULTED");
 
@@ -4004,7 +4326,7 @@ mod tests {
             &serde_json::json!({}),
             SmartSummary::default(),
             "critical",
-            "8 reallocated sectors".to_string(),
+            vec![coded_reason("reallocated", &[("count", "8".to_string())])],
         );
 
         let all = store::alerts_for_subject(&db, "disk", "wwn-leaf").unwrap();
@@ -4040,7 +4362,7 @@ mod tests {
                 &serde_json::json!({}),
                 SmartSummary::default(),
                 "critical",
-                "SMART overall status FAILED".to_string(),
+                vec![coded_reason("smart_failed", &[])],
             );
         }
         for live in cell.read().disks.values() {
@@ -4146,6 +4468,59 @@ mod tests {
         assert_eq!(all.len(), 1, "the first pass's alert, raised once and resolved: {all:?}");
     }
 
+    /// The critic's MINOR 4: every pass read every disk's persisted row and
+    /// its week-old sample, under the health gate, and threw both away for
+    /// any disk already live. Proven through the real pass: once the row can
+    /// no longer be read at all, a pass over a disk it already holds still
+    /// succeeds, and a pass that meets a NEW disk fails on that very read —
+    /// so the first half is not passing because the read was never broken.
+    #[tokio::test]
+    async fn an_inventory_pass_reads_the_persisted_health_only_of_a_disk_it_has_not_seen() {
+        let db = leaf_db(true);
+        let cell = RwLock::new(State::new());
+        let gate = tokio::sync::Mutex::new(());
+        let disk = NasDisk { disk_id: "wwn-leaf".to_string(), name: "sde".to_string(), ..used_disk() };
+        let seen = |d: &NasDisk| {
+            store::upsert_disk_seen(
+                &db,
+                &DiskIdentity {
+                    disk_id: &d.disk_id,
+                    name: &d.name,
+                    model: &d.model,
+                    serial: &d.serial,
+                    wwn: d.wwn.as_deref(),
+                    size_bytes: d.size_bytes,
+                    kind: &d.kind,
+                },
+            )
+            .unwrap()
+        };
+        seen(&disk);
+        store::store_smart(&db, "wwn-leaf", "{}", "warning", "8 reallocated sectors").unwrap();
+        let reading = |disks: Vec<NasDisk>| {
+            move || async move { Ok::<InventoryRead, anyhow::Error>((disks, HashMap::new(), None)) }
+        };
+
+        inventory_pass(&db, &cell, &gate, reading(vec![disk.clone()])).await.unwrap();
+        assert_eq!(cell.read().disks["wwn-leaf"].disk.health, "warning", "seeded from the persisted row");
+
+        db.write()
+            .unwrap()
+            .execute_batch("ALTER TABLE nas_disks RENAME COLUMN health_reason TO health_reason_gone")
+            .unwrap();
+        inventory_pass(&db, &cell, &gate, reading(vec![disk.clone()]))
+            .await
+            .expect("a disk already live is not looked up again");
+        assert_eq!(cell.read().disks["wwn-leaf"].disk.health, "warning", "the live record is kept");
+
+        let fresh = NasDisk { disk_id: "wwn-new".to_string(), name: "sdf".to_string(), ..used_disk() };
+        seen(&fresh);
+        assert!(
+            inventory_pass(&db, &cell, &gate, reading(vec![disk, fresh])).await.is_err(),
+            "a disk first seen IS looked up, and the broken read says so"
+        );
+    }
+
     #[test]
     fn smart_summary_for_nvme() {
         let doc: Value = serde_json::json!({
@@ -4160,7 +4535,7 @@ mod tests {
         let s = summarize_smart(&doc);
         assert_eq!(s.wear_pct, Some(3));
         assert_eq!(s.power_on_hours, Some(900));
-        assert_eq!(score_health(&s, "nvme", None).0, "ok");
+        assert_eq!(scored(&s, "nvme", None).0, "ok");
         let attrs = smart_attributes(&doc);
         assert!(attrs.iter().any(|a| a.name == "Unsafe Shutdowns" && a.status == "warning"));
     }
@@ -4195,7 +4570,7 @@ mod tests {
         assert!(doc.pointer("/scsi_error_counter_log/verify").is_none());
         assert_eq!(s.media_errors, Some(0));
         // Every counter clean, so the disk the node called "unknown" is "ok".
-        assert_eq!(score_health(&s, "hdd", None), ("ok", String::new()));
+        assert_eq!(scored(&s, "hdd", None), ("ok", String::new()));
 
         // SCSI keeps its self-test log in numbered keys, not a table.
         let tests = smart_self_tests(&doc);
@@ -4230,7 +4605,7 @@ mod tests {
             "verify": {"total_uncorrected_errors": 4},
         }));
         assert_eq!(s.media_errors, Some(9));
-        assert_eq!(score_health(&s, "hdd", None), ("warning", "9 media errors".to_string()));
+        assert_eq!(scored(&s, "hdd", None), ("warning", "9 media errors".to_string()));
 
         // `verify` absent — the shape of every disk in the fleet.
         let s = counted(serde_json::json!({
@@ -4238,7 +4613,7 @@ mod tests {
             "write": {"total_uncorrected_errors": 0},
         }));
         assert_eq!(s.media_errors, Some(0));
-        assert_eq!(score_health(&s, "hdd", None).0, "ok");
+        assert_eq!(scored(&s, "hdd", None).0, "ok");
 
         // A log with corrected errors but no uncorrected counter at all is not
         // evidence of zero: "not reported" must stay None, or the UI would show
@@ -4319,7 +4694,7 @@ mod tests {
 
         let failed = doc(entry(5, "Failed in first segment"), entry(0, "Completed"));
         assert!(failed.self_test_failed);
-        assert_eq!(score_health(&failed, "hdd", None).0, "critical");
+        assert_eq!(scored(&failed, "hdd", None).0, "critical");
 
         // A test still running does not hide the verdict underneath it.
         let running = doc(
@@ -4331,7 +4706,7 @@ mod tests {
         // A clean newest entry clears it — the last verdict is the one that counts.
         let passed = doc(entry(0, "Completed"), entry(5, "Failed in first segment"));
         assert!(!passed.self_test_failed);
-        assert_eq!(score_health(&passed, "hdd", None).0, "ok");
+        assert_eq!(scored(&passed, "hdd", None).0, "ok");
 
         // An incomplete test (SPC 3) is not a disk fault.
         let incomplete = doc(entry(3, "Unknown error, incomplete"), entry(0, "Completed"));
@@ -4495,6 +4870,43 @@ mod tests {
         critical.health_reason = "2 pending sectors".to_string();
         let advice = replacement_advice(&critical, Some(&since), Some(8), false).expect("advice");
         assert_eq!(advice.severity, "urgent");
+    }
+
+    /// The advice travels as codes too: the growth, then the days the disk
+    /// has been unhealthy — from the first whole day, which the English
+    /// sentence only says from `ADVICE_AFTER_DAYS` — then the disk's own
+    /// codes, without its "growing" when the growth part already says it.
+    #[test]
+    fn replacement_advice_carries_codes_without_repeating_the_growth() {
+        let (mut disk, since) = warned(1, Some(11));
+        disk.health_reasons = vec![
+            coded_reason("reallocated_growing", &[("from", "8".to_string()), ("to", "11".to_string())]),
+            coded_reason("temperature_high", &[("celsius", "54".to_string())]),
+        ];
+        let advice = replacement_advice(&disk, Some(&since), Some(8), false).expect("advice");
+        assert_eq!(advice.severity, "urgent");
+        assert_eq!(
+            codes(&advice.reasons),
+            vec![
+                code("reallocated_grew", &[("from", "8"), ("to", "11")]),
+                code("unhealthy_for_days", &[("days", "1"), ("health", "warning")]),
+                code("temperature_high", &[("celsius", "54")]),
+            ]
+        );
+        assert!(!advice.reason.contains("for 1 days"), "the sentence keeps its own threshold: {}", advice.reason);
+
+        // Old enough, not growing: the disk's codes follow the days whole.
+        let (mut disk, since) = warned(3, Some(8));
+        disk.health_reasons = vec![coded_reason("reallocated", &[("count", "8".to_string())])];
+        let advice = replacement_advice(&disk, Some(&since), Some(8), false).expect("advice");
+        assert_eq!(
+            codes(&advice.reasons),
+            vec![
+                code("unhealthy_for_days", &[("days", "3"), ("health", "warning")]),
+                code("reallocated", &[("count", "8")]),
+            ]
+        );
+        assert_eq!(advice.reason, "warning for 3 days; 8 reallocated sectors");
     }
 
     /// The whole list against a real database: the trigger reads the disk's

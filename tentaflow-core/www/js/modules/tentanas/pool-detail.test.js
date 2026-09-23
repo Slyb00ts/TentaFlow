@@ -476,7 +476,11 @@ test('a disk SMART warns about shows the warning tone inside an ONLINE leaf, and
   let leafState = 'online';
   const screen = liveScreen(
     { pool: () => ({ vdevs: [{ id: 'mirror-0', role: 'data', kind: 'mirror', state: 'online', faultTolerance: 1, disks: [disk('sda', { state: leafState }), disk('sdb')] }] }) },
-    { disks: () => [disk('sda', { role: 'member', health, healthReason: health === 'ok' ? '' : '8 reallocated sectors; 54°C', temperatureC: 47 }), disk('sdb', { role: 'member' })] },
+    { disks: () => [disk('sda', {
+      role: 'member', health, temperatureC: 47,
+      healthReason: health === 'ok' ? '' : '8 reallocated sectors; 54°C',
+      healthReasons: health === 'ok' ? [] : [{ code: 'reallocated', params: { count: '8' } }, { code: 'temperature_high', params: { celsius: '54' } }],
+    }), disk('sdb', { role: 'member' })] },
   );
   const body = mount();
   await drawPoolDetail(screen, body);
@@ -494,9 +498,10 @@ test('a disk SMART warns about shows the warning tone inside an ONLINE leaf, and
   const chip = cell().querySelector('.dc-name tf-chip');
   assert.equal(chip.getAttribute('status'), 'warn', 'a status tf-chip accepts (its allowlist has no "warning")');
   assert.ok(chip.querySelector('.tf-chip.warn'), 'and the component really renders it as warn, not the neutral fallback');
-  // M5: the chip shows the translated health grade, never the server's raw
-  // English SMART text — that goes in `title=` only, for support.
-  assert.equal(chip.getAttribute('label'), 'Uwaga', 'the chip names the health grade, not raw SMART text');
+  // M5 / backlog M1: the chip shows the translated grade and the first
+  // reason worded from its code, like the n03/n04 chips — never the server's
+  // English SMART text, which goes in `title=` only, for support.
+  assert.equal(chip.getAttribute('label'), 'Uwaga: 8 realok.', 'the chip names the grade and the reason in the reader\'s language');
   assert.equal(chip.getAttribute('title'), '8 reallocated sectors; 54°C', 'the server reason lives in the title only');
   assert.ok(cell().classList.contains('warn'));
   assert.match(stateTile().getAttribute('delta'), /1 ostrzeżenie dysku/, 'the KPI counts the SMART warning (n06:188)');

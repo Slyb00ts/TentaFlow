@@ -230,7 +230,6 @@ test('the forwarding dialog sends both targets and reports what the node refused
 
   typeInto(dialog.querySelector('#nas-forward-syslog'), 'siem.local:514');
   typeInto(dialog.querySelector('#nas-forward-webhook'), 'https://siem.local/hooks/tentanas');
-  dialog.querySelector('#nas-forward-include').checked = true;
   confirmWindow(dialog);
   await flush();
   await flush();
@@ -238,11 +237,81 @@ test('the forwarding dialog sends both targets and reports what the node refused
     enabled: true,
     syslogTarget: 'siem.local:514',
     webhookUrl: 'https://siem.local/hooks/tentanas',
-    includeAccess: true,
+    includeAccess: false,
   });
   // The saved answer repaints the card without a second request.
   assert.match(body.querySelector('#nas-access-state').textContent, /Przekazywanie włączone: siem\.local:514, https:\/\/siem\.local\/hooks\/tentanas \(w kolejce: 3\)/);
   screen.dispose();
+});
+
+// The node forwards no access line at all (tentanas/forward.rs): each one
+// belongs to an organisation, and the target is one setting for the whole
+// node. The switch that used to ask for them must say so and must not move.
+async function openForwarding(stored) {
+  let sent = null;
+  const screen = fakeScreen({
+    tentaNasAccessLogRequest: answer({ forward: { ...answer().forward, ...stored } }),
+    tentaNasAlertForwardSetRequest: (p) => { sent = p; return answer(); },
+  });
+  const body = mount();
+  const view = wireAccessLog(screen, body);
+  await view.refresh();
+  await flush();
+  click(body.querySelector('#nas-access-card [data-act="forward"]'));
+  await flush();
+  return { screen, dialog: latestWindow(), sentPayload: () => sent };
+}
+
+test('the access-log forwarding switch cannot be turned on and says why', async () => {
+  const { screen, dialog } = await openForwarding({});
+  try {
+    const toggle = dialog.querySelector('#nas-forward-include');
+    assert.ok(toggle.hasAttribute('disabled'), 'the switch is disabled');
+    assert.equal(toggle.checked, false, 'and off');
+    const inner = toggle.querySelector('.tf-toggle');
+    assert.equal(inner.getAttribute('aria-disabled'), 'true');
+    click(inner);
+    inner.dispatchEvent(new window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+    inner.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    await flush();
+    assert.equal(toggle.checked, false, 'a click or a key does not turn it on');
+    const why = dialog.querySelector('#nas-forward-include-why').textContent;
+    assert.match(why, /należą do jednej organizacji/, 'the reason: the lines are one organisation\'s');
+    assert.match(why, /wspólny dla całego noda/, 'and the target is the whole node\'s');
+    assert.match(why, /nie są jeszcze zbudowane/, 'and per-organisation targets do not exist yet');
+    assert.doesNotMatch(why, /zostaje zachowany/, 'nothing stored, nothing to keep');
+    assert.doesNotMatch(dialog.textContent, /wpisy dziennika dostępu\)/, 'the explanation no longer promises the log');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('a stored "forward the access log" survives a save and is named as kept', async () => {
+  const { screen, dialog, sentPayload } = await openForwarding({ enabled: true, syslogTarget: 'siem.local:514', includeAccess: true });
+  try {
+    const toggle = dialog.querySelector('#nas-forward-include');
+    assert.equal(toggle.checked, false, 'a stored "on" is not shown as working');
+    assert.match(dialog.querySelector('#nas-forward-include-why').textContent, /Zapisany wybór „włączone” zostaje zachowany, ale nic nie jest wysyłane/);
+    // Even a switch forced on by script does not reach the node: the save
+    // sends what the node holds.
+    toggle.checked = true;
+    confirmWindow(dialog);
+    await flush();
+    await flush();
+    assert.equal(sentPayload().includeAccess, true, 'the stored choice is sent back untouched');
+  } finally {
+    screen.dispose();
+  }
+  const { screen: screen2, dialog: dialog2, sentPayload: sent2 } = await openForwarding({ includeAccess: false });
+  try {
+    dialog2.querySelector('#nas-forward-include').checked = true;
+    confirmWindow(dialog2);
+    await flush();
+    await flush();
+    assert.equal(sent2().includeAccess, false, 'a stored "off" cannot be turned on through the switch');
+  } finally {
+    screen2.dispose();
+  }
 });
 
 test('a viewer sees the log but not the forwarding button', async () => {

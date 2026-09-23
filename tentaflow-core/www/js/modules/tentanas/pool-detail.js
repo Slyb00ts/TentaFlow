@@ -11,7 +11,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
   fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
-  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE,
+  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel,
 } from '/js/modules/tentanas/format.js';
 import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass } from '/js/modules/tentanas/dom-patch.js';
@@ -452,13 +452,14 @@ export function diskCondition(d, inv) {
   if (smart && TONE_RANK[smart] > TONE_RANK[tone]) tone = smart;
   if (errs && tone === 'ok') tone = 'warn';
   // The chip names the WHY: a leaf that is not online says its zpool state;
-  // otherwise it names the SMART health grade (M5) — the server's reason text
-  // is English free text ("8 reallocated sectors"), so it goes in `title=`
-  // only, never on the chip itself.
+  // otherwise the disk's grade and first reason, worded from its codes
+  // exactly like the n03/n04 chips (`diskHealthChipLabel`). The node's
+  // English sentence goes in `title=` only, never on the chip itself.
   let chip = null;
   if (d.state !== 'online') chip = { status: leaf, label: stateLabel(d.state) };
   else if (smart === 'warn' || smart === 'err') {
-    chip = { status: smart, label: T('health.' + inv.health), title: inv.healthReason || null };
+    const worded = diskHealthChipLabel(inv);
+    chip = { status: smart, label: worded.label, title: worded.title };
   }
   return { tone, errs, chip };
 }

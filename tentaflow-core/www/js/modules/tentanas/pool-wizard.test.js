@@ -305,18 +305,18 @@ test('a cancelled sudo prompt leaves the summary step armed and sends nothing', 
   screen.dispose();
 });
 
-// critic-round2-wave2-iter2 MINOR 3: a critical free disk's reason is the
-// node's English (`score_health`). The Elastic parity and cache pickers
-// printed it as the cell's visible text; it now goes through the shared
-// `localizedReason` (format.js) and the sentence is only the cell's tooltip.
+// critic-round2-wave2-iter2 MINOR 3, and backlog M1: a critical free disk's
+// reason reaches the Elastic parity and cache pickers worded from the node's
+// codes (`diskReasonsText`, format.js); the node's English sentence is only
+// the cell's tooltip.
 test('the Elastic parity and cache pickers name a critical disk\'s reason in the reader\'s language', async () => {
   const GB = 1024 ** 3;
   const elastic = [
     disk('sda', { sizeBytes: 64 * GB }),
     disk('sdb', { sizeBytes: 64 * GB }),
-    disk('sdc', { sizeBytes: 64 * GB, health: 'critical', healthReason: 'SMART overall status FAILED; 2 pending sectors' }),
-    disk('sde', { sizeBytes: 64 * GB, health: 'critical', healthReason: 'spindle motor stalled' }),
-    disk('nvme0n1', { kind: 'nvme', sizeBytes: 64 * GB, health: 'critical', healthReason: 'last self-test failed' }),
+    disk('sdc', { sizeBytes: 64 * GB, health: 'critical', healthReason: 'SMART overall status FAILED; 2 pending sectors', healthReasons: [{ code: 'smart_failed', params: {} }, { code: 'pending_sectors', params: { count: '2' } }] }),
+    disk('sde', { sizeBytes: 64 * GB, health: 'critical', healthReason: 'spindle motor stalled', healthReasons: [{ code: 'spindle_stall', params: {} }] }),
+    disk('nvme0n1', { kind: 'nvme', sizeBytes: 64 * GB, health: 'critical', healthReason: 'last self-test failed', healthReasons: [{ code: 'self_test_failed', params: {} }] }),
   ];
   const screen = fakeScreen({ tentaNasElasticCapabilitiesRequest: { capabilities: { mergerfs: true, snapraid: true, filesystems: ['xfs'], detail: '' }, freeDisks: elastic } });
   screen.nodeId = 'node-orion';
@@ -339,7 +339,7 @@ test('the Elastic parity and cache pickers name a critical disk\'s reason in the
     assert.match(sub('parity', 'sdc'), / · SMART: awaria; 2 oczek\. sekt\.$/);
     assert.equal(cell('parity', 'sdc').getAttribute('title'), 'SMART overall status FAILED; 2 pending sectors', 'the node\'s sentence is the tooltip');
     assert.ok(cell('parity', 'sdc').querySelector('tf-checkbox').hasAttribute('disabled'), 'a critical disk stays unpickable');
-    assert.match(sub('parity', 'sde'), / · Awaria$/, 'a sentence this build cannot name falls back to the grade');
+    assert.match(sub('parity', 'sde'), / · Awaria$/, 'a code this build cannot word falls back to the grade');
     assert.equal(cell('parity', 'sde').getAttribute('title'), 'spindle motor stalled');
     assert.ok(!/SMART overall|pending sectors|spindle/.test(win.querySelector('#nas-pw-parity').textContent), 'no English reason is visible text');
 

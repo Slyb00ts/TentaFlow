@@ -2154,7 +2154,10 @@ fn share_view(
 
 async fn shares_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let rows = store::list_shares(&g.db).map_err(|e| internal("shares", e))?;
+    // The asking organisation's shares and accounts only (migration 20): the
+    // node's database holds every tenant's, and this list names them, their
+    // paths and who may reach them.
+    let rows = store::list_shares_of_org(&g.db, &g.org_id).map_err(|e| internal("shares", e))?;
     let counts = tentanas::shares::session_counts(&g.db, &rows).await;
     let shares = rows
         .iter()
@@ -2163,15 +2166,48 @@ async fn shares_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError>
     Ok(tn(P::SharesListResponse {
         shares,
         services: tentanas::shares::services(&g.db).await,
-        users: store::list_share_users(&g.db).map_err(|e| internal("share users", e))?,
+        users: store::list_share_users(&g.db, &g.org_id).map_err(|e| internal("share users", e))?,
         mount_root: tentanas::shares::MOUNT_ROOT.to_string(),
     }))
 }
 
+/// One share of the ASKING organisation. Another organisation's share gets
+/// the answer an id that does not exist gets — every read, edit, delete and
+/// mount refresh goes through here, so none of them can confirm it exists.
 fn share_row(g: &Gate, share_id: &str) -> Result<store::ShareRow, ProtocolError> {
-    store::share(&g.db, share_id)
+    store::share(&g.db, &g.org_id, share_id)
         .map_err(|e| internal("shares", e))?
         .ok_or_else(|| ProtocolError::not_found("share not found on this node"))
+}
+
+/// Every account an SMB share is about to GRANT must be a share account of
+/// the asking organisation. A grant to another tenant's account would let
+/// that tenant's user into this share, and the refusal is the same sentence
+/// for an account that is someone else's and one that does not exist, so it
+/// confirms nothing. `already` are the grants the row carries now: a grant
+/// that is only being KEPT is not re-judged — a legacy grant (migration 20
+/// gives an account shared by two organisations to the default one) must not
+/// make every later edit of the share fail.
+fn require_own_grantees(
+    g: &Gate,
+    smb: &Option<tentaflow_protocol::tentanas::NasSmbOptions>,
+    already: &[tentaflow_protocol::tentanas::NasShareAccess],
+) -> Result<(), ProtocolError> {
+    let Some(smb) = smb else {
+        return Ok(());
+    };
+    for grant in &smb.users {
+        if already.iter().any(|kept| kept.user == grant.user) {
+            continue;
+        }
+        if !store::share_user_exists(&g.db, &g.org_id, &grant.user).map_err(|e| internal("share users", e))? {
+            return Err(ProtocolError::bad_request(format!(
+                "'{}' is not a share user of this organisation",
+                grant.user
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn share_get(ctx: &HandlerContext, share_id: &str) -> Result<MessageBody, ProtocolError> {
@@ -2185,6 +2221,12 @@ async fn share_get(ctx: &HandlerContext, share_id: &str) -> Result<MessageBody, 
 /// Spawns the job that rewrites both service configs and republishes the
 /// fleet's desired state. Every share mutation ends here, so the generated
 /// files always describe the whole node rather than the last change.
+///
+/// The job is the ASKING organisation's (`spawn_owned`, migration 20): its
+/// subject is that tenant's share. Its log comes from a NODE-WIDE apply,
+/// which speaks about every tenant's shares, so the lines naming another
+/// organisation's share are dropped before they are written
+/// (`shares::scope_log`).
 fn spawn_apply_job(
     ctx: &HandlerContext,
     g: &Gate,
@@ -2195,17 +2237,31 @@ fn spawn_apply_job(
     let explicit = secret.map(token);
     let main_db = ctx.state.db.clone();
     let addon_id = g.addon_id.clone();
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, None, move |h| async move {
+    let org_id = g.org_id.clone();
+    let job = tentanas::jobs::spawn_owned(&g.db, kind, subject, &g.user_id, Some(g.org_id.as_str()), None, None, move |h| async move {
         let db = h.db().clone();
-        for line in tentanas::shares::apply(&db, &main_db, &addon_id, explicit.as_deref(), tentanas::shares::ApplyTrigger::Change).await? {
-            h.log(line);
-        }
+        let lines = tentanas::shares::apply(&db, &main_db, &addon_id, explicit.as_deref(), tentanas::shares::ApplyTrigger::Change).await?;
+        log_scoped_share_lines(&h, &db, &org_id, lines);
         drop(explicit);
         h.progress(100);
         Ok(())
     })
     .map_err(|e| internal("job", e))?;
     Ok(job_response(ctx, job))
+}
+
+/// Writes the lines of a node-wide share apply that `org_id` may read. When
+/// the owners cannot be read, NO line is written: an unscoped log is exactly
+/// what this exists to prevent.
+fn log_scoped_share_lines(h: &tentanas::jobs::JobHandle, db: &DbPool, org_id: &str, lines: Vec<String>) {
+    match tentanas::shares::foreign_share_markers(db, org_id) {
+        Ok(markers) => {
+            for line in tentanas::shares::scope_log(lines, &markers) {
+                h.log(line);
+            }
+        }
+        Err(e) => h.log(format!("the apply log is withheld: the share owners could not be read ({e})")),
+    }
 }
 
 /// The two transport gates of a share, read from the CACHED environment the
@@ -2242,6 +2298,10 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let (rdma_ok, smb_direct_ok) = transport_gates(&g).await;
     tentanas::shares::validate_options(protocol, smb, nfs, rdma_ok, smb_direct_ok)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    require_own_grantees(&g, smb, &[])?;
+    // Node-wide on purpose: an SMB section and an export are named on the
+    // NODE, so the name is taken whoever took it. The sentence names only
+    // what the caller typed, never whose share holds it.
     if store::share_by_name(&g.db, name)
         .map_err(|e| internal("shares", e))?
         .is_some()
@@ -2255,9 +2315,14 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
         .map_err(|e| broker_error("datasets", e))?;
     // Only the caller's own arrays can be a share's source. The node holds
     // every tenant's arrays; resolving against all of them let one
-    // organisation publish another's union over SMB or NFS.
-    let arrays = store::elastic_arrays(&g.db, &elastic_owner(&g)).map_err(|e| internal("elastic arrays", e))?;
-    let source = tentanas::shares::resolve_source(&datasets, &arrays, source_path)
+    // organisation publish another's union over SMB or NFS. The OTHER
+    // tenants' unions are refused outright as well: on a node whose pool is
+    // mounted at `/mnt`, such a union was otherwise accepted as a directory
+    // of that pool.
+    let owner = elastic_owner(&g);
+    let arrays = store::elastic_arrays(&g.db, &owner).map_err(|e| internal("elastic arrays", e))?;
+    let foreign = tentanas::shares::foreign_unions(&g.db, &owner).map_err(|e| internal("elastic arrays", e))?;
+    let source = tentanas::shares::resolve_source(&datasets, &arrays, &foreign, source_path)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let now = store::now();
     let row = store::ShareRow {
@@ -2277,7 +2342,9 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
         created_at: now.clone(),
         updated_at: now,
     };
-    store::upsert_share(&g.db, &row).map_err(|e| internal("shares", e))?;
+    // Stamped with the creating organisation — the only one that will ever
+    // see or manage it (owner decision 2026-09-22).
+    store::upsert_share(&g.db, &g.org_id, &row).map_err(|e| internal("shares", e))?;
     spawn_apply_job(ctx, &g, "share_create", name, sudo_password.as_ref())
 }
 
@@ -2304,13 +2371,15 @@ async fn share_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let smb_direct_ok = row.smb.as_ref().is_some_and(|s| s.smb_direct) || smb_direct_probed;
     tentanas::shares::validate_options(&row.protocol, smb, nfs, rdma_ok, smb_direct_ok)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let kept = row.smb.as_ref().map(|o| o.users.clone()).unwrap_or_default();
+    require_own_grantees(&g, smb, &kept)?;
     row.smb = smb.clone();
     row.nfs = nfs.clone();
     row.fleet_mount = *fleet_mount;
     row.enabled = *enabled;
     row.updated_at = store::now();
     let name = row.name.clone();
-    store::upsert_share(&g.db, &row).map_err(|e| internal("shares", e))?;
+    store::upsert_share(&g.db, &g.org_id, &row).map_err(|e| internal("shares", e))?;
     spawn_apply_job(ctx, &g, "share_update", &name, sudo_password.as_ref())
 }
 
@@ -2347,7 +2416,9 @@ async fn share_delete(
             },
         );
     }
-    store::delete_share(&g.db, share_id).map_err(|e| internal("shares", e))?;
+    if !store::delete_share(&g.db, &g.org_id, share_id).map_err(|e| internal("shares", e))? {
+        return Err(ProtocolError::not_found("share not found on this node"));
+    }
     // The desired-state row goes now, not when the job finishes: every other
     // node reconciles off it and must stop mounting a share that is gone.
     tentanas::fleet_mounts::purge_share(&ctx.state.db, &g.addon_id, share_id);
@@ -2378,7 +2449,7 @@ async fn share_mounts_refresh(
 
 fn share_users_response(g: &Gate) -> Result<MessageBody, ProtocolError> {
     Ok(tn(P::ShareUsersListResponse {
-        users: store::list_share_users(&g.db).map_err(|e| internal("share users", e))?,
+        users: store::list_share_users(&g.db, &g.org_id).map_err(|e| internal("share users", e))?,
     }))
 }
 
@@ -2398,7 +2469,21 @@ async fn share_user_set(
     let g = gate_shares(ctx)?;
     tentanas_helper::validate_share_user(name)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    let known = store::share_user_exists(&g.db, name).map_err(|e| internal("share users", e))?;
+    // A share account is a node account (Samba's passdb maps it to a POSIX
+    // user), so its NAME is one namespace for every organisation. An account
+    // another organisation owns is refused HERE, before any password reaches
+    // `smbpasswd`: setting it would hand this tenant the other tenant's login
+    // — and with it every share that grants it. That the name is taken is
+    // the one thing the refusal has to say; it names nobody.
+    let known = match store::share_user_owner(&g.db, name).map_err(|e| internal("share users", e))? {
+        None => false,
+        Some(owner) if !owner.is_empty() && owner == g.org_id => true,
+        Some(_) => {
+            return Err(ProtocolError::bad_request(
+                "this account name is already in use on this node — choose another",
+            ))
+        }
+    };
     if let Some(password) = password {
         if password.0.is_empty() {
             return Err(ProtocolError::bad_request("the password may not be empty"));
@@ -2445,7 +2530,7 @@ async fn share_user_set(
             "a new share user needs a password",
         ));
     }
-    store::upsert_share_user(&g.db, name, description).map_err(|e| internal("share users", e))?;
+    store::upsert_share_user(&g.db, &g.org_id, name, description).map_err(|e| internal("share users", e))?;
     share_users_response(&g)
 }
 
@@ -2455,8 +2540,18 @@ async fn share_user_delete(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_shares(ctx)?;
-    if !store::share_user_exists(&g.db, name).map_err(|e| internal("share users", e))? {
+    // Another organisation's account answers like a missing one, and is
+    // refused before either password database is touched.
+    if !store::share_user_exists(&g.db, &g.org_id, name).map_err(|e| internal("share users", e))? {
         return Err(ProtocolError::not_found("share user not found on this node"));
+    }
+    // A legacy account (migration 20 gave one granted in two organisations to
+    // the default one) that a share of ANOTHER organisation still grants is
+    // one node account serving that organisation's users: removing it would
+    // cut them off their own share. Refused BEFORE either password database
+    // is touched, and without naming the share or its organisation.
+    if store::share_user_granted_elsewhere(&g.db, &g.org_id, name).map_err(|e| internal("share users", e))? {
+        return Err(ProtocolError::bad_request(store::SHARE_USER_IN_USE_ELSEWHERE));
     }
     let explicit = secret.map(token);
     // ksmbd's database goes FIRST and only then the POSIX account Samba's
@@ -2500,7 +2595,7 @@ async fn share_user_delete(
                 .to_string(),
         ));
     }
-    store::delete_share_user(&g.db, name).map_err(|e| internal("share users", e))?;
+    store::delete_share_user(&g.db, &g.org_id, name).map_err(|e| internal("share users", e))?;
     // Dropping the user changed every share that granted it, so the generated
     // sections have to follow before smbd offers access to an account that no
     // longer exists.
@@ -2527,10 +2622,23 @@ fn gate_targets(ctx: &HandlerContext) -> Result<Gate, ProtocolError> {
     gate_admin(ctx)
 }
 
+/// One target of the ASKING organisation; another organisation's answers
+/// like an id that does not exist (migration 20).
 fn target_row(g: &Gate, target_id: &str) -> Result<store::TargetRow, ProtocolError> {
-    store::target(&g.db, target_id)
+    store::target(&g.db, &g.org_id, target_id)
         .map_err(|e| internal("targets", e))?
         .ok_or_else(|| ProtocolError::not_found("target not found on this node"))
+}
+
+/// Every target of the node AS THE ASKING ORGANISATION MAY SEE IT
+/// (`targets::seen_by`): another organisation's rows stay in — a zvol it
+/// exports is still taken, a host NQN it allows still collides, a WWN it
+/// holds is still a configfs object — but carry no name, so neither the
+/// wizard's volume list nor a refusal can say whose they are.
+fn targets_seen_by(g: &Gate) -> Result<Vec<store::TargetRow>, ProtocolError> {
+    let rows = store::list_targets(&g.db).map_err(|e| internal("targets", e))?;
+    let owners = store::target_owners(&g.db).map_err(|e| internal("targets", e))?;
+    Ok(tentanas::targets::seen_by(rows, &owners, &g.org_id))
 }
 
 /// What this node can serve, plus the zvols and interfaces the wizard offers.
@@ -2605,11 +2713,12 @@ async fn block_capabilities_cached(
 
 async fn targets_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let rows = store::list_targets(&g.db).map_err(|e| internal("targets", e))?;
+    let rows = store::list_targets_of_org(&g.db, &g.org_id).map_err(|e| internal("targets", e))?;
     // The cached variant: this list is POLLED, and the uncached one spawns two
     // or three `zfs` processes and may fall through to a full environment
-    // probe on every single request.
-    let capabilities = block_capabilities_cached(&g, &rows).await;
+    // probe on every single request. Judged against EVERY target of the node
+    // (a zvol another tenant exports is not free), named only for ours.
+    let capabilities = block_capabilities_cached(&g, &targets_seen_by(&g)?).await;
     // ONE privileged read for the whole list, and only when the list has an
     // NVMe-oF row at all — the same deal `shares::session_counts` makes with
     // `smbstatus` rather than paying a sudo per row of a polled table.
@@ -2678,9 +2787,16 @@ fn spawn_target_job(
     let cipher = ctx.state.settings_cipher.clone();
     let name = subject.to_string();
     let scope = target_id.to_string();
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, None, move |h| async move {
+    let org_id = g.org_id.clone();
+    // The asking organisation's job. Only the KERNEL half of the apply is
+    // scoped to its target: the judging half re-evaluates every target on
+    // the node and logs each one whose state changed, so the log is cut to
+    // the lines this organisation may read (`apply_for_org`), exactly as the
+    // delete and the import cut theirs.
+    let job = tentanas::jobs::spawn_owned(&g.db, kind, subject, &g.user_id, Some(g.org_id.as_str()), None, None, move |h| async move {
         let db = h.db().clone();
-        for line in tentanas::targets::apply(&db, &cipher, explicit.as_deref(), Some(&scope)).await?
+        for line in
+            tentanas::targets::apply_for_org(&db, &cipher, explicit.as_deref(), Some(&scope), &org_id).await?
         {
             h.log(line);
         }
@@ -2847,6 +2963,8 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     // part of the target's permanent identity, and a node whose hostname is
     // empty (or holds nothing an IQN may carry) would publish `iqn.…:.name`.
     let node = target_host_for_create(&tentanas::config_io::hostname())?;
+    // Node-wide: the name is part of the node's IQN / NQN namespace, so it is
+    // taken whoever took it; the sentence names only what the caller typed.
     if store::target_by_name(&g.db, name)
         .map_err(|e| internal("targets", e))?
         .is_some()
@@ -2855,7 +2973,7 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
             "a target named '{name}' already exists on this node"
         )));
     }
-    let existing = store::list_targets(&g.db).map_err(|e| internal("targets", e))?;
+    let existing = targets_seen_by(&g)?;
     // Two targets on one zvol is two clients writing one raw disk.
     if let Some(other) = existing
         .iter()
@@ -3000,7 +3118,8 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         }
     }
     let row_target_id = row.target_id.clone();
-    store::upsert_target(&g.db, &row).map_err(|e| internal("targets", e))?;
+    // Stamped with the creating organisation (owner decision 2026-09-22).
+    store::upsert_target(&g.db, &g.org_id, &row).map_err(|e| internal("targets", e))?;
     spawn_target_job(ctx, &g, "target_create", name, &row_target_id, sudo_password.as_ref())
 }
 
@@ -3021,7 +3140,7 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     };
     let g = gate_targets(ctx)?;
     let mut row = target_row(&g, target_id)?;
-    let existing = store::list_targets(&g.db).map_err(|e| internal("targets", e))?;
+    let existing = targets_seen_by(&g)?;
     let caps = block_capabilities(&g, &existing).await;
     let (method, username, secret, mutual_username, mutual_secret, hash, dhgroup) =
         target_auth_columns(ctx, target_id, &row.protocol, auth.as_ref(), Some(&row))?;
@@ -3073,7 +3192,7 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     tentanas::targets::validate_options(&row, &existing, &caps, *confirm_all_interfaces)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let name = row.name.clone();
-    store::upsert_target(&g.db, &row).map_err(|e| internal("targets", e))?;
+    store::upsert_target(&g.db, &g.org_id, &row).map_err(|e| internal("targets", e))?;
     spawn_target_job(ctx, &g, "target_update", &name, target_id, sudo_password.as_ref())
 }
 
@@ -3119,7 +3238,9 @@ async fn target_delete(
     // leave exactly that, forever. Doing it first also makes the failure
     // harmless — the row still exists, so the next evaluation re-raises it.
     tentanas::targets::forget_alerts(&g.db, target_id).map_err(|e| internal("targets", e))?;
-    store::delete_target(&g.db, target_id).map_err(|e| internal("targets", e))?;
+    if !store::delete_target(&g.db, &g.org_id, target_id).map_err(|e| internal("targets", e))? {
+        return Err(ProtocolError::not_found("target not found on this node"));
+    }
     // The kernel object goes with the row, in the same job: a target left in
     // configfs with no row behind it is exactly the orphan §5.8 forbids.
     let explicit = secret.map(token);
@@ -3127,7 +3248,8 @@ async fn target_delete(
     let wwn = row.wwn.clone();
     let cipher = ctx.state.settings_cipher.clone();
     let restore = row.clone();
-    let job = tentanas::jobs::spawn(&g.db, "target_delete", &row.name, &g.user_id, None, None, move |h| async move {
+    let org_id = g.org_id.clone();
+    let job = tentanas::jobs::spawn_owned(&g.db, "target_delete", &row.name, &g.user_id, Some(g.org_id.as_str()), None, None, move |h| async move {
         let db = h.db().clone();
         let (lines, removed) = tentanas::targets::remove(&db, &protocol, &wwn, explicit.as_deref()).await;
         for line in lines {
@@ -3155,7 +3277,9 @@ async fn target_delete(
                  The node keeps trying; see the job log."
                     .to_string();
             back.updated_at = store::now();
-            if let Err(e) = store::upsert_target(&db, &back) {
+            // Back under the organisation that owned it: a restored row with
+            // no owner would be a live export nobody can see.
+            if let Err(e) = store::upsert_target(&db, &org_id, &back) {
                 h.log(format!("the target row could not be restored: {e}"));
             } else {
                 h.log(format!(
@@ -3171,8 +3295,10 @@ async fn target_delete(
         // Node-wide, deliberately: the row is already gone, so there is
         // nothing to scope to — and this is the one path that produces
         // orphans (a delete whose job then failed), which is what the
-        // unscoped apply sweeps.
-        for line in tentanas::targets::apply(&db, &cipher, explicit.as_deref(), None).await? {
+        // unscoped apply sweeps. Its LOG and its ERROR are scoped: this job
+        // is one organisation's, and a node-wide apply speaks about — and
+        // fails with the names of — every target (`apply_for_org`).
+        for line in tentanas::targets::apply_for_org(&db, &cipher, explicit.as_deref(), None, &org_id).await? {
             h.log(line);
         }
         drop(explicit);
@@ -3183,10 +3309,12 @@ async fn target_delete(
     Ok(job_response(ctx, job))
 }
 
+/// The asking organisation's own fleet shares only: the registry holds every
+/// tenant's, and each line names a share (`fleet_mounts` module header).
 fn fleet_mounts_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     Ok(tn(P::FleetMountsListResponse {
-        mounts: tentanas::fleet_mounts::fleet_mounts(ctx, &g.addon_id),
+        mounts: tentanas::fleet_mounts::fleet_mounts(ctx, &g.addon_id, &g.org_id),
     }))
 }
 
@@ -3196,6 +3324,16 @@ async fn fleet_mount_retry(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_shares(ctx)?;
+    // Another organisation's share is refused with the answer an id that
+    // exists nowhere gets, so the refusal confirms nothing — and before the
+    // channel is armed, which a refused request has no use for. An empty id
+    // is the whole pass the minute tick runs anyway; it reveals nothing, and
+    // the list it answers with is scoped like any other.
+    if !share_id.is_empty()
+        && !tentanas::fleet_mounts::may_retry(&ctx.state.db, &g.addon_id, &g.db, &g.org_id, share_id)
+    {
+        return Err(ProtocolError::not_found("share not found"));
+    }
     // A one-shot password arms the channel for the length of this pass, which
     // is exactly the mode B case the retry button exists for.
     if let Some(secret) = secret {
@@ -3212,7 +3350,9 @@ async fn fleet_mount_retry(
 
 async fn config_export(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let document = tentanas::config_io::export(&g.db)
+    // The asking organisation's shares, accounts and targets only; the node's
+    // whole state is what the uninstall backup writes, never a download.
+    let document = tentanas::config_io::export_for_org(&g.db, &g.org_id)
         .await
         .map_err(|e| internal("config export", e))?;
     let json = serde_json::to_string_pretty(&document).map_err(|e| internal("config export", e))?;
@@ -3275,7 +3415,9 @@ async fn config_import_apply(
     // The importing organisation: only its own Elastic unions may receive a
     // share from the document (`config_io::live_state`).
     let owner = elastic_owner(&g);
-    let job = tentanas::jobs::spawn(&g.db, "config_import", &subject, &g.user_id, None, None, move |h| async move {
+    // The importing organisation's job: its log names the shares, accounts
+    // and targets the import creates for it (migration 20).
+    let job = tentanas::jobs::spawn_owned(&g.db, "config_import", &subject, &g.user_id, Some(g.org_id.as_str()), None, None, move |h| async move {
         let outcome =
             tentanas::config_io::apply(&h, &main_db, &owner, document, explicit.as_deref()).await;
         drop(explicit);
@@ -3457,14 +3599,17 @@ async fn access_log(
             "the result filter is 'ok', 'fail' or empty",
         ));
     }
+    // The asking organisation's lines, facets and audit state only
+    // (migration 20): the log names shares, accounts, client addresses and
+    // files, and every tenant's are in this one node database.
     let (events, total) =
-        store::access_events(&g.db, filter).map_err(|e| internal("access log", e))?;
+        store::access_events(&g.db, &g.org_id, filter).map_err(|e| internal("access log", e))?;
     let (shares, users, operations) =
-        store::access_facets(&g.db).map_err(|e| internal("access log", e))?;
+        store::access_facets(&g.db, &g.org_id).map_err(|e| internal("access log", e))?;
     Ok(tn(P::AccessLogResponse {
         events,
         total,
-        audit: tentanas::access_log::state(&g.db),
+        audit: tentanas::access_log::state_for_org(&g.db, &g.org_id),
         shares,
         users,
         operations,
@@ -4755,7 +4900,10 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             // this node's row becomes what this tenant's alert list shows,
             // plus this tenant's own Elastic Arrays.
             tentanas::fleet::scope_local_alerts(&mut nodes, &g.db, &g.org_id);
-            tentanas::fleet::scope_local_arrays(&mut nodes, &g.db, &g.org_id);
+            // Shares are per organisation too (migration 20): the published
+            // row carries none, and this node's row gets this tenant's own.
+            // `per_org_counted` says whether both reads made it.
+            tentanas::fleet::scope_local_org_figures(&mut nodes, &g.db, &g.org_id);
             Ok(tn(P::NodesListResponse {
                 local_node_id: ctx.state.local_node_id.to_string(),
                 nodes,
@@ -5807,6 +5955,167 @@ mod registration_tests {
         );
     }
 
+    /// Shares, block targets and share accounts belong to the organisation
+    /// that created them (migration 20). Another organisation's are not in
+    /// the lists, and every read, edit, delete and mount refresh of them
+    /// answers exactly like an id that does not exist — before any privileged
+    /// step, and without changing a byte of the other tenant's rows. Its
+    /// account's password cannot be set from here: that would hand this
+    /// tenant the other tenant's login.
+    #[tokio::test]
+    async fn another_orgs_shares_targets_and_accounts_are_invisible_and_refused() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        for permission in [PERM_SHARES, PERM_TARGETS] {
+            crate::dispatch::app_gate::test_support::set_permission(
+                &fixture.ctx.state,
+                &fixture.addon_id,
+                "user",
+                &fixture.ctx.org_context.as_ref().unwrap().user_id,
+                permission,
+                "allow",
+            );
+        }
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let theirs = store::ShareRow {
+            share_id: "s-other".into(),
+            name: "kadry".into(),
+            protocol: "nfs".into(),
+            source_path: "/mnt/tank/kadry".into(),
+            nfs: Some(Default::default()),
+            state: "active".into(),
+            created_at: store::now(),
+            updated_at: store::now(),
+            ..Default::default()
+        };
+        store::upsert_share(&g.db, "org-other", &theirs).unwrap();
+        store::upsert_target(
+            &g.db,
+            "org-other",
+            &store::TargetRow {
+                target_id: "t-other".into(),
+                name: "vm-other".into(),
+                protocol: "iscsi".into(),
+                wwn: "iqn.2026-09.pl.test:n.vm-other".into(),
+                auth_method: "none".into(),
+                state: "disabled".into(),
+                created_at: store::now(),
+                updated_at: store::now(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store::upsert_share_user(&g.db, "org-other", "obcy", "kadry").unwrap();
+
+        // The lists read `list_shares_of_org` / `list_share_users` /
+        // `list_targets_of_org` with the gate's org (db.rs tests hold those);
+        // `shares_list` itself is not called here because its service rows
+        // run the node's environment probe.
+        assert!(store::list_shares_of_org(&g.db, &g.org_id).unwrap().is_empty());
+        assert!(store::list_share_users(&g.db, &g.org_id).unwrap().is_empty());
+        assert!(store::list_targets_of_org(&g.db, &g.org_id).unwrap().is_empty());
+
+        let not_found = |e: ProtocolError| assert_eq!(e.code, ProtocolErrorCode::NotFound, "{}", e.message);
+        not_found(share_get(&fixture.ctx, "s-other").await.unwrap_err());
+        not_found(share_mounts_refresh(&fixture.ctx, "s-other").await.unwrap_err());
+        not_found(
+            share_update(
+                &fixture.ctx,
+                &P::ShareUpdateRequest {
+                    share_id: "s-other".into(),
+                    smb: None,
+                    nfs: Some(Default::default()),
+                    fleet_mount: false,
+                    enabled: false,
+                    sudo_password: None,
+                },
+            )
+            .await
+            .unwrap_err(),
+        );
+        not_found(share_delete(&fixture.ctx, "s-other", "kadry", None, Origin::Direct).await.unwrap_err());
+        not_found(target_get(&fixture.ctx, "t-other").await.unwrap_err());
+        not_found(target_delete(&fixture.ctx, "t-other", "vm-other", None, Origin::Direct).await.unwrap_err());
+        not_found(share_user_delete(&fixture.ctx, "obcy", None).await.unwrap_err());
+        let taken = share_user_set(
+            &fixture.ctx,
+            &P::ShareUserSetRequest {
+                name: "obcy".into(),
+                password: Some(tentaflow_protocol::tentanas::NasSecret("przejete".into())),
+                description: String::new(),
+                sudo_password: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(taken.code, ProtocolErrorCode::BadRequest);
+        assert!(taken.message.contains("already in use on this node"), "{}", taken.message);
+        assert!(!taken.message.contains("org-other"), "{}", taken.message);
+
+        // Nothing of the other tenant's changed, and no job was started.
+        assert_eq!(store::share(&g.db, "org-other", "s-other").unwrap(), Some(theirs));
+        assert!(store::target(&g.db, "org-other", "t-other").unwrap().is_some());
+        assert_eq!(store::share_user_owner(&g.db, "obcy").unwrap().as_deref(), Some("org-other"));
+        assert_eq!(store::list_share_users(&g.db, "org-other").unwrap()[0].description, "kadry");
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty());
+    }
+
+    /// A legacy account migration 20 gave to this organisation because it
+    /// had grants in two (critic wave 3, MINOR 1): deleting it would remove
+    /// the node account ANOTHER organisation's share still serves its users
+    /// with. Refused before either password database is touched, and the
+    /// refusal names neither that share nor its organisation.
+    #[tokio::test]
+    async fn deleting_an_account_another_orgs_share_still_grants_is_refused_without_naming_it() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        crate::dispatch::app_gate::test_support::set_permission(
+            &fixture.ctx.state,
+            &fixture.addon_id,
+            "user",
+            &fixture.ctx.org_context.as_ref().unwrap().user_id,
+            PERM_SHARES,
+            "allow",
+        );
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        store::upsert_share_user(&g.db, &g.org_id, "wspolny", "").unwrap();
+        let theirs = store::ShareRow {
+            share_id: "s-other".into(),
+            name: "kadry-tajne".into(),
+            protocol: "smb".into(),
+            source_path: "/mnt/tank/kadry-tajne".into(),
+            smb: Some(tentaflow_protocol::tentanas::NasSmbOptions {
+                users: vec![tentaflow_protocol::tentanas::NasShareAccess {
+                    user: "wspolny".into(),
+                    mode: "rw".into(),
+                }],
+                ..Default::default()
+            }),
+            state: "active".into(),
+            created_at: store::now(),
+            updated_at: store::now(),
+            ..Default::default()
+        };
+        store::upsert_share(&g.db, "org-other", &theirs).unwrap();
+
+        let refused = share_user_delete(&fixture.ctx, "wspolny", None).await.unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::BadRequest, "{}", refused.message);
+        assert_eq!(refused.message, store::SHARE_USER_IN_USE_ELSEWHERE);
+        assert!(!refused.message.contains("kadry-tajne") && !refused.message.contains("org-other"));
+        // The store holds the same line on its own, for a caller that forgets.
+        let err = store::delete_share_user(&g.db, &g.org_id, "wspolny").unwrap_err();
+        assert_eq!(err.to_string(), store::SHARE_USER_IN_USE_ELSEWHERE);
+        // Nothing moved: the account and the other organisation's grant stay.
+        assert!(store::share_user_exists(&g.db, &g.org_id, "wspolny").unwrap());
+        assert_eq!(store::share_grants(&g.db, "s-other").unwrap().len(), 1);
+
+        // Once no other organisation grants it, it is this one's to delete
+        // (the store half; the handler would go on to the privilege channel).
+        store::delete_share(&g.db, "org-other", "s-other").unwrap();
+        assert!(!store::share_user_granted_elsewhere(&g.db, &g.org_id, "wspolny").unwrap());
+        assert!(store::delete_share_user(&g.db, &g.org_id, "wspolny").unwrap());
+    }
+
     /// The recovery path is admin-only and validates what it was given before
     /// it asks for root, and a node with no privilege channel says what to do
     /// about it rather than failing opaquely — the journals are unreachable
@@ -6299,6 +6608,7 @@ mod registration_tests {
         let union = tentanas_helper::elastic::union_path("media");
         store::upsert_share(
             &g.db,
+            &g.org_id,
             &store::ShareRow {
                 share_id: "share-1".into(),
                 name: "media-smb".into(),

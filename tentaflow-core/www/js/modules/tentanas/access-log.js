@@ -178,10 +178,19 @@ export function wireAccessLog(screen, body) {
 }
 
 /**
- * Where this node sends its alerts and (optionally) its access log (§5.9).
- * Both targets are optional and independent; the node refuses a target it
- * could not use, so the dialog reports its error instead of saving something
- * that would fail silently every two minutes.
+ * Where this node sends its alerts (§5.9). Both targets are optional and
+ * independent; the node refuses a target it could not use, so the dialog
+ * reports its error instead of saving something that would fail silently
+ * every two minutes.
+ *
+ * The "forward the access log too" switch is shown DISABLED and off, with the
+ * reason under it: every access line belongs to one organisation, and the
+ * target is one setting for the whole node that any organisation's admin may
+ * point anywhere, so the node sends no access line whatever the setting says
+ * (`tentanas/forward.rs`). A switch that could be turned on would be a
+ * control that does nothing. The stored choice is not dropped: the save sends
+ * back exactly what the node holds, and a stored "on" is named as kept, so a
+ * per-organisation target can honour it later.
  */
 export function openForwardDialog(screen, forward, onSaved) {
   const win = document.createElement('tf-window');
@@ -204,8 +213,9 @@ export function openForwardDialog(screen, forward, onSaved) {
       <tf-input id="nas-forward-syslog" label="${escapeAttr(T('access.forward_syslog'))}" placeholder="siem.example.com:514" autocomplete="off" spellcheck="false" value="${escapeAttr(forward.syslogTarget || '')}" hint="${escapeAttr(T('access.forward_syslog_hint'))}"></tf-input>
       <tf-input id="nas-forward-webhook" label="${escapeAttr(T('access.forward_webhook'))}" placeholder="https://siem.example.com/hooks/tentanas" autocomplete="off" spellcheck="false" value="${escapeAttr(forward.webhookUrl || '')}" hint="${escapeAttr(T('access.forward_webhook_hint'))}"></tf-input>
       <div class="toggle-card">
-        <div class="tc-text"><span>${escapeHtml(T('access.forward_include'))}</span><span class="tc-sub">${escapeHtml(T('access.forward_include_sub'))}</span></div>
-        <tf-toggle id="nas-forward-include" ${forward.includeAccess ? 'checked' : ''}></tf-toggle>
+        <div class="tc-text"><span>${escapeHtml(T('access.forward_include'))}</span><span class="tc-sub" id="nas-forward-include-why">${escapeHtml(T('access.forward_include_unavailable'))}${
+          forward.includeAccess ? ` ${escapeHtml(T('access.forward_include_kept'))}` : ''}</span></div>
+        <tf-toggle id="nas-forward-include" disabled></tf-toggle>
       </div>
       <div class="num-err" id="nas-forward-error" hidden></div>
     </div>
@@ -226,7 +236,8 @@ export function openForwardDialog(screen, forward, onSaved) {
         enabled: Boolean(win.querySelector('#nas-forward-enabled').checked),
         syslogTarget: String(win.querySelector('#nas-forward-syslog').value || '').trim(),
         webhookUrl: String(win.querySelector('#nas-forward-webhook').value || '').trim(),
-        includeAccess: Boolean(win.querySelector('#nas-forward-include').checked),
+        // What the node holds, untouched — never the disabled switch.
+        includeAccess: Boolean(forward.includeAccess),
       });
       toast(T('access.forward_saved'), 'success');
       win.close(true);

@@ -86,6 +86,15 @@ pub struct NasNodeInfo {
     /// rather than showing a confident total with a disk shelf missing.
     #[serde(default)]
     pub arrays_unmeasured: u32,
+    /// Whether this row's per-organisation figures (`shares_total`,
+    /// `arrays_total` and the arrays' part of the capacity) are the asking
+    /// organisation's real count. Only the node that answered the list can
+    /// count them, and only when both of its scoped reads succeeded — a
+    /// failed read (or a caller with no organisation) leaves the published 0,
+    /// which is "not counted", never "none". False on every remote row and
+    /// on a row from an older build.
+    #[serde(default)]
+    pub per_org_counted: bool,
 }
 
 // =============================================================================
@@ -223,7 +232,12 @@ pub struct NasDisk {
     pub member_of: Option<String>,
     /// 'ok' | 'warning' | 'critical' | 'unknown'.
     pub health: String,
-    /// Human reason behind `health` ("3 new reallocated sectors in 7 days").
+    /// DEPRECATED FOR DISPLAY. The node's English sentence behind `health`
+    /// ("ZFS reports this disk FAULTED; 3 reallocated sectors"): the same
+    /// text the stored health alert carries. A screen shows
+    /// `health_reasons` in the reader's language and puts this in a tooltip
+    /// at most — three review rounds found English leaking wherever a screen
+    /// printed it or tried to parse it back.
     pub health_reason: String,
     pub temperature_c: Option<i32>,
     pub power_on_hours: Option<u64>,
@@ -294,6 +308,61 @@ pub struct NasDisk {
     /// bytes, a parity disk holds no data at all).
     #[serde(default)]
     pub array_role: String,
+    /// The reasons behind `health` as codes, worst first — what a screen
+    /// words in the reader's language. Codes are listed on
+    /// `NasHealthReason`. Empty on a healthy disk, and on a disk whose
+    /// persisted reason could not be re-derived after a restart (until its
+    /// next SMART read): a screen then shows the translated grade, with
+    /// `health_reason` as the tooltip. Empty from an older node too.
+    #[serde(default)]
+    pub health_reasons: Vec<NasHealthReason>,
+}
+
+/// One reason behind a health grade, as a code and its parameters, so the
+/// front end composes the sentence in the reader's language instead of
+/// printing (or regex-parsing) the node's English.
+///
+/// Every parameter is a string: numbers are sent in decimal ("3"), words are
+/// wire spellings the screen translates itself (a pool state, a grade). A
+/// parameter a code does not list is never shown.
+///
+/// Disk codes (`NasDisk::health_reasons`, `tentanas::disks::score_health` /
+/// `grade_disk_health`):
+/// - 'smart_failed' — the drive's overall SMART verdict is FAILED;
+/// - 'self_test_failed' — its last self-test failed;
+/// - 'pending_sectors' {count};
+/// - 'media_errors' {count} — NVMe media errors / SCSI uncorrected errors;
+/// - 'reallocated_growing' {from, to} — the reallocated count grew over the
+///   last 7 days;
+/// - 'reallocated' {count} — reallocated sectors, not growing;
+/// - 'temperature_over_limit' {celsius, limit};
+/// - 'temperature_high' {celsius} — over the warning limit only;
+/// - 'crc_errors' {count} — UDMA CRC errors (cable or backplane);
+/// - 'wear' {pct} — SSD / NVMe wear;
+/// - 'no_smart_data' — the drive reported no SMART verdict;
+/// - 'zfs_faulted', 'zfs_unavail' — the disk's pool took it out of service.
+///
+/// Replacement-advice codes (`NasReplacementAdvice::reasons`, followed by the
+/// disk codes above):
+/// - 'reallocated_grew' {from, to} — the growth that makes advice urgent;
+/// - 'unhealthy_for_days' {health, days} — `health` is 'warning' | 'critical'.
+///
+/// Pool codes (`NasPool::health_reasons`, `tentanas::pools::score_health`):
+/// - 'pool_state' {state} — a pool state word ('faulted', 'degraded', …);
+/// - 'permanent_data_errors' {count};
+/// - 'data_errors_reported' {detail} — zpool reported data errors without a
+///   count; `detail` is zpool's own English line, for a tooltip only;
+/// - 'unusable_disks' {count}, 'degraded_disks' {count},
+///   'disks_with_errors' {count} — leaves by state / by error counters;
+/// - 'scrub_found_errors', 'resilver_found_errors', 'scan_found_errors'
+///   {count, kind} — the last scan's error count, one code per scan kind
+///   (`kind` is the wire word, for the English sentence only);
+/// - 'capacity' {pct} — the pool is over its warning or critical fill level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasHealthReason {
+    pub code: String,
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
 }
 
 /// One SMART attribute (ATA) or NVMe log field, normalized.
@@ -418,7 +487,8 @@ pub struct NasReplacementAdvice {
     pub disk_id: String,
     pub name: String,
     pub severity: String,
-    /// Why, in the same voice as `NasDisk::health_reason`.
+    /// DEPRECATED FOR DISPLAY: why, as the node's English sentence (tooltip
+    /// at most). A screen words `reasons` instead.
     pub reason: String,
     /// How long the disk has been unhealthy, in whole days.
     pub warning_days: u32,
@@ -429,6 +499,11 @@ pub struct NasReplacementAdvice {
     /// Whether the pool has a spare standing by, so the UI can say whether the
     /// replacement is a hot swap or needs a disk bought first.
     pub spare_available: bool,
+    /// Why, as codes (`NasHealthReason`): the growth and the time spent
+    /// unhealthy first, then the disk's own `health_reasons` — without the
+    /// disk's 'reallocated_growing' when 'reallocated_grew' already says it.
+    #[serde(default)]
+    pub reasons: Vec<NasHealthReason>,
 }
 
 /// One reason the node refuses to clear a disk, with a machine code beside
@@ -687,6 +762,8 @@ pub struct NasPool {
     /// 'ok' | 'warning' | 'critical' — the one status of the card, with the
     /// reason ("1 disk with checksum errors", "scrub found 3 errors").
     pub health: String,
+    /// DEPRECATED FOR DISPLAY: the node's English sentence behind `health`,
+    /// for a tooltip at most. A screen words `health_reasons` instead.
     pub health_reason: String,
     pub size_bytes: u64,
     pub alloc_bytes: u64,
@@ -735,6 +812,11 @@ pub struct NasPool {
     /// Mean completion of the leaf vdevs that support TRIM, 0..=100.
     #[serde(default)]
     pub trim_progress_pct: u8,
+    /// The reasons behind `health` as codes (`NasHealthReason`, pool
+    /// codes), critical ones first. Empty on a healthy pool and from an
+    /// older node.
+    #[serde(default)]
+    pub health_reasons: Vec<NasHealthReason>,
 }
 
 /// How often a recurring task runs. `every` is one of '15m' | '30m' | '1h' |
@@ -3563,6 +3645,36 @@ mod tests {
         assert_eq!(back, req);
     }
 
+    /// A node built before the health codes existed sends its disks, pools
+    /// and advice without them. Those frames must still decode — to no codes,
+    /// which the screen shows as the translated grade — or one old node in a
+    /// fleet would blank the Disks and Pools tabs for everybody.
+    #[test]
+    fn a_frame_without_health_codes_decodes_to_no_codes() {
+        fn without<T: Serialize + serde::de::DeserializeOwned>(value: &T, field: &str) -> T {
+            let bytes = crate::cbor::encode(value).expect("encode");
+            let mut doc: ciborium::value::Value = crate::cbor::decode(&bytes).expect("decode");
+            let ciborium::value::Value::Map(entries) = &mut doc else {
+                panic!("a struct encodes as a map");
+            };
+            let before = entries.len();
+            entries.retain(|(key, _)| key.as_text() != Some(field));
+            assert_eq!(entries.len(), before - 1, "the fixture must really omit {field}");
+            crate::cbor::decode(&crate::cbor::encode(&doc).expect("encode")).expect("decode")
+        }
+        let coded = vec![NasHealthReason { code: "capacity".to_string(), ..Default::default() }];
+        let disk = NasDisk { health_reasons: coded.clone(), ..Default::default() };
+        assert!(without(&disk, "health_reasons").health_reasons.is_empty());
+        let pool = NasPool { health_reasons: coded.clone(), ..Default::default() };
+        assert!(without(&pool, "health_reasons").health_reasons.is_empty());
+        let advice = NasReplacementAdvice { reasons: coded.clone(), ..Default::default() };
+        assert!(without(&advice, "reasons").reasons.is_empty());
+        // And a code sent without its parameter map reads as no parameters.
+        let bare: NasHealthReason = without(&coded[0], "params");
+        assert_eq!(bare.code, "capacity");
+        assert!(bare.params.is_empty());
+    }
+
     #[test]
     fn a_disk_round_trips_without_losing_a_field() {
         let disk = NasDisk {
@@ -3611,6 +3723,18 @@ mod tests {
             // which part of one it is stays empty here — the branch below
             // carries it.
             array_role: String::new(),
+            // A code with parameters and one without: the map must survive
+            // the wire, and so must an empty one.
+            health_reasons: vec![
+                NasHealthReason {
+                    code: "reallocated_growing".to_string(),
+                    params: [("from", "8"), ("to", "11")]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                },
+                NasHealthReason { code: "smart_failed".to_string(), ..Default::default() },
+            ],
         };
         // A second row whose state the first one cannot hold honestly: an
         // Elastic Array branch has no vdev and no RAID layout, the union owns
@@ -3643,6 +3767,13 @@ mod tests {
                 reallocated_week_ago: Some(5),
                 member_of: "tank".to_string(),
                 spare_available: true,
+                reasons: vec![NasHealthReason {
+                    code: "unhealthy_for_days".to_string(),
+                    params: [("health", "warning"), ("days", "9")]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                }],
             }],
         });
         let bytes = crate::cbor::encode(&body).expect("encode");

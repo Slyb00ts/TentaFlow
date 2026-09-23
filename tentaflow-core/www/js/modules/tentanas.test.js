@@ -33,21 +33,30 @@ function buildJobRow(container, j) {
 const LOCAL = 'nodeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const REMOTE = 'nodebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const MAC = 'nodeccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+// One health reason as the node sends it (`NasHealthReason`): a code and its
+// parameters, numbers in decimal strings.
+function R(code, params = {}) {
+  return { code, params };
+}
 
+// `perOrgCounted` follows `isLocal` unless a test sets it: the list handler
+// counts the asking organisation's figures on the local row only.
 function node(overrides) {
-  return {
+  const n = {
     nodeId: LOCAL, nodeName: 'orion', isLocal: true, online: true, instanceStatus: 'ready', health: 'ok',
     osName: 'Debian 12', zfsVersion: '2.2.4', elevationMode: 'helper', disksTotal: 2, disksWarning: 0,
     poolsTotal: 1, sharesTotal: 1, alertsActive: 0, capacityBytes: 4e12, usedBytes: 1e12, updatedAt: '2026-09-02 10:00:00',
     features: ['OpenZFS 2.2.4', 'SMB'],
     ...overrides,
   };
+  if (!('perOrgCounted' in overrides)) n.perOrgCounted = n.isLocal;
+  return n;
 }
 
 function disk(overrides) {
   return {
     diskId: 'sda', name: 'sda', path: '/dev/sda', kind: 'hdd', model: 'WD Red', serial: 'WD-1', wwn: null, sizeBytes: 2e12,
-    transport: 'sata', rotational: true, removable: false, firmware: null, role: 'free', memberOf: null, health: 'ok', healthReason: '',
+    transport: 'sata', rotational: true, removable: false, firmware: null, role: 'free', memberOf: null, health: 'ok', healthReason: '', healthReasons: [],
     temperatureC: 34, powerOnHours: 100, reallocatedSectors: 0, pendingSectors: 0, crcErrors: 0, mediaErrors: null, wearPct: null,
     smartAvailable: true, smartPassed: true, smartReadAt: '2026-09-02 09:59:00',
     io: { readBps: 1048576, writeBps: 0, readIops: 10, writeIops: 0, awaitMs: 2.5, utilPct: 3 }, ioHistoryBps: [0, 1, 2], mountpoints: [],
@@ -68,7 +77,7 @@ const environment = {
 };
 
 const pool = {
-  name: 'tank', guid: '1', kind: 'zfs', state: 'online', health: 'ok', healthReason: '',
+  name: 'tank', guid: '1', kind: 'zfs', state: 'online', health: 'ok', healthReason: '', healthReasons: [],
   sizeBytes: 4e12, allocBytes: 1e12, freeBytes: 3e12, usableBytes: 3.2e12, usedBytes: 1e12, availableBytes: 2.2e12,
   capacityPct: 31, fragmentationPct: 4, compressRatio: 1.31, dedupRatio: 1, ashift: 12, autotrim: false, readOnly: false,
   layout: 'raidz2', dataDisks: 2, faultTolerance: 2,
@@ -131,7 +140,7 @@ const fixtures = {
   tentaNasEnvironmentRequest: { environment },
   tentaNasElevationPlanRequest: { plan: { helperSource: '/opt/tentaflow/tentanas-helper', helperSourcePresent: true, helperPath: '/usr/local/libexec/tentanas-helper', sudoersPath: '/etc/sudoers.d/tentanas', sudoersLine: 'tentaflow ALL=(root) NOPASSWD: /usr/local/libexec/tentanas-helper', coreUser: 'tentaflow', coreVersion: '1.4.0', commands: [['install', '-m', '0755', '/opt/tentaflow/tentanas-helper', '/usr/local/libexec/tentanas-helper']] } },
   tentaNasDisksListRequest: {
-    disks: [disk({}), disk({ diskId: 'nvme0n1', name: 'nvme0n1', path: '/dev/nvme0n1', kind: 'nvme', model: 'Samsung 980', serial: 'S-1', health: 'warning', healthReason: 'pending sectors', wearPct: 12, rotational: false })],
+    disks: [disk({}), disk({ diskId: 'nvme0n1', name: 'nvme0n1', path: '/dev/nvme0n1', kind: 'nvme', model: 'Samsung 980', serial: 'S-1', health: 'warning', healthReason: '2 pending sectors', healthReasons: [R('pending_sectors', { count: '2' })], wearPct: 12, rotational: false })],
     telemetry: { sampledAt: '2026-09-02 10:00:00', smartReadAt: '2026-09-02 09:59:00', smartState: 'ok', detail: '' },
     iopsHourAvg: 16,
   },
@@ -703,6 +712,9 @@ test('"Uzbrój kanał" stays on the arm-channel prompt and never labels a one-sh
 // as having none — worse than silence. `arraysTotal` is on the wire now, so the
 // count can be what the Pools tab actually lists. The original intent is the
 // assertion that survives: the number must never be the ZFS count on its own.
+// On a REMOTE row the arrays are not counted at all (fleet.rs publishes 0 and
+// scopes only the local row), so there the count is "—", and the Shares count
+// is the one the node's own share list answered, never the published 0/3.
 test('zakładka Pule liczy pule ZFS RAZEM z macierzami, pozostałe badge pozostają pomiarami noda', async () => {
   stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL,
     nodes: [node({ poolsTotal: 0, arraysTotal: 2 }), node({ nodeId: REMOTE, isLocal: false, poolsTotal: 7, disksTotal: 9, sharesTotal: 3 })] } });
@@ -710,14 +722,36 @@ test('zakładka Pule liczy pule ZFS RAZEM z macierzami, pozostałe badge pozosta
   try {
     assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '2',
       'no ZFS pool, two arrays — the node is not storage-less');
+    assert.equal(root.querySelector('tf-tab#pools').hasAttribute('title'), false);
     assert.equal(root.querySelector('tf-tab#disks').getAttribute('count'), '2');
     assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '1');
     assert.equal(root.querySelector('tf-tab#jobs').getAttribute('count'), '1');
     Screen.selectNode(REMOTE, 'pools');
     await flush();
-    assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '7', 'pools still count');
+    await flush();
+    const pools = root.querySelector('tf-tab#pools');
+    assert.equal(pools.getAttribute('count'), '—', 'the ZFS half is not passed off as pools + arrays');
+    assert.match(pools.getAttribute('title'), /nie są tu liczone/);
     assert.equal(root.querySelector('tf-tab#disks').getAttribute('count'), '9');
-    assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '3');
+    assert.ok(kinds('tentaNasSharesListRequest').some((c) => c.options.targetNodeId === REMOTE), 'the remote node was asked for its shares');
+    assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '1', 'what the node itself answered, not the published figure');
+    assert.equal(root.querySelector('tf-tab#shares').hasAttribute('title'), false);
+  } finally { Screen.unmount(); }
+});
+
+test('a remote node view whose share list fails shows "—" on the Shares tab, not the published figure', async () => {
+  stubTransport({ ...fixtures,
+    tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [node({}), node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, sharesTotal: 0 })] },
+    tentaNasSharesListRequest: (payload, options) => {
+      if (options.targetNodeId === REMOTE) throw new Error('peer unreachable');
+      return fixtures.tentaNasSharesListRequest;
+    } });
+  const root = await mountScreen({ node: REMOTE });
+  try {
+    await flush();
+    const tab = root.querySelector('tf-tab#shares');
+    assert.equal(tab.getAttribute('count'), '—');
+    assert.match(tab.getAttribute('title'), /Tu nie liczone/);
   } finally { Screen.unmount(); }
 });
 
@@ -1793,6 +1827,150 @@ test('an unmeasured array is named beside the capacity, not folded into it', asy
   Screen.unmount();
 });
 
+// Per-organisation figures are published as 0 by every node and filled in
+// only on the LOCAL row (fleet.rs `scope_local_shares` / `scope_local_arrays`),
+// so a remote row's 0 shares / 0 arrays means "not counted". The card used to
+// print it as a fact: "Share 0", an array-only node labelled a client, left out
+// of the NAS count, and its pools-only capacity shown as complete.
+function remoteFleet(remote, sharesAnswer) {
+  stubTransport({ ...fixtures,
+    tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+      node({}),
+      node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, poolsTotal: 0, arraysTotal: 0, sharesTotal: 0, features: [], ...remote }),
+    ] },
+    tentaNasSharesListRequest: (payload, options) => {
+      if (options.targetNodeId !== REMOTE) return fixtures.tentaNasSharesListRequest;
+      if (sharesAnswer instanceof Error) throw sharesAnswer;
+      return sharesAnswer;
+    } });
+}
+
+function cardStat(card, key) {
+  return [...card.querySelectorAll('.nc-stats .kv-inline')].find((kv) => kv.querySelector('.k').textContent === key) || null;
+}
+
+test('a remote node card shows "—" for what it does not count, says why, and is not called a client', async () => {
+  remoteFleet({}, new Error('peer unreachable'));
+  const root = await mountScreen();
+  try {
+    await flush();
+    const card = root.querySelector(`.node-card[data-node="${REMOTE}"]`);
+    const shares = cardStat(card, 'Share');
+    assert.equal(shares.querySelector('.v').textContent, '—', 'not "0"');
+    assert.match(shares.querySelector('[data-not-counted]').getAttribute('title'), /dane organizacji nie są przesyłane między nodami/);
+    const arrays = cardStat(card, 'Elastic Array');
+    assert.ok(arrays, 'the arrays stat is shown to say it was not counted');
+    assert.equal(arrays.querySelector('.v').textContent, '—');
+    assert.match(arrays.querySelector('[data-not-counted]').getAttribute('title'), /Macierze Elastic Array nie są tu liczone/);
+    const capacity = cardStat(card, 'Pojemność łączna');
+    assert.equal(capacity.querySelector('[data-pools-only]').textContent, 'tylko pule');
+    assert.match(card.querySelector('.split-bar').getAttribute('title'), /tylko pule/);
+    const role = card.querySelector('.nc-foot').lastElementChild.textContent;
+    assert.equal(role, 'brak puli ZFS · macierze niepoliczone', 'a zero that means "not counted" makes no client');
+
+    const badges = [...root.querySelectorAll('#nas-fleet-badges tf-chip')];
+    assert.equal(badges[0].getAttribute('label'), '1× NAS: orion · macierze niepoliczone: vega');
+    assert.match(badges[0].getAttribute('title'), /nie są tu liczone/);
+    assert.match(badges[2].getAttribute('label'), /tylko pule na 1 nodzie$/);
+    const capacityTile = [...root.querySelectorAll('.kpi tf-stat-card')][0];
+    assert.match(capacityTile.getAttribute('delta'), /tylko pule na 1 nodzie/);
+
+    // The local card keeps its real, scoped figures.
+    const local = root.querySelector(`.node-card[data-node="${LOCAL}"]`);
+    assert.equal(cardStat(local, 'Share').querySelector('.v').textContent, '1');
+    assert.ok(absent(local, '[data-pools-only]'), 'the local capacity includes its arrays');
+    assert.ok(absent(local, '[data-not-counted]'), 'the local figures are counted');
+  } finally { Screen.unmount(); }
+});
+
+// `isLocal` is not "counted": the list handler gives up on a failed scoped
+// read (or a caller with no organisation) and leaves the published 0, which
+// only `perOrgCounted` tells apart from a real 0. The share list the fleet
+// poll asks for fails too, so nothing else counts the shares either.
+function localCountedFleet(perOrgCounted) {
+  stubTransport({ ...fixtures,
+    tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+      node({ poolsTotal: 1, arraysTotal: 2, sharesTotal: 3, perOrgCounted }),
+    ] },
+    tentaNasSharesListRequest: () => { throw new Error('database is locked'); } });
+}
+
+test('the local node card shows "—" for figures its scoped read did not count', async () => {
+  localCountedFleet(false);
+  const root = await mountScreen();
+  try {
+    await flush();
+    const card = root.querySelector(`.node-card[data-node="${LOCAL}"]`);
+    const shares = cardStat(card, 'Share');
+    assert.equal(shares.querySelector('.v').textContent, '—', 'a failed read is not "3" nor "0"');
+    assert.match(shares.querySelector('[data-not-counted]').getAttribute('title'), /dane organizacji nie są przesyłane między nodami/);
+    const arrays = cardStat(card, 'Elastic Array');
+    assert.equal(arrays.querySelector('.v').textContent, '—');
+    assert.ok(card.querySelector('[data-pools-only]'), 'the capacity is the pools\' alone');
+  } finally { Screen.unmount(); }
+});
+
+test('the local node card shows its counted figures when the scoped read succeeded', async () => {
+  localCountedFleet(true);
+  const root = await mountScreen();
+  try {
+    await flush();
+    const card = root.querySelector(`.node-card[data-node="${LOCAL}"]`);
+    assert.equal(cardStat(card, 'Share').querySelector('.v').textContent, '3');
+    assert.equal(cardStat(card, 'Elastic Array').querySelector('.v').textContent, '2');
+    assert.ok(absent(card, '[data-not-counted]'), 'nothing reads "not counted"');
+    assert.ok(absent(card, '[data-pools-only]'));
+  } finally { Screen.unmount(); }
+});
+
+test('a remote node card counts the shares the node answered for this organisation, and its broken share warns', async () => {
+  remoteFleet({}, { ...fixtures.tentaNasSharesListRequest, shares: [share, { ...share, shareId: 's2', name: 'b', state: 'error' }] });
+  const root = await mountScreen();
+  try {
+    await flush();
+    const card = root.querySelector(`.node-card[data-node="${REMOTE}"]`);
+    assert.equal(cardStat(card, 'Share').querySelector('.v').textContent, '2', 'the node\'s own answer, not the published 0');
+    assert.equal(card.querySelector('.nc-head tf-chip').getAttribute('status'), 'warn', 'its broken share makes it a warning');
+    assert.ok(card.querySelector('.health-dot').classList.contains('warn'), card.querySelector('.health-dot').className);
+  } finally { Screen.unmount(); }
+});
+
+test('a remote node with a ZFS pool is a fleet NAS on what it published; the local row keeps "client"', async () => {
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+    node({ poolsTotal: 0, arraysTotal: 0 }),
+    node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, poolsTotal: 2, features: [] }),
+  ] } });
+  const root = await mountScreen();
+  try {
+    await flush();
+    const remote = root.querySelector(`.node-card[data-node="${REMOTE}"]`);
+    assert.match(remote.querySelector('.nc-foot').lastElementChild.textContent, /NAS floty/);
+    const local = root.querySelector(`.node-card[data-node="${LOCAL}"]`);
+    assert.match(local.querySelector('.nc-foot').lastElementChild.textContent, /klient/, 'the local zero IS counted');
+    const badge = root.querySelector('#nas-fleet-badges tf-chip').getAttribute('label');
+    assert.equal(badge, '1× NAS: vega', 'no "not counted" note when every remote node has a pool');
+  } finally { Screen.unmount(); }
+});
+
+test('the not-counted words are translated in every locale, with the same placeholders', () => {
+  const root = new URL('../../', import.meta.url);
+  const all = {};
+  for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
+    all[lang] = JSON.parse(readFileSync(new URL(`i18n/${lang}.json`, root), 'utf8')).tentanas;
+  }
+  const keys = [['fleet', 'not_counted_hint'], ['fleet', 'arrays_not_counted_hint'], ['fleet', 'role_uncounted'],
+    ['fleet', 'pools_only'], ['fleet', 'badge_nas_uncounted'], ['kpi', 'capacity_pools_only']];
+  for (const [group, key] of keys) {
+    const values = Object.values(all).map((t) => t[group][key]);
+    assert.ok(values.every((v) => typeof v === 'string' && v.trim()), `${group}.${key} exists everywhere`);
+    assert.equal(new Set(values).size, values.length, `${group}.${key} is really translated, not copied: ${values}`);
+  }
+  for (const [lang, t] of Object.entries(all)) {
+    assert.match(t.fleet.badge_nas_uncounted, /\{nodes\}/, lang);
+    assert.match(t.kpi.capacity_pools_only, /\{n\}.*\{n\|/, lang);
+  }
+});
+
 test('a fleet that measured every array says nothing about unmeasured ones', async () => {
   stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
     node({ poolsTotal: 1, arraysTotal: 1, arraysUnmeasured: 0 }),
@@ -1978,7 +2156,7 @@ test('a pooled disk shows the vdev error counters and opens the replace wizard',
   stubTransport({
     ...fixtures,
     tentaNasDiskGetRequest: {
-      disk: disk({ diskId: 'sdd', name: 'sdd', serial: 'ZR9AB12K', role: 'pool', memberOf: 'tank', health: 'warning', healthReason: 'reallocated sectors growing (0 → 3 in 7 days)', vdevRole: 'data', vdevKind: 'raidz2' }),
+      disk: disk({ diskId: 'sdd', name: 'sdd', serial: 'ZR9AB12K', role: 'pool', memberOf: 'tank', health: 'warning', healthReason: 'reallocated sectors growing (0 → 3 in 7 days)', healthReasons: [R('reallocated_growing', { from: '0', to: '3' })], vdevRole: 'data', vdevKind: 'raidz2' }),
       attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
     },
     tentaNasPoolGetRequest: { pool, properties: [], datasets: [], alerts: [], history: [] },
@@ -2061,6 +2239,7 @@ test('the disk-detail breadcrumb walks back to the disk list and to the fleet', 
 const detailState = {
   health: 'warning',
   healthReason: 'reallocated sectors growing (0 → 3 in 7 days)',
+  healthReasons: [R('reallocated_growing', { from: '0', to: '3' })],
   reallocated: 3,
   cksum: 2,
   history: [
@@ -2080,7 +2259,7 @@ function diskDetailFixtures() {
       return {
         disk: disk({
           diskId: 'sdd', name: 'sdd', serial: 'ZR9AB12K', role: 'pool', memberOf: 'tank',
-          health: detailState.health, healthReason: detailState.healthReason,
+          health: detailState.health, healthReason: detailState.healthReason, healthReasons: detailState.healthReasons,
           reallocatedSectors: detailState.reallocated, vdevRole: 'data', vdevKind: 'raidz2',
         }),
         attributes: [{ id: 5, name: 'Reallocated_Sector_Ct', value: 98, raw: detailState.reallocated, rawText: String(detailState.reallocated), rawWeekAgo: 0, status: 'warning' }],
@@ -2107,6 +2286,7 @@ function diskDetailFixtures() {
 async function openDiskDetail() {
   detailState.health = 'warning';
   detailState.healthReason = 'reallocated sectors growing (0 → 3 in 7 days)';
+  detailState.healthReasons = [R('reallocated_growing', { from: '0', to: '3' })];
   detailState.reallocated = 3;
   detailState.cksum = 2;
   detailState.history = [
@@ -2182,6 +2362,7 @@ test('a disk-detail poll moves the values that changed and leaves their surround
 
   detailState.health = 'critical';
   detailState.healthReason = 'reallocated sectors growing (3 → 8 in 7 days)';
+  detailState.healthReasons = [R('reallocated_growing', { from: '3', to: '8' })];
   detailState.reallocated = 8;
   detailState.cksum = 5;
   detailState.history = [...detailState.history, { at: '2026-09-02 11:00:00', temperatureC: 41, reallocatedSectors: 8 }];
@@ -2766,8 +2947,8 @@ test('a failing disk makes the health tile a failure, not a warning', async () =
     tentaNasDisksListRequest: {
       ...fixtures.tentaNasDisksListRequest,
       disks: [
-        disk({ health: 'critical', healthReason: '835 media errors' }),
-        disk({ diskId: 'sdz', name: 'sdz', path: '/dev/sdz', health: 'warning', healthReason: '51°C' }),
+        disk({ health: 'critical', healthReason: '835 media errors', healthReasons: [R('media_errors', { count: '835' })] }),
+        disk({ diskId: 'sdz', name: 'sdz', path: '/dev/sdz', health: 'warning', healthReason: '51°C', healthReasons: [R('temperature_high', { celsius: '51' })] }),
       ],
     },
   });
@@ -2793,7 +2974,7 @@ test('with warnings only, the health tile stays a warning', async () => {
     ...fixtures,
     tentaNasDisksListRequest: {
       ...fixtures.tentaNasDisksListRequest,
-      disks: [disk({ health: 'warning', healthReason: '51°C' })],
+      disks: [disk({ health: 'warning', healthReason: '51°C', healthReasons: [R('temperature_high', { celsius: '51' })] })],
     },
   });
   const root = await mountScreen({ node: LOCAL });
@@ -3132,10 +3313,10 @@ test('n03 problem rows carry their tone class and a short reason chip', async ()
       ...fixtures.tentaNasDisksListRequest,
       disks: [
         disk({}),
-        disk({ diskId: 'sdd', name: 'sdd', health: 'warning', healthReason: '3 reallocated sectors' }),
-        disk({ diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: '54°C; 1 UDMA CRC errors (cable/backplane)' }),
-        disk({ diskId: 'sdg', name: 'sdg', health: 'critical', healthReason: '2 pending sectors' }),
-        disk({ diskId: 'sdh', name: 'sdh', health: 'unknown', healthReason: 'no SMART data' }),
+        disk({ diskId: 'sdd', name: 'sdd', health: 'warning', healthReason: '3 reallocated sectors', healthReasons: [R('reallocated', { count: '3' })] }),
+        disk({ diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: '54°C; 1 UDMA CRC errors (cable/backplane)', healthReasons: [R('temperature_high', { celsius: '54' }), R('crc_errors', { count: '1' })] }),
+        disk({ diskId: 'sdg', name: 'sdg', health: 'critical', healthReason: '2 pending sectors', healthReasons: [R('pending_sectors', { count: '2' })] }),
+        disk({ diskId: 'sdh', name: 'sdh', health: 'unknown', healthReason: 'no SMART data', healthReasons: [R('no_smart_data')] }),
       ],
     },
   });
@@ -3167,40 +3348,39 @@ test('n03 problem rows carry their tone class and a short reason chip', async ()
   }
 });
 
-// critic-round2-wave2 MAJOR 1: every sentence `score_health` and
-// `grade_disk_health` (tentanas/disks.rs) can put FIRST in a disk's reason has
-// a localized chip word. The temperature-over-limit and the ZFS leaf states
-// were added on the server without one, and a FAULTED disk — the gravest state
-// on the screen — wore an English chip in every locale.
+// critic-round2-wave2 MAJOR 1, and backlog M1: every reason `score_health`
+// and `grade_disk_health` (tentanas/disks.rs) can put FIRST on a disk arrives
+// as a code, and its chip word is composed from that code — never parsed out
+// of the node's English, which stays whole in the tooltip.
 const SERVER_REASONS = [
-  ['critical', 'SMART overall status FAILED', 'SMART: awaria'],
-  ['critical', 'last self-test failed', 'self-test niezaliczony'],
-  ['warning', '2 pending sectors', '2 oczek. sekt.'],
-  ['warning', '4 media errors', '4 bł. nośnika'],
-  ['warning', 'reallocated sectors growing (3 → 8 in 7 days)', 'realok. 3 → 8'],
-  ['warning', '3 reallocated sectors', '3 realok.'],
-  ['warning', '63°C (over the 60°C limit)', '63°C, ponad limit 60°C'],
-  ['warning', '54°C', '54°C'],
-  ['warning', '1 UDMA CRC errors (cable/backplane)', '1 CRC'],
-  ['warning', '87% worn', 'zużycie 87%'],
-  ['critical', 'ZFS reports this disk FAULTED', 'ZFS: awaria (FAULTED)'],
-  ['critical', 'ZFS reports this disk UNAVAIL', 'ZFS: niedostępny (UNAVAIL)'],
+  ['critical', 'SMART overall status FAILED', R('smart_failed'), 'SMART: awaria'],
+  ['critical', 'last self-test failed', R('self_test_failed'), 'self-test niezaliczony'],
+  ['warning', '2 pending sectors', R('pending_sectors', { count: '2' }), '2 oczek. sekt.'],
+  ['warning', '4 media errors', R('media_errors', { count: '4' }), '4 bł. nośnika'],
+  ['warning', 'reallocated sectors growing (3 → 8 in 7 days)', R('reallocated_growing', { from: '3', to: '8' }), 'realok. 3 → 8'],
+  ['warning', '3 reallocated sectors', R('reallocated', { count: '3' }), '3 realok.'],
+  ['warning', '63°C (over the 60°C limit)', R('temperature_over_limit', { celsius: '63', limit: '60' }), '63°C, ponad limit 60°C'],
+  ['warning', '54°C', R('temperature_high', { celsius: '54' }), '54°C'],
+  ['warning', '1 UDMA CRC errors (cable/backplane)', R('crc_errors', { count: '1' }), '1 CRC'],
+  ['warning', '87% worn', R('wear', { pct: '87' }), 'zużycie 87%'],
+  ['critical', 'ZFS reports this disk FAULTED', R('zfs_faulted'), 'ZFS: awaria (FAULTED)'],
+  ['critical', 'ZFS reports this disk UNAVAIL', R('zfs_unavail'), 'ZFS: niedostępny (UNAVAIL)'],
 ];
 
-async function reasonChipOf(health, healthReason) {
+async function reasonChipOf(health, healthReason, healthReasons) {
   stubTransport({
     ...fixtures,
-    tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, disks: [disk({ diskId: 'sdq', name: 'sdq', health, healthReason })] },
+    tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, disks: [disk({ diskId: 'sdq', name: 'sdq', health, healthReason, healthReasons })] },
   });
   const root = await mountScreen({ node: LOCAL, tab: 'disks' });
   await flush();
   return root.querySelector('#nas-disk-table').shadowRoot.querySelector('.row-actions [data-role="reason"]');
 }
 
-for (const [health, sentence, label] of SERVER_REASONS) {
-  test(`the server reason "${sentence}" has a localized n03 chip`, async () => {
+for (const [health, sentence, reason, label] of SERVER_REASONS) {
+  test(`the server reason code "${reason.code}" has a localized n03 chip`, async () => {
     try {
-      const chip = await reasonChipOf(health, sentence);
+      const chip = await reasonChipOf(health, sentence, [reason]);
       assert.ok(chip, 'a problem row carries a reason chip');
       assert.equal(chip.getAttribute('label'), label);
       assert.equal(chip.getAttribute('status'), health === 'critical' ? 'err' : 'warn');
@@ -3213,7 +3393,7 @@ for (const [health, sentence, label] of SERVER_REASONS) {
 
 test('a faulted disk that SMART also complains about leads with the ZFS state', async () => {
   try {
-    const chip = await reasonChipOf('critical', 'ZFS reports this disk FAULTED; 3 reallocated sectors');
+    const chip = await reasonChipOf('critical', 'ZFS reports this disk FAULTED; 3 reallocated sectors', [R('zfs_faulted'), R('reallocated', { count: '3' })]);
     assert.equal(chip.getAttribute('label'), 'ZFS: awaria (FAULTED)');
     assert.equal(chip.getAttribute('title'), 'ZFS reports this disk FAULTED; 3 reallocated sectors');
   } finally {
@@ -3221,17 +3401,19 @@ test('a faulted disk that SMART also complains about leads with the ZFS state', 
   }
 });
 
-// A sentence this build has no word for is not printed as the chip: English is
-// not a label in pl/de/es/fr. The chip reads the translated grade, and the
-// node's sentence is kept whole in the tooltip.
-test('an unknown server reason falls back to the translated grade, the sentence only in the tooltip', async () => {
+// The chip reads the CODE, never the sentence: a sentence that looks known but
+// comes with an unknown code (or with none, from an older node) gets the
+// translated grade, with the sentence whole in the tooltip.
+test('an unknown reason code falls back to the translated grade, the sentence only in the tooltip', async () => {
   for (const [health, grade] of [['warning', 'Uwaga'], ['critical', 'Awaria']]) {
-    try {
-      const chip = await reasonChipOf(health, 'spindle motor stalled; 54°C');
-      assert.equal(chip.getAttribute('label'), grade, health);
-      assert.equal(chip.getAttribute('title'), 'spindle motor stalled; 54°C');
-    } finally {
-      Screen.unmount();
+    for (const codes of [[R('spindle_stall'), R('temperature_high', { celsius: '54' })], undefined]) {
+      try {
+        const chip = await reasonChipOf(health, '54°C; spindle motor stalled', codes);
+        assert.equal(chip.getAttribute('label'), grade, `${health} ${JSON.stringify(codes)}`);
+        assert.equal(chip.getAttribute('title'), '54°C; spindle motor stalled');
+      } finally {
+        Screen.unmount();
+      }
     }
   }
 });
@@ -3239,14 +3421,14 @@ test('an unknown server reason falls back to the translated grade, the sentence 
 // The n04 identification chip names the symptom through the same words, and
 // falls back the same way.
 test('the n04 health chip localizes the server reason and never prints an unknown one', async () => {
-  for (const [reason, label] of [
-    ['ZFS reports this disk UNAVAIL; 2 pending sectors', 'Awaria: ZFS: niedostępny (UNAVAIL)'],
-    ['spindle motor stalled', 'Awaria'],
+  for (const [reason, codes, label] of [
+    ['ZFS reports this disk UNAVAIL; 2 pending sectors', [R('zfs_unavail'), R('pending_sectors', { count: '2' })], 'Awaria: ZFS: niedostępny (UNAVAIL)'],
+    ['spindle motor stalled', [R('spindle_stall')], 'Awaria'],
   ]) {
     stubTransport({
       ...fixtures,
       tentaNasDiskGetRequest: {
-        disk: disk({ health: 'critical', healthReason: reason }),
+        disk: disk({ health: 'critical', healthReason: reason, healthReasons: codes }),
         attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
       },
     });
@@ -3286,11 +3468,12 @@ test('the new reason words are translated in every locale, with the same placeho
 // the tooltip. The box is patched, never rebuilt.
 test('the n04 "why" box lists every symptom in the reader\'s language', async () => {
   let reason = 'ZFS reports this disk FAULTED; 3 reallocated sectors; 63°C (over the 60°C limit)';
+  let codes = [R('zfs_faulted'), R('reallocated', { count: '3' }), R('temperature_over_limit', { celsius: '63', limit: '60' })];
   let health = 'critical';
   stubTransport({
     ...fixtures,
     tentaNasDiskGetRequest: () => ({
-      disk: disk({ health, healthReason: reason }),
+      disk: disk({ health, healthReason: reason, healthReasons: codes }),
       attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
     }),
   });
@@ -3304,6 +3487,7 @@ test('the n04 "why" box lists every symptom in the reader\'s language', async ()
     assert.equal(why.getAttribute('title'), reason);
 
     reason = 'spindle motor stalled';
+    codes = [R('spindle_stall')];
     await Screen.refreshDiskDetail(body);
     await flush();
     assert.ok(root.querySelector('#nas-dd-why') === why, 'the box is patched, not rebuilt');
@@ -3311,18 +3495,21 @@ test('the n04 "why" box lists every symptom in the reader\'s language', async ()
     assert.equal(why.getAttribute('title'), 'spindle motor stalled', 'and stays in the tooltip only');
 
     reason = 'spindle motor stalled; 2 pending sectors';
+    codes = [R('spindle_stall'), R('pending_sectors', { count: '2' })];
     await Screen.refreshDiskDetail(body);
     await flush();
     assert.equal(why.textContent, '2 oczek. sekt.', 'a known symptom is named, the unknown one is not printed');
 
     health = 'unknown';
     reason = 'no SMART data';
+    codes = [R('no_smart_data')];
     await Screen.refreshDiskDetail(body);
     await flush();
     assert.equal(why.textContent, 'brak danych SMART');
 
     health = 'ok';
     reason = '';
+    codes = [];
     await Screen.refreshDiskDetail(body);
     await flush();
     assert.equal(why.textContent, 'Wszystkie źródła (SMART, liczniki puli, błędy I/O kernela) są czyste.');
@@ -3341,8 +3528,8 @@ test('the n02 disk-health tile names its problem disks in the reader\'s language
     tentaNasDisksListRequest: {
       ...fixtures.tentaNasDisksListRequest,
       disks: [
-        disk({ health: 'critical', healthReason: 'ZFS reports this disk UNAVAIL; 835 media errors' }),
-        disk({ diskId: 'sdz', name: 'sdz', path: '/dev/sdz', health: 'warning', healthReason: 'spindle motor stalled' }),
+        disk({ health: 'critical', healthReason: 'ZFS reports this disk UNAVAIL; 835 media errors', healthReasons: [R('zfs_unavail'), R('media_errors', { count: '835' })] }),
+        disk({ diskId: 'sdz', name: 'sdz', path: '/dev/sdz', health: 'warning', healthReason: 'spindle motor stalled', healthReasons: [R('spindle_stall')] }),
       ],
     },
   });
@@ -3364,11 +3551,12 @@ test('the n02 disk-health tile names its problem disks in the reader\'s language
 // close over; the chip's words are patched onto the kept element.
 test('a temperature step patches the reason chip and keeps the row buttons', async () => {
   let reason = '54°C';
+  let codes = [R('temperature_high', { celsius: '54' })];
   stubTransport({
     ...fixtures,
     tentaNasDisksListRequest: () => ({
       ...fixtures.tentaNasDisksListRequest,
-      disks: [disk({ diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: reason })],
+      disks: [disk({ diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: reason, healthReasons: codes })],
     }),
   });
   try {
@@ -3381,6 +3569,7 @@ test('a temperature step patches the reason chip and keeps the row buttons', asy
     assert.equal(chip.getAttribute('label'), '54°C');
 
     reason = '55°C; 1 UDMA CRC errors (cable/backplane)';
+    codes = [R('temperature_high', { celsius: '55' }), R('crc_errors', { count: '1' })];
     await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
     await flush();
     assert.ok(shadow.querySelector('.row-actions') === wrap, 'the very same actions element');
@@ -3390,6 +3579,7 @@ test('a temperature step patches the reason chip and keeps the row buttons', asy
     assert.equal(chip.getAttribute('title'), '55°C; 1 UDMA CRC errors (cable/backplane)');
 
     reason = '63°C (over the 60°C limit)';
+    codes = [R('temperature_over_limit', { celsius: '63', limit: '60' })];
     await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
     await flush();
     assert.ok(shadow.querySelector('.row-actions') === wrap);
@@ -3565,28 +3755,31 @@ test('every icon TentaNas gives a stat card or an empty state exists in /img/ico
   assert.deepEqual(missing, []);
 });
 
-// critic-round2-wave2-iter2 MAJOR A: the replacement advice printed the
-// node's `advice.reason` — English, with the disk's whole health reason in it
-// (`replacement_advice`, tentanas/disks.rs). The text is now rebuilt from the
-// advice's fields and the disk (`replacementAdviceText`, format.js); the
-// node's sentence is only the tooltip. The fixtures below are the sentences
-// that function writes, part for part.
-const FAULTED_DISK = { diskId: 'sde', name: 'sde', health: 'critical', healthReason: 'ZFS reports this disk FAULTED; 3 reallocated sectors', memberOf: 'tank', role: 'data' };
+// critic-round2-wave2-iter2 MAJOR A, and backlog M1: the replacement advice
+// printed the node's `advice.reason` — English, with the disk's whole health
+// reason in it (`replacement_advice`, tentanas/disks.rs). The node now sends
+// the advice's reasons as codes (`advice.reasons`) and the text is worded
+// from them (`replacementAdviceText`, format.js); the node's sentence is only
+// the tooltip. The fixtures are what that function sends, code for code.
+const FAULTED_DISK = { diskId: 'sde', name: 'sde', health: 'critical', healthReason: 'ZFS reports this disk FAULTED; 3 reallocated sectors', healthReasons: [R('zfs_faulted'), R('reallocated', { count: '3' })], memberOf: 'tank', role: 'data' };
 const FAULTED_ADVICE = {
   diskId: 'sde', name: 'sde', severity: 'urgent',
   reason: 'critical for 3 days; ZFS reports this disk FAULTED; 3 reallocated sectors',
+  reasons: [R('unhealthy_for_days', { health: 'critical', days: '3' }), R('zfs_faulted'), R('reallocated', { count: '3' })],
   warningDays: 3, reallocated: 3, reallocatedWeekAgo: 3, memberOf: 'tank', spareAvailable: false,
 };
-const GROWING_DISK = { diskId: 'sdd', name: 'sdd', health: 'warning', healthReason: 'reallocated sectors growing (3 → 8 in 7 days)', memberOf: 'tank', role: 'data', reallocatedSectors: 8 };
+const GROWING_DISK = { diskId: 'sdd', name: 'sdd', health: 'warning', healthReason: 'reallocated sectors growing (3 → 8 in 7 days)', healthReasons: [R('reallocated_growing', { from: '3', to: '8' })], memberOf: 'tank', role: 'data', reallocatedSectors: 8 };
 const GROWING_ADVICE = {
   diskId: 'sdd', name: 'sdd', severity: 'urgent',
   reason: 'reallocated sectors grew from 3 to 8 in the last 7 days; reallocated sectors growing (3 → 8 in 7 days)',
+  reasons: [R('reallocated_grew', { from: '3', to: '8' })],
   warningDays: 0, reallocated: 8, reallocatedWeekAgo: 3, memberOf: 'tank', spareAvailable: true,
 };
-const OTHER_DISK = { diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: '3 reallocated sectors', memberOf: 'tank', role: 'data' };
+const OTHER_DISK = { diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: '3 reallocated sectors', healthReasons: [R('reallocated', { count: '3' })], memberOf: 'tank', role: 'data' };
 const OTHER_ADVICE = {
   diskId: 'sdf', name: 'sdf', severity: 'retire_soon',
-  reason: 'firmware recall for this model', warningDays: 9, reallocated: 3, reallocatedWeekAgo: 3, memberOf: 'tank', spareAvailable: false,
+  reason: 'firmware recall for this model', reasons: [R('reallocated', { count: '3' })],
+  warningDays: 9, reallocated: 3, reallocatedWeekAgo: 3, memberOf: 'tank', spareAvailable: false,
 };
 const ENGLISH_ADVICE = /ZFS reports|reallocated sectors|critical for|grew from|firmware recall/;
 
@@ -3610,7 +3803,7 @@ test('n03 replacement advice reads in the reader\'s language, the node\'s senten
     assert.equal(reason('sde').getAttribute('title'), FAULTED_ADVICE.reason);
     assert.equal(kind('sde'), 'pilne');
 
-    assert.equal(reason('sdd').textContent, 'realokacje wzrosły z 3 do 8 w 7 dni', 'the growth is said once, from the fields');
+    assert.equal(reason('sdd').textContent, 'realokacje wzrosły z 3 do 8 w 7 dni', 'the growth is said once');
     assert.equal(reason('sdd').getAttribute('title'), GROWING_ADVICE.reason);
 
     assert.equal(reason('sdf').textContent, 'węzeł zaleca wymianę tego dysku', 'an unknown advice kind reads as the generic recommendation');

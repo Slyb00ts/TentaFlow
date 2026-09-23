@@ -286,12 +286,15 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
     let pool_warning = pools
         .iter()
         .any(|p| matches!(p.state.as_str(), "degraded" | "offline") || p.capacity_pct >= 80);
-    // A share the node cannot export (unmounted source, missing service) is a
-    // node problem the fleet view has to show, not a detail of one tab.
-    let (shares_total, shares_error) = super::db::share_counts(db).unwrap_or((0, 0));
+    // Shares are NOT counted here (migration 20): each belongs to one
+    // organisation and this row is read by every tenant of every node, so a
+    // count — or a "warning" caused by one tenant's broken share — would tell
+    // the others about it. The asking tenant's own shares, and the warning a
+    // share of theirs that the node cannot export deserves, are added to
+    // THIS node's row at read time (`scope_local_shares`).
     let health = if disks_critical > 0 || pool_critical {
         "critical"
-    } else if disks_warning > 0 || pool_warning || shares_error > 0 {
+    } else if disks_warning > 0 || pool_warning {
         "warning"
     } else {
         "ok"
@@ -307,7 +310,8 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         disks_total: disks.len() as u32,
         disks_warning,
         pools_total: pools.len() as u32,
-        shares_total,
+        // Per tenant, so never published (see above).
+        shares_total: 0,
         // NODE-WIDE alerts only: this row is published into the instance's
         // `addon_config`, which every tenant of every node reads, so it may
         // not count (and thereby reveal) any tenant's own alerts. The asking
@@ -384,14 +388,67 @@ pub fn scope_local_alerts(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) 
 /// node's database knows whose arrays are whose. A remote row keeps its
 /// pools-only figures — it undercounts the tenant's arrays there but never
 /// reveals another tenant's. A failed read adds nothing, for the same reason.
-pub fn scope_local_arrays(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) {
+///
+/// Returns whether the tenant's arrays were counted: false for a caller with
+/// no organisation and for a failed read (`scope_local_org_figures`).
+pub fn scope_local_arrays(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) -> bool {
     if org_id.is_empty() {
-        return;
+        return false;
     }
     let Ok(own) = super::db::elastic_array_names_of_org(db, org_id) else {
-        return;
+        return false;
     };
     add_own_arrays(nodes, &own, &local_array_readings().read());
+    true
+}
+
+/// Puts the asking organisation's own shares on THIS node's row: their count,
+/// and "warning" when one of them is in `error` (a share the node cannot
+/// export is a node problem the fleet view has to show — for the tenant it
+/// belongs to). The same shape and the same limits as `scope_local_alerts`:
+/// the published row carries no share figure at all, only the local row can
+/// be completed, and a remote row keeps 0 — it undercounts the tenant's
+/// shares there but never reveals another tenant's. A failed read leaves the
+/// row as published.
+///
+/// Returns whether the read succeeded (`scope_local_org_figures`).
+pub fn scope_local_shares(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) -> bool {
+    let Ok((total, errors)) = super::db::share_counts(db, org_id) else {
+        return false;
+    };
+    add_own_shares(nodes, total, errors);
+    true
+}
+
+/// Both per-organisation completions of THIS node's row — its arrays and its
+/// shares — and the flag that says they happened (`per_org_counted`).
+///
+/// WHY the flag: a scoped read that fails leaves the published figure, which
+/// is 0 for shares and arrays alike, and a 0 on the local row read exactly
+/// like "this tenant has none here". The front used `is_local` as "counted",
+/// so a database hiccup told a tenant its shares were gone. The flag is set
+/// only when BOTH reads succeeded for a caller with an organisation;
+/// anything else reads "not counted", like a remote row.
+pub fn scope_local_org_figures(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) {
+    let arrays = scope_local_arrays(nodes, db, org_id);
+    let shares = scope_local_shares(nodes, db, org_id);
+    // `scope_local_arrays` already answers false for no organisation.
+    mark_local_counted(nodes, arrays && shares);
+}
+
+fn mark_local_counted(nodes: &mut [NasNodeInfo], counted: bool) {
+    for node in nodes.iter_mut().filter(|n| n.is_local) {
+        node.per_org_counted = counted;
+    }
+}
+
+fn add_own_shares(nodes: &mut [NasNodeInfo], total: u32, errors: u32) {
+    for node in nodes.iter_mut().filter(|n| n.is_local) {
+        node.shares_total = total;
+        if errors > 0 && node.health == "ok" {
+            node.health = "warning".to_string();
+        }
+    }
 }
 
 /// `scope_local_arrays` over what it read. An own array missing from the
@@ -507,6 +564,8 @@ pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
                 disks_critical: s.disks_critical,
                 arrays_total: s.arrays_total,
                 arrays_unmeasured: s.arrays_unmeasured,
+                // Set by `scope_local_org_figures`, on this node's row only.
+                per_org_counted: false,
                 updated_at: (!s.updated_at.is_empty()).then_some(s.updated_at),
                 node_id,
             }
@@ -763,5 +822,93 @@ mod tests {
                 "{org}: the badge and the list agree"
             );
         }
+    }
+
+    /// The published row carries no share figure (every tenant reads it);
+    /// the local row gets the asking tenant's own count and turns "warning"
+    /// only for a broken share of THAT tenant — never downgrading a worse
+    /// grade, and never touching a remote row.
+    #[test]
+    fn the_local_row_counts_only_the_callers_shares() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&conn).unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let share = |id: &str, name: &str| super::super::db::ShareRow {
+            share_id: id.into(),
+            name: name.into(),
+            protocol: "nfs".into(),
+            source_path: format!("/mnt/tank/{name}"),
+            nfs: Some(Default::default()),
+            state: "active".into(),
+            ..Default::default()
+        };
+        super::super::db::upsert_share(&db, "org-a", &share("a1", "projekty")).unwrap();
+        super::super::db::upsert_share(&db, "org-b", &share("b1", "kadry")).unwrap();
+        super::super::db::upsert_share(&db, "org-b", &share("b2", "place")).unwrap();
+        super::super::db::set_share_state(&db, "b2", "error", "source path is not mounted").unwrap();
+
+        let rows = || {
+            vec![
+                NasNodeInfo { is_local: true, health: "ok".into(), shares_total: 9, ..Default::default() },
+                NasNodeInfo { is_local: false, health: "ok".into(), shares_total: 0, ..Default::default() },
+            ]
+        };
+        let mut a = rows();
+        scope_local_shares(&mut a, &db, "org-a");
+        assert_eq!((a[0].shares_total, a[0].health.as_str()), (1, "ok"), "org B's broken share is not A's warning");
+        assert_eq!(a[1].shares_total, 0);
+        let mut b = rows();
+        scope_local_shares(&mut b, &db, "org-b");
+        assert_eq!((b[0].shares_total, b[0].health.as_str()), (2, "warning"));
+        assert_eq!(b[1].health, "ok", "a remote row is never touched");
+        let mut critical = rows();
+        critical[0].health = "critical".into();
+        scope_local_shares(&mut critical, &db, "org-b");
+        assert_eq!(critical[0].health, "critical");
+    }
+
+    /// `per_org_counted` is what lets the front tell a real 0 from a figure
+    /// nobody counted: true on THIS node's row only when both scoped reads
+    /// succeeded for a caller with an organisation — never on a remote row,
+    /// never for a caller without an organisation, never after a failed read.
+    #[test]
+    fn the_local_row_is_counted_only_when_both_scoped_reads_succeed() {
+        let migrated = || {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            super::super::db::migrate(&conn).unwrap();
+            conn
+        };
+        let pool = |conn: rusqlite::Connection| -> DbPool { std::sync::Arc::new(crate::db::Db::from_connection(conn)) };
+        let rows = || {
+            vec![
+                NasNodeInfo { node_id: "local".into(), is_local: true, ..Default::default() },
+                NasNodeInfo { node_id: "peer".into(), is_local: false, ..Default::default() },
+            ]
+        };
+        let counted = |db: &DbPool, org: &str| {
+            let mut nodes = rows();
+            scope_local_org_figures(&mut nodes, db, org);
+            (nodes[0].per_org_counted, nodes[1].per_org_counted)
+        };
+
+        // Both reads succeed — an organisation with nothing on this node is a
+        // counted 0, which is exactly the case the flag exists for.
+        let db = pool(migrated());
+        assert_eq!(counted(&db, "org-a"), (true, false));
+        // No organisation: the arrays are not read at all.
+        assert_eq!(counted(&db, ""), (false, false));
+
+        // The share read fails, the array read does not.
+        let conn = migrated();
+        conn.execute_batch("DROP TABLE nas_shares;").unwrap();
+        assert_eq!(counted(&pool(conn), "org-a"), (false, false), "a failed share read is not a counted 0");
+
+        // The array read fails, the share read does not.
+        let conn = migrated();
+        conn.execute_batch("DROP TABLE nas_elastic_arrays;").unwrap();
+        assert_eq!(counted(&pool(conn), "org-a"), (false, false), "a failed array read is not a counted 0");
+
+        // A row as `nodes` builds it, before any scoping, is not counted.
+        assert!(rows().iter().all(|n| !n.per_org_counted));
     }
 }

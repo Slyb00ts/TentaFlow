@@ -336,9 +336,11 @@ fn record_state(db: &DbPool, state: &str, detail: &str) {
 
 /// What the view shows above the table: which shares audit, which of them lose
 /// the audit on their RDMA path, how much history is kept and whether the last
-/// collection worked.
-pub fn state(db: &DbPool) -> NasAccessAuditState {
-    let shares = store::list_shares(db).unwrap_or_default();
+/// collection worked — for the ASKING organisation (migration 20): its own
+/// shares and its own line count. The collector's health is the node's one
+/// journal reader and names nobody, so it is the same for everyone.
+pub fn state_for_org(db: &DbPool, org_id: &str) -> NasAccessAuditState {
+    let shares = store::list_shares_of_org(db, org_id).unwrap_or_default();
     let audited_shares: Vec<String> = shares
         .iter()
         .filter(|s| s.protocol == "smb")
@@ -371,7 +373,7 @@ pub fn state(db: &DbPool) -> NasAccessAuditState {
         collected_at: store::setting(db, store::SETTING_AUDIT_COLLECTED_AT)
             .ok()
             .flatten(),
-        event_count: store::access_event_count(db).unwrap_or(0),
+        event_count: store::access_event_count(db, org_id).unwrap_or(0),
     }
 }
 
@@ -500,19 +502,41 @@ mod tests {
             .any(|e| e.operation.contains("Permission")));
     }
 
+    /// The two shares the journal fixture logs, owned by `org-a` — a line is
+    /// stamped with its share's owner when it is collected (migration 20).
+    fn owned_shares(p: &DbPool) {
+        for name in ["projekty", "archiwum"] {
+            store::upsert_share(
+                p,
+                "org-a",
+                &ShareRow {
+                    share_id: format!("s-{name}"),
+                    name: name.to_string(),
+                    protocol: "smb".to_string(),
+                    source_path: format!("/mnt/tank/{name}"),
+                    smb: Some(NasSmbOptions::default()),
+                    ..Default::default()
+                },
+            )
+            .expect("share");
+        }
+    }
+
     #[test]
     fn the_log_filters_by_share_user_operation_and_result() {
         let p = db();
+        owned_shares(&p);
         let rows = parse_journal(JOURNAL).events;
         assert_eq!(store::insert_access_events(&p, &rows).expect("insert"), 3);
 
-        let all = store::access_events(&p, &store::AccessFilter::default()).expect("all");
+        let all = store::access_events(&p, "org-a", &store::AccessFilter::default()).expect("all");
         assert_eq!(all.1, 3);
         // Newest first.
         assert_eq!(all.0[0].operation, "renameat");
 
         let by_share = store::access_events(
             &p,
+            "org-a",
             &store::AccessFilter {
                 share: "projekty",
                 ..Default::default()
@@ -524,6 +548,7 @@ mod tests {
 
         let failures = store::access_events(
             &p,
+            "org-a",
             &store::AccessFilter {
                 result: "fail",
                 ..Default::default()
@@ -535,6 +560,7 @@ mod tests {
 
         let by_user = store::access_events(
             &p,
+            "org-a",
             &store::AccessFilter {
                 user: "jan",
                 ..Default::default()
@@ -545,6 +571,7 @@ mod tests {
 
         let by_op = store::access_events(
             &p,
+            "org-a",
             &store::AccessFilter {
                 operation: "openat",
                 ..Default::default()
@@ -556,6 +583,7 @@ mod tests {
         // Two filters at once narrow rather than widen.
         let both = store::access_events(
             &p,
+            "org-a",
             &store::AccessFilter {
                 share: "projekty",
                 result: "ok",
@@ -568,6 +596,7 @@ mod tests {
         // `since` cuts the window; `limit` cuts the page but not the total.
         let since = store::access_events(
             &p,
+            "org-a",
             &store::AccessFilter {
                 since: "2026-09-03T12:12:05Z",
                 ..Default::default()
@@ -577,6 +606,7 @@ mod tests {
         assert_eq!(since.1, 1);
         let paged = store::access_events(
             &p,
+            "org-a",
             &store::AccessFilter {
                 limit: 2,
                 ..Default::default()
@@ -586,7 +616,7 @@ mod tests {
         assert_eq!((paged.0.len(), paged.1), (2, 3));
 
         // The filters offer what the node actually logged.
-        let (shares, users, operations) = store::access_facets(&p).expect("facets");
+        let (shares, users, operations) = store::access_facets(&p, "org-a").expect("facets");
         assert_eq!(shares, vec!["archiwum", "projekty"]);
         assert_eq!(users, vec!["anna", "jan"]);
         assert_eq!(operations, vec!["openat", "renameat", "unlinkat"]);
@@ -608,11 +638,12 @@ mod tests {
             result: "ok".to_string(),
             ..Default::default()
         };
+        owned_shares(&p);
         store::insert_access_events(&p, &[event(stamp(old)), event(stamp(fresh))])
             .expect("insert");
-        assert_eq!(store::access_event_count(&p).expect("count"), 2);
+        assert_eq!(store::access_event_count(&p, "org-a").expect("count"), 2);
         assert_eq!(store::prune_access_events(&p).expect("prune"), 1);
-        let rows = store::access_events(&p, &store::AccessFilter::default()).expect("rows");
+        let rows = store::access_events(&p, "org-a", &store::AccessFilter::default()).expect("rows");
         assert_eq!(rows.1, 1);
         assert_eq!(rows.0[0].at, stamp(fresh));
         // A second pass has nothing left to drop.
@@ -627,6 +658,7 @@ mod tests {
         for (name, smb_direct) in [("projekty", true), ("archiwum", false)] {
             store::upsert_share(
                 &p,
+                "org-a",
                 &ShareRow {
                     share_id: format!("s-{name}"),
                     name: name.to_string(),
@@ -643,6 +675,7 @@ mod tests {
         }
         store::upsert_share(
             &p,
+            "org-a",
             &ShareRow {
                 share_id: "s-backups".to_string(),
                 name: "backups".to_string(),
@@ -657,13 +690,36 @@ mod tests {
         )
         .expect("share");
 
-        let state = state(&p);
+        // Another organisation's audited share is on the node — the collector
+        // reads it (`audited_shares`) — but not in org A's state.
+        store::upsert_share(
+            &p,
+            "org-b",
+            &ShareRow {
+                share_id: "s-kadry".to_string(),
+                name: "kadry".to_string(),
+                protocol: "smb".to_string(),
+                source_path: "/mnt/tank/kadry".to_string(),
+                smb: Some(NasSmbOptions {
+                    smb_direct: true,
+                    ..audited(&["writes"], true, true)
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("share");
+
+        let state = state_for_org(&p, "org-a");
         assert_eq!(state.audited_shares, vec!["archiwum", "projekty"]);
         assert_eq!(state.unaudited_smb_direct, vec!["projekty"]);
         assert_eq!(state.audited_exports, vec!["backups"]);
         assert_eq!(state.retention_days, store::ACCESS_LOG_DAYS);
         assert_eq!(state.event_count, 0);
-        assert_eq!(audited_shares(&p), vec!["archiwum", "projekty"]);
+        assert_eq!(audited_shares(&p), vec!["archiwum", "kadry", "projekty"]);
+        let theirs = state_for_org(&p, "org-b");
+        assert_eq!(theirs.audited_shares, vec!["kadry"]);
+        assert_eq!(theirs.unaudited_smb_direct, vec!["kadry"]);
+        assert!(theirs.audited_exports.is_empty());
 
         // The auditd document watches exactly the audited export's path.
         let rules = tentanas_helper::audit_rules_file(&audit_rules(

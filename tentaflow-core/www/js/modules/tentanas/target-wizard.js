@@ -48,6 +48,13 @@ export const targetNameValid = (name) => NAME_RE.test(name);
 // nothing checking it is a divergence waiting to happen.
 export const WWN_AUTHORITY = '2026-09.local.tentaflow';
 
+// What a volume's `exportedBy` carries when the target exporting it belongs to
+// ANOTHER organisation: taken, with no name to show. It MUST equal
+// `EXPORTED_BY_OTHER_ORG` in tentanas/targets.rs, pinned there by a test that
+// reads this file, like `WWN_AUTHORITY` above. `*` can never be a real name
+// (`targetNameValid`), so the two cases cannot be confused.
+export const VOLUME_TAKEN_BY_OTHER_ORG = '*';
+
 /**
  * The IQN/NQN host segment for the step-3 preview, or '' when it is unknown.
  *
@@ -454,9 +461,14 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
   const volumeOptions = () => {
     const rows = (caps.volumes || []).map((v) => ({
       value: v.name,
-      label: v.exportedBy
-        ? T('wizard_target.volume_taken', { name: v.name, target: v.exportedBy })
-        : T('wizard_target.volume_free', { name: v.name, size: fmtBytes(v.sizeBytes) }),
+      // `*` is the server's "exported by a target of ANOTHER organisation":
+      // the zvol is taken, and whose target holds it is not ours to know
+      // (`targets::EXPORTED_BY_OTHER_ORG`), so no name goes into the sentence.
+      label: v.exportedBy === VOLUME_TAKEN_BY_OTHER_ORG
+        ? T('wizard_target.volume_taken_other', { name: v.name })
+        : v.exportedBy
+          ? T('wizard_target.volume_taken', { name: v.name, target: v.exportedBy })
+          : T('wizard_target.volume_free', { name: v.name, size: fmtBytes(v.sizeBytes) }),
       disabled: Boolean(v.exportedBy),
     }));
     if (!rows.some((r) => !r.disabled)) {
