@@ -1577,6 +1577,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "IamListPermissionsResponse"
             }
             tentaflow_protocol::IamPayload::ResOk => "IamOkResponse",
+            tentaflow_protocol::IamPayload::ReqListOrganizations => "IamListOrganizationsRequest",
+            tentaflow_protocol::IamPayload::ResListOrganizations { .. } => {
+                "IamListOrganizationsResponse"
+            }
         },
         MessageBody::AuditLogListRequestBody(_) => "AuditLogListRequest",
         MessageBody::AuditLogListResponseBody(_) => "AuditLogListResponse",

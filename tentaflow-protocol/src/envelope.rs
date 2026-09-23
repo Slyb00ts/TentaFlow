@@ -288,6 +288,13 @@ mod serde_array64 {
 // addressed by account id, not by service id — nothing replaces these
 // variants because nothing on the new path ever named a service row to
 // begin with.
+//
+// Also from F3-REST (schema registry REST, `bus_schema_registry` API-key
+// scopes): `IamPayload` gained `ReqListOrganizations`/`ResListOrganizations`
+// (appended; ciborium tags by NAME), and `ResourceRef`,
+// `ApiKeyScopeSetRequest`, `ApiKeyScopeClearRequest` and `PermissionEntry`
+// gained an `action` field with `#[serde(default)]`, so nothing already on the
+// wire re-encodes. No separate v33: 32 has not shipped either.
 pub const SCHEMA_VERSION: u16 = 32;
 
 // =============================================================================

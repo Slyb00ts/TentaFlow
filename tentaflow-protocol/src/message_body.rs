@@ -612,9 +612,15 @@ pub struct ApiKeySummary {
 /// One resource entry on a general key's explicit allowlist at creation time.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ResourceRef {
-    /// 'model' | 'flow' | 'alias'.
+    /// 'model' | 'flow' | 'alias' | 'model_bundle' | 'ml_studio_export' |
+    /// 'topic' | 'bus_schema_registry'.
     pub resource_type: String,
     pub resource_id: String,
+    /// 'read' | 'write' for `bus_schema_registry` (each its own grant — write
+    /// never implies read); absent for every other type, whose grants carry no
+    /// action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -7503,6 +7509,18 @@ pub struct PermissionEntry {
     pub subject_type: String,
     pub subject_id: String,
     pub access_level: String,
+    /// 'read' | 'write' | 'admin' | '*' — `'*'` is the action-blind grant every
+    /// resource type other than `topic` and `bus_schema_registry` stores.
+    #[serde(default)]
+    pub action: String,
+}
+
+/// One organisation known to this node, for admin pickers that must scope a
+/// grant to an organisation (API-key `bus_schema_registry` scopes).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct OrganizationInfo {
+    pub org_id: String,
+    pub name: String,
 }
 
 /// Inner-enum pack dla calego Identity & Access Management —
@@ -7608,6 +7626,12 @@ pub enum IamPayload {
 
     // Generic OK dla mutacji (delete/update/set) bez specyficznego response.
     ResOk,
+
+    // ---- Organisations ----
+    ReqListOrganizations,
+    ResListOrganizations {
+        orgs: Vec<OrganizationInfo>,
+    },
 }
 
 /// Jeden fragment pliku wgrywanego z panelu UI addona do JEGO document store.
@@ -8262,18 +8286,24 @@ pub enum MessageBody {
     ApiKeyScopeListResponse {
         entries: Vec<PermissionEntry>,
     },
-    /// Sets one allow/deny scope entry for a general key.
+    /// Sets one allow/deny scope entry for a general key. `action` is required
+    /// ('read' | 'write') for `bus_schema_registry` and absent otherwise.
     ApiKeyScopeSetRequest {
         key_uid: String,
         resource_type: String,
         resource_id: String,
         access_level: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
     },
-    /// Removes one scope entry for a general key.
+    /// Removes one scope entry for a general key — only that action's row when
+    /// `action` is given (`bus_schema_registry`), every row otherwise.
     ApiKeyScopeClearRequest {
         key_uid: String,
         resource_type: String,
         resource_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
     },
     /// Rotates a key's secret: new token, same uid + scope, old token invalid.
     ApiKeyRotateRequest {
@@ -8876,10 +8906,18 @@ mod tests {
             name: "svc".to_string(),
             key_type: "general".to_string(),
             subject_id: None,
-            scope_resources: vec![ResourceRef {
-                resource_type: "model".to_string(),
-                resource_id: "gpt-4o".to_string(),
-            }],
+            scope_resources: vec![
+                ResourceRef {
+                    resource_type: "model".to_string(),
+                    resource_id: "gpt-4o".to_string(),
+                    action: None,
+                },
+                ResourceRef {
+                    resource_type: "bus_schema_registry".to_string(),
+                    resource_id: "17\u{1f}tentabus-aaaaaaaa5\u{1f}org-1".to_string(),
+                    action: Some("write".to_string()),
+                },
+            ],
         });
         assert_eq!(round_trip(create.clone()), create);
 
@@ -8896,6 +8934,80 @@ mod tests {
 
         let revoked = MessageBody::ApiKeyRevokeResponse { deleted: true };
         assert_eq!(round_trip(revoked.clone()), revoked);
+    }
+
+    /// The `action` fields were appended with `serde(default)`: a scope
+    /// request encoded without them (every sender before `bus_schema_registry`
+    /// scopes existed) must still decode, as the action-blind grant.
+    #[test]
+    fn api_key_scope_action_is_optional_on_the_wire() {
+        #[derive(serde::Serialize)]
+        enum Legacy {
+            ApiKeyScopeSetRequest {
+                key_uid: String,
+                resource_type: String,
+                resource_id: String,
+                access_level: String,
+            },
+        }
+        let bytes = crate::cbor::encode(&Legacy::ApiKeyScopeSetRequest {
+            key_uid: "k".to_string(),
+            resource_type: "model".to_string(),
+            resource_id: "gpt-4o".to_string(),
+            access_level: "allow".to_string(),
+        })
+        .expect("encode legacy shape");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode legacy shape");
+        assert_eq!(
+            decoded,
+            MessageBody::ApiKeyScopeSetRequest {
+                key_uid: "k".to_string(),
+                resource_type: "model".to_string(),
+                resource_id: "gpt-4o".to_string(),
+                access_level: "allow".to_string(),
+                action: None,
+            }
+        );
+
+        let set = MessageBody::ApiKeyScopeSetRequest {
+            key_uid: "k".to_string(),
+            resource_type: "bus_schema_registry".to_string(),
+            resource_id: "x".to_string(),
+            access_level: "allow".to_string(),
+            action: Some("read".to_string()),
+        };
+        assert_eq!(round_trip(set.clone()), set);
+        let clear = MessageBody::ApiKeyScopeClearRequest {
+            key_uid: "k".to_string(),
+            resource_type: "bus_schema_registry".to_string(),
+            resource_id: "x".to_string(),
+            action: Some("write".to_string()),
+        };
+        assert_eq!(round_trip(clear.clone()), clear);
+        let listed = MessageBody::ApiKeyScopeListResponse {
+            entries: vec![PermissionEntry {
+                resource_type: "bus_schema_registry".to_string(),
+                resource_id: "x".to_string(),
+                subject_type: "api_key".to_string(),
+                subject_id: "k".to_string(),
+                access_level: "allow".to_string(),
+                action: "read".to_string(),
+            }],
+        };
+        assert_eq!(round_trip(listed.clone()), listed);
+    }
+
+    #[test]
+    fn iam_organization_list_round_trip() {
+        let req = MessageBody::IamBody(IamPayload::ReqListOrganizations);
+        assert_eq!(round_trip(req.clone()), req);
+        let resp = MessageBody::IamBody(IamPayload::ResListOrganizations {
+            orgs: vec![OrganizationInfo {
+                org_id: "org-1".to_string(),
+                name: "Szpital".to_string(),
+            }],
+        });
+        assert_eq!(round_trip(resp.clone()), resp);
     }
 
     #[test]

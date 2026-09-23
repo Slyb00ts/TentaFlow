@@ -294,8 +294,10 @@ pub fn encode_api_key_list_request() -> Result<Vec<u8>, JsError> {
 }
 
 /// MessageBody::ApiKeyCreateRequest { name, key_type, subject_id, scope_resources }.
-/// `scope_resources` travels as two parallel arrays (types[i] + ids[i]) so the
-/// wasm-bindgen boundary stays on simple `Vec<String>` values.
+/// `scope_resources` travels as three parallel arrays (types[i] + ids[i] +
+/// actions[i]) so the wasm-bindgen boundary stays on simple `Vec<String>`
+/// values; an empty action means "no action" (every type but
+/// `bus_schema_registry`).
 #[wasm_bindgen(js_name = encodeApiKeyCreateRequest)]
 pub fn encode_api_key_create_request(
     name: String,
@@ -303,14 +305,22 @@ pub fn encode_api_key_create_request(
     subject_id: Option<String>,
     scope_types: Vec<String>,
     scope_ids: Vec<String>,
+    scope_actions: Vec<String>,
 ) -> Result<Vec<u8>, JsError> {
+    if scope_types.len() != scope_ids.len() || scope_types.len() != scope_actions.len() {
+        return Err(JsError::new(
+            "scope types, ids and actions must have the same length",
+        ));
+    }
     let scope_resources = scope_types
         .into_iter()
         .zip(scope_ids)
+        .zip(scope_actions)
         .map(
-            |(resource_type, resource_id)| tentaflow_protocol::ResourceRef {
+            |((resource_type, resource_id), action)| tentaflow_protocol::ResourceRef {
                 resource_type,
                 resource_id,
+                action: (!action.is_empty()).then_some(action),
             },
         )
         .collect();
@@ -330,34 +340,38 @@ pub fn encode_api_key_scope_list_request(key_uid: String) -> Result<Vec<u8>, JsE
         .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ApiKeyScopeSetRequest { key_uid, resource_type, resource_id, access_level }.
+/// MessageBody::ApiKeyScopeSetRequest { key_uid, resource_type, resource_id, access_level, action }.
 #[wasm_bindgen(js_name = encodeApiKeyScopeSetRequest)]
 pub fn encode_api_key_scope_set_request(
     key_uid: String,
     resource_type: String,
     resource_id: String,
     access_level: String,
+    action: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ApiKeyScopeSetRequest {
         key_uid,
         resource_type,
         resource_id,
         access_level,
+        action,
     })
     .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ApiKeyScopeClearRequest { key_uid, resource_type, resource_id }.
+/// MessageBody::ApiKeyScopeClearRequest { key_uid, resource_type, resource_id, action }.
 #[wasm_bindgen(js_name = encodeApiKeyScopeClearRequest)]
 pub fn encode_api_key_scope_clear_request(
     key_uid: String,
     resource_type: String,
     resource_id: String,
+    action: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ApiKeyScopeClearRequest {
         key_uid,
         resource_type,
         resource_id,
+        action,
     })
     .map_err(|e| JsError::new(&e))
 }
@@ -2265,6 +2279,8 @@ pub fn encode_bus_acl_list_request(instance_id: String, topic: String) -> Result
 }
 
 /// `access_level` is 'allow' | 'deny' | 'clear' (see `bus.rs`'s doc).
+/// `action` is 'read' | 'write' | 'admin' | '*'; omitted, it is `'*'` — the
+/// same default the wire gives a sender that does not carry the field.
 #[wasm_bindgen(js_name = encodeBusAclSetRequest)]
 pub fn encode_bus_acl_set_request(
     instance_id: String,
@@ -2272,6 +2288,7 @@ pub fn encode_bus_acl_set_request(
     subject_type: String,
     subject_id: String,
     access_level: String,
+    action: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
         instance_id,
@@ -2280,11 +2297,7 @@ pub fn encode_bus_acl_set_request(
             subject_type,
             subject_id,
             access_level,
-            // The browser does not pick an action yet (codec.js sends none), so
-            // this is the protocol's documented default for a payload without
-            // one: '*', every action — exactly what the request meant before
-            // the field existed.
-            action: "*".to_string(),
+            action: action.unwrap_or_else(|| "*".to_string()),
         },
     }))
     .map_err(|e| JsError::new(&e))
@@ -6543,6 +6556,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "subjectType", e.subject_type.into());
                 set(&item, "subjectId", e.subject_id.into());
                 set(&item, "accessLevel", e.access_level.into());
+                set(&item, "action", e.action.into());
                 arr.push(&item.into());
             }
             set(&obj, "entries", arr.into());
@@ -6560,22 +6574,30 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             resource_type,
             resource_id,
             access_level,
+            action,
         } => {
             set(&obj, "variant", "ApiKeyScopeSetRequest".into());
             set(&obj, "keyUid", key_uid.into());
             set(&obj, "resourceType", resource_type.into());
             set(&obj, "resourceId", resource_id.into());
             set(&obj, "accessLevel", access_level.into());
+            if let Some(action) = action {
+                set(&obj, "action", action.into());
+            }
         }
         MessageBody::ApiKeyScopeClearRequest {
             key_uid,
             resource_type,
             resource_id,
+            action,
         } => {
             set(&obj, "variant", "ApiKeyScopeClearRequest".into());
             set(&obj, "keyUid", key_uid.into());
             set(&obj, "resourceType", resource_type.into());
             set(&obj, "resourceId", resource_id.into());
+            if let Some(action) = action {
+                set(&obj, "action", action.into());
+            }
         }
         MessageBody::ApiKeyRotateRequest { key_uid } => {
             set(&obj, "variant", "ApiKeyRotateRequest".into());
@@ -7335,11 +7357,26 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&item, "subject_id", e.subject_id.clone().into());
                         set(&item, "accessLevel", e.access_level.clone().into());
                         set(&item, "access_level", e.access_level.clone().into());
+                        set(&item, "action", e.action.clone().into());
                         arr.push(&item.into());
                     }
                     set(&obj, "entries", arr.into());
                 }
                 IP::ResOk => set(&obj, "variant", "IamOkResponse".into()),
+                IP::ReqListOrganizations => {
+                    set(&obj, "variant", "IamListOrganizationsRequest".into())
+                }
+                IP::ResListOrganizations { orgs } => {
+                    set(&obj, "variant", "IamListOrganizationsResponse".into());
+                    let arr = js_sys::Array::new();
+                    for o in orgs {
+                        let item = js_sys::Object::new();
+                        set(&item, "orgId", o.org_id.clone().into());
+                        set(&item, "name", o.name.clone().into());
+                        arr.push(&item.into());
+                    }
+                    set(&obj, "orgs", arr.into());
+                }
             }
         }
 
@@ -17068,6 +17105,11 @@ pub fn encode_iam_reset_password(
 #[wasm_bindgen(js_name = encodeIamListGroupsRequest)]
 pub fn encode_iam_list_groups() -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqListGroups)
+}
+
+#[wasm_bindgen(js_name = encodeIamListOrganizationsRequest)]
+pub fn encode_iam_list_organizations() -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqListOrganizations)
 }
 
 #[wasm_bindgen(js_name = encodeIamCreateGroupRequest)]

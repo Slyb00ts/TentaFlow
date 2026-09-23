@@ -88,16 +88,21 @@ pub fn check_access_safe(
 /// Egzekucja ACL dla /v1 (Tier 2) — fail-CLOSED. Semantyka default DENY
 /// (patrz `resource_permissions::check_subject_default_deny`). Przy bledzie DB
 /// zwraca `false` (deny) i loguje warn — odwrotnosc `check_access_safe`.
+///
+/// `action` is `"*"` for every resource type whose grants carry no action;
+/// `bus_schema_registry` passes `"read"` or `"write"`.
 pub fn check_v1_access(
     db: &DbPool,
     resource_type: &str,
     resource_id: &str,
+    action: &str,
     principal: &Principal,
 ) -> bool {
     match crate::db::repository::resource_permissions::check_subject_default_deny(
         db,
         resource_type,
         resource_id,
+        action,
         principal,
     ) {
         Ok(v) => v,
@@ -105,6 +110,7 @@ pub fn check_v1_access(
             tracing::warn!(
                 resource_type,
                 resource_id,
+                action,
                 ?principal,
                 "v1 ACL check failed — fail-closed (deny): {}",
                 e

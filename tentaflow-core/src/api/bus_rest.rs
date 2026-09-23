@@ -171,7 +171,7 @@ fn parse_query(raw: &str) -> std::result::Result<BusRecordsQuery, &'static str> 
     Ok(q)
 }
 
-fn json_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
+pub(crate) fn json_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
     let stream = futures::stream::once(async move { Ok(Frame::data(Bytes::from(body))) });
     let boxed_stream: Pin<
         Box<dyn futures::Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
@@ -183,7 +183,7 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
         .unwrap()
 }
 
-fn error_response(
+pub(crate) fn error_response(
     status: StatusCode,
     error_type: &str,
     message: impl Into<String>,
@@ -199,7 +199,9 @@ fn error_response(
 }
 
 /// Same intent as `host_functions/bus.rs`'s `map_bus_error`, HTTP-flavored.
-fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
+/// Shared with the schema registry REST (`api/bus_schema_rest.rs`), which
+/// maps the same registry errors the WS surface does.
+pub(crate) fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
     match e {
         BusServiceError::TopicNotFound { .. } => {
             error_response(StatusCode::NOT_FOUND, "not_found_error", e.to_string())
@@ -453,7 +455,7 @@ fn resolve_instance(
 /// fallback to whichever OTHER instance happens to be running on this node:
 /// that fallback is the exact cross-instance leak this endpoint must not
 /// have.
-fn resolve_engine(
+pub(crate) fn resolve_engine(
     db: &crate::db::DbPool,
     instance: Option<&str>,
 ) -> std::result::Result<(BusInstanceId, Arc<bus::BusService>), Response<OpenAIBody>> {
@@ -856,6 +858,79 @@ pub async fn handle_consume(
     ))
 }
 
+/// Fixtures shared by the records REST tests below and the schema registry
+/// REST tests (`api/bus_schema_rest.rs`): both need a real, registry-visible
+/// engine behind an installed-and-enabled instance.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Local double of the process-wide test authorizer every `bus::mod`
+    /// test module keeps its own copy of (`AllowAllAuthorizer`'s doc there
+    /// notes it is intentionally not shared: it is a private `#[cfg(test)]`
+    /// item). The suites using it test instance ROUTING and the schema
+    /// registry REST gate, not topic RBAC, so an always-allow authorizer keeps
+    /// the fixtures focused.
+    struct AllowAllAuthorizer;
+    impl bus::BusAuthorizer for AllowAllAuthorizer {
+        fn authorize(
+            &self,
+            _ctx: &BusCallContext,
+            _action: bus::BusAction,
+            _topic: &str,
+        ) -> std::result::Result<(), BusServiceError> {
+            Ok(())
+        }
+        fn authorize_group(
+            &self,
+            _ctx: &BusCallContext,
+            _action: bus::BusAction,
+            _topic: &str,
+            _group: &str,
+        ) -> std::result::Result<(), BusServiceError> {
+            Ok(())
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Installs an ENABLED `tentabus` instance (`suffix` must be 8 lowercase
+    /// hex chars — `BusInstanceId::parse`'s shape) and starts a real,
+    /// registry-visible engine for it (`bus::init_instance`, exactly what
+    /// `resolve_engine`'s `bus::instance` lookup reads from). The returned
+    /// `TempDir` must outlive every use of the engine.
+    pub(crate) fn start_test_instance(
+        state: &Arc<crate::dispatch::state::AppState>,
+        suffix: &str,
+    ) -> (tempfile::TempDir, BusInstanceId, Arc<bus::BusService>) {
+        let addon_id = app_gate::test_support::install_app_instance(
+            state,
+            BusInstanceId::PACKAGE_ID,
+            suffix,
+            &[],
+        );
+        let id = BusInstanceId::parse(&addon_id).expect("test suffix produces a valid instance id");
+        let dir = tempfile::tempdir().expect("bus dir");
+        let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+        crate::bus::db::migrate(&local_conn).expect("migrate local db");
+        let local_db: crate::db::DbPool = Arc::new(crate::db::Db::from_connection(local_conn));
+        let svc = bus::init_instance(bus::BusInitConfig {
+            instance_id: id.clone(),
+            local_db,
+            bus_dir: dir.path().to_path_buf(),
+            db: state.db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus init_instance");
+        (dir, id, svc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +938,7 @@ mod tests {
     // auto-create path goes through `BusService::autocreate_topic`, which
     // picks the options itself.
     use crate::bus::topics::TopicOptions;
+    use test_support::start_test_instance;
 
     #[test]
     fn parse_bus_records_path_matches_the_legacy_shape() {
@@ -983,72 +1059,8 @@ mod tests {
 
     // ---- Instance resolution / cross-instance isolation (plan-app-platform §3.2) ----
 
-    /// Local double of the process-wide test authorizer every `bus::mod`
-    /// test module keeps its own copy of (`AllowAllAuthorizer`'s doc there
-    /// notes it is intentionally not shared: it is a private `#[cfg(test)]`
-    /// item). This suite is about instance ROUTING, not RBAC, so an
-    /// always-allow authorizer keeps the fixtures focused.
-    struct AllowAllAuthorizer;
-    impl bus::BusAuthorizer for AllowAllAuthorizer {
-        fn authorize(
-            &self,
-            _ctx: &BusCallContext,
-            _action: bus::BusAction,
-            _topic: &str,
-        ) -> std::result::Result<(), BusServiceError> {
-            Ok(())
-        }
-        fn authorize_group(
-            &self,
-            _ctx: &BusCallContext,
-            _action: bus::BusAction,
-            _topic: &str,
-            _group: &str,
-        ) -> std::result::Result<(), BusServiceError> {
-            Ok(())
-        }
-        fn generation(&self) -> u64 {
-            0
-        }
-    }
-
     fn test_state() -> Arc<crate::dispatch::state::AppState> {
         crate::dispatch::state::AppState::for_test()
-    }
-
-    /// Installs an ENABLED `tentabus` instance (`suffix` must be 8 lowercase
-    /// hex chars — `BusInstanceId::parse`'s shape) and starts a real,
-    /// registry-visible engine for it (`bus::init_instance`, exactly what
-    /// `resolve_engine`'s `bus::instance` lookup reads from). The returned
-    /// `TempDir` must outlive every use of the engine.
-    fn start_test_instance(
-        state: &Arc<crate::dispatch::state::AppState>,
-        suffix: &str,
-    ) -> (tempfile::TempDir, BusInstanceId, Arc<bus::BusService>) {
-        let addon_id = app_gate::test_support::install_app_instance(
-            state,
-            BusInstanceId::PACKAGE_ID,
-            suffix,
-            &[],
-        );
-        let id = BusInstanceId::parse(&addon_id).expect("test suffix produces a valid instance id");
-        let dir = tempfile::tempdir().expect("bus dir");
-        let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
-        crate::bus::db::migrate(&local_conn).expect("migrate local db");
-        let local_db: crate::db::DbPool = Arc::new(crate::db::Db::from_connection(local_conn));
-        let svc = bus::init_instance(bus::BusInitConfig {
-            instance_id: id.clone(),
-            local_db,
-            bus_dir: dir.path().to_path_buf(),
-            db: state.db.clone(),
-            authorizer: Arc::new(AllowAllAuthorizer),
-            retention_interval: None,
-            dedup_expected_rate_per_sec: 10_000,
-            partition_handle_lru: None,
-            publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
-        })
-        .expect("bus init_instance");
-        (dir, id, svc)
     }
 
     #[test]

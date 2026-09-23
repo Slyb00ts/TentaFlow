@@ -141,12 +141,13 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ApiKeyCreateRequest { name, keyType, subjectId?, scopeResources: {resourceType,resourceId}[] } */
+  /** MessageBody::ApiKeyCreateRequest { name, keyType, subjectId?, scopeResources: {resourceType,resourceId,action?}[] } */
   apiKeyCreateRequest(correlationId, { name, keyType = 'user', subjectId = null, scopeResources = [] }, sequence = 1) {
     assertReady();
     const types = scopeResources.map((r) => r.resourceType);
     const ids = scopeResources.map((r) => r.resourceId);
-    const body = _wasm.encodeApiKeyCreateRequest(name, keyType, subjectId ?? undefined, types, ids);
+    const actions = scopeResources.map((r) => r.action ?? '');
+    const body = _wasm.encodeApiKeyCreateRequest(name, keyType, subjectId ?? undefined, types, ids, actions);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -157,17 +158,17 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ApiKeyScopeSetRequest { keyUid, resourceType, resourceId, accessLevel } */
-  apiKeyScopeSetRequest(correlationId, { keyUid, resourceType, resourceId, accessLevel }, sequence = 1) {
+  /** MessageBody::ApiKeyScopeSetRequest { keyUid, resourceType, resourceId, accessLevel, action? } */
+  apiKeyScopeSetRequest(correlationId, { keyUid, resourceType, resourceId, accessLevel, action = null }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyScopeSetRequest(keyUid, resourceType, resourceId, accessLevel);
+    const body = _wasm.encodeApiKeyScopeSetRequest(keyUid, resourceType, resourceId, accessLevel, action ?? undefined);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ApiKeyScopeClearRequest { keyUid, resourceType, resourceId } */
-  apiKeyScopeClearRequest(correlationId, { keyUid, resourceType, resourceId }, sequence = 1) {
+  /** MessageBody::ApiKeyScopeClearRequest { keyUid, resourceType, resourceId, action? } */
+  apiKeyScopeClearRequest(correlationId, { keyUid, resourceType, resourceId, action = null }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyScopeClearRequest(keyUid, resourceType, resourceId);
+    const body = _wasm.encodeApiKeyScopeClearRequest(keyUid, resourceType, resourceId, action ?? undefined);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -5786,6 +5787,12 @@ export const encode = {
   iamListGroupsRequest(correlationId, _payload, sequence = 1) {
     assertReady();
     const body = _wasm.encodeIamListGroupsRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  /** MessageBody::IamBody(ReqListOrganizations) — every organisation on this node (admin). */
+  iamListOrganizationsRequest(correlationId, _payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamListOrganizationsRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamCreateGroupRequest(correlationId, p, sequence = 1) {

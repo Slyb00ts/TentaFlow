@@ -5,7 +5,10 @@
 //     wizard modal (3 steps, deploy-style step indicator) + rotate/revoke.
 //   - Macierz dostępu: addon-style permission matrix (rows = subjects, columns
 //     = resources model/flow/alias, tri-state allow/deny/inherit), subtabs
-//     Per grupa / Per user / Per klucz / Domyślne.
+//     Per grupa / Per user / Per klucz / Domyślne. Per klucz also carries the
+//     "Wzory wiadomości" columns (schema registry REST): one per TentaBus
+//     instance × organisation × read/write, because those grants exist only
+//     for general keys and read never implies write or the other way round.
 //   - Wg zasobu: same data, transposed (pick a resource → who can access it).
 // All writes go through the binary protocol; default-DENY is enforced server
 // side, this screen only edits resource_permissions / api-key scopes.
@@ -15,6 +18,13 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { modelBundleScopeResources } from '/js/modules/catalog/camera-cv-bundles.js';
+import {
+  BUS_SCHEMA_REGISTRY,
+  BUS_SCHEMA_ACTIONS,
+  busSchemaScopeId,
+  busSchemaScopeNames,
+  scopeKey,
+} from '/js/modules/access-keys-scopes.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-window.js';
@@ -33,12 +43,21 @@ let keys = [];
 let groups = [];
 let users = [];
 let resources = { model: [], flow: [], alias: [], model_bundle: [], ml_studio_export: [] };
+// TentaBus instances ({ addonId, title }) and organisations ({ orgId, name })
+// a schema-registry grant can be scoped to.
+let busInstances = [];
+let orgs = [];
+
+const TENTABUS_PACKAGE_ID = 'tentabus';
 
 const NEXT_MODE = { allow: 'deny', deny: 'inherit', inherit: 'allow' };
 
-function t(key, fallback) {
-  const v = I18n.t(key);
-  return v === key && fallback != null ? fallback : v;
+// `vars` feeds I18n's `{name}` and `{count|a|b|c}` forms; the Polish fallback
+// only ever shows when a bundle lacks the key, so it substitutes plain `{name}`.
+function t(key, fallback, vars = null) {
+  const v = I18n.t(key, vars);
+  if (v !== key || fallback == null) return v;
+  return vars ? fallback.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m)) : fallback;
 }
 
 const AccessKeysScreen = {
@@ -58,6 +77,8 @@ const AccessKeysScreen = {
     groups = [];
     users = [];
     resources = { model: [], flow: [], alias: [], model_bundle: [], ml_studio_export: [] };
+    busInstances = [];
+    orgs = [];
   },
 };
 export default AccessKeysScreen;
@@ -92,11 +113,19 @@ function bindTabs() {
   });
 }
 
+// Every render may land after an await: by then the admin can have left the
+// screen (`unmount` clears `host`) or another screen can own `#main`.
+function screenBody() {
+  const body = host?.querySelector('#ak-body');
+  return body?.isConnected ? body : null;
+}
+
 function renderActiveTab() {
+  const body = screenBody();
+  if (!body) return;
   host.querySelectorAll('#ak-tabs .tf-tab-btn').forEach((b) => {
     b.classList.toggle('active', b.dataset.tab === activeTab);
   });
-  const body = host.querySelector('#ak-body');
   if (activeTab === 'keys') renderKeysTab(body);
   else if (activeTab === 'matrix') renderMatrixTab(body);
   else renderByResourceTab(body);
@@ -111,7 +140,7 @@ async function loadKeys() {
 }
 
 async function loadSubjectsAndResources() {
-  const [g, u, models, flows, aliases, visionModels, mlProjects] = await Promise.all([
+  const [g, u, models, flows, aliases, visionModels, mlProjects, apps, orgList] = await Promise.all([
     ApiBinary.action('iamListGroupsRequest').then((r) => r?.groups ?? []).catch(() => []),
     ApiBinary.action('iamListUsersRequest').then((r) => r?.users ?? []).catch(() => []),
     ApiBinary.list('modelListRequest').catch(() => []),
@@ -119,7 +148,20 @@ async function loadSubjectsAndResources() {
     ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
     ApiBinary.one('mlStudioVisionModelsListRequest', {}).then((r) => r?.models ?? []).catch(() => []),
     ApiBinary.one('mlStudioProjectsListRequest').then((r) => r?.projects ?? []).catch(() => []),
+    ApiBinary.list('appsListRequest', { arrayKey: 'apps' }).catch(() => []),
+    ApiBinary.action('iamListOrganizationsRequest').then((r) => r?.orgs ?? []).catch(() => []),
   ]);
+  busInstances = (Array.isArray(apps) ? apps : [])
+    .filter((a) => (a.packageId ?? a.package_id) === TENTABUS_PACKAGE_ID)
+    .map((a) => {
+      const addonId = String(a.addonId ?? a.addon_id ?? '');
+      const title = (a.titleKey && I18n.t(a.titleKey) !== a.titleKey && I18n.t(a.titleKey)) || a.title || '';
+      return { addonId, title: String(title) };
+    })
+    .filter((a) => a.addonId && a.title);
+  orgs = (Array.isArray(orgList) ? orgList : [])
+    .map((o) => ({ orgId: String(o.orgId ?? o.org_id ?? ''), name: String(o.name ?? '') }))
+    .filter((o) => o.orgId && o.name);
   groups = Array.isArray(g) ? g : [];
   users = Array.isArray(u) ? u : [];
   if (keys.length === 0) await loadKeys();
@@ -164,21 +206,22 @@ function allResourceColumns() {
 // ---------------------------------------------------------------------------
 function typeChip(keyType) {
   const map = {
-    user: ['user', t('access_keys.type_user', 'User')],
-    group: ['users', t('access_keys.type_group', 'Grupa')],
-    general: ['key', t('access_keys.type_general', 'Ogólny')],
+    user: ['user', t('access_keys.chip_user', 'User')],
+    group: ['users', t('access_keys.chip_group', 'Grupa')],
+    general: ['key', t('access_keys.chip_general', 'Ogólny')],
   };
   const [icon, label] = map[keyType] || ['key', keyType];
   return `<span class="tf-chip ak-type-${escapeAttr(keyType)}"><svg class="icon icon-xs"><use href="#i-${icon}"/></svg>${escapeHtml(label)}</span>`;
 }
 
 function renderKeysTab(body) {
+  if (!body?.isConnected) return;
   const rows = keys.length === 0
     ? `<tr><td colspan="6"><div class="empty-big" style="padding:24px;">${escapeHtml(t('access_keys.empty', 'Brak kluczy API'))}</div></td></tr>`
     : keys.map((k) => {
         const subject = k.subjectLabel || k.subjectId || (k.keyType === 'general' ? '—' : '');
         const scope = k.keyType === 'general'
-          ? `${k.scopeCount || 0} ${escapeHtml(t('access_keys.resources', 'zasobów'))}`
+          ? escapeHtml(t('access_keys.resources_count', '{count} zasobów', { count: Number(k.scopeCount || 0) }))
           : escapeHtml(t('access_keys.inherits', 'dziedziczy'));
         const status = k.isActive === false
           ? `<span class="tf-chip danger">${escapeHtml(t('access_keys.revoked', 'zrewokowany'))}</span>`
@@ -196,7 +239,7 @@ function renderKeysTab(body) {
           <td style="text-align:right;white-space:nowrap">
             ${scopeBtn}
             <tf-button size="sm" variant="ghost" icon="refresh" data-rotate="${escapeAttr(k.keyId)}">${escapeHtml(t('access_keys.rotate', 'Rotuj'))}</tf-button>
-            <tf-button size="sm" variant="danger" icon="trash" data-revoke="${escapeAttr(k.keyId)}"></tf-button>
+            <tf-button size="sm" variant="danger" icon="trash" data-revoke="${escapeAttr(k.keyId)}" aria-label="${escapeAttr(t('access_keys.revoke_label', 'Zrewokuj klucz {name}', { name: k.name }))}" title="${escapeAttr(t('access_keys.revoke_label', 'Zrewokuj klucz {name}', { name: k.name }))}"></tf-button>
           </td>
         </tr>`;
       }).join('');
@@ -260,9 +303,13 @@ function stepIndicator(step) {
 }
 
 function openCreateWizard(body) {
-  const state = { step: 1, keyType: 'user', name: '', subjectId: '', scope: new Set() };
+  // `busScopes`: schema-registry grants chosen in step 2, one entry per
+  // (instance, organisation, action) — read and write are separate grants.
+  const state = { step: 1, keyType: 'user', name: '', subjectId: '', scope: new Set(), busScopes: [] };
+  const selectedText = () => t('access_keys.selected_count', '{count} zaznaczone', { count: state.scope.size + state.busScopes.length });
+  let busSection = null;
   const win = document.createElement('tf-window');
-  win.setAttribute('title', t('access_keys.new_key', 'Nowy klucz API'));
+  win.setAttribute('title', t('access_keys.new_key_title', 'Nowy klucz API'));
   win.setAttribute('width', '720');
   document.body.appendChild(win);
 
@@ -281,7 +328,7 @@ function openCreateWizard(body) {
           </div>
           <div class="ak-form-row">
             <label>${escapeHtml(t('access_keys.name_label', 'Nazwa klucza'))}</label>
-            <tf-input id="ak-name" value="${escapeAttr(state.name)}" placeholder="np. CI Pipeline"></tf-input>
+            <tf-input id="ak-name" value="${escapeAttr(state.name)}" placeholder="${escapeAttr(t('access_keys.name_placeholder', 'np. CI Pipeline'))}"></tf-input>
           </div>
         </div>
         <div slot="footer" class="ak-wizard-footer">
@@ -315,13 +362,18 @@ function openCreateWizard(body) {
             <h4 class="wizard-step-title">${escapeHtml(t('access_keys.wiz_pick_scope', 'Zaznacz dostępne zasoby'))}</h4>
             <div class="ak-deny-note">${escapeHtml(t('access_keys.deny_note', 'Default-DENY: bez zaznaczenia każde /v1 zwróci 403.'))}</div>
             <div class="ak-pick-list">${rowsHtml}</div>
+            ${busSchemaSectionHtml()}
           </div>
           <div slot="footer" class="ak-wizard-footer">
             <tf-button variant="ghost" id="ak-back">${escapeHtml(t('common.back', 'Wstecz'))}</tf-button>
             <span style="flex:1"></span>
-            <span class="ak-pick-count" id="ak-count">${state.scope.size} ${escapeHtml(t('access_keys.selected', 'zaznaczone'))}</span>
+            <span class="ak-pick-count" id="ak-count">${escapeHtml(selectedText())}</span>
             <tf-button variant="primary" id="ak-create-btn">${escapeHtml(t('access_keys.create_btn', 'Utwórz'))}</tf-button>
           </div>`;
+        const refreshCount = () => {
+          const count = win.querySelector('#ak-count');
+          if (count) count.textContent = selectedText();
+        };
         win.querySelectorAll('.ak-pick-row').forEach((row) => row.addEventListener('click', (e) => {
           e.preventDefault();
           const key = row.dataset.key;
@@ -329,8 +381,9 @@ function openCreateWizard(body) {
           row.classList.toggle('checked', state.scope.has(key));
           const cb = row.querySelector('tf-checkbox');
           if (cb) cb.toggleAttribute('checked', state.scope.has(key));
-          win.querySelector('#ak-count').textContent = `${state.scope.size} ${t('access_keys.selected', 'zaznaczone')}`;
+          refreshCount();
         }));
+        busSection = bindBusSchemaSection(win, state.busScopes, refreshCount);
       } else {
         await loadSubjectsAndResources();
         const opts = (state.keyType === 'user' ? users : groups)
@@ -340,6 +393,7 @@ function openCreateWizard(body) {
             ${stepIndicator(2)}
             <h4 class="wizard-step-title">${escapeHtml(state.keyType === 'user' ? t('access_keys.wiz_pick_user', 'Wybierz użytkownika') : t('access_keys.wiz_pick_group', 'Wybierz grupę'))}</h4>
             <div class="ak-deny-note info">${escapeHtml(t('access_keys.inherit_note', 'Klucz ściśle dziedziczy efektywne uprawnienia podmiotu.'))}</div>
+            <div class="ak-deny-note info" id="ak-bus-user-note">${escapeHtml(t('access_keys.bus_schema_user_key_note', 'Wzorów wiadomości nie da się dodać do tego klucza. Do nich potrzebny jest klucz ogólny.'))}</div>
             <div class="ak-form-row">
               <label>${escapeHtml(state.keyType === 'user' ? t('access_keys.col_user', 'Użytkownik') : t('access_keys.col_group', 'Grupa'))}</label>
               <tf-select id="ak-subject"><option value="">—</option>${opts}</tf-select>
@@ -356,6 +410,11 @@ function openCreateWizard(body) {
         if (state.keyType !== 'general') {
           state.subjectId = win.querySelector('#ak-subject')?.value || '';
           if (!state.subjectId) { toast(t('access_keys.subject_required', 'Wybierz podmiot'), 'error'); return; }
+        } else if (busSection) {
+          // A complete pick the admin forgot to add is taken as meant; a
+          // half-made one stops the creation instead of silently vanishing.
+          const pending = busSection.commitPending();
+          if (!pending.ok) { toast(pending.message, 'error'); return; }
         }
         await submitCreate(state, win, body, renderStep);
       });
@@ -367,6 +426,13 @@ function openCreateWizard(body) {
       const [resourceType, ...rest] = k.split(':');
       return { resourceType, resourceId: rest.join(':') };
     });
+    if (s.keyType === 'general') {
+      s.busScopes.forEach((b) => scopeResources.push({
+        resourceType: BUS_SCHEMA_REGISTRY,
+        resourceId: busSchemaScopeId(b.instanceId, b.orgId),
+        action: b.action,
+      }));
+    }
     try {
       const resp = await ApiBinary.action('apiKeyCreateRequest', {
         name: s.name,
@@ -400,6 +466,178 @@ function openCreateWizard(body) {
   renderStep();
 }
 
+// ---------------------------------------------------------------------------
+// "Wzory wiadomości" — schema registry REST grants (general keys only)
+// ---------------------------------------------------------------------------
+function busSchemaUnknownNames() {
+  return {
+    instance: t('access_keys.bus_schema_unknown_instance', 'Usunięty TentaBus'),
+    org: t('access_keys.bus_schema_unknown_org', 'Usunięta organizacja'),
+  };
+}
+
+function busSchemaActionLabel(action) {
+  return action === 'write'
+    ? t('access_keys.bus_schema_write', 'Zapisywanie')
+    : t('access_keys.bus_schema_read', 'Czytanie');
+}
+
+function busSchemaNames(scopeIds) {
+  return busSchemaScopeNames(scopeIds, busInstances, orgs, busSchemaUnknownNames());
+}
+
+function busSchemaScopeLabel(scopeId) {
+  const names = busSchemaNames([scopeId]).get(scopeId);
+  return `${names.instance} · ${names.org}`;
+}
+
+function busSchemaChipsHtml(busScopes) {
+  if (busScopes.length === 0) {
+    return `<div class="ak-bus-empty">${escapeHtml(t('access_keys.bus_schema_empty', 'Ten klucz nie ma jeszcze dostępu do wzorów wiadomości.'))}</div>`;
+  }
+  return busScopes.map((b, i) => {
+    const label = `${busSchemaScopeLabel(busSchemaScopeId(b.instanceId, b.orgId))} · ${busSchemaActionLabel(b.action)}`;
+    return `<tf-chip status="info" variant="outline" removable data-bus-index="${i}" label="${escapeAttr(label)}"></tf-chip>`;
+  }).join('');
+}
+
+function busSchemaSectionHtml() {
+  const title = `<h5 class="ak-section-title">${escapeHtml(t('access_keys.bus_schema_title', 'Wzory wiadomości'))}</h5>`;
+  const hint = `<div class="ak-deny-note info">
+    <div>${escapeHtml(t('access_keys.bus_schema_hint', 'Pozwól innemu programowi czytać albo dodawać wzory wiadomości w TentaBusie.'))}</div>
+    <div>${escapeHtml(t('access_keys.bus_schema_records_note', 'Do wysyłania wiadomości na topiki potrzebny jest osobny klucz użytkownika.'))}</div>
+  </div>`;
+  if (busInstances.length === 0 || orgs.length === 0) {
+    const missing = busInstances.length === 0
+      ? t('access_keys.bus_schema_no_instances', 'Nie ma jeszcze żadnego TentaBusa.')
+      : t('access_keys.bus_schema_no_orgs', 'Nie ma jeszcze żadnej organizacji.');
+    return `<div class="ak-bus-section">${title}<div class="ak-bus-empty">${escapeHtml(missing)}</div></div>`;
+  }
+  const instanceOpts = busInstances
+    .map((i) => `<option value="${escapeAttr(i.addonId)}">${escapeHtml(i.title)}</option>`).join('');
+  const orgOpts = orgs
+    .map((o) => `<option value="${escapeAttr(o.orgId)}">${escapeHtml(o.name)}</option>`).join('');
+  const action = (id, labelKey, labelFallback, descKey, descFallback) => `
+    <div class="ak-bus-action">
+      <tf-checkbox id="${id}" label="${escapeAttr(t(labelKey, labelFallback))}"></tf-checkbox>
+      <div class="ak-bus-action-desc">${escapeHtml(t(descKey, descFallback))}</div>
+    </div>`;
+  // The chosen grants sit above the picker, so a new chip appears where the
+  // admin is already looking instead of below the fold.
+  return `<div class="ak-bus-section">
+    ${title}
+    ${hint}
+    <div class="ak-bus-chips" id="ak-bus-chips">${busSchemaChipsHtml([])}</div>
+    <div class="tf-toolbar ak-bus-pickers">
+      <tf-select id="ak-bus-instance" aria-label="${escapeAttr(t('access_keys.bus_schema_instance', 'TentaBus'))}">
+        <option value="">${escapeHtml(t('access_keys.bus_schema_pick_instance', 'Wybierz TentaBus'))}</option>${instanceOpts}
+      </tf-select>
+      <tf-select id="ak-bus-org" aria-label="${escapeAttr(t('access_keys.bus_schema_org', 'Organizacja'))}">
+        <option value="">${escapeHtml(t('access_keys.bus_schema_pick_org', 'Wybierz organizację'))}</option>${orgOpts}
+      </tf-select>
+    </div>
+    <div class="ak-bus-actions" role="group" aria-label="${escapeAttr(t('access_keys.bus_schema_actions', 'Co program może robić'))}">
+      ${action('ak-bus-read', 'access_keys.bus_schema_read', 'Czytanie', 'access_keys.bus_schema_read_desc', 'Program widzi wzory.')}
+      ${action('ak-bus-write', 'access_keys.bus_schema_write', 'Zapisywanie', 'access_keys.bus_schema_write_desc', 'Program może dodawać nowe wzory i wersje, ale bez Czytania ich nie zobaczy.')}
+    </div>
+    <tf-button size="sm" variant="secondary" icon="plus" id="ak-bus-add">${escapeHtml(t('access_keys.bus_schema_add', 'Dodaj'))}</tf-button>
+  </div>`;
+}
+
+/**
+ * Wires the section rendered by `busSchemaSectionHtml`. `busScopes` is the
+ * wizard's own array, mutated in place so going Back and Forward keeps it.
+ * Returns `{ commitPending }`: on Create, a complete pick still sitting in the
+ * pickers is added, a half-made one is refused with the reason.
+ */
+function bindBusSchemaSection(root, busScopes, onChange) {
+  const chips = root.querySelector('#ak-bus-chips');
+  if (!chips) return { commitPending: () => ({ ok: true }) };
+  const instanceSel = root.querySelector('#ak-bus-instance');
+  const orgSel = root.querySelector('#ak-bus-org');
+  const readBox = root.querySelector('#ak-bus-read');
+  const writeBox = root.querySelector('#ak-bus-write');
+  const redraw = () => {
+    chips.innerHTML = busSchemaChipsHtml(busScopes);
+    chips.querySelectorAll('tf-chip[data-bus-index]').forEach((chip) => chip.addEventListener('remove', () => {
+      busScopes.splice(Number(chip.dataset.busIndex), 1);
+      redraw();
+      onChange();
+    }));
+  };
+  const pick = () => ({
+    instanceId: instanceSel?.value || '',
+    orgId: orgSel?.value || '',
+    actions: BUS_SCHEMA_ACTIONS.filter((a) => (a === 'read' ? readBox : writeBox)?.checked),
+  });
+  // `null` when the pick is complete, otherwise the message saying what is missing.
+  const incomplete = ({ instanceId, orgId, actions }) => {
+    if (!instanceId || !orgId) return t('access_keys.bus_schema_pick_both', 'Wybierz TentaBus i organizację.');
+    if (actions.length === 0) return t('access_keys.bus_schema_pick_action', 'Zaznacz czytanie, zapisywanie albo oba.');
+    return null;
+  };
+  const add = ({ instanceId, orgId, actions }) => {
+    actions.forEach((action) => {
+      if (!busScopes.some((b) => b.instanceId === instanceId && b.orgId === orgId && b.action === action)) {
+        busScopes.push({ instanceId, orgId, action });
+      }
+    });
+    if (instanceSel) instanceSel.value = '';
+    if (orgSel) orgSel.value = '';
+    readBox?.removeAttribute('checked');
+    writeBox?.removeAttribute('checked');
+    redraw();
+    onChange();
+    chips.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  };
+  root.querySelector('#ak-bus-add')?.addEventListener('click', () => {
+    const current = pick();
+    const problem = incomplete(current);
+    if (problem) { toast(problem, 'error'); return; }
+    add(current);
+  });
+  redraw();
+  return {
+    commitPending() {
+      const current = pick();
+      const untouched = !current.instanceId && !current.orgId && current.actions.length === 0;
+      if (untouched) return { ok: true };
+      const problem = incomplete(current);
+      if (problem) {
+        return { ok: false, message: t('access_keys.bus_schema_pending_incomplete', 'Wybór wzorów wiadomości nie jest skończony: {reason} Albo wyczyść ten wybór.', { reason: problem }) };
+      }
+      add(current);
+      return { ok: true };
+    },
+  };
+}
+
+/**
+ * Matrix columns for the Per klucz subtab: every known instance ×
+ * organisation, plus every scope a key already holds for an instance or
+ * organisation no longer listed (so it stays visible and revocable). Each
+ * scope contributes a read and a write column next to each other; the header
+ * names the scope once above the pair.
+ */
+function busSchemaColumns(levelMaps) {
+  const ids = [];
+  const addId = (id) => { if (!ids.includes(id)) ids.push(id); };
+  busInstances.forEach((i) => orgs.forEach((o) => addId(busSchemaScopeId(i.addonId, o.orgId))));
+  levelMaps.forEach((lv) => Object.values(lv.__bus || {}).forEach(({ id }) => addId(id)));
+  const names = busSchemaNames(ids);
+  return ids.flatMap((id) => {
+    const scope = `${names.get(id).instance} · ${names.get(id).org}`;
+    return BUS_SCHEMA_ACTIONS.map((action) => ({
+      type: BUS_SCHEMA_REGISTRY,
+      id,
+      action,
+      scope,
+      name: busSchemaActionLabel(action),
+      title: `${scope} · ${busSchemaActionLabel(action)}`,
+    }));
+  });
+}
+
 function typeCard(type, icon, title, desc, active) {
   return `<div class="ak-type-card ${active === type ? 'active' : ''}" data-type="${escapeAttr(type)}">
     <div class="ak-type-ico ak-type-${escapeAttr(type)}"><svg class="icon icon-lg"><use href="#i-${icon}"/></svg></div>
@@ -431,7 +669,7 @@ function showToken(token) {
 async function renderMatrixTab(body) {
   body.innerHTML = `<div class="empty-big" style="padding:24px;">${escapeHtml(t('common.loading', 'Ładowanie...'))}</div>`;
   await loadSubjectsAndResources();
-  if (activeTab !== 'matrix') return; // user switched tabs during the async load
+  if (activeTab !== 'matrix' || !body.isConnected) return; // tab switch or navigation during the load
   body.innerHTML = `
     <div class="tf-section-card">
       <div class="subtabs" id="ak-msub">
@@ -462,28 +700,40 @@ function legend() {
 async function subjectRows() {
   if (matrixSubtab === 'group') return groups.map((g) => ({ subjectType: 'group', subjectId: g.id, label: g.name, meta: `${g.memberCount ?? 0}` }));
   if (matrixSubtab === 'user') return users.map((u) => ({ subjectType: 'user', subjectId: u.id, label: u.username || u.displayName || u.id, meta: u.role || '' }));
-  if (matrixSubtab === 'api_key') return keys.filter((k) => k.keyType === 'general').map((k) => ({ subjectType: 'api_key', subjectId: k.keyId, label: k.name, meta: 'klucz ogólny' }));
+  if (matrixSubtab === 'api_key') return keys.filter((k) => k.keyType === 'general').map((k) => ({ subjectType: 'api_key', subjectId: k.keyId, label: k.name, meta: t('access_keys.meta_general_key', 'klucz ogólny') }));
   return [];
 }
 
 async function loadSubjectLevels(subjectType, subjectId) {
   // api_key scopes use the dedicated handler; user/group use the IAM perms list.
-  const map = {};
+  // Levels are filed by `scopeKey`, so a key's read and write grants on the
+  // same schema registry scope stay two cells. `__bus` lists the schema
+  // registry grants themselves, for `busSchemaColumns`.
+  const map = { __bus: {} };
+  const file = (e) => {
+    const key = scopeKey(e.resourceType, e.resourceId, e.action);
+    map[key] = e.accessLevel;
+    if (e.resourceType === BUS_SCHEMA_REGISTRY) map.__bus[key] = { id: e.resourceId, action: e.action };
+  };
   try {
     if (subjectType === 'api_key') {
       const resp = await ApiBinary.action('apiKeyScopeListRequest', { keyUid: subjectId });
-      (resp?.entries || []).forEach((e) => { map[`${e.resourceType}:${e.resourceId}`] = e.accessLevel; });
+      (resp?.entries || []).forEach(file);
     } else {
       const resp = await ApiBinary.action('iamListPermsForSubjectRequest', { subjectType, subjectId });
-      (resp?.entries || []).forEach((e) => { map[`${e.resourceType}:${e.resourceId}`] = e.accessLevel; });
+      (resp?.entries || []).forEach(file);
     }
   } catch (_) { /* empty */ }
   return map;
 }
 
-// Two-row header: top row groups columns under Modele / Flow / Aliasy
-// (spanning), bottom row carries the resource names — 1:1 with mockup 03.
-function matrixHead(firstLabel) {
+// Grouped header: the top row names each resource group (Modele / Flow /
+// Aliasy ... spanning its columns), the next row the resources. Schema-registry
+// columns need one more level — "instance · organisation" above its
+// Czytanie / Zapisywanie pair — so when they are present every other resource
+// name spans the two lower rows. The first column is pinned (see
+// access-keys.css) so the key name stays readable while the grid scrolls.
+function matrixHead(firstLabel, busCols = []) {
   const groups = [
     { label: t('access_keys.models', 'Modele'), icon: 'model', items: resources.model.map((r) => ({ ...r, type: 'model' })) },
     { label: 'Flow', icon: 'flow', items: resources.flow.map((r) => ({ ...r, type: 'flow' })) },
@@ -491,32 +741,51 @@ function matrixHead(firstLabel) {
     { label: t('access_keys.model_bundles', 'Bundle modeli'), icon: 'eye', items: resources.model_bundle.map((r) => ({ ...r, type: 'model_bundle' })) },
     { label: t('access_keys.ml_studio_projects', 'Projekty ML Studio'), icon: 'model', items: resources.ml_studio_export.map((r) => ({ ...r, type: 'ml_studio_export' })) },
   ].filter((g) => g.items.length > 0);
-  const top = groups.map((g) => `<th class="grp" colspan="${g.items.length}"><svg class="icon"><use href="#i-${g.icon}"/></svg> ${escapeHtml(g.label)}</th>`).join('');
-  const names = groups.flatMap((g) => g.items).map((c) => `<th class="func" title="${escapeAttr(c.type + ':' + c.id)}">${escapeHtml(c.name)}</th>`).join('');
-  return `<tr><th rowspan="2" style="min-width:220px;vertical-align:bottom;">${escapeHtml(firstLabel)}</th>${top}</tr><tr>${names}</tr>`;
+  const hasBus = busCols.length > 0;
+  const rows = hasBus ? 3 : 2;
+  const top = groups.map((g) => `<th class="grp" colspan="${g.items.length}"><svg class="icon"><use href="#i-${g.icon}"/></svg> ${escapeHtml(g.label)}</th>`).join('')
+    + (hasBus ? `<th class="grp ak-bus-grp" colspan="${busCols.length}"><svg class="icon"><use href="#i-flow"/></svg> ${escapeHtml(t('access_keys.bus_schema_title', 'Wzory wiadomości'))}</th>` : '');
+  const names = groups.flatMap((g) => g.items)
+    .map((c) => `<th class="func"${hasBus ? ' rowspan="2"' : ''} title="${escapeAttr(c.title || c.name)}">${escapeHtml(c.name)}</th>`).join('');
+  // Consecutive columns of one scope share the "instance · organisation" cell.
+  const scopes = [];
+  busCols.forEach((c) => {
+    const last = scopes[scopes.length - 1];
+    if (last && last.id === c.id) last.span += 1; else scopes.push({ id: c.id, label: c.scope, span: 1 });
+  });
+  const busScopes = scopes.map((sc) => `<th class="func ak-bus-scope" colspan="${sc.span}" title="${escapeAttr(sc.label)}">${escapeHtml(sc.label)}</th>`).join('');
+  const busActions = busCols.map((c) => `<th class="func ak-bus-action-head" title="${escapeAttr(c.title)}">${escapeHtml(c.name)}</th>`).join('');
+  return `<tr><th class="ak-subject-col" rowspan="${rows}">${escapeHtml(firstLabel)}</th>${top}</tr>`
+    + `<tr>${names}${busScopes}</tr>`
+    + (hasBus ? `<tr>${busActions}</tr>` : '');
 }
 
 async function renderMatrixGrid(grid) {
   const cols = allResourceColumns();
   if (matrixSubtab === 'default') {
-    grid.innerHTML = `<table class="perm-matrix"><thead>${matrixHead(t('access_keys.defaults', 'Domyślne'))}</thead>
-      <tbody><tr class="row-default"><td><div class="group-name">${escapeHtml(t('access_keys.default_v1', 'Domyślne (/v1)'))}</div><div class="group-meta">${escapeHtml(t('access_keys.default_meta', 'fallback = DENY'))}</div></td>
+    grid.innerHTML = `<table class="perm-matrix ak-matrix"><thead>${matrixHead(t('access_keys.defaults', 'Domyślne'))}</thead>
+      <tbody><tr class="row-default"><td class="ak-subject-col"><div class="group-name">${escapeHtml(t('access_keys.default_v1', 'Domyślne (/v1)'))}</div><div class="group-meta">${escapeHtml(t('access_keys.default_meta', 'fallback = DENY'))}</div></td>
       ${cols.map(() => `<td class="func"><button class="perm-btn deny" disabled><svg class="icon"><use href="#i-x"/></svg></button></td>`).join('')}</tr></tbody></table>`;
     return;
   }
   const subjects = await subjectRows();
   if (subjects.length === 0) { grid.innerHTML = `<div class="empty-big">${escapeHtml(t('access_keys.no_subjects', 'Brak podmiotów'))}</div>`; return; }
   const levels = await Promise.all(subjects.map((s) => loadSubjectLevels(s.subjectType, s.subjectId)));
-  const head = matrixHead(t('access_keys.subject', 'Podmiot'));
+  // Schema registry grants exist for general keys only — users and groups
+  // never reach that REST surface, so their rows get no such columns.
+  const busCols = matrixSubtab === 'api_key' ? busSchemaColumns(levels) : [];
+  const allCols = [...cols, ...busCols];
+  const head = matrixHead(t('access_keys.subject', 'Podmiot'), busCols);
   const rowsHtml = subjects.map((s, i) => {
     const lv = levels[i];
-    const cells = cols.map((c) => {
-      const mode = lv[`${c.type}:${c.id}`] || 'inherit';
+    const cells = allCols.map((c) => {
+      const mode = lv[scopeKey(c.type, c.id, c.action)] || 'inherit';
       return `<td class="func">${cellBtn(mode, s, c)}</td>`;
     }).join('');
-    return `<tr><td><div class="group-name">${escapeHtml(s.label)}</div><div class="group-meta">${escapeHtml(s.meta)}</div></td>${cells}</tr>`;
+    return `<tr><td class="ak-subject-col"><div class="group-name">${escapeHtml(s.label)}</div><div class="group-meta">${escapeHtml(s.meta)}</div></td>${cells}</tr>`;
   }).join('');
-  grid.innerHTML = `<table class="perm-matrix"><thead>${head}</thead><tbody>${rowsHtml}</tbody></table>`;
+  if (!grid.isConnected) return;
+  grid.innerHTML = `<table class="perm-matrix ak-matrix"><thead>${head}</thead><tbody>${rowsHtml}</tbody></table>`;
   grid.querySelectorAll('.perm-btn[data-subject-id]').forEach((btn) => btn.addEventListener('click', () => cycleCell(btn, grid)));
   if (highlightKeyUid) {
     const target = grid.querySelector(`.perm-btn[data-subject-id="${CSS.escape(highlightKeyUid)}"]`)?.closest('tr');
@@ -525,10 +794,36 @@ async function renderMatrixGrid(grid) {
   }
 }
 
+function modeLabel(mode) {
+  if (mode === 'allow') return t('access_keys.legend_allow', 'allow — dozwolone');
+  if (mode === 'deny') return t('access_keys.legend_deny', 'deny — zablokowane');
+  return t('access_keys.legend_inherit', 'dziedzicz');
+}
+
+// Accessible name of a matrix cell: who, what, and the current state — the
+// cell itself only shows a tick, a cross or a dash.
+function cellLabel(subject, col, mode) {
+  return t('access_keys.cell_label', '{subject} — {resource}: {state}', {
+    subject: subject.label,
+    resource: col.title || col.name,
+    state: modeLabel(mode),
+  });
+}
+
 function cellBtn(mode, subject, col) {
   const m = ['allow', 'deny', 'inherit'].includes(mode) ? mode : 'inherit';
   const inner = m === 'allow' ? '<svg class="icon"><use href="#i-check"/></svg>' : m === 'deny' ? '<svg class="icon"><use href="#i-x"/></svg>' : '—';
-  return `<button class="perm-btn ${m}" data-subject-type="${escapeAttr(subject.subjectType)}" data-subject-id="${escapeAttr(subject.subjectId)}" data-rtype="${escapeAttr(col.type)}" data-rid="${escapeAttr(col.id)}" data-mode="${m}">${inner}</button>`;
+  const action = col.action ? ` data-action="${escapeAttr(col.action)}"` : '';
+  const label = escapeAttr(cellLabel(subject, col, m));
+  return `<button class="perm-btn ${m}" type="button" aria-label="${label}" title="${label}" data-subject-type="${escapeAttr(subject.subjectType)}" data-subject-id="${escapeAttr(subject.subjectId)}" data-subject-label="${escapeAttr(subject.label)}" data-col-label="${escapeAttr(col.title || col.name)}" data-rtype="${escapeAttr(col.type)}" data-rid="${escapeAttr(col.id)}"${action} data-mode="${m}">${inner}</button>`;
+}
+
+function paintCell(btn, mode) {
+  btn.classList.remove('allow', 'deny', 'inherit'); btn.classList.add(mode); btn.dataset.mode = mode;
+  btn.innerHTML = mode === 'allow' ? '<svg class="icon"><use href="#i-check"/></svg>' : mode === 'deny' ? '<svg class="icon"><use href="#i-x"/></svg>' : '—';
+  const label = cellLabel({ label: btn.dataset.subjectLabel }, { name: btn.dataset.colLabel }, mode);
+  btn.setAttribute('aria-label', label);
+  btn.title = label;
 }
 
 async function cycleCell(btn, grid) {
@@ -538,13 +833,12 @@ async function cycleCell(btn, grid) {
   const subjectId = btn.dataset.subjectId;
   const resourceType = btn.dataset.rtype;
   const resourceId = btn.dataset.rid;
-  // optimistic
-  btn.classList.remove('allow', 'deny', 'inherit'); btn.classList.add(next); btn.dataset.mode = next;
-  btn.innerHTML = next === 'allow' ? '<svg class="icon"><use href="#i-check"/></svg>' : next === 'deny' ? '<svg class="icon"><use href="#i-x"/></svg>' : '—';
+  const action = btn.dataset.action || null;
+  paintCell(btn, next); // optimistic
   try {
     if (subjectType === 'api_key') {
-      if (next === 'inherit') await ApiBinary.action('apiKeyScopeClearRequest', { keyUid: subjectId, resourceType, resourceId });
-      else await ApiBinary.action('apiKeyScopeSetRequest', { keyUid: subjectId, resourceType, resourceId, accessLevel: next });
+      if (next === 'inherit') await ApiBinary.action('apiKeyScopeClearRequest', { keyUid: subjectId, resourceType, resourceId, action });
+      else await ApiBinary.action('apiKeyScopeSetRequest', { keyUid: subjectId, resourceType, resourceId, accessLevel: next, action });
     } else if (next === 'inherit') {
       await ApiBinary.action('iamClearPermissionRequest', { resourceType, resourceId, subjectType, subjectId });
     } else {
@@ -552,8 +846,7 @@ async function cycleCell(btn, grid) {
     }
     toast(t('access_keys.saved', 'Zapisano'), 'success');
   } catch (e) {
-    btn.classList.remove('allow', 'deny', 'inherit'); btn.classList.add(cur); btn.dataset.mode = cur;
-    btn.innerHTML = cur === 'allow' ? '<svg class="icon"><use href="#i-check"/></svg>' : cur === 'deny' ? '<svg class="icon"><use href="#i-x"/></svg>' : '—';
+    paintCell(btn, cur);
     toast(e.message || 'error', 'error');
   }
 }
@@ -570,43 +863,66 @@ function openScopeEditor(keyUid) {
 // ---------------------------------------------------------------------------
 // Tab: Wg zasobu (transpose — pick a resource, see subjects)
 // ---------------------------------------------------------------------------
+// Schema-registry scopes as pickable resources: one entry per known instance ×
+// organisation, named, never shown by id.
+function busSchemaResourceOptions() {
+  const ids = busInstances.flatMap((i) => orgs.map((o) => busSchemaScopeId(i.addonId, o.orgId)));
+  const names = busSchemaNames(ids);
+  return ids.map((id) => ({ id, name: `${names.get(id).instance} · ${names.get(id).org}` }));
+}
+
 async function renderByResourceTab(body) {
   body.innerHTML = `<div class="empty-big" style="padding:24px;">${escapeHtml(t('common.loading', 'Ładowanie...'))}</div>`;
   await loadSubjectsAndResources();
-  if (activeTab !== 'byresource') return; // user switched tabs during the async load
-  const cols = resources[resourceView] || [];
+  if (activeTab !== 'byresource' || !body.isConnected) return; // tab switch or navigation during the load
+  const cols = resourceView === BUS_SCHEMA_REGISTRY ? busSchemaResourceOptions() : (resources[resourceView] || []);
   const opts = cols.map((r) => `<option value="${escapeAttr(r.id)}">${escapeHtml(r.name)}</option>`).join('');
+  const sub = (view, label) => `<div class="subtab ${resourceView === view ? 'active' : ''}" data-rv="${view}">${escapeHtml(label)}</div>`;
   body.innerHTML = `
     <div class="tf-section-card">
       <div class="subtabs" id="ak-rsub">
-        <div class="subtab ${resourceView === 'model' ? 'active' : ''}" data-rv="model">${escapeHtml(t('access_keys.models', 'Modele'))}</div>
-        <div class="subtab ${resourceView === 'flow' ? 'active' : ''}" data-rv="flow">Flow</div>
-        <div class="subtab ${resourceView === 'alias' ? 'active' : ''}" data-rv="alias">${escapeHtml(t('access_keys.aliases', 'Aliasy'))}</div>
-        <div class="subtab ${resourceView === 'model_bundle' ? 'active' : ''}" data-rv="model_bundle">${escapeHtml(t('access_keys.model_bundles', 'Bundle modeli'))}</div>
-        <div class="subtab ${resourceView === 'ml_studio_export' ? 'active' : ''}" data-rv="ml_studio_export">${escapeHtml(t('access_keys.ml_studio_projects', 'Projekty ML Studio'))}</div>
+        ${sub('model', t('access_keys.models', 'Modele'))}
+        ${sub('flow', 'Flow')}
+        ${sub('alias', t('access_keys.aliases', 'Aliasy'))}
+        ${sub('model_bundle', t('access_keys.model_bundles', 'Bundle modeli'))}
+        ${sub('ml_studio_export', t('access_keys.ml_studio_projects', 'Projekty ML Studio'))}
+        ${sub(BUS_SCHEMA_REGISTRY, t('access_keys.bus_schema_title', 'Wzory wiadomości'))}
       </div>
       <div class="ak-form-row"><label>${escapeHtml(t('access_keys.resource', 'Zasób'))}</label><tf-select id="ak-resource"><option value="">—</option>${opts}</tf-select></div>
       <div id="ak-rmatrix"></div>
       ${legend()}
     </div>`;
   body.querySelector('#ak-rsub').addEventListener('click', (e) => { const s = e.target.closest('.subtab'); if (!s) return; resourceView = s.dataset.rv; renderByResourceTab(body); });
-  body.querySelector('#ak-resource').addEventListener('change', (e) => renderResourceMatrix(body.querySelector('#ak-rmatrix'), resourceView, e.detail?.value || e.target.value));
+  body.querySelector('#ak-resource').addEventListener('change', (e) => {
+    const rid = e.detail?.value || e.target.value;
+    const col = cols.find((c) => c.id === rid);
+    renderResourceMatrix(body.querySelector('#ak-rmatrix'), resourceView, rid, col?.name || rid);
+  });
 }
 
-async function renderResourceMatrix(grid, rtype, rid) {
+async function renderResourceMatrix(grid, rtype, rid, resourceName) {
   if (!rid) { grid.innerHTML = `<div class="empty-big">${escapeHtml(t('access_keys.pick_resource', 'Wybierz zasób'))}</div>`; return; }
-  const subjects = [
-    ...groups.map((g) => ({ subjectType: 'group', subjectId: g.id, label: g.name, meta: 'grupa' })),
-    ...users.map((u) => ({ subjectType: 'user', subjectId: u.id, label: u.username || u.id, meta: 'user' })),
-    ...keys.filter((k) => k.keyType === 'general').map((k) => ({ subjectType: 'api_key', subjectId: k.keyId, label: k.name, meta: 'klucz' })),
+  const generalKeys = keys.filter((k) => k.keyType === 'general')
+    .map((k) => ({ subjectType: 'api_key', subjectId: k.keyId, label: k.name, meta: t('access_keys.meta_key', 'klucz') }));
+  // Only general keys can hold a schema-registry grant; users and groups
+  // never reach that REST surface.
+  const subjects = rtype === BUS_SCHEMA_REGISTRY ? generalKeys : [
+    ...groups.map((g) => ({ subjectType: 'group', subjectId: g.id, label: g.name, meta: t('access_keys.meta_group', 'grupa') })),
+    ...users.map((u) => ({ subjectType: 'user', subjectId: u.id, label: u.username || u.id, meta: t('access_keys.meta_user', 'user') })),
+    ...generalKeys,
   ];
+  const cols = rtype === BUS_SCHEMA_REGISTRY
+    ? BUS_SCHEMA_ACTIONS.map((action) => ({ type: rtype, id: rid, action, name: busSchemaActionLabel(action), title: `${resourceName} · ${busSchemaActionLabel(action)}` }))
+    : [{ type: rtype, id: rid, name: resourceName, title: resourceName }];
   const levels = await Promise.all(subjects.map((s) => loadSubjectLevels(s.subjectType, s.subjectId)));
-  const col = { type: rtype, id: rid, name: rid };
+  if (!grid.isConnected) return;
   const rows = subjects.map((s, i) => {
-    const mode = levels[i][`${rtype}:${rid}`] || 'inherit';
-    return `<tr><td><div class="group-name">${escapeHtml(s.label)}</div><div class="group-meta">${escapeHtml(s.meta)}</div></td><td class="func">${cellBtn(mode, s, col)}</td></tr>`;
+    const cells = cols.map((c) => `<td class="func">${cellBtn(levels[i][scopeKey(c.type, c.id, c.action)] || 'inherit', s, c)}</td>`).join('');
+    return `<tr><td class="ak-subject-col"><div class="group-name">${escapeHtml(s.label)}</div><div class="group-meta">${escapeHtml(s.meta)}</div></td>${cells}</tr>`;
   }).join('');
-  grid.innerHTML = `<table class="perm-matrix"><thead><tr><th style="min-width:220px;">${escapeHtml(t('access_keys.subject', 'Podmiot'))}</th><th class="func">${escapeHtml(rid)}</th></tr></thead>
-    <tbody>${rows}<tr class="row-default"><td><div class="group-name">${escapeHtml(t('access_keys.default_v1', 'Domyślne (/v1)'))}</div></td><td class="func"><button class="perm-btn deny" disabled><svg class="icon"><use href="#i-x"/></svg></button></td></tr></tbody></table>`;
+  const heads = cols.map((c) => `<th class="func" title="${escapeAttr(c.title)}">${escapeHtml(c.name)}</th>`).join('');
+  const defaults = cols.map(() => '<td class="func"><button class="perm-btn deny" type="button" disabled><svg class="icon"><use href="#i-x"/></svg></button></td>').join('');
+  grid.innerHTML = `<table class="perm-matrix ak-matrix"><thead><tr><th class="ak-subject-col">${escapeHtml(t('access_keys.subject', 'Podmiot'))}</th>${heads}</tr></thead>
+    <tbody>${rows}<tr class="row-default"><td class="ak-subject-col"><div class="group-name">${escapeHtml(t('access_keys.default_v1', 'Domyślne (/v1)'))}</div></td>${defaults}</tr></tbody></table>`;
   grid.querySelectorAll('.perm-btn[data-subject-id]').forEach((btn) => btn.addEventListener('click', () => cycleCell(btn, grid)));
 }

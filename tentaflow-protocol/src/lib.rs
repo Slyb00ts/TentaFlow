@@ -643,6 +643,7 @@ pub use message_body::{
     NgcStatusResponse,
     NimCatalogListResponse,
     NimContainerEntry,
+    OrganizationInfo,
     PermissionEntry,
     PiiRule,
     PromptDetail,

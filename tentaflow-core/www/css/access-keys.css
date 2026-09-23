@@ -55,6 +55,23 @@
 .ak-pick-meta { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: .04em; }
 .ak-pick-count { font-size: 12px; color: var(--text-3); }
 
+/* "Wzory wiadomości" — schema registry grants in the create wizard */
+.ak-bus-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.ak-section-title { margin: 0 0 4px; font-size: 13px; font-weight: 700; color: var(--text); }
+.ak-bus-section .ak-deny-note { margin: 8px 0 12px; }
+.ak-bus-section .ak-deny-note div + div { margin-top: 6px; }
+.ak-bus-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 12px; }
+.ak-bus-chips tf-chip { max-width: 100%; }
+.ak-bus-chips .tf-chip { max-width: 100%; white-space: normal; height: auto; text-transform: none;
+  letter-spacing: normal; overflow-wrap: anywhere; line-height: 1.35; }
+.ak-bus-empty { font-size: 12.5px; color: var(--text-3); }
+.ak-bus-pickers { margin-bottom: 12px; }
+/* Read and write each carry their own one-line meaning, so they sit as a
+   group of their own under the pickers instead of squeezed into the bar. */
+.ak-bus-actions { display: flex; flex-wrap: wrap; gap: 10px 24px; margin-bottom: 12px; }
+.ak-bus-action { flex: 1 1 220px; min-width: 0; }
+.ak-bus-action-desc { font-size: 12px; color: var(--text-3); line-height: 1.45; margin: 4px 0 0 26px; }
+
 .ak-token-box { background: var(--bg-input); border: 1px solid var(--success); border-radius: var(--radius);
   padding: 14px; display: flex; align-items: center; gap: 12px; }
 .ak-token { flex: 1; font-family: ui-monospace, 'SF Mono', monospace; font-size: 13px; color: var(--success); word-break: break-all; }
@@ -71,3 +88,35 @@
 
 /* Highlighted row when jumping from a key's "Zakres" action to the matrix */
 .access-keys-body .perm-matrix tr.ak-row-hl td { background: var(--accent-glow); }
+
+/* Pinned subject column: the grid can be far wider than the screen (one
+   column per resource, two per schema-registry scope), and without it the key
+   name scrolls away from its row. Opaque backgrounds, because the cells
+   scrolling underneath must not show through; translucent row tints are
+   layered over the opaque base. */
+.access-keys-body .ak-matrix { width: auto; min-width: 100%; }
+.access-keys-body .ak-matrix .ak-subject-col {
+  position: sticky; left: 0; z-index: 2; min-width: 220px; max-width: 280px;
+  background: var(--bg-card); box-shadow: 1px 0 0 var(--border);
+}
+.access-keys-body .ak-matrix thead th.ak-subject-col { z-index: 3; background: var(--bg-2); vertical-align: bottom; }
+.access-keys-body .ak-matrix tr.row-default td.ak-subject-col {
+  background: linear-gradient(rgba(99, 102, 241, 0.06), rgba(99, 102, 241, 0.06)), var(--bg-card);
+}
+.access-keys-body .ak-matrix tr.ak-row-hl td.ak-subject-col {
+  background: linear-gradient(var(--accent-glow), var(--accent-glow)), var(--bg-card);
+}
+/* Schema-registry headers are names, not labels: no capitals, wrap freely. */
+.access-keys-body .ak-matrix th.ak-bus-scope,
+.access-keys-body .ak-matrix th.ak-bus-action-head {
+  text-transform: none; letter-spacing: normal; font-size: 11px; white-space: normal;
+}
+.access-keys-body .ak-matrix th.ak-bus-scope { color: var(--text-2); max-width: 220px; }
+
+@media (max-width: 600px) {
+  .access-keys-body .ak-matrix .ak-subject-col { min-width: 112px; max-width: 132px; }
+  .access-keys-body .ak-matrix .group-name { overflow-wrap: anywhere; }
+  .access-keys-body .perm-matrix th.func,
+  .access-keys-body .perm-matrix td.func { min-width: 72px; }
+  .ak-bus-action { flex-basis: 100%; }
+}

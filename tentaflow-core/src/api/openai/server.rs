@@ -48,6 +48,12 @@ pub(crate) fn v1_actor(req: &Request<Incoming>) -> FlowActor {
         .unwrap_or_else(FlowActor::system)
 }
 
+/// Socket peer address of a `/v1` request (port stripped, no `X-Forwarded-For`
+/// trust), inserted by the unified server gate so handlers that audit an
+/// external caller can record where the call came from.
+#[derive(Debug, Clone)]
+pub struct V1PeerIp(pub String);
+
 /// Tworzy error response z podanym statusem, typem bledu i wiadomoscia.
 fn error_response(status: StatusCode, error_type: &str, message: String) -> Response<OpenAIBody> {
     let error = ErrorResponse {
@@ -204,13 +210,14 @@ pub fn authorize_model(
 fn entry_access_allowed(db: &DbPool, entry: &CatalogEntry, principal: &Principal) -> bool {
     match &entry.kind {
         CatalogEntryKind::Flow { flow_id, .. } => {
-            crate::auth::acl::check_v1_access(db, "flow", &entry.id, principal)
-                || crate::auth::acl::check_v1_access(db, "flow", flow_id, principal)
+            crate::auth::acl::check_v1_access(db, "flow", &entry.id, "*", principal)
+                || crate::auth::acl::check_v1_access(db, "flow", flow_id, "*", principal)
         }
         other => crate::auth::acl::check_v1_access(
             db,
             resource_type_for_kind(other),
             &entry.id,
+            "*",
             principal,
         ),
     }
@@ -515,6 +522,15 @@ pub async fn handle_request(
             let instance = instance.map(str::to_string);
             let topic = topic.to_string();
             crate::api::bus_rest::handle_consume(req, router, instance, topic).await
+        }
+
+        // TentaBus schema registry REST (F3-REST) — same dynamic-segment
+        // reason as the records routes above; the method is part of the route
+        // (`GET`/`POST` on `.../versions` are list vs register).
+        (m, p) if crate::api::bus_schema_rest::parse_bus_schema_route(m, p).is_some() => {
+            let (instance, route) =
+                crate::api::bus_schema_rest::parse_bus_schema_route(m, p).unwrap();
+            crate::api::bus_schema_rest::handle_request(req, router, instance, route).await
         }
 
         // 404 Not Found

@@ -28,6 +28,7 @@ pub mod dashboard;
 
 /// Thin external REST endpoint for TentaBus (PLAN §6.5/M4).
 pub mod bus_rest;
+pub mod bus_schema_rest;
 
 pub mod unified_server;
 

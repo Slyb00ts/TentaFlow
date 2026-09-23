@@ -78,9 +78,49 @@ pub fn decode_first_segment(id: &str) -> Option<&str> {
     Some(segment)
 }
 
+/// Decodes EVERY segment `composite_resource_id` wrote, requiring the whole
+/// input to be consumed. `None` on any malformed prefix, a declared length
+/// running past the end, or trailing bytes that are not a complete segment —
+/// a scope id that does not round-trip must never be read as a shorter or
+/// longer one.
+pub fn decode_segments(id: &str) -> Option<Vec<&str>> {
+    let mut out = Vec::new();
+    let mut rest = id;
+    while !rest.is_empty() {
+        let segment = decode_first_segment(rest)?;
+        let sep_byte_pos = rest.find(RESOURCE_ID_SEP)?;
+        let consumed = sep_byte_pos + RESOURCE_ID_SEP.len_utf8() + segment.len();
+        out.push(segment);
+        rest = &rest[consumed..];
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_segments_round_trips_a_composite() {
+        let id = composite_resource_id(&["tentabus-aaaaaaaa", "org-1"]);
+        assert_eq!(
+            decode_segments(&id),
+            Some(vec!["tentabus-aaaaaaaa", "org-1"])
+        );
+        let with_sep = composite_resource_id(&[&format!("a{RESOURCE_ID_SEP}b"), "", "c"]);
+        assert_eq!(
+            decode_segments(&with_sep),
+            Some(vec![format!("a{RESOURCE_ID_SEP}b").as_str(), "", "c"])
+        );
+    }
+
+    #[test]
+    fn decode_segments_rejects_trailing_garbage_and_truncation() {
+        let id = composite_resource_id(&["tentabus-aaaaaaaa", "org-1"]);
+        assert_eq!(decode_segments(&format!("{id}x")), None);
+        assert_eq!(decode_segments(&id[..id.len() - 1]), None);
+        assert_eq!(decode_segments("tentabus-aaaaaaaa"), None);
+    }
 
     #[test]
     fn composite_uses_length_prefixed_segments() {
