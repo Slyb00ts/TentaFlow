@@ -17,27 +17,40 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{anyhow, bail, Result};
 use tracing::{info, warn};
 
-/// Domyślna ścieżka biblioteki ONNX Runtime dla dlopen (`ort` z `load-dynamic`),
-/// gdy autodetekcja w drzewie `native-libs/` nic nie znajdzie.
+/// Systemowy ONNX Runtime dla dlopen (`ort` z `load-dynamic`), gdy autodetekcja
+/// w drzewie `native-libs/` nic nie znajdzie (Linux/macOS).
 const DEFAULT_ORT_DYLIB: &str = "/usr/lib/libonnxruntime.so.1.24.4";
 
 /// Ustawia `ORT_DYLIB_PATH` na wykrytą ścieżkę — `ort` z `load-dynamic` dlopuje
 /// onnxruntime spod tej zmiennej przy pierwszym użyciu (to kontrakt crate'a
 /// `ort`, nie operatorska zmienna środowiskowa; operator niczego nie ustawia).
 /// Preferujemy runtime z drzewa `native-libs/` (zawiera providery TensorRT i
-/// CUDA), a dopiero gdy go brak — systemowy [`DEFAULT_ORT_DYLIB`] (który ma
-/// zwykle tylko CUDA). Idempotentne przez `OnceLock`; edycja 2021: `set_var`
-/// jest bezpieczne.
+/// CUDA), a dopiero gdy go brak — [`default_ort_dylib`]. Idempotentne przez
+/// `OnceLock`; edycja 2021: `set_var` jest bezpieczne.
 pub fn ensure_ort_dylib() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
-        let path =
-            locate_ort_dylib().unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ORT_DYLIB));
+        let path = locate_ort_dylib().unwrap_or_else(default_ort_dylib);
         std::env::set_var("ORT_DYLIB_PATH", &path);
     });
 }
 
-/// Szuka `libonnxruntime.{so*,dylib}` w drzewie `native-libs/<platform>/lib-dynamic/`
+/// Windows: `onnxruntime.dll` obok binarki (tentaflow/build.rs kopiuje go tam),
+/// zawsze jako ścieżka bezwzględna — sama nazwa pozwoliłaby LoadLibrary sięgnąć
+/// po starszą kopię z System32 (Windows ML) z niezgodnym C API.
+fn default_ort_dylib() -> std::path::PathBuf {
+    if cfg!(target_os = "windows") {
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+        {
+            return dir.join("onnxruntime.dll");
+        }
+    }
+    std::path::PathBuf::from(DEFAULT_ORT_DYLIB)
+}
+
+/// Szuka `libonnxruntime.{so*,dylib}` / `onnxruntime.dll` w drzewie `native-libs/<platform>/lib-dynamic/`
 /// (build-all.sh provisionuje tam runtime GPU z TensorRT). Lustrzana logika do
 /// `services::document::rasterize::locate_pdfium_library`, ale zawężona do runtime
 /// ONNX. Zwraca pierwszy trafiony plik albo `None` (wtedy caller bierze systemowy).
@@ -64,6 +77,8 @@ fn locate_ort_dylib() -> Option<std::path::PathBuf> {
             // dowiązania .so — bierzemy oba warianty, wersjonowany jako pierwszy.
             &["libonnxruntime.so", "libonnxruntime.so.*"],
         )
+    } else if cfg!(target_os = "windows") {
+        ("windows-x86_64", &["onnxruntime.dll"])
     } else {
         return None;
     };

@@ -31,6 +31,10 @@ fn main() {
 
     require(&include_dir.join("whisper.h"));
     require(&lib_dir.join(dynamic_name("whisper_tf", &target)));
+    if target.contains("windows-msvc") {
+        // MSVC links against the import library, the DLL is only loaded at runtime.
+        require(&lib_dir.join("whisper_tf.lib"));
+    }
 
     generate_bindings(&include_dir);
 

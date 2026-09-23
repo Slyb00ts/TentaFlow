@@ -1,0 +1,5 @@
+# Files executed or parsed by bash keep LF on every checkout, including Windows
+# clones with core.autocrlf=true: Git Bash rejects the CR ("pipefail\r: invalid
+# option") and scripts/native-libs/build-all.ps1 runs these scripts there.
+*.sh text eol=lf
+scripts/versions.env text eol=lf

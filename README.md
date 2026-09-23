@@ -514,9 +514,14 @@ profiles and automatic artifact retention.
 On Windows:
 
 ```bat
-scripts\build.bat --release --features gpu-cuda
+scripts\setup.bat
+powershell -ExecutionPolicy Bypass -File scripts\native-libs\build-all.ps1 -Backend cuda
+scripts\build.bat -Edition full -Backend cuda --release
 target_shared\release\tentaflow.exe --config config.toml
 ```
+
+`-Backend vulkan` builds the Vulkan edition; `-Edition slim` (in both scripts)
+builds the gateway without a local inference engine.
 
 Profiles and cache limits: [build performance](docs/build-performance.md).
 Dependency versions and purposes: [dependency audit](docs/cargo-dependencies-audit.md).

@@ -97,11 +97,8 @@ fn kernel_config() -> Option<(String, String)> {
                 continue;
             };
             let mut text = String::new();
-            if std::io::Read::read_to_string(
-                &mut flate2::read::GzDecoder::new(&raw[..]),
-                &mut text,
-            )
-            .is_ok()
+            if std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&raw[..]), &mut text)
+                .is_ok()
                 && !text.is_empty()
             {
                 return Some((path.to_string(), text));
@@ -235,7 +232,10 @@ pub fn kernel_support(protocol: &str) -> (bool, String) {
         // `target.service`, by §3.4. The apply does it through the catalog.
         return (
             true,
-            format!("{} available, loaded on the first target", modules.join(", ")),
+            format!(
+                "{} available, loaded on the first target",
+                modules.join(", ")
+            ),
         );
     }
     (
@@ -405,7 +405,9 @@ fn parse_default_route(text: &str) -> Option<String> {
         let iface = fields.next()?;
         let destination = fields.next()?;
         let _gateway = fields.next()?;
-        let flags = fields.next().and_then(|f| u32::from_str_radix(f, 16).ok())?;
+        let flags = fields
+            .next()
+            .and_then(|f| u32::from_str_radix(f, 16).ok())?;
         // RTF_UP | RTF_GATEWAY on the 0.0.0.0/0 route.
         if destination == "00000000" && flags & 0x0003 == 0x0003 {
             return Some(iface.to_string());
@@ -860,7 +862,11 @@ fn lun_specs(target: &TargetRow) -> Vec<BlockLun> {
         .iter()
         .map(|lun| BlockLun {
             index: lun.index,
-            name: format!("tentanas_{}_lun{}", target.name.replace(['.', '-'], "_"), lun.index),
+            name: format!(
+                "tentanas_{}_lun{}",
+                target.name.replace(['.', '-'], "_"),
+                lun.index
+            ),
             device_path: lun.device_path.clone(),
             uuid: lun.uuid.clone(),
             group_id: lun.group_id,
@@ -1107,7 +1113,9 @@ fn validate_options_with(
         // iSER is a flag ON the iSCSI portal, not a second one: the login is
         // TCP either way. Two portals on one target would be two addresses,
         // which the model allows but this slice's wizard does not build.
-        return Err(anyhow!("an iSCSI target carries one portal in this version"));
+        return Err(anyhow!(
+            "an iSCSI target carries one portal in this version"
+        ));
     }
     match target.protocol.as_str() {
         "iscsi" => match target.auth_method.as_str() {
@@ -1424,7 +1432,10 @@ fn evaluate_rows(
         };
         if let Err(e) = outcome {
             tracing::warn!("tentanas targets: alert {key} not written: {e}");
-            log.push(format!("{}: the drift alert was not written: {e}", target.name));
+            log.push(format!(
+                "{}: the drift alert was not written: {e}",
+                target.name
+            ));
         }
         // Since WHEN the backing volume has been missing. Recorded here
         // because this is the one place that already asks — and recorded as a
@@ -1479,7 +1490,6 @@ fn evaluate_rows(
 /// those two, the second is the one that does not destroy anything.
 const VOLUME_GONE_GRACE: Duration = Duration::from_secs(90);
 
-
 /// Whether a `Remove` verdict may be ACTED ON now.
 ///
 /// The verdict is honest the moment it is made; this is about the destructive
@@ -1518,7 +1528,9 @@ fn removal_is_due_with(target: &TargetRow, since: &GraceClock) -> bool {
     if volume_exists {
         return true;
     }
-    since.waited(&target.target_id).is_some_and(|w| w >= VOLUME_GONE_GRACE)
+    since
+        .waited(&target.target_id)
+        .is_some_and(|w| w >= VOLUME_GONE_GRACE)
 }
 
 /// When each target's backing volume was first seen missing.
@@ -1615,7 +1627,13 @@ pub struct Evaluation {
 pub fn evaluate(db: &DbPool) -> Result<Evaluation> {
     let mut targets = store::list_targets(db)?;
     let mut log = Vec::new();
-    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, RetryMemory::global(), &mut log)?;
+    let disposition = evaluate_rows(
+        db,
+        &mut targets,
+        &kernel_can_serve,
+        RetryMemory::global(),
+        &mut log,
+    )?;
     Ok(Evaluation {
         removals_pending: !rows_to_remove(
             &targets,
@@ -1937,7 +1955,13 @@ pub async fn apply(
     // What to do with each row, keyed by target id. It cannot live on
     // `TargetRow` — the row is the DESIRED state and this is a verdict about
     // the node — and the two loops below need it after the judging loop ends.
-    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, RetryMemory::global(), &mut log)?;
+    let disposition = evaluate_rows(
+        db,
+        &mut targets,
+        &kernel_can_serve,
+        RetryMemory::global(),
+        &mut log,
+    )?;
 
     // A frozen target is left ALONE — not removed, not re-applied — so both
     // loops below have to skip it. Reading the verdict rather than the state
@@ -2060,14 +2084,17 @@ pub async fn apply(
 /// Errors are RETURNED, not logged and forgotten: a removal the kernel refuses
 /// is a target still handing a client a raw disk, and the caller backs off and
 /// raises an alert about it.
-pub async fn sweep_removals(
-    db: &DbPool,
-    explicit: Option<&ElevationToken>,
-) -> Result<Vec<String>> {
+pub async fn sweep_removals(db: &DbPool, explicit: Option<&ElevationToken>) -> Result<Vec<String>> {
     let _guard = apply_lock().lock().await;
     let mut targets = store::list_targets(db)?;
     let mut log = Vec::new();
-    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, RetryMemory::global(), &mut log)?;
+    let disposition = evaluate_rows(
+        db,
+        &mut targets,
+        &kernel_can_serve,
+        RetryMemory::global(),
+        &mut log,
+    )?;
     let mut out = Vec::new();
     let failed = enact_removals(db, &targets, &disposition, None, explicit, &mut out).await;
     if !failed.is_empty() {
@@ -2161,10 +2188,21 @@ pub async fn sweep_applies(
     let _guard = apply_lock().lock().await;
     let mut targets = store::list_targets(db)?;
     let mut log = Vec::new();
-    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, RetryMemory::global(), &mut log)?;
+    let disposition = evaluate_rows(
+        db,
+        &mut targets,
+        &kernel_can_serve,
+        RetryMemory::global(),
+        &mut log,
+    )?;
     let mut out = Vec::new();
     let mut failed: Vec<String> = Vec::new();
-    for target in rows_to_apply(&targets, &disposition, &object_in_kernel, &apply_retry_pending) {
+    for target in rows_to_apply(
+        &targets,
+        &disposition,
+        &object_in_kernel,
+        &apply_retry_pending,
+    ) {
         out.push(format!(
             "{}: judged active but not in this node's kernel, applying it",
             target.name
@@ -2215,8 +2253,16 @@ fn orphans_in(iscsi_dir: &str, nvmet_dir: &str, rows: &[TargetRow]) -> Vec<(Stri
     let known: std::collections::BTreeSet<&str> = rows.iter().map(|t| t.wwn.as_str()).collect();
     let mut out = Vec::new();
     for (protocol, dir, prefix) in [
-        ("iscsi", iscsi_dir.to_string(), format!("iqn.{WWN_AUTHORITY}:")),
-        ("nvmet", nvmet_dir.to_string(), format!("nqn.{WWN_AUTHORITY}:")),
+        (
+            "iscsi",
+            iscsi_dir.to_string(),
+            format!("iqn.{WWN_AUTHORITY}:"),
+        ),
+        (
+            "nvmet",
+            nvmet_dir.to_string(),
+            format!("nqn.{WWN_AUTHORITY}:"),
+        ),
     ] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -3045,7 +3091,13 @@ pub fn default_port_groups() -> Vec<NasTargetPortGroup> {
 }
 
 /// The single LUN a target created by the wizard exports.
-pub fn lun_for(protocol: &str, zvol: &str, size_bytes: u64, thin: bool, uuid: &str) -> NasTargetLun {
+pub fn lun_for(
+    protocol: &str,
+    zvol: &str,
+    size_bytes: u64,
+    thin: bool,
+    uuid: &str,
+) -> NasTargetLun {
     NasTargetLun {
         // NVMe namespace ids start at 1, SCSI LUNs at 0.
         index: u32::from(protocol == "nvmet"),
@@ -3238,8 +3290,16 @@ mod tests {
             auth_secret: String::new(),
             auth_mutual_username: String::new(),
             auth_mutual_secret: String::new(),
-            dhchap_hash: if nvme { "hmac(sha256)".into() } else { String::new() },
-            dhchap_dhgroup: if nvme { "ffdhe2048".into() } else { String::new() },
+            dhchap_hash: if nvme {
+                "hmac(sha256)".into()
+            } else {
+                String::new()
+            },
+            dhchap_dhgroup: if nvme {
+                "ffdhe2048".into()
+            } else {
+                String::new()
+            },
             state: "active".into(),
             state_detail: String::new(),
             created_at: "2026-09-03T12:00:00Z".into(),
@@ -3260,16 +3320,34 @@ mod tests {
     fn the_rendered_iscsi_configuration_says_whether_chap_is_on() {
         let open = preview(&target("iscsi")).expect("preview");
         assert!(open.contains("/tpgt_1/param/AuthMethod = None\n"), "{open}");
-        assert!(open.contains("/tpgt_1/attrib/authentication = 0\n"), "{open}");
+        assert!(
+            open.contains("/tpgt_1/attrib/authentication = 0\n"),
+            "{open}"
+        );
         // No allowlist -> LIO generates the ACL, which is what makes an
         // unauthenticated target open to whoever reaches the portal.
-        assert!(open.contains("/tpgt_1/attrib/generate_node_acls = 1\n"), "{open}");
+        assert!(
+            open.contains("/tpgt_1/attrib/generate_node_acls = 1\n"),
+            "{open}"
+        );
 
         let secured = preview(&chap(target("iscsi"))).expect("preview");
-        assert!(secured.contains("/tpgt_1/param/AuthMethod = CHAP\n"), "{secured}");
-        assert!(secured.contains("/tpgt_1/attrib/authentication = 1\n"), "{secured}");
-        assert!(secured.contains("/tpgt_1/auth/userid = vmware01\n"), "{secured}");
-        assert!(secured.contains("/tpgt_1/auth/userid_mutual = helios\n"), "{secured}");
+        assert!(
+            secured.contains("/tpgt_1/param/AuthMethod = CHAP\n"),
+            "{secured}"
+        );
+        assert!(
+            secured.contains("/tpgt_1/attrib/authentication = 1\n"),
+            "{secured}"
+        );
+        assert!(
+            secured.contains("/tpgt_1/auth/userid = vmware01\n"),
+            "{secured}"
+        );
+        assert!(
+            secured.contains("/tpgt_1/auth/userid_mutual = helios\n"),
+            "{secured}"
+        );
         // Mutual CHAP is the mutual PAIR and nothing else: LIO's
         // `authenticate_target` is CONFIGFS_ATTR_RO — measured on a node, the
         // write fails with EACCES even as root, and the kernel raises the flag
@@ -3289,7 +3367,10 @@ mod tests {
         open.portals = vec![portal_for("nvmet", "storage0", "10.10.0.5", "tcp")];
         let text = preview(&open).expect("preview");
         assert!(text.contains("/attr_allow_any_host = 1\n"), "{text}");
-        assert!(text.contains("/namespaces/1/device_path = /dev/zvol/tank/vm-store\n"), "{text}");
+        assert!(
+            text.contains("/namespaces/1/device_path = /dev/zvol/tank/vm-store\n"),
+            "{text}"
+        );
         assert!(text.contains("/addr_trtype = tcp\n"), "{text}");
         assert!(text.contains("/addr_traddr = 10.10.0.5\n"), "{text}");
         assert!(text.contains("/addr_trsvcid = 4420\n"), "{text}");
@@ -3303,7 +3384,12 @@ mod tests {
         // Authentication forces the allowlist on: the keys live on the host
         // objects the allowlist is made of.
         assert!(text.contains("/attr_allow_any_host = 0\n"), "{text}");
-        assert!(text.contains("mkdir /sys/kernel/config/nvmet/hosts/nqn.2014-08.org.nvmexpress:uuid:1b4e28ba\n"), "{text}");
+        assert!(
+            text.contains(
+                "mkdir /sys/kernel/config/nvmet/hosts/nqn.2014-08.org.nvmexpress:uuid:1b4e28ba\n"
+            ),
+            "{text}"
+        );
         assert!(text.contains("/dhchap_key = ***\n"), "{text}");
         assert!(text.contains("/dhchap_ctrl_key = ***\n"), "{text}");
         assert!(text.contains("/dhchap_hash = hmac(sha256)\n"), "{text}");
@@ -3322,7 +3408,10 @@ mod tests {
         assert_eq!(every.portals[0].address, "0.0.0.0");
         let refused = validate_options(&every, &[], &caps(), false).expect_err("refused");
         assert!(refused.to_string().contains("0.0.0.0"), "{refused}");
-        assert!(validate_options(&every, &[], &caps(), true).is_ok(), "confirmed is allowed");
+        assert!(
+            validate_options(&every, &[], &caps(), true).is_ok(),
+            "confirmed is allowed"
+        );
     }
 
     #[test]
@@ -3335,8 +3424,14 @@ mod tests {
         listed.initiators = vec!["iqn.1998-01.com.vmware:esx01".into()];
         assert!(validate_options(&listed, &[], &caps(), false).is_ok());
         let text = preview(&listed).expect("preview");
-        assert!(text.contains("/tpgt_1/attrib/generate_node_acls = 0\n"), "{text}");
-        assert!(text.contains("/acls/iqn.1998-01.com.vmware:esx01/auth/userid = NULL\n"), "{text}");
+        assert!(
+            text.contains("/tpgt_1/attrib/generate_node_acls = 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/acls/iqn.1998-01.com.vmware:esx01/auth/userid = NULL\n"),
+            "{text}"
+        );
         assert!(text.contains("/tpgt_1/param/AuthMethod = None\n"), "{text}");
         // …and the target still reports why it is not safe, on every list.
         let (state, detail, _) = target_state(&listed, true, &|_| true, &here(), true);
@@ -3345,7 +3440,10 @@ mod tests {
 
         // With CHAP the same list carries credentials, and only then.
         let text = preview(&chap(listed)).expect("preview");
-        assert!(text.contains("/acls/iqn.1998-01.com.vmware:esx01/auth/userid = vmware01\n"), "{text}");
+        assert!(
+            text.contains("/acls/iqn.1998-01.com.vmware:esx01/auth/userid = vmware01\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3363,7 +3461,10 @@ mod tests {
         no_auth.dhchap = false;
         no_auth.dhchap_detail = "this kernel was built without CONFIG_NVME_TARGET_AUTH".into();
         let refused = validate_options(&row, &[], &no_auth, false).expect_err("refused");
-        assert!(refused.to_string().contains("CONFIG_NVME_TARGET_AUTH"), "{refused}");
+        assert!(
+            refused.to_string().contains("CONFIG_NVME_TARGET_AUTH"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -3375,7 +3476,10 @@ mod tests {
         no_rdma.iser = false;
         no_rdma.rdma_detail = "no RDMA device under /sys/class/infiniband".into();
         let refused = validate_options(&iser, &[], &no_rdma, false).expect_err("refused");
-        assert!(refused.to_string().contains("/sys/class/infiniband"), "{refused}");
+        assert!(
+            refused.to_string().contains("/sys/class/infiniband"),
+            "{refused}"
+        );
 
         let mut rdma = target("nvmet");
         rdma.portals = vec![portal_for("nvmet", "storage0", "10.10.0.5", "rdma")];
@@ -3399,8 +3503,14 @@ mod tests {
         scsi.luns[0].group_id = 2;
         assert!(validate_options(&scsi, &[], &caps(), false).is_ok());
         let text = preview(&scsi).expect("preview");
-        assert!(text.contains("/alua/tentanas_gp2/alua_access_state = 1\n"), "{text}");
-        assert!(text.contains("/alua/tentanas_gp2/preferred = 1\n"), "{text}");
+        assert!(
+            text.contains("/alua/tentanas_gp2/alua_access_state = 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/alua/tentanas_gp2/preferred = 1\n"),
+            "{text}"
+        );
 
         let mut nvme = target("nvmet");
         nvme.port_groups = vec![NasTargetPortGroup {
@@ -3410,7 +3520,10 @@ mod tests {
         }];
         nvme.luns[0].group_id = 2;
         let text = preview(&nvme).expect("preview");
-        assert!(text.contains("/ana_groups/2/ana_state = non-optimized\n"), "{text}");
+        assert!(
+            text.contains("/ana_groups/2/ana_state = non-optimized\n"),
+            "{text}"
+        );
         // ANA has no preferred bit, so asking for one is an error.
         nvme.port_groups[0].preferred = true;
         let refused = validate_options(&nvme, &[], &caps(), false).expect_err("refused");
@@ -3431,11 +3544,20 @@ mod tests {
         // in configfs, so an nvmet target renders a first-install plan naming
         // those two roots and nothing else.
         let text = preview(&target("nvmet")).expect("preview");
-        assert!(text.contains("mkdir /sys/kernel/config/nvmet/subsystems/"), "{text}");
+        assert!(
+            text.contains("mkdir /sys/kernel/config/nvmet/subsystems/"),
+            "{text}"
+        );
         let text = preview(&target("iscsi")).expect("preview");
-        assert!(text.contains("mkdir /sys/kernel/config/target/iscsi/"), "{text}");
+        assert!(
+            text.contains("mkdir /sys/kernel/config/target/iscsi/"),
+            "{text}"
+        );
     }
 
+    // configfs is Linux-only and so is this fixture: symlinked host objects and
+    // a key file readable by root alone.
+    #[cfg(unix)]
     #[test]
     fn the_preview_says_what_it_cannot_know_instead_of_guessing() {
         // `preview` is what the detail window prints under "podgląd konfiguracji",
@@ -3491,17 +3613,26 @@ mod tests {
             // stored one, so the honest answer is the same refusal the apply
             // would give, and it arrives as an error rather than as a plan.
             let refused = rendered.expect_err("a real difference is a refusal");
-            assert!(refused.to_string().contains("DH-HMAC-CHAP settings"), "{refused}");
+            assert!(
+                refused.to_string().contains("DH-HMAC-CHAP settings"),
+                "{refused}"
+            );
         } else {
             let text = rendered.expect("an unreadable host still renders");
             // The claim it must never make: it never read the key.
             assert!(!text.contains("already holds exactly"), "{text}");
             assert!(text.contains("readable only by root"), "{text}");
-            assert!(text.contains("the node decides that when it applies"), "{text}");
+            assert!(
+                text.contains("the node decides that when it applies"),
+                "{text}"
+            );
             // And it does not pretend the object needs writing either.
             // `= ***`, not `= `: `protect …/dhchap_key = 0600` contains the
             // looser form, so the loose assertion passes for any plan at all.
-            assert!(!text.contains(&format!("/hosts/{host}/dhchap_key = ***")), "{text}");
+            assert!(
+                !text.contains(&format!("/hosts/{host}/dhchap_key = ***")),
+                "{text}"
+            );
         }
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod back");
     }
@@ -3533,9 +3664,10 @@ mod tests {
         // The sibling is LIVE unless a case says otherwise: the whole rule
         // turns on that, and on a build machine nothing is ever in configfs.
         let live = |_: &TargetRow| true;
-        let check = |row: &TargetRow, siblings: &[TargetRow], in_kernel: &dyn Fn(&TargetRow) -> bool| {
-            validate_options_with(row, siblings, &caps(), false, in_kernel)
-        };
+        let check =
+            |row: &TargetRow, siblings: &[TargetRow], in_kernel: &dyn Fn(&TargetRow) -> bool| {
+                validate_options_with(row, siblings, &caps(), false, in_kernel)
+            };
 
         // Alone, each is a perfectly legal target: an allowlist without a key
         // is a filter, not a login (§5.5).
@@ -3543,7 +3675,8 @@ mod tests {
         assert!(check(&open, &[], &live).is_ok());
 
         // Together they disagree about one kernel object, in both directions.
-        let refused = check(&open, std::slice::from_ref(&authenticated), &live).expect_err("refused");
+        let refused =
+            check(&open, std::slice::from_ref(&authenticated), &live).expect_err("refused");
         assert!(refused.to_string().contains(esx), "{refused}");
         assert!(refused.to_string().contains("vm-store"), "{refused}");
         assert!(
@@ -3555,8 +3688,12 @@ mod tests {
         // NQN-shape rule, so the message has to be THIS one.
         let mut shouting = open.clone();
         shouting.initiators = vec![esx.to_uppercase()];
-        let refused = check(&shouting, std::slice::from_ref(&authenticated), &live).expect_err("refused");
-        assert!(refused.to_string().contains("shared by the whole node"), "{refused}");
+        let refused =
+            check(&shouting, std::slice::from_ref(&authenticated), &live).expect_err("refused");
+        assert!(
+            refused.to_string().contains("shared by the whole node"),
+            "{refused}"
+        );
 
         // ---- the SUBSET property, which the doc-comment used to assert and
         // the code used to break in three separate ways ----
@@ -3615,9 +3752,18 @@ mod tests {
         // `BlockModulesLoad` is ever called. The modules loaded only once the
         // modules were loaded, so nothing ever came back and the restore loop
         // reported success over an empty apply.
-        assert!(can_serve(false, 0), "a cold boot with the modules present can serve");
-        assert!(can_serve(true, 2), "a loaded tree can serve whatever the module tree says");
-        assert!(!can_serve(false, 1), "a kernel that has no such module cannot");
+        assert!(
+            can_serve(false, 0),
+            "a cold boot with the modules present can serve"
+        );
+        assert!(
+            can_serve(true, 2),
+            "a loaded tree can serve whatever the module tree says"
+        );
+        assert!(
+            !can_serve(false, 1),
+            "a kernel that has no such module cannot"
+        );
 
         // The verdict against BOTH answers, on any host. Deriving the expected
         // value from the same production call the code makes is a tautology —
@@ -3627,9 +3773,12 @@ mod tests {
         for protocol in ["iscsi", "nvmet"] {
             let mut row = target("iscsi");
             row.protocol = protocol.to_string();
-            let (state, detail, verdict) =
-                target_state(&row, true, &|_| false, &here(), false);
-            assert_eq!(verdict, Disposition::Remove, "a node that cannot serve it takes it out");
+            let (state, detail, verdict) = target_state(&row, true, &|_| false, &here(), false);
+            assert_eq!(
+                verdict,
+                Disposition::Remove,
+                "a node that cannot serve it takes it out"
+            );
             assert_eq!(state, "error");
             assert!(detail.contains("not available on this node"), "{detail}");
             // Can serve, not in the kernel yet: appliable and honest about it.
@@ -3693,10 +3842,25 @@ mod tests {
         let readdressed = node(&[("storage0", &["192.168.1.5"])]);
         let (state, detail, verdict) = target_state(&row, true, &|_| true, &readdressed, true);
         assert_eq!((state, verdict), ("error", Disposition::Freeze));
-        assert!(detail.contains("192.168.1.5") && detail.contains("storage0"), "{detail}");
-        assert!(detail.contains("10.10.0.5"), "the sentence names the portal that went missing: {detail}");
-        assert!(detail.contains("no interface of this node has that address"), "{detail}");
-        let (state, detail, verdict) = target_state(&row, true, &|_| true, &node(&[("lan0", &["192.168.1.5"])]), true);
+        assert!(
+            detail.contains("192.168.1.5") && detail.contains("storage0"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("10.10.0.5"),
+            "the sentence names the portal that went missing: {detail}"
+        );
+        assert!(
+            detail.contains("no interface of this node has that address"),
+            "{detail}"
+        );
+        let (state, detail, verdict) = target_state(
+            &row,
+            true,
+            &|_| true,
+            &node(&[("lan0", &["192.168.1.5"])]),
+            true,
+        );
         assert_eq!((state, verdict), ("error", Disposition::Freeze));
         assert!(detail.contains("gone from this node"), "{detail}");
     }
@@ -3733,7 +3897,10 @@ mod tests {
         //    takes the transport: iSER is not a different place to listen.
         let asked = vec![portal_for("iscsi", "storage0", "ignored-by-design", "iser")];
         let changed = portals_for_update("iscsi", &stored, &asked, false, &aliased).expect("ok");
-        assert_eq!(changed[0].address, "10.10.0.9", "the alias is not collapsed");
+        assert_eq!(
+            changed[0].address, "10.10.0.9",
+            "the alias is not collapsed"
+        );
         assert_eq!(changed[0].transport, "iser");
 
         // 3. WITH the intent the address is re-derived from the node — the
@@ -3745,9 +3912,12 @@ mod tests {
         //    quietly ignored: a save that reports success for a change it threw
         //    away is the failure this path exists to prevent.
         let elsewhere = vec![portal_for("iscsi", "lan0", "", "tcp")];
-        let refused = portals_for_update("iscsi", &stored, &elsewhere, false, &aliased)
-            .expect_err("refused");
-        assert!(refused.to_string().contains("only in the wizard"), "{refused}");
+        let refused =
+            portals_for_update("iscsi", &stored, &elsewhere, false, &aliased).expect_err("refused");
+        assert!(
+            refused.to_string().contains("only in the wizard"),
+            "{refused}"
+        );
 
         // 5. And an interface with no address a portal can bind is an error
         //    even WITH the intent — never an empty address, which would become
@@ -3760,7 +3930,10 @@ mod tests {
         }];
         let refused =
             portals_for_update("iscsi", &stored, &elsewhere, true, &ipv6).expect_err("refused");
-        assert!(refused.to_string().contains("a portal can bind"), "{refused}");
+        assert!(
+            refused.to_string().contains("a portal can bind"),
+            "{refused}"
+        );
 
         // 6. The deliberate every-interface portal survives a re-pick as
         //    `0.0.0.0` rather than as an empty address.
@@ -3802,8 +3975,14 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(bindable_addresses(&aliased, "storage0"), ["10.10.0.5", "10.10.0.9"]);
-        assert_eq!(primary_address(&aliased, "storage0").as_deref(), Some("10.10.0.5"));
+        assert_eq!(
+            bindable_addresses(&aliased, "storage0"),
+            ["10.10.0.5", "10.10.0.9"]
+        );
+        assert_eq!(
+            primary_address(&aliased, "storage0").as_deref(),
+            Some("10.10.0.5")
+        );
         assert!(bindable_addresses(&aliased, "lan0").is_empty());
         assert_eq!(primary_address(&aliased, "lan0"), None);
 
@@ -3825,7 +4004,10 @@ mod tests {
         // still does not act (that is the owner's decision), so the sentence
         // is the whole safety net and it has to name the interface.
         let row = target("iscsi");
-        let walked = node(&[("storage0", &["10.10.9.9"]), ("lan0", &["10.10.0.5", "192.168.1.5"])]);
+        let walked = node(&[
+            ("storage0", &["10.10.9.9"]),
+            ("lan0", &["10.10.0.5", "192.168.1.5"]),
+        ]);
         let (state, detail, verdict) = target_state(&row, true, &|_| true, &walked, true);
         assert_eq!((state, verdict), ("error", Disposition::Freeze));
         assert!(detail.contains("moved to lan0"), "{detail}");
@@ -4030,7 +4212,10 @@ mod tests {
         // zero. There is nothing to be logged into.
         let (found, known) = sessions(&target("iscsi"));
         assert!(found.is_empty());
-        assert!(known, "a target that is not in the kernel has a knowable zero");
+        assert!(
+            known,
+            "a target that is not in the kernel has a knowable zero"
+        );
     }
 
     #[test]
@@ -4050,8 +4235,14 @@ mod tests {
         };
         refine(&mut row);
         assert!(!row.detail.contains("targetcli"), "{}", row.detail);
-        assert!(row.binaries.is_empty(), "no userspace tool decides this row");
-        assert!(row.packages.is_empty(), "nothing to install for a kernel module");
+        assert!(
+            row.binaries.is_empty(),
+            "no userspace tool decides this row"
+        );
+        assert!(
+            row.packages.is_empty(),
+            "nothing to install for a kernel module"
+        );
         assert_eq!(row.kernel_module.as_deref(), Some("target_core_mod"));
         // §5.5a: the iSER module state is on the row.
         assert!(row.detail.contains("ib_isert"), "{}", row.detail);
@@ -4078,7 +4269,10 @@ mod tests {
         refine(&mut dhchap);
         let (dhchap_ok, dhchap_detail) = dhchap_support();
         assert_eq!(dhchap.detail, dhchap_detail);
-        assert_eq!(dhchap.status, if dhchap_ok { "ok" } else { "missing_module" });
+        assert_eq!(
+            dhchap.status,
+            if dhchap_ok { "ok" } else { "missing_module" }
+        );
         // No module and no binary: the answer is a kernel BUILD option, and an
         // install button would promise something no package can deliver.
         assert_eq!(dhchap.kernel_module, None);
@@ -4101,12 +4295,18 @@ mod tests {
         let yes = "CONFIG_NVME_TARGET=m\nCONFIG_NVME_TARGET_AUTH=y\n";
         assert_eq!(kconfig_verdict(yes, "CONFIG_NVME_TARGET_AUTH"), Some(true));
         let module = "CONFIG_NVME_TARGET_AUTH=m\n";
-        assert_eq!(kconfig_verdict(module, "CONFIG_NVME_TARGET_AUTH"), Some(true));
+        assert_eq!(
+            kconfig_verdict(module, "CONFIG_NVME_TARGET_AUTH"),
+            Some(true)
+        );
         let no = "# CONFIG_NVME_TARGET_AUTH is not set\n";
         assert_eq!(kconfig_verdict(no, "CONFIG_NVME_TARGET_AUTH"), Some(false));
         // A kernel config that never mentions the symbol is "unknown", not
         // "off" — the two get different sentences.
-        assert_eq!(kconfig_verdict("CONFIG_NVME_TARGET=m\n", "CONFIG_NVME_TARGET_AUTH"), None);
+        assert_eq!(
+            kconfig_verdict("CONFIG_NVME_TARGET=m\n", "CONFIG_NVME_TARGET_AUTH"),
+            None
+        );
         // A symbol that merely CONTAINS the name is not the symbol.
         let other = "CONFIG_NVME_TARGET_AUTH_EXTRA=y\n";
         assert_eq!(kconfig_verdict(other, "CONFIG_NVME_TARGET_AUTH"), None);
@@ -4126,7 +4326,10 @@ mod tests {
         let moved = node(&[("storage0", &["192.168.50.1"])]);
         let (state, detail, verdict) = target_state(&row, true, &|_| true, &moved, true);
         assert_eq!((state, verdict), ("error", Disposition::Freeze));
-        assert!(detail.contains("192.168.50.1") && detail.contains("10.10.0.5"), "{detail}");
+        assert!(
+            detail.contains("192.168.50.1") && detail.contains("10.10.0.5"),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -4137,7 +4340,13 @@ mod tests {
         // string — the shape this replaced — would take a live export away
         // from a client mid-write because a DHCP lease moved an address.
         let row = target("iscsi");
-        let drifted = target_state(&row, true, &|_| true, &node(&[("storage0", &["10.10.9.9"])]), true);
+        let drifted = target_state(
+            &row,
+            true,
+            &|_| true,
+            &node(&[("storage0", &["10.10.9.9"])]),
+            true,
+        );
         let volume_gone = target_state(&row, false, &|_| true, &here(), true);
         // Against the CONSTANT, not against each other: comparing the two
         // computed values to one another passes just as happily if both become
@@ -4151,7 +4360,11 @@ mod tests {
         // missing, where it was, and that nothing happened automatically.
         assert!(drifted.1.contains("10.10.0.5"), "{}", drifted.1);
         assert!(drifted.1.contains("storage0"), "{}", drifted.1);
-        assert!(drifted.1.contains("re-picks the interface"), "{}", drifted.1);
+        assert!(
+            drifted.1.contains("re-picks the interface"),
+            "{}",
+            drifted.1
+        );
     }
 
     #[test]
@@ -4178,22 +4391,33 @@ mod tests {
 
         let mut rows = vec![row.clone()];
         let mut log = Vec::new();
-        let verdicts = evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
+        let verdicts = evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log)
+            .expect("evaluate");
         assert_eq!(
             verdicts.get(&row.target_id).copied(),
             Some(Disposition::Freeze)
         );
         // Persisted, so n12 shows it to whoever opens the tab next.
-        let stored = store::target_by_name(&db, &row.name).expect("read").expect("row");
+        let stored = store::target_by_name(&db, &row.name)
+            .expect("read")
+            .expect("row");
         assert_eq!(stored.state, "error");
-        assert!(stored.state_detail.contains("10.10.0.5"), "{}", stored.state_detail);
+        assert!(
+            stored.state_detail.contains("10.10.0.5"),
+            "{}",
+            stored.state_detail
+        );
         // And raised on n02/n15, keyed on the target, named by the target — a
         // bare UUID in the alert row is the one thing an admin cannot place.
         let open = store::list_alerts(&db, true).expect("alerts");
         assert_eq!(open.len(), 1, "{open:?}");
         assert_eq!(open[0].subject_kind, "target");
         assert_eq!(open[0].subject_id, row.name);
-        assert!(open[0].detail.contains("tentanas-nie-ma-takiego0"), "{:?}", open[0]);
+        assert!(
+            open[0].detail.contains("tentanas-nie-ma-takiego0"),
+            "{:?}",
+            open[0]
+        );
 
         // The address comes back (here: the portal stops naming an interface,
         // which is the deliberate 0.0.0.0 case) — the same tick closes it.
@@ -4211,7 +4435,10 @@ mod tests {
         // a claim about what the node is SERVING. A green chip over an empty
         // kernel is how a target lost to a transient sat "active" forever.
         assert_eq!(
-            store::target_by_name(&db, &row.name).expect("read").expect("row").state,
+            store::target_by_name(&db, &row.name)
+                .expect("read")
+                .expect("row")
+                .state,
             "pending"
         );
     }
@@ -4264,10 +4491,20 @@ mod tests {
 
         let mut rows = vec![dead.clone(), drifted.clone(), healthy.clone()];
         let mut log = Vec::new();
-        let verdicts = evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
-        assert_eq!(verdicts.get(&dead.target_id).copied(), Some(Disposition::Remove));
-        assert_eq!(verdicts.get(&drifted.target_id).copied(), Some(Disposition::Freeze));
-        assert_eq!(verdicts.get(&healthy.target_id).copied(), Some(Disposition::Apply));
+        let verdicts = evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log)
+            .expect("evaluate");
+        assert_eq!(
+            verdicts.get(&dead.target_id).copied(),
+            Some(Disposition::Remove)
+        );
+        assert_eq!(
+            verdicts.get(&drifted.target_id).copied(),
+            Some(Disposition::Freeze)
+        );
+        assert_eq!(
+            verdicts.get(&healthy.target_id).copied(),
+            Some(Disposition::Apply)
+        );
 
         // Everything below calls the REAL selection, with `in_kernel` injected
         // the way `installed` is. The previous version of this test
@@ -4299,7 +4536,12 @@ mod tests {
         // is what the APPLY half is for. The drifted one is in neither.
         assert!(names(rows_to_remove(&rows, &verdicts, &nothing_in_kernel, &fresh)).is_empty());
         assert_eq!(
-            names(rows_to_apply(&rows, &verdicts, &nothing_in_kernel, &never_retried)),
+            names(rows_to_apply(
+                &rows,
+                &verdicts,
+                &nothing_in_kernel,
+                &never_retried
+            )),
             vec![healthy.name.clone()]
         );
 
@@ -4321,7 +4563,13 @@ mod tests {
             vec![dead.name.clone()],
             "a drifted portal is never torn out of the kernel"
         );
-        assert!(names(rows_to_apply(&rows, &verdicts, &all_in_kernel, &never_retried)).is_empty());
+        assert!(names(rows_to_apply(
+            &rows,
+            &verdicts,
+            &all_in_kernel,
+            &never_retried
+        ))
+        .is_empty());
 
         // And the apply gate's second input, which the directory alone cannot
         // see: a row whose last apply FAILED is retried even though its
@@ -4349,7 +4597,10 @@ mod tests {
             "the authentication secret has to be entered again after an import".to_string();
         let (state, detail, verdict) = target_state(&imported, true, &|_| true, &here(), false);
         assert_eq!((state, verdict), ("disabled", Disposition::Remove));
-        assert_eq!(detail, imported.state_detail, "the reason it arrived with survives");
+        assert_eq!(
+            detail, imported.state_detail,
+            "the reason it arrived with survives"
+        );
 
         // A target the ADMIN stopped keeps nothing: whatever its detail said,
         // it described a target that was running.
@@ -4359,7 +4610,10 @@ mod tests {
         stopped.state_detail = "no authentication — the IQN/NQN allowlist is a filter".to_string();
         let (state, detail, _) = target_state(&stopped, true, &|_| true, &here(), true);
         assert_eq!(state, "disabled");
-        assert!(detail.is_empty(), "a stopped target does not keep a running target's sentence");
+        assert!(
+            detail.is_empty(),
+            "a stopped target does not keep a running target's sentence"
+        );
     }
 
     #[test]
@@ -4375,7 +4629,10 @@ mod tests {
         assert!(clock.due(t0) && clock.settled());
 
         clock.failed(t0);
-        assert!(!clock.settled(), "a failure is outstanding until something clears it");
+        assert!(
+            !clock.settled(),
+            "a failure is outstanding until something clears it"
+        );
         assert!(!clock.due(t0), "and the next attempt waits");
         assert!(clock.due(t0 + RESTORE_RETRY_MIN));
         assert_eq!(clock.failures, 1);
@@ -4385,7 +4642,10 @@ mod tests {
         assert_eq!(clock.failures, 2);
         assert_eq!(clock.wait, RESTORE_RETRY_MIN * 4);
         clock.succeeded();
-        assert!(clock.settled() && clock.due(t0), "success resets everything");
+        assert!(
+            clock.settled() && clock.due(t0),
+            "success resets everything"
+        );
         assert_eq!(clock.failures, 0);
         assert_eq!(clock.wait, RESTORE_RETRY_MIN);
 
@@ -4394,7 +4654,10 @@ mod tests {
             clock.failed(t0);
         }
         assert_eq!(clock.wait, RESTORE_RETRY_MAX);
-        assert!(clock.failures >= SWEEP_ALERT_AFTER, "and the alert threshold is reachable");
+        assert!(
+            clock.failures >= SWEEP_ALERT_AFTER,
+            "and the alert threshold is reachable"
+        );
     }
 
     #[test]
@@ -4425,11 +4688,16 @@ mod tests {
         row.portals[0].address = "0.0.0.0".to_string();
         store::upsert_target(&db, &row).expect("insert");
         let seen = evaluate(&db).expect("evaluate");
-        assert!(seen.applies_pending, "a row the node is not exporting needs applying");
+        assert!(
+            seen.applies_pending,
+            "a row the node is not exporting needs applying"
+        );
         assert!(!seen.removals_pending, "and there is nothing to take out");
         // …and the judgement is persisted, which is the other half of what
         // this function is for.
-        let stored = store::target_by_name(&db, &row.name).expect("read").expect("row");
+        let stored = store::target_by_name(&db, &row.name)
+            .expect("read")
+            .expect("row");
         assert_eq!(stored.state, "pending");
 
         // A DISABLED row that the node is not exporting either: judged
@@ -4440,8 +4708,14 @@ mod tests {
         off.enabled = false;
         store::upsert_target(&db, &off).expect("update");
         let seen = evaluate(&db).expect("evaluate");
-        assert!(!seen.removals_pending, "nothing in the kernel is nothing to remove");
-        assert!(!seen.applies_pending, "and a disabled row is not applied either");
+        assert!(
+            !seen.removals_pending,
+            "nothing in the kernel is nothing to remove"
+        );
+        assert!(
+            !seen.applies_pending,
+            "and a disabled row is not applied either"
+        );
     }
 
     #[tokio::test]
@@ -4456,8 +4730,14 @@ mod tests {
         let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
         let cipher = SettingsCipher::new(&[7u8; 32]);
 
-        assert!(sweep_removals(&db, None).await.expect("removals").is_empty());
-        assert!(sweep_applies(&db, &cipher, None).await.expect("applies").is_empty());
+        assert!(sweep_removals(&db, None)
+            .await
+            .expect("removals")
+            .is_empty());
+        assert!(sweep_applies(&db, &cipher, None)
+            .await
+            .expect("applies")
+            .is_empty());
 
         // A row judged `Remove` whose object is NOT in the kernel is still
         // nothing to do — and this is the assertion that would catch a sweep
@@ -4467,11 +4747,20 @@ mod tests {
         off.enabled = false;
         off.luns[0].device_path = "/dev/null".to_string();
         store::upsert_target(&db, &off).expect("insert");
-        assert!(sweep_removals(&db, None).await.expect("removals").is_empty());
+        assert!(sweep_removals(&db, None)
+            .await
+            .expect("removals")
+            .is_empty());
 
         // And both release the lock they take: a second call must not hang.
-        assert!(sweep_removals(&db, None).await.expect("removals").is_empty());
-        assert!(sweep_applies(&db, &cipher, None).await.expect("applies").is_empty());
+        assert!(sweep_removals(&db, None)
+            .await
+            .expect("removals")
+            .is_empty());
+        assert!(sweep_applies(&db, &cipher, None)
+            .await
+            .expect("applies")
+            .is_empty());
 
         // NAMED HOLE, so nobody reads this test as more than it is: every
         // assertion above is negative. Replace either sweep's body with
@@ -4515,10 +4804,16 @@ mod tests {
         // countdown and the row would never become due; if it kept it, the row
         // is due one second later. The old version made these calls at t=0,
         // where `insert` and `or_insert_with` are indistinguishable.
-        clock.rewind_for_test(&vanished.target_id, VOLUME_GONE_GRACE - Duration::from_secs(1));
+        clock.rewind_for_test(
+            &vanished.target_id,
+            VOLUME_GONE_GRACE - Duration::from_secs(1),
+        );
         clock.note(&vanished.target_id, false);
         clock.note(&vanished.target_id, false);
-        clock.rewind_for_test(&vanished.target_id, VOLUME_GONE_GRACE + Duration::from_secs(1));
+        clock.rewind_for_test(
+            &vanished.target_id,
+            VOLUME_GONE_GRACE + Duration::from_secs(1),
+        );
         assert!(
             removal_is_due_with(&vanished, &clock),
             "re-judging a row must not restart its countdown"
@@ -4528,9 +4823,16 @@ mod tests {
         // rewind panicking if it did not, and by the row not being due after
         // the next sighting starts a fresh countdown.
         clock.note(&vanished.target_id, true);
-        assert_eq!(clock.waited(&vanished.target_id), None, "a returned volume clears the mark");
+        assert_eq!(
+            clock.waited(&vanished.target_id),
+            None,
+            "a returned volume clears the mark"
+        );
         clock.note(&vanished.target_id, false);
-        assert!(!removal_is_due_with(&vanished, &clock), "and the countdown starts again");
+        assert!(
+            !removal_is_due_with(&vanished, &clock),
+            "and the countdown starts again"
+        );
 
         // The admin's own "stop" needs no waiting — that click IS the
         // confirmation, and the grace period is about evidence, not about
@@ -4577,7 +4879,10 @@ mod tests {
         let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
 
         let first = nvmet_sessions(&db).await;
-        assert!(!first.available, "a node that cannot be asked does not report zero");
+        assert!(
+            !first.available,
+            "a node that cannot be asked does not report zero"
+        );
         assert!(!first.reason.is_empty(), "and it says why: {first:?}");
 
         // …and the second call is served from the cache, which is the whole
@@ -4625,7 +4930,10 @@ mod tests {
         // The detail has to say what an admin can DO about it — an alert whose
         // text names no action is one they learn to ignore.
         assert!(raised.3.contains("Environment"), "{}", raised.3);
-        assert!(channel_alert(false, &removals).is_some(), "a pending removal counts too");
+        assert!(
+            channel_alert(false, &removals).is_some(),
+            "a pending removal counts too"
+        );
 
         // Both ways out.
         assert!(
@@ -4661,7 +4969,10 @@ mod tests {
         row.luns[0].device_path = "/dev/null".to_string();
         let memory = RetryMemory::new();
 
-        assert!(!memory.pending(&row), "a row nobody applied yet has nothing to retry");
+        assert!(
+            !memory.pending(&row),
+            "a row nobody applied yet has nothing to retry"
+        );
 
         memory.note(&row.target_id, false);
         assert!(memory.pending(&row), "a failed apply is remembered");
@@ -4675,7 +4986,11 @@ mod tests {
         disposition.insert(row.target_id.clone(), Disposition::Apply);
         let retry = |t: &TargetRow| memory.pending(t);
         let picked = rows_to_apply(&targets, &disposition, &|_| true, &retry);
-        assert_eq!(picked.len(), 1, "the remembered failure re-selects a row already in the kernel");
+        assert_eq!(
+            picked.len(),
+            1,
+            "the remembered failure re-selects a row already in the kernel"
+        );
 
         memory.note(&row.target_id, true);
         assert!(!memory.pending(&row), "a successful apply forgets it");
@@ -4690,7 +5005,10 @@ mod tests {
         // `retain(|_| false)` passes the second assertion alone.
         memory.note(&row.target_id, false);
         memory.forget_missing(&targets);
-        assert!(memory.pending(&row), "a row still in the database keeps its failure");
+        assert!(
+            memory.pending(&row),
+            "a row still in the database keeps its failure"
+        );
         memory.forget_missing(&[]);
         assert!(!memory.pending(&row), "a row that is gone does not");
 
@@ -4704,11 +5022,20 @@ mod tests {
         //
         // A unique id, so even a future test that does touch the global cannot
         // collide.
-        assert!(!apply_retry_pending(&row), "the global set starts clean for this id");
+        assert!(
+            !apply_retry_pending(&row),
+            "the global set starts clean for this id"
+        );
         note_apply_outcome(&row.target_id, false);
-        assert!(apply_retry_pending(&row), "the two free functions share one set");
+        assert!(
+            apply_retry_pending(&row),
+            "the two free functions share one set"
+        );
         note_apply_outcome(&row.target_id, true);
-        assert!(!apply_retry_pending(&row), "and a success clears it there too");
+        assert!(
+            !apply_retry_pending(&row),
+            "and a success clears it there too"
+        );
 
         // What remains uncovered, said plainly: `apply` and both sweeps call
         // `note_apply_outcome` on a real apply outcome, and reaching that
@@ -4779,11 +5106,29 @@ mod tests {
         super::super::db::migrate(&conn).expect("migrate");
         let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
         let key = drift_alert_key("t1");
-        assert!(store::raise_alert(&db, &key, "warning", "target", "vm-store", "Target vm-store", "moved to lan0").expect("raise"));
+        assert!(store::raise_alert(
+            &db,
+            &key,
+            "warning",
+            "target",
+            "vm-store",
+            "Target vm-store",
+            "moved to lan0"
+        )
+        .expect("raise"));
         let first = store::list_alerts(&db, true).expect("alerts");
         assert_eq!(first.len(), 1);
         // A second raise is not a new event…
-        assert!(!store::raise_alert(&db, &key, "warning", "target", "vm-store", "Target vm-store", "moved to mgmt0").expect("raise"));
+        assert!(!store::raise_alert(
+            &db,
+            &key,
+            "warning",
+            "target",
+            "vm-store",
+            "Target vm-store",
+            "moved to mgmt0"
+        )
+        .expect("raise"));
         let open = store::list_alerts(&db, true).expect("alerts");
         assert_eq!(open.len(), 1);
         // …but it says what is true now, and it neither restarts the clock nor
@@ -4937,8 +5282,14 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                ("iscsi".to_string(), "iqn.2026-09.local.tentaflow:helios.zapomniany".to_string()),
-                ("nvmet".to_string(), "nqn.2026-09.local.tentaflow:helios.stary".to_string()),
+                (
+                    "iscsi".to_string(),
+                    "iqn.2026-09.local.tentaflow:helios.zapomniany".to_string()
+                ),
+                (
+                    "nvmet".to_string(),
+                    "nqn.2026-09.local.tentaflow:helios.stary".to_string()
+                ),
             ],
             "only this app's own names, and only the ones with no row"
         );
@@ -5016,7 +5367,10 @@ mod tests {
         let asked = vec![portal_for("iscsi", "lan0", "", "tcp")];
         let refused = portals_for_update("iscsi", &stored, &asked, true, &listed)
             .expect_err("an interface with no bindable address is refused");
-        assert!(refused.to_string().contains("a portal can bind"), "{refused}");
+        assert!(
+            refused.to_string().contains("a portal can bind"),
+            "{refused}"
+        );
         // But it is NOT dropped from the list the picker renders — that is the
         // difference between "you cannot pick this and here is why" and "your
         // node has no interfaces".

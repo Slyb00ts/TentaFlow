@@ -11,7 +11,7 @@ fn require(path: &Path, platform: &str) {
         let hint = if platform.starts_with("android-") {
             "scripts/native-libs/build-all-android.sh --only zvec".to_string()
         } else if platform == "windows-x86_64" {
-            "scripts\\native-libs\\build-all.ps1 --Only zvec".to_string()
+            "scripts\\native-libs\\build-all.ps1 -Only zvec".to_string()
         } else {
             "./scripts/native-libs/build-all.sh --only zvec".to_string()
         };

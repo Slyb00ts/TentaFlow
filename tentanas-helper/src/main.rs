@@ -20,14 +20,21 @@
 // 66 tool missing, 67 not root, 68 spawn failure, 69 builtin action failed.
 // =============================================================================
 
+#[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::io::{self, Read, Write};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 
+#[cfg(unix)]
 use tentanas_helper::{actions, CatalogError, HelperCommand, Plan, VERSION};
 
+#[cfg(unix)]
 const MAX_COMMAND_BYTES: u64 = 16 * 1024;
 
+#[cfg(unix)]
 fn syslog(message: &str) {
     // openlog/syslog are the only libc calls here; the identifier outlives
     // the process so a static C string is correct.
@@ -49,6 +56,16 @@ fn syslog(message: &str) {
     }
 }
 
+// The wrapper is installed only on the NAS host (Linux); a build on another
+// platform — the workspace compiles every member — refuses to run instead of
+// pretending to execute anything.
+#[cfg(not(unix))]
+fn main() -> ExitCode {
+    eprintln!("tentanas-helper runs only on the NAS host (Linux)");
+    ExitCode::from(64)
+}
+
+#[cfg(unix)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version") {

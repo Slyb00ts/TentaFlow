@@ -22,6 +22,8 @@ on:
     paths:
       - 'tentaflow-mobile/**'
       - 'scripts/native-libs/**'
+      - 'scripts/versions.env'
+      - 'scripts/lib/versions.sh'
       - '.github/workflows/android.yml'
 
 jobs:
@@ -77,7 +79,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: native-libs/android-arm64
-          key: native-libs-android-arm64-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh') }}
+          key: native-libs-android-arm64-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh', 'scripts/versions.env', 'scripts/lib/versions.sh') }}
 
       - name: cargo-ndk
         run: cargo install cargo-ndk --locked

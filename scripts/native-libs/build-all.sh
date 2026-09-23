@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 ONLY=""
+EDITION="full"
 EXPLICIT_PLATFORM=""
 BUILD_IOS_SIM=0
 
@@ -22,6 +23,16 @@ while [ "$#" -gt 0 ]; do
       ;;
     --only)
       ONLY="${2:?Brak wartości dla --only}"
+      shift 2
+      ;;
+    --edition)
+      # slim = no local inference engine (see CLAUDE.md "Distribution
+      # editions"): only the libraries the gateway itself links or loads.
+      EDITION="${2:?Brak wartości dla --edition}"
+      case "$EDITION" in
+        full|slim) ;;
+        *) echo "--edition: full albo slim, podano: $EDITION" >&2; exit 1 ;;
+      esac
       shift 2
       ;;
     --ios-sim)
@@ -75,7 +86,11 @@ run_step() {
 build_platform() {
   local platform="$1"
   prepare_layout "$platform"
-  write_manifest_header "$platform"
+  # A single-step run appends to the existing manifest instead of dropping the
+  # entries of every library it did not rebuild.
+  if [ -z "$ONLY" ] || [ ! -f "$NATIVE_ROOT/$platform/manifest.toml" ]; then
+    write_manifest_header "$platform"
+  fi
   echo "=========================================="
   echo "Platforma: $platform"
   echo "Cache:     $NATIVE_CACHE"
@@ -83,10 +98,15 @@ build_platform() {
   echo "=========================================="
 
   run_step zvec "$SCRIPT_DIR/build-zvec.sh" "$platform"
-  run_step llama-cpp "$SCRIPT_DIR/build-llama-cpp.sh" "$platform"
   # pdfium (rasteryzacja PDF w RAG) — prebuilt dla każdej platformy (linux/macos/
-  # android/ios). PDF musi działać na każdym urządzeniu, więc krok bezwarunkowy.
+  # windows/android/ios). PDF musi działać na każdym urządzeniu i w każdej
+  # edycji, więc krok bezwarunkowy.
   run_step pdfium "$SCRIPT_DIR/build-pdfium.sh" "$platform"
+  if [ "$EDITION" = "slim" ]; then
+    echo "Gotowe (slim): $NATIVE_ROOT/$platform"
+    return 0
+  fi
+  run_step llama-cpp "$SCRIPT_DIR/build-llama-cpp.sh" "$platform"
   case "$platform" in
     ios-*)
       run_step sherpa-onnx "$SCRIPT_DIR/build-sherpa-onnx.sh" "$platform"

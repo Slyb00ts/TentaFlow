@@ -18,7 +18,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=../Cargo.toml");
     println!("cargo:rerun-if-changed=../Cargo.lock");
-    set_linux_rpath();
+    set_platform_link_args();
     copy_native_dynamic_libs();
     copy_isolated_whisper_dylib();
     copy_zvec_dylib();
@@ -74,9 +74,9 @@ fn copy_zvec_dylib() {
     }
 }
 
-// ----- Linux linker flags ----------------------------------------------------
-// Rpath $ORIGIN: sherpa-rs (libsherpa-onnx-c-api.so + libonnxruntime.so) oraz
-// izolowany whisper (libwhisper_tf.so) sa kopiowane do target/<profile>/ przy
+// ----- Platform linker flags -------------------------------------------------
+// Rpath $ORIGIN: biblioteki z native-libs/<platform>/lib-dynamic (onnxruntime,
+// zvec, pdfium) oraz izolowany whisper (libwhisper_tf.so) sa kopiowane do target/<profile>/ przy
 // buildzie. Bez rpath binarka szukalaby ich tylko w systemowych sciezkach
 // (/usr/lib, LD_LIBRARY_PATH) i padla z "error while loading shared libraries".
 // $ORIGIN = szukaj obok exe. macOS uzywa @loader_path (build_mlx_bridge).
@@ -86,12 +86,21 @@ fn copy_zvec_dylib() {
 // whisper-rs-sys/build.rs), wiec znikla potrzeba `--allow-multiple-definition`
 // (Linux) / `/FORCE:MULTIPLE` (MSVC) — symbole ggml_* whispera nie trafiaja juz
 // do glownego linku binarki.
-fn set_linux_rpath() {
+fn set_platform_link_args() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "linux" => {
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
             add_native_dynamic_rpath();
+        }
+        "windows" => {
+            // Rust and every native library in native-libs use the DLL CRT
+            // (/MD), but cuda.lib of some CUDA toolkits (13.3) asks for the
+            // static one; two CRTs in one process keep separate heaps. A link
+            // arg from a -sys crate never reaches the binary, so it lives here.
+            if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+                println!("cargo:rustc-link-arg-bins=/NODEFAULTLIB:libcmt.lib");
+            }
         }
         "macos" => {
             // Na macOS dylib zvec ma install name `@rpath/libzvec_c_api.dylib`,

@@ -81,11 +81,7 @@ fn system_unit_path() -> PathBuf {
 
 fn user_unit_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".config/systemd/user")
-            .join(UNIT),
-    )
+    Some(PathBuf::from(home).join(".config/systemd/user").join(UNIT))
 }
 
 fn launchd_daemon_path() -> PathBuf {

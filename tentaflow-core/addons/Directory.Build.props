@@ -1,0 +1,24 @@
+<Project>
+
+  <!-- ===== File: Directory.Build.props — NativeAOT-LLVM compiler shared by every C# addon ===== -->
+  <!-- The compiler version lives in scripts/versions.env (one place for every
+       toolchain pin); it is read here instead of being repeated per csproj.
+       The host package follows the machine that compiles
+       (runtime.win-x64 / runtime.linux-x64 / runtime.osx-arm64 ...). -->
+
+  <PropertyGroup>
+    <TentaflowVersionsFile>$(MSBuildThisFileDirectory)../../scripts/versions.env</TentaflowVersionsFile>
+    <IlcLlvmVersion>$([System.Text.RegularExpressions.Regex]::Replace($([System.IO.File]::ReadAllText('$(TentaflowVersionsFile)')), '(?s)^(?:.*\n)?DOTNET_ILCOMPILER_LLVM_VERSION=([^\r\n]+).*$', '$1'))</IlcLlvmVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.DotNet.ILCompiler.LLVM" Version="$(IlcLlvmVersion)" />
+    <PackageReference Include="runtime.$(NETCoreSdkRuntimeIdentifier).Microsoft.DotNet.ILCompiler.LLVM" Version="$(IlcLlvmVersion)" />
+  </ItemGroup>
+
+  <Target Name="TentaflowCheckIlcLlvmVersion" BeforeTargets="CollectPackageReferences;Restore">
+    <Error Condition="!$([System.Text.RegularExpressions.Regex]::IsMatch('$(IlcLlvmVersion)', '^[0-9]+\.[0-9]+\.[0-9]+[-.0-9A-Za-z]*$'))"
+           Text="DOTNET_ILCOMPILER_LLVM_VERSION is missing or malformed in $(TentaflowVersionsFile)." />
+  </Target>
+
+</Project>

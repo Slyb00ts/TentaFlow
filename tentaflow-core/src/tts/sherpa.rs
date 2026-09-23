@@ -1,14 +1,13 @@
 // =============================================================================
 // Plik: tts/sherpa.rs
-// Opis: Adapter sherpa-onnx VITS TTS przez crate sherpa-rs. Wkompilowany w
+// Opis: Adapter sherpa-onnx VITS TTS nad C API (sherpa-rs-sys). Wkompilowany w
 //       binarke tentaflow przez Cargo feature `inference-sherpa`. Zaczyna
 //       od konfiguracji VITS Piper (model + tokens + opcjonalny espeak-ng-
 //       data); generate zwraca surowe sample float32 + sample rate.
 // =============================================================================
 
 use anyhow::{anyhow, Context, Result};
-use sherpa_rs::tts::{CommonTtsConfig, VitsTts, VitsTtsConfig};
-use sherpa_rs::OnnxConfig;
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::info;
@@ -547,6 +546,99 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Instancja `SherpaOnnxOfflineTts` z modelem VITS. Konfiguracje C budujemy od
+/// wyzerowanych struktur, tak jak przyklady sherpa-onnx (`memset` = wartosci
+/// domyslne), wiec pola dopisywane w kolejnych wersjach C API nie psuja
+/// kompilacji i dostaja swoje wartosci domyslne.
+struct VitsTts {
+    tts: *const sherpa_rs_sys::SherpaOnnxOfflineTts,
+}
+
+// SAFETY: sherpa-onnx pozwala uzywac instancji TTS z dowolnego watku; dostep
+// jest i tak serializowany przez Mutex w SherpaTtsEngine.
+unsafe impl Send for VitsTts {}
+
+struct VitsParams<'a> {
+    model: &'a Path,
+    tokens: &'a Path,
+    /// Katalog `espeak-ng-data`; `None` gdy voice go nie potrzebuje.
+    data_dir: Option<&'a Path>,
+    length_scale: f32,
+    noise_scale: f32,
+    noise_scale_w: f32,
+    num_threads: i32,
+}
+
+fn c_path(path: &Path) -> Result<CString> {
+    CString::new(path.to_string_lossy().into_owned())
+        .with_context(|| format!("sciezka z bajtem NUL: {}", path.display()))
+}
+
+impl VitsTts {
+    fn new(p: VitsParams<'_>) -> Result<Self> {
+        let model = c_path(p.model)?;
+        let tokens = c_path(p.tokens)?;
+        let data_dir = match p.data_dir {
+            Some(dir) => c_path(dir)?,
+            None => CString::default(),
+        };
+        let provider = CString::new("cpu").expect("static provider name");
+        // SAFETY: wszystkie struktury to POD z C API, zero to ich wartosc
+        // domyslna; wskazniki na CString zyja do konca wywolania Create, ktore
+        // kopiuje konfiguracje.
+        let tts = unsafe {
+            let mut config: sherpa_rs_sys::SherpaOnnxOfflineTtsConfig = std::mem::zeroed();
+            config.max_num_sentences = 1;
+            config.model.num_threads = p.num_threads;
+            config.model.provider = provider.as_ptr();
+            config.model.vits.model = model.as_ptr();
+            config.model.vits.tokens = tokens.as_ptr();
+            config.model.vits.data_dir = data_dir.as_ptr();
+            config.model.vits.length_scale = p.length_scale;
+            config.model.vits.noise_scale = p.noise_scale;
+            config.model.vits.noise_scale_w = p.noise_scale_w;
+            sherpa_rs_sys::SherpaOnnxCreateOfflineTts(&config)
+        };
+        if tts.is_null() {
+            anyhow::bail!(
+                "sherpa-onnx nie utworzyl TTS dla {} (zly model lub tokens)",
+                p.model.display()
+            );
+        }
+        Ok(Self { tts })
+    }
+
+    /// Synteza jednego tekstu; zwraca sample float32 i sample rate modelu.
+    fn generate(&mut self, text: &str, sid: i32, speed: f32) -> Result<(Vec<f32>, u32)> {
+        let text = CString::new(text).context("tekst z bajtem NUL")?;
+        // SAFETY: `self.tts` jest zywa instancja; zwrocony bufor audio nalezy
+        // do nas i zwalniamy go po skopiowaniu probek.
+        unsafe {
+            let audio =
+                sherpa_rs_sys::SherpaOnnxOfflineTtsGenerate(self.tts, text.as_ptr(), sid, speed);
+            if audio.is_null() {
+                anyhow::bail!("sherpa-onnx nie zwrocil audio");
+            }
+            let a = &*audio;
+            let result = if a.n < 0 || a.samples.is_null() {
+                Err(anyhow!("sherpa-onnx zwrocil puste audio"))
+            } else {
+                let samples = std::slice::from_raw_parts(a.samples, a.n as usize).to_vec();
+                Ok((samples, a.sample_rate as u32))
+            };
+            sherpa_rs_sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
+            result
+        }
+    }
+}
+
+impl Drop for VitsTts {
+    fn drop(&mut self) {
+        // SAFETY: instancja utworzona w `new`, zwalniana dokladnie raz.
+        unsafe { sherpa_rs_sys::SherpaOnnxDestroyOfflineTts(self.tts) };
+    }
+}
+
 /// Embedded TTS engine wokol sherpa-onnx VITS Piper. Loaduje model z
 /// katalogu zawierajacego `<model>.onnx` + `tokens.txt` + opcjonalnie
 /// `espeak-ng-data/` (wymagane dla wiekszosci VITS Piper voices).
@@ -648,11 +740,6 @@ impl TtsEngine for SherpaTtsEngine {
             anyhow::bail!("brak tokens.txt w {}", model_dir.display());
         }
         let espeak_dir = model_dir.join("espeak-ng-data");
-        let data_dir_str = if espeak_dir.exists() {
-            espeak_dir.to_string_lossy().into_owned()
-        } else {
-            String::new()
-        };
 
         let model_stem = model_path
             .file_stem()
@@ -661,29 +748,15 @@ impl TtsEngine for SherpaTtsEngine {
             .to_string();
         let (length_scale, noise_scale) = voice_tuning(&model_stem).unwrap_or((1.0, 0.667));
 
-        let config = VitsTtsConfig {
-            model: model_path.to_string_lossy().into_owned(),
-            tokens: tokens_path.to_string_lossy().into_owned(),
-            data_dir: data_dir_str,
+        let tts = VitsTts::new(VitsParams {
+            model: &model_path,
+            tokens: &tokens_path,
+            data_dir: espeak_dir.exists().then_some(espeak_dir.as_path()),
             length_scale,
             noise_scale,
             noise_scale_w: 0.8,
-            silence_scale: 0.0,
-            onnx_config: OnnxConfig {
-                provider: "cpu".to_string(),
-                num_threads: 2,
-                debug: false,
-                ..Default::default()
-            },
-            tts_config: CommonTtsConfig {
-                max_num_sentences: 1,
-                silence_scale: 0.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let tts = VitsTts::new(config);
+            num_threads: 2,
+        })?;
         // Sample rate poznajemy po pierwszej syntezie — ustawiamy domyslny
         // VITS 22050 Hz; faktyczna wartosc dopowiada SynthesizeResult.
         let info = TtsModelInfo {
@@ -705,12 +778,10 @@ impl TtsEngine for SherpaTtsEngine {
     fn synthesize(&self, params: SynthesizeParams) -> Result<SynthesizeResult> {
         let mut guard = self.inner.lock().unwrap();
         let tts = guard.as_mut().ok_or_else(|| anyhow!("model not loaded"))?;
-        let audio = tts
-            .create(&params.text, params.speaker_id, params.speed)
-            .map_err(|e| anyhow!("sherpa create: {e:?}"))?;
+        let (samples, sample_rate) = tts.generate(&params.text, params.speaker_id, params.speed)?;
         Ok(SynthesizeResult {
-            samples: audio.samples,
-            sample_rate: audio.sample_rate,
+            samples,
+            sample_rate,
         })
     }
 

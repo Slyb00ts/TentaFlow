@@ -13,9 +13,9 @@ default = ["camera", "inference-vision-gpu", "inference-supertonic"]
 docker = ["dep:bollard"]
 inference-llamacpp = ["dep:tentaflow-wrappers", "tentaflow-wrappers/llama"]
 inference-whisper = ["dep:tentaflow-wrappers", "tentaflow-wrappers/whisper"]
-# sherpa-onnx jako embedded TTS — bindings do sherpa-onnx + onnxruntime
-# z crate sherpa-rs. Niezalezny linker space (nie kolizja z ggml).
-inference-sherpa = ["dep:sherpa-rs"]
+# sherpa-onnx jako embedded TTS — C API sherpa-onnx (+ onnxruntime) przez
+# sherpa-rs-sys. Niezalezny linker space (nie kolizja z ggml).
+inference-sherpa = ["dep:sherpa-rs-sys"]
 # MLX inference przez Swift bridge (mlx-swift / MLXLLM). Wymagane macOS + Xcode
 # — build.rs w tentaflow/ buduje libMLXBridge.dylib przez xcodebuild. Aktywne
 # na desktop macOS i iOS. Stary `inference-mlx` (oparty o mlx-rs / mlx-models)
@@ -34,8 +34,8 @@ inference-mlx-whisper = ["dep:libloading"]
 inference-mlx-kokoro = ["dep:libloading"]
 # Supertonic TTS przez ONNX Runtime (crate `ort`). Desktop: Linux/macOS/Windows.
 # `ort` z feature `load-dynamic` dlopuje onnxruntime runtime'em (nie linkuje
-# statycznie), wiec NIE koliduje z sherpa-rs (ktore tez linkuje onnxruntime
-# dynamicznie) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
+# statycznie), wiec NIE koliduje ze statycznym onnxruntime sherpa-onnx
+# (sherpa-rs-sys) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
 inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
 # ONNX Runtime dla głównej ścieżki wizji. Jest niezależny od Supertonic, żeby
 # AMD/Intel mogły używać Burn przez WGPU/Vulkan przy zachowaniu TTS przez ORT.
@@ -324,14 +324,12 @@ tentaflow-hardware = { workspace = true, default-features = true }
 # STT — Whisper (optional)
 # dlopen libMLXBridge.dylib — feature inference-mlx-whisper.
 libloading = { workspace = true, optional = true }
-sherpa-rs = { workspace = true, optional = true }
-# Supertonic TTS — ONNX Runtime przez `ort`. `download-binaries`: ort pobiera
-# i wkompilowuje WLASNY onnxruntime (~1.24, ktorego wymaga rc.12). NIE
-# `load-dynamic` — bo to dlopowalo onnxruntime 1.17.1 dostarczany przez
-# sherpa-rs, a `ort` rc.12 wymaga C API >= 24 (na 1.17.1 `GetApi(24)`=NULL =>
-# tworzenie sesji wisi/wala sie). Wlasny onnxruntime ort wspolistnieje z
-# 1.17.1 sherpy przez two-level namespace (osobne dyliby). `ndarray` daje
-# Value::from_array(Array3).
+sherpa-rs-sys = { workspace = true, optional = true }
+# Supertonic TTS i wizja — ONNX Runtime przez `ort` z `load-dynamic`: runtime
+# (ONNXRUNTIME_REF z scripts/versions.env) jest w native-libs/<platform>/
+# lib-dynamic i ladowany po sciezce (vision/ort_common.rs, tts/supertonic.rs).
+# `api-24` wymaga ORT >= 1.24. Statyczny onnxruntime sherpa-onnx to osobna
+# kopia, niewidoczna dla `ort`. `ndarray` daje Value::from_array(Array3).
 ort = { workspace = true, features = ["load-dynamic", "tls-rustls", "ndarray", "std", "api-24"], optional = true }
 ndarray = { workspace = true, optional = true }
 # MPMC job channel feeding each pooled ort session's dedicated OS thread (see
@@ -402,6 +400,7 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = { workspace = true }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Dxgi"] }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

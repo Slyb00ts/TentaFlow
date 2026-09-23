@@ -130,7 +130,7 @@ extern "C" llama_rs_speculative * llama_rs_speculative_init(
                 common_speculative_get_draft_params(state->spec, static_cast<llama_seq_id>(seq));
             dp.drafting = false;
             dp.n_max    = -1;
-            dp.n_past   = 0;
+            dp.pos0     = 0;
             dp.id_last  = 0;
             dp.prompt   = &state->prompt_per_seq[seq];
             dp.result   = &state->draft_per_seq[seq];
@@ -198,22 +198,6 @@ extern "C" bool llama_rs_speculative_process(
     }
 }
 
-extern "C" bool llama_rs_speculative_need_embd(llama_rs_speculative * spec) {
-    if (!spec) {
-        return false;
-    }
-    auto * state = reinterpret_cast<wrapper_state *>(spec);
-    return common_speculative_need_embd(state->spec);
-}
-
-extern "C" bool llama_rs_speculative_need_embd_nextn(llama_rs_speculative * spec) {
-    if (!spec) {
-        return false;
-    }
-    auto * state = reinterpret_cast<wrapper_state *>(spec);
-    return common_speculative_need_embd_nextn(state->spec);
-}
-
 extern "C" void llama_rs_speculative_draft(
     llama_rs_speculative * spec,
     llama_seq_id seq_id,
@@ -246,7 +230,7 @@ extern "C" void llama_rs_speculative_draft(
             common_speculative_get_draft_params(state->spec, seq_id);
         dp.drafting = true;
         dp.n_max    = n_max;
-        dp.n_past   = n_past;
+        dp.pos0     = n_past;
         dp.id_last  = id_last;
         dp.prompt   = &prompt_buf;
         dp.result   = &state->draft_per_seq[seq];

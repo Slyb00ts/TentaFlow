@@ -47,10 +47,7 @@ impl InstallReceipt {
         let mut out = vec![PathBuf::from("/etc/tentaflow/install-receipt.json")];
         if let Some(home) = std::env::var_os("HOME") {
             out.push(PathBuf::from(&home).join(".config/tentaflow/install-receipt.json"));
-            out.push(
-                PathBuf::from(&home)
-                    .join(".local/share/tentaflow/install-receipt.json"),
-            );
+            out.push(PathBuf::from(&home).join(".local/share/tentaflow/install-receipt.json"));
         }
         out
     }

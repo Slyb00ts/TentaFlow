@@ -211,12 +211,12 @@ mod windows_impl {
             PdhQuery::open().map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
 
         let avail = query
-            .add_counter("\\Memory\\Available Bytes")
+            .add_english_counter("\\Memory\\Available Bytes")
             .map_err(|e| CollectorError::Custom(format!("Available Bytes: {e}")))?;
         let committed = query
-            .add_counter("\\Memory\\Committed Bytes")
+            .add_english_counter("\\Memory\\Committed Bytes")
             .map_err(|e| CollectorError::Custom(format!("Committed Bytes: {e}")))?;
-        let faults = query.add_counter("\\Memory\\Page Faults/sec").ok();
+        let faults = query.add_english_counter("\\Memory\\Page Faults/sec").ok();
 
         query
             .collect()

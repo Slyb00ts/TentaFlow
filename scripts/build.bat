@@ -5,10 +5,10 @@ REM cmd.exe ma .ps1 association = notepad, wiec nie odpala skryptu.
 REM Ten plik forwarduje wszystkie argumenty do PowerShella.
 REM
 REM Uzycie:
-REM   scripts\build                              # cargo build
-REM   scripts\build --features gpu-vulkan
-REM   scripts\build --release --features gpu-vulkan
-REM   scripts\build -Cmd run --features gpu-vulkan
+REM   scripts\build -Edition slim --release
+REM   scripts\build -Edition full -Backend cuda --release
+REM   scripts\build -Edition full -Backend vulkan --release
+REM   scripts\build -Cmd test -p tentaflow-core --lib
 REM ============================================================================
-powershell.exe -ExecutionPolicy Bypass -File "%~dp0build.ps1" %*
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" %*
 exit /b %ERRORLEVEL%

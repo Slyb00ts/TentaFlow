@@ -85,6 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             max_tokens: args.max_tokens,
             stop_sequences: vec!["</s>".to_string()],
+            grammar: None,
         };
 
         let stream = engine.submit(request)?;
@@ -291,6 +292,7 @@ fn scenario_drop_mid(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         sampling: SamplingParams::default(),
         max_tokens: 400,
         stop_sequences: vec!["</s>".to_string()],
+        grammar: None,
     };
     let stream = engine.submit(request)?;
     let mut received = 0_u32;
@@ -333,6 +335,7 @@ fn scenario_silent_consumer(args: &Args) -> Result<(), Box<dyn std::error::Error
         sampling: SamplingParams::default(),
         max_tokens: 600,
         stop_sequences: vec!["</s>".to_string()],
+        grammar: None,
     };
     let silent_stream = engine.submit(silent_request)?;
 
@@ -345,6 +348,7 @@ fn scenario_silent_consumer(args: &Args) -> Result<(), Box<dyn std::error::Error
             sampling: SamplingParams::default(),
             max_tokens: 60,
             stop_sequences: vec!["</s>".to_string()],
+            grammar: None,
         };
         let Ok(stream) = engine_for_fast.submit(request) else {
             return (false, 0);
@@ -427,6 +431,7 @@ fn scenario_queue_overflow(args: &Args) -> Result<(), Box<dyn std::error::Error>
                 },
                 max_tokens: 48,
                 stop_sequences: vec!["</s>".to_string()],
+                grammar: None,
             };
             let Ok(stream) = engine.submit(request) else {
                 return (i, false);

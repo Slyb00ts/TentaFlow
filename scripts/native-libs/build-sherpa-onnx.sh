@@ -9,7 +9,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 PLATFORM="${1:-$(detect_platform)}"
-SHERPA_ONNX_REF="${SHERPA_ONNX_REF:-v1.12.9}"
 BACKEND="${SHERPA_ONNX_BACKEND:-cpu}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
@@ -26,7 +25,7 @@ case "$PLATFORM" in
     # SHERPA_ONNXRUNTIME_LIB_DIR. PLATFORM=OS64 to device, SIMULATORARM64 to symulator.
     [ "$(uname -s)" = "Darwin" ] || { echo "Build iOS ($PLATFORM) wymaga macOS + Xcode." >&2; exit 1; }
     require_cmd curl tar
-    ORT_IOS_VERSION="${SHERPA_ONNX_IOS_ORT_VERSION:-1.17.1}"
+    ORT_IOS_VERSION="$(require_version SHERPA_ONNX_IOS_ORT_VERSION)"
     if [ "$PLATFORM" = "ios-arm64" ]; then
       IOS_CMAKE_PLATFORM="OS64"
       ORT_SLICE="ios-arm64"
@@ -35,19 +34,30 @@ case "$PLATFORM" in
       ORT_SLICE="ios-arm64_x86_64-simulator"
     fi
 
+    # Static xcframework: every slice holds onnxruntime.framework whose
+    # `onnxruntime` member is the static archive (same layout build-ios.sh of
+    # sherpa-onnx consumes).
     ORT_DIR="$NATIVE_CACHE/downloads/onnxruntime-ios-$ORT_IOS_VERSION"
     ORT_XCF="$ORT_DIR/onnxruntime.xcframework"
-    if [ ! -f "$ORT_XCF/$ORT_SLICE/onnxruntime.a" ]; then
+    ORT_FRAMEWORK="$ORT_XCF/$ORT_SLICE/onnxruntime.framework"
+    if [ ! -f "$ORT_FRAMEWORK/onnxruntime" ]; then
+      require_cmd unzip
+      ORT_ZIP="$NATIVE_CACHE/downloads/onnxruntime-ios-static-xcframework-$ORT_IOS_VERSION.xcframework.zip"
       mkdir -p "$ORT_DIR"
-      ORT_TARBALL="$NATIVE_CACHE/downloads/onnxruntime.xcframework-$ORT_IOS_VERSION.tar.bz2"
-      if [ ! -f "$ORT_TARBALL" ] || [ "${TENTAFLOW_NATIVE_UPDATE:-0}" = "1" ]; then
-        curl -fL "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v$ORT_IOS_VERSION/onnxruntime.xcframework-$ORT_IOS_VERSION.tar.bz2" -o "$ORT_TARBALL"
+      if [ ! -f "$ORT_ZIP" ] || [ "${TENTAFLOW_NATIVE_UPDATE:-0}" = "1" ]; then
+        curl -fL "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v$ORT_IOS_VERSION/$(basename "$ORT_ZIP")" -o "$ORT_ZIP"
       fi
-      tar xjf "$ORT_TARBALL" -C "$ORT_DIR"
+      ORT_EXPECTED="$(pinned_checksum SHERPA_ONNX_IOS_ORT_SHA256 SHERPA_ONNX_IOS_ORT_VERSION)"
+      if [ "$(sha256_of "$ORT_ZIP")" != "$ORT_EXPECTED" ]; then
+        echo "BLAD: SHA256 $(basename "$ORT_ZIP") nie zgadza sie z scripts/versions.env" >&2
+        rm -f "$ORT_ZIP"
+        exit 1
+      fi
+      unzip -qo "$ORT_ZIP" -d "$ORT_DIR"
     fi
 
     export SHERPA_ONNXRUNTIME_LIB_DIR="$ORT_XCF/$ORT_SLICE"
-    export SHERPA_ONNXRUNTIME_INCLUDE_DIR="$ORT_XCF/Headers"
+    export SHERPA_ONNXRUNTIME_INCLUDE_DIR="$ORT_FRAMEWORK/Headers"
 
     cmake \
       -S "$SRC" -B "$BUILD" \
@@ -82,16 +92,16 @@ case "$PLATFORM" in
     ORT_DST="$NATIVE_ROOT/$PLATFORM/lib-static/libonnxruntime.a"
     # Uwaga: dla cienkiego archiwum lipo wypisuje "Non-fat file: ...", co zawiera
     # podłańcuch "fat file" — dlatego dopasowujemy dokładną frazę pliku uniwersalnego.
-    if lipo -info "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" 2>/dev/null | grep -q 'Architectures in the fat file'; then
-      lipo "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" -thin arm64 -output "$ORT_DST"
+    if lipo -info "$ORT_FRAMEWORK/onnxruntime" 2>/dev/null | grep -q 'Architectures in the fat file'; then
+      lipo "$ORT_FRAMEWORK/onnxruntime" -thin arm64 -output "$ORT_DST"
     else
-      cp "$SHERPA_ONNXRUNTIME_LIB_DIR/onnxruntime.a" "$ORT_DST"
+      cp "$ORT_FRAMEWORK/onnxruntime" "$ORT_DST"
     fi
 
     mkdir -p "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx"
     find "$SRC/sherpa-onnx/c-api" "$SRC/sherpa-onnx/csrc" -type f -name '*.h' -exec cp {} "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx/" \;
     mkdir -p "$NATIVE_ROOT/$PLATFORM/include/onnxruntime"
-    cp -R "$ORT_XCF/Headers/." "$NATIVE_ROOT/$PLATFORM/include/onnxruntime/"
+    cp -R "$SHERPA_ONNXRUNTIME_INCLUDE_DIR/." "$NATIVE_ROOT/$PLATFORM/include/onnxruntime/"
 
     append_manifest_library "$PLATFORM" "sherpa-onnx" "static" "$SHERPA_ONNX_REF" "iOS (PLATFORM=$IOS_CMAKE_PLATFORM); TTS ON."
     append_manifest_library "$PLATFORM" "onnxruntime" "static" "v$ORT_IOS_VERSION" "iOS static z csukuangfj/onnxruntime-libs (slice $ORT_SLICE)."
@@ -116,6 +126,26 @@ CMAKE_ARGS=(
 if [ "$BACKEND" = "cuda" ]; then
   CMAKE_ARGS+=(-DSHERPA_ONNX_ENABLE_GPU=ON)
 fi
+
+case "$PLATFORM" in
+  windows-*)
+    CMAKE_ARGS+=(
+      # Rust links the dynamic CRT (/MD); sherpa defaults to /MT, and one
+      # static library built against the other CRT fails the final link with
+      # LNK2038. This also selects the MD flavour of its static onnxruntime.
+      -DSHERPA_ONNX_USE_STATIC_CRT=OFF
+      # cmake/onnxruntime-win-x64-static.cmake accepts only x64 and reads the
+      # platform from this variable, which only the Visual Studio generator
+      # sets; the Ninja build is x64 all the same.
+      -DCMAKE_VS_PLATFORM_NAME=x64
+      # Only the libraries are linked; the servers, binaries and JNI would add
+      # asio/websocket builds for nothing.
+      -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF
+      -DSHERPA_ONNX_ENABLE_BINARY=OFF
+      -DSHERPA_ONNX_ENABLE_JNI=OFF
+    )
+    ;;
+esac
 
 cmake "${CMAKE_ARGS[@]}"
 cmake --build "$BUILD" -j"$(platform_cpu_count)"

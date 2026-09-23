@@ -107,7 +107,7 @@ jobs:
           # cached: only the built artifacts are, so the job stays clear of the
           # runner's disk ceiling. The backend is part of the key because the
           # same directory holds a different llama.cpp/whisper build per backend.
-          key: native-libs-${{ matrix.platform }}-${{ matrix.backend }}-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh') }}
+          key: native-libs-${{ matrix.platform }}-${{ matrix.backend }}-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh', 'scripts/versions.env', 'scripts/lib/versions.sh') }}
 
       - name: Install build dependencies
         if: steps.cache.outputs.cache-hit != 'true'

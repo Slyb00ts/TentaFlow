@@ -1,208 +1,105 @@
 ﻿# =============================================================================
-# Plik: scripts/build.ps1
-# Opis: Wrapper buildu TentaFlow na Windows. Odpala cargo build z poprawnie
-#       zainicjalizowanym srodowiskiem MSVC (VCINSTALLDIR, INCLUDE, LIB itd.)
-#       i wymuszonym Ninja jako generatorem CMake.
+# File: scripts/build.ps1
+# Purpose: Windows entry point for Cargo. Loads the MSVC x64 environment, the
+#          variables setup.ps1 persisted (LIBCLANG_PATH, PROTOC, VULKAN_SDK,
+#          CUDA_PATH, GStreamer) and Ninja, then runs the same retention
+#          wrapper as scripts/build.sh (scripts/cargo-build.py).
 #
-# Po co to istnieje: zwykly PowerShell nie ma srodowiska MSVC ustawionego.
-# Wielu cratow uzywajacych cmake-rs / cc-rs to nie boli (auto-detekcja przez
-# rejestr), ale jak tylko jakikolwiek nested CMake / ExternalProject_Add
-# uzywa MSBuild — pada bo VCINSTALLDIR jest puste. Wrapper rozwiazuje to
-# raz dla calej sesji cargo.
+# Usage:
+#   scripts\build.ps1 -Edition slim --release              # no local inference engine
+#   scripts\build.ps1 -Edition full -Backend cuda --release
+#   scripts\build.ps1 -Edition full -Backend vulkan --profile release-fast
+#   scripts\build.ps1 -Edition full -Backend cpu --release
+#   scripts\build.ps1 -Cmd test -p tentaflow-core --lib   # anything else: plain cargo arguments
+#   scripts\build.ps1 -Cmd "clean -p whisper-rs-sys"
 #
-# Uzycie:
-#   .\scripts\build.ps1                     # cargo build (debug, default features)
-#   .\scripts\build.ps1 --release           # cargo build --release
-#   .\scripts\build.ps1 --features gpu-vulkan
-#   .\scripts\build.ps1 -Cmd test           # cargo test zamiast build
-#   .\scripts\build.ps1 -Cmd "clean -p whisper-rs-sys"   # dowolne cargo subcmd
+# -Edition/-Backend mirror the release matrix: they select the `tentaflow`
+# package, its features and the native-libs variant built by
+# scripts\native-libs\build-all.ps1 -Backend <same backend>.
 # =============================================================================
 
-[CmdletBinding(PositionalBinding = $false)]
-param(
-    [string]$Cmd = 'build',
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$CargoArgs
-)
+# No param() block: PowerShell binds declared parameters by position and by
+# prefix, so cargo's `-p <crate>` or a bare `--lib` would land in -Edition or
+# -PipelineVariable. The three script options are taken out of $args by hand;
+# everything else goes to cargo verbatim. A leading bare word is the command.
+$Cmd = 'build'
+$Edition = ''
+$Backend = ''
+$CargoArgs = @()
+$rest = @($args)
+for ($i = 0; $i -lt $rest.Count; $i++) {
+    $a = [string]$rest[$i]
+    switch -Regex ($a) {
+        '^-Cmd$'     { $Cmd = [string]$rest[++$i]; continue }
+        '^-Edition$' { $Edition = [string]$rest[++$i]; continue }
+        '^-Backend$' { $Backend = [string]$rest[++$i]; continue }
+        default {
+            if ($i -eq 0 -and -not $a.StartsWith('-')) { $Cmd = $a } else { $CargoArgs += $a }
+        }
+    }
+}
+if ($Edition -notin @('', 'slim', 'full')) { throw "-Edition must be slim or full, got '$Edition'." }
+if ($Backend -notin @('', 'cpu', 'cuda', 'vulkan')) { throw "-Backend must be cpu, cuda or vulkan, got '$Backend'." }
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib\windows.ps1')
 
-function Log-Info  { param($Msg) Write-Host "[INFO] $Msg"  -ForegroundColor Blue }
-function Log-Ok    { param($Msg) Write-Host "[OK] $Msg"    -ForegroundColor Green }
-function Log-Warn  { param($Msg) Write-Host "[WARN] $Msg"  -ForegroundColor Yellow }
-function Log-Error { param($Msg) Write-Host "[ERROR] $Msg" -ForegroundColor Red }
-
-# --- PATH refresh ------------------------------------------------------------
-
-function Refresh-Env {
-    # Skrypt moze byc uruchomiony z basha / WSL / IDE ktore propaguja okrojony
-    # zestaw env vars (czesto tylko PATH i to bez wpisow z User scope).
-    # Setup.ps1 zapisuje rzeczy jak VULKAN_SDK, LIBCLANG_PATH, PROTOC
-    # CMAKE_GENERATOR do User scope rejestru — musimy je tu zaciagnac, inaczej
-    # cargo widzi None i build.rs cratow pada.
-    foreach ($scope in @('Machine', 'User')) {
-        $vars = [Environment]::GetEnvironmentVariables($scope)
-        foreach ($name in $vars.Keys) {
-            if ($name -ieq 'Path') { continue }   # PATH lacze osobno
-            $val = $vars[$name]
-            if ($val -and -not (Get-Item "Env:$name" -ErrorAction SilentlyContinue)) {
-                Set-Item -Path "Env:$name" -Value $val
-            }
-        }
-    }
-
-    # PATH lacze Machine + User (User wins na koncu, jak Windows). Dorzucamy
-    # tez katalog VS Installer (vswhere.exe) bo Launch-VsDevShell.ps1 go
-    # potrzebuje a Microsoft go nie dodaje do PATH.
-    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $userPath    = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $vsInstaller = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer'
-    $combined = "$machinePath;$userPath"
-    if ((Test-Path $vsInstaller) -and ($combined -notmatch [regex]::Escape($vsInstaller))) {
-        $combined = "$combined;$vsInstaller"
-    }
-    $env:Path = $combined
-}
-
-# --- VS environment ----------------------------------------------------------
-
-function Initialize-VsEnv {
-    if ($env:VCINSTALLDIR) {
-        Log-Ok "VS env juz aktywne: $env:VCINSTALLDIR"
-        return
-    }
-
-    # Znajdz Launch-VsDevShell.ps1 — jest w kazdej instalacji VS 2022
-    # (BuildTools / Community / Pro / Enterprise).
-    $candidates = @(
-        'C:\BuildTools\Common7\Tools\Launch-VsDevShell.ps1',
-        'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1',
-        'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1',
-        'C:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\Tools\Launch-VsDevShell.ps1',
-        'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1',
-        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1'
-    )
-    $launcher = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-    if (-not $launcher) {
-        Log-Error "Nie znaleziono Launch-VsDevShell.ps1. Zainstaluj VS 2022 Build Tools:"
-        Log-Error "  scripts\setup.ps1"
-        exit 1
-    }
-
-    Log-Info "Inicjalizuje VS env: $launcher"
-    # -SkipAutomaticLocation zeby Launch-VsDevShell nie zmienil naszego CWD.
-    & $launcher -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
-    if (-not $env:VCINSTALLDIR) {
-        Log-Error "Launch-VsDevShell zakonczony, ale VCINSTALLDIR nadal puste."
-        exit 1
-    }
-    Log-Ok "VS env aktywne: $env:VCINSTALLDIR"
-}
-
-# --- CMake generator ---------------------------------------------------------
-
-function Ensure-Ninja {
-    # CMAKE_GENERATOR=Ninja powinno byc ustawione persistent przez setup.ps1,
-    # ale na wszelki wypadek wymuszamy w sesji jak puste.
-    if (-not $env:CMAKE_GENERATOR) {
-        $env:CMAKE_GENERATOR = 'Ninja'
-        Log-Info "Ustawiono CMAKE_GENERATOR=Ninja w tej sesji"
-    } else {
-        Log-Ok "CMAKE_GENERATOR=$env:CMAKE_GENERATOR"
-    }
-
-    # CMAKE_GENERATOR_INSTANCE / _PLATFORM / _TOOLSET maja sens tylko dla
-    # generatora "Visual Studio 17 2022"; pod Ninja CMake wybucha:
-    #   "Generator Ninja does not support instance specification".
-    # cmake-rs czyta te env vars z PROCESU (nie PS scope) i przekazuje do
-    # cmake. Niektore moga przyjsc z VsDevShell (CMAKE_GENERATOR_INSTANCE),
-    # inne moze ustawic cargo/env. Czyscimy je twardo na poziomie procesu.
-    foreach ($v in 'CMAKE_GENERATOR_INSTANCE','CMAKE_GENERATOR_PLATFORM','CMAKE_GENERATOR_TOOLSET') {
-        $current = [Environment]::GetEnvironmentVariable($v, 'Process')
-        if ($current) {
-            [Environment]::SetEnvironmentVariable($v, $null, 'Process')
-            Log-Info "Wyczyszczono $v (bylo: $current)"
-        }
-    }
-
-    if (-not (Get-Command 'ninja' -ErrorAction SilentlyContinue)) {
-        Log-Error "Ninja nie jest w PATH. Uruchom scripts\setup.ps1 i otworz nowy shell."
-        exit 1
+function Require-Env {
+    param([string]$Name, [string]$Why)
+    if (-not (Test-Path "Env:$Name")) {
+        Log-Warn "$Name is not set - $Why. Run scripts\setup.ps1."
     }
 }
 
-# --- PROTOC fallback ---------------------------------------------------------
+Update-SessionEnvironment
+[void](Import-TentaflowVersions)
+Enter-VsDevEnvironment
+Set-NinjaGenerator
+Use-PinnedCuda
+Require-Env 'LIBCLANG_PATH' 'bindgen (whisper/llama/sherpa/zvec -sys crates) needs libclang.dll'
+Require-Env 'PROTOC' 'prost-build in tentaflow-voice needs protoc'
+if (-not $env:TENTAFLOW_NATIVE_CACHE) { $env:TENTAFLOW_NATIVE_CACHE = Get-NativeCacheDir }
 
-function Ensure-Protoc {
-    # Setup ustawia PROTOC trwale. Jak go nie ma w sesji a jest w User scope,
-    # zaciagnij. Jak nie ma nigdzie — ostrzez.
-    if (-not $env:PROTOC) {
-        $userProtoc = [Environment]::GetEnvironmentVariable('PROTOC', 'User')
-        if ($userProtoc) {
-            $env:PROTOC = $userProtoc
-            Log-Info "PROTOC zaciagniete z User env: $env:PROTOC"
-        } else {
-            Log-Warn "PROTOC nie ustawione — tentaflow-voice build moze padac. Uruchom scripts\setup.ps1."
-        }
+$editionArgs = @()
+if ($Edition -eq 'slim') {
+    if ($Backend) { throw '-Backend has no meaning for -Edition slim (it links no inference engine).' }
+    $editionArgs = @('-p', 'tentaflow', '--no-default-features')
+} elseif ($Edition -eq 'full') {
+    if (-not $Backend) { throw '-Edition full needs -Backend cpu, cuda or vulkan.' }
+    $editionArgs = @('-p', 'tentaflow')
+    switch ($Backend) {
+        'cuda'   { $editionArgs += @('--features', 'gpu-cuda') }
+        'vulkan' { $editionArgs += @('--features', 'gpu-vulkan') }
     }
+    # The -sys crates link native-libs\...\<library>\<variant>.
+    $env:LLAMA_CPP_NATIVE_VARIANT = $Backend
+    $env:WHISPER_CPP_NATIVE_VARIANT = $Backend
+} elseif ($Backend) {
+    throw '-Backend needs -Edition full.'
 }
 
-# --- Main --------------------------------------------------------------------
+$cmdParts = @($Cmd -split '\s+' | Where-Object { $_ })
+$allArgs = @($cmdParts) + $editionArgs + @($CargoArgs | Where-Object { $_ })
 
-function Enter-CrateDir {
-    # Brak workspace Cargo.toml w roocie repo — glowna binarka zyje w
-    # tentaflow/. Jak user odpalil skrypt z D:\repos\TentaFlow (czesty case
-    # przy `scripts\build ...` z cmd), wchodzimy do tentaflow/ automatycznie.
-    if (Test-Path '.\Cargo.toml') { return }
-    if (Test-Path '.\tentaflow\Cargo.toml') {
-        Log-Info "Brak Cargo.toml w CWD — wchodze do tentaflow/"
-        Set-Location -LiteralPath '.\tentaflow'
-        return
-    }
-    Log-Error "Nie znalazlem Cargo.toml ani tentaflow/Cargo.toml. Uruchom z roota repo lub z katalogu crate'a."
-    exit 1
-}
-
-function Main {
-    Refresh-Env
-    Initialize-VsEnv
-    Ensure-Ninja
-    Ensure-Protoc
-    Enter-CrateDir
-
-    # Cargo subcommand moze byc multi-word ("clean -p whisper-rs-sys") —
-    # rozbij i polacz z pozostalymi argumentami.
-    $cmdParts = $Cmd -split '\s+'
-    $allArgs = @($cmdParts) + @($CargoArgs)
-
+Push-Location $script:TentaflowRoot
+try {
     Write-Host ''
-    Log-Info "Uruchamiam: cargo $($allArgs -join ' ')"
+    Log-Info "cargo $($allArgs -join ' ')"
+    if ($env:LLAMA_CPP_NATIVE_VARIANT) { Log-Info "native-libs variant: $env:LLAMA_CPP_NATIVE_VARIANT" }
     Write-Host ''
-
     if ($cmdParts[0] -in @('build', 'test', 'check', 'prune', 'report')) {
-        $python = $null
-        foreach ($candidate in @($env:TENTAFLOW_PYTHON, 'python', 'py', 'python3')) {
-            if (-not $candidate -or -not (Get-Command $candidate -ErrorAction SilentlyContinue)) { continue }
-            $pythonPath = & $candidate -c 'import sys; sys.exit(1) if sys.version_info < (3, 11) else print(sys.executable)'
-            if ($LASTEXITCODE -eq 0 -and $pythonPath) {
-                $python = "$pythonPath".Trim()
-                break
-            }
-        }
-        if (-not $python) {
-            throw 'Wymagany Python 3.11+; uruchom scripts\setup.ps1.'
-        }
+        $python = Find-Python
+        if (-not $python) { throw 'Python 3.11+ is required; run scripts\setup.ps1.' }
         & $python (Join-Path $PSScriptRoot 'cargo-build.py') @allArgs
     } else {
         & cargo @allArgs
     }
     $code = $LASTEXITCODE
-    if ($code -ne 0) {
-        Log-Error "cargo zakonczone z exit code $code"
-        exit $code
-    }
-    Log-Ok "Build OK"
+} finally {
+    Pop-Location
 }
-
-Main
+if ($code -ne 0) {
+    Log-Error "cargo exited with code $code"
+    exit $code
+}
+Log-Ok 'Build OK'

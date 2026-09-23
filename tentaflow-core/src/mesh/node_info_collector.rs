@@ -530,7 +530,10 @@ struct IcdManifest {
 
 #[cfg(target_os = "linux")]
 fn is_nvidia_manifest(manifest: &IcdManifest) -> bool {
-    manifest.library_path.to_ascii_lowercase().contains("nvidia")
+    manifest
+        .library_path
+        .to_ascii_lowercase()
+        .contains("nvidia")
 }
 
 /// Pure: when the NVIDIA kernel driver is loaded we touch nothing; otherwise we
@@ -1018,16 +1021,24 @@ pub fn detect_gpus_cached() -> Vec<PeerGpuInfo> {
 
 /// Bazowa lista GPU z wgpu + live metryki z platform-specific narzedzi.
 /// wgpu daje nazwy GPU (bez duplikatow), nvidia-smi/ioreg daja live metryki.
-/// Kolejnosc enrichmentu: NVIDIA -> AMD -> Intel -> macOS -> Android -> iOS.
-/// Kazda funkcja wzbogaca tylko GPU ktore jeszcze nie maja metryk (vram_total_mb == 0 && usage_percent == 0.0).
+/// Kolejnosc enrichmentu: NVIDIA -> Windows -> AMD -> Intel -> macOS -> Android -> iOS.
+/// nvidia-smi overwrites the cards it lists; the other enrichers fill only cards
+/// still without metrics (vram_total_mb == 0).
 fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
     let mut gpus = get_wgpu_gpus().unwrap_or_default();
+    let entries = query_nvidia_smi();
+
+    // Windows — DXGI lists every adapter of every vendor; it stands in while wgpu
+    // has not answered yet or sees no adapter.
+    #[cfg(target_os = "windows")]
+    if gpus.is_empty() {
+        gpus = windows_gpus_from_telemetry();
+    }
 
     // Fallback build z nvidia-smi gdy wgpu pusto: typowe na headless Linux/WSL2
     // bez Vulkan ICD — wgpu niczego nie widzi, mimo ze NVIDIA driver dziala.
     // nvidia-smi to userspace tool driver-level i raportuje GPU bez Vulkan.
     if gpus.is_empty() {
-        let entries = query_nvidia_smi();
         if !entries.is_empty() {
             let system_ram_mb = {
                 let sys = sys().lock();
@@ -1063,15 +1074,18 @@ fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
                 })
                 .collect();
         }
+    } else {
+        // NVIDIA — nvidia-smi (Linux, Windows).
+        enrich_nvidia_live(&mut gpus, &entries);
     }
+
+    // Windows — DXGI/PDH for every card nvidia-smi did not cover.
+    #[cfg(target_os = "windows")]
+    enrich_windows_live(&mut gpus);
 
     if gpus.is_empty() {
         return gpus;
     }
-
-    // NVIDIA — nvidia-smi (Linux, Windows). Idempotentne: pomija GPU juz wzbogacone
-    // (np. zbudowane w fallbacku powyzej).
-    enrich_nvidia_live(&mut gpus);
 
     // AMD — amd-smi / sysfs (Linux)
     #[cfg(target_os = "linux")]
@@ -1183,10 +1197,10 @@ pub(super) fn query_nvidia_smi() -> Vec<NvidiaEntry> {
 }
 
 /// NVIDIA live metryki — nvidia-smi CLI. Wzbogaca istniejace GPU o VRAM, usage, temp.
-/// Idempotentne: pomija GPU juz wzbogacone (vram_total_mb > 0), zeby kolejne wywolanie
-/// nie nadpisalo wartosci ustawionych przez fallback build z `query_nvidia_smi`.
-fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
-    let nvidia_entries = query_nvidia_smi();
+/// nvidia-smi lists only NVIDIA cards, so a card is matched by name and its
+/// ordinal among same-named cards — a positional match would hand an iGPU the
+/// numbers of the discrete card on a hybrid host.
+fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo], nvidia_entries: &[NvidiaEntry]) {
     if nvidia_entries.is_empty() {
         return;
     }
@@ -1196,13 +1210,16 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
         sys.total_memory() / (1024 * 1024)
     };
 
-    for (i, gpu) in gpus.iter_mut().enumerate() {
-        if gpu.vram_total_mb > 0 {
-            // Juz wzbogacone (np. fallback build z query_nvidia_smi). Pomijamy,
-            // zeby nie zresetowac danych przy ponownym wywolaniu enrich.
-            continue;
-        }
-        if let Some(nv) = nvidia_entries.get(i) {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for gpu in gpus.iter_mut() {
+        let key = gpu_name_key(&gpu.name);
+        let ordinal = seen.entry(key.clone()).or_insert(0);
+        let matched = nvidia_entries
+            .iter()
+            .filter(|nv| gpu_name_key(&nv.name) == key)
+            .nth(*ordinal);
+        *ordinal += 1;
+        if let Some(nv) = matched {
             gpu.vram_total_mb = nv.vram_total;
             gpu.vram_used_mb = nv.vram_used;
             gpu.usage_percent = nv.usage;
@@ -1224,6 +1241,87 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
             }
         }
     }
+}
+
+/// Name as the drivers agree on it: older NVIDIA tools drop the vendor prefix
+/// that Vulkan and DXGI keep.
+fn gpu_name_key(name: &str) -> String {
+    let lower = name.trim().to_ascii_lowercase();
+    match lower.strip_prefix("nvidia ") {
+        Some(rest) => rest.trim_start().to_string(),
+        None => lower,
+    }
+}
+
+#[cfg(target_os = "windows")]
+const BYTES_PER_MB: u64 = 1024 * 1024;
+
+#[cfg(target_os = "windows")]
+fn vendor_from_pci_id(vendor_id: u32, name: &str) -> crate::mesh::peer_store::GpuVendor {
+    use crate::mesh::peer_store::GpuVendor;
+    match vendor_id {
+        0x10DE => GpuVendor::Nvidia,
+        0x1002 | 0x1022 => GpuVendor::Amd,
+        0x8086 => GpuVendor::Intel,
+        _ => infer_vendor(name),
+    }
+}
+
+/// Windows OS accounting fills every card nvidia-smi did not cover (AMD, Intel,
+/// NVIDIA without the tool). Matched by name and ordinal, like nvidia-smi.
+#[cfg(target_os = "windows")]
+fn enrich_windows_live(gpus: &mut [PeerGpuInfo]) {
+    let Some(telemetry) = crate::gpu_telemetry::snapshot() else {
+        return;
+    };
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for gpu in gpus.iter_mut() {
+        let key = gpu_name_key(&gpu.name);
+        let ordinal = seen.entry(key.clone()).or_insert(0);
+        let matched = telemetry
+            .adapters
+            .iter()
+            .filter(|a| gpu_name_key(&a.name) == key)
+            .nth(*ordinal);
+        *ordinal += 1;
+        let Some(adapter) = matched else {
+            continue;
+        };
+        if gpu.vram_total_mb > 0 {
+            continue;
+        }
+        gpu.vram_total_mb = adapter.dedicated_total_bytes / BYTES_PER_MB;
+        gpu.vram_used_mb = adapter.dedicated_used_bytes.unwrap_or(0) / BYTES_PER_MB;
+        gpu.usage_percent = adapter.utilization_percent.unwrap_or(0.0);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_gpus_from_telemetry() -> Vec<PeerGpuInfo> {
+    let Some(telemetry) = crate::gpu_telemetry::snapshot() else {
+        return Vec::new();
+    };
+    telemetry
+        .adapters
+        .iter()
+        .map(|a| PeerGpuInfo {
+            name: a.name.trim().to_string(),
+            vram_total_mb: a.dedicated_total_bytes / BYTES_PER_MB,
+            vram_used_mb: a.dedicated_used_bytes.unwrap_or(0) / BYTES_PER_MB,
+            usage_percent: a.utilization_percent.unwrap_or(0.0),
+            temperature_c: 0,
+            power_draw_w: None,
+            power_limit_w: None,
+            vendor: vendor_from_pci_id(a.vendor_id, &a.name),
+            pci_bus_id: None,
+            uuid: None,
+            fan_speed_percent: None,
+            pcie_link_gen: None,
+            pcie_link_width: None,
+            pcie_link_gen_current: None,
+            pcie_link_width_current: None,
+        })
+        .collect()
 }
 
 /// macOS live metryki — ioreg dla Apple GPU (usage %, VRAM used)
@@ -1825,48 +1923,111 @@ fn detect_cpu_temperature() -> Option<f32> {
 }
 
 // =============================================================================
-// Informacje o interfejsach sieciowych — Linux-specific
+// Informacje o interfejsach sieciowych
 // =============================================================================
 
+/// Link, MAC, medium, speed and gateway of one interface — read from sysfs on
+/// Linux and from `netdev` (IP Helper / getifaddrs + routing) elsewhere.
+#[derive(Debug, Clone, Default)]
+struct InterfaceDetails {
+    link_up: bool,
+    mac_address: String,
+    interface_type: String,
+    speed_mbps: Option<u64>,
+    ipv4_gateway: String,
+}
+
+#[cfg(target_os = "linux")]
+fn interface_details(name: &str) -> InterfaceDetails {
+    InterfaceDetails {
+        link_up: detect_link_up(name),
+        mac_address: detect_mac_address(name),
+        interface_type: detect_interface_type(name),
+        speed_mbps: detect_link_speed(name),
+        ipv4_gateway: detect_gateway(name),
+    }
+}
+
+/// `netdev` snapshot keyed by the name sysinfo reports: the friendly name on
+/// Windows ("Ethernet", "Wi-Fi"), the BSD name elsewhere. Cached, because on
+/// Windows one enumeration walks every adapter plus the routing table.
+#[cfg(not(target_os = "linux"))]
+fn netdev_details() -> HashMap<String, InterfaceDetails> {
+    use netdev::interface::{state::OperState, types::InterfaceType};
+
+    static CACHE: OnceLock<Mutex<(Instant, HashMap<String, InterfaceDetails>)>> = OnceLock::new();
+    let cache = CACHE
+        .get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(60), HashMap::new())));
+    let mut cache = cache.lock();
+    if cache.0.elapsed() < Duration::from_secs(5) {
+        return cache.1.clone();
+    }
+    let details: HashMap<String, InterfaceDetails> = netdev::get_interfaces()
+        .into_iter()
+        .map(|iface| {
+            let interface_type = match iface.if_type {
+                InterfaceType::Loopback => "loopback",
+                InterfaceType::Wireless80211 => "wifi",
+                InterfaceType::Tunnel
+                | InterfaceType::ProprietaryVirtual
+                | InterfaceType::Bridge => "virtual",
+                _ if !iface.is_physical() => "virtual",
+                _ => "ethernet",
+            };
+            let speed_bps = iface.receive_speed.max(iface.transmit_speed);
+            let details = InterfaceDetails {
+                link_up: iface.oper_state == OperState::Up,
+                mac_address: iface
+                    .mac_addr
+                    .filter(|m| *m != netdev::MacAddr::zero())
+                    .map(|m| m.to_string())
+                    .unwrap_or_default(),
+                interface_type: interface_type.to_string(),
+                // bits/s; u64::MAX is "unknown" on Windows.
+                speed_mbps: speed_bps
+                    .filter(|&b| b > 0 && b != u64::MAX)
+                    .map(|b| b / 1_000_000),
+                ipv4_gateway: iface
+                    .gateway
+                    .as_ref()
+                    .and_then(|g| g.ipv4.first())
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_default(),
+            };
+            let key = iface.friendly_name.unwrap_or(iface.name);
+            (key, details)
+        })
+        .collect();
+    *cache = (Instant::now(), details.clone());
+    details
+}
+
 /// Odczytuje stan linku interfejsu sieciowego (Linux: /sys/class/net/{name}/operstate)
+#[cfg(target_os = "linux")]
 fn detect_link_up(name: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        // carrier = fizyczny kabel wpiety (1/0), niezalezny od konfiguracji IP
-        let carrier_path = format!("/sys/class/net/{}/carrier", name);
-        if let Ok(val) = std::fs::read_to_string(&carrier_path) {
-            return val.trim() == "1";
-        }
-        // Fallback na operstate jesli carrier nie dostepny (np. WiFi)
-        let operstate_path = format!("/sys/class/net/{}/operstate", name);
-        std::fs::read_to_string(&operstate_path)
-            .map(|s| s.trim() == "up")
-            .unwrap_or(false)
+    // carrier = fizyczny kabel wpiety (1/0), niezalezny od konfiguracji IP
+    let carrier_path = format!("/sys/class/net/{}/carrier", name);
+    if let Ok(val) = std::fs::read_to_string(&carrier_path) {
+        return val.trim() == "1";
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = name;
-        false
-    }
+    // Fallback na operstate jesli carrier nie dostepny (np. WiFi)
+    let operstate_path = format!("/sys/class/net/{}/operstate", name);
+    std::fs::read_to_string(&operstate_path)
+        .map(|s| s.trim() == "up")
+        .unwrap_or(false)
 }
 
 /// Odczytuje adres MAC interfejsu (Linux: /sys/class/net/{name}/address)
+#[cfg(target_os = "linux")]
 fn detect_mac_address(name: &str) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        let path = format!("/sys/class/net/{}/address", name);
-        std::fs::read_to_string(&path)
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = name;
-        String::new()
-    }
+    let path = format!("/sys/class/net/{}/address", name);
+    std::fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Wykrywa typ interfejsu sieciowego
+#[cfg(target_os = "linux")]
 fn detect_interface_type(name: &str) -> String {
     if name.starts_with("lo") {
         return "loopback".to_string();
@@ -1875,23 +2036,20 @@ fn detect_interface_type(name: &str) -> String {
         return "virtual".to_string();
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        // Thunderbolt
-        let subsystem_path = format!("/sys/class/net/{}/device/subsystem", name);
-        if let Ok(target) = std::fs::read_link(&subsystem_path) {
-            if let Some(s) = target.to_str() {
-                if s.contains("thunderbolt") {
-                    return "thunderbolt".to_string();
-                }
+    // Thunderbolt
+    let subsystem_path = format!("/sys/class/net/{}/device/subsystem", name);
+    if let Ok(target) = std::fs::read_link(&subsystem_path) {
+        if let Some(s) = target.to_str() {
+            if s.contains("thunderbolt") {
+                return "thunderbolt".to_string();
             }
         }
+    }
 
-        // Wi-Fi
-        let wireless_path = format!("/sys/class/net/{}/wireless", name);
-        if std::path::Path::new(&wireless_path).exists() {
-            return "wifi".to_string();
-        }
+    // Wi-Fi
+    let wireless_path = format!("/sys/class/net/{}/wireless", name);
+    if std::path::Path::new(&wireless_path).exists() {
+        return "wifi".to_string();
     }
 
     "ethernet".to_string()
@@ -1944,23 +2102,11 @@ fn detect_numa_node(name: &str) -> Option<i32> {
 }
 
 /// Odczytuje predkosc linku w Mbps (Linux: /sys/class/net/{name}/speed)
+#[cfg(target_os = "linux")]
 fn detect_link_speed(name: &str) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let path = format!("/sys/class/net/{}/speed", name);
-        if let Ok(val) = std::fs::read_to_string(&path) {
-            let speed: i64 = val.trim().parse().unwrap_or(-1);
-            if speed > 0 {
-                return Some(speed as u64);
-            }
-        }
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = name;
-        None
-    }
+    let path = format!("/sys/class/net/{}/speed", name);
+    let speed: i64 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    (speed > 0).then_some(speed as u64)
 }
 
 /// Pobiera WSZYSTKIE adresy IPv4 interfejsu (bridge moze miec wiele adresow)
@@ -1986,19 +2132,19 @@ fn detect_all_ipv4_info(name: &str, nets: &Networks) -> Vec<(String, String)> {
 }
 
 /// Cache bramek domyslnych per interfejs (parsowane z `ip route show`)
+#[cfg(target_os = "linux")]
 fn gateway_cache() -> &'static Mutex<(Instant, HashMap<String, String>)> {
     static C: OnceLock<Mutex<(Instant, HashMap<String, String>)>> = OnceLock::new();
     C.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(120), HashMap::new())))
 }
 
 /// Pobiera bramke domyslna dla interfejsu
+#[cfg(target_os = "linux")]
 fn detect_gateway(name: &str) -> String {
     let mut cache = gateway_cache().lock();
     // Odswiezaj co 30s
     if cache.0.elapsed() > Duration::from_secs(30) {
-        #[allow(unused_mut)]
         let mut gateways = HashMap::new();
-        #[cfg(target_os = "linux")]
         {
             if let Ok(output) = std::process::Command::new("ip")
                 .args(["route", "show"])
@@ -2043,6 +2189,8 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
     let elapsed_secs = prev.0.elapsed().as_secs_f64();
 
     let mut current_values: HashMap<String, (u64, u64)> = HashMap::new();
+    #[cfg(not(target_os = "linux"))]
+    let netdev = netdev_details();
 
     let results: Vec<PeerNetworkInfo> = nets
         .iter()
@@ -2075,14 +2223,23 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
             };
 
             let iface_name = name.to_string();
-            let link_up = detect_link_up(&iface_name);
+            #[cfg(target_os = "linux")]
+            let details = interface_details(&iface_name);
+            #[cfg(not(target_os = "linux"))]
+            let details = netdev.get(&iface_name).cloned().unwrap_or_default();
+            if details.interface_type == "loopback" {
+                return None;
+            }
+            let InterfaceDetails {
+                link_up,
+                mac_address,
+                interface_type,
+                speed_mbps,
+                ipv4_gateway,
+            } = details;
             let all_ips = detect_all_ipv4_info(&iface_name, &nets);
-            let ipv4_gateway = detect_gateway(&iface_name);
-            let mac_address = detect_mac_address(&iface_name);
-            let interface_type = detect_interface_type(&iface_name);
             let rdma_available =
                 crate::mesh::roce_config::rdma_device_for_netdev(&iface_name).is_some();
-            let speed_mbps = detect_link_speed(&iface_name);
             let numa_node = detect_numa_node(&iface_name);
 
             // Jesli interfejs ma wiele IP (np. bridge), tworz osobny wpis per IP

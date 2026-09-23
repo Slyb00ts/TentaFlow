@@ -122,7 +122,9 @@ pub fn init() -> Result<()> {
     match unsafe { lib.get::<LoadEmbedderFn>(b"MLXBridge_loadEmbedder\0") } {
         Ok(load_fn) => unsafe { tentaflow_register_mlx_swift_load_embedder(*load_fn) },
         Err(_) => {
-            warn!("[mlx-swift] Brak symbolu MLXBridge_loadEmbedder — load embeddera MLX niedostepny")
+            warn!(
+                "[mlx-swift] Brak symbolu MLXBridge_loadEmbedder — load embeddera MLX niedostepny"
+            )
         }
     }
 

@@ -10,7 +10,7 @@
 #include "llama.h"
 #include "wrapper_utils.h"
 
-#include <nlohmann/json.hpp>
+#include "common/json.h"
 
 extern "C" llama_rs_status llama_rs_json_schema_to_grammar(
     const char * schema_json,
@@ -22,7 +22,7 @@ extern "C" llama_rs_status llama_rs_json_schema_to_grammar(
 
     *out_grammar = nullptr;
     try {
-        const auto schema = nlohmann::ordered_json::parse(schema_json);
+        const auto schema = common_json::parse(schema_json);
         const auto grammar = json_schema_to_grammar(schema, force_gbnf);
         *out_grammar = llama_rs_dup_string(grammar);
         return *out_grammar ? LLAMA_RS_STATUS_OK : LLAMA_RS_STATUS_ALLOCATION_FAILED;

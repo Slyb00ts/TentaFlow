@@ -1,24 +1,42 @@
 # Native Libraries
 
 Ten katalog jest miejscem na gotowe artefakty natywnych bibliotek per platforma.
-Źródła pobierane przez skrypty nie trafiają do repozytorium: domyślny cache to
-`/tmp/tentaflow-native-libs`, a można go zmienić przez `TENTAFLOW_NATIVE_CACHE`.
+Nic poza tym plikiem nie trafia do repozytorium — każdy buduje je lokalnie.
+Źródła i pobrane archiwa leżą poza repo w `TENTAFLOW_NATIVE_CACHE`
+(domyślnie `~/.cache/tentaflow-native-libs`, na Windows
+`%LOCALAPPDATA%\tentaflow-native-libs`).
+
+## Wersje
+
+Wszystkie wersje bibliotek i ich sumy SHA-256 są w jednym pliku:
+[`scripts/versions.env`](../scripts/versions.env) (llama.cpp, whisper.cpp,
+sherpa-onnx, zvec, ONNX Runtime, runtime'y NVIDIA, PDFium, WASI SDK, GStreamer,
+CUDA, Vulkan SDK). Czytają go skrypty bash (`scripts/lib/versions.sh`),
+PowerShell (`scripts/lib/windows.ps1`) i MSBuild addonów C#. Podbicie biblioteki
+to zmiana jednej linii i sum obok niej. Zmienna środowiskowa o tej samej nazwie
+nadpisuje plik na jedno uruchomienie; nadpisana wersja wymaga też nadpisanej
+sumy — skrypty nie pobierają niczego bez weryfikacji.
 
 ## Budowanie
 
 Linux/macOS:
 
 ```bash
-./scripts/native-libs/build-all.sh
+./scripts/native-libs/build-all.sh                    # pełna edycja
+./scripts/native-libs/build-all.sh --edition slim     # tylko zvec + pdfium
 ```
 
-Windows:
+Windows x86_64 (po `scripts\setup.ps1`, z dowolnego PowerShella):
 
 ```powershell
-.\scripts\native-libs\build-all.ps1
+.\scripts\native-libs\build-all.ps1 -Backend cuda      # wariant CUDA
+.\scripts\native-libs\build-all.ps1 -Backend vulkan    # wariant Vulkan
+.\scripts\native-libs\build-all.ps1 -Edition slim      # tylko zvec + pdfium
 ```
 
-Skrypty wykrywają platformę automatycznie i zapisują wynik w:
+`build-all.ps1` ładuje środowisko MSVC x64 (vswhere), Ninja, CUDA/Vulkan SDK i
+Pythona, a potem uruchamia te same skrypty bash przez Git Bash — lista kroków i
+wersje są identyczne na każdej platformie. Wynik:
 
 ```text
 native-libs/<platform>/
@@ -37,15 +55,15 @@ native-libs/<platform>/
   żeby lokalny build miał dynamiczne zależności w jednym miejscu.
 
 `llama.cpp` domyślnie buduje wariant `multi`, czyli jeden zestaw bibliotek z
-wszystkimi wykrytymi backendami GPU. Domyślny ref to `master`, więc
-`--update` pobiera aktualny upstream; można go przypiąć przez `LLAMA_CPP_REF`.
-Domyślnie `LLAMA_CPP_BACKENDS=auto`
-wykrywa CUDA, Vulkan i CPU na Linux/Windows oraz Metal i CPU na macOS.
-Kart AMD i Intel nie budujemy przez HIP/ROCm — jadą na Vulkanie.
-Można wymusić osobne warianty diagnostyczne:
+wszystkimi wykrytymi backendami GPU (`LLAMA_CPP_BACKENDS=auto`: CUDA, gdy jest
+widoczne GPU NVIDIA i toolkit; Vulkan, gdy jest `glslc` z Vulkan SDK; zawsze
+CPU; na macOS Metal). Kart AMD i Intel nie budujemy przez HIP/ROCm — jadą na
+Vulkanie. Jawne backendy budują osobne warianty, które cargo wybiera przez
+`LLAMA_CPP_NATIVE_VARIANT` / `WHISPER_CPP_NATIVE_VARIANT` (na Windows robi to
+`scripts\build.ps1 -Edition full -Backend <backend>`):
 
 ```bash
-LLAMA_CPP_BACKENDS=cuda,vulkan,cpu ./scripts/native-libs/build-all.sh --only llama-cpp
+LLAMA_CPP_BACKENDS=cuda,vulkan ./scripts/native-libs/build-all.sh --only llama-cpp
 ```
 
 CUDA build wyłącza launchery kompilatora typu `sccache`, bo `nvcc`/`fatbinary`
@@ -56,66 +74,48 @@ potrafią wtedy gubić tymczasowe pliki `*.cubin`. Domyślna równoległość CU
 LLAMA_CPP_CUDA_JOBS=2 LLAMA_CPP_BACKENDS=cuda ./scripts/native-libs/build-all.sh --only llama-cpp
 ```
 
-`whisper.cpp` używa analogicznego modelu. Osobne warianty diagnostyczne można
-wymusić:
+`whisper.cpp` używa analogicznego modelu (`WHISPER_CPP_BACKENDS`). Jego wynik to
+jedna izolowana biblioteka (`libwhisper_tf.so` / `.dylib` / `whisper_tf.dll`)
+z prywatnym ggml, eksportująca wyłącznie `whisper_*` — na Windows przez plik
+`.def` generowany z `whisper.lib`.
 
-```bash
-WHISPER_CPP_BACKENDS=cuda,vulkan,cpu ./scripts/native-libs/build-all.sh --only whisper-cpp
-```
+zvec na Windows pochodzi z oficjalnego prebuilt SDK tej samej wersji
+(`zvec_c_api.dll` ze statycznym CRT, eksportuje tylko `zvec_*`); Linux/macOS
+budują go ze źródeł.
 
-## ONNX Runtime GPU (CUDA / TensorRT, NVIDIA B300)
+## ONNX Runtime GPU (CUDA / TensorRT)
 
-`build-onnxruntime.sh` provisions the runtime dlopened by the `ort` crate
-(load-dynamic): `lib-dynamic/libonnxruntime.so.<ver>` plus the
-`libonnxruntime_providers_{shared,cuda,tensorrt}.so` execution providers. On
-`linux-x86_64` it downloads the official GPU release and verifies a pinned
-SHA-256. The CUDA line is auto-detected from the driver
-(`ONNXRUNTIME_CUDA=auto|12|13`): CUDA 13-capable drivers get the `gpu_cuda13`
-artifact, which is required for SM_103 (B300, Blackwell Ultra).
+`build-onnxruntime.sh` provisions the runtime loaded by the `ort` crate
+(load-dynamic) plus the `providers_{shared,cuda,tensorrt}` execution providers.
+On `linux-x86_64`, and on Windows when an NVIDIA GPU is present (or
+`build-all.ps1 -Backend cuda`), it downloads the official GPU release; the CUDA
+line is auto-detected from the driver (`ONNXRUNTIME_CUDA=auto|12|13`). CUDA
+13-capable drivers get the `gpu_cuda13` artifact, which is required for SM_103
+(B300, Blackwell Ultra).
 
 ```bash
 ./scripts/native-libs/build-all.sh --only onnxruntime           # prebuilt (default)
 ./scripts/native-libs/build-onnxruntime.sh linux-x86_64 --from-source  # native SM_103 cubins
 ```
 
-For the `gpu_cuda13` variant the script also vendors the full NVIDIA runtime
-stack from the official NVIDIA wheels (pypi.nvidia.com / pypi.org, SHA-256
-pinned):
-
-- TensorRT: `libnvinfer.so.10` + `libnvinfer_plugin.so.10` +
-  `libnvonnxparser.so.10` + the builder resource for the target SM
-  (per-SM split since TRT 10.15; sm100 + ptx ≈ 1.24 GB),
-- the full cuDNN 9 split-lib set (≈ 0.97 GB),
-- the CUDA toolkit runtime libs the EPs DT_NEED and a driver-only host lacks:
-  `libcudart.so.13`, `libcublas.so.13` + `libcublasLt.so.13`,
-  `libcufft.so.12`, `libcurand.so.10` (≈ 0.96 GB, from the
-  `nvidia-cuda-runtime` / `nvidia-cublas` / `nvidia-cufft` / `nvidia-curand`
-  wheels — the CUDA 13 line dropped the `-cuXX` package suffix).
-
-Everything lands flat in `lib-dynamic/`, so `tentaflow/build.rs` copies it
-next to the binary and the loader resolves it via `$ORIGIN` — **no system
-TensorRT, cuDNN or CUDA toolkit install is needed on the target host; an
-NVIDIA R580+ driver (CUDA 13 compatible) is the only host requirement**.
-Expect ~3.2 GB in `lib-dynamic/` (and again next to the binary).
+For the `gpu_cuda13` variant the script also vendors the NVIDIA runtime stack
+from the official NVIDIA wheels (pypi.nvidia.com, SHA-256 pinned in
+`scripts/versions.env`): TensorRT 10 (nvinfer, nvinfer_plugin, nvonnxparser and
+the builder resource for the target SM + ptx), the full cuDNN 9 split-lib set,
+and the CUDA toolkit runtime (cudart 13, cublas/cublasLt 13, cufft 12,
+curand 10). Everything lands flat in `lib-dynamic/`, so `tentaflow/build.rs`
+copies it next to the binary — **no system TensorRT, cuDNN or CUDA toolkit is
+needed on the target host; an NVIDIA R580+ driver is the only requirement**.
+Expect ~3 GB in `lib-dynamic/` (and again next to the binary).
 
 - `TENTAFLOW_SKIP_TRT_VENDOR=1` skips ALL vendoring on hosts that have a
   system TensorRT/cuDNN/CUDA toolkit.
-- `TENTAFLOW_SKIP_CUDA_VENDOR=1` skips only the CUDA toolkit libs (host has
-  the toolkit installed but no TensorRT/cuDNN).
+- `TENTAFLOW_SKIP_CUDA_VENDOR=1` skips only the CUDA toolkit libs.
 - `TENSORRT_SMS` picks builder-resource buckets (`auto` detects the local
   GPU; use `TENSORRT_SMS=sm100` when provisioning for a B300 from another
-  machine; `all` vendors every SM bucket, ~1.9 GB extra).
-- `TENSORRT_VENDOR_REF` / `CUDNN_VENDOR_REF` / `CUDART_VENDOR_REF` /
-  `CUBLAS_VENDOR_REF` / `CUFFT_VENDOR_REF` / `CURAND_VENDOR_REF` override the
-  pinned wheel versions (for TRT/cuDNN provide `*_VENDOR_SHA256` to keep
-  checksum verification; other overrides warn loudly and skip verification).
+  machine; `all` vendors every SM bucket).
 
 Prebuilt CUDA 13 binaries ship PTX, so kernels JIT-compile on SM_103 (slower
 first session load). `--from-source` builds native cubins
 (`ONNXRUNTIME_CUDA_ARCHS=103` by default) with `CUDA_HOME` + `TENSORRT_HOME`
 pointing at a CUDA 13.x toolkit and TensorRT >= 10.13.
-
-Ciężkie pliki `.a`, `.so`, `.dylib`, `.dll`, `.lib`, `.framework` i `.bundle`
-w `native-libs/` są odblokowane w `.gitignore`, żeby maintainer mógł zbudować
-je raz na właściwej maszynie i dodać do repo. Cache źródeł i katalogi buildów
-pozostają poza repo.

@@ -2418,6 +2418,7 @@ pub fn plan_dissolve(spec: &ElasticCreateSpec) -> Result<Vec<ElasticStep>, Catal
     Ok(steps)
 }
 
+#[cfg(unix)]
 pub(crate) mod execution {
     use super::*;
     use std::ffi::CString;

@@ -142,8 +142,8 @@ fn download(client: &reqwest::blocking::Client, url: &str, dest: &Path) -> Resul
     if !resp.status().is_success() {
         bail!("downloading {url} returned {}", resp.status());
     }
-    let mut file = std::fs::File::create(dest)
-        .with_context(|| format!("writing {}", dest.display()))?;
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("writing {}", dest.display()))?;
     std::io::copy(&mut resp, &mut file)?;
     Ok(())
 }
@@ -178,7 +178,10 @@ fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
     for entry in std::fs::read_dir(into)? {
         let entry = entry?;
         if entry.file_type()?.is_dir()
-            && entry.file_name().to_string_lossy().starts_with("tentaflow-")
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tentaflow-")
         {
             return Ok(entry.path());
         }
@@ -189,12 +192,23 @@ fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
 /// Points `<prefix>/current` at `target` without ever unlinking it: a reader
 /// that opens the path mid-update sees the old version or the new one, never a
 /// missing symlink.
+#[cfg(unix)]
 fn swap_current(prefix: &Path, target: &Path) -> Result<()> {
     let staged = prefix.join("current.new");
     let _ = std::fs::remove_file(&staged);
     std::os::unix::fs::symlink(target, &staged)
         .with_context(|| format!("symlink {}", staged.display()))?;
     std::fs::rename(&staged, prefix.join("current")).context("swapping the current symlink")
+}
+
+/// The `versions/<ver>` + `current` layout is created only by install.sh
+/// (Linux, macOS); there is no Windows installer whose layout this could swap.
+#[cfg(not(unix))]
+fn swap_current(prefix: &Path, _target: &Path) -> Result<()> {
+    bail!(
+        "{} is not an installer layout: self-update exists only for installations made by install.sh (Linux, macOS)",
+        prefix.display()
+    )
 }
 
 /// Keeps the running version and the one before it — enough to roll back by
@@ -308,13 +322,8 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
         std::fs::remove_dir_all(&version_dir)?;
     }
     std::fs::create_dir_all(version_dir.parent().unwrap())?;
-    std::fs::rename(&unpacked, &version_dir).with_context(|| {
-        format!(
-            "moving {} -> {}",
-            unpacked.display(),
-            version_dir.display()
-        )
-    })?;
+    std::fs::rename(&unpacked, &version_dir)
+        .with_context(|| format!("moving {} -> {}", unpacked.display(), version_dir.display()))?;
 
     // The service is stopped only once the new tree is complete on disk, so a
     // failed download never costs downtime.
@@ -325,7 +334,10 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     }
 
     swap_current(&receipt.prefix, &version_dir)?;
-    prune_versions(&receipt.prefix, &[new_version.as_str(), receipt.version.as_str()]);
+    prune_versions(
+        &receipt.prefix,
+        &[new_version.as_str(), receipt.version.as_str()],
+    );
     std::fs::remove_dir_all(&work).ok();
 
     InstallReceipt {

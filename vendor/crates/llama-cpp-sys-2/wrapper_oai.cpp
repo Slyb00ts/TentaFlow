@@ -11,9 +11,11 @@
 #include "llama.h"
 #include "wrapper_utils.h"
 
-#include <nlohmann/json.hpp>
+// llama.cpp common speaks its own JSON type since 0.4 (common/json.h); the
+// chat and tool helpers take and return it.
+#include "common/json.h"
 
-using json = nlohmann::ordered_json;
+using json = common_json;
 
 struct llama_rs_chat_parse_state_oaicompat {
     common_chat_parser_params syntax;

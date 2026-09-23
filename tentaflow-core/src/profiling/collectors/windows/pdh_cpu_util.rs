@@ -229,14 +229,14 @@ mod windows_impl {
         let mut freq_counters = Vec::with_capacity(cores as usize);
         for i in 0..cores {
             let util_path = format!("\\Processor({i})\\% Processor Time");
-            match query.add_counter(&util_path) {
+            match query.add_english_counter(&util_path) {
                 Ok(c) => util_counters.push((i as u16, c)),
                 Err(e) => {
-                    eprintln!("PdhAddCounter util cpu{i}: {e}");
+                    eprintln!("PdhAddEnglishCounter util cpu{i}: {e}");
                 }
             }
             let freq_path = format!("\\Processor Information(0,{i})\\Processor Frequency");
-            freq_counters.push((i as u16, query.add_counter(&freq_path).ok()));
+            freq_counters.push((i as u16, query.add_english_counter(&freq_path).ok()));
         }
 
         // First collect primes the deltas; values are valid only after the

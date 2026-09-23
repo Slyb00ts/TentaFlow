@@ -244,7 +244,6 @@ serde_yaml_ng = "0.10.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 socket2 = "0.6.3"
-sherpa-rs = "0.6.8"
 sherpa-rs-sys = "0.6.8"
 shlex = "2.0.1"
 smallvec = "1.15.2"
@@ -306,6 +305,7 @@ wgpu = {version = "29.0.3", default-features = false}
 which = "8.0.4"
 whisper-rs-sys = "0.15.0"
 wide = "1.5.0"
+windows = {version = "0.62.2", default-features = false}
 windows-sys = "0.61.2"
 winreg = "0.56.0"
 winresource = "0.1"
@@ -322,8 +322,6 @@ incremental = true
 codegen-units = 256
 opt-level = 0
 
-[profile.dev.package."sherpa-rs"]
-opt-level = 3
 [profile.dev.package."sherpa-rs-sys"]
 opt-level = 3
 [profile.dev.package."whisper-rs-sys"]
@@ -376,7 +374,7 @@ opt-level = 3
 [profile.test]
 debug = 1
 
-[profile.test.package."sherpa-rs"]
+[profile.test.package."sherpa-rs-sys"]
 opt-level = 3
 [profile.test.package."whisper-rs-sys"]
 opt-level = 3

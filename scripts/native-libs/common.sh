@@ -9,14 +9,57 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NATIVE_ROOT="$ROOT/native-libs"
+# Every library ref and checksum comes from scripts/versions.env.
+source "$ROOT/scripts/lib/versions.sh"
+
+is_windows_host() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Scratch (klony git + rozpakowane FetchContent _deps + obiekty buildu) potrafi
 # urosnac do wielu GB. NIE trzymamy go w /tmp: na Linuksie to czesto tmpfs w RAM,
 # wiec na maszynie z malym RAM-em rozpakowanie urywa pliki do zer i CMake pada na
 # "Parse error ... bad character". Domyslnie celujemy w trwaly cache na dysku.
-NATIVE_CACHE="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
-# Wspólny pin dla producenta bibliotek i kontroli ich aktualności na Androidzie.
-LLAMA_CPP_REF="${LLAMA_CPP_REF:-689e227db485c6b33d061555e74034c93a867649}"
-ZVEC_REF="${ZVEC_REF:-ec8a78ee08b14a0b8c94158ffc1de42cd3f97f6d}"
+# Windows: %LOCALAPPDATA% (the same default setup.ps1 persists and build.rs
+# falls back to), never %TEMP%, which Storage Sense empties.
+default_native_cache() {
+  if is_windows_host; then
+    printf '%s/tentaflow-native-libs\n' "$(cygpath -u "$LOCALAPPDATA")"
+  else
+    printf '%s/tentaflow-native-libs\n' "${XDG_CACHE_HOME:-$HOME/.cache}"
+  fi
+}
+if [ -n "${TENTAFLOW_NATIVE_CACHE:-}" ]; then
+  NATIVE_CACHE="$TENTAFLOW_NATIVE_CACHE"
+  is_windows_host && NATIVE_CACHE="$(cygpath -u "$NATIVE_CACHE")"
+else
+  NATIVE_CACHE="$(default_native_cache)"
+fi
+
+# Python 3.11+ resolved by the caller (ensure-python.sh / build-all.ps1). On
+# Windows a bare `python3` is usually the Microsoft Store alias, not Python.
+python_cmd() {
+  if [ -n "${TENTAFLOW_PYTHON:-}" ]; then
+    printf '%s\n' "$TENTAFLOW_PYTHON"
+  else
+    printf '%s\n' python3
+  fi
+}
+
+# Windows (Git Bash + MSVC environment from build-all.ps1): absolute path of an
+# MSVC tool. Resolved next to cl.exe because Git's /usr/bin shadows `link`
+# with coreutils.
+msvc_tool() {
+  local cl
+  cl="$(command -v cl.exe 2>/dev/null)" || {
+    echo "cl.exe is not on PATH — run scripts\\native-libs\\build-all.ps1, which loads the MSVC environment." >&2
+    return 1
+  }
+  printf '%s/%s\n' "$(dirname "$cl")" "$1"
+}
 
 detect_platform() {
   local os arch
@@ -120,22 +163,20 @@ detect_backends() {
         detected+=("cuda")
         summary+=("cuda($NATIVE_NVCC)")
       fi
-      if command -v glslc >/dev/null 2>&1 || command -v vulkaninfo >/dev/null 2>&1 || [ -n "${VULKAN_SDK:-}" ]; then
+      # glslc is what ggml-vulkan actually needs; vulkaninfo alone ships with
+      # every GPU driver (System32 on Windows) and says nothing about the SDK.
+      if command -v glslc >/dev/null 2>&1 || { [ -n "${VULKAN_SDK:-}" ] && [ -x "$VULKAN_SDK/bin/glslc" ]; }; then
         detected+=("vulkan")
         summary+=("vulkan")
       fi
       echo "[native-libs] backends: ${summary[*]:-none}" >&2
-      case "$PLATFORM" in
-        linux-*)
-          if [ -z "$NATIVE_NVCC" ] && nvidia_gpu_visible; then
-            echo "[native-libs] ERROR: an NVIDIA GPU is visible (nvidia-smi -L) but no CUDA toolkit was found" >&2
-            echo "  (looked for nvcc on PATH, \$CUDA_HOME/bin, \$CUDA_PATH/bin, /usr/local/cuda/bin, /opt/cuda/bin)." >&2
-            echo "  Install the toolkit or export CUDA_HOME; to build without CUDA on purpose set" >&2
-            echo "  LLAMA_CPP_BACKENDS / WHISPER_CPP_BACKENDS explicitly instead of 'auto'." >&2
-            exit 1
-          fi
-          ;;
-      esac
+      if [ -z "$NATIVE_NVCC" ] && nvidia_gpu_visible; then
+        echo "[native-libs] ERROR: an NVIDIA GPU is visible (nvidia-smi -L) but no CUDA toolkit was found" >&2
+        echo "  (looked for nvcc on PATH, \$CUDA_HOME/bin, \$CUDA_PATH/bin, /usr/local/cuda/bin, /opt/cuda/bin)." >&2
+        echo "  Install the toolkit (setup.sh / setup.ps1) or export CUDA_HOME; to build without CUDA on purpose" >&2
+        echo "  set LLAMA_CPP_BACKENDS / WHISPER_CPP_BACKENDS explicitly instead of 'auto'." >&2
+        exit 1
+      fi
       printf '%s\n' "${detected[@]}"
       ;;
     macos-*|ios-*)

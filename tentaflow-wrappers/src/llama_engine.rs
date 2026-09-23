@@ -655,6 +655,14 @@ impl SpeculativeEngine {
         dims: ContextDims,
     ) -> Result<Self, LlamaError> {
         let n_seq = dims.n_seq;
+        // MTP drafts through the model's own nextn layers; without them there
+        // is nothing to draft with, so fail the load before creating ctx_dft
+        // (no-fallback contract).
+        if unsafe { sys::llama_model_n_layer_nextn(model) } <= 0 {
+            return Err(LlamaError::LoadFailed(
+                "model bez głowy MTP/nextn (llama_model_n_layer_nextn = 0)".to_string(),
+            ));
+        }
         let ctx_dft = create_mtp_draft_context(model, config, dims)?;
 
         let params = sys::llama_rs_speculative_params {
@@ -671,18 +679,6 @@ impl SpeculativeEngine {
             return Err(LlamaError::LoadFailed(
                 "nie udało się zainicjalizować draftera MTP (sprawdź czy model ma głowę MTP / nextn)"
                     .to_string(),
-            ));
-        }
-        // Tani guard: MTP wymaga, by biblioteka zgłosiła zapotrzebowanie na embeddingi
-        // nextn (model ma faktycznie głowę MTP / nextn). Jeśli false, init "udał się"
-        // strukturalnie, ale model nie potrafi draftować przez MTP — zwalniamy oba
-        // konteksty i zgłaszamy błąd ładowania wcześnie (kontrakt no-fallback).
-        let has_nextn = unsafe { sys::llama_rs_speculative_need_embd_nextn(raw) };
-        if !has_nextn {
-            unsafe { sys::llama_rs_speculative_free(raw) };
-            unsafe { sys::llama_free(ctx_dft) };
-            return Err(LlamaError::LoadFailed(
-                "model bez głowy MTP/nextn (need_embd_nextn=false)".to_string(),
             ));
         }
         Ok(Self {
@@ -790,7 +786,7 @@ impl SpeculativeEngine {
 impl Drop for SpeculativeEngine {
     fn drop(&mut self) {
         // Kolejność jest istotna: shim trzyma surowy wskaźnik ctx_dft i w destruktorze
-        // implementacji MTP woła na nim llama_set_sampler/llama_set_embeddings_nextn,
+        // implementacji MTP woła na nim llama_set_sampler,
         // więc ctx_dft musi żyć aż do zakończenia free. Dopiero potem zwalniamy ctx_dft.
         unsafe { sys::llama_rs_speculative_free(self.raw) };
         if !self.ctx_dft.is_null() {

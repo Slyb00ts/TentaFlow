@@ -171,6 +171,9 @@ fn compile_wrappers(include_dir: &Path, target_os: &TargetOs) {
     if matches!(target_os, TargetOs::Windows) {
         build.flag("/std:c++17");
         build.flag("/wd4505");
+        // The wrappers catch the exceptions llama.cpp common throws; without
+        // /EHsc MSVC compiles try/catch without unwind semantics.
+        build.flag("/EHsc");
     }
 
     build.compile("llama_cpp_sys_2_common_wrapper");
@@ -218,19 +221,38 @@ fn link_native(lib_dir: &Path, target: &str, target_os: &TargetOs) {
     }
 
     if lib_dir.join(static_name("ggml-vulkan", target)).exists() {
-        println!("cargo:rustc-link-lib=dylib=vulkan");
+        if matches!(target_os, TargetOs::Windows) {
+            // The loader import library ships with the LunarG SDK as vulkan-1.lib.
+            println!(
+                "cargo:rustc-link-search=native={}",
+                sdk_lib_dir("VULKAN_SDK", "Lib")
+            );
+            println!("cargo:rustc-link-lib=dylib=vulkan-1");
+        } else {
+            println!("cargo:rustc-link-lib=dylib=vulkan");
+        }
     }
 
     if lib_dir.join(static_name("ggml-cuda", target)).exists() {
-        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
-        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64/stubs");
-        println!("cargo:rustc-link-search=native=/opt/cuda/lib64");
-        println!("cargo:rustc-link-search=native=/opt/cuda/lib64/stubs");
+        if matches!(target_os, TargetOs::Windows) {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                sdk_lib_dir("CUDA_PATH", "lib\\x64")
+            );
+        } else {
+            println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+            println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64/stubs");
+            println!("cargo:rustc-link-search=native=/opt/cuda/lib64");
+            println!("cargo:rustc-link-search=native=/opt/cuda/lib64/stubs");
+        }
         println!("cargo:rustc-link-lib=dylib=cudart");
         println!("cargo:rustc-link-lib=dylib=cublas");
         println!("cargo:rustc-link-lib=dylib=cublasLt");
         println!("cargo:rustc-link-lib=dylib=cuda");
-        println!("cargo:rustc-link-lib=static=culibos");
+        if !matches!(target_os, TargetOs::Windows) {
+            // culibos exists only in the Linux toolkit.
+            println!("cargo:rustc-link-lib=static=culibos");
+        }
     }
 
     if lib_dir.join(static_name("ggml-hip", target)).exists() {
@@ -240,6 +262,16 @@ fn link_native(lib_dir: &Path, target: &str, target_os: &TargetOs) {
         println!("cargo:rustc-link-lib=dylib=rocblas");
         println!("cargo:rustc-link-lib=dylib=hipblas");
     }
+}
+
+/// `<env root>\<sub>` of an SDK installer variable (VULKAN_SDK, CUDA_PATH).
+/// The backend archive exists, so a missing SDK is a hard error, not a guess.
+fn sdk_lib_dir(var: &str, sub: &str) -> String {
+    println!("cargo:rerun-if-env-changed={var}");
+    let root = env::var(var).unwrap_or_else(|_| {
+        panic!("llama-cpp-sys-2: {var} is not set, but native-libs contain that backend")
+    });
+    Path::new(&root).join(sub).display().to_string()
 }
 
 fn link_static_if_exists(lib_dir: &Path, name: &str, target: &str) {
