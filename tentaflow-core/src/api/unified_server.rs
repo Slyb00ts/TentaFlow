@@ -775,6 +775,18 @@ pub fn start_unified_server_with_permissions(
                                 if let Some(a) = flow_actor {
                                     req.extensions_mut().insert(a);
                                 }
+                                // Raw socket peer, port stripped — the same
+                                // derivation as the Zabbix branch above (no XFF
+                                // trust). Handlers that audit an external caller
+                                // record it.
+                                let peer_ip = ra
+                                    .rsplit_once(':')
+                                    .map(|(host, _)| {
+                                        host.trim_matches(|c| c == '[' || c == ']').to_string()
+                                    })
+                                    .unwrap_or_else(|| ra.clone());
+                                req.extensions_mut()
+                                    .insert(crate::api::openai::server::V1PeerIp(peer_ip));
                                 let resp =
                                     crate::api::openai::server::handle_request(req, router).await?;
                                 let mut resp = resp.map(|body| {

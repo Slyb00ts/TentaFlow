@@ -157,6 +157,7 @@ fn api_key_project_allowed(pool: &DbPool, project_id: &str, key_uid: &str) -> bo
         pool,
         ML_STUDIO_SHARE_RESOURCE_TYPE,
         project_id,
+        "*",
         &crate::auth::acl::Principal::ApiKey {
             uid: key_uid.to_string(),
         },
@@ -888,8 +889,14 @@ mod tests {
         let pepper = crate::db::repository::get_or_create_api_key_pepper(db, cipher).unwrap();
         let raw = "sk-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let verifier = crate::api::dashboard::auth::api_key_verifier(raw, &pepper);
-        let scopes: Vec<(String, String)> = scope_project
-            .map(|p| vec![(ML_STUDIO_SHARE_RESOURCE_TYPE.to_string(), p.to_string())])
+        let scopes: Vec<(String, String, String)> = scope_project
+            .map(|p| {
+                vec![(
+                    ML_STUDIO_SHARE_RESOURCE_TYPE.to_string(),
+                    p.to_string(),
+                    "*".to_string(),
+                )]
+            })
             .unwrap_or_default();
         let (_id, uid) = crate::db::repository::create_api_key_with_scopes(
             db,

@@ -269,3 +269,25 @@ test('an overwriting import that goes to a second admin reports the parked reque
   assert.match(win.textContent, /Import konfiguracji/);
   screen.dispose();
 });
+
+// n18b M20 (critic-mockups-n11-n19-2026-09-21.md): the core plans `target`
+// items (config_io.rs), and the kind column printed the literal key
+// `tentanas.config.kind_target` for them.
+test('a target in the import plan is named, never shown as a raw key', async () => {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  try {
+    renderImportPlan(host, { items: [
+      { kind: 'target', name: 'vm-disk', action: 'create', detail: 'iscsi' },
+      { kind: 'mystery', name: 'x', action: 'skip', detail: '' },
+    ], warnings: [] });
+    await flush();
+    const rows = host.querySelector('#nas-ci-plan').rows;
+    assert.match(rows[0].kind, />Target<\/span>$/);
+    assert.match(rows[0].kind, /i-target/, 'with the target glyph, not the generic file');
+    assert.match(rows[1].kind, />mystery<\/span>$/);
+    assert.doesNotMatch(rows.map((r) => r.kind).join(''), /tentanas\.|config\.kind_/);
+  } finally {
+    host.remove();
+  }
+});

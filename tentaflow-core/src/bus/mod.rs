@@ -94,6 +94,7 @@ pub mod dlq;
 pub mod field_policies;
 pub mod groups;
 pub mod instance;
+pub mod lag_history;
 pub mod native;
 pub mod payload_format;
 pub mod producer;
@@ -189,6 +190,7 @@ pub fn init_instance(cfg: BusInitConfig) -> Result<Arc<BusService>, BusServiceEr
     }
     spawn_audit_flush_timer(Arc::clone(&service));
     spawn_metrics_rollup_timer(Arc::clone(&service));
+    spawn_lag_history_sampler(Arc::clone(&service));
     *BUS_SERVICE.write() = Some(service.clone());
     Ok(service)
 }
@@ -278,7 +280,7 @@ const AUDIT_WINDOW: Duration = Duration::from_secs(60);
 /// in depth) gets a chance to hide it.
 const LEGACY_PROBE_GROUP_ID: &str = "tf-system-probe";
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -931,8 +933,8 @@ pub enum BusServiceError {
         version: u32,
         detail: String,
     },
-    /// A topic's `schema_id` names a subject that does not exist (or no
-    /// longer resolves to an effective version — deprecated/version-less)
+    /// A topic's `schema_id` names a subject that does not exist (or has
+    /// no version at all — a deprecated subject still resolves)
     /// at the moment `publish` needed to validate against it: a bound-but-
     /// vanished schema must be loud, never silently treated as `off`.
     #[error("schema subject '{subject}' not found")]
@@ -2332,6 +2334,17 @@ pub struct BusService {
     /// Copied from `BusInitConfig::publish_ack_timeout` at `new()` — see
     /// that field's doc.
     publish_ack_timeout: Duration,
+    /// `lag_history::TrendState` per (org, group, topic): rebuilt from the
+    /// persisted samples once when the sampler starts (so a restarted node
+    /// reports its trend straight away), then advanced by each new sample —
+    /// neither `StatsSnapshot` (polled every few seconds) nor the per-minute
+    /// sampler re-reads a day of rows per group.
+    lag_trends: DashMap<(String, String, String), lag_history::TrendState>,
+    /// Serializes the sampler's "is the topic still there → write its rows"
+    /// step against `delete_topic`'s history delete, so a round that
+    /// measured a topic just before it was deleted cannot write rows back
+    /// after the delete removed them.
+    lag_history_lock: parking_lot::Mutex<()>,
     /// Test-only synchronization point: if set, taken and invoked exactly
     /// once, right after `open_consumer`'s phase 1 completes (before phase
     /// 2's side effects and the purge-epoch re-check) — lets a test
@@ -2340,6 +2353,90 @@ pub struct BusService {
     /// scheduling to reproduce a race. Always `None` outside tests.
     #[cfg(test)]
     test_open_consumer_after_phase1: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only: taken and run once inside `sample_lag_history`, after the
+    /// round measured its topics and before it takes `lag_history_lock` —
+    /// the window a concurrent `delete_topic` must not be able to exploit.
+    #[cfg(test)]
+    test_sampler_after_measure: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Healthy same-environment nodes counting this one: the local node always
+/// counts as a replica even when the snapshot has no OTHER same-env peer yet
+/// (a brand-new single-node mesh).
+fn healthy_node_count(same_env_peers: usize) -> u32 {
+    u32::try_from(same_env_peers).unwrap_or(u32::MAX).saturating_add(1)
+}
+
+/// Owner decision `9l-a-rf-default`: RF = min(3, nodes in the environment).
+fn default_rf_for_nodes(nodes: u32) -> u32 {
+    nodes.min(3)
+}
+
+fn check_partition_in_range(
+    topic: &str,
+    partition: u32,
+    cfg: &topics::TopicConfig,
+) -> Result<(), BusServiceError> {
+    if partition >= cfg.partitions {
+        return Err(BusServiceError::InvalidArgument(format!(
+            "partition {partition} out of range for topic '{topic}' ({} partition(s))",
+            cfg.partitions
+        )));
+    }
+    Ok(())
+}
+
+/// One partition of a consumer group's position, read WITHOUT a consumer
+/// session — see `BusService::group_lag`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupPartitionLag {
+    pub partition: u32,
+    pub committed_offset: u64,
+    pub high_watermark: u64,
+    pub lag: u64,
+}
+
+/// Records still waiting in one DLQ partition — see `BusService::dlq_recency`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DlqRecency {
+    /// Retained records minus the discarded ones.
+    pub waiting: u64,
+    /// Of `waiting`, how many arrived at or after the requested instant.
+    pub arrived_since: u64,
+    /// Arrival time of the newest waiting record.
+    pub last_arrival_ms: Option<i64>,
+}
+
+/// Timestamp and DLQ arrival time of one stored record.
+struct RecordStamp {
+    timestamp_ms: i64,
+    arrival_ms: i64,
+}
+
+/// Reads the record at `offset` (the first record at or after it — offsets
+/// within a partition are contiguous) straight from the engine. No
+/// authorization, audit or field-policy projection: callers only take
+/// timestamps from it, never payload bytes. `None` past the high watermark.
+fn read_record_stamp(
+    reader: &tentaflow_bus::PartitionReader,
+    offset: u64,
+    topic: &str,
+    partition: u32,
+) -> Result<Option<RecordStamp>, BusServiceError> {
+    let batches = reader
+        .fetch_from_offset(offset, 1)
+        .map_err(|e| map_engine_error(e, topic, partition))?;
+    for view in &batches {
+        if let Some(rv) = view.records_from(offset).next() {
+            let rv = rv?;
+            let timestamp_ms = view.header().base_timestamp_ms + i64::from(rv.ts_delta_ms);
+            return Ok(Some(RecordStamp {
+                timestamp_ms,
+                arrival_ms: dlq::arrival_ms(&rv.headers, timestamp_ms),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn environment_to_u8(env: NodeEnvironment) -> u8 {
@@ -2498,8 +2595,12 @@ impl BusService {
             partition_access_clock: AtomicU64::new(0),
             partition_handle_lru: cfg.partition_handle_lru,
             publish_ack_timeout: cfg.publish_ack_timeout,
+            lag_trends: DashMap::new(),
+            lag_history_lock: parking_lot::Mutex::new(()),
             #[cfg(test)]
             test_open_consumer_after_phase1: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_sampler_after_measure: std::sync::Mutex::new(None),
         };
         // PLAN §7.1 `max_bytes`: measure what is already on disk before the
         // first publish can be admitted. `publish` reads `org_stored_bytes`
@@ -3255,7 +3356,7 @@ impl BusService {
     /// pays the recompile cost here), for `subject` (`schema_cache`, keyed
     /// `(org_id, subject)`).
     /// `None` means the subject does not currently resolve to an effective
-    /// schema (missing, deprecated, or version-less —
+    /// schema (missing or version-less; deprecated still resolves —
     /// `registry::resolve_effective`'s exact contract) — the caller
     /// (`publish`) turns that into a loud `SchemaNotFound`, never a silent
     /// "treat as off". A cache hit is only served when its captured
@@ -3807,6 +3908,23 @@ impl BusService {
         autocreate_default_for(crate::services::environment::get_node_environment(&self.db))
     }
 
+    /// `(default_replication_factor, node_count)` a topic created right now
+    /// without an explicit `replication_factor` would get — the resolution
+    /// `create_topic_audited` applies, exposed so the UI states the real
+    /// number instead of guessing it. Without a replication coordinator this
+    /// node is the only replica: `(1, 1)`, `TopicConfig::from_options`' own
+    /// default.
+    pub fn default_replication(&self, org_id: &str) -> (u32, u32) {
+        let env = crate::services::environment::get_node_environment(&self.db);
+        match self.resolve_topic_placement(org_id, env) {
+            Some(resolved) => {
+                let nodes = healthy_node_count(resolved.same_env.len());
+                (default_rf_for_nodes(nodes), nodes)
+            }
+            None => (1, 1),
+        }
+    }
+
     /// M2 (PLAN-M2 §1e): replica placement. `replication_factor` defaults
     /// to `min(3, healthy same-environment nodes)` — PLAN §7.1's own
     /// intended default, meaningless in M1 (no coordinator, no mesh) and
@@ -3851,11 +3969,9 @@ impl BusService {
         let mut placement: Option<(String, Vec<String>)> = None;
         if let Some(resolved) = self.resolve_topic_placement(&ctx.org_id, env) {
             if opts.replication_factor.is_none() {
-                // +1: the local node itself always counts as one healthy
-                // replica even when the snapshot has no OTHER same-env
-                // peer yet (a brand-new single-node mesh).
-                let healthy = (resolved.same_env.len() as u32 + 1).min(3);
-                opts.replication_factor = Some(healthy);
+                opts.replication_factor = Some(default_rf_for_nodes(healthy_node_count(
+                    resolved.same_env.len(),
+                )));
             }
             if !resolved.local_node_id.is_empty() {
                 placement = Some((resolved.local_node_id, resolved.same_env));
@@ -4097,6 +4213,19 @@ impl BusService {
         let discarded_keys_purged = self.discarded.purge_topic(&ctx.org_id, name)?;
         let groups_purged =
             crate::db::repository::bus_groups_delete_by_topic(&self.local_db, &ctx.org_id, name)?;
+        // Best-effort: stale history of a deleted topic only ever shows up in
+        // a re-created topic of the same name, which pruning clears in 24 h.
+        // Under `lag_history_lock`, after the `bus_topics` row is gone: a
+        // sampling round either wrote before this delete or sees the topic
+        // missing and drops its rows (`sample_lag_history`).
+        {
+            let _history = self.lag_history_lock.lock();
+            if let Err(e) = lag_history::delete_topic(&self.local_db, &ctx.org_id, name) {
+                tracing::warn!(topic = %name, error = %e, "lag history: delete for topic failed");
+            }
+        }
+        self.lag_trends
+            .retain(|(org, _, topic), _| !(org == &ctx.org_id && topic == name));
         let dir = topics::topic_dir(&self.bus_dir, &ctx.org_id, name);
         let _ = std::fs::remove_dir_all(&dir);
         // The segments measured at the top of this call are gone now.
@@ -4864,28 +4993,32 @@ impl BusService {
         topic: &str,
         partition: u32,
     ) -> Result<PartitionStats, BusServiceError> {
-        self.check_instance(ctx)?;
-        topics::validate_org_id(&ctx.org_id)?;
-        self.authorizer
-            .authorize(ctx, BusAction::Consume, topic)
-            .map_err(|_| {
-                self.audit_windowed(
-                    ctx,
-                    "bus.consume.denied",
-                    Some(topic),
-                    Some("action=partition_stats"),
-                );
-                deny(BusAction::Consume, topic)
-            })?;
-        let cfg = self.topic_config(&ctx.org_id, topic)?;
-        self.check_environment(&cfg)?;
-        if partition >= cfg.partitions {
-            return Err(BusServiceError::InvalidArgument(format!(
-                "partition {partition} out of range for topic '{topic}' ({} partition(s))",
-                cfg.partitions
-            )));
-        }
-        let part = self.partition_handle(&ctx.org_id, topic, partition, &cfg)?;
+        let cfg = self.authorized_topic(ctx, topic, "partition_stats")?;
+        check_partition_in_range(topic, partition, &cfg)?;
+        self.read_partition_stats(&ctx.org_id, topic, partition, &cfg)
+    }
+
+    /// `partition_stats` for every partition of `topic`, authorized once —
+    /// `StatsSnapshot` polls this per topic every few seconds.
+    pub fn topic_partition_stats(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+    ) -> Result<Vec<PartitionStats>, BusServiceError> {
+        let cfg = self.authorized_topic(ctx, topic, "partition_stats")?;
+        (0..cfg.partitions)
+            .map(|p| self.read_partition_stats(&ctx.org_id, topic, p, &cfg))
+            .collect()
+    }
+
+    fn read_partition_stats(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+        cfg: &topics::TopicConfig,
+    ) -> Result<PartitionStats, BusServiceError> {
+        let part = self.partition_handle(org_id, topic, partition, cfg)?;
         let reader = part.open_reader();
         let sealed = part.sealed_segments();
         let sealed_bytes: u64 = sealed.iter().map(|s| s.len).sum();
@@ -4899,6 +5032,542 @@ impl BusService {
             // by `sealed_segments()`.
             segments: sealed.len() as u32 + 1,
         })
+    }
+
+    /// A consumer group's committed offset, high watermark and lag on every
+    /// partition of `topic`, read WITHOUT opening a consumer session: no
+    /// `bus_groups` upsert, so the `commit_mode` the group's own program
+    /// chose (and `updated_at_ms`) are never touched by a dashboard poll.
+    /// Same checks `open_consumer` runs before its side effects — group-
+    /// scoped Consume authorization (denial audited, windowed), Z12
+    /// environment fencing, and leadership of every partition (offsets are
+    /// committed on the leader, so a follower's copy would be stale).
+    pub fn group_lag(
+        &self,
+        ctx: &BusCallContext,
+        group: &str,
+        topic: &str,
+    ) -> Result<Vec<GroupPartitionLag>, BusServiceError> {
+        self.check_instance(ctx)?;
+        topics::validate_org_id(&ctx.org_id)?;
+        validate_group_name(group)?;
+        self.authorizer
+            .authorize_group(ctx, BusAction::Consume, topic, group)
+            .map_err(|_| {
+                self.audit_windowed(
+                    ctx,
+                    "bus.consume.denied",
+                    Some(topic),
+                    Some(&format!("group={group} action=group_lag")),
+                );
+                deny(BusAction::Consume, topic)
+            })?;
+        let cfg = self.topic_config(&ctx.org_id, topic)?;
+        self.check_environment(&cfg)?;
+        let coordinator = self.replication();
+        for p in 0..cfg.partitions {
+            check_leader_role(&coordinator, &ctx.org_id, topic, p)?;
+        }
+        self.read_group_lag(&ctx.org_id, group, topic, &cfg)
+    }
+
+    fn read_group_lag(
+        &self,
+        org_id: &str,
+        group: &str,
+        topic: &str,
+        cfg: &topics::TopicConfig,
+    ) -> Result<Vec<GroupPartitionLag>, BusServiceError> {
+        (0..cfg.partitions)
+            .map(|partition| {
+                let part = self.partition_handle(org_id, topic, partition, cfg)?;
+                let reader = part.open_reader();
+                if reader.is_detached() {
+                    return Err(BusServiceError::TopicNotFound {
+                        name: topic.to_string(),
+                    });
+                }
+                let high_watermark = reader.high_watermark();
+                let committed_offset = self
+                    .offsets
+                    .committed_offset(org_id, group, topic, partition)?;
+                Ok(GroupPartitionLag {
+                    partition,
+                    committed_offset,
+                    high_watermark,
+                    lag: high_watermark.saturating_sub(committed_offset),
+                })
+            })
+            .collect()
+    }
+
+    /// Timestamp of the oldest retained record on `(topic, partition)`, or
+    /// `None` for an empty partition. Same authorization as
+    /// `partition_stats`; reads one batch, no audit row (no payload leaves
+    /// this function).
+    pub fn partition_earliest_timestamp(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+    ) -> Result<Option<i64>, BusServiceError> {
+        let reader = self.authorized_reader(ctx, topic, partition, "earliest_timestamp")?;
+        let earliest = reader.earliest_offset();
+        Ok(read_record_stamp(&reader, earliest, topic, partition)?.map(|s| s.timestamp_ms))
+    }
+
+    /// How many records wait in DLQ `dlq_topic`, how
+    /// many of them arrived at or after `since_ms`, and when the newest one
+    /// arrived — discarded records (`dlq_discard`) excluded everywhere.
+    /// Arrival is `dlq::arrival_ms`, which grows with the offset (records
+    /// are appended as they fail), so the "since" boundary is found by a
+    /// binary search over offsets: O(log n) single-batch reads, no scan.
+    ///
+    /// Summed over every partition of `dlq_topic`, authorized once.
+    pub fn dlq_recency(
+        &self,
+        ctx: &BusCallContext,
+        dlq_topic: &str,
+        since_ms: i64,
+    ) -> Result<DlqRecency, BusServiceError> {
+        let cfg = self.authorized_topic(ctx, dlq_topic, "dlq_recency")?;
+        let mut total = DlqRecency::default();
+        for partition in 0..cfg.partitions {
+            let reader = self
+                .partition_handle(&ctx.org_id, dlq_topic, partition, &cfg)?
+                .open_reader();
+            let r = self.dlq_recency_on(&ctx.org_id, dlq_topic, partition, &reader, since_ms)?;
+            total.waiting += r.waiting;
+            total.arrived_since += r.arrived_since;
+            total.last_arrival_ms = total.last_arrival_ms.max(r.last_arrival_ms);
+        }
+        Ok(total)
+    }
+
+    /// Retained, not discarded records of one DLQ partition between
+    /// `earliest` and `high_watermark` — the part of `dlq_recency_on` the
+    /// history sampler needs, without any record reads.
+    fn dlq_waiting(
+        &self,
+        org_id: &str,
+        dlq_topic: &str,
+        partition: u32,
+        earliest: u64,
+        high_watermark: u64,
+    ) -> Result<(u64, std::collections::HashSet<u64>), BusServiceError> {
+        let discarded = self
+            .discarded
+            .discarded_offsets(org_id, dlq_topic, partition, earliest)?;
+        let discarded_live = discarded
+            .iter()
+            .filter(|&&o| o >= earliest && o < high_watermark)
+            .count() as u64;
+        Ok((
+            high_watermark
+                .saturating_sub(earliest)
+                .saturating_sub(discarded_live),
+            discarded,
+        ))
+    }
+
+    fn dlq_recency_on(
+        &self,
+        org_id: &str,
+        dlq_topic: &str,
+        partition: u32,
+        reader: &tentaflow_bus::PartitionReader,
+        since_ms: i64,
+    ) -> Result<DlqRecency, BusServiceError> {
+        let earliest = reader.earliest_offset();
+        let high_watermark = reader.high_watermark();
+        let (waiting, discarded) =
+            self.dlq_waiting(org_id, dlq_topic, partition, earliest, high_watermark)?;
+        let discarded_in = |from: u64| {
+            discarded
+                .iter()
+                .filter(|&&o| o >= from && o < high_watermark)
+                .count() as u64
+        };
+
+        let mut last_arrival_ms = None;
+        let mut offset = high_watermark;
+        while offset > earliest {
+            offset -= 1;
+            if discarded.contains(&offset) {
+                continue;
+            }
+            last_arrival_ms = read_record_stamp(reader, offset, dlq_topic, partition)?
+                .map(|s| s.arrival_ms);
+            break;
+        }
+
+        let (mut lo, mut hi) = (earliest, high_watermark);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let arrived = read_record_stamp(reader, mid, dlq_topic, partition)?
+                .map(|s| s.arrival_ms)
+                .unwrap_or(i64::MAX);
+            if arrived < since_ms {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let arrived_since = high_watermark
+            .saturating_sub(lo)
+            .saturating_sub(discarded_in(lo));
+
+        Ok(DlqRecency {
+            waiting,
+            arrived_since,
+            last_arrival_ms,
+        })
+    }
+
+    /// The Consume check + partition lookup `partition_stats` does, shared
+    /// by the timestamp readers above.
+    fn authorized_reader(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+        action: &str,
+    ) -> Result<tentaflow_bus::PartitionReader, BusServiceError> {
+        let cfg = self.authorized_topic(ctx, topic, action)?;
+        check_partition_in_range(topic, partition, &cfg)?;
+        Ok(self
+            .partition_handle(&ctx.org_id, topic, partition, &cfg)?
+            .open_reader())
+    }
+
+    /// The Consume check (denial audited, windowed) + topic lookup + Z12
+    /// fencing every metadata read of a topic starts with, done once so a
+    /// caller walking all partitions does not repeat it per partition.
+    fn authorized_topic(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        action: &str,
+    ) -> Result<topics::TopicConfig, BusServiceError> {
+        self.check_instance(ctx)?;
+        topics::validate_org_id(&ctx.org_id)?;
+        self.authorizer
+            .authorize(ctx, BusAction::Consume, topic)
+            .map_err(|_| {
+                self.audit_windowed(
+                    ctx,
+                    "bus.consume.denied",
+                    Some(topic),
+                    Some(&format!("action={action}")),
+                );
+                deny(BusAction::Consume, topic)
+            })?;
+        let cfg = self.topic_config(&ctx.org_id, topic)?;
+        self.check_environment(&cfg)?;
+        Ok(cfg)
+    }
+
+    /// `(can_read, can_write, can_admin)` of the caller on `topic` per the
+    /// topic ACL — the same `authorize` calls `peek`/`publish`/admin paths
+    /// make, but a plain question: a `false` here is not a denied access
+    /// attempt, so it writes no audit row.
+    pub fn topic_access(&self, ctx: &BusCallContext, topic: &str) -> (bool, bool, bool) {
+        if self.check_instance(ctx).is_err() {
+            return (false, false, false);
+        }
+        let allowed = |action| self.authorizer.authorize(ctx, action, topic).is_ok();
+        (
+            allowed(BusAction::Consume),
+            allowed(BusAction::Produce),
+            allowed(BusAction::Admin),
+        )
+    }
+
+    /// Last computed trend of `(group, topic)` — default (nothing known)
+    /// until the sampler has seen two samples.
+    pub fn lag_trend(&self, org_id: &str, group: &str, topic: &str) -> lag_history::LagTrend {
+        self.lag_trends
+            .get(&(org_id.to_string(), group.to_string(), topic.to_string()))
+            .map(|state| state.trend())
+            .unwrap_or_default()
+    }
+
+    /// Persisted history of the caller's org since `since_ms`, narrowed by
+    /// `topic`/`group`. Series of a topic the caller may not consume are
+    /// left out (a DLQ series is checked against the DLQ topic itself, the
+    /// same check `DlqList` applies); a group filter returns no DLQ series.
+    pub fn lag_history(
+        &self,
+        ctx: &BusCallContext,
+        topic: Option<&str>,
+        group: Option<&str>,
+        since_ms: i64,
+    ) -> Result<(Vec<lag_history::GroupSeries>, Vec<lag_history::DlqSeries>), BusServiceError> {
+        self.check_instance(ctx)?;
+        topics::validate_org_id(&ctx.org_id)?;
+        let readable = |t: &str| self.authorizer.authorize(ctx, BusAction::Consume, t).is_ok();
+        let groups = lag_history::group_series(&self.local_db, &ctx.org_id, since_ms, topic, group)?
+            .into_iter()
+            .filter(|s| readable(&s.topic))
+            .collect();
+        let dlqs = if group.is_some() {
+            Vec::new()
+        } else {
+            lag_history::dlq_series(&self.local_db, &ctx.org_id, since_ms, topic)?
+                .into_iter()
+                .filter(|s| readable(&dlq::dlq_topic_name(&s.topic)))
+                .collect()
+        };
+        Ok((groups, dlqs))
+    }
+
+    /// Rebuilds `lag_trends` for every registered subscription from the
+    /// persisted samples — what the sampler thread does once at start, so a
+    /// restart does not blank "rośnie od" until two new samples exist.
+    fn refresh_lag_trends(&self) {
+        let subscriptions = match crate::db::repository::bus_group_list_all(&self.local_db) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(instance_id = %self.instance_id, error = %e, "lag history: listing groups failed");
+                return;
+            }
+        };
+        let mut live = std::collections::HashSet::new();
+        for row in subscriptions {
+            let key = (row.org_id, row.group_id, row.topic);
+            match lag_history::group_trend_state(&self.local_db, &key.0, &key.1, &key.2) {
+                Ok(Some(state)) => {
+                    self.lag_trends.insert(key.clone(), state);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(instance_id = %self.instance_id, error = %e, "lag history: reading trend failed")
+                }
+            }
+            live.insert(key);
+        }
+        self.lag_trends.retain(|k, _| live.contains(k));
+    }
+
+    /// `(earliest_offset, high_watermark)` of a partition read WITHOUT
+    /// opening it: from the handle when a producer/consumer already holds one
+    /// open, otherwise from what is on disk (`partition.meta`'s persisted
+    /// high watermark, the lowest `<base_offset>.log` segment name —
+    /// `tentaflow_bus::segment::log_path`'s naming). Never opens a writer or
+    /// creates a directory, so the sampler cannot resurrect a deleted
+    /// topic's files or hold a partition lock a producer then trips over.
+    /// A partition with no directory has never been written: `(0, 0)`.
+    /// The caller re-checks that the topic still exists before recording
+    /// (`sample_lag_history`), which is what tells "never written" apart
+    /// from "just deleted". `None` when a directory exists without a
+    /// `partition.meta` (not flushed since M2 — the value is unknown) or
+    /// the open handle is detached.
+    fn passive_partition_offsets(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+    ) -> Option<(u64, u64)> {
+        let key = (org_id.to_string(), topic.to_string(), partition);
+        let live = self
+            .partitions
+            .get(&key)
+            .map(|entry| entry.value().clone())
+            .or_else(|| {
+                self.consumer_partitions
+                    .get(&key)
+                    .and_then(|weak_parts| weak_parts.iter().find_map(|w| w.upgrade()))
+            });
+        if let Some(part) = live {
+            let reader = part.open_reader();
+            if reader.is_detached() {
+                return None;
+            }
+            return Some((reader.earliest_offset(), reader.high_watermark()));
+        }
+        let dir = topics::partition_dir(&self.bus_dir, org_id, topic, partition);
+        if !dir.exists() {
+            return Some((0, 0));
+        }
+        let meta = tentaflow_bus::meta::read_meta(&dir)?;
+        let earliest = std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name();
+                name.to_str()?.strip_suffix(".log")?.parse::<u64>().ok()
+            })
+            .min()
+            .unwrap_or(meta.high_watermark);
+        Some((earliest.min(meta.high_watermark), meta.high_watermark))
+    }
+
+    /// One sampling round at `now_ms`: every registered (group, topic) whose
+    /// partitions this node leads, and every source topic with a DLQ, then
+    /// retention pruning and the trend update. Best-effort and logged — a
+    /// failure here must never affect traffic. Offsets are read passively
+    /// (`passive_partition_offsets`); a series with any partition that cannot
+    /// be read that way is skipped this round rather than sampled partially.
+    pub(crate) fn sample_lag_history(&self, now_ms: i64) {
+        let coordinator = self.replication();
+        let registered = match crate::db::repository::bus_group_list_all(&self.local_db) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(instance_id = %self.instance_id, error = %e, "lag history: listing groups failed");
+                return;
+            }
+        };
+
+        let mut group_samples = Vec::new();
+        for row in &registered {
+            let Ok(cfg) = self.topic_config(&row.org_id, &row.topic) else {
+                continue;
+            };
+            if self.check_environment(&cfg).is_err()
+                || (0..cfg.partitions)
+                    .any(|p| check_leader_role(&coordinator, &row.org_id, &row.topic, p).is_err())
+            {
+                continue;
+            }
+            let mut lag_total = 0u64;
+            let mut committed_total = 0u64;
+            let mut complete = true;
+            for p in 0..cfg.partitions {
+                let committed = self
+                    .offsets
+                    .committed_offset(&row.org_id, &row.group_id, &row.topic, p);
+                match (self.passive_partition_offsets(&row.org_id, &row.topic, p), committed) {
+                    (Some((_, high_watermark)), Ok(committed)) => {
+                        lag_total += high_watermark.saturating_sub(committed);
+                        committed_total += committed;
+                    }
+                    _ => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                group_samples.push(lag_history::GroupSample {
+                    org_id: row.org_id.clone(),
+                    group_id: row.group_id.clone(),
+                    topic: row.topic.clone(),
+                    lag_total,
+                    committed_total,
+                });
+            }
+        }
+
+        let mut dlq_samples = Vec::new();
+        let org_ids = crate::db::repository::bus_topic_org_ids(&self.db, &self.instance_id)
+            .unwrap_or_default();
+        for org_id in &org_ids {
+            if topics::validate_org_id(org_id).is_err() {
+                continue;
+            }
+            let Ok(rows) =
+                crate::db::repository::bus_topic_list(&self.db, &self.instance_id, org_id)
+            else {
+                continue;
+            };
+            for row in rows {
+                let Some(source) = row.name.strip_prefix(dlq::DLQ_TOPIC_PREFIX) else {
+                    continue;
+                };
+                let source = source.to_string();
+                let Ok(cfg) = topics::TopicConfig::try_from(row) else {
+                    continue;
+                };
+                if self.check_environment(&cfg).is_err() {
+                    continue;
+                }
+                let mut depth = 0u64;
+                let mut complete = true;
+                for p in 0..cfg.partitions {
+                    let waiting = self
+                        .passive_partition_offsets(org_id, &cfg.name, p)
+                        .and_then(|(earliest, high_watermark)| {
+                            self.dlq_waiting(org_id, &cfg.name, p, earliest, high_watermark)
+                                .ok()
+                        });
+                    match waiting {
+                        Some((w, _)) => depth += w,
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete {
+                    dlq_samples.push(lag_history::DlqSample {
+                        org_id: org_id.clone(),
+                        topic: source,
+                        dlq_depth: depth,
+                    });
+                }
+            }
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.test_sampler_after_measure.lock().unwrap().take() {
+            hook();
+        }
+
+        {
+            // A topic deleted while this round measured it must not get rows
+            // written back after `delete_topic` removed them: re-check which
+            // topics exist (one list per org involved) and write under the
+            // lock `delete_topic` takes for its history delete.
+            let _history = self.lag_history_lock.lock();
+            let mut live: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            let orgs: std::collections::BTreeSet<&str> = group_samples
+                .iter()
+                .map(|g| g.org_id.as_str())
+                .chain(dlq_samples.iter().map(|d| d.org_id.as_str()))
+                .collect();
+            for org in orgs {
+                if let Ok(rows) =
+                    crate::db::repository::bus_topic_list(&self.db, &self.instance_id, org)
+                {
+                    live.extend(rows.into_iter().map(|r| (org.to_string(), r.name)));
+                }
+            }
+            group_samples.retain(|g| live.contains(&(g.org_id.clone(), g.topic.clone())));
+            dlq_samples.retain(|d| {
+                live.contains(&(d.org_id.clone(), d.topic.clone()))
+                    && live.contains(&(d.org_id.clone(), dlq::dlq_topic_name(&d.topic)))
+            });
+            if let Err(e) =
+                lag_history::record(&self.local_db, now_ms, &group_samples, &dlq_samples)
+            {
+                tracing::warn!(instance_id = %self.instance_id, error = %e, "lag history: writing samples failed");
+                return;
+            }
+        }
+        if let Err(e) = lag_history::prune(&self.local_db, now_ms - lag_history::RETENTION_MS) {
+            tracing::warn!(instance_id = %self.instance_id, error = %e, "lag history: pruning failed");
+        }
+
+        for sample in &group_samples {
+            let point = lag_history::LagPoint {
+                at_ms: now_ms,
+                lag_total: sample.lag_total,
+                committed_total: sample.committed_total,
+            };
+            self.lag_trends
+                .entry((
+                    sample.org_id.clone(),
+                    sample.group_id.clone(),
+                    sample.topic.clone(),
+                ))
+                .and_modify(|state| state.push(point))
+                .or_insert_with(|| lag_history::TrendState::start(point));
+        }
+        let registered: std::collections::HashSet<(String, String, String)> = registered
+            .into_iter()
+            .map(|r| (r.org_id, r.group_id, r.topic))
+            .collect();
+        self.lag_trends.retain(|key, _| registered.contains(key));
     }
 
     /// Resolves the first offset on `(topic, partition)` whose record
@@ -6135,6 +6804,9 @@ impl BusService {
         crate::db::repository::bus_quota_delete_by_org(&self.db, &self.instance_id, org_id)?;
         let groups_deleted =
             crate::db::repository::bus_groups_delete_by_org(&self.local_db, org_id)? as u32;
+        // The history names the org's groups and topics — erased with them.
+        lag_history::delete_org(&self.local_db, org_id)?;
+        self.lag_trends.retain(|(org, _, _), _| org != org_id);
         // Review finding #9: the DB rows themselves (admin schema text,
         // `created_by` attribution) used to survive a purge — `bus_field_
         // policies` had the exact same gap (no delete-by-org function
@@ -7024,6 +7696,23 @@ fn spawn_metrics_rollup_timer(service: Arc<BusService>) {
             break;
         }
         service.publish_metrics_rollup();
+    });
+}
+
+/// Background thread started by `init_instance`: restores the trend cache
+/// from the persisted history, then writes one `lag_history` sampling round
+/// every `lag_history::SAMPLE_INTERVAL`. Same shutdown flag as every other
+/// engine thread, so `stop_instance` releases its `Arc<BusService>` within
+/// one `SHUTDOWN_POLL_INTERVAL`.
+fn spawn_lag_history_sampler(service: Arc<BusService>) {
+    std::thread::spawn(move || {
+        service.refresh_lag_trends();
+        loop {
+            if interruptible_sleep(&service, lag_history::SAMPLE_INTERVAL) {
+                break;
+            }
+            service.sample_lag_history(now_ms());
+        }
     });
 }
 
@@ -16020,6 +16709,559 @@ mod tests {
             peek_b_after_purge.records.len(),
             0,
             "instance B's own data (none published on B yet) is unaffected by A's purge"
+        );
+    }
+
+    // ---- PLAN-UI-20260923 B1 / B1b -----------------------------------------
+
+    fn publish_to(svc: &BusService, ctx: &BusCallContext, topic: &str, records: Vec<PublishRecord>) {
+        svc.publish(
+            ctx,
+            topic,
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Regression for PLAN-UI §0.1 at the service level: reading a group's
+    /// lag must not go through `open_consumer`'s `bus_groups` upsert.
+    #[test]
+    fn group_lag_reads_offsets_without_touching_the_group_row() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "orders", topics::TopicOptions::default())
+            .unwrap();
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::AutoAfterSuccess,
+                },
+            )
+            .unwrap();
+        publish_to(&svc, &ctx, "orders", vec![record("a"), record("b"), record("c")]);
+        handle
+            .commit(&[(
+                TopicPartition {
+                    topic: "orders".to_string(),
+                    partition: 0,
+                },
+                1,
+            )])
+            .unwrap();
+        let before = crate::db::repository::bus_group_get(&svc.local_db, "org-1", "g1", "orders")
+            .unwrap()
+            .unwrap();
+
+        let lag: Vec<GroupPartitionLag> = svc.group_lag(&ctx, "g1", "orders").unwrap();
+        let p0 = lag.iter().find(|p| p.partition == 0).unwrap();
+        assert_eq!((p0.committed_offset, p0.high_watermark, p0.lag), (1, 3, 2));
+
+        let after = crate::db::repository::bus_group_get(&svc.local_db, "org-1", "g1", "orders")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.commit_mode, "auto_after_success");
+        assert_eq!(after.updated_at_ms, before.updated_at_ms);
+        // A group that never consumed here is measured too, without
+        // creating a row for it.
+        let ghost = svc.group_lag(&ctx, "never-opened", "orders").unwrap();
+        assert_eq!(ghost.iter().map(|p| p.lag).sum::<u64>(), 3);
+        assert!(
+            crate::db::repository::bus_group_get(&svc.local_db, "org-1", "never-opened", "orders")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Owner decision 23.09 ("Wycofanie wzoru"): deprecating a subject is a
+    /// marker only — the topic bound to it keeps validating (a violating
+    /// record still goes to the DLQ, a valid one is accepted), its
+    /// validation mode can still be changed, but the subject can no longer
+    /// be bound to another topic.
+    #[test]
+    fn a_deprecated_subject_keeps_validating_its_bound_topic() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        schema_registry::registry::delete(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "orders",
+            None,
+            true,
+        )
+        .unwrap();
+
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![
+                        record(r#"{"id":"ok"}"#),
+                        record(r#"{"status":"missing-required-id"}"#),
+                    ],
+                },
+            )
+            .expect("a deprecated subject must not stop publishing");
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.schema_rejected, 1, "validation still runs");
+
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                validation: Some(topics::ValidationMode::Warn),
+                ..Default::default()
+            },
+        )
+        .expect("the existing binding may still change its validation mode");
+
+        svc.create_topic(&ctx, "orders.other", topics::TopicOptions::default())
+            .unwrap();
+        let err = svc
+            .update_topic(
+                &ctx,
+                "orders.other",
+                topics::TopicOptions {
+                    schema_id: Some("orders".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::InvalidTopicConfig { ref reason } if reason.contains("deprecated")),
+            "{err:?}"
+        );
+    }
+
+    /// `dlq_recency` counts by DLQ ARRIVAL (`dlq.last_failed_at_ms` /
+    /// `dlq.rejected_at_ms`), not by the original record timestamp, on both
+    /// sides of the boundary, and leaves discarded records out.
+    #[test]
+    fn dlq_recency_counts_arrivals_since_the_boundary_and_skips_discarded() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let source = svc
+            .create_topic(&ctx, "orders", topics::TopicOptions::default())
+            .unwrap();
+        let dlq_cfg = svc.ensure_dlq_topic(&ctx, "orders", &source).unwrap();
+        assert_eq!(dlq_cfg.partitions, source.partitions);
+        let now = now_ms();
+        let minute = 60_000;
+        let arrived = |header: &str, at_ms: i64| PublishRecord {
+            key: None,
+            headers: vec![(header.to_string(), Bytes::from(at_ms.to_string()))],
+            payload: Bytes::from_static(b"{}"),
+            // Days older than the failure: must not be what is counted.
+            timestamp_ms: now - 5 * 24 * 60 * minute,
+            schema_id: 0,
+        };
+        publish_to(
+            &svc,
+            &ctx,
+            "__dlq.orders",
+            vec![
+                arrived("dlq.last_failed_at_ms", now - 180 * minute),
+                arrived("dlq.last_failed_at_ms", now - 120 * minute),
+                arrived("dlq.rejected_at_ms", now - 30 * minute),
+                arrived("dlq.last_failed_at_ms", now - 10 * minute),
+                arrived("dlq.last_failed_at_ms", now - minute),
+            ],
+        );
+
+        let r = svc
+            .dlq_recency(&ctx, "__dlq.orders", now - 60 * minute)
+            .unwrap();
+        assert_eq!(r.waiting, 5);
+        assert_eq!(r.arrived_since, 3);
+        assert_eq!(r.last_arrival_ms, Some(now - minute));
+
+        svc.dlq_discard(&ctx, "__dlq.orders", 0, 4).unwrap();
+        svc.dlq_discard(&ctx, "__dlq.orders", 0, 0).unwrap();
+        let r = svc
+            .dlq_recency(&ctx, "__dlq.orders", now - 60 * minute)
+            .unwrap();
+        assert_eq!(r.waiting, 3);
+        assert_eq!(r.arrived_since, 2);
+        assert_eq!(r.last_arrival_ms, Some(now - 10 * minute));
+
+        let empty = svc.dlq_recency(&ctx, "__dlq.orders", now).unwrap();
+        assert_eq!(empty.arrived_since, 0);
+    }
+
+    #[test]
+    fn partition_earliest_timestamp_is_the_oldest_retained_record() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "orders", topics::TopicOptions::default())
+            .unwrap();
+        assert_eq!(svc.partition_earliest_timestamp(&ctx, "orders", 0).unwrap(), None);
+        let mut first = record("a");
+        first.timestamp_ms = 1_700_000_000_000;
+        let mut second = record("b");
+        second.timestamp_ms = 1_700_000_500_000;
+        publish_to(&svc, &ctx, "orders", vec![first, second]);
+        assert_eq!(
+            svc.partition_earliest_timestamp(&ctx, "orders", 0).unwrap(),
+            Some(1_700_000_000_000)
+        );
+    }
+
+    /// B1b: each sampling round persists one row per (group, topic) and one
+    /// per DLQ, the trend follows the lag, and the rows are pruned after
+    /// 24 h and erased with the topic/org.
+    #[test]
+    fn lag_history_sampler_persists_samples_and_derives_the_trend() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let source = svc
+            .create_topic(
+                &ctx,
+                "faktury",
+                topics::TopicOptions {
+                    partitions: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        svc.ensure_dlq_topic(&ctx, "faktury", &source).unwrap();
+        drop(
+            svc.open_consumer(
+                &ctx,
+                "ksiegowosc",
+                &["faktury".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap(),
+        );
+        let t0 = 1_800_000_000_000;
+        let minute = 60_000;
+
+        publish_to(&svc, &ctx, "faktury", vec![record("1")]);
+        svc.sample_lag_history(t0);
+        assert_eq!(
+            svc.lag_trend("org-1", "ksiegowosc", "faktury"),
+            lag_history::LagTrend::default(),
+            "one sample has no trend yet"
+        );
+        publish_to(&svc, &ctx, "faktury", vec![record("2"), record("3")]);
+        svc.sample_lag_history(t0 + minute);
+        let trend = svc.lag_trend("org-1", "ksiegowosc", "faktury");
+        assert_eq!(trend.rising_since_ms, Some(t0));
+        assert_eq!(trend.consume_rate_per_min, Some(0));
+
+        let (groups_series, dlq_series) =
+            svc.lag_history(&ctx, Some("faktury"), None, 0).unwrap();
+        assert_eq!(groups_series.len(), 1);
+        assert_eq!(
+            groups_series[0]
+                .points
+                .iter()
+                .map(|p| (p.at_ms, p.lag_total))
+                .collect::<Vec<_>>(),
+            vec![(t0, 1), (t0 + minute, 3)]
+        );
+        assert_eq!(dlq_series.len(), 1, "an existing DLQ is sampled too");
+        assert_eq!(dlq_series[0].topic, "faktury");
+        assert!(dlq_series[0].points.iter().all(|p| p.dlq_depth == 0));
+
+        // Restart: a fresh trend cache rebuilt from the persisted rows.
+        svc.lag_trends.clear();
+        svc.refresh_lag_trends();
+        assert_eq!(
+            svc.lag_trend("org-1", "ksiegowosc", "faktury").rising_since_ms,
+            Some(t0)
+        );
+
+        // 24 h later the first two rounds are pruned.
+        svc.sample_lag_history(t0 + lag_history::RETENTION_MS + 2 * minute);
+        let (after_prune, _) = svc.lag_history(&ctx, Some("faktury"), None, 0).unwrap();
+        assert_eq!(after_prune[0].points.len(), 1);
+
+        svc.delete_topic(&ctx, "faktury").unwrap();
+        let (gone, gone_dlq) = svc.lag_history(&ctx, Some("faktury"), None, 0).unwrap();
+        assert!(gone.is_empty());
+        assert!(gone_dlq.is_empty());
+        assert_eq!(
+            svc.lag_trend("org-1", "ksiegowosc", "faktury"),
+            lag_history::LagTrend::default()
+        );
+    }
+
+    #[test]
+    fn purge_org_erases_the_orgs_lag_history() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "orders", topics::TopicOptions::default())
+            .unwrap();
+        drop(
+            svc.open_consumer(
+                &ctx,
+                "g1",
+                &["orders".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap(),
+        );
+        svc.sample_lag_history(1_800_000_000_000);
+        assert!(!lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
+            .unwrap()
+            .is_empty());
+        svc.purge_org("org-1").unwrap();
+        assert!(lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn default_replication_without_a_coordinator_is_this_node_alone() {
+        let (_tmp, svc) = test_service();
+        assert_eq!(svc.default_replication("org-1"), (1, 1));
+        assert_eq!(default_rf_for_nodes(healthy_node_count(0)), 1);
+        assert_eq!(default_rf_for_nodes(healthy_node_count(1)), 2);
+        assert_eq!(default_rf_for_nodes(healthy_node_count(5)), 3);
+    }
+
+    /// Denies `Consume` (both plain and group-scoped) on every topic whose
+    /// name starts with `prefix`, allows everything else.
+    struct DenyConsumePrefixAuthorizer {
+        prefix: &'static str,
+    }
+    impl BusAuthorizer for DenyConsumePrefixAuthorizer {
+        fn authorize(
+            &self,
+            _ctx: &BusCallContext,
+            action: BusAction,
+            topic: &str,
+        ) -> Result<(), BusServiceError> {
+            if action == BusAction::Consume && topic.starts_with(self.prefix) {
+                Err(deny(action, topic))
+            } else {
+                Ok(())
+            }
+        }
+        fn authorize_group(
+            &self,
+            ctx: &BusCallContext,
+            action: BusAction,
+            topic: &str,
+            _group: &str,
+        ) -> Result<(), BusServiceError> {
+            self.authorize(ctx, action, topic)
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+
+    /// A caller who may consume the topic but NOT its DLQ gets the group
+    /// series and no DLQ series; one who may not consume the topic gets
+    /// nothing at all. Same rows in the database both times.
+    #[test]
+    fn lag_history_leaves_out_series_the_caller_may_not_read() {
+        let (_tmp, bus_dir) = test_bus_dir();
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db).expect("bus tables");
+        let local_db = test_local_db();
+        let config = |authorizer: Arc<dyn BusAuthorizer>, bus_dir: PathBuf| BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: local_db.clone(),
+            bus_dir,
+            db: db.clone(),
+            authorizer,
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        };
+        let no_dlq = BusService::new(config(
+            Arc::new(DenyConsumePrefixAuthorizer { prefix: "__dlq." }),
+            bus_dir.clone(),
+        ))
+        .unwrap();
+        let ctx = test_ctx("org-1");
+        let at = 1_800_000_000_000;
+        lag_history::record(
+            &local_db,
+            at,
+            &[lag_history::GroupSample {
+                org_id: "org-1".to_string(),
+                group_id: "g1".to_string(),
+                topic: "wyniki".to_string(),
+                lag_total: 5,
+                committed_total: 1,
+            }],
+            &[lag_history::DlqSample {
+                org_id: "org-1".to_string(),
+                topic: "wyniki".to_string(),
+                dlq_depth: 2,
+            }],
+        )
+        .unwrap();
+
+        let (groups, dlqs) = no_dlq.lag_history(&ctx, Some("wyniki"), None, 0).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(dlqs.is_empty(), "the DLQ series needs Consume on __dlq.<topic>");
+        drop(no_dlq);
+
+        let no_topic = BusService::new(config(
+            Arc::new(DenyConsumePrefixAuthorizer { prefix: "wyniki" }),
+            bus_dir,
+        ))
+        .unwrap();
+        let (groups, _) = no_topic.lag_history(&ctx, Some("wyniki"), None, 0).unwrap();
+        assert!(groups.is_empty());
+        let (groups, _) = no_topic.lag_history(&ctx, None, Some("g1"), 0).unwrap();
+        assert!(groups.is_empty(), "a group filter must not bypass the topic check");
+    }
+
+    /// Reading offsets passively never creates anything on disk.
+    #[test]
+    fn passive_partition_offsets_never_create_a_partition() {
+        let (_tmp, svc) = test_service();
+        assert_eq!(svc.passive_partition_offsets("org-1", "gone", 0), Some((0, 0)));
+        let dir = topics::partition_dir(&svc.bus_dir, "org-1", "gone", 0);
+        assert!(!dir.exists());
+        assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "gone").exists());
+    }
+
+    /// PLAN-UI review 3: a sampling round that measured a topic which is
+    /// deleted before the round writes must not write its rows back, and
+    /// must not leave (or recreate) the topic's directory.
+    #[test]
+    fn a_topic_deleted_during_a_sampling_round_gets_no_history_back() {
+        let (_tmp, svc) = test_service();
+        let svc = Arc::new(svc);
+        let ctx = test_ctx("org-1");
+        let source = svc
+            .create_topic(&ctx, "faktury", topics::TopicOptions::default())
+            .unwrap();
+        svc.ensure_dlq_topic(&ctx, "faktury", &source).unwrap();
+        drop(
+            svc.open_consumer(
+                &ctx,
+                "ksiegowosc",
+                &["faktury".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap(),
+        );
+        publish_to(&svc, &ctx, "faktury", vec![record("1")]);
+
+        let deleter = Arc::clone(&svc);
+        let delete_ctx = ctx.clone();
+        *svc.test_sampler_after_measure.lock().unwrap() = Some(Box::new(move || {
+            deleter.delete_topic(&delete_ctx, "__dlq.faktury").unwrap();
+            deleter.delete_topic(&delete_ctx, "faktury").unwrap();
+        }));
+        svc.sample_lag_history(1_800_000_000_000);
+
+        assert!(lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
+            .unwrap()
+            .is_empty());
+        assert!(lag_history::dlq_series(&svc.local_db, "org-1", 0, None)
+            .unwrap()
+            .is_empty());
+        assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "faktury").exists());
+        assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "__dlq.faktury").exists());
+        // Later rounds keep it that way.
+        svc.sample_lag_history(1_800_000_060_000);
+        assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "faktury").exists());
+        assert!(lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The same race with real threads: a sampler running in a loop while
+    /// a topic is created, consumed, published to and deleted over and over.
+    /// Once the last delete returns, no directory and no history row of the
+    /// topic may be left behind.
+    #[test]
+    fn sampler_racing_topic_deletes_leaves_nothing_behind() {
+        // A file-backed (WAL) database like production: the shared-cache
+        // `:memory:` fixture reports "table is locked" for any read that
+        // overlaps a write, which is a property of the fixture, not of the
+        // code under test.
+        let (tmp, bus_dir) = test_bus_dir();
+        let db = crate::db::init(&tmp.path().join("race.db")).expect("file db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db).expect("bus tables");
+        let svc = Arc::new(
+            BusService::new(BusInitConfig {
+                instance_id: test_instance_id(),
+                local_db: test_local_db(),
+                bus_dir,
+                db,
+                authorizer: Arc::new(AllowAllAuthorizer),
+                retention_interval: None,
+                dedup_expected_rate_per_sec: 10_000,
+                partition_handle_lru: None,
+                publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            })
+            .unwrap(),
+        );
+        let ctx = test_ctx("org-1");
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (svc, stop) = (Arc::clone(&svc), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut at = 1_800_000_000_000;
+                while !stop.load(Ordering::Acquire) {
+                    svc.sample_lag_history(at);
+                    at += 60_000;
+                }
+            })
+        };
+        for _ in 0..25 {
+            svc.create_topic(&ctx, "wyscig", topics::TopicOptions::default())
+                .unwrap();
+            drop(
+                svc.open_consumer(
+                    &ctx,
+                    "gr",
+                    &["wyscig".to_string()],
+                    ConsumerConfig {
+                        commit_mode: groups::CommitMode::Explicit,
+                    },
+                )
+                .unwrap(),
+            );
+            publish_to(&svc, &ctx, "wyscig", vec![record("x")]);
+            svc.delete_topic(&ctx, "wyscig").unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        sampler.join().unwrap();
+
+        assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "wyscig").exists());
+        assert!(
+            lag_history::group_series(&svc.local_db, "org-1", 0, Some("wyscig"), None)
+                .unwrap()
+                .is_empty()
         );
     }
 }

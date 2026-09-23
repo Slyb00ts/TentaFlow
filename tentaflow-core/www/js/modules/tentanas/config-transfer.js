@@ -16,7 +16,22 @@ import '/js/components/tf-chip.js';
 import '/js/components/tf-segmented.js';
 
 const ACTION_TONE = { import: 'ok', create: 'ok', update: 'info', skip: 'neutral', conflict: 'err', missing: 'warn' };
-const KIND_ICON = { pool: 'database', dataset: 'folder', share: 'share', share_user: 'user', schedule: 'clock' };
+const KIND_ICON = { pool: 'database', dataset: 'folder', share: 'share', share_user: 'user', schedule: 'clock', target: 'target' };
+// The plan's kind column. A kind without a `config.kind_*` label printed the
+// literal key (n18b M20: `tentanas.config.kind_target`); the core emits
+// `target` (config_io.rs), labelled by `config.kind_target`. A kind this list
+// does not know shows its wire word rather than a key.
+const KIND_LABEL = {
+  pool: 'config.kind_pool', dataset: 'config.kind_dataset', share: 'config.kind_share',
+  share_user: 'config.kind_share_user', schedule: 'config.kind_schedule', target: 'config.kind_target',
+};
+// A plain `function`, not an arrow: tf-table.test.js scans these modules for the
+// classes their table cells emit, and its scanner does not find where an arrow
+// assigned to a `const` ends — it read on to the end of the file and counted
+// dialog markup as cell classes.
+function kindLabel(kind) {
+  return KIND_LABEL[kind] ? T(KIND_LABEL[kind]) : String(kind || '');
+}
 
 /** Hands a text blob to the browser as a file download; the object URL is released once the click has been dispatched. */
 export function downloadText(text, filename, type = 'application/json') {
@@ -183,7 +198,7 @@ export function renderImportPlan(host, { items = [], warnings = [] }) {
   const table = host.querySelector('#nas-ci-plan');
   if (table) {
     table.rows = items.map((it) => ({
-      kind: `<span class="tf-table__cell-row">${sprite(KIND_ICON[it.kind] || 'file')}${escapeHtml(T('config.kind_' + it.kind))}</span>`,
+      kind: `<span class="tf-table__cell-row">${sprite(KIND_ICON[it.kind] || 'file')}${escapeHtml(kindLabel(it.kind))}</span>`,
       name: `<span class="tf-table__cell--mono">${escapeHtml(it.name)}</span>`,
       action: { status: ACTION_TONE[it.action] || 'info', label: T('config.action_' + it.action), dot: true },
       detail: it.detail || '',

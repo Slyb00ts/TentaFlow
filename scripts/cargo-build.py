@@ -6,6 +6,7 @@
 # =============================================================================
 
 import argparse
+import collections
 import contextlib
 import json
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import time
 import stat
 
@@ -369,9 +371,41 @@ def run_cargo(command, arguments, config):
         return code
 
 
+def annotate(title, text):
+    """A GitHub Actions error annotation: the job log of this repository needs
+    admin rights to read, an annotation is what a failed run shows everyone."""
+    body = text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+    print(f"::error title={title}::{body}", flush=True)
+
+
 def stream_cargo(command, arguments, cwd, target):
     artifacts = set()
-    cargo = subprocess.Popen(["cargo", command, "--message-format=json-render-diagnostics", *arguments], cwd=cwd, env=dict(os.environ, TENTAFLOW_PYTHON=sys.executable), stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
+    on_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    cargo = subprocess.Popen(["cargo", command, "--message-format=json-render-diagnostics", *arguments], cwd=cwd, env=dict(os.environ, TENTAFLOW_PYTHON=sys.executable), stdout=subprocess.PIPE, stderr=subprocess.PIPE if on_actions else None, text=True, encoding="utf-8", errors="replace", bufsize=1)
+    # On GitHub Actions cargo's stderr is echoed and mined for the annotations
+    # written when cargo fails: with json-render-diagnostics both rustc errors
+    # and build-script failures are rendered there as text, not as JSON. An
+    # error block runs from a line starting with "error" to the next blank one.
+    stderr_tail = collections.deque(maxlen=60)
+    error_blocks = []
+    echo = None
+    if on_actions:
+        def forward():
+            block = None
+            for line in cargo.stderr:
+                text = line.rstrip("\n")
+                stderr_tail.append(text)
+                print(line, end="", file=sys.stderr, flush=True)
+                if block is None and text.startswith("error") and len(error_blocks) < 10:
+                    block = [text]
+                    error_blocks.append(block)
+                elif block is not None:
+                    if not text.strip() or len(block) >= 40:
+                        block = None
+                    else:
+                        block.append(text)
+        echo = threading.Thread(target=forward, daemon=True)
+        echo.start()
     try:
         for line in cargo.stdout:
             try:
@@ -393,10 +427,16 @@ def stream_cargo(command, arguments, cwd, target):
                     if path.is_relative_to(target):
                         artifacts.add(str(checked_path(target, path).relative_to(target)))
         code = cargo.wait()
+        if echo:
+            echo.join()
     except BaseException:
         cargo.terminate()
         cargo.wait()
         raise
+    if on_actions and code != 0:
+        for block in error_blocks:
+            annotate(f"cargo {command}: {block[0][:120]}", "\n".join(block))
+        annotate(f"cargo {command} exited with {code}", "\n".join(stderr_tail))
     return code, artifacts
 
 

@@ -71,6 +71,14 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 - `tentanas-helper`'s executing side (root wrapper, configfs, elastic executor) is `cfg(unix)`;
   the catalog compiles everywhere because core links it on Windows too.
 - A full-edition binary needs GStreamer's `bin` on PATH (setup adds it; open a new terminal).
+- The native-libs cache defaults to `%SystemDrive%	entaflow-native`, not a profile path:
+  `link.exe` cannot open paths past MAX_PATH (260), and llama.cpp's nested vulkan-shaders-gen
+  try-compile adds 165 characters below its build directory, so under `%LOCALAPPDATA%` any
+  username longer than ~8 characters failed with LNK1104 on `intermediate.manifest`. The
+  default lives in three places that must agree: `common.sh`, `windows.ps1`, `tentaflow-core/build.rs`.
+- `setup.ps1` pins `PKG_CONFIG` to the pkg-config-lite it installs. The first `pkg-config` on
+  PATH is often another one — GitHub's Windows image carries Strawberry Perl's, which answers
+  `--modversion a b c` with the first module only — and `gstreamer-sys` would use it.
 - The firewall self-check runs on its own thread: its UAC prompt waits for a human, and the
   listeners must not.
 - **Release archives** come from `.github/workflows/build-windows.yml` (called by

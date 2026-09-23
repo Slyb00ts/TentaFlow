@@ -597,8 +597,10 @@ pub fn create_api_key(
 /// its scopes commit together, or nothing does — a scope failure rolls back the
 /// key, so callers can never observe a half-created key with a partial allowlist.
 ///
-/// `scopes` are `(resource_type, resource_id)` pairs, each written as an `allow`
-/// rule with `subject_type='api_key'`, `subject_id=<new key uid>`. The audit entry
+/// `scopes` are `(resource_type, resource_id, action)` triples, each written as an
+/// `allow` rule with `subject_type='api_key'`, `subject_id=<new key uid>`. `action`
+/// is `'*'` for every resource type whose grants carry no action and `'read'` /
+/// `'write'` for `bus_schema_registry`, where each is its own row. The audit entry
 /// is written in the same transaction so it can never be orphaned from the key.
 #[allow(clippy::too_many_arguments)]
 pub fn create_api_key_with_scopes(
@@ -609,7 +611,7 @@ pub fn create_api_key_with_scopes(
     key_type: &str,
     subject_id: Option<&str>,
     rate_limit_rps: i64,
-    scopes: &[(String, String)],
+    scopes: &[(String, String, String)],
     actor_user_id: Option<&str>,
     node_id: Option<&str>,
 ) -> Result<(i64, String)> {
@@ -652,8 +654,16 @@ pub fn create_api_key_with_scopes(
         ),
         None,
     )?;
-    for (resource_type, resource_id) in scopes {
-        resource_permissions::set_tx(&tx, resource_type, resource_id, "api_key", &uid, "allow")?;
+    for (resource_type, resource_id, action) in scopes {
+        resource_permissions::set_with_action_tx(
+            &tx,
+            resource_type,
+            resource_id,
+            "api_key",
+            &uid,
+            action,
+            "allow",
+        )?;
     }
     log_audit_tx(
         &tx,
@@ -21928,7 +21938,8 @@ pub mod resource_permissions {
         /// "read" | "write" | "admin" | "*" (migration 168). `'*'` matches
         /// every action a caller asks about — the meaning every row had
         /// before this column existed, and still the only value any
-        /// resource_type other than `topic` ever writes.
+        /// resource_type other than `topic` and `bus_schema_registry` ever
+        /// writes.
         pub action: String,
     }
 
@@ -21956,33 +21967,12 @@ pub mod resource_permissions {
         )
     }
 
-    /// Transactional upsert — same logic + capture as `set`, but joins a caller's
-    /// transaction so seeding multiple scopes (key creation) commits atomically.
-    pub(crate) fn set_tx(
-        tx: &rusqlite::Transaction<'_>,
-        resource_type: &str,
-        resource_id: &str,
-        subject_type: &str,
-        subject_id: &str,
-        access_level: &str,
-    ) -> Result<()> {
-        set_with_action_tx(
-            tx,
-            resource_type,
-            resource_id,
-            subject_type,
-            subject_id,
-            "*",
-            access_level,
-        )
-    }
-
     /// Action-aware upsert (migration 168) — one row per (resource, subject,
     /// action). `action` must be `'read'`, `'write'`, `'admin'` or `'*'`
-    /// (matches every action). Used by the bus topic ACL, which is the one
-    /// resource type that needs independent read/write/admin grants per
-    /// subject; every other resource type keeps calling plain `set` (pinned
-    /// to `action = '*'`).
+    /// (matches every action). Used by the bus topic ACL and by the
+    /// `bus_schema_registry` API-key scopes, the resource types that need
+    /// independent read/write/admin grants per subject; every other resource
+    /// type keeps calling plain `set` (pinned to `action = '*'`).
     pub fn set_with_action(
         pool: &DbPool,
         resource_type: &str,
@@ -22367,9 +22357,8 @@ pub mod resource_permissions {
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
 
         // 2. + 3. User-level override. Only "no matching row" collapses to
-        // None; any real DB error must propagate so the /v1 fail-closed
-        // wrapper (`check_v1_access`) denies instead of falling through to
-        // the group/default path. `action = '*'` restricts this to the
+        // None; any real DB error must propagate to the caller instead of
+        // falling through to the group/default path. `action = '*'` restricts this to the
         // action-blind row shape every caller of this function (model/flow/
         // alias/model_bundle/ml_studio_export ACLs, never `topic`) writes —
         // an action-scoped `topic` row would otherwise make `query_row`
@@ -22431,33 +22420,46 @@ pub mod resource_permissions {
     ///   (deny>allow); brak admin-bypass; else DENY.
     /// - `ApiKey`: wylacznie reguly `subject_type='api_key'`, `subject_id=uid`
     ///   (deny>allow); brak admin-bypass; else DENY.
+    ///
+    /// `action` selects the rows that count: the rows recorded for exactly
+    /// that action plus the action-blind `'*'` rows. Every resource type whose
+    /// scopes carry no action (model/flow/alias/model_bundle/ml_studio_export)
+    /// asks with `"*"`, which matches only the `'*'` rows those types ever
+    /// write — the same set this check read before it took an action.
+    /// `bus_schema_registry` asks with `"read"`/`"write"` and stores only
+    /// those, so a write grant never answers a read question.
     pub fn check_subject_default_deny(
         pool: &DbPool,
         resource_type: &str,
         resource_id: &str,
+        action: &str,
         subject: &crate::auth::acl::Principal,
     ) -> Result<bool> {
         use crate::auth::acl::Principal;
         match subject {
             Principal::User { user_id, role } => {
-                check_inner(pool, resource_type, resource_id, user_id, role, false)
+                if role == "admin" {
+                    return Ok(true);
+                }
+                check_action(pool, resource_type, resource_id, action, user_id, false)
             }
             Principal::Group { group_id } => {
-                check_single_subject(pool, resource_type, resource_id, "group", group_id)
+                check_single_subject(pool, resource_type, resource_id, action, "group", group_id)
             }
             Principal::ApiKey { uid } => {
-                check_single_subject(pool, resource_type, resource_id, "api_key", uid)
+                check_single_subject(pool, resource_type, resource_id, action, "api_key", uid)
             }
         }
     }
 
     /// Sprawdza wylacznie wpisy dla pojedynczego podmiotu
-    /// `(subject_type, subject_id)`. deny>allow; brak wpisu → DENY.
-    /// Bez admin-bypass, bez rozwijania grup.
+    /// `(subject_type, subject_id)` dla `action` (plus wpisy `'*'`).
+    /// deny>allow; brak wpisu → DENY. Bez admin-bypass, bez rozwijania grup.
     fn check_single_subject(
         pool: &DbPool,
         resource_type: &str,
         resource_id: &str,
+        action: &str,
         subject_type: &str,
         subject_id: &str,
     ) -> Result<bool> {
@@ -22467,11 +22469,12 @@ pub mod resource_permissions {
         let mut stmt = conn.prepare_cached(
             "SELECT access_level FROM resource_permissions
              WHERE resource_type = ?1 AND resource_id = ?2
-               AND subject_type = ?3 AND subject_id = ?4",
+               AND subject_type = ?3 AND subject_id = ?4
+               AND (action = ?5 OR action = '*')",
         )?;
         let levels: Vec<String> = stmt
             .query_map(
-                rusqlite::params![resource_type, resource_id, subject_type, subject_id],
+                rusqlite::params![resource_type, resource_id, subject_type, subject_id, action],
                 |row| row.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -22490,10 +22493,11 @@ pub mod resource_permissions {
     /// the rows recorded as `'*'` (matches every action — what every
     /// pre-168 row means, per the migration's own mapping note). No
     /// admin-role bypass: unlike `check_inner`'s Tier-1 shape, the bus topic
-    /// ACL (this function's only caller today) sits BEHIND the addon
-    /// permission matrix's own `bus.admin` check, so folding a second,
-    /// org-role-based bypass in here would let an org admin who was never
-    /// granted `bus.admin` on this instance skip that layer entirely.
+    /// ACL sits BEHIND the addon permission matrix's own `bus.admin` check,
+    /// so folding a second, org-role-based bypass in here would let an org
+    /// admin who was never granted `bus.admin` on this instance skip that
+    /// layer entirely. The /v1 `User` branch of `check_subject_default_deny`
+    /// applies its own site-admin bypass before calling this.
     pub fn check_action(
         pool: &DbPool,
         resource_type: &str,
@@ -27949,7 +27953,8 @@ mod api_key_access_v2_tests {
             role: "user".into(),
         };
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "/v1 default must be DENY"
         );
     }
@@ -27964,7 +27969,8 @@ mod api_key_access_v2_tests {
             role: "user".into(),
         };
         assert!(
-            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap()
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap()
         );
     }
 
@@ -27978,7 +27984,8 @@ mod api_key_access_v2_tests {
             role: "user".into(),
         };
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap()
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap()
         );
     }
 
@@ -27990,7 +27997,8 @@ mod api_key_access_v2_tests {
             role: "admin".into(),
         };
         assert!(
-            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "admin User must bypass even under default-deny"
         );
     }
@@ -28006,19 +28014,22 @@ mod api_key_access_v2_tests {
             role: "user".into(),
         };
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "no group rule → DENY"
         );
 
         resource_permissions::set(&db, "model", "gpt-4o", "group", "g1", "allow").unwrap();
         assert!(
-            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "group allow → allow"
         );
 
         resource_permissions::set(&db, "model", "gpt-4o", "group", "g1", "deny").unwrap();
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "group deny wins over allow"
         );
     }
@@ -28030,18 +28041,21 @@ mod api_key_access_v2_tests {
             group_id: "g1".into(),
         };
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "no rule → DENY"
         );
 
         resource_permissions::set(&db, "model", "gpt-4o", "group", "g1", "allow").unwrap();
         assert!(
-            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap()
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap()
         );
 
         resource_permissions::set(&db, "model", "gpt-4o", "group", "g1", "deny").unwrap();
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "deny wins"
         );
     }
@@ -28053,18 +28067,21 @@ mod api_key_access_v2_tests {
             uid: "key-uid-1".into(),
         };
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "no rule → DENY"
         );
 
         resource_permissions::set(&db, "model", "gpt-4o", "api_key", "key-uid-1", "allow").unwrap();
         assert!(
-            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap()
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap()
         );
 
         resource_permissions::set(&db, "model", "gpt-4o", "api_key", "key-uid-1", "deny").unwrap();
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "deny wins"
         );
     }
@@ -28079,7 +28096,8 @@ mod api_key_access_v2_tests {
             uid: "key-uid-1".into(),
         };
         assert!(
-            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", "*", &p)
+                .unwrap(),
             "api_key must never get admin-bypass"
         );
     }
@@ -28100,7 +28118,7 @@ mod api_key_access_v2_tests {
             },
         ] {
             assert!(
-                !crate::auth::acl::check_v1_access(&db, "model", "gpt-4o", &p),
+                !crate::auth::acl::check_v1_access(&db, "model", "gpt-4o", "*", &p),
                 "no rules → deny for every principal variant"
             );
         }
@@ -28451,8 +28469,8 @@ mod api_key_access_v2_tests {
     fn create_with_scopes_is_atomic_seeds_all_scopes_and_audits() {
         let db = fresh_db();
         let scopes = vec![
-            ("model".to_string(), "gpt-4o".to_string()),
-            ("flow".to_string(), "flow-1".to_string()),
+            ("model".to_string(), "gpt-4o".to_string(), "*".to_string()),
+            ("flow".to_string(), "flow-1".to_string(), "*".to_string()),
         ];
         let (_, uid) = create_api_key_with_scopes(
             &db,
@@ -28501,7 +28519,7 @@ mod api_key_access_v2_tests {
             "general",
             None,
             60,
-            &[("model".to_string(), "m-a".to_string())],
+            &[("model".to_string(), "m-a".to_string(), "*".to_string())],
             None,
             None,
         )
@@ -28520,8 +28538,8 @@ mod api_key_access_v2_tests {
             None,
             60,
             &[
-                ("model".to_string(), "m-b".to_string()),
-                ("flow".to_string(), "f-b".to_string()),
+                ("model".to_string(), "m-b".to_string(), "*".to_string()),
+                ("flow".to_string(), "f-b".to_string(), "*".to_string()),
             ],
             None,
             None,
@@ -30954,6 +30972,35 @@ pub fn bus_group_list(pool: &DbPool, org_id: &str) -> Result<Vec<DbBusGroup>> {
     ))?;
     let rows = stmt
         .query_map(rusqlite::params![org_id], map_bus_group_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every org that owns at least one topic of `instance_id` — the system-side
+/// enumeration for work that has no request org (metrics exporter, lag
+/// history sampler).
+pub fn bus_topic_org_ids(pool: &DbPool, instance_id: &str) -> Result<Vec<String>> {
+    let conn = pool.read()?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT org_id FROM bus_topics WHERE instance_id = ?1 ORDER BY org_id")?;
+    let rows = stmt
+        .query_map(rusqlite::params![instance_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every `bus_groups` row of the instance database, all orgs — the
+/// system-side enumeration the metrics exporter and the lag-history sampler
+/// walk (no request context, so no org to scope to).
+pub fn bus_group_list_all(pool: &DbPool) -> Result<Vec<DbBusGroup>> {
+    let conn = pool.read()?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_GROUP_COLUMNS} FROM bus_groups ORDER BY org_id, group_id, topic"
+    ))?;
+    let rows = stmt
+        .query_map([], map_bus_group_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }

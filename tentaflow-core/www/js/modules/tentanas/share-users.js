@@ -65,7 +65,7 @@ export function openShareUsersDialog(screen, { users = [], onChange = null } = {
     <tf-table id="nas-su-table" empty-message="${escapeAttr(T('share_users.empty'))}">
       <tf-column key="name" label="${escapeAttr(T('share_users.col_name'))}" renderer="html" fill></tf-column>
       <tf-column key="shares" label="${escapeAttr(T('share_users.col_shares'))}" renderer="html"></tf-column>
-      <tf-column key="created" label="${escapeAttr(T('share_users.col_created'))}" renderer="text" nowrap hide-below="600"></tf-column>
+      <tf-column key="created" label="${escapeAttr(T('share_users.col_created'))}" renderer="text" nowrap hide-below="640"></tf-column>
     </tf-table>` : `
     <tf-empty-state icon="users" title="${escapeAttr(T('share_users.empty'))}" message="${escapeAttr(T('share_users.empty_msg'))}"></tf-empty-state>`}`;
 

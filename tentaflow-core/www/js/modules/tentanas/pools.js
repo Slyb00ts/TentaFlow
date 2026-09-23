@@ -21,7 +21,7 @@ import '/js/components/tf-menu.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-checkbox.js';
-import { elasticCardSkeletonHtml, paintElasticCard, memberName } from '/js/modules/tentanas/elastic-detail.js';
+import { elasticCardSkeletonHtml, paintElasticCard, memberName, elasticMaintenanceBlocker } from '/js/modules/tentanas/elastic-detail.js';
 import { nodeT } from '/js/modules/tentanas/node-phrase.js';
 
 export async function drawPools(screen, body) {
@@ -52,7 +52,8 @@ export async function drawPools(screen, body) {
       </div>
     </div>`;
 
-  const state = { pools: [], arrays: [], freeDisks: [], diskKinds: new Map(), errors: {}, completed: new Set(), epoch: 0, isCurrent };
+  // `syncBusy`: arrays whose card "Sync teraz" request is in flight.
+  const state = { pools: [], arrays: [], freeDisks: [], diskKinds: new Map(), errors: {}, completed: new Set(), epoch: 0, isCurrent, syncBusy: new Set() };
   state.onCreated = ({ name, outcome }) => {
     if (!isCurrent()) return;
     if (outcome === 'job') screen.openArray(name);
@@ -83,7 +84,11 @@ export async function drawPools(screen, body) {
   list.addEventListener('click', async (e) => {
     if (!isCurrent()) return;
     const elastic = e.target.closest('.pool-card[data-array]');
-    if (elastic) { screen.openArray(elastic.dataset.array); return; }
+    if (elastic) {
+      if (e.target.closest('[data-act="array-sync"]')) { e.stopPropagation(); await elasticSyncAction(screen, state, elastic.dataset.array, { repaint: () => renderPools(screen, body, state), refresh }); return; }
+      screen.openArray(elastic.dataset.array);
+      return;
+    }
     const card = e.target.closest('.pool-card[data-pool]');
     if (!card) return;
     const pool = state.pools.find((p) => p.name === card.dataset.pool);
@@ -195,7 +200,7 @@ function renderPools(screen, body, state) {
     // given — `patchKeyedList` places survivors and newcomers in item order,
     // with the loading line, if any, following both.
     state.pools.forEach((p, i) => paintPoolCard(list.children[i], p));
-    state.arrays.forEach((a, i) => paintElasticCard(list.children[state.pools.length + i], a));
+    state.arrays.forEach((a, i) => paintElasticCard(list.children[state.pools.length + i], a, { admin: screen.isAdmin, syncBusy: state.syncBusy.has(a.name) }));
   }
 
   const spares = spareDisks(state.pools);
@@ -420,6 +425,27 @@ function paintPoolCard(card, p) {
 
 // Starting a scrub answers with a job (it runs for hours); pause/resume/stop
 // answer with the refreshed pool. Both are admin actions.
+// The n05 card's "Sync teraz" (mockup n05:267; plan §3.2 lists a manual
+// SnapRAID sync next to the scheduled one). Moving files off the cache is
+// automatic and has no button here; a sync is the explicit way to close the
+// protection window for data written straight to the data disks before the
+// nightly sync does. Gated by the SAME rule as the detail pane's button
+// (`elasticMaintenanceBlocker`), and locked while its own request is in flight.
+async function elasticSyncAction(screen, state, name, { repaint, refresh }) {
+  const array = () => state.arrays.find((a) => a.name === name);
+  const allowed = () => state.isCurrent() && !state.syncBusy.has(name) && array() && !elasticMaintenanceBlocker(array(), screen.isAdmin);
+  if (!allowed()) return;
+  state.syncBusy.add(name);
+  repaint();
+  try {
+    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArraySyncRequest', { name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.sync_now'));
+    if (state.isCurrent()) followResponse(screen, res, null, T('elastic.maintenance_accepted'));
+  } finally {
+    state.syncBusy.delete(name);
+    if (state.isCurrent()) { repaint(); await refresh(); }
+  }
+}
+
 export async function scrubAction(screen, name, action, onDone) {
   if (!screen.isAdmin) { toast(T('elevation.admin_only'), 'warning'); return; }
   const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolScrubRequest', { name, action, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.scrub_title', { name }));

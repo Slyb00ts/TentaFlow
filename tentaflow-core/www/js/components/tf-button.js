@@ -3,6 +3,8 @@
 // Opis: Komponent <tf-button> — renderuje standardowy button z klasami .tf-btn.
 //       Light DOM (bez Shadow DOM) zeby controls.css obslugiwal style.
 //       Atrybuty: variant, tone, size, icon, disabled, full-width.
+//       `aria-label` is copied onto the inner <button>: the host is not
+//       focusable, so an icon-only button needs its name on the real control.
 // Przyklad: <tf-button variant="primary" icon="plus">Dodaj</tf-button>
 // =============================================================================
 
@@ -96,6 +98,8 @@ class TfButton extends HTMLElement {
     this.innerHTML = '';
     const btn = document.createElement('button');
     btn.className = 'tf-btn';
+    const ariaLabel = this.getAttribute('aria-label');
+    if (ariaLabel) btn.setAttribute('aria-label', ariaLabel);
     btn.innerHTML = this._renderContent(innerHtml);
     btn.addEventListener('click', (e) => {
       if (this.hasAttribute('disabled')) {

@@ -17,12 +17,25 @@ use tentaflow_core::dispatch::{dispatch, HandlerContext};
 use tentaflow_core::services::rbac::OrgContext;
 use tentaflow_protocol::{ApiKeyCreateRequest, MessageBody, ResourceRef, SessionAuth};
 
+/// Admin session backed by a real, active account: the dispatcher refuses a
+/// session whose account does not exist ("account unavailable") before any
+/// handler runs, which would make every assertion below vacuous.
 fn admin_ctx(state: Arc<AppState>) -> HandlerContext {
-    let mut user_id_bytes = [0u8; 16];
-    user_id_bytes[0] = 0xAB;
+    let id =
+        repository::create_user_account(&state.db, "scope-admin", "not-a-login-hash", "Admin", "")
+            .expect("admin account");
+    state
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "UPDATE user_accounts SET must_change_password = 0, is_active = 1 WHERE id = ?1",
+            [&id],
+        )
+        .expect("activate admin account");
     HandlerContext {
         session: SessionAuth::UserSession {
-            user_id: user_id_bytes,
+            user_id: *uuid::Uuid::parse_str(&id).unwrap().as_bytes(),
             role: Some("admin".to_string()),
         },
         correlation_id: 1,
@@ -40,9 +53,21 @@ fn admin_ctx(state: Arc<AppState>) -> HandlerContext {
 }
 
 fn non_admin_ctx(state: Arc<AppState>) -> HandlerContext {
+    let id =
+        repository::create_user_account(&state.db, "scope-power", "not-a-login-hash", "Power", "")
+            .expect("power-user account");
+    state
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "UPDATE user_accounts SET must_change_password = 0, is_active = 1 WHERE id = ?1",
+            [&id],
+        )
+        .expect("activate power-user account");
     HandlerContext {
         session: SessionAuth::UserSession {
-            user_id: [0u8; 16],
+            user_id: *uuid::Uuid::parse_str(&id).unwrap().as_bytes(),
             role: Some("power_user".to_string()),
         },
         correlation_id: 2,
@@ -84,10 +109,12 @@ async fn create_general_persists_scope_resources() {
             ResourceRef {
                 resource_type: "model".into(),
                 resource_id: "gpt-4o".into(),
+                action: None,
             },
             ResourceRef {
                 resource_type: "flow".into(),
                 resource_id: "flow-123".into(),
+                action: None,
             },
         ],
     )
@@ -130,6 +157,7 @@ async fn scope_set_and_clear_round_trip() {
             resource_type: "alias".into(),
             resource_id: "fast".into(),
             access_level: "allow".into(),
+            action: None,
         },
         &ctx,
     )
@@ -146,6 +174,7 @@ async fn scope_set_and_clear_round_trip() {
             key_uid: uid.clone(),
             resource_type: "alias".into(),
             resource_id: "fast".into(),
+            action: None,
         },
         &ctx,
     )
@@ -211,6 +240,7 @@ async fn create_and_scope_are_audited() {
             resource_type: "model".into(),
             resource_id: "gpt-4o".into(),
             access_level: "allow".into(),
+            action: None,
         },
         &ctx,
     )
@@ -260,6 +290,7 @@ async fn scope_set_rejects_invalid_resource() {
             resource_type: "garbage".into(),
             resource_id: "x".into(),
             access_level: "allow".into(),
+            action: None,
         },
         &ctx,
     )
@@ -274,6 +305,7 @@ async fn scope_set_rejects_invalid_resource() {
             resource_type: "model".into(),
             resource_id: "".into(),
             access_level: "allow".into(),
+            action: None,
         },
         &ctx,
     )
@@ -300,6 +332,7 @@ async fn scope_clear_rejects_invalid_resource() {
             key_uid: uid.clone(),
             resource_type: "garbage".into(),
             resource_id: "x".into(),
+            action: None,
         },
         &ctx,
     )
@@ -312,6 +345,7 @@ async fn scope_clear_rejects_invalid_resource() {
             key_uid: uid.clone(),
             resource_type: "model".into(),
             resource_id: "".into(),
+            action: None,
         },
         &ctx,
     )
@@ -335,11 +369,15 @@ async fn create_with_invalid_scope_creates_no_key() {
         scope_resources: vec![ResourceRef {
             resource_type: "garbage".into(),
             resource_id: "x".into(),
+            action: None,
         }],
     });
     let (resp, is_err) = dispatch(&req, &ctx).await;
     assert!(is_err, "create with a bad scope must fail");
-    assert!(matches!(resp, MessageBody::Error(_)));
+    assert!(
+        matches!(&resp, MessageBody::Error(e) if e.code == tentaflow_protocol::ProtocolErrorCode::BadRequest),
+        "refused by scope validation, not by an earlier gate: {resp:?}"
+    );
     assert_eq!(
         repository::list_api_keys(&state.db).unwrap().len(),
         before,
@@ -359,7 +397,10 @@ async fn non_admin_is_policy_denied_on_create() {
     });
     let (resp, is_err) = dispatch(&req, &ctx).await;
     assert!(is_err);
-    assert!(matches!(resp, MessageBody::Error(_)));
+    assert!(
+        matches!(&resp, MessageBody::Error(e) if e.code == tentaflow_protocol::ProtocolErrorCode::PolicyDenied),
+        "refused by the Admin policy: {resp:?}"
+    );
 }
 
 #[tokio::test]
@@ -374,5 +415,8 @@ async fn user_key_requires_existing_active_subject() {
     });
     let (resp, is_err) = dispatch(&req, &ctx).await;
     assert!(is_err, "user key with non-existent subject must fail");
-    assert!(matches!(resp, MessageBody::Error(_)));
+    assert!(
+        matches!(&resp, MessageBody::Error(e) if e.code == tentaflow_protocol::ProtocolErrorCode::NotFound),
+        "refused because the subject does not exist: {resp:?}"
+    );
 }

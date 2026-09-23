@@ -134,6 +134,14 @@ pub fn next_run_utc(schedule: &NasSchedule, after: DateTime<Local>) -> Option<St
     })
 }
 
+/// A first slot that could not be written is tried again on the next tick
+/// (the row stays unarmed); it is only worth a line in the log.
+fn arm_logged(result: anyhow::Result<bool>, kind: &str) {
+    if let Err(e) = result {
+        tracing::warn!("tentanas scheduler: first {kind} slot not recorded: {e}");
+    }
+}
+
 fn is_due(next_run_at: Option<&str>, now: DateTime<Local>) -> bool {
     let Some(next) = next_run_at else {
         // A schedule with no computed next run has one computed on this tick;
@@ -303,7 +311,12 @@ async fn run_due_pool_tasks(db: &DbPool, task: store::PoolTask, now: DateTime<Lo
         let next = next_run_utc(&row.schedule, now);
         if !is_due(row.next_run_at.as_deref(), now) {
             if row.next_run_at.is_none() {
-                let _ = store::set_pool_schedule(db, task, &row.pool, true, &row.schedule, next.as_deref());
+                // Arms the row as it is NOW, never writes this copy back: an
+                // admin's change since the read wins (`arm_schedule_row`).
+                arm_logged(
+                    store::arm_pool_schedule(db, task, &row.pool, |s| next_run_utc(s, now)),
+                    task.kind(),
+                );
             }
             continue;
         }
@@ -363,13 +376,12 @@ async fn run_due_elastic_tasks(
             let next = next_run_utc(&row.schedule, now);
             if !is_due(row.next_run_at.as_deref(), now) {
                 if row.next_run_at.is_none() {
-                    let _ = store::set_elastic_schedule(
-                        db,
-                        &row.array_id,
-                        task,
-                        true,
-                        &row.schedule,
-                        next.as_deref(),
+                    // Arms the row as it is NOW, never writes this copy back:
+                    // an admin who disabled the new default scrub since the
+                    // read keeps it disabled (`arm_schedule_row`).
+                    arm_logged(
+                        store::arm_elastic_schedule(db, &row.array_id, task, |s| next_run_utc(s, now)),
+                        task.kind(),
                     );
                 }
                 continue;
@@ -665,7 +677,13 @@ async fn run_due_snapshots(db: &DbPool, now: DateTime<Local>) {
         let next = next_run_utc(&schedule.schedule, now);
         if !is_due(schedule.next_run_at.as_deref(), now) {
             if schedule.next_run_at.is_none() {
-                let _ = store::upsert_snapshot_schedule(db, &schedule, next.as_deref());
+                // Not the upsert: writing this copy back re-enabled a schedule
+                // switched off since the read, and re-inserted a deleted one
+                // (`arm_schedule_row`).
+                arm_logged(
+                    store::arm_snapshot_schedule(db, &schedule.schedule_id, |s| next_run_utc(s, now)),
+                    "snapshot",
+                );
             }
             continue;
         }
@@ -1332,6 +1350,180 @@ mod tests {
             started.last_result.starts_with("started job"),
             "one array's refusal must not stop the next one: {}",
             started.last_result
+        );
+    }
+    /// Owner decision 2026-09-22, end to end: the default scrub a new array
+    /// is created with is armed on the first tick for the 15th at 04:00, and
+    /// when that slot passes the scheduler starts a real Elastic scrub job —
+    /// an `elastic_scrub` job, a `scrub` operation, and the helper command
+    /// `ElasticScrub` (which the helper runs as `snapraid -p full scrub`).
+    #[tokio::test]
+    async fn the_scheduler_spawns_the_default_scrub() {
+        let p = db();
+        let spec = settled_array(&p, "media");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+
+        let now = at(2026, 9, 1, 14, 45);
+        run_due_elastic_tasks(&p, &arrays, now).await;
+        let armed = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub)
+            .expect("read")
+            .expect("the default scrub row exists without anyone arming it");
+        assert!(armed.enabled);
+        assert_eq!(armed.schedule, store::default_elastic_scrub_schedule());
+        assert!(armed.last_run_at.is_none(), "armed, not fired: nothing is retroactive");
+        let slot = DateTime::parse_from_rfc3339(armed.next_run_at.as_deref().expect("next"))
+            .expect("parse")
+            .with_timezone(&Local);
+        assert_eq!(slot, at(2026, 9, 15, 4, 0));
+        let scrubs = |p: &DbPool| {
+            store::list_jobs(p, 100)
+                .expect("jobs")
+                .into_iter()
+                .filter(|job| job.kind == "elastic_scrub")
+                .collect::<Vec<_>>()
+        };
+        assert!(scrubs(&p).is_empty());
+
+        run_due_elastic_tasks(&p, &arrays, slot + chrono::Duration::minutes(1)).await;
+        let fired = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub)
+            .expect("read")
+            .expect("row");
+        assert!(fired.last_result.starts_with("started job"), "{}", fired.last_result);
+        let jobs = scrubs(&p);
+        assert_eq!(jobs.len(), 1, "one scheduled scrub");
+        assert_eq!(jobs[0].subject, "media");
+        assert_eq!(jobs[0].started_by, STARTED_BY);
+        // The operation the job reserved carries the helper command it runs.
+        let (kind, request): (String, String) = p
+            .read()
+            .expect("read")
+            .query_row(
+                "SELECT kind, request_json FROM nas_elastic_operations WHERE job_id=?1",
+                [&jobs[0].job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("operation");
+        assert_eq!(kind, "scrub");
+        match serde_json::from_str::<tentanas_helper::HelperCommand>(&request).expect("request") {
+            tentanas_helper::HelperCommand::ElasticScrub { array_id, .. } => {
+                assert_eq!(array_id, spec.array_id)
+            }
+            other => panic!("{other:?}"),
+        }
+        // Re-armed a month forward, not left to re-fire every tick.
+        let next = DateTime::parse_from_rfc3339(fired.next_run_at.as_deref().expect("next"))
+            .expect("parse")
+            .with_timezone(&Local);
+        assert_eq!(next, at(2026, 10, 15, 4, 0));
+    }
+
+    /// The first tick arms a row it read a moment earlier. An admin who
+    /// switched the schedule off, changed its cadence or deleted it in that
+    /// moment keeps the change: the tick sets `next_run_at` on the row as it
+    /// is NOW — computed from the cadence it holds now — or not at all. It
+    /// used to write its stale copy back, re-enabling the new default scrub
+    /// and re-inserting a deleted snapshot schedule.
+    #[tokio::test]
+    async fn the_first_tick_never_undoes_an_admins_change_to_an_unarmed_schedule() {
+        let p = db();
+        let spec = settled_array(&p, "media");
+        let scrub = store::ElasticTask::Scrub;
+        let default = store::default_elastic_scrub_schedule();
+        store::set_elastic_schedule(&p, &spec.array_id, scrub, true, &default, None).expect("unarmed");
+        let now = at(2026, 9, 23, 12, 0);
+
+        // The tick's read sees an enabled, unarmed row…
+        let seen = store::list_elastic_schedules(&p, scrub).expect("list");
+        assert!(seen
+            .iter()
+            .any(|r| r.array_id == spec.array_id && r.enabled && r.next_run_at.is_none()));
+        // …the admin switches it off…
+        store::set_elastic_schedule(&p, &spec.array_id, scrub, false, &default, None).expect("disable");
+        // …and the tick's write comes after.
+        let armed = store::arm_elastic_schedule(&p, &spec.array_id, scrub, |s| next_run_utc(s, now));
+        assert!(!armed.expect("arm"));
+        let row = store::elastic_schedule(&p, &spec.array_id, scrub).expect("read").expect("row");
+        assert!(!row.enabled, "the admin's disable stands");
+        assert_eq!(row.next_run_at, None);
+
+        // A cadence changed in between: the slot follows the NEW cadence.
+        let weekly = NasSchedule {
+            every: "weekly".to_string(),
+            hour: 2,
+            minute: 30,
+            weekday: 3,
+            day: 1,
+        };
+        store::set_elastic_schedule(&p, &spec.array_id, scrub, true, &weekly, None).expect("change");
+        let armed = store::arm_elastic_schedule(&p, &spec.array_id, scrub, |s| next_run_utc(s, now));
+        assert!(armed.expect("arm"));
+        let row = store::elastic_schedule(&p, &spec.array_id, scrub).expect("read").expect("row");
+        assert!(row.enabled);
+        assert_eq!(row.schedule, weekly);
+        assert_eq!(row.next_run_at, next_run_utc(&weekly, now));
+        // An armed row is not armed again.
+        let again = store::arm_elastic_schedule(&p, &spec.array_id, scrub, |s| next_run_utc(s, now));
+        assert!(!again.expect("arm"));
+
+        // The pool cadences share the rule.
+        store::set_pool_schedule(&p, store::PoolTask::Scrub, "tank", true, &weekly, None).expect("pool");
+        store::set_pool_schedule(&p, store::PoolTask::Scrub, "tank", false, &weekly, None).expect("off");
+        let armed = store::arm_pool_schedule(&p, store::PoolTask::Scrub, "tank", |s| next_run_utc(s, now));
+        assert!(!armed.expect("arm"));
+        let row = store::pool_schedule(&p, store::PoolTask::Scrub, "tank").expect("read").expect("row");
+        assert!(!row.enabled);
+        assert_eq!(row.next_run_at, None);
+
+        // A snapshot schedule deleted in between is not brought back.
+        let snap = NasSnapshotSchedule {
+            schedule_id: "snap-1".to_string(),
+            dataset: "tank/data".to_string(),
+            enabled: true,
+            schedule: weekly.clone(),
+            keep_daily: 7,
+            ..Default::default()
+        };
+        store::upsert_snapshot_schedule(&p, &snap, None).expect("snapshot");
+        assert!(store::delete_snapshot_schedule(&p, "snap-1").expect("delete"));
+        let armed = store::arm_snapshot_schedule(&p, "snap-1", |s| next_run_utc(s, now));
+        assert!(!armed.expect("arm"));
+        assert!(store::list_snapshot_schedules(&p).expect("list").is_empty());
+    }
+
+    /// The default scrub obeys the same admission as a manual one: on an array
+    /// that does not admit a parity run (here: its create never finished) the
+    /// slot records the refusal and starts nothing.
+    #[tokio::test]
+    async fn the_default_scrub_respects_parity_admission() {
+        let p = db();
+        let spec = crate::tentanas::elastic::tests::create_spec("media");
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_create".to_string(),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_by: "test".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&p, &job, Some(&crate::tentanas::jobs::ElasticJobIntent::Create(spec.clone())))
+            .expect("create job");
+        let armed_at = Some("2026-09-01T00:00:00Z");
+        let default = store::default_elastic_scrub_schedule();
+        store::set_elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub, true, &default, armed_at)
+            .expect("due");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        run_due_elastic_tasks(&p, &arrays, at(2026, 9, 2, 10, 0)).await;
+        let row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub)
+            .expect("read")
+            .expect("row");
+        assert!(row.last_result.starts_with("failed to start"), "{}", row.last_result);
+        assert!(
+            store::list_jobs(&p, 100)
+                .expect("jobs")
+                .iter()
+                .all(|job| job.kind != "elastic_scrub"),
+            "an array that is still being created is not scrubbed"
         );
     }
     // ----- the automatic mover ------------------------------------------------

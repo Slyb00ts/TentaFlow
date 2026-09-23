@@ -94,6 +94,23 @@ impl DlqReason {
 /// that redaction before it reaches here.
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 
+/// When a record entered its DLQ: `dlq.last_failed_at_ms` for a consume-side
+/// failure (`build_dlq_record`), `dlq.rejected_at_ms` for a publish-side
+/// schema rejection (`build_publish_violation_record`). A DLQ record keeps
+/// its ORIGINAL `timestamp_ms`, which can be hours older than the moment it
+/// failed — the UI's "N w ostatniej godzinie" / "ostatnia …" are about the
+/// failure, so they read this. `fallback` (the record timestamp) only
+/// applies to a record written before either header existed.
+pub fn arrival_ms(headers: &[(Bytes, Bytes)], fallback: i64) -> i64 {
+    headers
+        .iter()
+        .find(|(k, _)| {
+            k.as_ref() == b"dlq.last_failed_at_ms" || k.as_ref() == b"dlq.rejected_at_ms"
+        })
+        .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse::<i64>().ok())
+        .unwrap_or(fallback)
+}
+
 /// Truncates `s` to at most `max_bytes` BYTES, backing off to the nearest
 /// preceding UTF-8 character boundary so the result is always valid `str`
 /// (never splits a multi-byte codepoint in half).

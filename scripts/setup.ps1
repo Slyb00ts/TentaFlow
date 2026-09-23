@@ -209,6 +209,23 @@ function Find-ProtocExe {
     return $null
 }
 
+# pkg-config-lite is a zip package: winget unpacks it under WinGet\Packages and
+# links nothing. The pkg-config first on PATH is often a different one - the
+# GitHub runner image carries Strawberry Perl's, which answers --modversion for
+# the first module only - so builds are pointed at this one through PKG_CONFIG.
+function Find-PkgConfigExe {
+    foreach ($packages in @((Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'),
+                            (Join-Path $env:ProgramFiles 'WinGet\Packages'))) {
+        if (-not (Test-Path $packages)) { continue }
+        $found = Get-ChildItem $packages -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'bloodrock.pkg-config-lite*' } |
+            ForEach-Object { Get-ChildItem $_.FullName -Recurse -Filter 'pkg-config.exe' -ErrorAction SilentlyContinue } |
+            Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+    return $null
+}
+
 function Install-BaseTools {
     Log-Section 'Base tools'
     Install-WingetPackage -Id 'Git.Git' -Label 'Git for Windows'
@@ -231,6 +248,12 @@ function Install-BaseTools {
     if (-not $protoc) { throw 'protoc.exe not found after installing Google.Protobuf.' }
     Set-PersistentEnv -Name 'PROTOC' -Value $protoc
     Add-PersistentPath -Path (Split-Path -Parent $protoc)
+
+    $pkgConfig = Find-PkgConfigExe
+    if (-not $pkgConfig) { throw 'pkg-config.exe (pkg-config-lite) not found after installation.' }
+    # The pkg-config crate behind gstreamer-sys honours PKG_CONFIG before PATH.
+    Set-PersistentEnv -Name 'PKG_CONFIG' -Value $pkgConfig
+    Add-PersistentPath -Path (Split-Path -Parent $pkgConfig)
 }
 
 function Install-Python {
@@ -469,7 +492,7 @@ function Verify-Installation {
     Log-Section 'Verification'
     Update-SessionEnvironment
     $ok = $true
-    foreach ($tool in @('git', 'cmake', 'ninja', 'clang', 'protoc', 'pkg-config', 'cargo', 'rustc', 'wasm-bindgen', 'dotnet', 'ffmpeg')) {
+    foreach ($tool in @('git', 'cmake', 'ninja', 'clang', 'protoc', 'cargo', 'rustc', 'wasm-bindgen', 'dotnet', 'ffmpeg')) {
         if (Test-Command $tool) {
             Log-Ok "$tool"
         } else {
@@ -489,7 +512,13 @@ function Verify-Installation {
     # the pipeline after the first of three lines and kill pkg-config, leaving
     # a non-zero $LASTEXITCODE whenever the process had not exited yet.
     $gstModules = @('gstreamer-1.0', 'gstreamer-app-1.0', 'gstreamer-video-1.0')
-    $gstVersions = @(Invoke-NativeCapture { pkg-config --modversion @gstModules })
+    if ($env:PKG_CONFIG -and (Test-Path $env:PKG_CONFIG)) {
+        Log-Ok "PKG_CONFIG: $env:PKG_CONFIG"
+    } else {
+        Log-Error 'PKG_CONFIG does not point at pkg-config.exe'
+        $ok = $false
+    }
+    $gstVersions = @(Invoke-NativeCapture { & $env:PKG_CONFIG --modversion @gstModules })
     $gstCode = $LASTEXITCODE
     $gstWrong = @($gstVersions | Where-Object { $_.Trim() -ne $env:GSTREAMER_VERSION })
     if ($gstCode -eq 0 -and $gstVersions.Count -eq $gstModules.Count -and $gstWrong.Count -eq 0) {

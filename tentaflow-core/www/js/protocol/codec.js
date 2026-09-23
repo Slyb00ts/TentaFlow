@@ -141,12 +141,13 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ApiKeyCreateRequest { name, keyType, subjectId?, scopeResources: {resourceType,resourceId}[] } */
+  /** MessageBody::ApiKeyCreateRequest { name, keyType, subjectId?, scopeResources: {resourceType,resourceId,action?}[] } */
   apiKeyCreateRequest(correlationId, { name, keyType = 'user', subjectId = null, scopeResources = [] }, sequence = 1) {
     assertReady();
     const types = scopeResources.map((r) => r.resourceType);
     const ids = scopeResources.map((r) => r.resourceId);
-    const body = _wasm.encodeApiKeyCreateRequest(name, keyType, subjectId ?? undefined, types, ids);
+    const actions = scopeResources.map((r) => r.action ?? '');
+    const body = _wasm.encodeApiKeyCreateRequest(name, keyType, subjectId ?? undefined, types, ids, actions);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -157,17 +158,17 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ApiKeyScopeSetRequest { keyUid, resourceType, resourceId, accessLevel } */
-  apiKeyScopeSetRequest(correlationId, { keyUid, resourceType, resourceId, accessLevel }, sequence = 1) {
+  /** MessageBody::ApiKeyScopeSetRequest { keyUid, resourceType, resourceId, accessLevel, action? } */
+  apiKeyScopeSetRequest(correlationId, { keyUid, resourceType, resourceId, accessLevel, action = null }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyScopeSetRequest(keyUid, resourceType, resourceId, accessLevel);
+    const body = _wasm.encodeApiKeyScopeSetRequest(keyUid, resourceType, resourceId, accessLevel, action ?? undefined);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ApiKeyScopeClearRequest { keyUid, resourceType, resourceId } */
-  apiKeyScopeClearRequest(correlationId, { keyUid, resourceType, resourceId }, sequence = 1) {
+  /** MessageBody::ApiKeyScopeClearRequest { keyUid, resourceType, resourceId, action? } */
+  apiKeyScopeClearRequest(correlationId, { keyUid, resourceType, resourceId, action = null }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyScopeClearRequest(keyUid, resourceType, resourceId);
+    const body = _wasm.encodeApiKeyScopeClearRequest(keyUid, resourceType, resourceId, action ?? undefined);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -3124,14 +3125,18 @@ export const encode = {
 
   /**
    * BusPayload::DlqListRequest (M05; uses `BusService::peek`, follow-up toru P task 1).
-   * payload: { sourceTopic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition? }.
+   * payload: { sourceTopic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition?,
+   * newestFirst? }.
    * `partition`: see `busMessagesBrowseRequest`'s doc — same semantics, applied to the
-   * derived `__dlq.<sourceTopic>` topic.
+   * derived `__dlq.<sourceTopic>` topic. `newestFirst: true` pages backwards from the newest
+   * record: each `fromOffsets` entry is then an EXCLUSIVE upper bound and each partition's
+   * `nextOffset` in the response is the bound of the next, older page.
    */
   busDlqListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const fromOffset = payload.fromOffset ?? payload.from_offset;
     const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
+    const newestFirst = payload.newestFirst ?? payload.newest_first;
     const body = _wasm.encodeBusDlqListRequest(
       encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
@@ -3139,6 +3144,7 @@ export const encode = {
       Number(payload.limit ?? 100),
       fromOffsets == null ? undefined : JSON.stringify(fromOffsets),
       payload.partition == null ? undefined : Number(payload.partition),
+      newestFirst == null ? undefined : Boolean(newestFirst),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -3213,6 +3219,22 @@ export const encode = {
   busStatsSnapshotRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusStatsSnapshotRequest(encode._busInstanceId(payload));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::LagHistoryRequest — persisted per-minute lag / DLQ-depth history of this
+   * node (24 h). payload: { instanceId, topic?, group?, sinceMs? } — every filter optional.
+   */
+  busLagHistoryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const sinceMs = payload.sinceMs ?? payload.since_ms;
+    const body = _wasm.encodeBusLagHistoryRequest(
+      encode._busInstanceId(payload),
+      payload.topic == null ? undefined : String(payload.topic),
+      payload.group == null ? undefined : String(payload.group),
+      sinceMs == null ? undefined : BigInt(sinceMs),
+    );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -5800,6 +5822,12 @@ export const encode = {
   iamListGroupsRequest(correlationId, _payload, sequence = 1) {
     assertReady();
     const body = _wasm.encodeIamListGroupsRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  /** MessageBody::IamBody(ReqListOrganizations) — every organisation on this node (admin). */
+  iamListOrganizationsRequest(correlationId, _payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamListOrganizationsRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamCreateGroupRequest(correlationId, p, sequence = 1) {

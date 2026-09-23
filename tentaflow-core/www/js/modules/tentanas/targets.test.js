@@ -712,3 +712,23 @@ test('the allowlist parser drops blanks and duplicates, and the group states are
   assert.equal(groupStateLabel('zzz'), 'zzz');
   assert.equal(groupStateLabel(''), '—');
 });
+
+// tf-table honours only its own breakpoint scale (480 640 720 900 1024 1180
+// 1280); `hide-below="1000"` on the portal column was silently dropped.
+test('every hide-below on the targets table is a breakpoint tf-table honours', async () => {
+  const screen = fakeScreen({});
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  try {
+    mountTargetsSection(screen, host, {}).set(listAnswer([iscsiTarget()]));
+    await flush();
+    const table = host.querySelector('#nas-tg-table');
+    const wanted = [...table.querySelectorAll('tf-column[hide-below]')].map((c) => c.getAttribute('hide-below'));
+    assert.ok(wanted.includes('1024'), 'the portal column hides below 1024');
+    const got = [...table.shadowRoot.querySelectorAll('thead th')].flatMap((th) => [...th.classList]
+      .filter((c) => c.startsWith('tf-table__col--hide-below-')).map((c) => c.slice('tf-table__col--hide-below-'.length)));
+    assert.deepEqual(got, wanted);
+  } finally {
+    screen.dispose();
+  }
+});

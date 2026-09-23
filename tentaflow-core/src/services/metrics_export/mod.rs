@@ -457,18 +457,7 @@ fn accumulate_consumer_lag(
 /// replication-derived bus metric aggregates across every org THIS
 /// INSTANCE knows about (see `collect_bus_metrics`'s doc).
 fn bus_org_ids(db: &DbPool, instance_id: &str) -> Vec<String> {
-    let Ok(conn) = db.read() else {
-        return Vec::new();
-    };
-    let Ok(mut stmt) =
-        conn.prepare("SELECT DISTINCT org_id FROM bus_topics WHERE instance_id = ?1")
-    else {
-        return Vec::new();
-    };
-    let Ok(mapped) = stmt.query_map([instance_id], |row| row.get::<_, String>(0)) else {
-        return Vec::new();
-    };
-    mapped.filter_map(std::result::Result::ok).collect()
+    crate::db::repository::bus_topic_org_ids(db, instance_id).unwrap_or_default()
 }
 
 /// Every registered consumer-group subscription — `(org_id, group_id,
@@ -478,22 +467,13 @@ fn bus_org_ids(db: &DbPool, instance_id: &str) -> Vec<String> {
 /// database now, not the main pool), so no `instance_id` filter is needed —
 /// the pool itself already is that one instance's own table.
 fn bus_group_subscriptions(db: &DbPool) -> Vec<(String, String, String)> {
-    let Ok(conn) = db.read() else {
-        return Vec::new();
-    };
-    let Ok(mut stmt) = conn.prepare("SELECT org_id, group_id, topic FROM bus_groups") else {
-        return Vec::new();
-    };
-    let Ok(mapped) = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    }) else {
-        return Vec::new();
-    };
-    mapped.filter_map(std::result::Result::ok).collect()
+    crate::db::repository::bus_group_list_all(db)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|g| (g.org_id, g.group_id, g.topic))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `(topic_count, partition_count)`, scoped to `instance_id` (plan-app-

@@ -865,6 +865,7 @@ pub async fn addon_config_set(
     // Privacy options drive the camera pipeline, so a change must reach the
     // RUNNING camera; the session rebuilds its graph rather than switching one,
     // which is what keeps an unprocessed frame from slipping out mid-change.
+    #[cfg(feature = "camera")]
     let privacy_cameras_applied = if fields_changed.iter().any(|k| {
         k == crate::services::camera_ingest::privacy_options::CONFIG_FACE_BLUR
             || k == crate::services::camera_ingest::privacy_options::CONFIG_PERSON_DETECT
@@ -878,6 +879,10 @@ pub async fn addon_config_set(
     } else {
         0
     };
+    // A build without the camera pipeline (the slim edition) runs no camera
+    // whose graph the options could change.
+    #[cfg(not(feature = "camera"))]
+    let privacy_cameras_applied: u32 = 0;
 
     // A connection param (robot IP) feeds the instance's network rules, which
     // were resolved at install — re-resolve them and reload the runtime.

@@ -67,12 +67,26 @@ function Update-SessionEnvironment {
         if ($userValue) { $value = $userValue }
         if ($value) { Set-Item -Path "Env:$name" -Value $value }
     }
+    $env:Path = Merge-PathList -Name 'Path'
+    # A list, not a value: setup.ps1 records GStreamer's pkgconfig directory in
+    # the registry, while a tool that ran earlier (actions/setup-python, a conda
+    # shell) may already have set its own. Taking either alone loses the other,
+    # and without GStreamer's entry glib-sys cannot find glib-2.0.pc.
+    $pkgConfigPath = Merge-PathList -Name 'PKG_CONFIG_PATH'
+    if ($pkgConfigPath) { $env:PKG_CONFIG_PATH = $pkgConfigPath }
+    Clear-InvalidCompilerEnv
+}
+
+# Machine, then User, then this process' entries of a ';'-separated list,
+# without duplicates. The process keeps whatever it added on its own.
+function Merge-PathList {
+    param([Parameter(Mandatory)][string]$Name)
     $entries = New-Object System.Collections.Generic.List[string]
     $seen = @{}
     $sources = @(
-        [Environment]::GetEnvironmentVariable('Path', 'Machine'),
-        [Environment]::GetEnvironmentVariable('Path', 'User'),
-        $env:Path
+        [Environment]::GetEnvironmentVariable($Name, 'Machine'),
+        [Environment]::GetEnvironmentVariable($Name, 'User'),
+        [Environment]::GetEnvironmentVariable($Name, 'Process')
     )
     foreach ($source in $sources) {
         if (-not $source) { continue }
@@ -85,8 +99,7 @@ function Update-SessionEnvironment {
             $entries.Add($trimmed)
         }
     }
-    $env:Path = $entries -join ';'
-    Clear-InvalidCompilerEnv
+    return ($entries -join ';')
 }
 
 # cc-rs and CMake run whatever CC/CXX/AR name. A value that is not an existing
@@ -236,9 +249,12 @@ function Test-NvidiaGpu {
 
 # Default native-libs cache, shared with scripts/native-libs/common.sh and the
 # WASI SDK lookup of tentaflow-core/build.rs.
+# Same default as scripts/native-libs/common.sh: the drive root, because
+# link.exe cannot open paths past MAX_PATH and the build trees under a user
+# profile run past it (see default_native_cache there).
 function Get-NativeCacheDir {
     if ($env:TENTAFLOW_NATIVE_CACHE) { return $env:TENTAFLOW_NATIVE_CACHE }
-    return (Join-Path $env:LOCALAPPDATA 'tentaflow-native-libs')
+    return (Join-Path "$env:SystemDrive\" 'tentaflow-native')
 }
 
 # Runs a script through Git Bash with this process' environment (MSVC, CUDA,

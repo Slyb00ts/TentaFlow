@@ -502,17 +502,43 @@ pub fn api_key_list_request(
 /// Shared validation for a general key's scope resource. `resource_type` must be
 /// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
 /// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
-fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
+///
+/// Returns the action the row is stored under. `bus_schema_registry` requires an
+/// explicit `read` or `write` — never `'*'`, which would let one row answer both
+/// questions and make a write grant readable. Every other type carries no action
+/// and is stored as `'*'`.
+fn validate_scope_resource(
+    db: &crate::db::DbPool,
+    resource_type: &str,
+    resource_id: &str,
+    action: Option<&str>,
+) -> Result<&'static str, ProtocolError> {
     if !matches!(
         resource_type,
-        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export" | "topic"
+        "model"
+            | "flow"
+            | "alias"
+            | "model_bundle"
+            | "ml_studio_export"
+            | "topic"
+            | crate::api::bus_schema_rest::BUS_SCHEMA_REGISTRY_RESOURCE_TYPE
     ) {
         return Err(ProtocolError::bad_request(
-            "resource_type must be 'model', 'flow', 'alias', 'model_bundle', 'ml_studio_export' or 'topic'",
+            "resource_type must be 'model', 'flow', 'alias', 'model_bundle', 'ml_studio_export', 'topic' or 'bus_schema_registry'",
         ));
     }
     if resource_id.is_empty() {
         return Err(ProtocolError::bad_request("resource_id is empty"));
+    }
+    if resource_type == crate::api::bus_schema_rest::BUS_SCHEMA_REGISTRY_RESOURCE_TYPE {
+        let action = bus_schema_scope_action(action)?;
+        validate_bus_schema_scope_id(db, resource_id)?;
+        return Ok(action);
+    }
+    if !matches!(action, None | Some("*")) {
+        return Err(ProtocolError::bad_request(
+            "action is only valid for bus_schema_registry scopes",
+        ));
     }
     // model_bundle scopes gate the /models/* endpoints — only refs the bundle
     // endpoints can actually serve are storable.
@@ -530,7 +556,81 @@ fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(),
             "resource_id is not a valid ML Studio project id",
         ));
     }
-    Ok(())
+    Ok("*")
+}
+
+/// The action a scope clear removes: `Some` (exactly that row) for
+/// `bus_schema_registry`, `None` (every row of the pair) for every other type.
+/// Only the shape is checked for `bus_schema_registry` — a grant whose instance
+/// or organisation has gone away since must still be revocable.
+fn clear_scope_action(
+    db: &crate::db::DbPool,
+    resource_type: &str,
+    resource_id: &str,
+    action: Option<&str>,
+) -> Result<Option<&'static str>, ProtocolError> {
+    if resource_type != crate::api::bus_schema_rest::BUS_SCHEMA_REGISTRY_RESOURCE_TYPE {
+        validate_scope_resource(db, resource_type, resource_id, action)?;
+        return Ok(None);
+    }
+    let action = bus_schema_scope_action(action)?;
+    parse_bus_schema_scope_id(resource_id)?;
+    Ok(Some(action))
+}
+
+/// `read` and `write` are separate grants on this surface; `'*'` (both at once)
+/// and `admin` have no meaning for an external schema producer.
+fn bus_schema_scope_action(action: Option<&str>) -> Result<&'static str, ProtocolError> {
+    match action {
+        Some("read") => Ok("read"),
+        Some("write") => Ok("write"),
+        _ => Err(ProtocolError::bad_request(
+            "bus_schema_registry scopes need action 'read' or 'write'",
+        )),
+    }
+}
+
+/// Shape of a `bus_schema_registry` scope id: `composite_resource_id([instance_id,
+/// org_id])` — exactly the id the REST gate rebuilds from the request path and
+/// `?org_id=` — with a well-formed instance id and a non-empty organisation.
+fn parse_bus_schema_scope_id(resource_id: &str) -> Result<(&str, &str), ProtocolError> {
+    let segments = crate::sync::resource_id::decode_segments(resource_id).unwrap_or_default();
+    let [instance_id, org_id] = segments.as_slice() else {
+        return Err(ProtocolError::bad_request(
+            "bus_schema_registry resource_id must name exactly an instance and an organisation",
+        ));
+    };
+    crate::bus::instance::BusInstanceId::parse(instance_id)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if org_id.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "bus_schema_registry resource_id names no organisation",
+        ));
+    }
+    Ok((instance_id, org_id))
+}
+
+/// A new `bus_schema_registry` grant must name a TentaBus instance installed
+/// here and an organisation this node knows and has not deleted; a scope for
+/// anything else could never match a request, so it is refused instead of
+/// stored.
+fn validate_bus_schema_scope_id(
+    db: &crate::db::DbPool,
+    resource_id: &str,
+) -> Result<(), ProtocolError> {
+    let (instance_id, org_id) = parse_bus_schema_scope_id(resource_id)?;
+    let installed =
+        repository::list_package_instances(db, crate::bus::instance::BusInstanceId::PACKAGE_ID)
+            .map_err(db_err)?
+            .into_iter()
+            .any(|(addon_id, _, _)| addon_id == instance_id);
+    if !installed {
+        return Err(ProtocolError::not_found("TentaBus instance not found"));
+    }
+    match crate::services::org::get_organization(db, org_id).map_err(db_err)? {
+        Some(org) if org.status != "deleted" => Ok(()),
+        _ => Err(ProtocolError::not_found("organisation not found")),
+    }
 }
 
 #[handler(variant = "ApiKeyCreateRequest", since = (1, 0))]
@@ -603,8 +703,16 @@ pub fn api_key_create(
             "scope_resources only valid for key_type='general'",
         ));
     }
+    let mut scopes: Vec<(String, String, String)> =
+        Vec::with_capacity(payload.scope_resources.len());
     for r in &payload.scope_resources {
-        validate_scope_resource(&r.resource_type, &r.resource_id)?;
+        let action =
+            validate_scope_resource(db, &r.resource_type, &r.resource_id, r.action.as_deref())?;
+        scopes.push((
+            r.resource_type.clone(),
+            r.resource_id.clone(),
+            action.to_string(),
+        ));
     }
 
     // Token = "sk-" + 256-bit CSPRNG hex (NOT a UUID). Only the HMAC verifier is
@@ -621,16 +729,6 @@ pub fn api_key_create(
         repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
     let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
     let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
-
-    let scopes: Vec<(String, String)> = if payload.key_type == "general" {
-        payload
-            .scope_resources
-            .iter()
-            .map(|r| (r.resource_type.clone(), r.resource_id.clone()))
-            .collect()
-    } else {
-        Vec::new()
-    };
 
     let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     // Key INSERT, scope seeding and the audit entry commit in ONE transaction: a
@@ -746,6 +844,7 @@ pub fn api_key_scope_list(
             subject_type: r.subject_type,
             subject_id: r.subject_id,
             access_level: r.access_level,
+            action: r.action,
         })
         .collect();
     Ok(MessageBody::ApiKeyScopeListResponse { entries })
@@ -758,27 +857,30 @@ pub fn api_key_scope_set(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let (key_uid, resource_type, resource_id, access_level) = match req {
+    let (key_uid, resource_type, resource_id, access_level, action) = match req {
         MessageBody::ApiKeyScopeSetRequest {
             key_uid,
             resource_type,
             resource_id,
             access_level,
-        } => (key_uid, resource_type, resource_id, access_level),
+            action,
+        } => (key_uid, resource_type, resource_id, access_level, action),
         _ => {
             return Err(ProtocolError::bad_request(
                 "api_key_scope_set expected ApiKeyScopeSetRequest variant",
             ));
         }
     };
-    validate_scope_resource(resource_type, resource_id)?;
+    let action =
+        validate_scope_resource(&ctx.state.db, resource_type, resource_id, action.as_deref())?;
     require_general_key(ctx, key_uid)?;
-    repository::resource_permissions::set(
+    repository::resource_permissions::set_with_action(
         &ctx.state.db,
         resource_type,
         resource_id,
         "api_key",
         key_uid,
+        action,
         access_level,
     )
     .map_err(iam_err)?;
@@ -796,8 +898,8 @@ pub fn api_key_scope_set(
         "apikey.scope.set",
         Some(&format!("apikey:{}", key_uid)),
         Some(&format!(
-            "{}:{}={}",
-            resource_type, resource_id, access_level
+            "{}:{}:{}={}",
+            resource_type, resource_id, action, access_level
         )),
         None,
         Some(&ctx.state.local_node_id),
@@ -813,27 +915,42 @@ pub fn api_key_scope_clear(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let (key_uid, resource_type, resource_id) = match req {
+    let (key_uid, resource_type, resource_id, action) = match req {
         MessageBody::ApiKeyScopeClearRequest {
             key_uid,
             resource_type,
             resource_id,
-        } => (key_uid, resource_type, resource_id),
+            action,
+        } => (key_uid, resource_type, resource_id, action),
         _ => {
             return Err(ProtocolError::bad_request(
                 "api_key_scope_clear expected ApiKeyScopeClearRequest variant",
             ));
         }
     };
-    validate_scope_resource(resource_type, resource_id)?;
+    // A clear only ever removes rows, so it validates the shape alone: a scope
+    // left behind for an instance or organisation removed since must stay
+    // revocable. `bus_schema_registry` clears exactly one action's row — a
+    // revoked `write` never takes the key's separate `read` with it.
+    let action = clear_scope_action(&ctx.state.db, resource_type, resource_id, action.as_deref())?;
     require_general_key(ctx, key_uid)?;
-    repository::resource_permissions::clear(
-        &ctx.state.db,
-        resource_type,
-        resource_id,
-        "api_key",
-        key_uid,
-    )
+    match action {
+        Some(action) => repository::resource_permissions::clear_with_action(
+            &ctx.state.db,
+            resource_type,
+            resource_id,
+            "api_key",
+            key_uid,
+            action,
+        ),
+        None => repository::resource_permissions::clear(
+            &ctx.state.db,
+            resource_type,
+            resource_id,
+            "api_key",
+            key_uid,
+        ),
+    }
     .map_err(db_err)?;
 
     // Audit mandatory (see api_key_scope_set): propagate the failure.
@@ -844,7 +961,12 @@ pub fn api_key_scope_clear(
         None,
         "apikey.scope.clear",
         Some(&format!("apikey:{}", key_uid)),
-        Some(&format!("{}:{}", resource_type, resource_id)),
+        Some(&format!(
+            "{}:{}:{}",
+            resource_type,
+            resource_id,
+            action.unwrap_or("*")
+        )),
         None,
         Some(&ctx.state.local_node_id),
     )
@@ -9418,6 +9540,15 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             subject_id,
             access_level,
         } => {
+            // This setter writes action-blind `'*'` rows, and a `'*'` row on a
+            // schema-registry scope would answer read AND write at once — the
+            // one thing that scope must never do. Its grants go through the
+            // API-key scope handlers, which store read and write separately.
+            if resource_type == crate::api::bus_schema_rest::BUS_SCHEMA_REGISTRY_RESOURCE_TYPE {
+                return Err(ProtocolError::bad_request(
+                    "bus_schema_registry grants are set per API key with an explicit action",
+                ));
+            }
             repository::resource_permissions::set(
                 db,
                 resource_type,
@@ -9460,6 +9591,7 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                     subject_type: r.subject_type,
                     subject_id: r.subject_id,
                     access_level: r.access_level,
+                    action: r.action,
                 })
                 .collect();
             P::ResListPermissions { entries }
@@ -9479,9 +9611,27 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                     subject_type: r.subject_type,
                     subject_id: r.subject_id,
                     access_level: r.access_level,
+                    action: r.action,
                 })
                 .collect();
             P::ResListPermissions { entries }
+        }
+
+        // ---- Organisations ----
+        // A soft-deleted organisation keeps its row under its retention
+        // policy, but nothing new may be scoped to it — the same rule
+        // `validate_scope_resource` enforces for a key scope.
+        P::ReqListOrganizations => {
+            let orgs = crate::services::org::list_organizations(db, None)
+                .map_err(db_err)?
+                .into_iter()
+                .filter(|o| o.status != "deleted")
+                .map(|o| tentaflow_protocol::OrganizationInfo {
+                    org_id: o.org_id,
+                    name: o.name,
+                })
+                .collect();
+            P::ResListOrganizations { orgs }
         }
 
         // Response-only variants nie powinny byc requestowane przez klienta.
@@ -9492,6 +9642,7 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         | P::ResCreateGroup { .. }
         | P::ResGroupMembers { .. }
         | P::ResListPermissions { .. }
+        | P::ResListOrganizations { .. }
         | P::ResOk => {
             return Err(ProtocolError::bad_request("response variant in request"));
         }
@@ -9577,6 +9728,10 @@ register_iam_variant!(
 register_iam_variant!(
     "IamListPermsForSubjectRequest",
     "tentaflow_ws_handler_iam_list_perms_subject"
+);
+register_iam_variant!(
+    "IamListOrganizationsRequest",
+    "tentaflow_ws_handler_iam_list_organizations"
 );
 
 // =============================================================================

@@ -13,7 +13,7 @@ import { fakeScreen, flush, click, window } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { drawPoolDetail, openAddVdevDialog, openReplaceWizard, isUnresolvedLeafName } = await import('./pool-detail.js');
+const { drawPoolDetail, openAddVdevDialog, openReplaceWizard, isUnresolvedLeafName, REPLACE_SCAN_EVERY_MS } = await import('./pool-detail.js');
 const { KIND_BADGE } = await import('./format.js');
 
 const TB = 1024 ** 4;
@@ -65,6 +65,10 @@ function makeScreen(extra = {}) {
   screen.locations = 0;
   screen.setLocation = () => { screen.locations += 1; };
   screen.renderAlertList = () => {};
+  // The shell's one breadcrumb (tentanas.js `setCrumbTail`): the view only
+  // hands it its tail, recorded here.
+  screen.crumbTails = [];
+  screen.setCrumbTail = (tail) => { screen.crumbTails.push(tail); };
   return screen;
 }
 
@@ -84,8 +88,10 @@ test('renders the KPI row and one topology group per vdev with the free-disk act
 
   assert.equal(body.querySelector('#nas-pool-head'), null, 'n06 carries no separate pool-identity card');
   assert.equal(body.querySelector('#nas-pool-kpi').children.length, 4, 'four KPI tiles');
-  const crumbs = [...body.querySelectorAll('.nas-crumbs .tf-breadcrumb-item')].map((c) => c.textContent);
-  assert.deepEqual(crumbs, ['Pule', 'tank']);
+  // m26: one breadcrumb on the screen. "Pule › tank" is the tail of the
+  // shell's bar ("TentaNas › helios › Pule › tank"), never a second bar here.
+  assert.equal(body.querySelectorAll('tf-breadcrumb').length, 0, 'the pool view draws no breadcrumb of its own');
+  assert.deepEqual(screen.crumbTails.at(-1), [{ label: 'Pule', act: 'pools', query: `node=${screen.nodeId}&tab=pools` }, { label: 'tank' }]);
   assert.ok(body.querySelector('#nas-pool-tab-body [data-act="scrub-start"]'), 'idle pool offers a scrub in the topology panel');
   const groups = [...body.querySelectorAll('.vdev-group[data-vdev]')];
   assert.deepEqual(groups.map((g) => g.dataset.vdev), ['raidz1-0', 'cache-0']);
@@ -266,15 +272,16 @@ test('the Właściwości tab renders the same properties table and danger zone a
   screen.dispose();
 });
 
-test('a failed load shows the error with the breadcrumb back to the pools', async () => {
+test('a failed load shows the error and the shell breadcrumb still leads back to the pools', async () => {
   const screen = makeScreen({ tentaNasPoolGetRequest: () => { throw new Error('no such pool'); } });
   const body = mount();
   await drawPoolDetail(screen, body);
   await flush();
   assert.match(body.querySelector('tf-alert').getAttribute('message'), /no such pool/);
-  click(body.querySelector('.nas-crumbs a'));
-  assert.equal(screen.pool, null);
-  assert.equal(screen.locations, 1);
+  // The way back is the shell's "Pule" crumb, set before the read could fail.
+  assert.equal(body.querySelectorAll('tf-breadcrumb').length, 0);
+  assert.equal(screen.crumbTails.length, 1);
+  assert.equal(screen.crumbTails[0][0].act, 'pools');
   screen.dispose();
 });
 
@@ -509,6 +516,9 @@ test('a disk SMART warns about shows the warning tone inside an ONLINE leaf, and
 // job — which spans the resilver — had finished.
 test('the replace wizard patches its tick in place and reaches step 3 while the job is still resilvering', async () => {
   const realSetTimeout = globalThis.setTimeout;
+  const realNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
   const ticks = [];
   globalThis.setTimeout = (fn, ms, ...rest) => (ms === 1500 ? (ticks.push(fn), 0) : realSetTimeout(fn, ms, ...rest));
   try {
@@ -547,8 +557,11 @@ test('the replace wizard patches its tick in place and reaches step 3 while the 
     assert.equal(win.querySelector('[data-wizard-cancel]') === cancel, true, 'the footer buttons survive the tick');
     assert.equal([...win.querySelectorAll('.install-step')].every((el, i) => el === rail[i]), true, 'the step rail survives the tick');
 
-    // The job is still running, but the pool now reports the resilver it started.
+    // The job is still running, but the pool now reports the resilver it
+    // started. The pool is read at its own, slower cadence, so the rail
+    // moves once that much time has passed.
     scan = { kind: 'resilver', status: 'running', progressPct: 40, etaSecs: 1800, errors: 0 };
+    now += REPLACE_SCAN_EVERY_MS;
     await ticks.shift()();
     await flush();
     assert.ok(rail[2].classList.contains('active'), 'step 3 is reached during the resilver, not after it');
@@ -559,6 +572,48 @@ test('the replace wizard patches its tick in place and reaches step 3 while the 
     screen.dispose();
   } finally {
     globalThis.setTimeout = realSetTimeout;
+    Date.now = realNow;
+  }
+});
+
+// The replace wizard follows the JOB every 1.5 s tick, but the pool's scan
+// only every REPLACE_SCAN_EVERY_MS: a `zpool status` per tick for the hours a
+// resilver runs was load on the node for a rail that does not move that fast.
+test('the replace wizard asks for the job every tick but for the pool only every few seconds', async () => {
+  const realSetTimeout = globalThis.setTimeout;
+  const realNow = Date.now;
+  let now = 2_000_000;
+  Date.now = () => now;
+  const ticks = [];
+  globalThis.setTimeout = (fn, ms, ...rest) => (ms === 1500 ? (ticks.push(fn), 0) : realSetTimeout(fn, ms, ...rest));
+  const screen = fakeScreen({
+    tentaNasPoolReplaceDiskRequest: { job: { jobId: 'j1', status: 'running', progressPct: 5, log: [] } },
+    tentaNasJobGetRequest: () => ({ job: { jobId: 'j1', status: 'running', progressPct: 5, log: [] } }),
+    tentaNasPoolGetRequest: () => ({ ...poolGet, pool: { ...poolGet.pool, scan: { kind: 'none', status: 'idle' } } }),
+  });
+  let win = null;
+  try {
+    const pool = poolGet.pool;
+    win = openReplaceWizard(screen, { pool, vdev: pool.vdevs[0], disk: pool.vdevs[0].disks[2], freeDisks: [disk('sdd', { role: 'free' })], disks: [] });
+    await flush();
+    click(win.querySelector('.target-option[data-disk="sdd"]'));
+    click(win.querySelector('[data-wizard-next]'));
+    await flush();
+    await flush();
+    const count = (kind) => screen.calls.filter((c) => c.kind === kind).length;
+    // Six more ticks, 1.5 s apart: 9 s in all.
+    for (let i = 0; i < 6; i += 1) {
+      now += 1500;
+      await ticks.shift()();
+      await flush();
+    }
+    assert.equal(count('tentaNasJobGetRequest'), 7, 'the job is read on every tick');
+    assert.equal(count('tentaNasPoolGetRequest'), 2, 'the pool at t=0 and t=6 s only, not on every tick');
+  } finally {
+    win?.remove();
+    screen.dispose();
+    globalThis.setTimeout = realSetTimeout;
+    Date.now = realNow;
   }
 });
 

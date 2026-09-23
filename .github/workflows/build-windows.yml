@@ -59,6 +59,8 @@ jobs:
   # ---------------------------------------------------------------------------
   native-libs:
     name: native-libs (windows-x86_64, ${{ matrix.backend }})
+    # windows-2025 because it has winget, which setup.ps1 installs through;
+    # windows-2022 has none.
     runs-on: windows-2025
     timeout-minutes: 360
     strategy:
@@ -88,7 +90,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: native-libs/windows-x86_64
-          key: native-libs-windows-x86_64-${{ matrix.backend }}-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh', 'scripts/versions.env', 'scripts/lib/**') }}
+          # The same inputs as the Linux key. scripts/lib/windows.ps1 stays out:
+          # it prepares the environment, and hashing it made every edit there
+          # rebuild four hours of CUDA kernels that come out identical.
+          key: native-libs-windows-x86_64-${{ matrix.backend }}-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh', 'scripts/versions.env', 'scripts/lib/versions.sh') }}
 
       - name: Toolchain (scripts\setup.ps1 ${{ matrix.setup }})
         if: steps.cache.outputs.cache-hit != 'true'
@@ -148,6 +153,8 @@ jobs:
   build:
     name: build (windows-x86_64, ${{ matrix.asset }})
     needs: native-libs
+    # Same image as native-libs: the static libraries and the Rust code must
+    # meet one MSVC toolset at link time.
     runs-on: windows-2025
     timeout-minutes: 360
     strategy:

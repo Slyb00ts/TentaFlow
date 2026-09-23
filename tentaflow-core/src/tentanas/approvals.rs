@@ -88,8 +88,16 @@ pub const OP_ELASTIC_SCHEDULE: &str = "elastic_schedule";
 /// that a forgotten request cannot be approved next month.
 pub const DEFAULT_TTL_HOURS: u32 = 24;
 
-/// The fleet-wide switch, in the instance's synced `addon_config` — the
-/// setting is per fleet (§5.10), and `tentanas.db` is per node.
+/// The switch, in the instance's synced `addon_config` — per fleet (§5.10),
+/// because `tentanas.db` is per node — and PER ORGANISATION under
+/// `__nas_four_eyes/<org_id>`.
+///
+/// WHY per organisation: TentaNas is ONE instance per node shared by every
+/// tenant, and `addon_config` is keyed by that instance alone. One key for
+/// everybody let an admin of org B switch four eyes OFF for org A — the
+/// second pair of eyes guarding A's Elastic destroy would then be whatever B
+/// decided. The admins who can approve are already counted per organisation
+/// (`approver_ids`), so the switch they are the second pair for is too.
 const SETTINGS_KEY: &str = "__nas_four_eyes";
 
 /// The permission an approver must hold, on top of the org Admin role.
@@ -150,11 +158,21 @@ struct StoredSettings {
     ttl_hours: u32,
 }
 
-fn stored(main_db: &DbPool, addon_id: &str) -> Option<StoredSettings> {
+/// The key one organisation's switch is saved under.
+fn settings_key(org_id: &str) -> String {
+    format!("{SETTINGS_KEY}/{org_id}")
+}
+
+fn stored(main_db: &DbPool, org_id: &str, addon_id: &str) -> Option<StoredSettings> {
     // The prefixed read strips the prefix from every key it returns, so asking
-    // for the whole key back comes with an EMPTY remainder — that row is the
-    // one, and any other is a longer key that merely starts the same way.
-    crate::db::repository::list_addon_config_prefixed(main_db, addon_id, SETTINGS_KEY)
+    // for the organisation's whole key back comes with an EMPTY remainder —
+    // that row is the one, and any other is a longer key that merely starts
+    // the same way (`org-a` must not read `org-ab`'s switch).
+    //
+    // No fallback to the instance-wide `__nas_four_eyes` row of earlier
+    // builds: measured on rig11 (2026-09-23) no such row exists, and honouring
+    // one would keep applying whichever tenant saved it to every other.
+    crate::db::repository::list_addon_config_prefixed(main_db, addon_id, &settings_key(org_id))
         .ok()?
         .into_iter()
         .find(|(rest, _, _)| rest.is_empty())
@@ -192,7 +210,7 @@ pub fn settings(
     addon_id: &str,
 ) -> NasApprovalSettings {
     let admin_count = approver_ids(main_db, checker, org_id, addon_id).len() as u32;
-    match stored(main_db, addon_id) {
+    match stored(main_db, org_id, addon_id) {
         Some(s) => NasApprovalSettings {
             enabled: s.enabled,
             ttl_hours: if s.ttl_hours == 0 { DEFAULT_TTL_HOURS } else { s.ttl_hours },
@@ -208,8 +226,9 @@ pub fn settings(
     }
 }
 
-/// Saves the fleet switch. `ttl_hours` = 0 keeps whatever is in effect, so the
-/// toggle does not have to resend a number the card never showed.
+/// Saves the caller's organisation's switch. `ttl_hours` = 0 keeps whatever
+/// is in effect, so the toggle does not have to resend a number the card
+/// never showed.
 pub fn set_settings(a: &Actor<'_>, enabled: bool, ttl_hours: u32) -> Result<NasApprovalSettings> {
     let current = settings(a.main_db, a.checker, a.org_id, a.addon_id);
     let value = serde_json::to_string(&StoredSettings {
@@ -219,7 +238,7 @@ pub fn set_settings(a: &Actor<'_>, enabled: bool, ttl_hours: u32) -> Result<NasA
     crate::db::repository::upsert_addon_config_value(
         a.main_db,
         a.addon_id,
-        SETTINGS_KEY,
+        &settings_key(a.org_id),
         &value,
         false,
         Some(a.user_id),
@@ -398,14 +417,28 @@ pub fn expire_due(main_db: &DbPool, nas_db: &DbPool, node_id: &str) -> Vec<NasPe
     closed
 }
 
-/// The list the Tasks tab shows, with `is_own_request` resolved for the caller
-/// so the dashboard can grey out its own approve button — the node refuses it
-/// either way.
+/// Whether `row` is a request of the caller's organisation — the ONLY
+/// requests a caller may see or decide.
+///
+/// WHY: `tentanas.db` is one per node and shared by every tenant on it, so
+/// `nas_pending_approvals` holds every organisation's parked requests. Without
+/// this an admin of org B saw org A's queue (array names, author) and could
+/// APPROVE org A's parked Elastic destroy — replayed, moreover, under B's own
+/// request context. An empty caller org matches nothing, so a request with no
+/// real tenant can never see rows whose owner was recorded as empty.
+fn is_callers(a: &Actor<'_>, row: &store::ApprovalRow) -> bool {
+    !a.org_id.is_empty() && row.org_id == a.org_id
+}
+
+/// The list the Tasks tab shows — the caller's organisation's requests only —
+/// with `is_own_request` resolved for the caller so the dashboard can grey out
+/// its own approve button; the node refuses it either way.
 pub fn list(a: &Actor<'_>, include_closed: bool) -> Result<Vec<NasPendingApproval>> {
     expire_due(a.main_db, a.nas_db, a.node_id);
-    Ok(store::list_approvals(a.nas_db, include_closed)
+    Ok(store::list_approvals(a.nas_db, &a.org_id, include_closed)
         .map_err(|e| anyhow!("{e}"))?
         .into_iter()
+        .filter(|row| is_callers(a, row))
         .map(|row| NasPendingApproval {
             is_own_request: row.approval.requested_by == a.user_id,
             ..row.approval
@@ -421,10 +454,18 @@ pub fn stored_payload(row: &store::ApprovalRow) -> Result<TentaNasPayload> {
         .map_err(|e| anyhow!("the parked request cannot be read back: {e}"))
 }
 
+/// The caller's pending request `request_id`.
+///
+/// Another organisation's request is `NotFound` — the very answer an id that
+/// does not exist gets — and that check comes BEFORE the status and the TTL:
+/// "already approved" or "expired" about a row the caller may not see would
+/// confirm it exists and leak how it ended. Nor does it run the expiry sweep
+/// on the caller's behalf, so the answer takes the same path as a missing id.
 fn load(a: &Actor<'_>, request_id: &str) -> Result<store::ApprovalRow, ApprovalError> {
     let row = store::approval(a.nas_db, request_id)
         .ok()
         .flatten()
+        .filter(|row| is_callers(a, row))
         .ok_or(ApprovalError::NotFound)?;
     if row.approval.status != "pending" {
         return Err(ApprovalError::Closed(row.approval.status));
@@ -624,6 +665,34 @@ mod tests {
 
         fn settings(&self) -> NasApprovalSettings {
             settings(&self.main, &self.checker, &self.org_id, &self.addon_id)
+        }
+
+        /// The same instance and node, asked by a member of `org_id`.
+        fn actor_in<'a>(&'a self, org_id: &'a str, user_id: &'a str) -> Actor<'a> {
+            Actor { org_id, ..self.actor(user_id) }
+        }
+
+        /// A SECOND tenant on the same node: its own organisation, whose
+        /// `admins` are org Admins holding `nas.admin` on the one shared
+        /// instance — exactly what makes them approvers in their own org.
+        fn second_org(&self, admins: &[&str]) -> String {
+            let org = crate::services::org::repo::create_organization(
+                &self.main, "Beta", "beta", None, None, None, None,
+            )
+            .expect("org");
+            let admin_role = role_id(&self.main, "org_admin");
+            for user in admins {
+                crate::services::org::repo::add_membership(
+                    &self.main, &org.org_id, user, &admin_role, "test",
+                )
+                .expect("membership");
+                crate::db::repository::upsert_permission(
+                    &self.main, &self.addon_id, "user", user, PERM_ADMIN, "allow", None,
+                )
+                .expect("grant");
+            }
+            self.checker.refresh_all();
+            org.org_id
         }
     }
 
@@ -1075,6 +1144,114 @@ mod tests {
         .expect("grant");
         one.checker.refresh_all();
         assert!(second_pair_available(&one.actor("u-anna")));
+    }
+
+    /// TentaNas is one instance and one `tentanas.db` per node, shared by
+    /// every organisation on it. Org B's admins are real approvers — in B —
+    /// and must neither see org A's parked request nor be able to decide it:
+    /// every answer B gets is the one a request id that does not exist gets,
+    /// whether A's request is pending, decided or expired.
+    #[test]
+    fn another_organisations_request_is_invisible_and_answers_like_a_missing_one() {
+        let f = fixture(&["u-anna", "u-piotr"], &[]);
+        let beta = f.second_org(&["u-ewa", "u-marek"]);
+        assert_eq!(
+            approver_ids(&f.main, &f.checker, &beta, &f.addon_id).len(),
+            2,
+            "B's admins are approvers of their own organisation"
+        );
+        let parked = park_destroy(&f, "u-anna");
+        let missing = |user: &str| {
+            let b = f.actor_in(&beta, user);
+            (
+                claim(&b, &parked.request_id).unwrap_err(),
+                reject(&b, &parked.request_id, "nie").unwrap_err(),
+                claim(&b, "nie-ma").unwrap_err(),
+            )
+        };
+        let not_found = (ApprovalError::NotFound, ApprovalError::NotFound, ApprovalError::NotFound);
+
+        // Pending: B sees nothing and cannot approve or reject it.
+        assert!(list(&f.actor_in(&beta, "u-ewa"), true).expect("list").is_empty());
+        assert_eq!(missing("u-ewa"), not_found);
+        // …and B's attempts changed nothing: A's second admin still decides.
+        let open = list(&f.actor("u-piotr"), false).expect("list");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].status, "pending");
+
+        // B's own request is B's: listed for B, never for A.
+        let own = park(
+            &f.actor_in(&beta, "u-ewa"),
+            OP_ELASTIC_DESTROY,
+            "bravo",
+            "rozwiązuje macierz bravo",
+            &TentaNasPayload::ElasticArrayDestroyRequest {
+                name: "bravo".into(),
+                confirm_name: "bravo".into(),
+                sudo_password: None,
+            },
+        )
+        .expect("park");
+        let seen_by_b: Vec<String> = list(&f.actor_in(&beta, "u-marek"), true)
+            .expect("list")
+            .into_iter()
+            .map(|r| r.request_id)
+            .collect();
+        assert_eq!(seen_by_b, vec![own.request_id.clone()]);
+        assert!(list(&f.actor("u-piotr"), true)
+            .expect("list")
+            .iter()
+            .all(|r| r.request_id != own.request_id));
+        assert_eq!(
+            claim(&f.actor("u-piotr"), &own.request_id).unwrap_err(),
+            ApprovalError::NotFound
+        );
+
+        // Decided: still "not found" for B, never "already rejected".
+        reject(&f.actor("u-piotr"), &parked.request_id, "nie teraz").expect("reject");
+        assert_eq!(missing("u-marek"), not_found);
+
+        // Expired: still "not found" for B, never "expired".
+        let late = park_destroy(&f, "u-anna");
+        {
+            let conn = f.nas.write().expect("write");
+            conn.execute(
+                "UPDATE nas_pending_approvals SET expires_at = ?2 WHERE request_id = ?1",
+                rusqlite::params![late.request_id, "2020-01-01T00:00:00Z"],
+            )
+            .expect("expire");
+        }
+        assert_eq!(
+            claim(&f.actor_in(&beta, "u-ewa"), &late.request_id).unwrap_err(),
+            ApprovalError::NotFound
+        );
+        // The request itself is A's and still closes for A as expired.
+        assert_eq!(
+            claim(&f.actor("u-piotr"), &late.request_id).unwrap_err(),
+            ApprovalError::Expired
+        );
+    }
+
+    /// The four-eyes switch is per organisation: org B turning it OFF for
+    /// itself leaves org A's red paths parking, and A's saved TTL is A's.
+    #[test]
+    fn four_eyes_is_switched_per_organisation() {
+        let f = fixture(&["u-anna", "u-piotr"], &[]);
+        let beta = f.second_org(&["u-ewa", "u-marek"]);
+        set_settings(&f.actor("u-anna"), true, 6).expect("A saves");
+        let b = set_settings(&f.actor_in(&beta, "u-ewa"), false, 48).expect("B saves");
+        assert!(!b.enabled && b.ttl_hours == 48);
+        assert!(!required(&f.actor_in(&beta, "u-marek")));
+
+        let a = f.settings();
+        assert!(a.enabled && !a.by_default, "B's switch reached A: {a:?}");
+        assert_eq!(a.ttl_hours, 6);
+        assert!(required(&f.actor("u-piotr")));
+        // …and a parked request of A carries A's TTL, not B's.
+        let parked = park_destroy(&f, "u-anna");
+        let requested = chrono::DateTime::parse_from_rfc3339(&parked.requested_at).expect("at");
+        let expires = chrono::DateTime::parse_from_rfc3339(&parked.expires_at).expect("at");
+        assert_eq!((expires - requested).num_hours(), 6);
     }
 
     #[test]

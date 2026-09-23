@@ -6,7 +6,8 @@
 // privilege/credential error (`ProtocolErrorCode::NotAvailable`, the code
 // `broker_error` in dispatch/tentanas.rs gives a rejected sudo password, an
 // unarmed channel or a helper/core version mismatch), plus `refusedBatchNames`
-// naming the disks a batch refused.
+// naming the disks a batch refused; and `replacementAdviceText`, the
+// replacement advice rebuilt in the reader's language.
 // =============================================================================
 
 import './_test-setup.js';
@@ -100,4 +101,46 @@ test('jobAuthor keeps the system authors translated, with no tooltip', () => {
   assert.equal(jobAuthor('scheduler').label, 'harmonogram');
   assert.equal(jobAuthor('scheduler').title, '');
   assert.equal(jobAuthor('startup').title, '');
+});
+
+// `replacement_advice` (tentanas/disks.rs) joins at most three parts with
+// "; ": the growth sentence, "{health} for {days} days" and the disk's whole
+// health reason. Every combination it can write is rebuilt from fields, and
+// none of its English survives into the text.
+test('replacementAdviceText rebuilds every part of the node\'s advice sentence', async () => {
+  const { replacementAdviceText } = await import('./format.js');
+  const cases = [
+    // growth only (fewer than ADVICE_AFTER_DAYS days, reason repeats the growth)
+    [{ severity: 'urgent', reallocated: 8, reallocatedWeekAgo: 3, warningDays: 0,
+      reason: 'reallocated sectors grew from 3 to 8 in the last 7 days; reallocated sectors growing (3 → 8 in 7 days)' },
+    { health: 'warning', healthReason: 'reallocated sectors growing (3 → 8 in 7 days)' },
+    'realokacje wzrosły z 3 do 8 w 7 dni'],
+    // days + reason, a warning disk (the `advice` kind)
+    [{ severity: 'advice', reallocated: 3, reallocatedWeekAgo: 3, warningDays: 5, reason: 'warning for 5 days; 54°C; 1 UDMA CRC errors (cable/backplane)' },
+      { health: 'warning', healthReason: '54°C; 1 UDMA CRC errors (cable/backplane)' },
+      'Uwaga od 5 dni; 54°C; 1 CRC'],
+    // all three parts, a critical disk
+    [{ severity: 'urgent', reallocated: 9, reallocatedWeekAgo: 4, warningDays: 2, reason: 'reallocated sectors grew from 4 to 9 in the last 7 days; critical for 2 days; SMART overall status FAILED' },
+      { health: 'critical', healthReason: 'SMART overall status FAILED' },
+      'realokacje wzrosły z 4 do 9 w 7 dni; Awaria od 2 dni; SMART: awaria'],
+    // one whole day: the Polish singular form, and no counter at all
+    [{ severity: 'advice', reallocated: null, reallocatedWeekAgo: null, warningDays: 1, reason: 'warning for 1 days; 87% worn' },
+      { health: 'warning', healthReason: '87% worn' },
+      'Uwaga od 1 dnia; zużycie 87%'],
+    // the disk's reason has nothing this build can name: nothing English leaks
+    [{ severity: 'advice', reallocated: 0, reallocatedWeekAgo: 0, warningDays: 0, reason: 'spindle motor stalled' },
+      { health: 'warning', healthReason: 'spindle motor stalled' },
+      'Uwaga'],
+  ];
+  for (const [advice, disk, text] of cases) {
+    const out = replacementAdviceText(advice, disk);
+    assert.equal(out.text, text, advice.reason);
+    assert.equal(out.title, advice.reason, 'the node\'s sentence is the tooltip');
+    assert.equal(out.known, true);
+  }
+  const unknown = replacementAdviceText({ severity: 'retire_soon', reason: 'firmware recall' }, { health: 'warning', healthReason: '' });
+  assert.deepEqual(unknown, { known: false, text: 'węzeł zaleca wymianę tego dysku', title: 'firmware recall' });
+  const noDisk = replacementAdviceText({ severity: 'urgent', reason: 'critical for 3 days' }, undefined);
+  assert.equal(noDisk.known, false, 'without the disk there is no reason to translate');
+  assert.equal(noDisk.text, 'węzeł zaleca wymianę tego dysku');
 });

@@ -12,7 +12,7 @@
 import { window, flush, click, windowTitle } from './tentanas/_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 
 const { ApiBinary } = await import('../protocol/api-binary-shim.js');
 const { default: Screen } = await import('./tentanas.js');
@@ -726,7 +726,9 @@ test('the node header carries the disk-warning and service chips plus the mockup
   const root = await mountScreen({ node: LOCAL });
   await flush();
   const chips = [...root.querySelectorAll('#nas-head-chips tf-chip')].map((c) => c.getAttribute('label'));
-  assert.deepEqual(chips, ['Dyski OK', 'Usługi nieaktywne']);
+  // The fixture node runs smbd (the shares list's service row), and that —
+  // not which packages the probe found — is what the chip reports.
+  assert.deepEqual(chips, ['Dyski OK', 'Usługi aktywne']);
   const badges = [...root.querySelectorAll('#nas-head-badges tf-chip')].map((c) => c.getAttribute('label'));
   assert.equal(badges[0], 'OpenZFS 2.2.4');
   assert.equal(badges[1], 'Kanał uprawnień: tryb A');
@@ -977,8 +979,11 @@ test('a dashboard poll that brings the same Elastic Array mutates no node of the
 // whole list — any one of these three changing rebuilt everything alongside
 // it, including buttons the fixed-node assertions below catch as `!==`.
 test('n02: a poll with changed ARC numbers, job progress and a newer alert time keeps every card, row and button the same node', async () => {
-  const runningV1 = [{ jobId: 'j1', kind: 'smart_test', subject: 'sda', status: 'running', progressPct: 10, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started'] }];
-  const runningV2 = [{ jobId: 'j1', kind: 'smart_test', subject: 'sda', status: 'running', progressPct: 55, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started', 'halfway'] }];
+  // A `pool_scrub` job: the one kind `jobCanCancel` (format.js) offers Cancel
+  // for. With a job that has no Cancel the identity check below would compare
+  // nothing to nothing and pass vacuously.
+  const runningV1 = [{ jobId: 'j1', kind: 'pool_scrub', subject: 'tank', status: 'running', progressPct: 10, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started'] }];
+  const runningV2 = [{ jobId: 'j1', kind: 'pool_scrub', subject: 'tank', status: 'running', progressPct: 55, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started', 'halfway'] }];
   const alertV1 = { alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'nvme0n1', title: 'nvme0n1: pending sectors', detail: 'w 7 dni', raisedAt: '2026-08-01 10:00:00', ackedAt: null, resolvedAt: null };
   const alertV2 = { ...alertV1, raisedAt: '2026-09-20 10:00:00' };
   const arcV1 = { ...arc };
@@ -990,51 +995,55 @@ test('n02: a poll with changed ARC numbers, job progress and a newer alert time 
     tentaNasAlertsListRequest: () => ({ alerts: [poll === 0 ? alertV1 : alertV2] }),
     tentaNasArcStatsRequest: () => ({ arc: poll === 0 ? arcV1 : arcV2 }),
   });
-  const root = await mountScreen({ node: LOCAL });
-  await flush();
-  const body = root.querySelector('#nas-tab-body');
+  try {
+    const root = await mountScreen({ node: LOCAL });
+    await flush();
+    const body = root.querySelector('#nas-tab-body');
 
-  const arcHost = root.querySelector('#nas-ov-arc');
-  const donut1 = arcHost.querySelector('.donut');
-  const dnVal1 = arcHost.querySelector('.dn-val');
-  const jobRow1 = root.querySelector('#nas-ov-jobs .job-row');
-  const cancelBtn1 = jobRow1.querySelector('[data-act="cancel"]');
-  const bar1 = jobRow1.querySelector('tf-progress-bar');
-  const alertRow1 = root.querySelector('#nas-ov-alerts .alert-row');
-  const gotoBtn1 = alertRow1.querySelector('[data-goto]');
-  const ackBtn1 = alertRow1.querySelector('[data-ack]');
-  const agoText1 = alertRow1.querySelector('.a-sub').textContent;
-  assert.equal(bar1.getAttribute('value'), '10');
-  assert.match(dnVal1.textContent, /94\.2%/);
+    const arcHost = root.querySelector('#nas-ov-arc');
+    const donut1 = arcHost.querySelector('.donut');
+    const dnVal1 = arcHost.querySelector('.dn-val');
+    const jobRow1 = root.querySelector('#nas-ov-jobs .job-row');
+    const cancelBtn1 = jobRow1.querySelector('[data-act="cancel"]');
+    assert.ok(cancelBtn1 !== null, 'the running scrub offers Cancel — the identity check below is not vacuous');
+    const bar1 = jobRow1.querySelector('tf-progress-bar');
+    const alertRow1 = root.querySelector('#nas-ov-alerts .alert-row');
+    const gotoBtn1 = alertRow1.querySelector('[data-goto]');
+    const ackBtn1 = alertRow1.querySelector('[data-ack]');
+    const agoText1 = alertRow1.querySelector('.a-sub').textContent;
+    assert.equal(bar1.getAttribute('value'), '10');
+    assert.match(dnVal1.textContent, /94\.2%/);
 
-  poll = 1;
-  await Screen.refreshOverview(body);
-  await flush();
+    poll = 1;
+    await Screen.refreshOverview(body);
+    await flush();
 
-  // ARC: the very same card AND the very same donut ring inside it — a full
-  // `host.innerHTML =` on every poll (the pre-fix behaviour) keeps the outer
-  // container's identity but destroys everything inside it, which the two
-  // checks below catch that a container-only check would miss.
-  assert.ok(root.querySelector('#nas-ov-arc') === arcHost, 'the ARC card container is the same node');
-  assert.ok(arcHost.querySelector('.donut') === donut1, 'the donut ring is the same node');
-  assert.ok(arcHost.querySelector('.dn-val') === dnVal1, 'its value element is the same node');
-  assert.match(dnVal1.textContent, /88\.1%/, 'and its hit ratio moved');
+    // ARC: the very same card AND the very same donut ring inside it — a full
+    // `host.innerHTML =` on every poll (the pre-fix behaviour) keeps the outer
+    // container's identity but destroys everything inside it, which the two
+    // checks below catch that a container-only check would miss.
+    assert.ok(root.querySelector('#nas-ov-arc') === arcHost, 'the ARC card container is the same node');
+    assert.ok(arcHost.querySelector('.donut') === donut1, 'the donut ring is the same node');
+    assert.ok(arcHost.querySelector('.dn-val') === dnVal1, 'its value element is the same node');
+    assert.match(dnVal1.textContent, /88\.1%/, 'and its hit ratio moved');
 
-  // The running job: the very same row and Cancel button, its progress moved.
-  const jobRow2 = root.querySelector('#nas-ov-jobs .job-row');
-  assert.ok(jobRow2 === jobRow1, 'the job row survives the poll');
-  assert.ok(jobRow2.querySelector('[data-act="cancel"]') === cancelBtn1, 'its Cancel button is the same node');
-  const bar2 = jobRow2.querySelector('tf-progress-bar');
-  assert.ok(bar2 === bar1, 'the progress bar is the same node');
-  assert.equal(bar2.getAttribute('value'), '55', 'and its value moved');
+    // The running job: the very same row and Cancel button, its progress moved.
+    const jobRow2 = root.querySelector('#nas-ov-jobs .job-row');
+    assert.ok(jobRow2 === jobRow1, 'the job row survives the poll');
+    assert.ok(jobRow2.querySelector('[data-act="cancel"]') === cancelBtn1, 'its Cancel button is the same node');
+    const bar2 = jobRow2.querySelector('tf-progress-bar');
+    assert.ok(bar2 === bar1, 'the progress bar is the same node');
+    assert.equal(bar2.getAttribute('value'), '55', 'and its value moved');
 
-  // The alert: the very same row and buttons, its age moved.
-  const alertRow2 = root.querySelector('#nas-ov-alerts .alert-row');
-  assert.ok(alertRow2 === alertRow1, 'the alert row survives the poll');
-  assert.ok(alertRow2.querySelector('[data-goto]') === gotoBtn1, 'its "Szczegóły" button is the same node');
-  assert.ok(alertRow2.querySelector('[data-ack]') === ackBtn1, 'its "Potwierdź" button is the same node');
-  assert.notEqual(alertRow2.querySelector('.a-sub').textContent, agoText1, 'and the relative time moved');
-  Screen.unmount();
+    // The alert: the very same row and buttons, its age moved.
+    const alertRow2 = root.querySelector('#nas-ov-alerts .alert-row');
+    assert.ok(alertRow2 === alertRow1, 'the alert row survives the poll');
+    assert.ok(alertRow2.querySelector('[data-goto]') === gotoBtn1, 'its "Szczegóły" button is the same node');
+    assert.ok(alertRow2.querySelector('[data-ack]') === ackBtn1, 'its "Potwierdź" button is the same node');
+    assert.notEqual(alertRow2.querySelector('.a-sub').textContent, agoText1, 'and the relative time moved');
+  } finally {
+    Screen.unmount();
+  }
 });
 
 // MINOR 6 (critic-round2-wave1-2026-09-22.md): `alertRowSkeleton`'s comment
@@ -1969,7 +1978,7 @@ test('a pooled disk shows the vdev error counters and opens the replace wizard',
   stubTransport({
     ...fixtures,
     tentaNasDiskGetRequest: {
-      disk: disk({ diskId: 'sdd', name: 'sdd', serial: 'ZR9AB12K', role: 'pool', memberOf: 'tank', health: 'warning', healthReason: '3 nowe realokowane sektory w 7 dni', vdevRole: 'data', vdevKind: 'raidz2' }),
+      disk: disk({ diskId: 'sdd', name: 'sdd', serial: 'ZR9AB12K', role: 'pool', memberOf: 'tank', health: 'warning', healthReason: 'reallocated sectors growing (0 → 3 in 7 days)', vdevRole: 'data', vdevKind: 'raidz2' }),
       attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
     },
     tentaNasPoolGetRequest: { pool, properties: [], datasets: [], alerts: [], history: [] },
@@ -1979,7 +1988,7 @@ test('a pooled disk shows the vdev error counters and opens the replace wizard',
   await flush();
   assert.equal(kinds('tentaNasPoolGetRequest')[0].payload.name, 'tank');
   // n04:175 — the identification chip carries the status AND its reason.
-  assert.equal(root.querySelector('.section-card-head tf-chip').getAttribute('label'), 'Uwaga: 3 nowe realokowane sektory w 7 dni');
+  assert.equal(root.querySelector('.section-card-head tf-chip').getAttribute('label'), 'Uwaga: realok. 0 → 3');
   assert.match(root.textContent, /Dlaczego status „Uwaga”\?/);
   const roleField = [...root.querySelectorAll('.id-fields .f')].find((f) => f.querySelector('.k').textContent === 'Rola');
   assert.equal(roleField.querySelector('.v').textContent, 'tank · RAIDZ2');
@@ -2011,26 +2020,33 @@ test('the disk-detail breadcrumb walks back to the disk list and to the fleet', 
     ...fixtures,
     tentaNasDiskGetRequest: { disk: disk({}), attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30 },
   });
-  const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sda' });
-  await flush();
-  await flush();
-  // The header crumb says "TentaNas › orion"; the tab body adds "Dyski › sda",
-  // the same tail shape the pool detail uses.
-  const crumbs = [...root.querySelectorAll('.nas-crumbs')];
-  assert.equal(crumbs.length, 2, 'header crumb plus the tab-local tail');
-  assert.deepEqual([...crumbs[0].querySelectorAll('.tf-breadcrumb-item')].map((a) => a.textContent), ['TentaNas', 'orion']);
-  const tail = [...crumbs[1].querySelectorAll('.tf-breadcrumb-item')];
-  assert.deepEqual(tail.map((a) => a.textContent), ['Dyski', 'sda']);
-  assert.equal(crumbs[1].querySelector('a.tf-breadcrumb-item').getAttribute('href'), `#/tentanas?node=${LOCAL}&tab=disks`);
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sda' });
+    await flush();
+    await flush();
+    // m26 / n04:125-134: ONE bar, "TentaNas › orion › Dyski › sda" — the
+    // shell's own, with the detail's tail in it, never a second bar under it.
+    const crumbs = [...root.querySelectorAll('tf-breadcrumb')];
+    assert.equal(crumbs.length, 1, 'a single breadcrumb on the screen');
+    const bar = crumbs[0];
+    assert.deepEqual([...bar.querySelectorAll('.tf-breadcrumb-item')].map((a) => a.textContent), ['TentaNas', 'orion', 'Dyski', 'sda']);
+    const links = () => [...bar.querySelectorAll('a.tf-breadcrumb-item')];
+    assert.equal(links()[2].getAttribute('href'), `#/tentanas?node=${LOCAL}&tab=disks`);
 
-  click(crumbs[1].querySelector('a.tf-breadcrumb-item'));
-  await flush();
-  assert.equal(Screen.diskId, null, 'the "Dyski" crumb returns to the disk list');
+    click(links()[2]);
+    await flush();
+    assert.equal(Screen.diskId, null, 'the "Dyski" crumb returns to the disk list');
+    assert.ok(root.querySelector('tf-breadcrumb') === bar, 'the same bar stays on screen');
+    assert.deepEqual([...bar.querySelectorAll('.tf-breadcrumb-item')].map((a) => a.textContent), ['TentaNas', 'orion'], 'and loses the tail with the detail');
 
-  click(crumbs[0].querySelector('a.tf-breadcrumb-item'));
-  await flush();
-  assert.equal(Screen.nodeId, null, 'the "TentaNas" crumb returns to the fleet');
-  Screen.unmount();
+    click(links()[0]);
+    await flush();
+    assert.equal(Screen.nodeId, null, 'the "TentaNas" crumb returns to the fleet');
+  } finally {
+    // A failed assertion above must not leave the disk-detail poll running:
+    // the test process would never exit.
+    Screen.unmount();
+  }
 });
 
 // --- n04 refreshes itself, and refreshes the way this screen refreshes -------
@@ -2044,7 +2060,7 @@ test('the disk-detail breadcrumb walks back to the disk list and to the fleet', 
 // counters are part of what the poll has to keep fresh.
 const detailState = {
   health: 'warning',
-  healthReason: '3 nowe realokowane sektory w 7 dni',
+  healthReason: 'reallocated sectors growing (0 → 3 in 7 days)',
   reallocated: 3,
   cksum: 2,
   history: [
@@ -2090,7 +2106,7 @@ function diskDetailFixtures() {
 
 async function openDiskDetail() {
   detailState.health = 'warning';
-  detailState.healthReason = '3 nowe realokowane sektory w 7 dni';
+  detailState.healthReason = 'reallocated sectors growing (0 → 3 in 7 days)';
   detailState.reallocated = 3;
   detailState.cksum = 2;
   detailState.history = [
@@ -2119,7 +2135,7 @@ test('a disk-detail poll that brings the same disk replaces no node of the scree
   const stTable = root.querySelector('#nas-st-table');
   const chart = root.querySelector('#nas-disk-temp-chart tf-line-chart');
   assert.ok(chip && reallocated && rows && attrTable && stTable && chart, 'the screen is fully drawn before the poll');
-  assert.equal(chip.getAttribute('label'), 'Uwaga: 3 nowe realokowane sektory w 7 dni');
+  assert.equal(chip.getAttribute('label'), 'Uwaga: realok. 0 → 3');
   assert.equal(cksum.textContent, '2');
 
   // Records are COLLECTED IN THE CALLBACK for the reason the fleet tests
@@ -2165,20 +2181,21 @@ test('a disk-detail poll moves the values that changed and leaves their surround
   assert.equal(root.querySelector('#nas-disk-temp-chart polyline.tf-chart__series-line').getAttribute('points').trim().split(' ').length, 3);
 
   detailState.health = 'critical';
-  detailState.healthReason = '8 realokowanych sektorów, rośnie';
+  detailState.healthReason = 'reallocated sectors growing (3 → 8 in 7 days)';
   detailState.reallocated = 8;
   detailState.cksum = 5;
   detailState.history = [...detailState.history, { at: '2026-09-02 11:00:00', temperatureC: 41, reallocatedSectors: 8 }];
   await Screen.refreshDiskDetail(body);
   await flush();
 
-  assert.equal(chip.getAttribute('label'), 'Awaria: 8 realokowanych sektorów, rośnie', 'the health chip carries the new status and reason');
+  assert.equal(chip.getAttribute('label'), 'Awaria: realok. 3 → 8', 'the health chip carries the new status and reason');
   assert.equal(chip.getAttribute('status'), 'err');
-  assert.equal(chip.textContent, 'Awaria: 8 realokowanych sektorów, rośnie', 'and the component rendered it');
+  assert.equal(chip.textContent, 'Awaria: realok. 3 → 8', 'and the component rendered it');
   assert.equal(root.querySelector('[data-f="reallocated"]').textContent, '8', 'the reallocated counter moved');
   assert.equal(root.querySelector('#nas-dd-pool [data-c="cksum"]').textContent, '5', 'and so did the pool checksum counter');
   assert.equal(root.querySelector('#nas-dd-pool [data-c="cksum"]').getAttribute('class'), 'v num-err');
-  assert.equal(why.textContent, '8 realokowanych sektorów, rośnie', 'the explanation box follows the reason');
+  assert.equal(why.textContent, 'realok. 3 → 8', 'the explanation box follows the reason, in the reader\'s language');
+  assert.equal(why.getAttribute('title'), 'reallocated sectors growing (3 → 8 in 7 days)', 'the node\'s sentence is its tooltip');
   // The surroundings survive: same chip, same grid, same counter cell, same
   // rows — only their contents differ.
   assert.equal(same(root.querySelector('#nas-dd-health'), chip), true, 'the chip was patched, not replaced');
@@ -2201,7 +2218,7 @@ test('a failed disk-detail poll keeps the last good screen and keeps asking', as
   await Screen.refreshDiskDetail(body);
   await flush();
   assert.match(root.querySelector('#nas-dd-error tf-alert').getAttribute('message'), /node nie odpowiada/, 'the failure is stated');
-  assert.equal(chip.getAttribute('label'), 'Uwaga: 3 nowe realokowane sektory w 7 dni', 'the last good health stays on screen');
+  assert.equal(chip.getAttribute('label'), 'Uwaga: realok. 0 → 3', 'the last good health stays on screen');
   assert.equal(root.querySelector('[data-f="reallocated"]').textContent, '3', 'and the last good counter');
   assert.equal(root.querySelector('#nas-dd-pool [data-c="cksum"]').textContent, '2', 'and the last good pool counters');
   assert.ok(root.querySelector('#nas-attr-table'), 'the SMART table is not blanked');
@@ -2763,7 +2780,7 @@ test('a failing disk makes the health tile a failure, not a warning', async () =
     assert.equal(tile.getAttribute('value'), '1', 'the failure count leads the tile');
     assert.match(tile.getAttribute('suffix'), /awari/i, 'and it is named a failure');
     // Failures come first in the detail line, so the dying disk is the one read.
-    assert.match(tile.getAttribute('delta'), /^[^·]*835 media errors/);
+    assert.match(tile.getAttribute('delta'), /^[^·]*835 bł\. nośnika/);
   } finally {
     Screen.unmount();
   }
@@ -2902,6 +2919,742 @@ test('the job-log window appends the growing tail instead of rewriting the whole
     // pending timer fires — this MUST run even when an assertion above
     // throws, or that timer keeps firing every 1.5 s forever and the test
     // process never exits.
+    Screen.unmount();
+  }
+});
+
+// --- Real functionality critic 2026-09-21 + mockups n01-n10 critic ----------
+
+// Every toast, recorded at the append (see the bulk SMART test for why the
+// container itself cannot be read). Returns the list and a restore function.
+function recordToasts() {
+  const toasts = [];
+  const append = window.Node.prototype.appendChild;
+  window.Node.prototype.appendChild = function (child) {
+    const kind = /(?:^|\s)toast-(\w+)/.exec(child?.className || '')?.[1];
+    if (kind && kind !== 'container') toasts.push({ kind, text: child.textContent });
+    return append.call(this, child);
+  };
+  return { toasts, restore: () => { window.Node.prototype.appendChild = append; } };
+}
+
+const diskGet = (d, extra = {}) => ({ disk: d, attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30, ...extra });
+
+// A1 / M5: an Elastic Array member's `memberOf` is the ARRAY name. n04 asked
+// for a ZFS pool of that name on every poll (always failing), offered
+// "Wymień dysk…" (withdrawn for arrays; it ended in a "no vdev" toast) and
+// titled a card "Błędy z warstwy puli" over "Dysk nie należy do żadnej puli".
+test('n04 of an Elastic Array member asks for no pool, offers no replace and names its array', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDiskGetRequest: diskGet(disk({ diskId: 'sdk', name: 'sdk', role: 'array_member', memberOf: 'produkt', arrayRole: 'data' })),
+    tentaNasPoolGetRequest: () => { throw new Error('no such pool'); },
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sdk' });
+    await flush();
+    await flush();
+    await Screen.refreshDiskDetail(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.equal(kinds('tentaNasPoolGetRequest').length, 0, 'no pool read, not on the draw and not on a poll');
+    assert.equal(absent(root, '[data-act="replace"]'), true, 'no replace button for an array disk');
+    assert.equal(root.querySelector('#nas-dd-pool-title').textContent, 'Macierz Elastic (produkt)');
+    const card = root.querySelector('#nas-dd-pool');
+    assert.doesNotMatch(card.textContent, /nie należy do żadnej puli/, 'the card no longer contradicts its title');
+    assert.match(card.textContent, /Wymiana dysku macierzy nie jest udostępniona w tej wersji/);
+    assert.deepEqual([...card.querySelectorAll('.sr .v')].map((v) => v.textContent), ['produkt', 'Dane']);
+    const open = card.querySelector('[data-act="open-array"]');
+    assert.equal(open.textContent, 'Zobacz macierz produkt');
+    click(open);
+    await flush();
+    assert.equal(Screen.array, 'produkt', 'the card opens the array');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+test('n04 of another organisation\'s array disk says only that, with no name, no pool read and no replace', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDiskGetRequest: diskGet(disk({ diskId: 'sdm', name: 'sdm', role: 'other_org_array', memberOf: null, arrayRole: '' })),
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sdm' });
+    await flush();
+    await flush();
+    assert.equal(kinds('tentaNasPoolGetRequest').length, 0);
+    assert.equal(absent(root, '[data-act="replace"]'), true);
+    assert.equal(root.querySelector('#nas-dd-pool-title').textContent, 'Macierz innej organizacji');
+    assert.match(root.querySelector('#nas-dd-pool').textContent, /należy do macierzy Elastic innej organizacji/);
+    assert.equal(absent(root, '#nas-dd-pool [data-act="open-array"]'), true, 'nothing to open: the name is not ours to know');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// B1: a failed `ledctl` answers `active:false` with its stderr in `detail`.
+test('a failed locate LED is an error toast with the node\'s reason, never a green "LED off"', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDiskLocateRequest: { method: 'ledctl', active: false, detail: 'ledctl: no enclosure for /dev/sda' },
+  });
+  const rec = recordToasts();
+  try {
+    await mountScreen({ node: LOCAL, tab: 'disks' });
+    await Screen.locateDisk(disk({}), true);
+    await flush();
+  } finally {
+    rec.restore();
+    Screen.unmount();
+  }
+  assert.equal(rec.toasts.filter((t) => t.kind === 'success').length, 0, 'no success toast');
+  assert.match(rec.toasts.filter((t) => t.kind === 'error').map((t) => t.text).join('\n'), /Dioda sda: polecenie nie powiodło się — ledctl: no enclosure/);
+  assert.equal(Boolean(Screen.locateState.sda), false, 'the LED is not recorded as blinking');
+});
+
+test('a locate that worked still says so', async () => {
+  stubTransport({ ...fixtures, tentaNasDiskLocateRequest: { method: 'ledctl', active: true, detail: '' } });
+  const rec = recordToasts();
+  try {
+    await mountScreen({ node: LOCAL, tab: 'disks' });
+    await Screen.locateDisk(disk({}), true);
+    await flush();
+  } finally {
+    rec.restore();
+    Screen.unmount();
+  }
+  assert.match(rec.toasts.filter((t) => t.kind === 'success').map((t) => t.text).join('\n'), /Dioda sda miga/);
+  assert.equal(Screen.locateState.sda, true);
+});
+
+// M4: n04 shows the SMART test in flight with the shared job row and refuses
+// a second one while it runs.
+test('n04 shows the running SMART job with the shared job row and greys both test buttons', async () => {
+  let jobs = fixtures.tentaNasJobsListRequest.jobs; // a running smart_test on sda
+  stubTransport({
+    ...fixtures,
+    tentaNasDiskGetRequest: diskGet(disk({})),
+    tentaNasJobsListRequest: () => ({ jobs }),
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sda' });
+    await flush();
+    await flush();
+    const body = root.querySelector('#nas-tab-body');
+    const rows = root.querySelectorAll('#nas-dd-jobs .job-row');
+    assert.equal(rows.length, 1, 'the running test is listed');
+    assert.equal(rows[0].dataset.job, 'j1');
+    assert.match(rows[0].querySelector('.job-name').textContent, /sda/);
+    assert.equal(rows[0].querySelector('tf-progress-bar').getAttribute('value'), '40', 'painted by the shared paintJobRow');
+    const short = root.querySelector('[data-act="smart-short"]');
+    const long = root.querySelector('[data-act="smart-long"]');
+    assert.equal(short.hasAttribute('disabled') && long.hasAttribute('disabled'), true, 'no second test while one runs');
+    assert.match(long.getAttribute('title'), /już trwa/);
+
+    // Progress moves: the same row, patched.
+    const row = rows[0];
+    jobs = [{ ...jobs[0], progressPct: 70 }];
+    Screen.clearTimers();
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.ok(root.querySelector('#nas-dd-jobs .job-row') === row, 'the job row is kept across the poll');
+    assert.equal(row.querySelector('tf-progress-bar').getAttribute('value'), '70');
+
+    // The test ends: the row goes and the buttons come back.
+    jobs = [];
+    Screen.clearTimers();
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.equal(root.querySelectorAll('#nas-dd-jobs .job-row').length, 0);
+    assert.equal(root.querySelector('[data-act="smart-long"]').hasAttribute('disabled'), false, 'a new test can start again');
+    // A job for ANOTHER disk does not grey this one's buttons.
+    jobs = [{ ...fixtures.tentaNasJobsListRequest.jobs[0], jobId: 'j9', subject: 'sdb' }];
+    Screen.clearTimers();
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.equal(root.querySelector('[data-act="smart-long"]').hasAttribute('disabled'), false);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+test('n04 greys the test buttons while the drive itself reports a running self-test', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasJobsListRequest: { jobs: [] },
+    tentaNasDiskGetRequest: diskGet(disk({}), { selfTests: [{ startedAt: null, kind: 'Extended offline', status: 'running', detail: '40% remaining', lifetimeHours: 100 }] }),
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sda' });
+    await flush();
+    await flush();
+    assert.equal(root.querySelector('[data-act="smart-long"]').hasAttribute('disabled'), true);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+test('starting a SMART test on n04 greys the buttons at once, so a double click cannot start two', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  stubTransport({
+    ...fixtures,
+    tentaNasJobsListRequest: { jobs: [] },
+    tentaNasDiskGetRequest: diskGet(disk({})),
+    tentaNasDiskSmartTestRequest: () => gate.then(() => ({ job: { jobId: 'j2', kind: 'smart_test', subject: 'sda', status: 'queued', log: [] } })),
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sda' });
+    await flush();
+    await flush();
+    click(root.querySelector('[data-act="smart-long"]'));
+    await flush();
+    const long = root.querySelector('[data-act="smart-long"]');
+    assert.equal(long.hasAttribute('disabled'), true, 'grey while the request is out');
+    click(long);
+    click(root.querySelector('[data-act="smart-short"]'));
+    release();
+    await flush();
+    await flush();
+    assert.equal(kinds('tentaNasDiskSmartTestRequest').length, 1, 'exactly one test was asked for');
+    assert.equal(root.querySelector('[data-act="smart-long"]').hasAttribute('disabled'), true, 'and it stays grey until a poll shows the job');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// M13: n03 problem rows carry a tone the shadow root can style, and a chip
+// with the short reason ("3 realok." / "54°C").
+test('n03 problem rows carry their tone class and a short reason chip', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      ...fixtures.tentaNasDisksListRequest,
+      disks: [
+        disk({}),
+        disk({ diskId: 'sdd', name: 'sdd', health: 'warning', healthReason: '3 reallocated sectors' }),
+        disk({ diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: '54°C; 1 UDMA CRC errors (cable/backplane)' }),
+        disk({ diskId: 'sdg', name: 'sdg', health: 'critical', healthReason: '2 pending sectors' }),
+        disk({ diskId: 'sdh', name: 'sdh', health: 'unknown', healthReason: 'no SMART data' }),
+      ],
+    },
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+    await flush();
+    const table = root.querySelector('#nas-disk-table');
+    const byName = (n) => table.rows.find((r) => r._disk.name === n);
+    assert.equal(byName('sda')._class, '');
+    assert.equal(byName('sdd')._class, 'row-warn');
+    assert.equal(byName('sdg')._class, 'row-danger');
+    assert.equal(byName('sdh')._class, '', 'an unknown disk is not a problem row');
+    const chip = (n) => table.rowActions(byName(n), 0, () => byName(n)).querySelector('[data-role="reason"]');
+    assert.equal(chip('sdd').getAttribute('label'), '3 realok.');
+    assert.equal(chip('sdd').getAttribute('status'), 'warn');
+    assert.equal(chip('sdf').getAttribute('label'), '54°C', 'the first symptom is the reason');
+    assert.equal(chip('sdf').getAttribute('title'), '54°C; 1 UDMA CRC errors (cable/backplane)', 'the whole reason stays in the tooltip');
+    assert.equal(chip('sdg').getAttribute('label'), '2 oczek. sekt.');
+    assert.equal(chip('sdg').getAttribute('status'), 'err');
+    assert.equal(chip('sda'), null, 'a healthy row has no chip');
+    assert.equal(chip('sdh'), null);
+    // The class reaches the <tr> inside the shadow root.
+    await flush();
+    const trs = [...table.shadowRoot.querySelectorAll('tbody tr')];
+    assert.ok(trs.some((tr) => tr.classList.contains('row-warn')), 'a warn row is rendered with its class');
+    assert.ok(trs.some((tr) => tr.classList.contains('row-danger')));
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// critic-round2-wave2 MAJOR 1: every sentence `score_health` and
+// `grade_disk_health` (tentanas/disks.rs) can put FIRST in a disk's reason has
+// a localized chip word. The temperature-over-limit and the ZFS leaf states
+// were added on the server without one, and a FAULTED disk — the gravest state
+// on the screen — wore an English chip in every locale.
+const SERVER_REASONS = [
+  ['critical', 'SMART overall status FAILED', 'SMART: awaria'],
+  ['critical', 'last self-test failed', 'self-test niezaliczony'],
+  ['warning', '2 pending sectors', '2 oczek. sekt.'],
+  ['warning', '4 media errors', '4 bł. nośnika'],
+  ['warning', 'reallocated sectors growing (3 → 8 in 7 days)', 'realok. 3 → 8'],
+  ['warning', '3 reallocated sectors', '3 realok.'],
+  ['warning', '63°C (over the 60°C limit)', '63°C, ponad limit 60°C'],
+  ['warning', '54°C', '54°C'],
+  ['warning', '1 UDMA CRC errors (cable/backplane)', '1 CRC'],
+  ['warning', '87% worn', 'zużycie 87%'],
+  ['critical', 'ZFS reports this disk FAULTED', 'ZFS: awaria (FAULTED)'],
+  ['critical', 'ZFS reports this disk UNAVAIL', 'ZFS: niedostępny (UNAVAIL)'],
+];
+
+async function reasonChipOf(health, healthReason) {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, disks: [disk({ diskId: 'sdq', name: 'sdq', health, healthReason })] },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  await flush();
+  return root.querySelector('#nas-disk-table').shadowRoot.querySelector('.row-actions [data-role="reason"]');
+}
+
+for (const [health, sentence, label] of SERVER_REASONS) {
+  test(`the server reason "${sentence}" has a localized n03 chip`, async () => {
+    try {
+      const chip = await reasonChipOf(health, sentence);
+      assert.ok(chip, 'a problem row carries a reason chip');
+      assert.equal(chip.getAttribute('label'), label);
+      assert.equal(chip.getAttribute('status'), health === 'critical' ? 'err' : 'warn');
+      assert.equal(chip.getAttribute('title'), sentence, 'the node\'s sentence stays in the tooltip');
+    } finally {
+      Screen.unmount();
+    }
+  });
+}
+
+test('a faulted disk that SMART also complains about leads with the ZFS state', async () => {
+  try {
+    const chip = await reasonChipOf('critical', 'ZFS reports this disk FAULTED; 3 reallocated sectors');
+    assert.equal(chip.getAttribute('label'), 'ZFS: awaria (FAULTED)');
+    assert.equal(chip.getAttribute('title'), 'ZFS reports this disk FAULTED; 3 reallocated sectors');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// A sentence this build has no word for is not printed as the chip: English is
+// not a label in pl/de/es/fr. The chip reads the translated grade, and the
+// node's sentence is kept whole in the tooltip.
+test('an unknown server reason falls back to the translated grade, the sentence only in the tooltip', async () => {
+  for (const [health, grade] of [['warning', 'Uwaga'], ['critical', 'Awaria']]) {
+    try {
+      const chip = await reasonChipOf(health, 'spindle motor stalled; 54°C');
+      assert.equal(chip.getAttribute('label'), grade, health);
+      assert.equal(chip.getAttribute('title'), 'spindle motor stalled; 54°C');
+    } finally {
+      Screen.unmount();
+    }
+  }
+});
+
+// The n04 identification chip names the symptom through the same words, and
+// falls back the same way.
+test('the n04 health chip localizes the server reason and never prints an unknown one', async () => {
+  for (const [reason, label] of [
+    ['ZFS reports this disk UNAVAIL; 2 pending sectors', 'Awaria: ZFS: niedostępny (UNAVAIL)'],
+    ['spindle motor stalled', 'Awaria'],
+  ]) {
+    stubTransport({
+      ...fixtures,
+      tentaNasDiskGetRequest: {
+        disk: disk({ health: 'critical', healthReason: reason }),
+        attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
+      },
+    });
+    try {
+      const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sda' });
+      await flush();
+      await flush();
+      const chip = root.querySelector('#nas-dd-health');
+      assert.equal(chip.getAttribute('label'), label, reason);
+      assert.equal(chip.getAttribute('title'), reason, 'the whole sentence is the tooltip');
+    } finally {
+      Screen.unmount();
+    }
+  }
+});
+
+test('the new reason words are translated in every locale, with the same placeholders', () => {
+  const root = new URL('../../', import.meta.url);
+  const words = {};
+  for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
+    words[lang] = JSON.parse(readFileSync(new URL(`i18n/${lang}.json`, root), 'utf8')).tentanas.disks;
+  }
+  for (const key of ['reason_temp_over', 'reason_zfs_faulted', 'reason_zfs_unavail']) {
+    const values = Object.values(words).map((w) => w[key]);
+    assert.ok(values.every((v) => typeof v === 'string' && v.trim()), `${key} exists everywhere`);
+    assert.equal(new Set(values).size, values.length, `${key} is really translated, not copied: ${values}`);
+  }
+  for (const lang of Object.keys(words)) {
+    assert.match(words[lang].reason_temp_over, /\{t\}.*\{limit\}/, lang);
+  }
+});
+
+// The n04 "why" box listed the node's English sentences verbatim — the same
+// defect as the chip (critic-round2-wave2 MAJOR 1). Every symptom now goes
+// through the chip's words; one this build cannot name is left out of the
+// text, the grade stands in when none is known, and the node's sentence is
+// the tooltip. The box is patched, never rebuilt.
+test('the n04 "why" box lists every symptom in the reader\'s language', async () => {
+  let reason = 'ZFS reports this disk FAULTED; 3 reallocated sectors; 63°C (over the 60°C limit)';
+  let health = 'critical';
+  stubTransport({
+    ...fixtures,
+    tentaNasDiskGetRequest: () => ({
+      disk: disk({ health, healthReason: reason }),
+      attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
+    }),
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sda' });
+    await flush();
+    await flush();
+    const why = root.querySelector('#nas-dd-why');
+    const body = root.querySelector('#nas-tab-body');
+    assert.equal(why.textContent, 'ZFS: awaria (FAULTED); 3 realok.; 63°C, ponad limit 60°C');
+    assert.equal(why.getAttribute('title'), reason);
+
+    reason = 'spindle motor stalled';
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.ok(root.querySelector('#nas-dd-why') === why, 'the box is patched, not rebuilt');
+    assert.equal(why.textContent, 'Awaria', 'an unknown symptom falls back to the grade');
+    assert.equal(why.getAttribute('title'), 'spindle motor stalled', 'and stays in the tooltip only');
+
+    reason = 'spindle motor stalled; 2 pending sectors';
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.equal(why.textContent, '2 oczek. sekt.', 'a known symptom is named, the unknown one is not printed');
+
+    health = 'unknown';
+    reason = 'no SMART data';
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.equal(why.textContent, 'brak danych SMART');
+
+    health = 'ok';
+    reason = '';
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.equal(why.textContent, 'Wszystkie źródła (SMART, liczniki puli, błędy I/O kernela) są czyste.');
+    assert.equal(why.hasAttribute('title'), false);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// The n02 disk-health tile named up to three problem disks with the node's
+// English reasons. They read in the reader's language now; the node's
+// sentences are the tile's tooltip, and an unknown one never reaches the text.
+test('the n02 disk-health tile names its problem disks in the reader\'s language', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      ...fixtures.tentaNasDisksListRequest,
+      disks: [
+        disk({ health: 'critical', healthReason: 'ZFS reports this disk UNAVAIL; 835 media errors' }),
+        disk({ diskId: 'sdz', name: 'sdz', path: '/dev/sdz', health: 'warning', healthReason: 'spindle motor stalled' }),
+      ],
+    },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const tile = root.querySelector('#nas-ov-kpi [data-kpi="disks"]');
+    assert.equal(tile.getAttribute('delta'), 'sda: ZFS: niedostępny (UNAVAIL); 835 bł. nośnika · sdz: Uwaga');
+    assert.equal(tile.getAttribute('title'), 'sda: ZFS reports this disk UNAVAIL; 835 media errors · sdz: spindle motor stalled');
+    assert.doesNotMatch(tile.getAttribute('delta'), /media errors|spindle|reports/);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// critic-round2-wave2 MINOR 10: `rowActionsKey` used to carry the chip's label,
+// so every 1 °C step of a warm disk destroyed and rebuilt its row buttons (and
+// the focus on one of them). The key now covers what the buttons render and
+// close over; the chip's words are patched onto the kept element.
+test('a temperature step patches the reason chip and keeps the row buttons', async () => {
+  let reason = '54°C';
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: () => ({
+      ...fixtures.tentaNasDisksListRequest,
+      disks: [disk({ diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: reason })],
+    }),
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+    await flush();
+    const shadow = root.querySelector('#nas-disk-table').shadowRoot;
+    const wrap = shadow.querySelector('.row-actions');
+    const button = wrap.querySelector('[data-act="details"]');
+    const chip = wrap.querySelector('[data-role="reason"]');
+    assert.equal(chip.getAttribute('label'), '54°C');
+
+    reason = '55°C; 1 UDMA CRC errors (cable/backplane)';
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.ok(shadow.querySelector('.row-actions') === wrap, 'the very same actions element');
+    assert.ok(shadow.querySelector('[data-act="details"]') === button, 'and the same button under the cursor');
+    assert.ok(shadow.querySelector('[data-role="reason"]') === chip, 'and the same chip');
+    assert.equal(chip.getAttribute('label'), '55°C', 'whose words follow the poll');
+    assert.equal(chip.getAttribute('title'), '55°C; 1 UDMA CRC errors (cable/backplane)');
+
+    reason = '63°C (over the 60°C limit)';
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.ok(shadow.querySelector('.row-actions') === wrap);
+    assert.equal(chip.getAttribute('label'), '63°C, ponad limit 60°C');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// A `_class` lands on a <tr> inside tf-table's shadow root, which adopts only
+// controls.css and the scoped cell sheets: a rule in tentanas.css can never
+// reach it. `row-danger` was once emitted and styled nowhere at all.
+test('every row class TentaNas puts on a table row is styled in the scoped cell sheet', () => {
+  const root = new URL('../../', import.meta.url);
+  const sources = [readFileSync(new URL('js/modules/tentanas.js', root), 'utf8')];
+  const classes = new Set();
+  for (const text of sources) {
+    // The VALUES a `_class` expression can take: a literal right after the
+    // key or after a `?` (the compared operands, `'critical'`, are not).
+    for (const m of text.matchAll(/_class:([^\n]*)/g)) {
+      for (const lit of `?${m[1]}`.matchAll(/\?\s*'([a-z][\w-]*)'/g)) classes.add(lit[1]);
+    }
+  }
+  assert.ok(classes.has('row-warn') && classes.has('row-danger'), `parsed the row classes: ${[...classes]}`);
+  const sheet = readFileSync(new URL('css/tentanas-cells.css', root), 'utf8');
+  const unstyled = [...classes].filter((c) => !new RegExp(`tr\\.${c}(?![\\w-])`).test(sheet));
+  assert.deepEqual(unstyled, [], 'css/tentanas-cells.css styles every row class on a <tr>');
+});
+
+// B2: an unreachable node's session count is unknown, not zero.
+test('an unreachable node shows "—" sessions in the fleet resources, not 0', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasSharesListRequest: (payload, options) => {
+      if (options.targetNodeId === REMOTE) throw new Error('mesh timeout');
+      return fixtures.tentaNasSharesListRequest;
+    },
+  });
+  try {
+    const root = await mountScreen();
+    await flush();
+    await flush();
+    const rows = root.querySelector('#nas-fleet-res-table').rows;
+    assert.equal(rows[0].sessions, 14);
+    assert.equal(rows[1].sessions, '—');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// B3: "services running" holds only when every expected service runs.
+test('the fleet services chip names each service that is down, and an unreachable node as unknown', async () => {
+  const smbUp = { protocol: 'smb', installed: true, running: true, version: '4.21', configPath: '', detail: '' };
+  const nfsDown = { protocol: 'nfs', installed: true, running: false, version: null, configPath: '', detail: '' };
+  const nfsAbsent = { protocol: 'nfs', installed: false, running: false, version: null, configPath: '', detail: '' };
+  let remote = { shares: [], services: [smbUp, nfsDown], users: [], mountRoot: '/mnt/tentanas' };
+  stubTransport({
+    ...fixtures,
+    tentaNasSharesListRequest: (payload, options) => {
+      if (options.targetNodeId === REMOTE) {
+        if (!remote) throw new Error('mesh timeout');
+        return remote;
+      }
+      return { ...fixtures.tentaNasSharesListRequest, services: [smbUp, nfsAbsent] };
+    },
+  });
+  const chip = (root) => [...root.querySelectorAll('#nas-fleet-chips tf-chip')][1];
+  try {
+    let root = await mountScreen();
+    await flush();
+    await flush();
+    assert.equal(chip(root).getAttribute('label'), 'Usługi nieaktywne: vega: NFS', 'one dead service is enough, and it is named');
+    assert.equal(chip(root).getAttribute('status'), 'warn');
+    Screen.unmount();
+
+    // Everything installed runs; NFS that is neither installed nor used is not expected.
+    remote = { shares: [], services: [smbUp, nfsAbsent], users: [], mountRoot: '/mnt/tentanas' };
+    root = await mountScreen();
+    await flush();
+    await flush();
+    assert.equal(chip(root).getAttribute('label'), 'Usługi aktywne');
+    assert.equal(chip(root).getAttribute('status'), 'ok');
+    Screen.unmount();
+
+    remote = null;
+    root = await mountScreen();
+    await flush();
+    await flush();
+    assert.equal(chip(root).getAttribute('label'), 'Usługi: brak odpowiedzi z vega', 'a silent node is not "active"');
+    assert.equal(chip(root).getAttribute('status'), 'warn');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// B4: no pools and no arrays is "—", never the sum of raw disk sizes.
+test('the capacity tile of a node with no pools says "—", not the sum of its raw disks', async () => {
+  stubTransport({ ...fixtures, tentaNasPoolsListRequest: { pools: [], freeDisks: [] }, tentaNasElasticArraysListRequest: { arrays: [] } });
+  try {
+    const root = await mountScreen({ node: LOCAL });
+    await flush();
+    const tile = root.querySelector('#nas-ov-kpi [data-kpi="pools"]');
+    assert.equal(tile.getAttribute('value'), '—');
+    assert.equal(tile.getAttribute('delta'), 'brak pul i macierzy');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// B6: the fleet header version is checked on every node, not read off the first.
+test('the fleet header names each version and its nodes when the fleet runs more than one', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasEnvironmentRequest: (payload, options) => ({
+      environment: { ...environment, elevation: { ...environment.elevation, coreVersion: options.targetNodeId === REMOTE ? '1.5.0' : '1.4.0' } },
+    }),
+  });
+  try {
+    const root = await mountScreen();
+    await flush();
+    await flush();
+    const sub = root.querySelector('.tf-detail-header .d-sub').textContent;
+    assert.match(sub, /TentaNas: 1\.4\.0 \(orion\) · 1\.5\.0 \(vega\)/);
+    assert.equal(kinds('tentaNasEnvironmentRequest').length, 2, 'one probe per supported node');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// m26: the pool detail's "Pule › tank" is the tail of the shell's one bar.
+test('the pool detail puts its tail into the one shell breadcrumb, and "Pule" walks back', async () => {
+  stubTransport({ ...fixtures, tentaNasPoolGetRequest: { pool, properties: [], datasets: [], alerts: [], history: [] } });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'pools', pool: 'tank' });
+    await flush();
+    await flush();
+    const bars = [...root.querySelectorAll('tf-breadcrumb')];
+    assert.equal(bars.length, 1, 'one bar on the screen');
+    assert.deepEqual([...bars[0].querySelectorAll('.tf-breadcrumb-item')].map((a) => a.textContent), ['TentaNas', 'orion', 'Pule', 'tank']);
+    const links = [...bars[0].querySelectorAll('a.tf-breadcrumb-item')];
+    assert.equal(links[1].getAttribute('href'), `#/tentanas?node=${LOCAL}`, 'the node level links to its dashboard');
+    click(links[2]);
+    await flush();
+    assert.equal(Screen.pool, null, '"Pule" returns to the pool list');
+    assert.equal(Screen.tab, 'pools');
+    assert.deepEqual([...root.querySelector('tf-breadcrumb').querySelectorAll('.tf-breadcrumb-item')].map((a) => a.textContent), ['TentaNas', 'orion']);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// Icons the TentaNas screens hand to components that read /img/icons.svg
+// (tf-stat-card, tf-empty-state) must exist there, or they render blank —
+// `layers` and `grid-2x2` did.
+test('every icon TentaNas gives a stat card or an empty state exists in /img/icons.svg', () => {
+  const root = new URL('../../', import.meta.url);
+  const dir = new URL('js/modules/tentanas/', root);
+  const files = [new URL('js/modules/tentanas.js', root)];
+  for (const f of readdirSync(dir)) if (f.endsWith('.js') && !f.endsWith('.test.js') && !f.startsWith('_')) files.push(new URL(f, dir));
+  const names = new Set();
+  for (const f of files) {
+    const text = readFileSync(f, 'utf8');
+    for (const m of text.matchAll(/<tf-empty-state\b[^>]*\bicon="([\w-]+)"/g)) names.add(m[1]);
+    // Stat-card attribute objects: `label:` … `icon: '…'` on one line.
+    for (const line of text.split('\n')) {
+      if (!/\blabel:/.test(line)) continue;
+      for (const m of line.matchAll(/\bicon: '([\w-]+)'/g)) names.add(m[1]);
+    }
+  }
+  assert.ok(names.has('layers') && names.has('grid-2x2'), `parsed the icon names: ${[...names]}`);
+  const sprite = readFileSync(new URL('img/icons.svg', root), 'utf8');
+  const missing = [...names].filter((n) => !sprite.includes(`id="icon-${n}"`)).sort();
+  assert.deepEqual(missing, []);
+});
+
+// critic-round2-wave2-iter2 MAJOR A: the replacement advice printed the
+// node's `advice.reason` — English, with the disk's whole health reason in it
+// (`replacement_advice`, tentanas/disks.rs). The text is now rebuilt from the
+// advice's fields and the disk (`replacementAdviceText`, format.js); the
+// node's sentence is only the tooltip. The fixtures below are the sentences
+// that function writes, part for part.
+const FAULTED_DISK = { diskId: 'sde', name: 'sde', health: 'critical', healthReason: 'ZFS reports this disk FAULTED; 3 reallocated sectors', memberOf: 'tank', role: 'data' };
+const FAULTED_ADVICE = {
+  diskId: 'sde', name: 'sde', severity: 'urgent',
+  reason: 'critical for 3 days; ZFS reports this disk FAULTED; 3 reallocated sectors',
+  warningDays: 3, reallocated: 3, reallocatedWeekAgo: 3, memberOf: 'tank', spareAvailable: false,
+};
+const GROWING_DISK = { diskId: 'sdd', name: 'sdd', health: 'warning', healthReason: 'reallocated sectors growing (3 → 8 in 7 days)', memberOf: 'tank', role: 'data', reallocatedSectors: 8 };
+const GROWING_ADVICE = {
+  diskId: 'sdd', name: 'sdd', severity: 'urgent',
+  reason: 'reallocated sectors grew from 3 to 8 in the last 7 days; reallocated sectors growing (3 → 8 in 7 days)',
+  warningDays: 0, reallocated: 8, reallocatedWeekAgo: 3, memberOf: 'tank', spareAvailable: true,
+};
+const OTHER_DISK = { diskId: 'sdf', name: 'sdf', health: 'warning', healthReason: '3 reallocated sectors', memberOf: 'tank', role: 'data' };
+const OTHER_ADVICE = {
+  diskId: 'sdf', name: 'sdf', severity: 'retire_soon',
+  reason: 'firmware recall for this model', warningDays: 9, reallocated: 3, reallocatedWeekAgo: 3, memberOf: 'tank', spareAvailable: false,
+};
+const ENGLISH_ADVICE = /ZFS reports|reallocated sectors|critical for|grew from|firmware recall/;
+
+test('n03 replacement advice reads in the reader\'s language, the node\'s sentence only in the tooltip', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      ...fixtures.tentaNasDisksListRequest,
+      disks: [disk({}), disk(FAULTED_DISK), disk(GROWING_DISK), disk(OTHER_DISK)],
+      advice: [FAULTED_ADVICE, GROWING_ADVICE, OTHER_ADVICE],
+    },
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+    await flush();
+    const row = (id) => root.querySelector(`#nas-disk-advice [data-advice="${id}"]`);
+    const reason = (id) => row(id).querySelector('[data-role="advice-reason"]');
+    const kind = (id) => row(id).querySelector('tf-chip').getAttribute('label');
+
+    assert.equal(reason('sde').textContent, 'Awaria od 3 dni; ZFS: awaria (FAULTED); 3 realok.');
+    assert.equal(reason('sde').getAttribute('title'), FAULTED_ADVICE.reason);
+    assert.equal(kind('sde'), 'pilne');
+
+    assert.equal(reason('sdd').textContent, 'realokacje wzrosły z 3 do 8 w 7 dni', 'the growth is said once, from the fields');
+    assert.equal(reason('sdd').getAttribute('title'), GROWING_ADVICE.reason);
+
+    assert.equal(reason('sdf').textContent, 'węzeł zaleca wymianę tego dysku', 'an unknown advice kind reads as the generic recommendation');
+    assert.equal(reason('sdf').getAttribute('title'), OTHER_ADVICE.reason);
+    assert.equal(kind('sdf'), 'zalecenie', 'and its chip is a word, not a raw key');
+
+    assert.ok(!ENGLISH_ADVICE.test(root.querySelector('#nas-disk-advice').textContent), 'no English advice is visible text');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+test('n04 replacement advice reads in the reader\'s language, the node\'s sentence only in the tooltip', async () => {
+  let current = { disk: FAULTED_DISK, advice: FAULTED_ADVICE };
+  stubTransport({
+    ...fixtures,
+    tentaNasDiskGetRequest: () => ({
+      disk: disk(current.disk), advice: current.advice,
+      attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
+    }),
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sde' });
+    await flush();
+    await flush();
+    const box = () => root.querySelector('#nas-dd-advice .wizard-warning');
+    assert.equal(box().textContent, 'Wymień ten dysk teraz: Awaria od 3 dni; ZFS: awaria (FAULTED); 3 realok.. brak spare w puli — przygotuj dysk zastępczy.');
+    assert.equal(box().getAttribute('title'), FAULTED_ADVICE.reason);
+    assert.ok(box().classList.contains('danger'));
+
+    const body = root.querySelector('#nas-tab-body');
+    current = { disk: GROWING_DISK, advice: GROWING_ADVICE };
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.equal(box().textContent, 'Wymień ten dysk teraz: realokacje wzrosły z 3 do 8 w 7 dni. pula ma spare gotowy do podmiany.');
+    assert.equal(box().getAttribute('title'), GROWING_ADVICE.reason);
+
+    current = { disk: OTHER_DISK, advice: OTHER_ADVICE };
+    await Screen.refreshDiskDetail(body);
+    await flush();
+    assert.equal(box().textContent, 'Węzeł zaleca wymianę tego dysku. brak spare w puli — przygotuj dysk zastępczy.');
+    assert.equal(box().getAttribute('title'), OTHER_ADVICE.reason);
+    assert.ok(!ENGLISH_ADVICE.test(root.querySelector('#nas-dd-advice').textContent));
+  } finally {
     Screen.unmount();
   }
 });

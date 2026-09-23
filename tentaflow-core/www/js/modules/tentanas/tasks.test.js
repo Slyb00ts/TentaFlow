@@ -14,7 +14,8 @@ import { fakeScreen, flush, click, confirmWindow, window } from './_test-setup.j
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow } = await import('./tasks.js');
+const { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow, scheduleOutcome } = await import('./tasks.js');
+const { jobCanCancel } = await import('./format.js');
 
 const jobs = [
   { jobId: 'j1', kind: 'pool_scrub', subject: 'tank', status: 'running', startedBy: 'admin', startedAt: '2026-09-02 08:00:00', finishedAt: null, progressPct: 40 },
@@ -774,4 +775,203 @@ test('an unchanged poll leaves the running-job icon untouched (MINOR 8)', async 
 
   assert.equal(mutations, 0, 'the icon class attribute was not touched by an unchanged poll');
   assert.ok(ico.classList.contains('running'), 'the icon is still marked running');
+});
+
+// ===== B2 (critic-mockups-n11-n19-2026-09-21.md): the scheduler stores its
+// own sentence, `started job <uuid>` / `failed to start: <error>`
+// (scheduler.rs). The row used to print `tentanas.schedules.result_started
+// job <uuid>`; it now shows the named job's real, translated status and never
+// the uuid or a key.
+const UUID_A = '0192f1c2-7a3b-7c11-9d2e-3f4a5b6c7d8e';
+const UUID_B = '0192f1c2-7a3b-7c11-9d2e-3f4a5b6c7d8f';
+const RAW_KEY = /tentanas\.|schedules\.|jobs\.|started job|[0-9a-f]{8}-[0-9a-f]{4}-/;
+
+test('a scheduled scrub row shows its job\'s real outcome, never the uuid or a raw key (B2)', async () => {
+  const listed = [{ jobId: UUID_A, kind: 'pool_scrub', subject: 'tank', status: 'failed', startedBy: 'scheduler', startedAt: '2026-08-30 02:00:00', finishedAt: '2026-08-30 03:00:00', error: 'checksum errors' }];
+  const sched = { ...schedules, rows: [
+    { ...schedules.rows[0], lastResult: `started job ${UUID_A}` },
+    // The trim's job is older than the jobs list: fetched once by id.
+    { ...schedules.rows[1], lastRunAt: '2026-08-01 03:30:00', lastResult: `started job ${UUID_B}` },
+  ] };
+  const gets = [];
+  const screen = fakeScreen(fixtures({
+    tentaNasJobsListRequest: { jobs: listed },
+    tentaNasSchedulesListRequest: sched,
+    tentaNasJobGetRequest: (p) => { gets.push(p.jobId); return { job: { jobId: p.jobId, kind: 'pool_trim', subject: 'fast', status: 'succeeded' } }; },
+  }));
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  try {
+    const body = mount();
+    await drawTasks(screen, body);
+    await flush(); await flush();
+    const [scrubRow, trimRow] = scheduleRows(body);
+    const scrubSub = scrubRow.querySelector('[data-role="sub"]').textContent;
+    const trimSub = trimRow.querySelector('[data-role="sub"]').textContent;
+    assert.match(scrubSub, /ostatni: .* · błąd/);
+    assert.match(trimSub, /ostatni: .* · OK/);
+    assert.doesNotMatch(scrubSub + trimSub, RAW_KEY);
+    assert.deepEqual(gets, [UUID_B], 'only the job missing from the list is fetched, once');
+    // The failed run finally reaches the protection strip.
+    assert.match(body.querySelector('#nas-prot').textContent, /błąd · ostatni/);
+
+    for (const fn of [...scheduled]) await fn();
+    await flush();
+    assert.deepEqual(gets, [UUID_B], 'a poll never asks for the same job again');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('a job that cannot be resolved shows only when it ran; a refused start reads as failed with the reason in a tooltip (B2)', async () => {
+  const sched = { ...schedules, rows: [
+    { ...schedules.rows[0], lastResult: `started job ${UUID_A}` },
+    { ...schedules.rows[1], lastRunAt: '2026-08-01 03:30:00', lastResult: 'failed to start: pool is busy' },
+  ] };
+  const screen = fakeScreen(fixtures({
+    tentaNasJobsListRequest: { jobs: [] },
+    tentaNasSchedulesListRequest: sched,
+    tentaNasJobGetRequest: () => { throw new Error('job not found'); },
+  }));
+  screen.later = () => {};
+  try {
+    const body = mount();
+    await drawTasks(screen, body);
+    await flush(); await flush();
+    const [scrubRow, trimRow] = scheduleRows(body);
+    const scrubSub = scrubRow.querySelector('[data-role="sub"]');
+    const trimSub = trimRow.querySelector('[data-role="sub"]');
+    assert.match(scrubSub.textContent, /^ostatni: \S/);
+    assert.doesNotMatch(scrubSub.textContent, /·/, 'no invented outcome for a job nobody can read');
+    assert.match(trimSub.textContent, /· błąd$/);
+    assert.equal(trimSub.getAttribute('title'), 'pool is busy');
+    assert.doesNotMatch(scrubSub.textContent + trimSub.textContent, RAW_KEY);
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('scheduleOutcome maps every stored shape and never returns a raw key', () => {
+  const statusOf = (id) => ({ a: 'running', b: 'cancelled', c: 'mystery' })[id] ?? null;
+  assert.equal(scheduleOutcome('ok').label, 'OK');
+  assert.equal(scheduleOutcome('failed').failed, true);
+  assert.equal(scheduleOutcome('started job a', statusOf).label, 'w toku');
+  assert.equal(scheduleOutcome('started job b', statusOf).label, 'przerwane');
+  assert.equal(scheduleOutcome('started job c', statusOf), null, 'an unknown status is not rendered as a key');
+  assert.equal(scheduleOutcome('started job z', statusOf), null);
+  assert.equal(scheduleOutcome(''), null);
+  assert.equal(scheduleOutcome('the node wrote something new'), null, 'free text is not classified');
+});
+
+// n15 (critic-round2-wave2 MINOR 9): the scheduler stores `pominięto: <why>`
+// when it declines a Sync slot because parity errors await a repair
+// (`elastic::scheduled_sync_blocker`). That is neither a run nor a failure,
+// and it used to render as no outcome at all — the row read like a normal run.
+test('a skipped scheduled Sync reads as skipped, with the reason only in the tooltip', async () => {
+  const why = 'scrub zgłosił 3 błędów, których nic jeszcze nie naprawiło — uruchom naprawę z parity';
+  const outcome = scheduleOutcome(`pominięto: ${why}`);
+  assert.deepEqual(outcome, { label: 'pominięto', failed: false, skipped: true, title: why });
+  // Every stored shape carries the same fields.
+  for (const raw of ['ok', 'failed', 'skipped', 'failed to start: busy']) {
+    assert.deepEqual(Object.keys(scheduleOutcome(raw)).sort(), ['failed', 'label', 'skipped', 'title'], raw);
+  }
+  assert.equal(scheduleOutcome('skipped').skipped, true);
+  assert.equal(scheduleOutcome('failed to start: busy').skipped, false);
+
+  const sched = { ...elasticSchedules, rows: [
+    elasticSchedules.rows[0],
+    { ...elasticSchedules.rows[1], enabled: true, lastRunAt: '2026-09-02 03:00:00', lastResult: `pominięto: ${why}` },
+  ] };
+  const screen = fakeScreen(fixtures({ tentaNasSchedulesListRequest: sched }));
+  screen.later = () => {};
+  try {
+    const body = mount();
+    await drawTasks(screen, body);
+    await flush(); await flush();
+    const sub = scheduleRows(body)[1].querySelector('[data-role="sub"]');
+    assert.match(sub.textContent, /^ostatni: .* · pominięto$/);
+    assert.equal(sub.getAttribute('title'), why, 'the node\'s sentence is the tooltip');
+    assert.doesNotMatch(sub.textContent, /scrub zgłosił/, 'and never the row text');
+  } finally {
+    screen.dispose();
+  }
+});
+
+// n15 (critic-round2-wave2 MINOR 12): the status of a job a schedule row
+// names used to be read ONCE per mount, so a job still running at that moment
+// read "w toku" until the tab was left. An unfinished status is re-read on the
+// schedules cadence; a finished one is never asked for again.
+test('a named job still running is re-read on the schedules poll, a finished one is cached', async () => {
+  const sched = { ...schedules, rows: [
+    schedules.rows[0],
+    { ...schedules.rows[1], lastRunAt: '2026-08-01 03:30:00', lastResult: `started job ${UUID_B}` },
+  ] };
+  let status = 'running';
+  const gets = [];
+  const screen = fakeScreen(fixtures({
+    tentaNasJobsListRequest: { jobs: [] },
+    tentaNasSchedulesListRequest: sched,
+    tentaNasJobGetRequest: (p) => { gets.push(p.jobId); return { job: { jobId: p.jobId, kind: 'pool_trim', subject: 'fast', status } }; },
+  }));
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const runPolls = async () => {
+    const due = scheduled.splice(0);
+    for (const fn of due) await fn();
+    await flush(); await flush();
+  };
+  try {
+    const body = mount();
+    await drawTasks(screen, body);
+    await flush(); await flush();
+    const trimSub = () => scheduleRows(body)[1].querySelector('[data-role="sub"]').textContent;
+    assert.match(trimSub(), / · w toku$/);
+    assert.equal(gets.length, 1);
+
+    status = 'succeeded';
+    await runPolls();
+    assert.match(trimSub(), / · OK$/, 'the finished outcome replaces "running"');
+    const afterFinish = gets.length;
+    assert.ok(afterFinish >= 2, 'the running job was asked for again');
+
+    await runPolls();
+    await runPolls();
+    assert.equal(gets.length, afterFinish, 'a finished status is never asked for again');
+    assert.match(trimSub(), / · OK$/);
+  } finally {
+    screen.dispose();
+  }
+});
+
+// A2/A3/A5 (critic-real-functionality-2026-09-21.md): Cancel only where it
+// really stops the work.
+test('Cancel is offered only for a pool scrub, never for kinds whose cancel stops nothing', () => {
+  assert.equal(jobCanCancel({ kind: 'pool_scrub' }), true);
+  for (const kind of ['elastic_fix', 'elastic_add_disk', 'elastic_destroy', 'elastic_replace_disk', 'elastic_sync', 'elastic_mover',
+    'smart_test', 'pool_trim', 'pool_create', 'pool_replace', 'dataset_destroy', 'disk_wipe', 'packages_install', 'config_import', 'some_future_kind']) {
+    assert.equal(jobCanCancel({ kind }), false, kind);
+  }
+  const host = mount();
+  host.innerHTML = ['smart_test', 'elastic_fix', 'pool_trim', 'pool_scrub'].map((kind) => jobRowSkeleton({ jobId: kind, kind, subject: 'tank', status: 'running' })).join('');
+  assert.deepEqual([...host.querySelectorAll('[data-act="cancel"]')].map((b) => b.closest('.job-row').dataset.job), ['pool_scrub']);
+  assert.equal(host.querySelectorAll('[data-act="log"]').length, 4, 'the log stays reachable for every job');
+  host.remove();
+});
+
+test('every hide-below of the history table is a breakpoint tf-table honours', async () => {
+  const screen = fakeScreen(fixtures());
+  screen.later = () => {};
+  try {
+    const body = mount();
+    await drawTasks(screen, body);
+    await flush();
+    const table = body.querySelector('#nas-jobs-table');
+    const wanted = [...table.querySelectorAll('tf-column[hide-below]')].map((c) => c.getAttribute('hide-below'));
+    const got = [...table.shadowRoot.querySelectorAll('thead th')].flatMap((th) => [...th.classList]
+      .filter((c) => c.startsWith('tf-table__col--hide-below-')).map((c) => c.slice('tf-table__col--hide-below-'.length)));
+    assert.deepEqual(got, wanted);
+    assert.ok(wanted.includes('1024'));
+  } finally {
+    screen.dispose();
+  }
 });

@@ -47,6 +47,14 @@ pub enum SchemaType {
 }
 
 impl SchemaType {
+    /// Every kind the registry stores, in the order the UI lists them.
+    pub const ALL: [SchemaType; 4] = [
+        SchemaType::JsonSchema,
+        SchemaType::Avro,
+        SchemaType::Protobuf,
+        SchemaType::Thrift,
+    ];
+
     /// Persisted form (`bus_schema_subjects.schema_type` CHECK constraint).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -297,14 +305,20 @@ mod tests {
 
     #[test]
     fn schema_type_and_compatibility_round_trip_their_persisted_forms() {
-        for t in [
-            SchemaType::JsonSchema,
-            SchemaType::Avro,
-            SchemaType::Protobuf,
-            SchemaType::Thrift,
-        ] {
+        for t in SchemaType::ALL {
             assert_eq!(SchemaType::parse(t.as_str()), Some(t));
         }
+        // `ALL` must list every variant: a kind missing from it would never
+        // be offered to the UI (`BusCapabilitiesWire.schema_types`).
+        for t in SchemaType::ALL {
+            match t {
+                SchemaType::JsonSchema
+                | SchemaType::Avro
+                | SchemaType::Protobuf
+                | SchemaType::Thrift => {}
+            }
+        }
+        assert_eq!(SchemaType::ALL.len(), 4);
         for c in [
             Compatibility::None,
             Compatibility::Backward,

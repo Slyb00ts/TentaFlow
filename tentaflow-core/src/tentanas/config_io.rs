@@ -359,10 +359,12 @@ pub struct LiveState {
     pub serials: Vec<String>,
     pub datasets: Vec<String>,
     pub pool_mountpoints: Vec<String>,
-    /// Union paths of this node's Elastic Arrays. A share may sit on one since
-    /// `resolve_source` began accepting the union, and this module carried its
-    /// OWN copy of the pool-only rule — so an imported config marked every
-    /// array share `conflict` and `apply_with` then skipped creating it.
+    /// Union paths of the IMPORTING organisation's Elastic Arrays on this
+    /// node. A share may sit on one since `resolve_source` began accepting
+    /// the union, and this module carried its OWN copy of the pool-only rule —
+    /// so an imported config marked every array share `conflict` and
+    /// `apply_with` then skipped creating it. Another tenant's union is not in
+    /// here (see `live_state`).
     pub array_unions: Vec<String>,
     pub shares: Vec<ShareRow>,
     pub targets: Vec<store::TargetRow>,
@@ -373,7 +375,19 @@ pub struct LiveState {
     pub smart_enabled: bool,
 }
 
-pub async fn live_state(db: &DbPool) -> Result<LiveState> {
+/// The node as `owner` may build on. Pools, datasets and disks are node
+/// hardware and are read whole; the Elastic unions are `owner`'s only.
+///
+/// WHY: the node's database holds every tenant's arrays, and an import used
+/// to accept any of their unions as a share source — so a document naming
+/// `/mnt/<org A's array>` let org B publish A's files over SMB or NFS, the
+/// very thing `share_create` refuses by resolving against the caller's own
+/// arrays. Another tenant's union now plans as `conflict` with the sentence a
+/// path on no pool gets, so the plan does not confirm that it exists.
+pub async fn live_state(
+    db: &DbPool,
+    owner: &tentanas_helper::elastic::ElasticOwner,
+) -> Result<LiveState> {
     let datasets = super::datasets::list("").await.unwrap_or_default();
     Ok(LiveState {
         pools: super::pools::list_rows()
@@ -393,7 +407,7 @@ pub async fn live_state(db: &DbPool) -> Result<LiveState> {
             .filter(|d| !d.name.contains('/'))
             .filter_map(|d| d.mountpoint.clone())
             .collect(),
-        array_unions: store::elastic_arrays_all(db)?
+        array_unions: store::elastic_arrays(db, owner)?
             .into_iter()
             .map(|a| a.union_path())
             .collect(),
@@ -737,16 +751,18 @@ pub fn overwritten(items: &[NasConfigImportItem]) -> Vec<String> {
 /// Runs the plan. Every step logs what it did; a conflict or a missing pool is
 /// logged and skipped, so one unavailable pool never stops the shares that do
 /// not depend on it.
+/// `owner` is the importing organisation: its unions are the only ones a
+/// share of the document may land on (`live_state`).
 pub async fn apply(
     handle: &super::jobs::JobHandle,
     main_db: &DbPool,
-    addon_id: &str,
+    owner: &tentanas_helper::elastic::ElasticOwner,
     document: ConfigDocument,
     explicit: Option<&ElevationToken>,
 ) -> Result<()> {
     let db = handle.db().clone();
-    let live = live_state(&db).await?;
-    apply_with(handle, main_db, addon_id, document, explicit, live, None).await
+    let live = live_state(&db, owner).await?;
+    apply_with(handle, main_db, &owner.addon_id, document, explicit, live, None).await
 }
 
 /// The same, with the node's LIVE STATE injected — the seam every other
@@ -1393,6 +1409,44 @@ mod tests {
             "the refusal has to name both owners it looked for: {}",
             refused.detail
         );
+    }
+
+    /// Two tenants on one node: an import by org A may put a share on A's
+    /// own union, and a share on org B's union is a `conflict` worded exactly
+    /// like a path that is on no pool and no array — the plan neither accepts
+    /// B's union nor confirms that it exists.
+    #[tokio::test]
+    async fn an_import_cannot_put_a_share_on_another_organisations_union() {
+        use tentanas_helper::elastic::ElasticOwner;
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let org_a = ElasticOwner { org_id: "org-a".into(), addon_id: "nas".into() };
+        for (name, owner) in [
+            ("alpha", org_a.clone()),
+            ("bravo", ElasticOwner { org_id: "org-b".into(), addon_id: "nas".into() }),
+        ] {
+            let mut spec = super::super::elastic::tests::create_spec(name);
+            spec.owner = owner;
+            store::elastic_import(&db, &spec, "admin").expect("array");
+        }
+
+        let live = live_state(&db, &org_a).await.expect("live");
+        assert_eq!(live.array_unions, vec!["/mnt/alpha".to_string()]);
+
+        let planned = |source: &str| {
+            let mut doc = document();
+            doc.shares[0].name = "wspolny".into();
+            doc.shares[0].source_path = source.into();
+            let (items, _) = plan(&doc, &live);
+            let item = find(&items, "share", "wspolny").clone();
+            (item.action, item.detail.replace(source, "<path>"))
+        };
+        assert_eq!(planned("/mnt/alpha").0, "create", "A's own union");
+        let nowhere = planned("/mnt/nothing");
+        assert_eq!(nowhere.0, "conflict");
+        assert_eq!(planned("/mnt/bravo"), nowhere, "B's union");
+        assert_eq!(planned("/mnt/bravo/filmy"), nowhere, "inside B's union");
     }
 
     #[test]

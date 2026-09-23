@@ -350,7 +350,8 @@ pub const ROLE_OTHER_ORG_ARRAY: &str = "other_org_array";
 /// (`health`, `temperature_c`, `power_on_hours`, `reallocated_sectors`,
 /// `pending_sectors`, `crc_errors`, `media_errors`, `wear_pct`,
 /// `smart_available`, `smart_passed`, `smart_read_at`), `health_reason`
-/// (built by `score_health` from SMART counters only) and the I/O figures
+/// (built by `score_health` from SMART counters, plus `grade_disk_health`'s
+/// FAULTED/UNAVAIL sentence, which names no pool) and the I/O figures
 /// (`io`, `io_history_bps`: numbers). `role` stays, rewritten to
 /// `ROLE_OTHER_ORG_ARRAY`.
 pub fn hide_other_org_array(disk: &mut NasDisk, own_arrays: &std::collections::BTreeSet<String>) {
@@ -764,33 +765,50 @@ pub fn journal_claim_of(
 /// only `zpool status` knows; reading it here — once per inventory refresh —
 /// keeps it off the tab's five-second poll, where it used to cost a full pool
 /// listing (datasets and snapshots included) per tick.
-async fn vdev_membership() -> HashMap<String, (String, String)> {
+///
+/// The second map is the same leaves' grading state
+/// (`pools::leaf_grading_state`: a state word the parser does not know is
+/// `unknown`, never `unavail`), from the same `zpool status` read:
+/// FAULTED/UNAVAIL is what `grade_disk_health` calls "Awaria", and a second
+/// pass over the pools for it would only be able to disagree with this one.
+/// A leaf whose device node is gone is in neither map: its kernel name may
+/// already belong to a new disk (`zfs::resolved_kernel_name`).
+/// It is `None` when any pool could not be read: a
+/// leaf missing from a PARTIAL read is unknown, not healthy, and reading it
+/// as healthy would close a faulted disk's alert on one failed `zpool
+/// status` and re-raise it — with a new timestamp — on the next.
+async fn vdev_membership() -> (HashMap<String, (String, String)>, Option<HashMap<String, String>>) {
     if !super::zfs::available() {
-        return HashMap::new();
+        // No ZFS, no pool, no leaf: that is a complete answer.
+        return (HashMap::new(), Some(HashMap::new()));
     }
     let rows = match super::pools::list_rows().await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("tentanas: pool list for disk roles failed: {e}");
-            return HashMap::new();
+            return (HashMap::new(), None);
         }
     };
     let mut index = HashMap::new();
+    let mut states = Some(HashMap::new());
     for row in rows {
         let status = match super::pools::status(&row.name).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("tentanas: pool status for disk roles failed ({}): {e}", row.name);
+                states = None;
                 continue;
             }
         };
-        for vdev in status.vdevs {
-            for leaf in vdev.disks {
-                index.insert(leaf.name, (vdev.role.clone(), vdev.kind.clone()));
+        for leaf in status.leaves {
+            let Some(name) = leaf.kernel_name else { continue };
+            if let Some(states) = states.as_mut() {
+                states.insert(name.clone(), leaf.state.to_string());
             }
+            index.insert(name, (leaf.role, leaf.kind));
         }
     }
-    index
+    (index, states)
 }
 
 /// Disk id → (array name, part played in it) for every Elastic Array this
@@ -1383,52 +1401,86 @@ pub fn smart_self_tests(doc: &Value) -> Vec<NasSmartSelfTest> {
 
 // ----- health ----------------------------------------------------------------------
 
-/// Thresholds (§5.4): `critical` means "replace / act now", `warning` means
-/// "watch and plan"; a growing reallocated count is the classic early sign
-/// so the trend against the week-old sample counts, not only the level.
+/// SMART's verdict on one disk (§5.4), graded against the SPEC legend of the
+/// Disks tab (n03 "Jak czytać zdrowie"): `ok` = no symptom in any source,
+/// `warning` ("Uwaga") = a symptom that needs watching or a decision — new
+/// reallocations and temperature are the legend's own examples — and
+/// `critical` ("Awaria") = "dysk FAULTED/UNAVAIL — wymagana wymiana", a disk
+/// that is out of service or must be replaced.
+///
+/// A COUNTER IS A SYMPTOM, NOT A FAILURE. Before this, a disk with three new
+/// reallocations in a week — the SPEC's `sdd`, "+3 realokacje w 7 dni", drawn
+/// as "Uwaga" on n03, n04 and in the alert list — was shown as "Awaria", the
+/// same red as a disk that is gone. The urgency of a MOVING count is not lost
+/// with the colour: it is `replacement_advice`'s `urgent` severity, which
+/// does not wait for the two-day threshold, and the reason still says
+/// "growing".
+///
+/// Rules against the legend (owner decision 2026-09-21):
+/// - reallocated count growing against the week-old sample: was `critical`,
+///   now `warning` — the legend's example of "Uwaga";
+/// - temperature over the critical limit: was `critical`, now `warning` —
+///   temperature is the legend's other example; the reason names the limit;
+/// - pending sectors: was `critical`, now `warning` — the SPEC's `sdd` passed
+///   its long test "z uwagą: 2 pending sectors" and is "Uwaga";
+/// - media errors (NVMe / SCSI uncorrected): was `critical`, now `warning` —
+///   the NVMe and SCSI counterpart of pending sectors;
+/// - wear >= 95 %: was `critical`, now `warning` — a worn-out SSD still
+///   serves; replacing it is a decision to plan, not an outage;
+/// - overall SMART FAILED and a failed self-test stay `critical`: they are the
+///   drive's OWN verdict that it is failing, which is the "wymagana wymiana"
+///   of the legend's "Awaria" — and the pool wizard refuses a `critical` disk
+///   (`pool-wizard.js`), which is the only thing keeping such a free disk out
+///   of a new pool;
+/// - static reallocated count, UDMA CRC errors, wear >= 85 %, temperature over
+///   the warning limit: `warning` before and after — they already matched.
+///
+/// FAULTED/UNAVAIL itself is not SMART's to know; `grade_disk_health` adds it
+/// from the pool's leaf state.
 pub fn score_health(s: &SmartSummary, kind: &str, reallocated_week_ago: Option<i64>) -> (&'static str, String) {
     let mut critical = Vec::new();
     let mut warning = Vec::new();
     if s.passed == Some(false) {
         critical.push("SMART overall status FAILED".to_string());
     }
-    if let Some(p) = s.pending.filter(|v| *v > 0) {
-        critical.push(format!("{p} pending sectors"));
-    }
-    if let Some(m) = s.media_errors.filter(|v| *v > 0) {
-        critical.push(format!("{m} media errors"));
-    }
     if s.self_test_failed {
         critical.push("last self-test failed".to_string());
     }
-    let temp_warn = if kind == "hdd" { 50 } else { 65 };
-    let temp_crit = if kind == "hdd" { 60 } else { 75 };
-    if let Some(t) = s.temperature_c {
-        if t >= temp_crit {
-            critical.push(format!("{t}°C"));
-        } else if t >= temp_warn {
-            warning.push(format!("{t}°C"));
-        }
+    if let Some(p) = s.pending.filter(|v| *v > 0) {
+        warning.push(format!("{p} pending sectors"));
+    }
+    if let Some(m) = s.media_errors.filter(|v| *v > 0) {
+        warning.push(format!("{m} media errors"));
     }
     if let Some(r) = s.reallocated.filter(|v| *v > 0) {
         match reallocated_week_ago {
-            Some(old) if (r as i64) > old => critical.push(format!(
+            Some(old) if (r as i64) > old => warning.push(format!(
                 "reallocated sectors growing ({old} → {r} in 7 days)"
             )),
             _ => warning.push(format!("{r} reallocated sectors")),
+        }
+    }
+    let temp_warn = if kind == "hdd" { 50 } else { 65 };
+    let temp_limit = if kind == "hdd" { 60 } else { 75 };
+    if let Some(t) = s.temperature_c {
+        if t >= temp_limit {
+            warning.push(format!("{t}°C (over the {temp_limit}°C limit)"));
+        } else if t >= temp_warn {
+            warning.push(format!("{t}°C"));
         }
     }
     if let Some(c) = s.crc_errors.filter(|v| *v > 0) {
         warning.push(format!("{c} UDMA CRC errors (cable/backplane)"));
     }
     if let Some(w) = s.wear_pct {
-        if w >= 95 {
-            critical.push(format!("{w}% worn"));
-        } else if w >= 85 {
+        if w >= 85 {
             warning.push(format!("{w}% worn"));
         }
     }
     if !critical.is_empty() {
+        // The symptoms travel with the verdict: a failing drive that is also
+        // hot or reallocating says so in the same sentence.
+        critical.extend(warning);
         ("critical", critical.join("; "))
     } else if !warning.is_empty() {
         ("warning", warning.join("; "))
@@ -1436,6 +1488,46 @@ pub fn score_health(s: &SmartSummary, kind: &str, reallocated_week_ago: Option<i
         ("ok", String::new())
     } else {
         ("unknown", "no SMART data".to_string())
+    }
+}
+
+/// The health the Disks tab shows: SMART's verdict, raised to `critical` when
+/// the disk's pool has taken it out of service.
+///
+/// `leaf_state` is the grading state of the disk's leaf in `zpool status`
+/// (`pools::leaf_grading_state`), `None` for a disk that is no ZFS leaf.
+/// FAULTED and UNAVAIL are the legend's "Awaria": the pool no longer reads
+/// the disk, so whatever SMART says about the medium, the redundancy it
+/// provided is already spent. Every other leaf state (online, degraded,
+/// offline, removed, and `unknown` — a state word the parser does not
+/// recognise) leaves SMART's verdict as it is: OFFLINE and REMOVED are an
+/// admin's act or a pulled disk, and an unreadable word is no evidence of a
+/// failure at all.
+///
+/// The SMART reason is kept behind the pool's, so a faulted disk that SMART
+/// also complains about says both. No pool name goes into the reason: the
+/// health text is shown to every tenant of the node (`hide_other_org_array`
+/// keeps it), and the membership is already a column of its own.
+pub fn grade_disk_health(
+    smart_health: &str,
+    smart_reason: &str,
+    leaf_state: Option<&str>,
+) -> (String, String) {
+    let pool_verdict = match leaf_state {
+        Some("faulted") => Some("ZFS reports this disk FAULTED"),
+        Some("unavail") => Some("ZFS reports this disk UNAVAIL"),
+        _ => None,
+    };
+    match pool_verdict {
+        Some(verdict) => {
+            let reason = if smart_reason.is_empty() {
+                verdict.to_string()
+            } else {
+                format!("{verdict}; {smart_reason}")
+            };
+            ("critical".to_string(), reason)
+        }
+        None => (smart_health.to_string(), smart_reason.to_string()),
     }
 }
 
@@ -1456,7 +1548,8 @@ pub const ADVICE_AFTER_DAYS: i64 = 2;
 ///   last changed for the worse;
 /// - the reallocated count GREW against the week-old sample. That one does not
 ///   wait: a moving reallocation count is the sign that the disk is failing
-///   now, and `score_health` already calls it critical.
+///   now. `score_health` grades it `warning` (the SPEC legend's "Uwaga"), so
+///   the urgency lives HERE, in the `urgent` severity.
 ///
 /// Pure over its inputs so both triggers are testable on a real history shape
 /// without a disk being present.
@@ -1576,6 +1669,26 @@ struct Live {
     history: VecDeque<u64>,
     /// Latest SMART counters, kept for the minute sample.
     smart: SmartSummary,
+    /// SMART's own verdict (`score_health`), kept apart from `disk.health`:
+    /// the shown health is this raised by the pool's leaf state
+    /// (`grade_disk_health`), and the two are refreshed on different clocks —
+    /// SMART every 30 minutes, the leaf state with every inventory pass.
+    /// Recombining from the shown value would make a FAULTED verdict stick
+    /// after the pool took the disk back.
+    smart_health: String,
+    smart_reason: String,
+    /// The disk's leaf state in `zpool status`, `None` for no ZFS leaf.
+    leaf_state: Option<String>,
+    /// Whether this process has written the disk's health alert against its
+    /// current grade. False on first sight and after a failed alert write.
+    ///
+    /// WHY a flag of its own and not an unset `leaf_state`: an alert left
+    /// open by the previous process lifetime (a disk that was FAULTED, and has
+    /// since left every pool) is graded `None` both before and after the
+    /// first pass, so a leaf-state comparison never sees a change and the
+    /// alert would stay open until a SMART pass — never, on a node without a
+    /// privilege channel.
+    alert_settled: bool,
 }
 
 struct State {
@@ -1595,8 +1708,29 @@ struct State {
 
 fn state() -> &'static RwLock<State> {
     static STATE: OnceLock<RwLock<State>> = OnceLock::new();
-    STATE.get_or_init(|| {
-        RwLock::new(State {
+    STATE.get_or_init(|| RwLock::new(State::new()))
+}
+
+/// Serialises everything that writes a disk's health alert: a whole
+/// inventory pass, and the alert write of each SMART read.
+///
+/// WHY: `refresh_inventory` is called by the sampler AND by dispatch (the
+/// wipe plan, array create/add, the journal scan, the wipe job). Two passes
+/// running at once grade under the state lock in one order and write their
+/// alerts, after releasing it, in the other — the older pass's FAULTED raise
+/// lands after the newer pass's resolve, and nothing re-writes it while the
+/// leaf state stays put. A tokio mutex, because a pass holds it across the
+/// `lsblk` and `zpool status` awaits: the read must not start before the
+/// previous pass's writes are done either, or a pass could grade from a read
+/// older than the one already applied.
+fn health_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+impl State {
+    fn new() -> Self {
+        State {
             disks: BTreeMap::new(),
             iops_hour: VecDeque::with_capacity(IOPS_BASELINE_POINTS),
             prev_stats: HashMap::new(),
@@ -1613,8 +1747,8 @@ fn state() -> &'static RwLock<State> {
                 detail: String::new(),
             },
             inventory_error: None,
-        })
-    })
+        }
+    }
 }
 
 /// Current disks with live I/O, the sparkline and the telemetry state.
@@ -1743,17 +1877,55 @@ fn stale(last: Option<Instant>, every: Duration) -> bool {
 /// Re-reads lsblk and merges into the live map, keeping I/O history and SMART
 /// of disks that are still there. A disk that disappeared is dropped from
 /// the live view (its DB row stays for history).
+///
+/// One pass at a time (`health_gate`). A caller that finds a pass running
+/// WAITS and then runs its own, rather than skipping or sharing the running
+/// one's result: every dispatch caller reads `snapshot()`/`disk()` right
+/// after this returns and acts on it — the wipe plan, the disks picked for an
+/// Elastic create or add, the import candidates, the picture after a wipe —
+/// so it needs a read that started after its own call, not one that may
+/// predate the wipe or the pool change it is about to judge.
 pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
-    let mut found = match inventory().await {
-        Ok(d) => d,
+    inventory_pass(db, state(), health_gate(), || async {
+        let found = inventory().await?;
+        let (vdevs, leaf_states) = vdev_membership().await;
+        Ok::<InventoryRead, anyhow::Error>((found, vdevs, leaf_states))
+    })
+    .await
+}
+
+/// What one inventory pass reads off the node: lsblk's disks, then
+/// `vdev_membership`'s vdev index and leaf states.
+type InventoryRead = (
+    Vec<NasDisk>,
+    HashMap<String, (String, String)>,
+    Option<HashMap<String, String>>,
+);
+
+/// `refresh_inventory` over an injected read, state and gate, so the
+/// serialisation of passes can be exercised without lsblk or `zpool status`
+/// and without the process-wide state other tests share.
+async fn inventory_pass<R, F>(
+    db: &DbPool,
+    cell: &RwLock<State>,
+    gate: &tokio::sync::Mutex<()>,
+    read: R,
+) -> Result<()>
+where
+    R: FnOnce() -> F,
+    F: std::future::Future<Output = Result<InventoryRead>>,
+{
+    // Held to the end of the pass, the alert writes and rollbacks included.
+    let _pass = gate.lock().await;
+    let (mut found, vdevs, leaf_states) = match read().await {
+        Ok(r) => r,
         Err(e) => {
-            let mut st = state().write();
+            let mut st = cell.write();
             st.inventory_error = Some(e.to_string());
             st.last_inventory = Some(Instant::now());
             return Err(e);
         }
     };
-    let vdevs = vdev_membership().await;
     let arrays = array_membership(db);
     apply_membership(&mut found, &vdevs, &arrays);
     for d in &found {
@@ -1778,10 +1950,13 @@ pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
             persisted.insert(d.disk_id.clone(), row);
         }
     }
-    let mut st = state().write();
+    let mut st = cell.write();
     let mut next = BTreeMap::new();
+    // Leaf-state changes, whose alerts are written once the lock is released:
+    // `sync_health_alert` writes the database.
+    let mut regrades = Vec::new();
     for mut d in found {
-        let live = match st.disks.remove(&d.disk_id) {
+        let mut live = match st.disks.remove(&d.disk_id) {
             Some(mut old) => {
                 // Identity/role/mounts from the fresh scan, everything SMART
                 // and I/O from the live record.
@@ -1805,33 +1980,179 @@ pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
                 old
             }
             None => {
-                let mut smart = SmartSummary::default();
-                if let Some(row) = persisted.get(&d.disk_id) {
-                    d.health = row.health.clone();
-                    d.health_reason = row.health_reason.clone();
-                    d.smart_read_at = row.smart_read_at.clone();
-                    if let Some(doc) = row
-                        .smart_json
-                        .as_deref()
-                        .and_then(|j| serde_json::from_str::<Value>(j).ok())
-                    {
-                        smart = summarize_smart(&doc);
-                        apply_summary(&mut d, &smart);
-                    }
-                }
-                Live {
-                    disk: d,
-                    history: VecDeque::with_capacity(HISTORY_POINTS),
-                    smart,
-                }
+                let row = persisted.get(&d.disk_id);
+                live_from_persisted(d, row)
             }
         };
+        regrades.extend(regrade_leaf(&mut live, leaf_states.as_ref()));
         next.insert(live.disk.disk_id.clone(), live);
     }
     st.disks = next;
     st.inventory_error = None;
     st.last_inventory = Some(Instant::now());
+    drop(st);
+    // One disk's failed alert write neither aborts the others nor is lost:
+    // its leaf state is put back, so the next pass sees the same change and
+    // writes the alert again. Until then the shown grade is the one its
+    // alert says, not one no alert was ever raised for.
+    let failed = settle_leaf_alerts(db, regrades);
+    if !failed.is_empty() {
+        let mut st = cell.write();
+        for (regrade, e) in &failed {
+            tracing::warn!(
+                "tentanas: health alert of disk {} not written, retried next pass: {e}",
+                regrade.disk_id
+            );
+            if let Some(live) = st.disks.get_mut(&regrade.disk_id) {
+                roll_back_leaf(live, regrade);
+            }
+        }
+    }
     Ok(())
+}
+
+/// A disk first seen in this process (a restart, a hot-plug), seeded from
+/// its persisted row so a restart does not show every disk as "unknown"
+/// until the first SMART pass. The persisted health is SMART's verdict
+/// (`refresh_smart` stores it before the leaf state is applied), so it seeds
+/// `smart_health` as it is.
+fn live_from_persisted(mut d: NasDisk, row: Option<&store::DiskRow>) -> Live {
+    let mut smart = SmartSummary::default();
+    if let Some(row) = row {
+        d.health = row.health.clone();
+        d.health_reason = row.health_reason.clone();
+        d.smart_read_at = row.smart_read_at.clone();
+        if let Some(doc) = row
+            .smart_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        {
+            smart = summarize_smart(&doc);
+            apply_summary(&mut d, &smart);
+        }
+    }
+    Live {
+        smart_health: d.health.clone(),
+        smart_reason: d.health_reason.clone(),
+        disk: d,
+        history: VecDeque::with_capacity(HISTORY_POINTS),
+        smart,
+        leaf_state: None,
+        // The first pass that reads the pools settles the disk's alert
+        // against it, whatever the leaf state — `None` included.
+        alert_settled: false,
+    }
+}
+
+/// A leaf-state change of one disk: found under the state lock, settled (its
+/// alert written) after the lock is released, and undone if that write fails.
+#[derive(Debug, Clone, PartialEq)]
+struct LeafRegrade {
+    disk_id: String,
+    /// The leaf state before this pass, restored by `roll_back_leaf`.
+    prior_leaf: Option<String>,
+    leaf: Option<String>,
+    health: String,
+    reason: String,
+}
+
+/// One inventory pass's regrade of one disk by its leaf state.
+///
+/// `leaf_states` is `vdev_membership`'s second map: `None` when a pool could
+/// not be read, and then the last known leaf state stands — a failed `zpool
+/// status` is no news about the disk, and treating it as "no leaf" would
+/// close a FAULTED disk's alert and re-raise it, with a new timestamp, on the
+/// next good read.
+///
+/// Any change of the leaf state is returned, even one that leaves the grade
+/// as it was: the alert's text follows the reason ("ZFS reports this disk
+/// FAULTED; …" on a disk SMART already calls critical), and settling an
+/// unchanged alert costs one keyed read.
+///
+/// A disk whose alert is not settled (`Live::alert_settled`: first sight in
+/// this process, or a failed write) is returned even with its leaf state
+/// unchanged, so an alert the previous process left open is re-evaluated
+/// against the current grade — a disk that was FAULTED and has since left
+/// every pool reads `None` before and after. Not while the pools cannot be
+/// read: the disk then stays unsettled until a pass that can.
+fn regrade_leaf(
+    live: &mut Live,
+    leaf_states: Option<&HashMap<String, String>>,
+) -> Option<LeafRegrade> {
+    let leaf = leaf_states?.get(&live.disk.name).cloned();
+    if live.leaf_state == leaf && live.alert_settled {
+        return None;
+    }
+    live.alert_settled = true;
+    let (health, reason) =
+        grade_disk_health(&live.smart_health, &live.smart_reason, leaf.as_deref());
+    live.disk.health = health.clone();
+    live.disk.health_reason = reason.clone();
+    let prior_leaf = std::mem::replace(&mut live.leaf_state, leaf.clone());
+    Some(LeafRegrade {
+        disk_id: live.disk.disk_id.clone(),
+        prior_leaf,
+        leaf,
+        health,
+        reason,
+    })
+}
+
+/// Undoes a regrade whose alert could not be written, so the next pass finds
+/// the same change and writes it again. A later pass that already moved the
+/// leaf on carries its own regrade, and is left alone.
+fn roll_back_leaf(live: &mut Live, regrade: &LeafRegrade) {
+    if live.leaf_state != regrade.leaf {
+        return;
+    }
+    let (health, reason) = grade_disk_health(
+        &live.smart_health,
+        &live.smart_reason,
+        regrade.prior_leaf.as_deref(),
+    );
+    live.disk.health = health;
+    live.disk.health_reason = reason;
+    live.leaf_state = regrade.prior_leaf.clone();
+    // Also what makes a first-sight settle (no leaf change to find again)
+    // retried: the alert table is not known to match any grade now.
+    live.alert_settled = false;
+}
+
+/// Writes the health alert of every regrade and returns the ones that failed,
+/// each with its error; one disk's failure does not stop the others.
+fn settle_leaf_alerts(db: &DbPool, regrades: Vec<LeafRegrade>) -> Vec<(LeafRegrade, anyhow::Error)> {
+    regrades
+        .into_iter()
+        .filter_map(|r| {
+            write_health_alert(db, &r.disk_id, &r.health, &r.reason)
+                .err()
+                .map(|e| (r, e))
+        })
+        .collect()
+}
+
+/// The severity the alert moves FROM is the one of the disk's OPEN alert row,
+/// not the grade this process showed before.
+///
+/// WHY: the shown grade is not what the alert table holds after a restart (a
+/// disk seen for the first time has no shown grade of its own) or after a
+/// failed write. Taken from the row, an unchanged severity refreshes the row
+/// in place, so `warning_since` — and the replacement advice's two-day clock
+/// — is not restarted by every restart of the node; and a RISEN one (an open
+/// warning that is now critical) closes that row and raises a new one, with
+/// its own `raised_at` and no acknowledgement carried over from the milder
+/// condition. Refreshing it in place had kept the warning's timestamp and ack.
+///
+/// The SMART pass writes through here too: after a failed write the shown
+/// grade it would otherwise move from is not what the table holds either.
+fn write_health_alert(db: &DbPool, disk_id: &str, health: &str, reason: &str) -> Result<()> {
+    let open = store::open_alert_severity(db, &health_alert_key(disk_id))?;
+    let from = open.as_deref().unwrap_or("ok");
+    sync_health_alert(db, disk_id, from, health, reason)
+}
+
+fn health_alert_key(disk_id: &str) -> String {
+    format!("disk:{disk_id}:health")
 }
 
 fn apply_summary(d: &mut NasDisk, s: &SmartSummary) {
@@ -1904,20 +2225,11 @@ pub async fn refresh_smart(db: &DbPool) -> Result<()> {
             Ok(doc) => {
                 let summary = summarize_smart(&doc);
                 let week_ago = store::attribute_week_ago(db, &id, "reallocated").unwrap_or(None);
-                let (health, reason) = score_health(&summary, &kind, week_ago);
-                store::store_smart(db, &id, &doc.to_string(), health, &reason)?;
-                let previous = {
-                    let mut st = state().write();
-                    let Some(live) = st.disks.get_mut(&id) else { continue };
-                    let previous = live.disk.health.clone();
-                    apply_summary(&mut live.disk, &summary);
-                    live.disk.health = health.to_string();
-                    live.disk.health_reason = reason.clone();
-                    live.disk.smart_read_at = Some(store::now());
-                    live.smart = summary;
-                    previous
-                };
-                sync_health_alert(db, &id, &previous, health, &reason)?;
+                let (smart_health, smart_reason) = score_health(&summary, &kind, week_ago);
+                // Not across an inventory pass: its alert writes and this
+                // one would otherwise land in either order (`health_gate`).
+                let _pass = health_gate().lock().await;
+                settle_smart_read(db, state(), &id, &doc, summary, smart_health, smart_reason);
             }
             Err(e) => failures.push(format!("{path}: {e}")),
         }
@@ -1933,6 +2245,60 @@ pub async fn refresh_smart(db: &DbPool) -> Result<()> {
         st.telemetry.detail = failures.join("\n");
     }
     Ok(())
+}
+
+/// One disk's SMART read, applied: stored, graded into the live disk, and its
+/// health alert written. Returns nothing on purpose — no write failing here
+/// may end the pass over the remaining disks.
+///
+/// - A failed store is logged and the verdict still applied: it is a real
+///   reading of the disk, and the next pass stores it again.
+/// - A failed alert write is logged and leaves the disk unsettled
+///   (`Live::alert_settled`), so the next inventory pass — seconds away, not
+///   the next SMART pass half an hour away — writes it from the open row.
+///   The verdict itself is kept, unlike the inventory pass's rollback: it
+///   is already in the stored row, and rolling it back in memory would show
+///   a grade that neither the row nor the disk says.
+fn settle_smart_read(
+    db: &DbPool,
+    cell: &RwLock<State>,
+    id: &str,
+    doc: &Value,
+    summary: SmartSummary,
+    smart_health: &str,
+    smart_reason: String,
+) {
+    // SMART's verdict is what persists: the leaf state is re-read on every
+    // inventory pass, and a stored FAULTED would outlive the fault across a
+    // restart.
+    if let Err(e) = store::store_smart(db, id, &doc.to_string(), smart_health, &smart_reason) {
+        tracing::warn!("tentanas: SMART verdict of disk {id} not stored: {e}");
+    }
+    let (health, reason) = {
+        let mut st = cell.write();
+        let Some(live) = st.disks.get_mut(id) else { return };
+        apply_summary(&mut live.disk, &summary);
+        live.disk.smart_read_at = Some(store::now());
+        live.smart = summary;
+        apply_smart_verdict(live, smart_health, smart_reason)
+    };
+    if let Err(e) = write_health_alert(db, id, &health, &reason) {
+        tracing::warn!("tentanas: health alert of disk {id} not written, retried next pass: {e}");
+        if let Some(live) = cell.write().disks.get_mut(id) {
+            live.alert_settled = false;
+        }
+    }
+}
+
+/// Records SMART's own verdict on a live disk and re-grades it against the
+/// leaf state it already has. Returns the shown health and reason.
+fn apply_smart_verdict(live: &mut Live, smart_health: &str, smart_reason: String) -> (String, String) {
+    let (health, reason) = grade_disk_health(smart_health, &smart_reason, live.leaf_state.as_deref());
+    live.smart_health = smart_health.to_string();
+    live.smart_reason = smart_reason;
+    live.disk.health = health.clone();
+    live.disk.health_reason = reason.clone();
+    (health, reason)
 }
 
 /// One `smartctl --json=c -x` run. smartctl's exit code is a bitmask; only
@@ -2023,7 +2389,7 @@ pub(super) fn smartctl_failure_detail(out: &broker::CommandOutput) -> String {
 }
 
 fn sync_health_alert(db: &DbPool, disk_id: &str, previous: &str, health: &str, reason: &str) -> Result<()> {
-    let key = format!("disk:{disk_id}:health");
+    let key = health_alert_key(disk_id);
     match health {
         "critical" | "warning" => {
             if previous != health {
@@ -3078,7 +3444,10 @@ mod tests {
         // A reserved code (Ch, in the Ah–Eh range) on top of a failed segment.
         let reserved = nvme(serde_json::json!([nvme_entry(12), nvme_entry(6)]));
         assert!(reserved.self_test_failed, "a reserved code is not a verdict");
-        assert_eq!(score_health(&reserved, "ssd", None).0, "critical");
+        assert_eq!(
+            score_health(&reserved, "ssd", None),
+            ("critical", "last self-test failed".to_string())
+        );
 
         // An entry with no readable `self_test_result.value` at all.
         let unreadable = nvme(serde_json::json!([
@@ -3289,12 +3658,492 @@ mod tests {
         let (h, reason) = score_health(&s, "hdd", Some(8));
         assert_eq!(h, "warning");
         assert!(reason.contains("8 reallocated"));
+        // Growth is still SAID ("growing"), but graded `warning`: the SPEC's
+        // sdd, "+3 realokacje w 7 dni", is "Uwaga", not "Awaria".
         let (h, reason) = score_health(&s, "hdd", Some(2));
-        assert_eq!(h, "critical");
+        assert_eq!(h, "warning");
         assert!(reason.contains("growing"));
         assert_eq!(smart_attributes(&doc).len(), 3);
         let tests = smart_self_tests(&doc);
         assert_eq!(tests[0].status, "passed");
+    }
+
+    /// Owner decision 2026-09-21: a reallocated count that GREW in the last
+    /// week is "Uwaga", not "Awaria". The SPEC's sdd — three new reallocations
+    /// in seven days, 47°C, SMART passed — is `warning` with the growth named.
+    #[test]
+    fn realloc_growth_grades_warning() {
+        let sdd = SmartSummary {
+            passed: Some(true),
+            temperature_c: Some(47),
+            reallocated: Some(3),
+            pending: Some(0),
+            crc_errors: Some(0),
+            ..Default::default()
+        };
+        let (health, reason) = score_health(&sdd, "hdd", Some(0));
+        assert_eq!(health, "warning");
+        assert_eq!(reason, "reallocated sectors growing (0 → 3 in 7 days)");
+        // Unchanged over the week it is still a symptom, just not a moving one.
+        assert_eq!(
+            score_health(&sdd, "hdd", Some(3)),
+            ("warning", "3 reallocated sectors".to_string())
+        );
+    }
+
+    /// A counter is a symptom — "Uwaga" — however high: pending sectors,
+    /// media errors, a temperature past the limit, a worn-out SSD. Only the
+    /// drive's own verdict (overall FAILED, a failed self-test) is "Awaria",
+    /// and it then carries the symptoms in the same sentence.
+    #[test]
+    fn counter_symptoms_grade_warning_and_a_failing_drive_critical() {
+        let worn = SmartSummary {
+            passed: Some(true),
+            temperature_c: Some(61),
+            reallocated: Some(40),
+            pending: Some(2),
+            media_errors: Some(1),
+            crc_errors: Some(5),
+            wear_pct: Some(97),
+            ..Default::default()
+        };
+        let (health, reason) = score_health(&worn, "hdd", Some(10));
+        assert_eq!(health, "warning");
+        assert_eq!(
+            reason,
+            "2 pending sectors; 1 media errors; reallocated sectors growing (10 → 40 in 7 days); \
+             61°C (over the 60°C limit); 5 UDMA CRC errors (cable/backplane); 97% worn"
+        );
+        // The same disk once the drive itself says it is failing.
+        let failing = SmartSummary { passed: Some(false), self_test_failed: true, ..worn.clone() };
+        let (health, reason) = score_health(&failing, "hdd", Some(10));
+        assert_eq!(health, "critical");
+        assert!(reason.starts_with("SMART overall status FAILED; last self-test failed; 2 pending sectors"), "{reason}");
+        // Below the warning limits there is nothing to say.
+        let calm = SmartSummary { passed: Some(true), temperature_c: Some(49), wear_pct: Some(84), ..Default::default() };
+        assert_eq!(score_health(&calm, "hdd", None), ("ok", String::new()));
+        assert_eq!(score_health(&SmartSummary::default(), "hdd", None).0, "unknown");
+    }
+
+    /// "Awaria" is a disk its pool reports FAULTED or UNAVAIL — whatever SMART
+    /// says, since the pool no longer reads it. The SMART reason stays behind
+    /// the pool's sentence, and no pool name is put into it.
+    #[test]
+    fn faulted_or_unavail_grades_critical() {
+        for (state, sentence) in [
+            ("faulted", "ZFS reports this disk FAULTED"),
+            ("unavail", "ZFS reports this disk UNAVAIL"),
+        ] {
+            assert_eq!(
+                grade_disk_health("ok", "", Some(state)),
+                ("critical".to_string(), sentence.to_string())
+            );
+            assert_eq!(
+                grade_disk_health("warning", "3 reallocated sectors", Some(state)),
+                ("critical".to_string(), format!("{sentence}; 3 reallocated sectors"))
+            );
+        }
+        // Every other leaf state, and no leaf at all, leaves SMART's verdict:
+        // OFFLINE and REMOVED are an admin's act or a pulled disk, not a
+        // verdict on the hardware.
+        for state in [Some("online"), Some("degraded"), Some("offline"), Some("removed"), None] {
+            assert_eq!(
+                grade_disk_health("warning", "47°C", state),
+                ("warning".to_string(), "47°C".to_string()),
+                "{state:?}"
+            );
+        }
+        // And a pool that still reads the disk does not soften SMART's own
+        // verdict either.
+        assert_eq!(
+            grade_disk_health("critical", "SMART overall status FAILED", Some("online")),
+            ("critical".to_string(), "SMART overall status FAILED".to_string())
+        );
+    }
+
+    // ----- regrading by the ZFS leaf state -----------------------------------------
+
+    /// A disk this process has not seen yet, seeded like `refresh_inventory`
+    /// seeds it after a restart: from the persisted SMART verdict.
+    fn restarted_live(smart_health: &str, smart_reason: &str) -> Live {
+        let disk = NasDisk { disk_id: "wwn-leaf".to_string(), name: "sde".to_string(), ..used_disk() };
+        let row = store::DiskRow {
+            disk_id: disk.disk_id.clone(),
+            first_seen_at: "2026-09-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-09-22T00:00:00Z".to_string(),
+            smart_json: None,
+            smart_read_at: Some("2026-09-22T00:00:00Z".to_string()),
+            health: smart_health.to_string(),
+            health_reason: smart_reason.to_string(),
+        };
+        live_from_persisted(disk, Some(&row))
+    }
+
+    fn leaves(state: &str) -> HashMap<String, String> {
+        HashMap::from([("sde".to_string(), state.to_string())])
+    }
+
+    fn leaf_db(with_alerts: bool) -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        store::migrate(&conn).expect("migrate");
+        if !with_alerts {
+            // A write that fails for real, the way a locked or broken database
+            // fails it: the statement itself is refused.
+            conn.execute_batch("DROP TABLE nas_alerts").expect("drop");
+        }
+        std::sync::Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    fn open_health_alert(db: &DbPool) -> Option<tentaflow_protocol::tentanas::NasAlert> {
+        store::alerts_for_subject(db, "disk", "wwn-leaf")
+            .unwrap()
+            .into_iter()
+            .find(|a| a.resolved_at.is_none())
+    }
+
+    /// Several inventory passes over one disk: FAULTED raises the grade to
+    /// critical, a failed pool read changes nothing (no flap to SMART's grade
+    /// and back), a SMART pass in the middle does not lift the pool's
+    /// verdict, and once the pool reads the disk again the grade is SMART's
+    /// LATEST verdict — kept apart the whole time — not the persisted one.
+    #[test]
+    fn a_faulted_leaf_holds_through_a_failed_pool_read_and_recovers_to_the_smart_grade() {
+        let mut live = restarted_live("warning", "3 reallocated sectors");
+        assert_eq!(live.disk.health, "warning", "the restart shows the persisted SMART verdict");
+
+        let faulted = regrade_leaf(&mut live, Some(&leaves("faulted"))).expect("a change");
+        assert_eq!(faulted.health, "critical");
+        assert_eq!(faulted.reason, "ZFS reports this disk FAULTED; 3 reallocated sectors");
+        assert_eq!(faulted.prior_leaf, None);
+        assert_eq!(live.disk.health, "critical");
+
+        // `zpool status` failed: the last known leaf state stands.
+        assert_eq!(regrade_leaf(&mut live, None), None);
+        assert_eq!(live.disk.health, "critical");
+        assert_eq!(live.leaf_state.as_deref(), Some("faulted"));
+        // The same state again is no change either.
+        assert_eq!(regrade_leaf(&mut live, Some(&leaves("faulted"))), None);
+
+        // SMART now finds nothing wrong; the pool still does not read the disk.
+        let previous = live.disk.health.clone();
+        let (health, reason) = apply_smart_verdict(&mut live, "ok", String::new());
+        assert_eq!((previous.as_str(), health.as_str()), ("critical", "critical"));
+        assert_eq!(reason, "ZFS reports this disk FAULTED");
+
+        // Another failed read, then the pool takes the disk back.
+        assert_eq!(regrade_leaf(&mut live, None), None);
+        let back = regrade_leaf(&mut live, Some(&leaves("online"))).expect("a change");
+        assert_eq!((back.health.as_str(), back.reason.as_str()), ("ok", ""));
+        assert_eq!(live.disk.health, "ok", "SMART's latest verdict, not the persisted warning");
+
+        // Out of the pool altogether (replaced): still SMART's grade.
+        let gone = regrade_leaf(&mut live, Some(&HashMap::new())).expect("a change");
+        assert_eq!((gone.leaf, gone.health.as_str()), (None, "ok"));
+
+        // A state the parser could not read is not a failure.
+        let odd = regrade_leaf(&mut live, Some(&leaves("unknown"))).expect("a change");
+        assert_eq!(odd.health, "ok");
+    }
+
+    /// Across a restart the alert moves from the severity of its OPEN row.
+    /// The same severity refreshes that row in place, so its `raised_at` and
+    /// acknowledgement — the replacement advice's clock — survive the
+    /// restart; a RISEN severity is a new condition with its own timestamp
+    /// and no acknowledgement carried over from the milder one.
+    #[test]
+    fn an_escalated_health_alert_is_raised_anew_and_an_unchanged_one_keeps_its_time() {
+        let db = leaf_db(true);
+        store::raise_alert(&db, "disk:wwn-leaf:health", "warning", "disk", "wwn-leaf", "Disk sde: warning", "3 reallocated sectors")
+            .unwrap();
+        let old = open_health_alert(&db).unwrap();
+        {
+            let conn = db.write().unwrap();
+            conn.execute(
+                "UPDATE nas_alerts SET raised_at = '2026-09-01T00:00:00Z', acked_at = '2026-09-02T00:00:00Z' WHERE alert_id = ?1",
+                rusqlite::params![old.alert_id],
+            )
+            .unwrap();
+        }
+
+        // The restart: the disk is first seen as an ONLINE leaf. Its grade is
+        // still the warning, and settling it leaves the row as it was.
+        let mut live = restarted_live("warning", "3 reallocated sectors");
+        let online = regrade_leaf(&mut live, Some(&leaves("online"))).expect("first sight is a change");
+        assert!(settle_leaf_alerts(&db, vec![online]).is_empty());
+        let kept = open_health_alert(&db).unwrap();
+        assert_eq!(kept.alert_id, old.alert_id);
+        assert_eq!(kept.raised_at, "2026-09-01T00:00:00Z");
+        assert_eq!(kept.acked_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+
+        // The pool faults the disk: warning → critical.
+        let faulted = regrade_leaf(&mut live, Some(&leaves("faulted"))).expect("a change");
+        assert!(settle_leaf_alerts(&db, vec![faulted]).is_empty());
+        let raised = open_health_alert(&db).unwrap();
+        assert_ne!(raised.alert_id, old.alert_id, "a new row for the new condition");
+        assert_eq!(raised.severity, "critical");
+        assert_ne!(raised.raised_at, "2026-09-01T00:00:00Z");
+        assert_eq!(raised.acked_at, None);
+        assert_eq!(raised.detail, "ZFS reports this disk FAULTED; 3 reallocated sectors");
+        let all = store::alerts_for_subject(&db, "disk", "wwn-leaf").unwrap();
+        assert_eq!(all.iter().filter(|a| a.resolved_at.is_none()).count(), 1);
+        assert!(all.iter().any(|a| a.alert_id == old.alert_id && a.resolved_at.is_some()));
+
+        // And the same escalation seen by a restarted process (the shown grade
+        // is fresh, the open row is the warning) takes the same path.
+        let db = leaf_db(true);
+        store::raise_alert(&db, "disk:wwn-leaf:health", "warning", "disk", "wwn-leaf", "Disk sde: warning", "3 reallocated sectors")
+            .unwrap();
+        let old = open_health_alert(&db).unwrap();
+        let mut live = restarted_live("warning", "3 reallocated sectors");
+        let faulted = regrade_leaf(&mut live, Some(&leaves("faulted"))).expect("a change");
+        assert!(settle_leaf_alerts(&db, vec![faulted]).is_empty());
+        let raised = open_health_alert(&db).unwrap();
+        assert_ne!(raised.alert_id, old.alert_id);
+        assert_eq!(raised.severity, "critical");
+    }
+
+    /// A failed alert write is not lost: every regrade is attempted (one
+    /// failure does not stop the rest), the failed one's leaf state is put
+    /// back, and the next pass finds the very same change and writes it.
+    #[test]
+    fn a_failed_health_alert_write_is_retried_on_the_next_pass() {
+        let broken = leaf_db(false);
+        let mut live = restarted_live("warning", "3 reallocated sectors");
+        let mut other = restarted_live("ok", "");
+        other.disk.disk_id = "wwn-other".to_string();
+        other.disk.name = "sdf".to_string();
+
+        let states = HashMap::from([
+            ("sde".to_string(), "faulted".to_string()),
+            ("sdf".to_string(), "unavail".to_string()),
+        ]);
+        let first = regrade_leaf(&mut live, Some(&states)).expect("a change");
+        let second = regrade_leaf(&mut other, Some(&states)).expect("a change");
+        let failed = settle_leaf_alerts(&broken, vec![first.clone(), second]);
+        let ids: Vec<&str> = failed.iter().map(|(r, _)| r.disk_id.as_str()).collect();
+        assert_eq!(ids, ["wwn-leaf", "wwn-other"], "both attempted, both reported");
+
+        roll_back_leaf(&mut live, &first);
+        assert_eq!(live.leaf_state, None);
+        assert_eq!(live.disk.health, "warning", "the grade its (missing) alert says");
+
+        // The next pass, with the database back: the same change, written.
+        let good = leaf_db(true);
+        let again = regrade_leaf(&mut live, Some(&states)).expect("the change is found again");
+        assert_eq!(again, first);
+        assert!(settle_leaf_alerts(&good, vec![again]).is_empty());
+        let alert = open_health_alert(&good).expect("the alert is written");
+        assert_eq!(alert.severity, "critical");
+
+        // A rollback that arrives after a later pass moved the leaf on leaves
+        // that later state alone.
+        let stale = LeafRegrade { leaf: Some("online".to_string()), ..first };
+        roll_back_leaf(&mut live, &stale);
+        assert_eq!(live.leaf_state.as_deref(), Some("faulted"));
+        assert_eq!(live.disk.health, "critical");
+    }
+
+    /// The previous process raised a critical alert for a FAULTED disk; the
+    /// disk has since left every pool and SMART calls it healthy. Its leaf
+    /// state is `None` before and after the restart, so no leaf change ever
+    /// closes that alert — only the first-sight settle does, once a pass can
+    /// read the pools. A failed first-sight write is retried the same way.
+    #[test]
+    fn a_stale_open_alert_from_before_a_restart_is_settled_on_first_sight() {
+        let db = leaf_db(true);
+        store::raise_alert(&db, "disk:wwn-leaf:health", "critical", "disk", "wwn-leaf", "Disk sde: critical", "ZFS reports this disk FAULTED")
+            .unwrap();
+        let mut live = restarted_live("ok", "");
+        assert_eq!(live.disk.health, "ok");
+
+        // The pools could not be read: no word on the leaf, nothing settled.
+        assert_eq!(regrade_leaf(&mut live, None), None);
+        assert!(open_health_alert(&db).is_some());
+
+        let first = regrade_leaf(&mut live, Some(&HashMap::new())).expect("first sight settles");
+        assert_eq!(first.prior_leaf, None);
+        assert_eq!(first.leaf, None);
+        assert_eq!(first.health, "ok");
+        assert!(settle_leaf_alerts(&db, vec![first]).is_empty());
+        assert!(open_health_alert(&db).is_none(), "the stale alert is closed");
+        // Settled once: the same picture on the next pass writes nothing.
+        assert_eq!(regrade_leaf(&mut live, Some(&HashMap::new())), None);
+
+        // A first-sight write that fails has no leaf change to be found by
+        // again; the rollback leaves the disk unsettled instead.
+        let broken = leaf_db(false);
+        let mut live = restarted_live("ok", "");
+        let first = regrade_leaf(&mut live, Some(&HashMap::new())).expect("first sight settles");
+        assert_eq!(settle_leaf_alerts(&broken, vec![first.clone()]).len(), 1);
+        roll_back_leaf(&mut live, &first);
+        assert_eq!(regrade_leaf(&mut live, Some(&HashMap::new())), Some(first));
+    }
+
+    /// A disk SMART still calls critical keeps its ONE alert across a
+    /// restart: the first-sight settle refreshes the open row in place (same
+    /// id, same `raised_at`), and neither further passes nor a SMART read
+    /// add a row.
+    #[test]
+    fn a_first_sight_settle_never_duplicates_the_open_alert() {
+        let db = leaf_db(true);
+        store::raise_alert(&db, "disk:wwn-leaf:health", "critical", "disk", "wwn-leaf", "Disk sde: critical", "8 reallocated sectors")
+            .unwrap();
+        let old = open_health_alert(&db).unwrap();
+        let mut live = restarted_live("critical", "8 reallocated sectors");
+        for _ in 0..3 {
+            if let Some(regrade) = regrade_leaf(&mut live, Some(&HashMap::new())) {
+                assert!(settle_leaf_alerts(&db, vec![regrade]).is_empty());
+            }
+        }
+        let cell = RwLock::new(State::new());
+        cell.write().disks.insert("wwn-leaf".to_string(), live);
+        settle_smart_read(
+            &db,
+            &cell,
+            "wwn-leaf",
+            &serde_json::json!({}),
+            SmartSummary::default(),
+            "critical",
+            "8 reallocated sectors".to_string(),
+        );
+
+        let all = store::alerts_for_subject(&db, "disk", "wwn-leaf").unwrap();
+        assert_eq!(all.len(), 1, "one row, never a second one: {all:?}");
+        assert_eq!(all[0].alert_id, old.alert_id);
+        assert_eq!(all[0].raised_at, old.raised_at);
+        assert!(all[0].resolved_at.is_none());
+    }
+
+    /// `refresh_smart` over two disks while the database refuses the writes
+    /// (the stored verdict and the alert both): each disk still takes its new
+    /// verdict — the first failure ends nothing — and is left unsettled, so
+    /// the next inventory pass writes both alerts once the database is back.
+    #[test]
+    fn a_failed_smart_alert_write_neither_ends_the_pass_nor_is_lost() {
+        let broken = leaf_db(false);
+        broken.write().unwrap().execute_batch("DROP TABLE nas_disks").expect("drop");
+        let cell = RwLock::new(State::new());
+        let ids = ["wwn-leaf", "wwn-other"];
+        for (id, name) in ids.into_iter().zip(["sde", "sdf"]) {
+            let mut live = restarted_live("ok", "");
+            live.disk.disk_id = id.to_string();
+            live.disk.name = name.to_string();
+            // Settled by an earlier pass.
+            assert!(regrade_leaf(&mut live, Some(&HashMap::new())).is_some());
+            cell.write().disks.insert(id.to_string(), live);
+        }
+        for id in ids {
+            settle_smart_read(
+                &broken,
+                &cell,
+                id,
+                &serde_json::json!({}),
+                SmartSummary::default(),
+                "critical",
+                "SMART overall status FAILED".to_string(),
+            );
+        }
+        for live in cell.read().disks.values() {
+            assert_eq!(live.disk.health, "critical", "{} took its verdict", live.disk.disk_id);
+            assert!(!live.alert_settled, "{} is left for the next pass", live.disk.disk_id);
+        }
+
+        let good = leaf_db(true);
+        let regrades: Vec<LeafRegrade> = cell
+            .write()
+            .disks
+            .values_mut()
+            .filter_map(|l| regrade_leaf(l, Some(&HashMap::new())))
+            .collect();
+        assert_eq!(regrades.len(), 2, "both unchanged leaves are settled again");
+        assert!(settle_leaf_alerts(&good, regrades).is_empty());
+        for id in ids {
+            let open: Vec<_> = store::alerts_for_subject(&good, "disk", id)
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.resolved_at.is_none())
+                .collect();
+            assert_eq!(open.len(), 1, "{id}");
+            assert_eq!(open[0].severity, "critical");
+        }
+    }
+
+    /// Two inventory passes at once: the sampler's and a dispatch call's.
+    /// The first read the disk FAULTED and is still inside its read when the
+    /// second starts; the second reads it ONLINE. The second may not read
+    /// before the first has written its alert, so what is left is the newer
+    /// reading: no open alert, the disk graded by SMART again. Without the
+    /// gate the second pass runs to the end first, and the first then raises
+    /// a critical alert from the older reading that nothing ever closes.
+    #[tokio::test]
+    async fn concurrent_inventory_passes_cannot_leave_the_alert_in_the_older_state() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let db = leaf_db(true);
+        let cell = RwLock::new(State::new());
+        let gate = tokio::sync::Mutex::new(());
+        let disk = NasDisk { disk_id: "wwn-leaf".to_string(), name: "sde".to_string(), ..used_disk() };
+        // Known from the previous process lifetime, SMART-healthy.
+        store::upsert_disk_seen(
+            &db,
+            &DiskIdentity {
+                disk_id: &disk.disk_id,
+                name: &disk.name,
+                model: &disk.model,
+                serial: &disk.serial,
+                wwn: disk.wwn.as_deref(),
+                size_bytes: disk.size_bytes,
+                kind: &disk.kind,
+            },
+        )
+        .unwrap();
+        store::store_smart(&db, "wwn-leaf", "{}", "ok", "").unwrap();
+
+        let disk = &disk;
+        let reading = move |state: &str| -> Result<InventoryRead> {
+            Ok((vec![disk.clone()], HashMap::new(), Some(leaves(state))))
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let second_read_flag = AtomicBool::new(false);
+        let second_read = &second_read_flag;
+
+        let first = inventory_pass(&db, &cell, &gate, move || async move {
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            reading("faulted")
+        });
+        let second = async {
+            started_rx.await.unwrap();
+            inventory_pass(&db, &cell, &gate, move || async move {
+                second_read.store(true, Ordering::SeqCst);
+                reading("online")
+            })
+            .await
+        };
+        let driver = async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !second_read.load(Ordering::SeqCst),
+                "the second pass read the node while the first was still in flight"
+            );
+            release_tx.send(()).unwrap();
+        };
+        let (first, second, ()) = tokio::join!(first, second, driver);
+        first.unwrap();
+        second.unwrap();
+
+        {
+            let st = cell.read();
+            let live = &st.disks["wwn-leaf"];
+            assert_eq!(live.leaf_state.as_deref(), Some("online"));
+            assert_eq!(live.disk.health, "ok");
+        }
+        assert!(open_health_alert(&db).is_none(), "the newer reading closed the older one's alert");
+        let all = store::alerts_for_subject(&db, "disk", "wwn-leaf").unwrap();
+        assert_eq!(all.len(), 1, "the first pass's alert, raised once and resolved: {all:?}");
     }
 
     #[test]
@@ -3381,7 +4230,7 @@ mod tests {
             "verify": {"total_uncorrected_errors": 4},
         }));
         assert_eq!(s.media_errors, Some(9));
-        assert_eq!(score_health(&s, "hdd", None).0, "critical");
+        assert_eq!(score_health(&s, "hdd", None), ("warning", "9 media errors".to_string()));
 
         // `verify` absent — the shape of every disk in the fleet.
         let s = counted(serde_json::json!({

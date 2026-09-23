@@ -701,7 +701,7 @@ pub struct TopicConfig {
     /// F3 (SUM/tentabus/PLAN-F3.md §3): the SUBJECT NAME of a registered
     /// `bus::schema_registry` entry. `Some(non-empty)` after `create_topic`/
     /// `update_topic` only when `apply_schema_binding_guard` accepted it —
-    /// subject must exist, not be deprecated, and its type must match this
+    /// subject must exist, not be deprecated when newly bound, and its type must match this
     /// topic's resolved `PayloadFormat`. `Some("")`/`None` means "no schema
     /// bound"; a call that clears it also forces `validation` to `Off` (see
     /// `apply_schema_binding_guard`'s doc). Pre-F3 rows may carry arbitrary
@@ -1126,7 +1126,10 @@ pub fn partition_dir(
 /// `update_topic` next to the pre-existing field-policy content_type guard
 /// it mirrors — it is not gated by "touched" at all, same as that one):
 ///   1. An explicit non-empty `schema_id` must name a subject that exists
-///      for this org and is not deprecated — but ONLY when the binding is
+///      for this org (and, when the binding CHANGES, is not deprecated —
+///      owner decision 23.09: a deprecated subject cannot be chosen anew,
+///      while a topic already bound to it keeps it, validation mode edits
+///      included) — but ONLY when the binding is
 ///      actually CHANGING (`cfg.schema_id` after merge differs from
 ///      `old_schema_id`) or enforcement is actually being requested
 ///      (`cfg.validation != Off`). A UI that always echoes back the
@@ -1214,7 +1217,7 @@ fn apply_schema_binding_guard(
         .ok_or_else(|| BusServiceError::InvalidTopicConfig {
             reason: format!("schema subject '{subject_name}' is not registered for this org"),
         })?;
-    if row.deprecated_at_ms.is_some() {
+    if binding_changed && row.deprecated_at_ms.is_some() {
         return Err(BusServiceError::InvalidTopicConfig {
             reason: format!("schema subject '{subject_name}' is deprecated"),
         });

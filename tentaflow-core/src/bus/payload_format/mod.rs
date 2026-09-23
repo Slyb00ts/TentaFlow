@@ -86,6 +86,23 @@ pub enum PayloadFormat {
 }
 
 impl PayloadFormat {
+    /// Every format this build parses, in the order the UI lists them.
+    pub const ALL: [PayloadFormat; 3] = [
+        PayloadFormat::Json,
+        PayloadFormat::Xml,
+        PayloadFormat::Hl7V2,
+    ];
+
+    /// The `content_type` a topic of this format is created with — the
+    /// first of the spellings `from_content_type` recognizes for it.
+    pub fn canonical_content_type(self) -> &'static str {
+        match self {
+            PayloadFormat::Json => "application/json",
+            PayloadFormat::Xml => "application/xml",
+            PayloadFormat::Hl7V2 => "application/hl7-v2",
+        }
+    }
+
     /// Resolves a topic's `content_type` to a format. Backward-compat rule
     /// (see this module's header): unrecognized or
     /// `application/octet-stream` resolves to `Json`, matching pre-F0
@@ -121,6 +138,16 @@ impl PayloadFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_canonical_content_type_resolves_back_to_its_format() {
+        for format in PayloadFormat::ALL {
+            assert_eq!(
+                PayloadFormat::from_content_type(format.canonical_content_type()),
+                format
+            );
+        }
+    }
 
     #[test]
     fn from_content_type_recognizes_json() {
