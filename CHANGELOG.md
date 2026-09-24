@@ -23,6 +23,10 @@ builds failed), so this is the first release published after `0.1.0-beta`: the
   they cannot be decrypted with another node's key. At startup the node logs how
   many credential rows it removed, per node and engine and in total, so the
   loss of old entries never looks like silent data loss.
+- **TentaBus partitions damaged by the old segment-roll bug no longer open.** A
+  partition whose segment files were misnamed by that bug now fails with
+  `SegmentOffsetMismatch` instead of being silently truncated; recover it by hand
+  from a healthy replica.
 
 ### Windows
 
@@ -80,7 +84,12 @@ builds failed), so this is the first release published after `0.1.0-beta`: the
   instance isolation, quota enforcement and validation.
 - Schema-registry REST API with per-action API-key scopes; the compliance
   retention floor applies to bus topics.
-- Hardened replication transport; failover audit names the instance.
+- Replication: followers acknowledge on their own cadence and the leader waits
+  without a thread per publish, raising quorum throughput from about 1k to about
+  220k messages/s. Fixed a segment-roll bug that could make consumers skip
+  records, and leader-term races (term rollback, duplicate leaders after
+  failover, unauthenticated leader handshakes). The replication transport is
+  hardened and the failover audit names the instance.
 - Lag without side effects, truthful deprecation, lag history, and the first
   TentaBus screen (shell and overview).
 
