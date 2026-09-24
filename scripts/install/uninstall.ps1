@@ -46,13 +46,16 @@ $fate = '(kept)'
 if ($Purge) { $fate = '(WILL BE DELETED)' }
 Write-Host "  data:   $dataDir $fate"
 
-$service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+$service = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
 if ($service) {
     # Stopped before it is deleted: a deleted service that still runs is only
-    # marked for deletion and keeps its files open until it exits.
-    if ($service.Status -ne 'Stopped') {
+    # marked for deletion and keeps its files open until it exits. STOPPED is
+    # reported before the process has exited, so the wait is for the process.
+    if ($service.State -ne 'Stopped') {
+        $servicePid = $service.ProcessId
         Stop-Service -Name $ServiceName -Force
-        $service.WaitForStatus('Stopped', [TimeSpan]::FromMinutes(3))
+        (Get-Service -Name $ServiceName).WaitForStatus('Stopped', [TimeSpan]::FromMinutes(3))
+        if ($servicePid) { Wait-Process -Id $servicePid -Timeout 60 -ErrorAction SilentlyContinue }
     }
     & sc.exe delete $ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "sc.exe delete $ServiceName failed (exit $LASTEXITCODE)." }

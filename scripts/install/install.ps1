@@ -290,13 +290,16 @@ function Add-MachinePath($dir) {
 }
 
 function Stop-TentaflowService {
-    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($service -and $service.Status -ne 'Stopped') {
+    $service = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+    if ($service -and $service.State -ne 'Stopped') {
         Log 'Stopping the running service before the swap'
         # A running server holds its DLLs open; the version directory must not
-        # change underneath it.
+        # change underneath it. STOPPED is reported before the process has
+        # exited, so the wait is for the process, not only the state.
+        $servicePid = $service.ProcessId
         Stop-Service -Name $ServiceName -Force
-        $service.WaitForStatus('Stopped', [TimeSpan]::FromMinutes(3))
+        (Get-Service -Name $ServiceName).WaitForStatus('Stopped', [TimeSpan]::FromMinutes(3))
+        if ($servicePid) { Wait-Process -Id $servicePid -Timeout 60 -ErrorAction SilentlyContinue }
     }
 }
 

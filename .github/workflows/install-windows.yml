@@ -129,7 +129,10 @@ jobs:
 
       - name: Uninstall
         run: |
-          .\scripts\install\uninstall.ps1 -Purge
+          try { .\scripts\install\uninstall.ps1 -Purge } catch {
+            Write-Host "::error title=uninstall.ps1 line $($_.InvocationInfo.ScriptLineNumber)::$($_.Exception.Message) | $($_.InvocationInfo.Line.Trim())"
+            exit 1
+          }
           if (Get-Service TentaFlow -ErrorAction SilentlyContinue) { Write-Host '::error::the service is still registered'; exit 1 }
           if (Test-Path (Join-Path $env:ProgramFiles 'TentaFlow')) { Write-Host '::error::the prefix is still there'; exit 1 }
           if (Get-NetFirewallRule -Group TentaFlow -ErrorAction SilentlyContinue) { Write-Host '::error::firewall rules left behind'; exit 1 }
