@@ -521,6 +521,14 @@ fn approval_alert_text(operation: &str, subject: &str, shown_subject: &str, deta
 /// or, when it is empty, the operation alone. Also what the read boundary
 /// rewrites a config import's stored title to once it has resolved the node
 /// (`dispatch::tentanas::alerts_list`).
+/// A parked operation's `detail` as a CODE the approver's screen words in
+/// the approver's language (`approvals.detail_<code>`, `approvals.js`),
+/// instead of a sentence in one language: `text:<code>`. The approvals list
+/// shows a detail that is not such a code as it was written.
+pub fn coded_detail(code: &str) -> String {
+    format!("text:{code}")
+}
+
 pub fn approval_alert_title(shown_subject: &str) -> String {
     if shown_subject.trim().is_empty() {
         "a red-path operation waits for a second admin".to_string()

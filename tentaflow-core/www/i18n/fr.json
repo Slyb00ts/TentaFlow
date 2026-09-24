@@ -6267,7 +6267,9 @@
       "elastic_mover_window_on": "hors de la fenêtre, les fichiers attendent sur le cache",
       "elastic_mover_window_off": "désactivée : les fichiers sont déplacés automatiquement",
       "elastic_sync_name": "Sync SnapRAID {array}",
-      "elastic_scrub_name": "Scrub SnapRAID {array}"
+      "elastic_scrub_name": "Scrub SnapRAID {array}",
+      "skip_elastic_scrub_errors_unrepaired": "un scrub a signalé des erreurs que rien n’a encore réparées — lancez la réparation depuis la parité",
+      "skip_elastic_parity_fault_unacknowledged": "la grappe a une erreur de scrub ou de réparation non corrigée — la synchronisation exige une confirmation sur l’écran de la grappe"
     },
     "kpi": {
       "shares": "Partages",
@@ -6675,7 +6677,8 @@
         },
         "elastic_sync_held": {
           "title": "Matrice {array} : Sync planifié suspendu, la parité signale des erreurs",
-          "detail": "Un scrub a signalé des erreurs que rien n'a encore réparées. Un Sync planifié retirerait du fichier content les fichiers que le scrub n'a pas pu lire. Lancez la réparation depuis la parité, puis un scrub ; le Sync manuel reste disponible."
+          "detail": "Un scrub a signalé des erreurs que rien n'a encore réparées. Un Sync planifié retirerait du fichier content les fichiers que le scrub n'a pas pu lire. Lancez la réparation depuis la parité, puis un scrub ; le Sync manuel reste disponible.",
+          "detail_fault": "Le scrub ne s’est pas terminé correctement ou une réparation a échoué. La synchronisation planifiée retirerait du fichier content les fichiers que le scrub n’a pas pu lire ; elle exige donc une confirmation sur l’écran de la grappe. Lancez un scrub ou la réparation depuis la parité ; une synchronisation manuelle reste disponible après confirmation."
         },
         "elastic_mover_settle_stopped": {
           "title": "Matrice {array} : achèvement automatique du déplacement suspendu",
@@ -7237,7 +7240,9 @@
       "single_admin": "Un seul administrateur détient nas.admin : lever la protection d'un snapshot passe par le chemin rouge ordinaire (nom retapé + mot de passe sudo), car personne ne pourrait l'approuver. Dès qu'un second administrateur existe, cela revient dans la file d'approbation.",
       "op_target_delete": "Suppression d'une cible bloc",
       "op_elastic_schedule": "Armer une planification Elastic",
-      "op_elastic_add_disk_abort": "Elastic Array · Annulation de l’ajout d’un disque"
+      "op_elastic_add_disk_abort": "Elastic Array · Annulation de l’ajout d’un disque",
+      "detail_elastic_sync": "Écrit un nouveau point de contrôle de parité et de content.",
+      "detail_elastic_sync_over_fault": "Écrit un nouveau point de contrôle de parité et de content. ATTENTION : la grappe a une erreur de scrub ou de réparation non corrigée. Les blocs marqués restent réparables, mais les fichiers que le scrub n’a pas pu lire seront retirés du fichier content et la parité ne les couvrira plus. Lancez d’abord la réparation depuis la parité."
     },
     "access": {
       "title": "Journal d'accès",

@@ -947,7 +947,7 @@ test('nieudany scrub i naprawa bez zapisu zostawiają Sync i Scrub do uruchomien
     if (fault) {
       const win = document.querySelector('tf-window');
       assert.ok(win, `${history[0].outcome}: the confirm opens`);
-      typeInto(win.querySelector('#nas-retype'), 'media');
+      typeInto(win.querySelector('#retype-input'), 'media');
       confirmWindow(win);
       await flush();
     }
@@ -1534,9 +1534,9 @@ test('Sync przy nienaprawionym błędzie wymaga potwierdzenia kosztu, a tylko on
     assert.match(win.textContent, /zostaną usunięte z content/, `${label}: the confirm names the cost`);
     assert.match(win.textContent, /pozostaną naprawialne/, label);
     const confirm = win.querySelector('[data-action="confirm"]');
-    typeInto(win.querySelector('#nas-retype'), 'medi');
+    typeInto(win.querySelector('#retype-input'), 'medi');
     assert.ok(confirm.hasAttribute('disabled'), `${label}: armed only by the array name`);
-    typeInto(win.querySelector('#nas-retype'), 'media');
+    typeInto(win.querySelector('#retype-input'), 'media');
     confirmWindow(win);
     await flush();
     // The confirm names THE fault it showed (M1): the id stays internal.
@@ -1647,7 +1647,7 @@ test('niedokończone dodanie dysku: „Dokończ dodawanie dysku” wysyła przyp
   const win = document.querySelector('tf-window');
   assert.ok(win);
   assert.equal(win.querySelector('#nas-add-disk'), null, 'the picker stays closed');
-  typeInto(win.querySelector('#nas-retype'), 'media');
+  typeInto(win.querySelector('#retype-input'), 'media');
   confirmWindow(win);
   await flush();
   assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticCapabilitiesRequest').length, 0, 'no free-disk list is asked for');
@@ -1658,7 +1658,7 @@ test('niedokończone dodanie dysku: „Dokończ dodawanie dysku” wysyła przyp
   await flush();
   const undo = [...document.querySelectorAll('tf-window')].pop();
   assert.match(undo.textContent, /wyczyści wyłącznie system plików, który nadało mu to dodawanie/);
-  typeInto(undo.querySelector('#nas-retype'), 'media');
+  typeInto(undo.querySelector('#retype-input'), 'media');
   confirmWindow(undo);
   await flush();
   assert.deepEqual(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayAddDiskAbortRequest').map((c) => c.payload),

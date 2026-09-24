@@ -2913,16 +2913,32 @@ pub fn unresolved_parity_fault(history: &[NasSnapraidRun]) -> Option<&NasSnaprai
     None
 }
 
-/// Why the CADENCE must not start a Sync on this array, or `None` when it may.
-/// The sentence is what the schedule row records, so an admin reading the
-/// schedule sees why a slot did nothing instead of finding a silent gap.
-pub fn scheduled_sync_blocker(history: &[NasSnapraidRun]) -> Option<String> {
-    let run = unresolved_parity_fault(history)?;
-    Some(format!(
-        "pominięto: scrub zgłosił {} błędów, których nic jeszcze nie naprawiło — uruchom naprawę z parity \
-         (Sync usunąłby z content pliki, których scrub nie mógł odczytać)",
-        run.errors.unwrap_or_default()
-    ))
+/// Why the CADENCE must not start a Sync on this array, or `None` when it may,
+/// as the code the schedule row records (`pominięto: reason:<code>`) and the
+/// screen words (`schedules.skip_<code>`), so an admin reading the schedule
+/// sees why a slot did nothing instead of finding a silent gap:
+/// - `elastic_scrub_errors_unrepaired` — a scrub counted errors nothing has
+///   repaired (`unresolved_parity_fault`);
+/// - `elastic_parity_fault_unacknowledged` — a scrub that failed without
+///   counting anything (its log broke), or a repair that failed. The helper
+///   records both as the array's cause and refuses every Sync that does not
+///   acknowledge it (minor 8 of the release review): starting one per slot
+///   only added a refused run to the history each time.
+/// Either ends as the fault does — a successful repair or a clean scrub —
+/// and the uncounted one also with a successful (confirmed) Sync, after
+/// which the helper holds no cause.
+pub fn scheduled_sync_blocker(history: &[NasSnapraidRun]) -> Option<&'static str> {
+    if unresolved_parity_fault(history).is_some() {
+        return Some("elastic_scrub_errors_unrepaired");
+    }
+    for run in history {
+        match (run.kind.as_str(), run.outcome.as_str()) {
+            ("fix" | "scrub", "ok") | ("sync", "ok" | "partial") => return None,
+            ("scrub" | "fix", "failed" | "needs_attention") => return Some("elastic_parity_fault_unacknowledged"),
+            _ => (),
+        }
+    }
+    None
 }
 
 /// The alert key for a cadence slot skipped because parity errors await a
@@ -11246,7 +11262,7 @@ pub(crate) mod tests {
             ("a repair failed, then a clean scrub", vec![scrub_ok.clone(), fix_failed.clone()], false),
         ] {
             assert_eq!(sync_acknowledgement_needed(&history), stands, "{label}");
-            assert_eq!(scheduled_sync_blocker(&history).is_some(), stands && label.contains("errors"), "{label}: cadence");
+            assert_eq!(scheduled_sync_blocker(&history).is_some(), stands, "{label}: cadence");
         }
         // The id an acknowledgement names is the fault's own run.
         assert_eq!(unacknowledged_fault(&[sync_ok, data_fault.clone()]).and_then(|r| r.operation_id.clone()), data_fault.operation_id);

@@ -566,7 +566,11 @@ const ALERT_WORDS = new Map([
   }],
   ['elastic_sync_held', (p) => {
     const t = textParams(p, ['array']);
-    return t ? { title: T('alerts.code.elastic_sync_held.title', t), detail: T('alerts.code.elastic_sync_held.detail') } : null;
+    if (!t) return null;
+    // `cause` 'parity_fault': a fault the helper records with no counts (a
+    // scrub whose log broke, a failed repair). Absent on older rows.
+    const detail = textParam(p, 'cause') === 'parity_fault' ? 'detail_fault' : 'detail';
+    return { title: T('alerts.code.elastic_sync_held.title', t), detail: T('alerts.code.elastic_sync_held.' + detail) };
   }],
   ['elastic_mover_settle_stopped', (p) => {
     const t = textParams(p, ['array']);

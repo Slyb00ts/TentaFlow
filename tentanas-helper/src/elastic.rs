@@ -290,9 +290,10 @@ pub enum ElasticAttention {
     AddDisk {
         disk_id: String,
         /// DURABLE INTENT, written before the branch is appended to the live
-        /// union: the disk may have joined the share. Once true, only a live
-        /// read of that union in this boot can prove it did not, and without
-        /// that proof the add can only go forward.
+        /// union: the disk may have joined the share. Once true the add goes
+        /// forward only (`add_undo_admission`): nothing — a live read of the
+        /// union included, which after a reboot finds no union at all — can
+        /// prove what the branch received while it served.
         #[serde(default)]
         joined: bool,
     },
@@ -7581,10 +7582,15 @@ pub(crate) mod execution {
                     let disk = role_disk(&journal.spec, role)?.clone();
                     let current = system.device(&disk)?;
                     system.clean_device(&current).map_err(|error| {
-                        // H11, until M1 is measured: an add never formats over
-                        // a signature, not even the partial filesystem its own
-                        // interrupted mkfs may have left. The undo can wipe
-                        // exactly that one (`own_signatures_only`).
+                        // H11: an add never formats over a signature, not even
+                        // the partial filesystem its own interrupted mkfs may
+                        // have left. The undo can wipe exactly that one
+                        // (`own_signatures_only`). MEASURED (M1, rig11): an
+                        // interrupted mkfs leaves either no signature or only
+                        // the slot's own type with its own UUID — never a
+                        // foreign one — and mkfs or `wipefs --all` over it is
+                        // always clean, so the undo's rule covers every state
+                        // it leaves.
                         if mode == StepMode::AddDisk {
                             format!(
                                 "{error} — dysk nosi już podpis, być może niedokończonego formatowania tego \
@@ -15310,10 +15316,11 @@ Nothing to do
             assert_eq!(assert_added(&root, "resumed").stale_parity_bytes, Some(0));
         }
 
-        /// H11, gated on M1: a resume never formats over a signature — not
-        /// even over the partial filesystem the add's own interrupted mkfs
-        /// left — and says the way out is the undo. The undo's own rule is
-        /// that it erases ONLY that filesystem.
+        /// H11: a resume never formats over a signature — not even over the
+        /// partial filesystem the add's own interrupted mkfs left — and says
+        /// the way out is the undo. The undo's own rule is that it erases ONLY
+        /// that filesystem; measured (M1, rig11), an interrupted mkfs leaves
+        /// nothing else for it to meet.
         #[test]
         fn a_partial_filesystem_is_refused_by_the_resume_and_recognised_by_the_undo() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

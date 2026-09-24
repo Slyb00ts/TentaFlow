@@ -6568,7 +6568,8 @@
         },
         "elastic_sync_held": {
           "title": "Array {array}: scheduled Sync held, parity reports errors",
-          "detail": "A scrub reported errors nothing has repaired yet. A scheduled Sync would drop from the content file the files the scrub could not read. Run the repair from parity, then a scrub; a manual Sync stays available."
+          "detail": "A scrub reported errors nothing has repaired yet. A scheduled Sync would drop from the content file the files the scrub could not read. Run the repair from parity, then a scrub; a manual Sync stays available.",
+          "detail_fault": "The scrub did not finish correctly or a repair failed. The scheduled Sync would remove the files the scrub could not read from the content file, so it needs a confirmation on the array screen. Run a scrub or the repair from parity; a manual Sync stays available after the confirmation."
         },
         "elastic_mover_settle_stopped": {
           "title": "Array {array}: automatic move completion paused",
@@ -8021,7 +8022,9 @@
       "elastic_mover_window_on": "outside the window files wait on the cache",
       "elastic_mover_window_off": "off: files are moved automatically",
       "elastic_sync_name": "SnapRAID sync {array}",
-      "elastic_scrub_name": "SnapRAID scrub {array}"
+      "elastic_scrub_name": "SnapRAID scrub {array}",
+      "skip_elastic_scrub_errors_unrepaired": "a scrub reported errors nothing has repaired yet — run the repair from parity",
+      "skip_elastic_parity_fault_unacknowledged": "the array has an unrepaired scrub or repair fault — the Sync needs a confirmation on the array screen"
     },
     "shares": {
       "create": "New share",
@@ -8453,7 +8456,9 @@
       "single_admin": "Only one administrator holds nas.admin: lifting a snapshot's protection goes through the ordinary red path (retyped name + sudo password), because nobody could approve it. As soon as a second administrator exists it returns to the approval queue.",
       "op_target_delete": "Block target deletion",
       "op_elastic_schedule": "Arm an Elastic schedule",
-      "op_elastic_add_disk_abort": "Elastic Array · Undo disk addition"
+      "op_elastic_add_disk_abort": "Elastic Array · Undo disk addition",
+      "detail_elastic_sync": "Writes a new parity and content checkpoint.",
+      "detail_elastic_sync_over_fault": "Writes a new parity and content checkpoint. WARNING: the array has an unrepaired scrub or repair fault. Marked blocks stay repairable, but files the scrub could not read will be removed from the content file and parity will no longer cover them. Run the repair from parity first."
     },
     "access": {
       "title": "Access log",

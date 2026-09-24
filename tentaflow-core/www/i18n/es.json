@@ -6267,7 +6267,9 @@
       "elastic_mover_window_on": "fuera de la ventana los archivos esperan en la caché",
       "elastic_mover_window_off": "desactivada: los archivos se trasladan automáticamente",
       "elastic_sync_name": "Sync de SnapRAID {array}",
-      "elastic_scrub_name": "Scrub de SnapRAID {array}"
+      "elastic_scrub_name": "Scrub de SnapRAID {array}",
+      "skip_elastic_scrub_errors_unrepaired": "un scrub informó de errores que aún nada ha reparado — ejecute la reparación desde la paridad",
+      "skip_elastic_parity_fault_unacknowledged": "la matriz tiene un error de scrub o de reparación sin corregir — la sincronización requiere confirmación en la pantalla de la matriz"
     },
     "kpi": {
       "shares": "Recursos",
@@ -6675,7 +6677,8 @@
         },
         "elastic_sync_held": {
           "title": "Matriz {array}: Sync programado detenido, la paridad informa de errores",
-          "detail": "Un scrub informó de errores que nada ha reparado todavía. Un Sync programado quitaría del archivo content los archivos que el scrub no pudo leer. Ejecuta la reparación desde la paridad y después un scrub; el Sync manual sigue disponible."
+          "detail": "Un scrub informó de errores que nada ha reparado todavía. Un Sync programado quitaría del archivo content los archivos que el scrub no pudo leer. Ejecuta la reparación desde la paridad y después un scrub; el Sync manual sigue disponible.",
+          "detail_fault": "El scrub no terminó correctamente o una reparación falló. La sincronización programada eliminaría del archivo content los archivos que el scrub no pudo leer, así que requiere confirmación en la pantalla de la matriz. Ejecute un scrub o la reparación desde la paridad; la sincronización manual sigue disponible tras la confirmación."
         },
         "elastic_mover_settle_stopped": {
           "title": "Matriz {array}: finalización automática del movimiento en pausa",
@@ -7237,7 +7240,9 @@
       "single_admin": "Solo un administrador tiene nas.admin: retirar la protección de un snapshot va por la ruta roja normal (reescribir el nombre + contraseña sudo), porque nadie podría aprobarla. En cuanto exista un segundo administrador volverá a la cola de aprobaciones.",
       "op_target_delete": "Eliminación de un destino de bloque",
       "op_elastic_schedule": "Armar una programación de Elastic",
-      "op_elastic_add_disk_abort": "Elastic Array · Deshacer la adición de un disco"
+      "op_elastic_add_disk_abort": "Elastic Array · Deshacer la adición de un disco",
+      "detail_elastic_sync": "Escribe un nuevo punto de control de paridad y de content.",
+      "detail_elastic_sync_over_fault": "Escribe un nuevo punto de control de paridad y de content. ATENCIÓN: la matriz tiene un error de scrub o de reparación sin corregir. Los bloques marcados siguen siendo reparables, pero los archivos que el scrub no pudo leer se eliminarán del archivo content y la paridad dejará de cubrirlos. Ejecute primero la reparación desde la paridad."
     },
     "access": {
       "title": "Registro de acceso",

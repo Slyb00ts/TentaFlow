@@ -2124,8 +2124,9 @@ pub fn insert_job_owned(
             // filesystem that add gave the disk is ever erased — and it is
             // admitted on an array that needs attention, because the add
             // needing attention is what it resolves. Whether the disk may
-            // still be taken out is the helper's live read of the union, not
-            // anything this database knows.
+            // still be taken out is the helper's to decide — its journal's
+            // durable `joined`, which a live read of the union can only add
+            // refusals to — not anything this database knows.
             ElasticJobIntent::AddDiskAbort { owner, array_id, operation_id, disk } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_add_disk_abort" && job.subject == spec.name,

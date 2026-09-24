@@ -10,7 +10,7 @@
 // and in what "Uruchom teraz" sends. Runs under happy-dom.
 // =============================================================================
 
-import { fakeScreen, flush, click, confirmWindow, window } from './_test-setup.js';
+import { fakeScreen, flush, click, confirmWindow, window, I18n } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -1023,6 +1023,66 @@ test('a changed schedule patches only its own protection row, in place', async (
     assert.ok(rowOf('snapshot:none'), 'the empty state row replaces it');
     assert.ok(rowOf('scrub:tank') === before.scrub, 'the other column is still untouched');
   } finally {
+    screen.dispose();
+  }
+});
+
+// Minor 8 of the release review: a scheduled Sync the node skipped over a
+// parity fault records a CODE, and the row says why in the reader's
+// language — the older stored sentence stays a tooltip.
+test('a coded skip reason is the row text, translated, and never a code', async () => {
+  const sched = { ...elasticSchedules, rows: [
+    elasticSchedules.rows[0],
+    { ...elasticSchedules.rows[1], enabled: true, lastRunAt: '2026-09-02 03:00:00', lastResult: 'pominięto: reason:elastic_parity_fault_unacknowledged' },
+  ] };
+  try {
+    for (const [language, words] of [['pl', /pominięto: macierz ma nienaprawiony błąd scrub lub naprawy/], ['en', /the array has an unrepaired scrub or repair fault/]]) {
+      await I18n.setLanguage(language);
+      const screen = fakeScreen(fixtures({ tentaNasSchedulesListRequest: sched }));
+      screen.later = () => {};
+      const body = mount();
+      await drawTasks(screen, body);
+      await flush(); await flush();
+      const sub = scheduleRows(body)[1].querySelector('[data-role="sub"]');
+      assert.match(sub.textContent, words, language);
+      assert.doesNotMatch(sub.textContent, /reason:|elastic_/, language);
+      screen.dispose();
+    }
+  } finally { await I18n.setLanguage('pl'); }
+  // A code this build has no words for stays a tooltip, never row text.
+  const unknown = scheduleOutcome('pominięto: reason:elastic_something_new');
+  assert.equal(unknown.skipped, true);
+  assert.equal(unknown.reason, undefined);
+});
+
+// "Uruchom teraz" on a Sync the node refuses for want of the confirm (a
+// parity fault, or a confirm that named an older fault): the refusal is
+// worded by the toast, and the admin is taken to the array screen, where the
+// confirm that names the cost lives. Any other refusal stays where it is.
+test('"Uruchom teraz" on a Sync that needs the confirm opens the array screen', async () => {
+  const sched = { ...elasticSchedules, rows: [elasticSchedules.rows[0], { ...elasticSchedules.rows[1], enabled: true }] };
+  for (const [refusal, redirected] of [
+    ['refusal:elastic_fault_unacknowledged', true],
+    ['refusal:elastic_fault_changed', true],
+    ['refusal:elastic_operation_pending', false],
+  ]) {
+    const screen = fakeScreen(fixtures({
+      tentaNasSchedulesListRequest: sched,
+      tentaNasElasticArraySyncRequest: () => { throw new Error(`protocol error NotAvailable: ${refusal}`); },
+    }));
+    screen.later = () => {};
+    // As the real screen does: the error is toasted and the call answers null.
+    screen.withSudo = async (fn) => { try { return await fn('hunter2'); } catch { return null; } };
+    const opened = [];
+    screen.openArray = (name) => opened.push(name);
+    const body = mount();
+    await drawTasks(screen, body);
+    await flush();
+    click(scheduleRows(body)[1].querySelector('[data-act="run"]'));
+    await flush(); await flush();
+    assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest').length, 1, refusal);
+    assert.deepEqual(opened, redirected ? ['media'] : [], refusal);
+    assert.equal(screen.jobLogs.length, 0, refusal);
     screen.dispose();
   }
 });

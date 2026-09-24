@@ -6267,7 +6267,9 @@
       "elastic_mover_window_on": "außerhalb des Fensters warten Dateien auf dem Cache",
       "elastic_mover_window_off": "aus: Dateien werden automatisch verschoben",
       "elastic_sync_name": "SnapRAID-Sync {array}",
-      "elastic_scrub_name": "SnapRAID-Scrub {array}"
+      "elastic_scrub_name": "SnapRAID-Scrub {array}",
+      "skip_elastic_scrub_errors_unrepaired": "ein Scrub hat Fehler gemeldet, die noch nichts behoben hat — führen Sie die Reparatur aus der Parität aus",
+      "skip_elastic_parity_fault_unacknowledged": "das Array hat einen nicht behobenen Scrub- oder Reparaturfehler — der Sync erfordert eine Bestätigung in der Array-Ansicht"
     },
     "kpi": {
       "shares": "Freigaben",
@@ -6675,7 +6677,8 @@
         },
         "elastic_sync_held": {
           "title": "Array {array}: geplanter Sync angehalten, Parity meldet Fehler",
-          "detail": "Ein Scrub hat Fehler gemeldet, die noch nichts repariert hat. Ein geplanter Sync würde die Dateien, die der Scrub nicht lesen konnte, aus der Content-Datei entfernen. Führen Sie die Reparatur aus der Parity und danach einen Scrub aus; ein manueller Sync bleibt verfügbar."
+          "detail": "Ein Scrub hat Fehler gemeldet, die noch nichts repariert hat. Ein geplanter Sync würde die Dateien, die der Scrub nicht lesen konnte, aus der Content-Datei entfernen. Führen Sie die Reparatur aus der Parity und danach einen Scrub aus; ein manueller Sync bleibt verfügbar.",
+          "detail_fault": "Der Scrub wurde nicht korrekt beendet oder eine Reparatur ist fehlgeschlagen. Der geplante Sync würde die Dateien, die der Scrub nicht lesen konnte, aus der Content-Datei entfernen und erfordert daher eine Bestätigung in der Array-Ansicht. Führen Sie einen Scrub oder die Reparatur aus der Parität aus; ein manueller Sync bleibt nach der Bestätigung verfügbar."
         },
         "elastic_mover_settle_stopped": {
           "title": "Array {array}: automatischer Abschluss des Verschiebens pausiert",
@@ -7237,7 +7240,9 @@
       "single_admin": "Nur ein Administrator hat nas.admin: das Aufheben des Snapshot-Schutzes läuft über den gewöhnlichen roten Pfad (Namen abtippen + sudo-Passwort), weil niemand es genehmigen könnte. Sobald ein zweiter Administrator existiert, kehrt es in die Genehmigungswarteschlange zurück.",
       "op_target_delete": "Löschen eines Block-Targets",
       "op_elastic_schedule": "Elastic-Zeitplan scharfschalten",
-      "op_elastic_add_disk_abort": "Elastic Array · Hinzufügen eines Datenträgers rückgängig machen"
+      "op_elastic_add_disk_abort": "Elastic Array · Hinzufügen eines Datenträgers rückgängig machen",
+      "detail_elastic_sync": "Schreibt einen neuen Paritäts- und Content-Checkpoint.",
+      "detail_elastic_sync_over_fault": "Schreibt einen neuen Paritäts- und Content-Checkpoint. ACHTUNG: Das Array hat einen nicht behobenen Scrub- oder Reparaturfehler. Markierte Blöcke bleiben reparierbar, aber Dateien, die der Scrub nicht lesen konnte, werden aus der Content-Datei entfernt und von der Parität nicht mehr abgedeckt. Führen Sie zuerst die Reparatur aus der Parität aus."
     },
     "access": {
       "title": "Zugriffsprotokoll",

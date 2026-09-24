@@ -424,3 +424,27 @@ test('every hide-below of the approvals table is a breakpoint tf-table honours',
     screen.dispose();
   }
 });
+
+// The data-loss warning of a Sync over a parity fault reaches the approver in
+// the approver's language: the node parks a CODE (`text:<code>`), never a
+// Polish sentence. A detail that is no such code is shown as written.
+test('a coded approval detail is worded in the reader language, in all five locales', async () => {
+  const { I18n } = await import('./_test-setup.js');
+  try {
+    for (const [language, warning] of [['pl', /UWAGA/], ['en', /WARNING/], ['de', /ACHTUNG/], ['es', /ATENCIÓN/], ['fr', /ATTENTION/]]) {
+      await I18n.setLanguage(language);
+      const screen = fakeScreen({ tentaNasApprovalsListRequest: {
+        approvals: [pending({ operation: 'elastic_sync', subject: 'media', detail: 'text:elastic_sync_over_fault' })],
+        settings: settings(),
+      } });
+      const body = mount();
+      const { refresh } = wireApprovals(screen, body);
+      await refresh();
+      await flush();
+      const cell = body.querySelector('#nas-approvals-table').rows[0].operation;
+      assert.match(cell, warning, language);
+      assert.doesNotMatch(cell, /text:|elastic_sync_over_fault/, language);
+      screen.dispose();
+    }
+  } finally { await I18n.setLanguage('pl'); }
+});

@@ -431,8 +431,10 @@ pub struct NasAlert {
     ///   `NasHealthReason`s, worst first;
     /// - 'approval_pending' {operation, subject} — `operation` is the
     ///   `NasPendingApproval::operation` code;
-    /// - 'elastic_sync_held' {array} — the scheduled Sync is skipped over a
-    ///   scrub's unrepaired errors;
+    /// - 'elastic_sync_held' {array, cause?} — the scheduled Sync is skipped
+    ///   over a parity fault: `cause` is 'scrub_errors' (a scrub's unrepaired
+    ///   errors) | 'parity_fault' (a fault the helper records with no counts:
+    ///   a scrub whose log broke, a failed repair); absent on older rows;
     /// - 'elastic_mover_settle_stopped' {array, runs};
     /// - 'elastic_cache_stuck' {array, oldest_secs, limit_secs, cause} —
     ///   `cause` is 'unresolved_operation' | 'files_busy' | 'schedule_window'

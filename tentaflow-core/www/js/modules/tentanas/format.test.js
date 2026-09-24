@@ -572,3 +572,23 @@ test('the sweep alert counts in English agree with their verb', async () => {
     await I18n.setLanguage('pl');
   }
 });
+
+// Minor 8 of the release review: the held Sync alert says WHICH fault holds
+// it — counted scrub errors, or a fault the helper records with no counts (a
+// scrub whose log broke, a failed repair) — in every locale; a row raised
+// before `cause` existed reads the scrub-errors text it always had.
+test('the held Sync alert words its cause in every locale', async () => {
+  try {
+    for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(lang);
+      const errors = alertText(A('elastic_sync_held', { array: 'media', cause: 'scrub_errors' }));
+      const fault = alertText(A('elastic_sync_held', { array: 'media', cause: 'parity_fault' }));
+      const legacy = alertText(A('elastic_sync_held', { array: 'media' }));
+      assert.notEqual(fault.detail, errors.detail, lang);
+      assert.equal(legacy.detail, errors.detail, lang);
+      assert.doesNotMatch(fault.detail, /tentanas\.|\{/, lang);
+    }
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});

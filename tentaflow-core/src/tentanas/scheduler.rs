@@ -413,8 +413,8 @@ async fn run_due_elastic_tasks(
             // version of this guard cleared its own alert and skipped silently.
             if task == store::ElasticTask::Sync {
             let repair_key = super::elastic::repair_alert_key(&array.name);
-            let alerted = match &parity_fault {
-                Some(_) => store::raise_coded_alert(
+            let alerted = match parity_fault {
+                Some(code) => store::raise_coded_alert(
                     db,
                     &repair_key,
                     "warning",
@@ -427,7 +427,14 @@ async fn run_due_elastic_tasks(
                          zaplanowanego Sync, bo usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom \
                          naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
                     )
-                    .param("array", &array.name),
+                    .param("array", &array.name)
+                    // Which fault holds it: counted scrub errors, or a fault
+                    // the helper records without counts (a broken scrub log,
+                    // a failed repair). The screen words each.
+                    .param(
+                        "cause",
+                        if code == "elastic_scrub_errors_unrepaired" { "scrub_errors" } else { "parity_fault" },
+                    ),
                 )
                 .map(|_| ()),
                 None => store::resolve_alert(db, &repair_key),
@@ -436,9 +443,10 @@ async fn run_due_elastic_tasks(
                 tracing::warn!("tentanas scheduler: repair alert of {} not recorded: {e}", array.name);
             }
             }
-            if let Some(reason) = parity_fault {
+            if let Some(code) = parity_fault {
                 // The advanced `next_run_at` goes in with the reason, so the
                 // slot is skipped once and not re-tried every tick.
+                let reason = format!("pominięto: reason:{code}");
                 if let Err(e) =
                     store::record_elastic_schedule_run(db, &row.array_id, task, &reason, next.as_deref())
                 {
@@ -1214,8 +1222,7 @@ mod tests {
         let sync_row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Sync)
             .expect("read")
             .expect("row");
-        assert!(sync_row.last_result.contains("pominięto"), "{}", sync_row.last_result);
-        assert!(sync_row.last_result.contains("naprawę"), "{}", sync_row.last_result);
+        assert_eq!(sync_row.last_result, "pominięto: reason:elastic_scrub_errors_unrepaired");
         let rearmed = DateTime::parse_from_rfc3339(sync_row.next_run_at.as_deref().expect("next"))
             .expect("parse")
             .with_timezone(&Local);
@@ -1240,6 +1247,7 @@ mod tests {
         assert!(alert.detail.contains("naprawę"), "{}", alert.detail);
         assert_eq!(alert.code, "elastic_sync_held", "worded by the screen, not by this text");
         assert_eq!(alert.params.get("array").map(String::as_str), Some("media"));
+        assert_eq!(alert.params.get("cause").map(String::as_str), Some("scrub_errors"));
 
         // THE SCRUB SLOT STILL RUNS: a full scrub writes no parity, and it is
         // how the array gets re-measured after a repair.
@@ -1307,6 +1315,74 @@ mod tests {
                 .all(|alert| !alert.title.contains("Sync wstrzymany")),
             "and the alert is resolved"
         );
+    }
+
+    /// Minor 8 of the release review: a scrub whose LOG broke counts nothing,
+    /// so the history holds no scrub errors — but the helper records the
+    /// failure as the array's cause and refuses every Sync that does not
+    /// acknowledge it. The cadence used to start one per slot anyway, each
+    /// refused and each one more row in the short history, with no reason on
+    /// the schedule row. Now it skips, with a coded reason the screen words
+    /// and the held alert, and starts nothing.
+    #[tokio::test]
+    async fn a_scheduled_sync_skips_a_fault_the_helper_records_without_counts() {
+        use tentanas_helper::elastic::{ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome};
+        let p = db();
+        let spec = settled_array(&p, "media");
+        let (job, intent) = snapraid_job(&spec, Kind::Scrub);
+        let crate::tentanas::jobs::ElasticJobIntent::Snapraid { operation_id, .. } = &intent else {
+            panic!("a scrub intent")
+        };
+        let scrub_id = operation_id.clone();
+        store::insert_job(&p, &job, Some(&intent)).expect("scrub job");
+        let mut broken = crate::tentanas::elastic::tests::snapraid_result(&spec, &scrub_id, Kind::Scrub, Outcome::Failed);
+        broken.run.outcome = Outcome::NeedsAttention;
+        broken.run.exit_code = Some(0);
+        broken.run.errors_file = None;
+        broken.run.errors_io = None;
+        broken.run.errors_data = None;
+        broken.state.last_run = Some(broken.run.clone());
+        store::record_snapraid_result(&p, &spec.owner, &scrub_id, &broken).expect("result");
+        store::finish_job(&p, &job.job_id, "failed", Some("niepełne zakończenie scrub")).expect("finish");
+
+        store::set_elastic_schedule(&p, &spec.array_id, store::ElasticTask::Sync, true, &hourly(), None).expect("arm");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        let history_before = arrays[0].snapraid_history.len();
+        run_due_elastic_tasks(&p, &arrays, at(2026, 9, 1, 14, 45)).await;
+        let due = DateTime::parse_from_rfc3339(
+            store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Sync)
+                .expect("read")
+                .expect("row")
+                .next_run_at
+                .as_deref()
+                .expect("next"),
+        )
+        .expect("parse")
+        .with_timezone(&Local)
+            + chrono::Duration::minutes(1);
+        for tick in 0..3 {
+            let arrays = store::elastic_arrays_all(&p).expect("arrays");
+            run_due_elastic_tasks(&p, &arrays, due + chrono::Duration::hours(tick)).await;
+        }
+        let sync_row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Sync)
+            .expect("read")
+            .expect("row");
+        assert_eq!(sync_row.last_result, "pominięto: reason:elastic_parity_fault_unacknowledged");
+        assert!(
+            store::list_jobs(&p, 100).expect("jobs").iter().all(|job| job.kind != "elastic_sync"),
+            "no Sync the helper can only refuse is started"
+        );
+        assert_eq!(
+            store::elastic_arrays_all(&p).expect("arrays")[0].snapraid_history.len(),
+            history_before,
+            "no refused run per slot enters the history"
+        );
+        let alert = store::list_alerts(&p, true)
+            .expect("alerts")
+            .into_iter()
+            .find(|alert| alert.code == "elastic_sync_held")
+            .expect("the skip raises the held alert");
+        assert_eq!(alert.params.get("cause").map(String::as_str), Some("parity_fault"));
     }
 
     /// A refused spawn is NORMAL and must not stop the sweep.

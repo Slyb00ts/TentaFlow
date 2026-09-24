@@ -604,8 +604,9 @@ function openResumeAddDiskDialog(screen, array, onDone) {
 
 /// Undoing an add that stopped before its disk joined the share (D3 = b).
 /// Offered only while the node says it is possible (`undoPossible`, the
-/// helper's live read of the union): once the disk may have served a file,
-/// the add can only be finished.
+/// helper's own gate: its journal proves the add never tried to join the
+/// share, and a live read of the union can only add a refusal): once the
+/// disk may have served a file, the add can only be finished.
 function openUndoAddDiskDialog(screen, array, onDone) {
   const pending = pendingAdd(array);
   if (!pending?.undoPossible) return null;
@@ -634,9 +635,11 @@ function openUndoAddDiskDialog(screen, array, onDone) {
 
 /// A Sync over an unrepaired Scrub or Repair fault (F1). The confirm names
 /// the cost before anything is sent, and it is the ONLY place that sends
-/// `acknowledgeParityFault: true` — measured on rig11, such a Sync removes
-/// the files the Scrub could not read from the content file, while the
-/// marked blocks stay repairable. Shared by the detail pane and the n05
+/// `acknowledgeParityFault`: the id of the very fault it showed
+/// (`syncFaultId`), which the node and its helper compare with the fault
+/// the array carries when the Sync runs. Measured on rig11, such a Sync
+/// removes the files the Scrub could not read from the content file, while
+/// the marked blocks stay repairable. Shared by the detail pane and the n05
 /// card, so the two "Sync teraz" buttons cannot disagree.
 export function openSyncOverFaultDialog(screen, array, onDone) {
   // One confirm per array at a time: a second click does not open a second

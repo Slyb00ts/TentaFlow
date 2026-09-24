@@ -4239,10 +4239,13 @@ async fn elastic_snapraid(
                 // The warning follows the OBSERVED need — the helper's
                 // recorded cause included, which a scrub whose log broke
                 // leaves with no counts in the history.
+                // A CODE, worded by the approver's screen in the approver's
+                // language (`approvals.detail_<code>`): this is the data-loss
+                // warning, and a de/en/fr/es approver has to read it.
                 if fault_warning {
-                    "Zapisuje nowy checkpoint parity i content. UWAGA: macierz ma nienaprawiony błąd scrub lub naprawy. Zaznaczone bloki pozostaną naprawialne, ale pliki, których scrub nie mógł odczytać, zostaną usunięte z content i parity przestanie je obejmować. Najpierw uruchom naprawę z parity.".to_string()
+                    tentanas::approvals::coded_detail("elastic_sync_over_fault")
                 } else {
-                    "Zapisuje nowy checkpoint parity i content".to_string()
+                    tentanas::approvals::coded_detail("elastic_sync")
                 },
             ),
             ElasticSnapraidKind::Scrub => (
@@ -4451,8 +4454,10 @@ async fn elastic_add_disk(
 /// Undoes the unfinished add of `disk_id` (D3 = b): the array loses the slot
 /// again, and the disk loses only the filesystem this add gave it.
 ///
-/// Admitted only while the disk PROVABLY never joined the share — the
-/// helper's live read of the union, which the observed array carries as
+/// Admitted only while the disk PROVABLY never joined the share — which only
+/// the helper's journal proves (`joined == false`, written durably before
+/// the branch is ever appended to the union); a live read of the union can
+/// only add a refusal. The observed array carries the helper's verdict as
 /// `pending_add_disk.undo_possible`. Once it may have joined, a branch taken
 /// out of a live union can hide users' files, and the add can only go
 /// forward. The helper holds the same rule (`add_undo_admission`), so this is
@@ -6808,9 +6813,7 @@ mod registration_tests {
         };
         let sync_row = store::approval(&g.db, &sync_approval.request_id).unwrap().unwrap();
         assert_eq!(sync_row.approval.operation, tentanas::approvals::OP_ELASTIC_SYNC);
-        for phrase in ["scrub", "naprawę", "content"] {
-            assert!(sync_row.approval.detail.contains(phrase), "{}", sync_row.approval.detail);
-        }
+        assert_eq!(sync_row.approval.detail, "text:elastic_sync_over_fault", "the warning, as a code the screen words");
         // The acknowledgement is parked WITH the request: the approver
         // releases the author's decision, not a Sync that would be refused.
         assert!(
@@ -6822,9 +6825,10 @@ mod registration_tests {
 
     /// An add that STOPPED PART-WAY (K4, F3/F4 on the node's side): while it
     /// is pinned no other disk is admitted — the refusal is a code the screen
-    /// words — and its UNDO is started only when the helper's live read said
-    /// the disk never joined the share. Without that answer the undo is
-    /// refused, and so is an undo of a disk nothing pinned. Nothing is started
+    /// words — and its UNDO is started only when the helper said the disk
+    /// never joined the share (its journal's `joined`, which a live read can
+    /// only add refusals to). Without that answer the undo is refused, and so
+    /// is an undo of a disk nothing pinned. Nothing is started
     /// by any of it.
     #[tokio::test]
     async fn an_unfinished_add_admits_only_itself_and_its_undo_needs_the_helpers_word() {

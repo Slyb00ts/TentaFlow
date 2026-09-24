@@ -76,9 +76,11 @@ export function jobSubject(j) {
 // - `started job <uuid>` — the pool scrub/TRIM, Elastic and snapshot
 //   cadences, when the spawn worked;
 // - `failed to start: <error>` — the same cadences, when it was refused;
-// - `pominięto: <why>` — a scheduled Elastic Sync skipped because parity
-//   errors await a repair (`elastic::scheduled_sync_blocker`). No job exists
-//   for it, and it is not a failure: the slot was declined on purpose;
+// - `pominięto: reason:<code>` — a scheduled Elastic Sync skipped over a
+//   parity fault (`elastic::scheduled_sync_blocker`), worded from
+//   `schedules.skip_<code>`; `pominięto: <why>` is the older stored form,
+//   the node's own sentence. No job exists for it, and it is not a failure:
+//   the slot was declined on purpose;
 // - '' — never ran, and always for the SMART pair (dispatch sends none).
 // The bare words in RESULT_WORDS are an older stored form, still read.
 //
@@ -89,6 +91,7 @@ const RESULT_WORDS = new Set(['ok', 'succeeded', 'failed', 'skipped']);
 const STARTED_JOB = /^started job (\S+)$/;
 const FAILED_TO_START = /^failed to start:?\s*/;
 const SKIPPED = /^pominięto:?\s*/;
+const SKIP_REASON = /^reason:([a-z0-9_]+)$/;
 const JOB_STATUSES = new Set(['queued', 'running', 'succeeded', 'done', 'failed', 'blocked', 'cancelled']);
 // The statuses a job never leaves: only these may be cached for good.
 const FINISHED_JOB_STATUSES = new Set(['succeeded', 'done', 'failed', 'cancelled']);
@@ -103,7 +106,15 @@ export function scheduleOutcome(lastResult, statusOf = () => null) {
   // The reason is the node's own sentence: it belongs in the tooltip, and
   // the row itself reads the translated word.
   if (SKIPPED.test(raw)) {
-    return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: raw.replace(SKIPPED, '') };
+    const why = raw.replace(SKIPPED, '');
+    const code = SKIP_REASON.exec(why)?.[1];
+    const words = code ? T('schedules.skip_' + code) : '';
+    // A coded reason is the row's own text, in the reader's language; the
+    // older stored sentence stays the tooltip it always was.
+    if (code && words !== 'tentanas.schedules.skip_' + code) {
+      return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: words, reason: words };
+    }
+    return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: why };
   }
   const started = STARTED_JOB.exec(raw);
   const status = started ? statusOf(started[1]) : null;
@@ -553,7 +564,7 @@ export async function drawTasks(screen, body) {
         // restricts it. So it also says what its switch means for the files.
         sub: [
           r.lastRunAt ? T('schedules.last_run', { t: fmtAgo(r.lastRunAt) }) : T('schedules.never_ran'),
-          ...(r.lastRunAt && outcome ? [outcome.label] : []),
+          ...(r.lastRunAt && outcome ? [outcome.reason ? `${outcome.label}: ${outcome.reason}` : outcome.label] : []),
           ...(verb === 'mover' ? [T(r.enabled ? 'schedules.elastic_mover_window_on' : 'schedules.elastic_mover_window_off')] : []),
         ].join(' · '),
       };

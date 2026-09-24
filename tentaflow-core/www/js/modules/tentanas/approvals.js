@@ -35,6 +35,19 @@ const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_
 
 export const operationLabel = (op) => T('approvals.op_' + (OPERATIONS.includes(op) ? op : 'unknown'));
 
+// A parked operation's detail. The node writes a CODE (`text:<code>`,
+// `approvals::coded_detail`) where the sentence has to reach the approver in
+// their own language — above all the data-loss warning of a Sync over a
+// parity fault. Any other detail is shown as the node wrote it; a code this
+// build has no words for, too, rather than dropped.
+const CODED_DETAIL = /^text:([a-z0-9_]+)$/;
+export function approvalDetail(detail) {
+  const code = CODED_DETAIL.exec(String(detail || ''))?.[1];
+  if (!code) return String(detail || '');
+  const words = T('approvals.detail_' + code);
+  return words === 'tentanas.approvals.detail_' + code ? String(detail) : words;
+}
+
 const STATUS_TONE = {
   pending: 'warn',
   approved: 'ok',
@@ -91,7 +104,7 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
       const decider = a.decidedBy ? jobAuthor(a.decidedBy) : null;
       return {
         _approval: a,
-        operation: `<span class="tf-table__cell-title">${escapeHtml(operationLabel(a.operation))}</span><div class="tf-table__cell-sub">${escapeHtml(a.detail)}</div>`,
+        operation: `<span class="tf-table__cell-title">${escapeHtml(operationLabel(a.operation))}</span><div class="tf-table__cell-sub">${escapeHtml(approvalDetail(a.detail))}</div>`,
         subject: a.subject ? `<span class="tf-table__cell--mono">${escapeHtml(a.subject)}</span>` : '—',
         requested: `<span>${escapeHtml(fmtAgo(a.requestedAt))}</span><div class="tf-table__cell-sub"${requester.title ? ` title="${escapeAttr(requester.title)}"` : ''}>${escapeHtml(T('approvals.requested_by', { user: requester.label }))}</div>`,
         expires: `<span class="tf-table__cell--mono">${escapeHtml(a.status === 'pending' ? fmtIn(a.expiresAt) : fmtDate(a.expiresAt))}</span>`,
