@@ -22,9 +22,9 @@ use tentaflow_core::routing::Router;
 mod mlx_swift_init;
 mod receipt;
 mod service;
+mod update;
 #[cfg(windows)]
 mod windows_host;
-mod update;
 
 // =============================================================================
 // Argumenty CLI
@@ -182,7 +182,9 @@ fn main() -> Result<()> {
         #[cfg(not(windows))]
         anyhow::bail!("--windows-service exists only on Windows");
     }
-    serve(args)
+    let result = serve(args);
+    flush_logs();
+    result
 }
 
 /// Builds the async runtime and runs the server until a shutdown signal. Shared
@@ -1422,6 +1424,18 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 // Setup loggingu
 // =============================================================================
 
+/// The guard of the background log writer. A static is never dropped, so the
+/// lines still buffered when the process ends would be lost without
+/// flush_logs() — the whole shutdown of a service, which ends right after it.
+static LOG_WORKER: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
+    std::sync::Mutex::new(None);
+
+/// Drains the log buffer. Called once the server has stopped; anything logged
+/// later is dropped.
+fn flush_logs() {
+    drop(LOG_WORKER.lock().unwrap_or_else(|e| e.into_inner()).take());
+}
+
 fn setup_logging(verbose: bool, log_dir: Option<&std::path::Path>) -> Result<()> {
     use tracing_subscriber::{fmt, EnvFilter};
 
@@ -1462,11 +1476,8 @@ fn setup_logging(verbose: bool, log_dir: Option<&std::path::Path>) -> Result<()>
 
     // Non-blocking writer: logi ida przez bufor + watek tla zamiast
     // synchronicznego zapisu na stdout (pty). Watek requestu nigdy nie blokuje
-    // sie na wolnym terminalu. `WorkerGuard` musi zyca, dopoki proces loguje —
-    // jego drop zamknilby kanal i cisnal reszte bufora, wiec trzymany jest w
-    // `static` na cale zycie procesu.
-    static LOG_WORKER: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-        std::sync::OnceLock::new();
+    // sie na wolnym terminalu. `WorkerGuard` lives in LOG_WORKER until
+    // flush_logs() drops it, which drains the buffer.
     let (non_blocking, worker) = match log_dir {
         // Two weeks of daily files: enough to look back at an incident, bounded
         // so a long-running service does not fill the disk.
@@ -1480,7 +1491,7 @@ fn setup_logging(verbose: bool, log_dir: Option<&std::path::Path>) -> Result<()>
         ),
         None => tracing_appender::non_blocking(std::io::stdout()),
     };
-    let _ = LOG_WORKER.set(worker);
+    *LOG_WORKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
 
     fmt()
         .with_env_filter(filter)

@@ -218,10 +218,12 @@ function Get-GstreamerRoot {
     return (Join-Path $env:ProgramFiles 'gstreamer\1.0\msvc_x86_64')
 }
 
+# The GStreamer DLLs carry no version resource, so the version is the one its
+# installer registered, trusted only while the files are where it says.
 function Get-GstreamerVersion($root) {
-    $dll = Join-Path $root 'bin\gstreamer-1.0-0.dll'
-    if (-not (Test-Path -LiteralPath $dll)) { return $null }
-    return ([Diagnostics.FileVersionInfo]::GetVersionInfo($dll)).ProductVersion
+    $entry = Get-ItemProperty -LiteralPath "HKLM:\$GstreamerUninstallKey" -ErrorAction SilentlyContinue
+    if (-not $entry -or -not (Test-Path -LiteralPath (Join-Path $root 'bin\gstreamer-1.0-0.dll'))) { return $null }
+    return $entry.DisplayVersion
 }
 
 function Install-Gstreamer($releaseDir) {
