@@ -341,7 +341,7 @@ test('odświeżenie zmienia obserwację adresu; czytelnik nie dostaje CTA mutacj
   await expect(page.locator('[data-act="repick-portal"]')).toHaveCount(0);
   await page.evaluate(() => { window.fixture.caps.interfaces = []; });
   await page.locator('[data-act="refresh"]').click();
-  await expect(page.getByTestId('portal_actual')).toHaveText('Żaden interfejs węzła');
+  await expect(page.getByTestId('portal_actual')).toHaveText('Żaden interfejs noda');
   await expect(page.getByTestId('portal_exposure')).toHaveText('Nie zmierzono');
 });
 
@@ -380,18 +380,18 @@ test('N19c: potwierdzenie nazwy, błąd pozostawia dialog, ponowienie usuwa eksp
   await expect(page.locator('.loss-list')).toContainText('Allowlista (2 initiatorów)');
   await expect(page.locator('.loss-list')).toContainText('ustawienia uwierzytelniania');
   await expect(page.locator('.nas-target-delete .explain-box')).toContainText('Snapshoty również pozostają');
-  await page.locator('#nas-retype input').fill('vm-stor');
+  await page.locator('#retype-input input').fill('vm-stor');
   await expect(confirm).toHaveAttribute('disabled', '');
-  await page.locator('#nas-retype input').fill('vm-store');
+  await page.locator('#retype-input input').fill('vm-store');
   await expect(confirm).not.toHaveAttribute('disabled', '');
   await expect(page.getByTestId('target-sessions-count')).toHaveCount(1);
   await page.screenshot({ path: path.join(artifacts, 'n19c-delete.png'), animations: 'disabled' });
   await confirm.click();
-  await expect(page.locator('#nas-retype-error')).toContainText('Jądro odmówiło');
+  await expect(page.locator('#retype-error')).toContainText('Jądro odmówiło');
   await page.evaluate(() => { window.fixture.deleteFailure = false; });
   await confirm.click();
   await expect.poll(() => page.evaluate(() => window.jobId)).toBe('job-delete');
-  await expect(page.locator('#nas-retype')).toHaveCount(0);
+  await expect(page.locator('#retype-input')).toHaveCount(0);
 });
 
 for (const sessionsKnown of [true, false]) {
@@ -402,7 +402,7 @@ for (const sessionsKnown of [true, false]) {
     const unknown = page.locator('.loss-list').filter({ hasText: 'nieznana' });
     await expect(unknown).toHaveCount(sessionsKnown ? 0 : 1);
     await page.locator('[data-action="cancel"]').last().click();
-    await expect(page.locator('#nas-retype')).toHaveCount(0);
+    await expect(page.locator('#retype-input')).toHaveCount(0);
     expect(await page.evaluate(() => window.calls.filter((call) => call.kind.includes('Delete')))).toEqual([]);
   });
 }
@@ -496,7 +496,7 @@ for (const surface of ['wizard', 'delete', 'create']) {
       await page.locator('[data-wizard-next]').click();
     } else {
       await page.locator('#nas-tg-table [data-act="delete"]').click();
-      await page.locator('#nas-retype input').fill('scratch');
+      await page.locator('#retype-input input').fill('scratch');
     }
     await page.locator('#nas-node-select select').selectOption('other');
     await expect(page.locator('#nas-head-sub')).toContainText('other');
@@ -519,7 +519,7 @@ for (const surface of ['wizard', 'delete']) {
       await page.locator('[data-wizard-next]').click();
     } else {
       await page.locator('[data-act="delete"]').click();
-      await page.locator('#nas-retype input').fill('scratch');
+      await page.locator('#retype-input input').fill('scratch');
     }
     await page.evaluate(() => window.screenUnderTest.openTarget(null));
     await page.locator(surface === 'wizard' ? '[data-wizard-next]' : 'tf-window [data-action="confirm"]').click();

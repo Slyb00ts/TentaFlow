@@ -49,7 +49,18 @@
 //! TENTABUS_SEED_DB=/path/to/tentaflow.db \
 //! TENTABUS_SEED_HOME=/path/to/tentaflow_home \
 //!   cargo test --test bus_demo_seed -- --ignored wipe_demo_data --nocapture
+//!
+//! TENTABUS_SEED_DB=/path/to/tentaflow.db \
+//! TENTABUS_SEED_HOME=/path/to/tentaflow_home \
+//!   cargo test --test bus_demo_seed -- --ignored seed_clinic_data --nocapture
 //! ```
+//! `seed_clinic_data` is the small-scale "Przychodnia Zdrowie" world of the
+//! TentaBus UI mockups (SUM/mockups/tentabus-20260923): instance
+//! "Produkcja" with HL7 v2 / JSON / XML topics, a consumer that falls
+//! behind (with 25 minutes of rising lag history), a caught-up one, a paused
+//! one with a backlog, unprocessed messages from the last hour and message
+//! patterns (one in use, one withdrawn); and an empty instance "Szkolenia".
+//! `tests/e2e/tentabus-ui.spec.js` drives the dashboard against it.
 //! `TENTABUS_SEED_DB` is the main sqlite database file (may be a fresh,
 //! already-migrated db, e.g. one produced by booting the real binary once
 //! and stopping it — see `tests/e2e/analytics.spec.js`'s own two-phase
@@ -90,10 +101,13 @@ use bytes::Bytes;
 
 use tentaflow_core::addon::{bundled, fs_sandbox, lifecycle};
 use tentaflow_core::bus::instance::BusInstanceId;
+use tentaflow_core::bus::schema_registry::{
+    registry as schema_registry, Compatibility, SchemaType,
+};
 use tentaflow_core::bus::{
-    self, dlq, groups, native as bus_native, topics, BusAction, BusCallContext, BusInitConfig,
-    BusService, BusServiceError, ConsumerConfig, FetchedRecordMeta, PublishBatch, PublishRecord,
-    TopicPartition,
+    self, dlq, groups, lag_history, native as bus_native, topics, BusAction, BusCallContext,
+    BusInitConfig, BusService, BusServiceError, ConsumerConfig, FetchedRecordMeta, PublishBatch,
+    PublishRecord, TopicPartition,
 };
 use tentaflow_core::db::{self, repository, DbPool};
 use tentaflow_core::services::org::DEFAULT_ORG_ID;
@@ -255,9 +269,7 @@ fn open_platform() -> DbPool {
 fn ensure_instance(db: &DbPool, display_name: &str) -> BusInstanceId {
     let existing =
         repository::list_package_instances(db, BusInstanceId::PACKAGE_ID).unwrap_or_default();
-    if let Some((addon_id, enabled, _)) = existing
-        .iter()
-        .find(|(_, _, name)| name == display_name)
+    if let Some((addon_id, enabled, _)) = existing.iter().find(|(_, _, name)| name == display_name)
     {
         if !*enabled {
             repository::set_addon_enabled(db, addon_id, true)
@@ -274,8 +286,7 @@ fn ensure_instance(db: &DbPool, display_name: &str) -> BusInstanceId {
         &BTreeMap::new(),
     )
     .unwrap_or_else(|e| panic!("install_instance('{display_name}') failed: {e}"));
-    repository::set_addon_enabled(db, &addon_id, true)
-        .expect("enable freshly installed instance");
+    repository::set_addon_enabled(db, &addon_id, true).expect("enable freshly installed instance");
     println!("seed: installed instance '{display_name}' -> {addon_id}");
     BusInstanceId::parse(&addon_id).expect("valid instance id")
 }
@@ -299,16 +310,17 @@ fn grant_full_access(db: &DbPool, addon_id: &str) {
 /// bus directory (`fs_sandbox::addon_data_dir(...).join("log")`) — the
 /// same two paths a real `native_on_enable` uses, so a real server booting
 /// later against this same home finds exactly the state this harness left.
-fn start_engine(db: &DbPool, instance_id: &BusInstanceId) -> Arc<BusService> {
+/// Also returns the instance's own local db, where the lag history lives.
+fn start_engine(db: &DbPool, instance_id: &BusInstanceId) -> (Arc<BusService>, DbPool) {
     let org_id = DEFAULT_ORG_ID;
     let local_db = bus_native::open_db(db, org_id, instance_id.as_str())
         .expect("open per-instance on-disk local db");
     let bus_dir = fs_sandbox::addon_data_dir(org_id, instance_id.as_str())
         .unwrap_or_else(|e| panic!("instance data dir for '{instance_id}': {e:?}"))
         .join("log");
-    bus::init_instance(BusInitConfig {
+    let svc = bus::init_instance(BusInitConfig {
         instance_id: instance_id.clone(),
-        local_db,
+        local_db: local_db.clone(),
         bus_dir,
         db: db.clone(),
         authorizer: Arc::new(AllowAllAuthorizer),
@@ -317,7 +329,8 @@ fn start_engine(db: &DbPool, instance_id: &BusInstanceId) -> Arc<BusService> {
         partition_handle_lru: None,
         publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
     })
-    .expect("bus::init_instance")
+    .expect("bus::init_instance");
+    (svc, local_db)
 }
 
 fn lab_payload(seq: usize, patient_key: &str) -> Bytes {
@@ -377,11 +390,18 @@ fn ensure_topic(
         .expect("get_topic")
         .is_some()
     {
-        println!("seed: topic '{name}' already exists on '{}' — skipping", svc.instance_id());
+        println!(
+            "seed: topic '{name}' already exists on '{}' — skipping",
+            svc.instance_id()
+        );
         return false;
     }
-    svc.create_topic(ctx, name, opts)
-        .unwrap_or_else(|e| panic!("create_topic('{name}') on '{}' failed: {e}", svc.instance_id()));
+    svc.create_topic(ctx, name, opts).unwrap_or_else(|e| {
+        panic!(
+            "create_topic('{name}') on '{}' failed: {e}",
+            svc.instance_id()
+        )
+    });
     println!("seed: created topic '{name}' on '{}'", svc.instance_id());
     true
 }
@@ -710,7 +730,10 @@ fn seed_instance(svc: &BusService, db: &DbPool, ctx: &BusCallContext, spec: &Ins
 
     // ---- summary (read-only: safe whether this run seeded or skipped) -----
     let dlq_topic = dlq::dlq_topic_name(LAB_TOPIC);
-    println!("\n=== bus_demo_seed summary: instance '{}' ===", svc.instance_id());
+    println!(
+        "\n=== bus_demo_seed summary: instance '{}' ===",
+        svc.instance_id()
+    );
     println!("topic '{LAB_TOPIC}': {} partitions", lab_cfg.partitions);
     let billing_lag = group_lag(ctx, BILLING_GROUP, LAB_TOPIC);
     let mut lab_total = 0u64;
@@ -739,9 +762,7 @@ fn seed_instance(svc: &BusService, db: &DbPool, ctx: &BusCallContext, spec: &Ins
     let dlq_count: u64 = (0..lab_cfg.partitions)
         .map(|p| partition_high_watermark(svc, ctx, &dlq_topic, p))
         .sum();
-    println!(
-        "DLQ topic '{dlq_topic}': {dlq_count} records (expected >= {DLQ_RECORD_COUNT})"
-    );
+    println!("DLQ topic '{dlq_topic}': {dlq_count} records (expected >= {DLQ_RECORD_COUNT})");
     assert!(
         dlq_count >= DLQ_RECORD_COUNT,
         "expected at least {DLQ_RECORD_COUNT} records in '{dlq_topic}' on instance '{}', \
@@ -759,7 +780,7 @@ fn seed_demo_data() {
     for spec in &INSTANCE_SPECS {
         let instance_id = ensure_instance(&db, spec.display_name);
         grant_full_access(&db, instance_id.as_str());
-        let svc = start_engine(&db, &instance_id);
+        let (svc, _local_db) = start_engine(&db, &instance_id);
         let ctx = call_ctx(&instance_id);
         seed_instance(&svc, &db, &ctx, spec);
         bus::stop_instance(&instance_id);
@@ -807,4 +828,340 @@ fn wipe_demo_data() {
             spec.display_name
         );
     }
+}
+
+// =============================================================================
+// "Przychodnia Zdrowie" — the TentaBus UI mockup world in small scale
+// (`seed_clinic_data`). Every figure the Przegląd tab derives is produced by
+// the real engine: lag from real commits, unprocessed messages from real
+// delivery failures, a paused group through `pause_group`. The only thing
+// written directly is the lag HISTORY, because 25 minutes of it cannot be
+// lived through in a test. The samples end at the real current lag and at
+// the moment of seeding. The server's sampler takes its first sample one
+// `lag_history::SAMPLE_INTERVAL` after the instance starts; a flat sample
+// (nobody consumes) continues the rising run, but two samples further apart
+// than `lag_history::MAX_SAMPLE_GAP_MS` (3 min) do not form one run — the
+// node knows nothing about the lag in between. So the server has to be
+// booted right after seeding (the e2e rig does), or "rośnie od" rightly
+// starts over.
+// =============================================================================
+
+const CLINIC_PRODUCTION: &str = "Produkcja";
+const CLINIC_TRAINING: &str = "Szkolenia";
+
+const RESULTS_TOPIC: &str = "wyniki-badan";
+const VISITS_TOPIC: &str = "wizyty";
+const INVOICES_TOPIC: &str = "faktury";
+
+const DOCTOR_APP_GROUP: &str = "aplikacja-lekarza";
+const LAB_REPORTS_GROUP: &str = "raporty-laboratorium";
+const REGISTRATION_GROUP: &str = "rejestracja-online";
+const BILLING_SYSTEM_GROUP: &str = "system-rozliczen";
+
+const VISIT_SCHEMA: &str = "wizyta";
+const VISIT_SCHEMA_OLD: &str = "wizyta-2025";
+
+const RESULTS_RECORDS: usize = 3000;
+const VISITS_RECORDS: usize = 600;
+const INVOICES_RECORDS: usize = 400;
+/// Unprocessed messages of `wyniki-badan`, all failed within the last hour.
+const RESULTS_UNPROCESSED: u64 = 14;
+/// Minutes of rising lag history written for the lagging consumer.
+const RISING_MINUTES: i64 = 25;
+
+/// Three backward-compatible versions: each adds an optional field.
+const VISIT_SCHEMA_VERSIONS: [&str; 3] = [
+    r#"{"type":"object","required":["pacjent","termin"],"properties":{"pacjent":{"type":"string"},"termin":{"type":"string"}}}"#,
+    r#"{"type":"object","required":["pacjent","termin"],"properties":{"pacjent":{"type":"string"},"termin":{"type":"string"},"lekarz":{"type":"string"}}}"#,
+    r#"{"type":"object","required":["pacjent","termin"],"properties":{"pacjent":{"type":"string"},"termin":{"type":"string"},"lekarz":{"type":"string"},"gabinet":{"type":"string"}}}"#,
+];
+
+fn hl7_result(seq: usize) -> Bytes {
+    Bytes::from(format!(
+        "MSH|^~\\&|LIS|PRZYCHODNIA|HIS|PRZYCHODNIA|20260923140211||ORU^R01|MSG{seq:06}|P|2.5\r\
+         PID|1||{pid:011}||Kowalski^Jan||19800101|M\r\
+         OBR|1||{seq}|CBC^Morfologia\r\
+         OBX|1|NM|HGB^Hemoglobina||{hgb}.{dec}|g/dL|12-16|N",
+        pid = 80010112345u64 + (seq % 400) as u64,
+        hgb = 12 + seq % 4,
+        dec = seq % 10,
+    ))
+}
+
+fn visit_json(seq: usize) -> Bytes {
+    Bytes::from(format!(
+        "{{\"pacjent\":\"P-{p:04}\",\"termin\":\"2026-09-{d:02}T{h:02}:00:00\",\"lekarz\":\"L-{l:02}\"}}",
+        p = seq % 500,
+        d = 1 + seq % 28,
+        h = 8 + seq % 9,
+        l = seq % 12,
+    ))
+}
+
+fn invoice_xml(seq: usize) -> Bytes {
+    Bytes::from(format!(
+        "<faktura><numer>FV/{seq:05}/2026</numer><kwota>{kw}.00</kwota><pacjent>P-{p:04}</pacjent></faktura>",
+        kw = 80 + seq % 400,
+        p = seq % 500,
+    ))
+}
+
+fn publish_generated(
+    svc: &BusService,
+    ctx: &BusCallContext,
+    topic: &str,
+    count: usize,
+    keyed: bool,
+    payload: fn(usize) -> Bytes,
+) {
+    let records = (0..count)
+        .map(|seq| PublishRecord {
+            key: keyed.then(|| Bytes::from(format!("P-{:04}", seq % 500))),
+            headers: seed_headers(),
+            payload: payload(seq),
+            timestamp_ms: now_ms(),
+            schema_id: 0,
+        })
+        .collect();
+    publish_chunked(svc, ctx, topic, records);
+}
+
+/// Opens `group` on `topic`, reads everything and commits `fraction` of each
+/// partition. Returns the fetched records by partition and the committed
+/// offsets.
+fn consume_fraction(
+    ctx: &BusCallContext,
+    group: &str,
+    topic: &str,
+    fraction: f64,
+) -> (BTreeMap<u32, Vec<FetchedRecordMeta>>, BTreeMap<u32, u64>) {
+    let handle = bus::open_consumer(
+        ctx,
+        group,
+        &[topic.to_string()],
+        ConsumerConfig {
+            commit_mode: groups::CommitMode::Explicit,
+        },
+    )
+    .unwrap_or_else(|e| panic!("open_consumer('{group}') failed: {e}"));
+    let fetched = handle
+        .fetch(64 * 1024 * 1024, 10_000)
+        .unwrap_or_else(|e| panic!("fetch('{group}') failed: {e}"));
+    let by_part = by_partition(fetched.records);
+    let committed: BTreeMap<u32, u64> = by_part
+        .iter()
+        .map(|(&p, recs)| (p, ((recs.len() as f64) * fraction).floor() as u64))
+        .collect();
+    let targets: Vec<(TopicPartition, u64)> = committed
+        .iter()
+        .filter(|(_, &c)| c > 0)
+        .map(|(&p, &c)| {
+            (
+                TopicPartition {
+                    topic: topic.to_string(),
+                    partition: p,
+                },
+                c,
+            )
+        })
+        .collect();
+    if !targets.is_empty() {
+        handle
+            .commit(&targets)
+            .unwrap_or_else(|e| panic!("commit('{group}') failed: {e}"));
+    }
+    (by_part, committed)
+}
+
+fn total_lag(ctx: &BusCallContext, group: &str, topic: &str) -> (u64, u64) {
+    let per_partition = group_lag(ctx, group, topic);
+    let lag: u64 = per_partition.iter().map(|(_, l)| l).sum();
+    (per_partition.len() as u64, lag)
+}
+
+fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx: &BusCallContext) {
+    let instance = svc.instance_id().to_string();
+
+    // ---- message patterns: one bound to `wizyty`, one withdrawn ------------
+    let existing = repository::bus_schema_subject_get(db, &instance, &ctx.org_id, VISIT_SCHEMA)
+        .expect("read pattern wizyta");
+    if existing.is_some() {
+        println!("seed[clinic]: pattern '{VISIT_SCHEMA}' already exists — skipping");
+    } else {
+        // Withdrawing ONE version (not the whole pattern) needs registry
+        // support that is not there yet (`registry::delete` refuses
+        // `deprecate_only` with a version), so all three stay current.
+        for text in VISIT_SCHEMA_VERSIONS {
+            schema_registry::register(
+                db,
+                &instance,
+                &ctx.org_id,
+                VISIT_SCHEMA,
+                SchemaType::JsonSchema,
+                text,
+                Some(Compatibility::Backward),
+                Some(ACTOR),
+            )
+            .expect("register a version of pattern wizyta");
+        }
+        schema_registry::register(
+            db,
+            &instance,
+            &ctx.org_id,
+            VISIT_SCHEMA_OLD,
+            SchemaType::JsonSchema,
+            VISIT_SCHEMA_VERSIONS[0],
+            Some(Compatibility::Backward),
+            Some(ACTOR),
+        )
+        .expect("register pattern wizyta-2025");
+        schema_registry::delete(db, &instance, &ctx.org_id, VISIT_SCHEMA_OLD, None, true)
+            .expect("withdraw pattern wizyta-2025");
+    }
+
+    // ---- wyniki-badan: HL7 v2, one consumer behind, one caught up -----------
+    if ensure_topic(
+        svc,
+        db,
+        ctx,
+        RESULTS_TOPIC,
+        topics::TopicOptions {
+            partitions: Some(3),
+            content_type: Some("application/hl7-v2".to_string()),
+            ..Default::default()
+        },
+    ) {
+        publish_generated(svc, ctx, RESULTS_TOPIC, RESULTS_RECORDS, true, hl7_result);
+        let cfg = topics::get_topic(db, svc.instance_id(), &ctx.org_id, RESULTS_TOPIC)
+            .expect("get_topic")
+            .expect("wyniki-badan exists");
+        let (records, committed) = consume_fraction(ctx, DOCTOR_APP_GROUP, RESULTS_TOPIC, 0.25);
+        // The consumer's program reports failures on the records right after
+        // what it committed; each exhausts its attempts and becomes an
+        // unprocessed message of the last hour.
+        let mut sent = 0u64;
+        'outer: for (&partition, recs) in &records {
+            let mut offset = committed[&partition];
+            while (offset as usize) < recs.len() {
+                if sent == RESULTS_UNPROCESSED {
+                    break 'outer;
+                }
+                let record = &recs[offset as usize];
+                for _ in 0..cfg.max_delivery_attempts {
+                    svc.note_delivery_failure(
+                        ctx,
+                        DOCTOR_APP_GROUP,
+                        RESULTS_TOPIC,
+                        partition,
+                        offset,
+                        record,
+                        dlq::DlqReason::ConsumerError,
+                        "przekroczono czas zapisu wyniku do karty pacjenta",
+                    )
+                    .expect("note_delivery_failure");
+                }
+                sent += 1;
+                offset += 1;
+                if sent % 5 == 0 {
+                    continue 'outer;
+                }
+            }
+        }
+        consume_fraction(ctx, LAB_REPORTS_GROUP, RESULTS_TOPIC, 1.0);
+    }
+
+    // ---- wizyty: JSON bound to the pattern, a consumer slightly behind ------
+    if ensure_topic(
+        svc,
+        db,
+        ctx,
+        VISITS_TOPIC,
+        topics::TopicOptions {
+            partitions: Some(3),
+            content_type: Some("application/json".to_string()),
+            schema_id: Some(VISIT_SCHEMA.to_string()),
+            ..Default::default()
+        },
+    ) {
+        publish_generated(svc, ctx, VISITS_TOPIC, VISITS_RECORDS, true, visit_json);
+        consume_fraction(ctx, REGISTRATION_GROUP, VISITS_TOPIC, 0.9);
+    }
+
+    // ---- faktury: XML, the billing system paused with everything waiting ----
+    if ensure_topic(
+        svc,
+        db,
+        ctx,
+        INVOICES_TOPIC,
+        topics::TopicOptions {
+            partitions: Some(2),
+            content_type: Some("application/xml".to_string()),
+            ..Default::default()
+        },
+    ) {
+        publish_generated(
+            svc,
+            ctx,
+            INVOICES_TOPIC,
+            INVOICES_RECORDS,
+            false,
+            invoice_xml,
+        );
+        consume_fraction(ctx, BILLING_SYSTEM_GROUP, INVOICES_TOPIC, 0.0);
+        svc.pause_group(ctx, BILLING_SYSTEM_GROUP, INVOICES_TOPIC)
+            .expect("pause system-rozliczen");
+    }
+
+    // ---- 25 minutes of rising lag for the consumer that falls behind -------
+    let (_, lag_now) = total_lag(ctx, DOCTOR_APP_GROUP, RESULTS_TOPIC);
+    let now = now_ms();
+    let start_lag = lag_now / 4;
+    for step in 0..=RISING_MINUTES {
+        let at_ms = now - (RISING_MINUTES - step) * 60_000;
+        let lag = start_lag + (lag_now - start_lag) * step as u64 / RISING_MINUTES as u64;
+        lag_history::record(
+            local_db,
+            at_ms,
+            &[lag_history::GroupSample {
+                org_id: ctx.org_id.clone(),
+                group_id: DOCTOR_APP_GROUP.to_string(),
+                topic: RESULTS_TOPIC.to_string(),
+                lag_total: lag,
+                committed_total: (RESULTS_RECORDS as u64).saturating_sub(lag),
+            }],
+            &[],
+        )
+        .expect("record lag history");
+    }
+    println!(
+        "seed[clinic]: '{DOCTOR_APP_GROUP}' lag {lag_now}, rising for {RISING_MINUTES} min in the history"
+    );
+    for (group, topic) in [
+        (LAB_REPORTS_GROUP, RESULTS_TOPIC),
+        (REGISTRATION_GROUP, VISITS_TOPIC),
+        (BILLING_SYSTEM_GROUP, INVOICES_TOPIC),
+    ] {
+        let (partitions, lag) = total_lag(ctx, group, topic);
+        println!("seed[clinic]: '{group}' on '{topic}': {partitions} partitions, lag {lag}");
+    }
+}
+
+#[test]
+#[ignore]
+fn seed_clinic_data() {
+    let db = open_platform();
+
+    let production = ensure_instance(&db, CLINIC_PRODUCTION);
+    grant_full_access(&db, production.as_str());
+    let (svc, local_db) = start_engine(&db, &production);
+    seed_clinic_production(&svc, &local_db, &db, &call_ctx(&production));
+    bus::stop_instance(&production);
+
+    // "Szkolenia" stays empty on purpose: the T11 empty states.
+    let training = ensure_instance(&db, CLINIC_TRAINING);
+    grant_full_access(&db, training.as_str());
+    let (_svc, _local_db) = start_engine(&db, &training);
+    bus::stop_instance(&training);
+
+    println!("bus_demo_seed: seeded '{CLINIC_PRODUCTION}' ({production}) and empty '{CLINIC_TRAINING}' ({training})");
 }

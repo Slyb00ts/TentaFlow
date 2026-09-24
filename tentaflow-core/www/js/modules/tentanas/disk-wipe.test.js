@@ -83,9 +83,9 @@ test('the plan is read first and its removal list names the signature and the la
   assert.ok(!win.querySelector('#nas-wipe-ack'), 'no journal claim, no acknowledgement');
 
   assert.ok(!armed(win), 'the button starts disabled');
-  typeInto(win.querySelector('#nas-retype'), 'sdb');
+  typeInto(win.querySelector('#retype-input'), 'sdb');
   assert.ok(!armed(win), 'a near miss does not arm it');
-  typeInto(win.querySelector('#nas-retype'), 'sdc');
+  typeInto(win.querySelector('#retype-input'), 'sdc');
   assert.ok(armed(win), 'the retyped device name arms it');
 
   confirmWindow(win);
@@ -116,7 +116,7 @@ test('a refused plan shows the node’s own sentence and can never arm the butto
 
   assert.match(win.textContent, /puli ZFS tank/, 'the refusal is the node’s sentence, verbatim');
   assert.match(win.textContent, /zniszcz pulę/, 'and it names the remedy');
-  typeInto(win.querySelector('#nas-retype'), 'sdc');
+  typeInto(win.querySelector('#retype-input'), 'sdc');
   assert.ok(!armed(win), 'a retyped name cannot override a refusal');
   confirmWindow(win);
   await flush();
@@ -145,7 +145,7 @@ test('a dissolved array’s journal claim needs its own acknowledgement, sent as
 
   // The retyped device name alone is NOT enough: the second victim is the
   // array's recoverability, which the device name says nothing about.
-  typeInto(win.querySelector('#nas-retype'), 'sdc');
+  typeInto(win.querySelector('#retype-input'), 'sdc');
   assert.ok(!armed(win), 'the typed device name alone does not arm the button');
 
   const ack = win.querySelector('#nas-wipe-ack');
@@ -223,7 +223,7 @@ test('a claim on a plan the node already refused is never offered for acknowledg
   const win = await openDiskWipeDialog(screen, DISK, () => {});
   await flush();
   assert.ok(!win.querySelector('#nas-wipe-ack'), 'nothing to acknowledge on a refused plan');
-  typeInto(win.querySelector('#nas-retype'), 'sdc');
+  typeInto(win.querySelector('#retype-input'), 'sdc');
   assert.ok(!armed(win));
 });
 
@@ -238,7 +238,7 @@ test('another organisation’s disk on this node is refused in the admin’s lan
   await flush();
   assert.match(win.textContent, /sdc: dysk należy do macierzy Elastic innej organizacji na tym nodzie\. Ta organizacja nie może go wyczyścić ani przejąć tej macierzy\./);
   assert.ok(!win.querySelector('#nas-wipe-ack'), 'nothing to acknowledge');
-  typeInto(win.querySelector('#nas-retype'), 'sdc');
+  typeInto(win.querySelector('#retype-input'), 'sdc');
   assert.ok(!armed(win), 'refused, however carefully the name is typed');
   win.remove();
 

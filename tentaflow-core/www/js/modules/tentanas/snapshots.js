@@ -23,7 +23,8 @@ import {
   fmtDate, fmtAgo, fmtBytes, errMessage, fmtSchedule, fmtScheduleUnit,
 } from '/js/modules/tentanas/format.js';
 import { scheduleFieldsHtml, wireScheduleFields, readScheduleFields, normalizeSchedule } from '/js/modules/tentanas/schedule-editor.js';
-import { openRetypeDialog, followResponse, pathCrumbsHtml, wirePathCrumbs } from '/js/modules/tentanas/dialogs.js';
+import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { followResponse, pathCrumbsHtml, wirePathCrumbs, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-filter-chips.js';
@@ -402,6 +403,7 @@ export function keepSummary(s) {
  */
 export function openReleaseDialog(screen, { snapshot, onDone }) {
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('snapshots.release_title'),
     subtitle: snapshot.name,
     icon: 'unlock',
@@ -588,6 +590,7 @@ export function openRollbackDialog(screen, { snapshot, newer = [], pool = snapsh
     </div></div>
     <div class="explain-box mt-md">${T('rollback.clone_hint')}</div>`;
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('rollback.title', { name: snapshot.shortName }),
     icon: 'history',
     name: snapshot.shortName,

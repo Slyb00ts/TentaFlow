@@ -1,16 +1,16 @@
 // =============================================================================
-// File: modules/tentanas/dom-patch.test.js
+// File: lib/dom-patch.test.js
 // Description: The shared in-place DOM patchers, tested as the primitive they
 // are — the number of DOM operations a poll performs, not just the shape it
 // leaves behind. Every caller on this screen polls, so a pass that lands the
 // right markup by moving six nodes where one would do is still a bug: the
 // screen blinks and anything the pointer was over is re-inserted underneath it.
 // dom-patch.js imports nothing, so this file takes the bare happy-dom harness
-// rather than the TentaNas bootstrap — a primitive's test owes nothing to the
+// rather than a screen bootstrap — a primitive's test owes nothing to the
 // locale files.
 // =============================================================================
 
-import '../../sdk-runtime/_dom-test-harness.js';
+import '../sdk-runtime/_dom-test-harness.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 

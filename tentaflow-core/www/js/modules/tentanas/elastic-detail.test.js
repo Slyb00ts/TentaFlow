@@ -1032,13 +1032,13 @@ test('naprawa wymaga przepisania nazwy dysku i wysyła dokładnie jedno żądani
   assert.doesNotMatch(win.textContent, /Odtwarza pliki z ostatniego udanego sync/);
   const confirm = win.querySelector('[data-action="confirm"]');
   assert.ok(confirm.hasAttribute('disabled'), 'przycisk startuje zablokowany');
-  typeInto(win.querySelector('#nas-retype'), 'media');
+  typeInto(win.querySelector('#retype-input'), 'media');
   assert.ok(confirm.hasAttribute('disabled'), 'nazwa macierzy nie uzbraja naprawy dysku');
   // The admin retypes the name on the cell. The slot is not it.
-  typeInto(win.querySelector('#nas-retype'), 'd1');
+  typeInto(win.querySelector('#retype-input'), 'd1');
   assert.ok(confirm.hasAttribute('disabled'), 'the slot key does not arm the repair');
   assert.match(win.textContent, /Przepisz nazwę dysku, aby potwierdzić: vdb/);
-  typeInto(win.querySelector('#nas-retype'), 'vdb');
+  typeInto(win.querySelector('#retype-input'), 'vdb');
   assert.equal(confirm.hasAttribute('disabled'), false);
   confirmWindow(win);
   await flush();
@@ -1080,7 +1080,7 @@ test('dodanie dysku przepisuje nazwę macierzy, odmawia dysku większego niż pa
   const good = cells.find((c) => c.dataset.disk === 'free-1');
   click(good);
   assert.ok(good.classList.contains('checked'));
-  typeInto(win.querySelector('#nas-retype'), 'media');
+  typeInto(win.querySelector('#retype-input'), 'media');
   confirmWindow(win);
   await flush();
   const sent = screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayAddDiskRequest');
@@ -1109,9 +1109,9 @@ test('rozwiązanie obiecuje zachowanie danych, wymaga przepisania nazwy i wysył
   assert.match(win.textContent, /nie formatuje niczego/, 'dialog mówi wprost, że nic nie formatuje');
   // Nothing was sent while the retype was empty.
   assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayDestroyRequest').length, 0);
-  typeInto(win.querySelector('#nas-retype'), 'medi');
+  typeInto(win.querySelector('#retype-input'), 'medi');
   assert.ok(confirm.hasAttribute('disabled'), 'częściowa nazwa nie uzbraja');
-  typeInto(win.querySelector('#nas-retype'), 'media');
+  typeInto(win.querySelector('#retype-input'), 'media');
   confirmWindow(win);
   await flush();
   const sent = screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayDestroyRequest');

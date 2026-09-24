@@ -7,8 +7,9 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/modules/tentanas/dom-patch.js';
-import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/lib/dom-patch.js';
+import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { followResponse, dangerRowHtml, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -464,6 +465,7 @@ function openElasticFixDialog(screen, array, disk, evidence, onDone) {
     </ul>
     <div class="explain-box">${escapeHtml(T('elastic.repair_explain'))}</div>`;
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('elastic.repair_title', { disk: shown, name: array.name }),
     icon: 'alert',
     name: shown,
@@ -539,6 +541,7 @@ async function openAddDataDiskDialog(screen, array, onDone) {
     <div class="disk-cells" id="nas-add-disk">${cells}</div>
     <div class="explain-box">${escapeHtml(T('elastic.add_disk_explain'))}</div>`;
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('elastic.add_disk_title', { name: array.name }),
     icon: 'plus',
     name: array.name,
@@ -686,6 +689,7 @@ function openElasticDestroyDialog(screen, array, onDone) {
     </ul>
     <div class="explain-box">${escapeHtml(T('elastic.dissolve_explain'))}</div>`;
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('elastic.dissolve_title', { name: array.name }),
     icon: 'alert',
     name: array.name,

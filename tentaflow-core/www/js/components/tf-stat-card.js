@@ -5,6 +5,9 @@
 //       The `size` attribute (sm|md|lg) switches to the compact .tf-stat
 //       variant (no card chrome). Pre-existing light-DOM children (e.g. an
 //       SDK footnote) are preserved after the generated content.
+//       `delta-position="under-value"` puts the delta right under the value
+//       instead of pinning it to the bottom of a stretched card (a row of
+//       tiles whose descriptions are sentences, not small deltas).
 // =============================================================================
 
 const ACCENT_CLASSES = new Set(['success', 'danger', 'warning', 'info']);
@@ -26,7 +29,7 @@ function escapeHtml(value) {
 
 class TfStatCard extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'value', 'suffix', 'delta', 'delta-type', 'icon', 'accent', 'size'];
+    return ['label', 'value', 'suffix', 'delta', 'delta-type', 'icon', 'accent', 'size', 'delta-position'];
   }
 
   constructor() {
@@ -92,6 +95,7 @@ class TfStatCard extends HTMLElement {
 
     const cls = ['tf-stat-card'];
     if (ACCENT_CLASSES.has(accent)) cls.push(`accent-${accent}`);
+    if (this.getAttribute('delta-position') === 'under-value') cls.push('tf-stat-card--delta-under');
     this._root.className = cls.join(' ');
 
     const parts = [];

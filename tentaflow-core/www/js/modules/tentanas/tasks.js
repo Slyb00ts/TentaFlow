@@ -13,7 +13,7 @@ import {
   T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
   jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/lib/dom-patch.js';
 import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields, normalizeSchedule } from '/js/modules/tentanas/schedule-editor.js';
 import { openSnapshotScheduleEditor, keepSummary } from '/js/modules/tentanas/snapshots.js';

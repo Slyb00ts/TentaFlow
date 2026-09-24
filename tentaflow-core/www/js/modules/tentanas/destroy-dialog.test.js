@@ -38,7 +38,7 @@ test('lists what is lost and keeps the danger button locked until the exact name
 
   const btn = confirmButton(win);
   assert.ok(btn.hasAttribute('disabled'), 'locked before typing');
-  const input = win.querySelector('#nas-retype');
+  const input = win.querySelector('#retype-input');
   typeInto(input, 'tan');
   assert.ok(btn.hasAttribute('disabled'), 'partial name keeps it locked');
   typeInto(input, 'Tank');
@@ -77,7 +77,7 @@ test('an armed confirm sends PoolDestroyRequest with the confirm name and follow
   let done = 0;
   const win = openPoolDestroyDialog(screen, pool, datasets, () => { done += 1; });
   await flush();
-  typeInto(win.querySelector('#nas-retype'), 'tank');
+  typeInto(win.querySelector('#retype-input'), 'tank');
   confirmWindow(win);
   await flush();
   await flush();
@@ -98,7 +98,7 @@ test('a cancelled sudo prompt keeps the dialog open and armed', async () => {
   const screen = fakeScreen({ tentaNasPoolDestroyRequest: {} }, { sudo: null });
   const win = openPoolDestroyDialog(screen, pool, datasets, () => {});
   await flush();
-  typeInto(win.querySelector('#nas-retype'), 'tank');
+  typeInto(win.querySelector('#retype-input'), 'tank');
   confirmWindow(win);
   await flush();
   await flush();
@@ -113,11 +113,11 @@ test('a failed destroy shows the error under the retype field and unlocks again'
   const screen = fakeScreen({ tentaNasPoolDestroyRequest: () => { throw new Error('pool is busy'); } });
   const win = openPoolDestroyDialog(screen, pool, datasets, () => {});
   await flush();
-  typeInto(win.querySelector('#nas-retype'), 'tank');
+  typeInto(win.querySelector('#retype-input'), 'tank');
   confirmWindow(win);
   await flush();
   await flush();
-  const err = win.querySelector('#nas-retype-error');
+  const err = win.querySelector('#retype-error');
   assert.equal(err.hidden, false);
   assert.match(err.textContent, /pool is busy/);
   assert.ok(!confirmButton(win).hasAttribute('disabled'));

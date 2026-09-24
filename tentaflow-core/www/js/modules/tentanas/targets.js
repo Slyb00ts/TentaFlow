@@ -13,8 +13,9 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage, errCode } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl, setRowsIfChanged } from '/js/modules/tentanas/dom-patch.js';
-import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl, setRowsIfChanged } from '/js/lib/dom-patch.js';
+import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { followResponse, warningHtml, NAS_DIALOG, nasRetypeLabel } from '/js/modules/tentanas/dialogs.js';
 import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns } from '/js/modules/tentanas/target-wizard.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
@@ -855,9 +856,11 @@ export function openTargetDeleteDialog(screen, target, onDone, isCurrent) {
     </ul>
     <div class="explain-box mt-md"><b>${escapeHtml(T('targets.delete_keep_volume', { source: lun ? lun.source : '—' }))}</b> ${escapeHtml(T('targets.delete_keep_snapshots'))}</div>`;
   const win = openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('targets.delete_title', { name: target.name }),
     icon: 'trash',
     name: target.name,
+    retypeLabel: nasRetypeLabel(target.name),
     bodyHtml,
     confirmLabel: T('targets.delete'),
     onConfirm: async () => {

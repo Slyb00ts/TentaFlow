@@ -23,7 +23,7 @@ import {
   layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
   firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS, alertText,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, setRowsIfChanged } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { nodeT, nodeHeadSub } from '/js/modules/tentanas/node-phrase.js';
 import { isOpaqueId, isDiskIdShape, scrubIds } from '/js/modules/tentanas/machine-id.js';
 import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
@@ -64,7 +64,7 @@ import { drawElasticDetail, elasticState, elasticProtection, elasticCapacity } f
 // -----------------------------------------------------------------------------
 
 // The in-place patching helpers (`setAttr`, `setText`, `patchHtml`,
-// `paintStatCards`) live in modules/tentanas/dom-patch.js, imported above —
+// `paintStatCards`) live in lib/dom-patch.js, imported above —
 // the tab modules this file imports need them too, and a leaf module both
 // sides import avoids the cycle that exporting them from here would create.
 

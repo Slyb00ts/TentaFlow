@@ -27,7 +27,8 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, sprite, fmtBytes, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
-import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { followResponse, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
 import { journalOwnerPhrase, journalOwnerIds, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
 import '/js/components/tf-checkbox.js';
 
@@ -125,6 +126,7 @@ export async function openDiskWipeDialog(screen, disk, onDone) {
     <div class="explain-box">${escapeHtml(T('wipe_disk.explain'))}</div>`;
   let acknowledged = false;
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('wipe_disk.title', { name: plan.name }),
     // The device NAME can move between reboots; the path and the serial are
     // how an admin checks they are erasing the disk they walked to the rack

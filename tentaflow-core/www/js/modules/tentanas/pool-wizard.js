@@ -13,7 +13,7 @@ import {
   T, sprite, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, diskReasonsText,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, paintJobLog } from '/js/lib/dom-patch.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-checkbox.js';

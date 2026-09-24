@@ -191,3 +191,16 @@ test('push() with a value for one series only extends that series', () => {
   assert.equal(pointCount(el.querySelector('polyline[data-series-id="write"]')), 0);
   el.remove();
 });
+
+test('yAxis.integer keeps every tick a whole number, even for a signal of 0–1', () => {
+  const chart = document.createElement('tf-stream-chart');
+  chart.window = 60;
+  chart.yAxis = { min: 0, ticks: 4, integer: true };
+  const now = Date.now();
+  const points = [{ x: now - 2000, y: 0 }, { x: now - 1000, y: 1 }, { x: now, y: 1 }];
+  chart.series = [{ id: 'w', name: 'w', tone: 'primary', points }];
+  const ys = chart._yDomain(chart._series, chart._xDomain());
+  assert.ok(ys.max >= 4, `domain reaches the tick count, got ${ys.max}`);
+  chart.yAxis = { min: 0, ticks: 4 };
+  assert.ok(chart._yDomain(chart._series, chart._xDomain()).max < 4, 'without it the domain stays tight');
+});

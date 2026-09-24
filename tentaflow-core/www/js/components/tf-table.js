@@ -941,7 +941,8 @@ class TfTable extends HTMLElement {
         ? value
         : { status: 'info', label: String(value ?? '') };
       const status = String(chip.status || 'info').replace(/[^a-zA-Z0-9_-]/g, '');
-      const cls = `tf-chip ${status}`;
+      // `variant: 'outline'` — the sentence-case pill (tf-chip variant="outline").
+      const cls = `tf-chip ${status}${chip.variant === 'outline' ? ' tf-chip--outline' : ''}`;
       const label = chip.label == null ? '' : String(chip.label);
       // Skip an identical write, the way the `html` renderer below already
       // does. Without this the cell swapped one <span> per row on EVERY poll:

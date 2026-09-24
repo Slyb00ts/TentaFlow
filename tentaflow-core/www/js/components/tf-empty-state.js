@@ -1,12 +1,14 @@
 // =============================================================================
 // File: tf-empty-state.js
 // Opis: No-data placeholder component. Displays a centered icon, title,
-//       message, and an optional action slot for buttons.
+//       message, and an optional action slot for buttons. `badge` sets the
+//       icon, smaller, inside a round tinted badge (the empty/error state of
+//       an app card).
 // =============================================================================
 
 class TfEmptyState extends HTMLElement {
   static get observedAttributes() {
-    return ['icon', 'title', 'message'];
+    return ['icon', 'title', 'message', 'badge'];
   }
 
   constructor() {
@@ -80,6 +82,8 @@ class TfEmptyState extends HTMLElement {
     } else {
       this._iconEl.style.display = 'none';
     }
+
+    this._root.classList.toggle('tf-empty-state--badge', this.hasAttribute('badge'));
 
     this._titleEl.textContent = title;
     this._titleEl.style.display = title ? '' : 'none';

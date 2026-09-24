@@ -12,7 +12,8 @@ import {
   T, sprite, ADMIN_TIMEOUT_MS,
   fmtAgo, fmtBytes, fmtRatio, pct, errMessage, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
-import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { followResponse, warningHtml, NAS_DIALOG, nasRetypeLabel } from '/js/modules/tentanas/dialogs.js';
 import { openPropertyEditor, sourceChipHtml } from '/js/modules/tentanas/pool-detail.js';
 import { openSnapshotNowDialog } from '/js/modules/tentanas/snapshots.js';
 import '/js/components/tf-table.js';
@@ -464,9 +465,11 @@ export function openDatasetDestroyDialog(screen, dataset, all, onDone) {
       <ul class="loss-list">${children.slice(0, 8).map((c) => `<li class="ll bad">${sprite('x')}<span class="mono">${escapeHtml(c.name)}</span></li>`).join('')}${children.length > 8 ? `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('destroy_pool.more', { n: children.length - 8 }))}</span></li>` : ''}</ul>` : ''}
     <tf-checkbox id="nas-dd-recursive" label="${escapeAttr(T('datasets.destroy_recursive'))}" ${children.length ? 'checked' : ''}></tf-checkbox>`;
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('datasets.destroy_title', { name: dataset.name }),
     icon: 'trash',
     name: dataset.name,
+    retypeLabel: nasRetypeLabel(dataset.name),
     bodyHtml,
     confirmLabel: T('datasets.destroy'),
     onConfirm: async (win) => {

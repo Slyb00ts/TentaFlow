@@ -64,7 +64,7 @@ function runSeeder(testName) {
         TENTABUS_SEED_HOME: HOME,
       },
       stdio: 'inherit',
-      timeout: 180000,
+      timeout: 900000,
     },
   );
 }
@@ -77,6 +77,8 @@ async function stopAndWait(proc) {
 }
 
 test.beforeAll(async () => {
+  // Two boots plus the seeder, which cargo may have to compile first.
+  test.setTimeout(900000);
   test.skip(!binaryExists(), 'tentaflow binary not built (target_shared/{release-fast,release,debug})');
   fs.rmSync(WORK_DIR, { recursive: true, force: true });
   fs.mkdirSync(WORK_DIR, { recursive: true });
@@ -159,17 +161,19 @@ for (const name of INSTANCE_NAMES) {
 
     await page.locator('.tb-instance-row', { hasText: name }).click();
     await expect(page.locator('#tb-tabs')).toBeVisible();
+    // The instance opens on Przegląd; the topic list is its own tab.
+    await page.locator('#tb-tabs tf-tab#topics > button').click();
 
     const table = page.locator('#tb-topics-table');
-    // The list also carries each topic's dead-letter queue (`__dlq.<topic>`,
-    // badged), so the seeded pair is four rows here, not two.
-    await expect(table.locator('tbody tr')).toHaveCount(4, { timeout: 15000 });
+    // The broker's own `__*` topics (each topic's unprocessed-message store,
+    // metrics) are not topics of the reader's: the seeded pair is two rows.
+    await expect(table.locator('tbody tr')).toHaveCount(2, { timeout: 15000 });
     // tf-table renders its rows in a shadow root, so the host's own innerText
     // is empty — the text has to come from the row locators themselves.
     const rowText = (await table.locator('tbody tr').allTextContents()).join('\n');
     expect(rowText).toContain(LAB_TOPIC);
     expect(rowText).toContain(ORDERS_TOPIC);
-    expect(rowText).toContain(`__dlq.${LAB_TOPIC}`);
+    expect(rowText).not.toContain('__');
 
     expect(errors, `console/page errors: ${errors.join('\n')}`).toEqual([]);
   });

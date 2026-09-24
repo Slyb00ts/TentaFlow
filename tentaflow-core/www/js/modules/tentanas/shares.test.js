@@ -230,11 +230,11 @@ test('deleting a share needs the name retyped and sends the confirm name through
   const btn = win.querySelector('tf-button[data-action="confirm"]');
   assert.ok(btn.hasAttribute('disabled'));
   assert.match(win.querySelector('.loss-list').textContent, /atlas/, 'mounted nodes listed');
-  typeInto(win.querySelector('#nas-retype'), 'dokument');
+  typeInto(win.querySelector('#retype-input'), 'dokument');
   confirmWindow(win);
   await flush();
   assert.equal(screen.calls.length, 0, 'nothing sent while locked');
-  typeInto(win.querySelector('#nas-retype'), 'dokumenty');
+  typeInto(win.querySelector('#retype-input'), 'dokumenty');
   assert.ok(!btn.hasAttribute('disabled'));
   confirmWindow(win);
   await flush();

@@ -124,7 +124,7 @@ test('the topology tab carries properties and the danger zone, and no invented a
   await flush();
   const dlg = document.querySelector('tf-window');
   assert.ok(dlg, 'destroy dialog opened');
-  assert.ok(dlg.querySelector('#nas-retype'), 'with the retype gate');
+  assert.ok(dlg.querySelector('#retype-input'), 'with the retype gate');
   assert.ok(dlg.querySelector('[data-action="confirm"]').hasAttribute('disabled'));
   dlg.remove();
   screen.dispose();

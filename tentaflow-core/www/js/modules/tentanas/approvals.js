@@ -13,7 +13,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtAgo, fmtIn, fmtDate, errMessage, ADMIN_TIMEOUT_MS, jobAuthor } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml } from '/js/lib/dom-patch.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';

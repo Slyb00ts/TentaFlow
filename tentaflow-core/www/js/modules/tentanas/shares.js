@@ -8,8 +8,9 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml, nodeLabel } from '/js/modules/tentanas/format.js';
-import { setAttr, patchHtml } from '/js/modules/tentanas/dom-patch.js';
-import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { setAttr, patchHtml } from '/js/lib/dom-patch.js';
+import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { followResponse, warningHtml, NAS_DIALOG, nasRetypeLabel } from '/js/modules/tentanas/dialogs.js';
 import { openShareWizard } from '/js/modules/tentanas/share-wizard.js';
 import { mountTargetsSection } from '/js/modules/tentanas/targets.js';
 import '/js/components/tf-table.js';
@@ -513,9 +514,11 @@ export function openShareDeleteDialog(screen, share, onDone) {
       <li class="ll good">${sprite('check')}<span>${escapeHtml(T('shares.delete_keep_data', { path: share.sourcePath }))}</span></li>
     </ul>`;
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('shares.delete_title', { name: share.name }),
     icon: 'trash',
     name: share.name,
+    retypeLabel: nasRetypeLabel(share.name),
     bodyHtml,
     confirmLabel: T('shares.delete'),
     onConfirm: async () => {

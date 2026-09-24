@@ -73,6 +73,7 @@ module.exports = defineConfig({
     { name: 'agent-accounts-mesh', testMatch: 'agent-accounts-mesh.spec.js' },
     { name: 'tentaquant', testMatch: 'tentaquant.spec.js' },
     { name: 'tentabus-seed', testMatch: 'tentabus-seed.spec.js' },
+    { name: 'tentabus-ui', testMatch: 'tentabus-ui.spec.js' },
     { name: 'access-keys-bus-schema', testMatch: 'access-keys-bus-schema.spec.js' },
   ],
 });

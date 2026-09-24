@@ -549,6 +549,31 @@ tf-window [slot="footer"] {
   transition: border-color 0.15s;
 }
 .tf-select-wrap:focus-within::after { border-color: var(--tf-accent-1); }
+/* `prefix`/`dot`: a small caption (and state dot) inside the field, before the
+   chosen value — "● INSTANCJA Produkcja". Not interactive: clicks reach the
+   native select underneath. */
+.tf-select-prefix { display: none; }
+.tf-select-wrap--prefix > .tf-select-prefix {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--tf-text-3);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.tf-select-wrap--prefix > .tf-select { font-weight: 700; }
+.tf-select-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tf-text-3); }
+.tf-select-dot--ok { background: var(--tf-success); box-shadow: 0 0 6px var(--tf-success); }
+.tf-select-dot--warn { background: var(--tf-warning); }
+.tf-select-dot--err { background: var(--tf-danger); box-shadow: 0 0 6px var(--tf-danger); }
 .tf-select option {
   background: var(--tf-bg-card);
   color: var(--tf-text);
@@ -1024,6 +1049,7 @@ tf-tabs {
    to save space. */
 @media (max-width: 640px) {
   .tf-tabs-chev { display: none; }
+}
 }
 
 /* =============================================================================
@@ -2922,6 +2948,7 @@ tf-stat-card { display: block; height: 100%; }
   margin-top: auto;
   padding-top: 2px;
 }
+.tf-stat-card--delta-under .tf-stat-card-delta { margin-top: 4px; padding-top: 0; }
 .tf-stat-card-delta.up      { color: var(--tf-success); }
 .tf-stat-card-delta.down    { color: var(--tf-danger); }
 .tf-stat-card-delta.warn    { color: var(--tf-warning); }
@@ -3324,6 +3351,20 @@ tf-empty-state { display: block; }
   stroke: currentColor;
   fill: none;
 }
+.tf-empty-state--badge .tf-empty-state-icon {
+  width: 52px;
+  height: 52px;
+  margin: 0 auto 8px;
+  border-radius: 50%;
+  background: var(--tf-bg-3);
+  border: 1px solid var(--tf-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--tf-accent-2);
+  opacity: 1;
+}
+.tf-empty-state--badge .tf-empty-state-icon svg { width: 22px; height: 22px; stroke-width: 1.75; }
 .tf-empty-state-title {
   font-size: 15px;
   font-weight: 700;

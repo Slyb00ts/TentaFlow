@@ -1,17 +1,14 @@
-// ===== File: modules/tentanas/dom-patch.js — in-place DOM patching shared by the TentaNas screen shell and every tab module =====
+// ===== File: lib/dom-patch.js — in-place DOM patching shared by polling screens (TentaNas, TentaBus) =====
 //
-// Every tab of this screen polls, and the rule the mockups state is explicit:
+// Every polling screen follows the rule the mockups state explicitly:
 // "nigdy pełne odświeżenie całości" (research/03-ui-wzorce-mockupy.md). An
 // `innerHTML =` on a poll destroys and recreates nodes whose content did not
 // change, which is exactly what makes an alert, a KPI tile or a filter chip
 // blink every few seconds. These helpers write only what actually differs.
 //
-// They live HERE and not in tentanas.js because tentanas.js imports
-// pools.js / pool-detail.js / shares.js / targets.js / tasks.js /
-// elastic-detail.js. Exporting them from the shell would make every one of
-// those modules import back into it — an import cycle whose evaluation order
-// depends on which module the bundler happens to enter first. A leaf module
-// both sides import has no such hazard.
+// A leaf module with no imports: a screen shell and its tab modules both
+// import it, so exporting these from a shell would create an import cycle
+// whose evaluation order depends on which module is entered first.
 
 /// Sets (or removes) one attribute, but only when the value really changes:
 /// `setAttribute` with an identical value still runs the element's

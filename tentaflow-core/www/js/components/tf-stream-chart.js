@@ -13,7 +13,9 @@
 // Property `window`: number sekund widocznych (domyślnie 300).
 // Property `yAxis`: { min (domyślnie 0), max (null → auto, zaokrąglone do
 //   ładnego ticka; skala rośnie natychmiast, maleje dopiero gdy maksimum
-//   spadnie poniżej połowy), ticks, format }.
+//   spadnie poniżej połowy), ticks, format, integer }. `integer: true` —
+//   seria liczy całe rzeczy (wiadomości/s): domena rośnie co najmniej do
+//   liczby ticków, więc krok podziałki nigdy nie jest ułamkiem.
 // Property `xAxis`: { format: ((secondsAgo: number) => string) | null }
 //   — etykiety osi X są względne (-300 … 0 s), domyślnie "-4m" / "-30s" / "0".
 // Property `fill`: boolean — wypełnienie pod linią (domyślnie true).
@@ -152,6 +154,9 @@ class TfStreamChart extends TfCartesianChart {
     // of it, so a brief dip does not make the whole plot jump.
     if (this._usedYMax != null && top < this._usedYMax && max >= this._usedYMax / 2) top = this._usedYMax;
     if (top <= min) top = min + 1;
+    // Nice steps are 1/2/5×10^k; a domain at least `ticks` wide never needs a
+    // fractional one.
+    if (this._yAxis.integer && top - min < ticks) top = niceCeiling(min + ticks, ticks);
     return { min, max: top };
   }
 

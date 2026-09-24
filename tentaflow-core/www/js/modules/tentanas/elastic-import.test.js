@@ -191,7 +191,7 @@ test('adopting needs the array name retyped and sends the array id it was scanne
 
   const button = confirm.querySelector('tf-button[data-action="confirm"]');
   assert.ok(button.hasAttribute('disabled'), 'locked before the name is typed');
-  const input = confirm.querySelector('#nas-retype');
+  const input = confirm.querySelector('#retype-input');
   typeInto(input, 'Media');
   assert.ok(button.hasAttribute('disabled'), 'case matters');
   confirmWindow(confirm);

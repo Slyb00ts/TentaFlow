@@ -8,7 +8,10 @@
 //   layout (inline|stacked — stacked puts the icon ABOVE the label),
 //   indicator (top|bottom — which edge the moving 2px rule rides; bar only),
 //   safe-area (adds the iOS home-indicator inset + a 46px touch target, for a
-//   bottom navigation bar).
+//   bottom navigation bar),
+//   scroll-align (center — an overflowing strip keeps the active tab centred,
+//   also after a resize or a counter widening the tabs, as the phone main
+//   tabs do; the default only scrolls it just inside the edge).
 //
 // <tf-tab> attributes: label (overrides the light-DOM text), icon (sprite id),
 //   count (trailing pill) + count-tone (hot), disabled, dirty (unsaved-content
@@ -75,8 +78,14 @@ class TfTab extends HTMLElement {
     }
   }
 
-  attributeChangedCallback() {
-    if (this._btn) this._update();
+  attributeChangedCallback(name) {
+    if (!this._btn) return;
+    this._update();
+    // A counter or label changes the tab's width: a centring strip re-centres.
+    if (name === 'count' || name === 'label') {
+      const host = this.closest('tf-tabs');
+      if (host && typeof host._recentre === 'function') host._recentre();
+    }
   }
 
   _build() {
@@ -216,7 +225,7 @@ const CHEV_RIGHT_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><polyline po
 
 class TfTabs extends HTMLElement {
   static get observedAttributes() {
-    return ['variant', 'value', 'layout', 'indicator'];
+    return ['variant', 'value', 'layout', 'indicator', 'scroll-align'];
   }
 
   constructor() {
@@ -438,7 +447,9 @@ class TfTabs extends HTMLElement {
     if (switched) this._playIndicatorEnter();
     requestAnimationFrame(() => {
       this._syncIndicator();
-      this._scrollActiveIntoView(activeTab);
+      // Glide only on a real switch; the first placement (a deep link, a
+      // reload) jumps straight there.
+      this._scrollActiveIntoView(activeTab, switched);
     });
   }
 
@@ -480,12 +491,29 @@ class TfTabs extends HTMLElement {
     this._indicator.setAttribute('data-ready', '');
   }
 
-  _scrollActiveIntoView(tab) {
+  _isCentring() {
+    return (this.getAttribute('scroll-align') || '').toLowerCase() === 'center';
+  }
+
+  // Re-centres the active tab at once (resize, a counter changed its width).
+  _recentre() {
+    if (!this._scroller || !this._isCentring()) return;
+    const active = this._getTabs().find((t) => t.id === this.getAttribute('value'));
+    this._scrollActiveIntoView(active, false);
+  }
+
+  _scrollActiveIntoView(tab, smooth = true) {
     if (!tab) return;
     const s = this._scroller;
     const tabEl = tab.querySelector('.tf-tab') || tab;
     const tabRect = tabEl.getBoundingClientRect();
     const sRect = s.getBoundingClientRect();
+    if (this._isCentring()) {
+      if (s.scrollWidth <= s.clientWidth) return;
+      const delta = (tabRect.left + tabRect.width / 2) - (sRect.left + sRect.width / 2);
+      if (Math.abs(delta) > 1) s.scrollBy({ left: delta, behavior: smooth ? 'smooth' : 'auto' });
+      return;
+    }
     const margin = 24;
     if (tabRect.left < sRect.left + margin) {
       s.scrollBy({ left: tabRect.left - sRect.left - margin, behavior: 'smooth' });
@@ -548,6 +576,7 @@ class TfTabs extends HTMLElement {
   }
 
   _onResize() {
+    this._recentre();
     this._syncIndicator();
     this._updateFades();
   }

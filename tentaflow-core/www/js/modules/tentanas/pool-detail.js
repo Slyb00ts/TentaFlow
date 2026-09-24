@@ -14,9 +14,10 @@ import {
   layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel,
 } from '/js/modules/tentanas/format.js';
 import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
-import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass, setRowsIfChanged } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { openScheduleEditor } from '/js/modules/tentanas/schedule-editor.js';
-import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { followResponse, dangerRowHtml, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
 import { scrubAction, trimAction } from '/js/modules/tentanas/pools.js';
 import { toggleCellCheckbox } from '/js/modules/tentanas/pool-wizard.js';
 import { drawDatasets } from '/js/modules/tentanas/datasets.js';
@@ -1107,6 +1108,7 @@ export function openPoolDestroyDialog(screen, pool, datasets, onDone) {
     </ul>
     <div class="explain-box">${explain}</div>`;
   return openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('destroy_pool.title', { name: pool.name }),
     icon: 'alert',
     name: pool.name,

@@ -1,12 +1,15 @@
 // =============================================================================
-// File: modules/tentabus.js — TentaBus M1 admin screen (SUM/tentabus/PLAN.md
-// §7.3, mockups SUM/mockups/tentabus-final-20260826/{m01,m02,m03,m04,m05,m08}).
-// Screens: topic list + create/edit wizard (M01/M02), topic detail with
-// overview/partitions/config/ACL tabs (M03), consumer groups + offset reset
-// (M04), DLQ per topic (M05), audited message preview (M08). Render/mount/
-// unmount contract mirrors `analytics.js` (~line 542); tables via `tf-table`,
-// modals via `tf-modal`, live charts via `tf-line-chart`'s `TfCartesianChart`
-// base (see the module doc below for the "24h" caveat).
+// File: modules/tentabus.js — the TentaBus screen shell (SUM/tentabus/
+// PLAN-UI-20260923.md U0, mockups SUM/mockups/tentabus-20260923 T01/T11/T12):
+// breadcrumb, the TentaBus header card with the instance picker, the six
+// underlined main tabs (Przegląd / Topiki / Odbiorcy / Nieprzetworzone /
+// Wzory wiadomości / Kopie i nody) with their counters, the address
+// (`#/tentabus?instance=…&tab=…&topic=…&group=…`, see modules/tentabus/
+// routes.js) and the polling every tab reads. Przegląd and Wzory wiadomości
+// live in modules/tentabus/*. The Topiki, Odbiorcy, Nieprzetworzone and Kopie
+// i nody bodies below are the M1/M2 views (topic list + wizard, topic detail,
+// consumer groups + offset reset, unprocessed messages per topic, message
+// preview, replication) until their U1–U4 packages replace them.
 //
 // PROTOCOL GAPS (M1 wire vs. the accepted mockups/PLAN — each one is called
 // out again at its exact render site so a reviewer does not have to trust
@@ -117,6 +120,14 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes, fmtCompact } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
+import { setAttr, setText, patchHtml, setClass } from '/js/lib/dom-patch.js';
+import { fmtCount, fmtElapsed, loadErrorKind } from '/js/modules/tentabus/format.js';
+import { MAIN_TABS, DEFAULT_TAB, parseRoute, routeParams } from '/js/modules/tentabus/routes.js';
+import { shellCounts, userTopics, userRate, isInternalTopic, nodeRows } from '/js/modules/tentabus/model.js';
+import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
+import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
+import { drawSchemas } from '/js/modules/tentabus/schemas.js';
+import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
@@ -139,14 +150,15 @@ const T = (key, params) => I18n.t(`tentabus.${key}`, params);
 const PACKAGE_ID = 'tentabus';
 
 const STATS_POLL_MS = 3000;
-// M2: 'replication' (M06) is a 5th tab, added alongside the 3 M1 tabs.
-const TABS = ['topics', 'groups', 'dlq', 'replication'];
-// The 5 mutually-exclusive views `#tb-panel` can show (4 tabs + topic
+const REPLICA_POLL_MS = 10_000;
+const TABS = MAIN_TABS;
+const TAB_ICONS = { overview: 'gauge', topics: 'share', groups: 'users', dlq: 'inbox', schemas: 'file-code', replication: 'branch' };
+// The mutually-exclusive views `#tb-panel` can show (six tabs + topic
 // detail) — each gets its OWN persistent container (`ensureViewContainer`)
 // so switching between them shows/hides existing DOM instead of tearing it
 // down and rebuilding it, keeping scroll position, in-progress search text,
 // table sort and focus intact across a tab switch.
-const VIEW_SLOTS = ['topics', 'groups', 'dlq', 'detail', 'replication'];
+const VIEW_SLOTS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'detail', 'replication'];
 const DLQ_RETRY_ALL_MAX = 500;
 // Rolling in-memory window for the "live" M01/M03 charts — there is no
 // history/time-series endpoint (module-doc gap #1), so this is the last
@@ -408,9 +420,11 @@ function isValidExplicitOffset(value) {
   return Number.isFinite(n) && n >= 0;
 }
 
+// The broker's own `__*` topics (the unprocessed-message stores themselves,
+// metrics) are never a source to pick.
 function dlqSourceTopicOptions(topics) {
   return (Array.isArray(topics) ? topics : [])
-    .filter((t) => !(t.isDlq ?? t.is_dlq))
+    .filter((t) => !(t.isDlq ?? t.is_dlq) && !String(t.name || '').startsWith('__'))
     .map((t) => ({ value: t.name, label: t.name }));
 }
 
@@ -430,10 +444,15 @@ function dlqSourceTopicOptions(topics) {
 // its candidate topic list (`ensureDlqTabReady`, called from both `setTab`
 // and `loadTopics`) without risking the same race again: there is exactly one
 // function, `ensureDlqTabReady`, that ever ACTS on this value.
-function resolveDlqEntrySource(currentSource, topics) {
-  if (currentSource) return currentSource;
-  const first = dlqSourceTopicOptions(topics)[0];
-  return first ? first.value : '';
+// A kept choice must still name a listed topic (an address can carry a stale
+// or foreign one); the default is the topic with the most unprocessed
+// messages in the stats snapshot, then the first topic.
+function resolveDlqEntrySource(currentSource, topics, statsTopics = []) {
+  const options = dlqSourceTopicOptions(topics);
+  if (currentSource && (!options.length || options.some((o) => o.value === currentSource))) return currentSource;
+  const depth = new Map((statsTopics || []).map((t) => [t.topic, Number(t.dlqDepth) || 0]));
+  const best = options.reduce((top, o) => (top == null || (depth.get(o.value) || 0) > (depth.get(top.value) || 0) ? o : top), null);
+  return best ? best.value : '';
 }
 
 // Best-effort preview decode for a record's raw bytes: valid UTF-8 renders as
@@ -818,7 +837,7 @@ const state = {
   instanceId: null,
   instanceLabel: '',
   capabilities: NO_CAPABILITIES,
-  tab: 'topics',
+  tab: DEFAULT_TAB,
   view: null, // null | { kind: 'topic-detail', name }
   detailTab: 'overview',
 
@@ -890,7 +909,30 @@ const state = {
     topicsTableRows: null, groupsTableRows: null,
     nodeCards: null, roleMatrix: null, failoverKeys: null,
   },
+
+  // What the frame (header card, tab counters) and Przegląd read beside the
+  // stats snapshot — see `freshShellState`.
+  shell: freshShellState(),
 };
+
+// `null` = that source has not answered yet (the figure is left out), never
+// a guessed zero.
+function freshShellState() {
+  return {
+    instances: [],
+    version: null,
+    subjects: null,
+    subjectsError: null,
+    statsAt: 0,
+    statsError: null,
+    ratePoints: [],
+    nodes: null,
+    replicaTopics: null,
+    replicaLags: [],
+    lagSeries: new Map(),
+    replicaTimer: null,
+  };
+}
 
 // `canAdmin` gates EVERY mutating admin action in this module: topic CRUD,
 // pause/resume, DLQ retry/discard, offset reset, ACL writes, partition
@@ -971,37 +1013,47 @@ async function resolveInstanceGate(requestedId) {
   return { target: null, instances };
 }
 
+// Shown only when the address names no instance (or one that does not
+// exist) and there is not exactly one to open: the same header card as the
+// screen itself, then one row per instance. The screen's own picker takes
+// over as soon as one is open.
 function renderInstanceGate(instances, unknownRequestedId = null) {
   const root = byId('tb-root');
   if (!root) return;
   const enabled = instances.filter((a) => a.enabled);
+  let hint = T('instance_picker_hint');
+  if (unknownRequestedId) hint = T('instance_picker_unknown', { id: unknownRequestedId });
+  else if (!enabled.length) hint = T('instance_picker_empty');
   const body = enabled.length === 0
-    ? `<div class="tb-state tb-empty">
-        <div>${escapeHtml(T('instance_picker_empty'))}</div>
+    ? `<tf-empty-state icon="apps" title="${escapeAttr(T('title'))}" message="${escapeAttr(hint)}">
         <tf-button variant="secondary" id="tb-instance-goto-apps">${escapeHtml(I18n.t('nav.apps_home'))}</tf-button>
-      </div>`
+      </tf-empty-state>`
     : `<div class="tb-instance-list">${enabled.map((a) => `
-        <button type="button" class="tb-instance-row" data-instance="${escapeAttr(a.addonId)}">
+        <div class="tb-instance-row" role="link" tabindex="0" data-instance="${escapeAttr(a.addonId)}">
+          <span class="tb-instance-ico">${sprite('broadcast')}</span>
           <span class="tb-instance-row-title">${escapeHtml(a.title)}</span>
-          <tf-chip status="info">${escapeHtml(a.addonId)}</tf-chip>
-        </button>`).join('')}
+          ${sprite('chevron-right')}
+        </div>`).join('')}
       </div>`;
   root.innerHTML = `
-    <div class="tb-head">
-      <div>
-        <h1 class="tb-title">${escapeHtml(T('title'))}</h1>
-        <div class="tb-sub">${escapeHtml(
-          unknownRequestedId
-            ? T('instance_picker_unknown').replace('{id}', unknownRequestedId)
-            : (enabled.length ? T('instance_picker_hint') : T('subtitle'))
-        )}</div>
+    <tf-breadcrumb class="tb-crumbs"><tf-breadcrumb-item current>${escapeHtml(T('title'))}</tf-breadcrumb-item></tf-breadcrumb>
+    <div class="tf-detail-header tb-app-head">
+      <div class="big-ico">${sprite('broadcast')}</div>
+      <div class="d-meta">
+        <div class="d-name">${escapeHtml(T('title'))}</div>
+        <div class="d-sub">${escapeHtml(T('subtitle'))}</div>
       </div>
     </div>
-    <div class="tb-panel">${body}</div>
+    <div class="section-card">
+      ${enabled.length ? `<div class="section-sub">${escapeHtml(hint)}</div>` : ''}
+      ${body}
+    </div>
   `;
   root.querySelector('#tb-instance-goto-apps')?.addEventListener('click', () => Router.navigate('apps-home'));
+  const open = (el) => Router.navigate('tentabus', { instance: el.dataset.instance });
   root.querySelectorAll('.tb-instance-row').forEach((el) => {
-    el.addEventListener('click', () => Router.navigate('tentabus', { instance: el.dataset.instance }));
+    el.addEventListener('click', () => open(el));
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(el); } });
   });
 }
 
@@ -1017,9 +1069,8 @@ const TentaBusScreen = {
   },
 
   async mount(params = {}) {
-    const { target, instances, unknownRequestedId } = await resolveInstanceGate(
-      params?.instance || null,
-    );
+    const route = parseRoute(params);
+    const { target, instances, unknownRequestedId } = await resolveInstanceGate(route.instance);
     if (!target) {
       state.instanceId = null;
       state.instanceLabel = '';
@@ -1028,6 +1079,9 @@ const TentaBusScreen = {
     }
     state.instanceId = target.addonId;
     state.instanceLabel = target.title;
+    state.shell.instances = instances.filter((a) => a.enabled || a.addonId === target.addonId);
+    state.tab = route.tab;
+    if (route.dlqTopic) state.dlqSource = route.dlqTopic;
 
     try {
       state.capabilities = unwrapCapabilities(await ApiBinary.one('busCapabilitiesRequest', { instanceId: requireInstanceId(state.instanceId) }));
@@ -1037,38 +1091,28 @@ const TentaBusScreen = {
     const root = byId('tb-root');
     if (!root) return;
     root.innerHTML = shellHtml();
-
-    byId('tb-tabs')?.addEventListener('change', (e) => {
-      const id = e.detail?.value;
-      if (id && TABS.includes(id)) setTab(id);
-    });
+    wireShell(root);
 
     paintHeadActions();
     renderPanel();
-    // Task 3: `loadGroups()` used to be lazy (only on the first visit to the
-    // Groups tab), so the Topics tab's KPI strip had no `state.groups` to
-    // read from and fell back to the server's separate `groupCount`
-    // aggregate — the two-source split behind N-2's KPI=4/list=3. Loading it
-    // in parallel with the topics list here means the KPI numbers are
-    // sourced from the same list the M04 table renders regardless of which
-    // tab is open first.
-    await Promise.all([loadTopics(), loadGroups()]);
+    if (route.topic) openTopicDetail(route.topic);
+    else if (route.group && route.groupTopic) openGroupDetail(route.group, route.groupTopic);
+    loadShellMeta();
     startStatsPolling();
+    // Task 3: groups load together with topics so every counter reads the
+    // same lists regardless of which tab is open first.
+    await Promise.all([loadTopics(), loadGroups()]);
   },
 
   unmount() {
-    // Stopping the poll BEFORE anything else is the one line in this
-    // function that actually matters for isolation (PLAN §6.1's own
-    // warning): a leaked `setInterval` surviving into the next mount would
-    // keep firing `refreshStats()` against `state.instanceId`, which the
-    // very next line is about to repoint at a DIFFERENT instance — that is
-    // exactly how one instance's numbers would start bleeding into
-    // another's screen.
+    // Stopping the polls BEFORE anything else is what keeps one instance's
+    // numbers out of the next mount: a leaked timer would keep firing against
+    // `state.instanceId`, which the lines below repoint.
     stopStatsPolling();
     state.instanceId = null;
     state.instanceLabel = '';
     state.capabilities = NO_CAPABILITIES;
-    state.tab = 'topics';
+    state.tab = DEFAULT_TAB;
     state.view = null;
     state.detailTab = 'overview';
     state.topics = [];
@@ -1090,6 +1134,7 @@ const TentaBusScreen = {
     state.dlqLoading = false;
     state.dlqError = null;
     state.repl = { topic: '', loaded: false, loading: false, error: null, data: null, localEnv: null };
+    state.shell = freshShellState();
     state.dom = {
       topicsTableRows: null, groupsTableRows: null,
       nodeCards: null, roleMatrix: null, failoverKeys: null,
@@ -1097,76 +1142,302 @@ const TentaBusScreen = {
   },
 };
 
+// =============================================================================
+// Screen shell (T01 frame): breadcrumb, the TentaBus header card, the six
+// underlined main tabs with their counters, and the tab body. Built ONCE per
+// mount; every later change patches it in place (`paintShell`), so a poll
+// never rebuilds the header, the tab strip or the instance picker.
+// =============================================================================
+
 function shellHtml() {
   return `
-    <div class="tb-head">
-      <div>
-        <h1 class="tb-title">${escapeHtml(state.instanceLabel || T('title'))} <tf-chip status="info" title="${escapeAttr(T('instance_label'))}">${escapeHtml(state.instanceId || '')}</tf-chip><tf-chip id="tb-dlq-badge" status="err" hidden></tf-chip></h1>
-        <div class="tb-sub">${escapeHtml(T('subtitle'))}</div>
+    <tf-breadcrumb class="tb-crumbs" id="tb-crumbs"></tf-breadcrumb>
+    <div class="tf-detail-header tb-app-head">
+      <div class="big-ico">${sprite('broadcast')}</div>
+      <div class="d-meta">
+        <div class="d-name">${escapeHtml(T('title'))} <span id="tb-head-chips" class="tb-head-chips"></span></div>
+        <div class="d-sub" id="tb-head-sub"></div>
+        <div class="d-badges" id="tb-head-badges"></div>
       </div>
-      <div class="tb-head-actions" id="tb-head-actions"></div>
+      <div class="d-actions">
+        <tf-select id="tb-instance-select" prefix="${escapeAttr(T('shell.instance'))}"></tf-select>
+        <tf-button variant="secondary" icon="refresh" id="tb-refresh">${escapeHtml(T('shell.refresh'))}</tf-button>
+      </div>
     </div>
-    <tf-tabs id="tb-tabs" value="${escapeAttr(state.tab)}" variant="solid">
-      <tf-tab id="topics">${escapeHtml(T('tab_topics'))}</tf-tab>
-      <tf-tab id="groups">${escapeHtml(T('tab_groups'))}</tf-tab>
-      <tf-tab id="dlq">${escapeHtml(T('tab_dlq'))}</tf-tab>
-      <tf-tab id="replication">${escapeHtml(T('tab_replication'))}</tf-tab>
+    <tf-tabs id="tb-tabs" variant="underline" scroll-align="center" value="${escapeAttr(state.tab)}">
+      ${MAIN_TABS.map((id) => `<tf-tab id="${id}" icon="${TAB_ICONS[id]}">${escapeHtml(T(`shell.tabs.${id}`))}</tf-tab>`).join('')}
     </tf-tabs>
+    <div class="tb-head-actions" id="tb-head-actions" hidden></div>
     <div id="tb-panel" class="tb-panel"></div>
   `;
 }
 
+function wireShell(root) {
+  root.querySelector('#tb-tabs')?.addEventListener('change', (e) => {
+    const id = e.detail?.value;
+    if (id && TABS.includes(id)) setTab(id);
+  });
+  const select = root.querySelector('#tb-instance-select');
+  select.setOptions(state.shell.instances.map((a) => ({ value: a.addonId, label: a.title })), state.instanceId);
+  select.addEventListener('change', (e) => {
+    const next = e.detail?.value;
+    if (next && next !== state.instanceId) Router.navigate('tentabus', { instance: next });
+  });
+  root.querySelector('#tb-refresh')?.addEventListener('click', () => refreshAll());
+  const crumbs = root.querySelector('#tb-crumbs');
+  crumbs.addEventListener('click', (e) => {
+    const link = e.target.closest('a.tf-breadcrumb-item');
+    if (!link) return;
+    e.preventDefault();
+    const links = [...crumbs.querySelectorAll('a.tf-breadcrumb-item')];
+    const acts = [...crumbs.querySelectorAll('tf-breadcrumb-item')].filter((i) => !i.hasAttribute('current')).map((i) => i.dataset.crumb || '');
+    const act = acts[links.indexOf(link)];
+    if (act === 'overview') setTab('overview');
+    else if (act && TABS.includes(act)) setTab(act);
+  });
+}
+
+// The one breadcrumb: TentaBus › <instance> › <tab> › <topic>. Rewritten only
+// when its items change (navigation), never by a poll.
+function paintCrumbs() {
+  const bar = byId('tb-crumbs');
+  if (!bar) return;
+  const href = (params) => `#/tentabus?${new URLSearchParams(routeParams({ instance: state.instanceId, ...params })).toString()}`;
+  const items = [{ label: T('title'), act: 'overview', href: href({ tab: DEFAULT_TAB }) }];
+  const onOverview = state.tab === DEFAULT_TAB && !state.view;
+  items.push(onOverview ? { label: state.instanceLabel } : { label: state.instanceLabel, act: 'overview', href: href({ tab: DEFAULT_TAB }) });
+  if (!onOverview) {
+    const tabLabel = T(`shell.tabs.${state.tab}`);
+    if (state.view?.kind === 'topic-detail') {
+      items.push({ label: tabLabel, act: 'topics', href: href({ tab: 'topics' }) });
+      items.push({ label: state.view.name });
+    } else {
+      items.push({ label: tabLabel });
+    }
+  }
+  const html = items.map((it) => (it.act
+    ? `<tf-breadcrumb-item href="${escapeAttr(it.href)}" data-crumb="${escapeAttr(it.act)}">${escapeHtml(it.label)}</tf-breadcrumb-item>`
+    : `<tf-breadcrumb-item current>${escapeHtml(it.label)}</tf-breadcrumb-item>`)).join('');
+  if (bar.__tbCrumbs === html) return;
+  bar.__tbCrumbs = html;
+  bar.querySelectorAll('tf-breadcrumb-item').forEach((i) => i.remove());
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  bar.insertBefore(tpl.content, bar.firstChild);
+  if (bar._nav && typeof bar._render === 'function') bar._render();
+}
+
+// The address names the view (instance, tab, open topic or consumer) through
+// the router's own `replaceParams`: no history entry per click, and the
+// router's notion of the current params stays true for a language repaint.
+function syncLocation() {
+  if (!state.instanceId) return;
+  const gd = state.tab === 'groups' ? state.groupDetail : null;
+  Router.replaceParams(routeParams({
+    instance: state.instanceId,
+    tab: state.tab,
+    topic: state.view?.kind === 'topic-detail' ? state.view.name : null,
+    group: gd?.group || null,
+    groupTopic: gd?.topic || null,
+    dlqTopic: state.tab === 'dlq' ? state.dlqSource || null : null,
+  }));
+}
+
+// Header card, tab counters and the stale state — everything a poll moves in
+// the frame. Each figure is left out until its source has answered.
+function paintShell() {
+  const root = byId('tb-root');
+  if (!root || !byId('tb-head-chips')) return;
+  const sh = state.shell;
+  const counts = shellCounts({ stats: state.stats, topicList: state.topicsLoaded ? state.topics : null, subjects: sh.subjects, nodes: sh.nodes });
+  const errorKind = sh.statsError ? loadErrorKind(sh.statsError) : null;
+  const stale = Boolean(state.stats && errorKind);
+  let status;
+  if (errorKind === 'denied') status = { tone: 'warn', label: T('shell.status_denied') };
+  else if (errorKind) status = { tone: 'err', label: T('shell.status_lost') };
+  else if (state.stats) status = { tone: 'ok', label: T('shell.status_ok') };
+  else status = { tone: 'neutral', label: T('shell.loading') };
+  patchHtml(byId('tb-head-chips'), [
+    `<tf-chip size="sm" variant="outline" dot data-role="status"></tf-chip>`,
+    counts.nodes != null ? `<tf-chip size="sm" variant="outline" status="info" icon="branch" data-role="nodes"></tf-chip>` : '',
+    sh.version ? `<tf-chip size="sm" variant="outline" status="neutral" data-role="version"></tf-chip>` : '',
+  ].join(''));
+  const chips = byId('tb-head-chips');
+  setAttr(chips.querySelector('[data-role="status"]'), 'status', status.tone);
+  setAttr(chips.querySelector('[data-role="status"]'), 'label', status.label);
+  setAttr(chips.querySelector('[data-role="nodes"]'), 'label', counts.nodes != null ? T('shell.chip_nodes', { count: fmtCount(counts.nodes), n: counts.nodes }) : null);
+  setAttr(chips.querySelector('[data-role="version"]'), 'label', sh.version ? T('shell.chip_version', { v: sh.version }) : null);
+
+  const now = Date.now();
+  const age = sh.statsAt ? fmtElapsed(now - sh.statsAt) : null;
+  setText(byId('tb-head-sub'), [
+    T('shell.meta_instance', { name: state.instanceLabel }),
+    age ? T(stale ? 'shell.meta_stale' : 'shell.meta_refreshed', { ago: age }) : null,
+  ].filter(Boolean).join(' · '));
+
+  const badges = byId('tb-head-badges');
+  patchHtml(badges, [
+    counts.topics != null ? '<tf-chip size="sm" variant="outline" status="accent" icon="share" data-role="topics"></tf-chip>' : '',
+    counts.dlq != null ? '<tf-chip size="sm" variant="outline" status="neutral" icon="inbox" data-role="dlq"></tf-chip>' : '',
+    counts.schemas != null ? '<tf-chip size="sm" variant="outline" status="neutral" icon="file-code" data-role="schemas"></tf-chip>' : '',
+    sh.nodes?.length ? '<tf-chip size="sm" variant="outline" status="info" icon="cpu" data-role="node-list"></tf-chip>' : '',
+  ].join(''));
+  setAttr(badges.querySelector('[data-role="topics"]'), 'label', counts.topics != null ? T('shell.badge_topics', { count: fmtCount(counts.topics), n: counts.topics }) : null);
+  const dlqBadge = badges.querySelector('[data-role="dlq"]');
+  setAttr(dlqBadge, 'label', counts.dlq != null ? T('shell.badge_dlq', { count: fmtCount(counts.dlq), n: counts.dlq }) : null);
+  setAttr(dlqBadge, 'status', counts.dlq ? 'warn' : 'neutral');
+  setAttr(badges.querySelector('[data-role="schemas"]'), 'label', counts.schemas != null ? T('shell.badge_schemas', { count: fmtCount(counts.schemas), n: counts.schemas }) : null);
+  setAttr(badges.querySelector('[data-role="node-list"]'), 'label', sh.nodes?.length ? T('shell.badge_nodes', { list: sh.nodes.map((n) => n.label || n.nodeId).join(' · ') }) : null);
+  setClass(badges, 'is-stale', stale);
+
+  const select = byId('tb-instance-select');
+  setAttr(select, 'dot', status.tone === 'neutral' ? null : status.tone);
+
+  const tabs = byId('tb-tabs');
+  if (tabs) {
+    setClass(tabs, 'is-stale', stale);
+    const tabCount = { topics: counts.topics, groups: counts.groups, dlq: counts.dlq, schemas: counts.schemas, replication: counts.nodes };
+    for (const [id, value] of Object.entries(tabCount)) {
+      setAttr(tabs.querySelector(`tf-tab#${id}`), 'count', value != null ? fmtCount(value) : null);
+    }
+  }
+}
+
+// Navigation, crumbs and the address follow every view change; the header
+// counters follow every data change.
+function paintFrame() {
+  const tabs = byId('tb-tabs');
+  if (tabs && tabs.getAttribute('value') !== state.tab) tabs.value = state.tab;
+  paintCrumbs();
+  syncLocation();
+  paintShell();
+}
+
+// Version (from the platform's addon registry: the bus does not know its own
+// package version) and the message-pattern list behind the "wzory" counter.
+async function loadShellMeta() {
+  const instanceId = state.instanceId;
+  ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).then((addons) => {
+    if (state.instanceId !== instanceId) return;
+    const row = (addons || []).find((a) => a.addonId === instanceId);
+    state.shell.version = row?.version ? String(row.version) : null;
+    paintShell();
+  }, () => {});
+  await loadSubjects();
+}
+
+async function loadSubjects() {
+  const instanceId = state.instanceId;
+  try {
+    const subjects = await ApiBinary.list('busSchemaSubjectListRequest', { arrayKey: 'subjects', payload: { instanceId: requireInstanceId(instanceId) } });
+    if (state.instanceId !== instanceId) return;
+    state.shell.subjects = subjects || [];
+    state.shell.subjectsError = null;
+  } catch (err) {
+    if (state.instanceId !== instanceId) return;
+    state.shell.subjectsError = err;
+  }
+  paintShell();
+  if (state.tab === 'schemas' && !state.view) renderPanel();
+}
+
+// "Odśwież": asks every source again and repaints the open tab.
+async function refreshAll() {
+  refreshStats();
+  refreshReplicas();
+  loadSubjects();
+  await Promise.all([loadTopics(), loadGroups()]);
+  if (state.view?.kind === 'topic-detail') loadTopicDetail(state.view.name);
+  else if (state.tab === 'dlq') loadDlqRecords(true);
+  else if (state.tab === 'replication') { state.repl.loaded = false; renderPanel(); }
+  else if (state.tab === 'groups' && state.groupDetail) openGroupDetail(state.groupDetail.group, state.groupDetail.topic);
+}
+
+// What Przegląd and Wzory wiadomości read, and where their buttons lead.
+const tabContext = {
+  view() {
+    const sh = state.shell;
+    return {
+      stats: state.stats,
+      error: sh.statsError,
+      errorKind: sh.statsError ? loadErrorKind(sh.statsError) : null,
+      topicList: state.topics,
+      nodes: sh.nodes,
+      replicaTopics: sh.replicaTopics,
+      replicaLags: sh.replicaLags,
+      lagSeries: sh.lagSeries,
+      instanceLabel: state.instanceLabel,
+      stale: Boolean(state.stats && sh.statsError),
+      ratePoints: sh.ratePoints,
+      nowMs: Date.now(),
+    };
+  },
+  go(action) {
+    if (action.kind === 'tab' && TABS.includes(action.tab)) setTab(action.tab);
+    else if (action.kind === 'topic') { setTab('topics'); openTopicDetail(action.topic); }
+    else if (action.kind === 'group') { setTab('groups'); openGroupDetail(action.group, action.topic); }
+    else if (action.kind === 'dlq') {
+      // Chosen BEFORE the tab opens, so the tab's own default pick does not
+      // start a second, racing load of another topic.
+      if (action.topic && action.topic !== state.dlqSource) {
+        state.dlqSource = action.topic;
+        state.dlqRecords = null;
+        state.dlqPartitions = [];
+      }
+      setTab('dlq');
+    }
+    else if (action.kind === 'retry') refreshAll();
+  },
+};
+
+const schemasContext = {
+  view() {
+    const sh = state.shell;
+    return {
+      subjects: sh.subjects,
+      error: sh.subjectsError,
+      errorKind: sh.subjectsError ? loadErrorKind(sh.subjectsError) : null,
+      instanceLabel: state.instanceLabel,
+    };
+  },
+  go(action) {
+    if (action.kind === 'retry') { state.shell.subjectsError = null; renderPanel(); loadSubjects(); }
+  },
+};
+
 function setTab(id) {
   if (state.view) state.view = null;
+  if (id !== 'groups') state.groupDetail = null;
   state.tab = id;
   paintHeadActions();
   renderPanel();
   if (id === 'groups' && !state.groupsLoaded) loadGroups();
   if (id === 'dlq') ensureDlqTabReady();
   // 'replication' needs no entry here — `renderPanel()` above already ran
-  // `renderReplicationTab`, which triggers its own load the same way
-  // (`renderReplicationTab`'s own doc: self-sufficient regardless of entry
-  // path, including M03's "otwórz w Replikacji" button).
+  // `renderReplicationTab`, which triggers its own load.
 }
 
+// The topics list keeps its "create topic" action above the table until the
+// Topiki package replaces that tab; every other tab owns its actions.
 function paintHeadActions() {
   const host = byId('tb-head-actions');
   if (!host) return;
   if (state.tab === 'topics' && !state.view && canAdmin()) {
     host.innerHTML = `<tf-button variant="primary" icon="plus" id="tb-new-topic">${escapeHtml(T('new_topic'))}</tf-button>`;
+    host.hidden = false;
     byId('tb-new-topic')?.addEventListener('click', () => openTopicWizard(null));
   } else {
     host.innerHTML = '';
-  }
-}
-
-// 6.1: cross-tab DLQ-depth badge next to the instance chip in the screen
-// header (W9, PLAN-APP-PLATFORM.md §3.6) — same `state.stats.totalDlqDepth`
-// the Topics-tab KPI card reads, painted on every stats poll so it stays
-// current no matter which tab/view is open, and hidden entirely at 0 (a
-// healthy DLQ has nothing to flag here).
-function paintDlqBadge() {
-  const el = byId('tb-dlq-badge');
-  if (!el) return;
-  const depth = Number(state.stats?.totalDlqDepth) || 0;
-  if (depth > 0) {
-    el.textContent = fmtCompact(depth);
-    el.setAttribute('title', T('head_dlq_badge_title', { count: depth }));
-    el.removeAttribute('hidden');
-  } else {
-    el.setAttribute('hidden', '');
+    host.hidden = true;
   }
 }
 
 // Persistent per-view container inside `#tb-panel`, keyed by `VIEW_SLOTS`
 // entry (`data-tb-view-slot`, distinct from `ensureSkeleton`'s own
-// `data-tb-view` marker on the SAME element — one records "which of the 4
-// views is this container for" and never changes once created, the other
-// records "which skeleton variant is currently built inside it" and changes
-// when the view's own content needs a full rebuild, e.g. a different M03
-// topic). Built once, on first visit; never removed for the life of the
-// mount, so `unmount()`'s `root.innerHTML = shellHtml()` on the NEXT mount is
-// what finally discards it.
+// `data-tb-view` marker on the SAME element — one records "which view is this
+// container for" and never changes once created, the other records "which
+// skeleton variant is currently built inside it"). Built once, on first
+// visit; never removed for the life of the mount.
 function ensureViewContainer(panel, key) {
   let el = panel.querySelector(`:scope > [data-tb-view-slot="${key}"]`);
   if (!el) {
@@ -1188,7 +1459,10 @@ function renderPanel() {
     el.hidden = key !== activeKey;
     if (key === activeKey) activeEl = el;
   }
+  paintFrame();
   if (!activeEl) return;
+  if (activeKey === 'overview') { drawOverview(activeEl, tabContext); return; }
+  if (activeKey === 'schemas') { drawSchemas(activeEl, schemasContext); return; }
   if (activeKey === 'detail') { renderTopicDetail(activeEl); return; }
   if (activeKey === 'topics') { renderTopicsTab(activeEl); return; }
   if (activeKey === 'groups') { renderGroupsTab(activeEl); return; }
@@ -1210,67 +1484,127 @@ function ensureSkeleton(panel, viewId, buildFn) {
 }
 
 // =============================================================================
-// Stats polling (M01 KPI strip / M03 overview) — BusStatsSnapshotRequest is a
-// plain poll, not a push subscription (PLAN §6.2's StatsSubscribe was not
-// wired for M1; see `dispatch/bus.rs`'s module doc). Started once in mount(),
-// stopped in unmount() — never left running against an unmounted screen.
+// Polling — BusStatsSnapshotRequest every 3 s (the header, the tab counters,
+// Przegląd and the legacy tab strips all read it) and ReplicaListRequest every
+// 10 s (node state and lagging replicas). Plain polls, not push
+// subscriptions; started once in mount(), stopped in unmount(). A failed poll
+// keeps the last data on screen and turns the header to "Brak połączenia"
+// with the age of that data (T12) — it never blanks the numbers.
 // =============================================================================
 
 function startStatsPolling() {
   stopStatsPolling();
   refreshStats();
+  refreshReplicas();
   state.statsTimer = setInterval(refreshStats, STATS_POLL_MS);
+  state.shell.replicaTimer = setInterval(refreshReplicas, REPLICA_POLL_MS);
 }
 
 function stopStatsPolling() {
   if (state.statsTimer) clearInterval(state.statsTimer);
   state.statsTimer = null;
+  if (state.shell.replicaTimer) clearInterval(state.shell.replicaTimer);
+  state.shell.replicaTimer = null;
 }
 
 async function refreshStats() {
+  const instanceId = state.instanceId;
+  if (!instanceId) return;
   try {
-    state.stats = await ApiBinary.one('busStatsSnapshotRequest', { instanceId: requireInstanceId(state.instanceId) });
-  } catch {
-    // Silent — the KPI strip just keeps its last known values (or the
-    // loading placeholder if it never loaded), matching the "silently skip"
-    // convention `refreshNavCounts` in app.js already uses for count badges.
+    const stats = await ApiBinary.one('busStatsSnapshotRequest', { instanceId: requireInstanceId(instanceId) });
+    if (state.instanceId !== instanceId) return;
+    state.stats = stats;
+    state.shell.statsAt = Date.now();
+    state.shell.statsError = null;
+  } catch (err) {
+    if (state.instanceId !== instanceId) return;
+    state.shell.statsError = err;
+    paintShell();
+    if (state.tab === 'overview' && !state.view) renderPanel();
     return;
   }
-  // The rolling window is sampled every poll regardless of which view is
-  // visible — only the DOM PATCH below is gated by visibility, so switching
-  // back to a tab/topic shows an already-up-to-date, already-scrolled chart
-  // instead of a gap or a reset-to-empty series.
+  // The rolling windows are sampled every poll regardless of which view is
+  // visible — only the DOM patches below are gated by visibility, so
+  // switching back to a tab shows an already-up-to-date chart.
   pushChartSample(state.chartSeries, state.stats);
-  // The DLQ-depth badge lives in the screen HEADER (`shellHtml`), which is
-  // never rebuilt while a tab/topic-detail view is showing (unlike the KPI
-  // strip, which only exists inside the Topics view DOM) — so it is always
-  // safe to patch on every poll, regardless of `state.tab`/`state.view`.
-  paintDlqBadge();
-  // M01: KPI strip + chart + topics table only exist inside the Topics view
-  // — never touch that DOM while a different tab/topic-detail is showing
-  // (task requirement: "polling must not touch panels that are not
-  // visible").
+  ensureDlqTabReady();
+  const rate = userRate(state.stats);
+  pushRateSample(state.shell.ratePoints, state.shell.statsAt, rate);
+  paintShell();
+  if (state.tab === 'overview' && !state.view) {
+    const body = document.querySelector('#tb-panel > [data-tb-view-slot="overview"]');
+    pushOverviewSample(body, rate, state.shell.statsAt);
+    renderPanel();
+  }
+  // M01: KPI strip + chart + topics table only exist inside the Topics view.
   if (state.tab === 'topics' && !state.view) {
     paintKpiStrip();
     updateLiveChartSeries('tb-chart-live', state.chartSeries);
     paintTopicsTable();
   }
-  // M06: reuses this SAME 3s cadence (task requirement) rather than its own
-  // timer, but only touches its DOM while the tab is actually visible and no
-  // topic-detail is open over it — `pollReplication` itself re-fetches and
-  // patches in place (diffed node cards/matrix, append-only failover rows),
-  // never a full `renderReplicationTab` skeleton rebuild.
+  // M06 patches its own DOM in place on the same cadence while visible.
   if (state.tab === 'replication' && !state.view) {
     pollReplication();
   }
   if (state.view?.kind === 'topic-detail' && state.detail?.topic) {
-    // Sample the OPEN topic's own series every poll (not just while the
-    // overview tab is visible) so switching back to it does not lose the
-    // window already collected — only the repaint is tab-gated.
+    // Sample the OPEN topic's own series every poll so switching back to its
+    // overview does not lose the window already collected.
     const ts = findTopicStats(state.stats?.topics, state.detail.topic.name);
     if (ts && state.detailChartSeries) pushChartSample(state.detailChartSeries, null, ts.msgsInPerSec, ts.bytesInPerSec, ts.totalLag);
     if (state.detailTab === 'overview') renderDetailBody();
   }
+}
+
+// Keeps the live-chart window as epoch-ms points, so a chart built later
+// (Przegląd opened after another tab) starts from what the screen already saw.
+function pushRateSample(points, atMs, rate) {
+  points.push({ x: atMs, y: Number(rate) || 0 });
+  const floor = atMs - (CHART_WINDOW_SECS + STATS_POLL_MS / 1000) * 1000;
+  while (points.length && points[0].x < floor) points.shift();
+}
+
+// Node state for the header and Przegląd, and which replicas trail their
+// leader. The whole-instance answer names the nodes; the per-topic answers
+// give the partitions of the reader's topics (the wire partition carries no
+// topic name, and the node summary also counts the broker's own `__*`
+// topics), from which Przegląd counts leaders, copies and lagging replicas.
+// The last few lag samples of every consumer the overview flags as falling
+// behind — whether its backlog still grows ("rośnie od") or only waits
+// ("czeka od") is read from what the node measured, not guessed.
+async function refreshLagSeries(instanceId) {
+  const now = Date.now();
+  const flagged = (state.stats?.groups || []).filter((g) => isLagging(g, now));
+  const next = new Map();
+  await Promise.all(flagged.map((g) => ApiBinary.one('busLagHistoryRequest', {
+    instanceId: requireInstanceId(instanceId), group: g.group, topic: g.topic, sinceMs: now - 10 * 60_000,
+  }).then((r) => {
+    const series = (r?.groups || []).find((x) => x.group === g.group && x.topic === g.topic);
+    if (series) next.set(lagSeriesKey(g.group, g.topic), series.samples || []);
+  }, () => {})));
+  if (state.instanceId === instanceId) state.shell.lagSeries = next;
+}
+
+async function refreshReplicas() {
+  const instanceId = state.instanceId;
+  if (!instanceId || !state.topicsLoaded) return;
+  let all;
+  try {
+    all = await ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(instanceId, ''));
+  } catch {
+    return;
+  }
+  const names = state.topics.map((t) => t.name);
+  const perTopic = await Promise.all(names.map((topic) => ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(instanceId, topic))
+    .then((r) => ({ topic, partitions: r?.partitions || [] }), () => ({ topic, partitions: [] }))));
+  if (state.instanceId !== instanceId) return;
+  const nodes = all?.nodes || [];
+  state.shell.nodes = nodes;
+  state.shell.replicaTopics = perTopic;
+  state.shell.replicaLags = laggingReplicas(perTopic, nodes);
+  await refreshLagSeries(instanceId);
+  if (state.instanceId !== instanceId) return;
+  paintShell();
+  if (state.tab === 'overview' && !state.view) renderPanel();
 }
 
 // Appends one sample to a rolling `{msgsIn, bytesIn, lag}` window, trimmed to
@@ -1291,14 +1625,17 @@ function paintKpiStrip() {
   const set = (id, v) => patchAttr(byId(id), 'value', v == null ? '—' : String(v));
   const setFmt = (id, v, fmt) => patchAttr(byId(id), 'value', v == null ? '—' : fmt(Number(v)));
   const setAccent = (id, accent) => patchAttr(byId(id), 'accent', accent || '');
-  set('tb-kpi-topics', s?.topicCount);
-  setFmt('tb-kpi-msgs-in', s?.totalMsgsInPerSec, (v) => fmtCompact(v));
+  // Topics, partitions, rate and disk of the reader's topics: the snapshot's
+  // own totals also count the broker's `__*` topics.
+  const own = (s?.topics || []).filter((t) => !isInternalTopic(t.topic));
+  set('tb-kpi-topics', state.topicsLoaded ? state.topics.length : null);
+  setFmt('tb-kpi-msgs-in', s ? userRate(s) : null, (v) => fmtCompact(v));
   setFmt('tb-kpi-lag', s?.totalLag, (v) => fmtCompact(v));
   setAccent('tb-kpi-lag', (Number(s?.totalLag) || 0) > 0 ? 'warning' : '');
   setFmt('tb-kpi-dlq-depth', s?.totalDlqDepth, (v) => fmtCompact(v));
   setAccent('tb-kpi-dlq-depth', (Number(s?.totalDlqDepth) || 0) > 0 ? 'danger' : '');
-  setFmt('tb-kpi-disk', s?.totalBytesOnDisk, (v) => formatBytes(v));
-  set('tb-kpi-partitions', s?.partitionCountTotal);
+  setFmt('tb-kpi-disk', s ? own.reduce((sum, t) => sum + (Number(t.totalBytesOnDisk) || 0), 0) : null, (v) => formatBytes(v));
+  set('tb-kpi-partitions', state.topicsLoaded ? state.topics.reduce((sum, t) => sum + (Number(t.partitions) || 0), 0) : null);
   // Sourced from the same `state.groups` the M04 table renders (task 3),
   // not `BusStatsSnapshotWire.groupCount`/`pausedGroupCount` — those were a
   // separate server-side aggregate that could (and did) disagree with the
@@ -1391,13 +1728,18 @@ function updateLiveChartSeries(hostId, series) {
 
 async function loadTopics() {
   try {
-    state.topics = await ApiBinary.list('busTopicListRequest', { arrayKey: 'topics', payload: { instanceId: requireInstanceId(state.instanceId) } });
+    // The broker's own `__*` topics (unprocessed-message stores, metrics) are
+    // never shown as topics: every list, count and picker reads this one.
+    state.topics = userTopics(await ApiBinary.list('busTopicListRequest', { arrayKey: 'topics', payload: { instanceId: requireInstanceId(state.instanceId) } }));
   } catch (err) {
     toast(mapBusErrorMessage(err?.message, T), 'error');
     state.topics = [];
   }
   state.topicsLoaded = true;
   if (state.tab === 'topics' && !state.view) paintTopicsTable();
+  paintShell();
+  refreshReplicas();
+  if (state.tab === 'overview' && !state.view) renderPanel();
   // Covers the race where a user switches to the DLQ tab BEFORE this initial
   // `loadTopics()` (kicked off in parallel from `mount()`) resolves: `setTab`'s
   // own `ensureDlqTabReady()` call ran too early to see any topics yet, so the
@@ -1506,7 +1848,7 @@ function topicLagCellHtml(lag) {
   const n = Number(lag) || 0;
   if (n <= 0) return fmtCompact(n);
   const status = n >= 10_000 ? 'err' : n >= 1_000 ? 'warn' : 'ok';
-  return `<span class="tf-chip ${status}">${escapeHtml(fmtCompact(n))}</span>`;
+  return `<span class="tf-chip tf-chip--outline ${status}">${escapeHtml(fmtCompact(n))}</span>`;
 }
 
 function paintTopicsTable() {
@@ -1526,7 +1868,7 @@ function paintTopicsTable() {
     const ts = findTopicStats(statsTopics, t.name);
     const dlqTs = t.isDlq ? null : ts;
     return {
-      name: `${escapeHtml(t.name)}${t.isDlq ? ` <span class="tf-chip warn">${escapeHtml(T('badge_dlq'))}</span>` : ''}`,
+      name: `${escapeHtml(t.name)}${t.isDlq ? ` <span class="tf-chip tf-chip--outline warn">${escapeHtml(T('badge_dlq'))}</span>` : ''}`,
       msgsInPerSec: dlqTs ? fmtCompact(dlqTs.msgsInPerSec) : '—',
       lag: dlqTs ? topicLagCellHtml(dlqTs.totalLag) : '—',
       dlqDepth: dlqTs ? fmtCompact(dlqTs.dlqDepth) : '—',
@@ -1667,7 +2009,7 @@ function wireRowKeyboardActivation(table) {
 
 function envChip(env) {
   const status = env === 'prod' ? 'err' : env === 'test' ? 'warn' : 'ok';
-  return { status, label: T(`env_${env}`) || env };
+  return { status, variant: 'outline', label: T(`env_${env}`) || env };
 }
 
 // Owner decision B: the M01 list column and the M03 config tab both render
@@ -1694,7 +2036,7 @@ function durabilityClassChipHtml(topic) {
   const label = T(`durability_class_chip_${cls}`);
   const durability = topic?.durability;
   const title = durability ? escapeAttr(T('durability_class_policy_title', { durability })) : '';
-  const chip = `<span class="tf-chip ${status}"${title ? ` title="${title}"` : ''}>${escapeHtml(label)}</span>`;
+  const chip = `<span class="tf-chip tf-chip--outline ${status}"${title ? ` title="${title}"` : ''}>${escapeHtml(label)}</span>`;
   if (!shouldShowDurabilityExplicitLabel(topic)) return chip;
   return `${chip} <span class="tb-field-hint tb-durability-explicit">${escapeHtml(T('durability_class_explicit_suffix'))}</span>`;
 }
@@ -1838,7 +2180,7 @@ function openTopicWizard(existing) {
             <output id="tb-w-rf-value">${form.replicationFactor}</output>
             <button type="button" id="tb-w-rf-inc" aria-label="${escapeAttr(T('wizard_rf_inc'))}">+</button>
           </span>
-          <tf-chip id="tb-w-rf-warning" status="warn" class="tb-rf-warning ${form.replicationFactor === 1 ? 'show' : ''}">${escapeHtml(T('wizard_rf_warning'))}</tf-chip>
+          <tf-chip variant="outline" id="tb-w-rf-warning" status="warn" class="tb-rf-warning ${form.replicationFactor === 1 ? 'show' : ''}">${escapeHtml(T('wizard_rf_warning'))}</tf-chip>
         </div>
         <p class="tb-field-hint">${escapeHtml(T('wizard_nodes_gap_note'))}</p>
         <div id="tb-w-node-picker-wrap" class="tb-node-picker-wrap">
@@ -1875,7 +2217,7 @@ function openTopicWizard(existing) {
             </span>
           </label>
         </fieldset>
-        <tf-chip id="tb-w-durability-explicit-warn" status="warn"
+        <tf-chip variant="outline" id="tb-w-durability-explicit-warn" status="warn"
           class="tb-durability-explicit-warn${form.durability !== 'auto' ? ' show' : ''}">${escapeHtml(T('wizard_durability_class_inactive_warning'))}</tf-chip>
         <p class="tb-field-hint">${escapeHtml(T('wizard_durability_class_latency_note'))}</p>
         ${isEdit && form.name.startsWith('__dlq.') ? `<p class="tb-field-hint tb-dlq-durability-note">${escapeHtml(T('wizard_durability_class_dlq_note'))}</p>` : ''}
@@ -1899,11 +2241,6 @@ function openTopicWizard(existing) {
           <option value="at_least_once">${escapeHtml(T('wizard_delivery_at_least_once'))}</option>
           <option value="fire_and_forget" disabled>${escapeHtml(T('wizard_delivery_fire_and_forget'))}</option>
         </tf-select>
-      </div>
-
-      <div class="tb-disabled-row">
-        <span>${escapeHtml(T('wizard_field_idempotency_key'))} — ${escapeHtml(T('wizard_idempotency_disabled_hint'))}</span>
-        <tf-chip status="info">${escapeHtml(T('chip_soon_m3a'))}</tf-chip>
       </div>
 
       <div class="tb-wizard-grid--3">
@@ -1947,14 +2284,6 @@ function openTopicWizard(existing) {
         </tf-select>
       </div>
 
-      <div class="tb-disabled-row">
-        <span>${escapeHtml(T('wizard_field_cleanup_policy'))} — ${escapeHtml(T('wizard_cleanup_compact_hint'))}</span>
-        <tf-chip status="info">${escapeHtml(T('chip_soon_m5'))}</tf-chip>
-      </div>
-      <div class="tb-disabled-row">
-        <span>${escapeHtml(T('wizard_field_encryption'))} — ${escapeHtml(T('wizard_encryption_hint'))}</span>
-        <tf-chip status="info">${escapeHtml(T('chip_soon_m5'))}</tf-chip>
-      </div>
     </div>
   `;
 
@@ -2498,18 +2827,18 @@ function renderDetailBody() {
 }
 
 function chipHtml(chip) {
-  return `<tf-chip status="${escapeAttr(chip.status)}">${escapeHtml(chip.label)}</tf-chip>`;
+  return `<tf-chip variant="outline" status="${escapeAttr(chip.status)}">${escapeHtml(chip.label)}</tf-chip>`;
 }
 
 function heroHtml(topic, groups) {
   return `
     <div class="tb-hero">
       <div class="tb-hero-ident">
-        <div class="tb-hero-name">${escapeHtml(topic.name)}${topic.name.startsWith('__dlq.') ? ` <tf-chip status="warn">${escapeHtml(T('badge_dlq'))}</tf-chip>` : ''}</div>
+        <div class="tb-hero-name">${escapeHtml(topic.name)}${topic.name.startsWith('__dlq.') ? ` <tf-chip variant="outline" status="warn">${escapeHtml(T('badge_dlq'))}</tf-chip>` : ''}</div>
         <div class="tb-hero-meta">
           ${chipHtml(envChip(topic.environment))}
-          <tf-chip status="info">${escapeHtml(topic.delivery)}</tf-chip>
-          <tf-chip status="info">${escapeHtml(topic.acks)}</tf-chip>
+          <tf-chip variant="outline" status="info">${escapeHtml(topic.delivery)}</tf-chip>
+          <tf-chip variant="outline" status="info">${escapeHtml(topic.acks)}</tf-chip>
         </div>
       </div>
       <div class="tb-mini-kpis">
@@ -2592,14 +2921,14 @@ function detailPartitionsHtml(partitions, topicName) {
         <td>${p.partition}</td>
         <td class="mono">${p.leaderNodeId ? escapeHtml(p.leaderNodeId) : '—'}</td>
         <td class="mono">${p.leaderEpoch != null ? `e${p.leaderEpoch}` : '—'}</td>
-        <td>${isrCount != null && replicaCount != null ? `${isrCount}/${replicaCount}` : '—'}${degraded ? ` <span class="tf-chip warn">${escapeHtml(T('detail_isr_degraded'))}</span>` : ''}</td>
+        <td>${isrCount != null && replicaCount != null ? `${isrCount}/${replicaCount}` : '—'}${degraded ? ` <span class="tf-chip tf-chip--outline warn">${escapeHtml(T('detail_isr_degraded'))}</span>` : ''}</td>
         <td class="mono">${p.earliestOffset}</td>
         <td class="mono">${p.logEndOffset}</td>
         <td class="mono">${p.highWatermark != null ? p.highWatermark : '—'}</td>
         <td class="mono">${p.highWatermark != null ? lag : '—'}</td>
         <td>${formatBytes(p.sizeBytes)}</td>
         <td>${p.segments}</td>
-        <td>${reasonKey ? `<span class="tf-chip err" title="${escapeAttr(T(reasonKey))}">${escapeHtml(T('detail_partition_unavailable'))}</span>` : ''}</td>
+        <td>${reasonKey ? `<span class="tf-chip tf-chip--outline err" title="${escapeAttr(T(reasonKey))}">${escapeHtml(T('detail_partition_unavailable'))}</span>` : ''}</td>
       </tr>
     `;
   }).join('');
@@ -2904,7 +3233,7 @@ function openMessagePreview(topicName, partitionCount) {
 function partitionSummaryHtml(partitions) {
   if (!partitions?.length) return '';
   const chips = partitions.map((p) => `
-    <span class="tf-chip info" title="${escapeAttr(T('partitions_summary_chip_title', { partition: p.partition, earliest: p.earliestOffset, hwm: p.highWatermark }))}">
+    <span class="tf-chip tf-chip--outline info" title="${escapeAttr(T('partitions_summary_chip_title', { partition: p.partition, earliest: p.earliestOffset, hwm: p.highWatermark }))}">
       P${p.partition}: ${p.earliestOffset}–${p.highWatermark}
     </span>
   `).join('');
@@ -2965,8 +3294,8 @@ async function loadPreviewPage(modal, topicName, previewState, isFirstPage) {
             <td>${msToDate(r.timestampMs)}</td>
             <td class="mono">${escapeHtml(r.key?.length ? bytesToPreviewText(r.key, 32) : '—')}</td>
             <td>
-              ${r.isBlobRef ? `<tf-chip status="info">BlobRef</tf-chip>` : ''}
-              ${r.truncated ? `<tf-chip status="warn">${escapeHtml(T('preview_truncated'))}</tf-chip>` : ''}
+              ${r.isBlobRef ? `<tf-chip variant="outline" status="info">BlobRef</tf-chip>` : ''}
+              ${r.truncated ? `<tf-chip variant="outline" status="warn">${escapeHtml(T('preview_truncated'))}</tf-chip>` : ''}
               <tf-button variant="ghost" size="sm" icon="eye" class="tb-preview-view" data-idx="${idx}">${escapeHtml(T('preview_action_view'))}</tf-button>
             </td>
           </tr>
@@ -3085,7 +3414,7 @@ function paintGroupsTable() {
     group: g.group,
     topic: g.topic,
     commitMode: g.commitMode,
-    state: { status: g.paused ? 'warn' : 'ok', label: T(g.paused ? 'groups_state_paused' : 'groups_state_active') },
+    state: { status: g.paused ? 'warn' : 'ok', variant: 'outline', label: T(g.paused ? 'groups_state_paused' : 'groups_state_active') },
     paused: g.paused,
   }));
   // Same no-op-poll gate as `paintTopicsTable` (this table is not on the
@@ -3130,6 +3459,7 @@ async function openGroupDetail(group, topic) {
     state.groupDetail = null;
   }
   paintGroupDetail();
+  paintFrame();
 }
 
 function paintGroupDetail() {
@@ -3261,13 +3591,13 @@ function renderDlqTab(panel) {
 
 function dlqSkeletonHtml() {
   return `
-    <div class="tb-toolbar">
+    <div class="tb-toolbar" id="tb-dlq-toolbar" hidden>
       <tf-select id="tb-dlq-source" label="${escapeAttr(T('dlq_source_label'))}"></tf-select>
       <span class="tb-spacer"></span>
-      ${canAdmin() ? `<tf-button variant="danger" icon="rotate" id="tb-dlq-retry-all">${escapeHtml(T('dlq_retry_all'))}</tf-button>` : ''}
+      ${canAdmin() ? `<tf-button variant="danger" icon="rotate" id="tb-dlq-retry-all" hidden>${escapeHtml(T('dlq_retry_all'))}</tf-button>` : ''}
     </div>
     <div class="tb-card">
-      <div class="tb-c-body tb-c-body--table" id="tb-dlq-body"></div>
+      <div class="tb-c-body" id="tb-dlq-body"></div>
     </div>
   `;
 }
@@ -3291,6 +3621,15 @@ function paintDlqSourceOptions() {
   if (!select) return;
   const options = dlqSourceTopicOptions(state.topics);
   select.setOptions(options, state.dlqSource || options[0]?.value || '');
+  // No topic, nothing to pick: the toolbar (and its card) goes away.
+  const toolbar = byId('tb-dlq-toolbar');
+  if (toolbar) toolbar.hidden = !(state.topicsLoaded && options.length > 0);
+}
+
+// "Ponów wszystkie" only when it has something to retry in the chosen topic.
+function paintDlqRetryAll() {
+  const btn = byId('tb-dlq-retry-all');
+  if (btn) btn.hidden = !(state.dlqSource && (state.dlqRecords || []).length > 0);
 }
 
 // R3-1: the only function that ACTS on `resolveDlqEntrySource`'s answer —
@@ -3300,18 +3639,25 @@ function paintDlqSourceOptions() {
 // re-entering the tab with an already-loaded source is a no-op.
 function ensureDlqTabReady() {
   if (state.tab !== 'dlq' || state.view) return;
-  const next = resolveDlqEntrySource(state.dlqSource, state.topics);
+  // The default choice needs both the topic list and the snapshot's counts;
+  // `loadTopics` and the first stats poll each call back in here.
+  if (!state.topicsLoaded || !state.stats) return;
+  paintDlqSourceOptions();
+  const next = resolveDlqEntrySource(state.dlqSource, state.topics, state.stats.topics);
   if (next !== state.dlqSource) {
     selectDlqSource(next);
     return;
   }
-  if (next && state.dlqRecords == null && !state.dlqLoading) loadDlqRecords(true);
+  // With no source (no topics) the load settles on "nothing to show" at once.
+  if (state.dlqRecords == null && !state.dlqLoading) loadDlqRecords(true);
 }
 
 function selectDlqSource(topicName) {
   state.dlqSource = topicName;
   state.dlqRecords = null;
   state.dlqPartitions = [];
+  paintDlqSourceOptions();
+  syncLocation();
   loadDlqRecords(true);
 }
 
@@ -3366,6 +3712,7 @@ const DLQ_REASON_TONE = {
 function paintDlqTable() {
   const host = byId('tb-dlq-body');
   if (!host) return;
+  paintDlqRetryAll();
   if (state.dlqLoading) {
     host.innerHTML = `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('loading'))}</div>`;
     return;
@@ -3389,7 +3736,9 @@ function paintDlqTable() {
     return;
   }
   if (state.dlqRecords.length === 0) {
-    host.innerHTML = `${partitionSummaryHtml(state.dlqPartitions)}<div class="tb-state tb-empty">${escapeHtml(T('dlq_empty_for_topic'))}</div>`;
+    const empty = state.dlqSource ? T('dlq_empty_for_topic') : T('dlq_all_processed_sub');
+    host.innerHTML = `${state.dlqSource ? partitionSummaryHtml(state.dlqPartitions) : ''}
+      <tf-empty-state badge icon="inbox" title="${escapeAttr(T('dlq_all_processed_title'))}" message="${escapeAttr(empty)}"></tf-empty-state>`;
     return;
   }
   const admin = canAdmin();
@@ -3402,7 +3751,7 @@ function paintDlqTable() {
         <td>${r.partition}</td>
         <td>${r.offset}</td>
         <td>${msToDate(r.timestampMs)}</td>
-        <td><tf-chip status="${DLQ_REASON_TONE[reason] || 'info'}">${escapeHtml(T(`dlq_reason_${reason}`) || reason)}</tf-chip></td>
+        <td><tf-chip variant="outline" status="${DLQ_REASON_TONE[reason] || 'info'}">${escapeHtml(T(`dlq_reason_${reason}`) || reason)}</tf-chip></td>
         <td>${escapeHtml(attempts)}</td>
         <td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeAttr(errorMsg)}">${escapeHtml(errorMsg)}</td>
         <td>
@@ -3681,22 +4030,33 @@ async function pollReplication() {
   paintReplFailovers();
 }
 
+// Counts per node over the reader's topics — the same `nodeRows` Przegląd
+// uses, so both screens say the same. "Wszystkie topiki" reads the shell's
+// per-topic snapshots; a chosen topic reads its own answer. The node summary
+// on the wire also counts the broker's `__*` topics, so it only names nodes.
 function nodeCardRows(data) {
   const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
   const partitions = Array.isArray(data?.partitions) ? data.partitions : [];
-  return nodes.map((n) => ({
-    _key: n.nodeId,
-    nodeId: n.nodeId,
-    label: n.label || n.nodeId,
-    environment: n.environment,
-    isLocal: !!n.isLocal,
-    reachable: n.reachable !== false,
-    lastHeartbeatMsAgo: n.lastHeartbeatMsAgo,
-    leaderCount: n.leaderCount,
-    followerCount: n.followerCount,
-    isrCount: n.isrCount,
-    degraded: nodeDegradedReason(n, partitions),
-  }));
+  const perTopic = state.repl.topic
+    ? [{ topic: state.repl.topic, partitions }]
+    : state.shell.replicaTopics;
+  const counts = new Map((nodeRows(nodes, perTopic) || []).map((r) => [r.nodeId, r]));
+  return nodes.map((n) => {
+    const c = counts.get(n.nodeId);
+    return {
+      _key: n.nodeId,
+      nodeId: n.nodeId,
+      label: n.label || n.nodeId,
+      environment: n.environment,
+      isLocal: !!n.isLocal,
+      reachable: n.reachable !== false,
+      lastHeartbeatMsAgo: n.lastHeartbeatMsAgo,
+      leaderCount: c ? c.leads : null,
+      followerCount: c ? c.holds : null,
+      isrCount: c ? c.inSync : null,
+      degraded: nodeDegradedReason(n, partitions),
+    };
+  });
 }
 
 function nodeCardSubText(r) {
@@ -3721,7 +4081,7 @@ function nodeCardHtml(r) {
         <span class="tb-node-dot ${dotCls}"></span>
         <span class="tb-node-name">${escapeHtml(r.label)}</span>
         ${chipHtml(envChip(r.environment))}
-        ${r.isLocal ? `<span class="tf-chip info">${escapeHtml(T('replication.node_local_badge'))}</span>` : ''}
+        ${r.isLocal ? `<span class="tf-chip tf-chip--outline info">${escapeHtml(T('replication.node_local_badge'))}</span>` : ''}
       </div>
       <div class="tb-node-stats">
         <div><b id="tb-repl-node-${key}-leader">${r.leaderCount ?? '—'}</b><span>${escapeHtml(T('replication.node_stat_leader'))}</span></div>
@@ -3790,7 +4150,7 @@ function roleMatrixRowHtml(row, nodes) {
     <tr class="${row.unavailableReason ? 'tb-row-unavailable' : ''}" id="tb-repl-row-${key}">
       <td>
         P${row.partition}
-        ${reasonKey ? `<div class="tf-chip warn tb-role-unavailable-chip">${escapeHtml(T(reasonKey))}</div>` : ''}
+        ${reasonKey ? `<div class="tf-chip tf-chip--outline warn tb-role-unavailable-chip">${escapeHtml(T(reasonKey))}</div>` : ''}
       </td>
       ${cells}
       <td class="mono" id="tb-repl-epoch-${key}">e${row.leaderEpoch}</td>
@@ -3914,7 +4274,7 @@ function failoverRowHtml(e) {
   return `
     <tr>
       <td class="mono">${escapeHtml(e.topic)} / P${e.partition}</td>
-      <td><span class="tf-chip">e${e.fromEpoch} → e${e.toEpoch}</span></td>
+      <td><span class="tf-chip tf-chip--outline">e${e.fromEpoch} → e${e.toEpoch}</span></td>
       <td class="mono">${escapeHtml(e.fromNode)} → ${escapeHtml(e.toNode)}</td>
       <td>${fmtCompact((Number(e.durationMs) || 0) / 1000)} s</td>
       <td>${escapeHtml(msToDate(e.atMs))}</td>

@@ -61,15 +61,15 @@ test('rollback with newer snapshots lists them and sends destroyNewer only after
   await flush();
   assert.equal(screen.calls.length, 0, 'nothing sent while locked');
 
-  typeInto(win.querySelector('#nas-retype'), 'daily-2026-08-3');
+  typeInto(win.querySelector('#retype-input'), 'daily-2026-08-3');
   assert.ok(confirmButton(win).hasAttribute('disabled'), 'partial name keeps it locked');
   confirmWindow(win);
   await flush();
   assert.equal(screen.calls.length, 0);
-  typeInto(win.querySelector('#nas-retype'), target.name);
+  typeInto(win.querySelector('#retype-input'), target.name);
   assert.ok(confirmButton(win).hasAttribute('disabled'), 'the full dataset@name is not what the label asks for');
 
-  typeInto(win.querySelector('#nas-retype'), target.shortName);
+  typeInto(win.querySelector('#retype-input'), target.shortName);
   assert.ok(!confirmButton(win).hasAttribute('disabled'));
   assert.equal(screen.calls.length, 0, 'typing alone sends nothing');
   confirmWindow(win);
@@ -93,7 +93,7 @@ test('rollback to the newest snapshot sends destroyNewer=false', async () => {
   assert.equal(win.querySelector('.snap-lost'), null, 'no loss list');
   assert.match(win.querySelector('.wizard-warning').textContent, /nowszych snapshotów nie ma/);
   assert.equal(confirmButton(win).textContent.trim(), 'Rollback');
-  typeInto(win.querySelector('#nas-retype'), target.shortName);
+  typeInto(win.querySelector('#retype-input'), target.shortName);
   confirmWindow(win);
   await flush();
   await flush();
@@ -111,7 +111,7 @@ test('a cancelled sudo prompt sends nothing and keeps the dialog armed', async (
   const screen = fakeScreen({ tentaNasSnapshotRollbackRequest: {} }, { sudo: null });
   const win = openRollbackDialog(screen, { snapshot: target, newer: newerThan(all, target), onDone: () => {} });
   await flush();
-  typeInto(win.querySelector('#nas-retype'), target.shortName);
+  typeInto(win.querySelector('#retype-input'), target.shortName);
   confirmWindow(win);
   await flush();
   await flush();
@@ -290,7 +290,7 @@ test('"Zdejmij ochronę" retypes the name and reports that a second admin has to
   await flush();
   assert.equal(sent, null, 'nothing is sent while the name is not retyped');
 
-  typeInto(dialog.querySelector('#nas-retype'), target.name);
+  typeInto(dialog.querySelector('#retype-input'), target.name);
   assert.equal(confirm.hasAttribute('disabled'), false);
   dialog.querySelector('#nas-release-reason').value = 'projekt zamknięty';
   confirmWindow(dialog);

@@ -11,9 +11,10 @@ import {
   fmtDate, fmtIn, fmtBytes, fmtRatio, pct, healthClass, healthChip, errMessage, layoutLabel, stateTone, stateLabel, fmtSchedule,
   poolReasonsText,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl } from '/js/lib/dom-patch.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
-import { followResponse, warningHtml, openRetypeDialog } from '/js/modules/tentanas/dialogs.js';
+import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { followResponse, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
 import { journalOwnerPhrase, journalOwnerIds, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-chip.js';
@@ -729,6 +730,7 @@ export function openElasticImportDialog(screen, onDone) {
   // re-owns storage that belongs to another identity, and the journal owner
   // is on the dialog so nobody re-owns somebody else's array by accident.
   const openAdopt = (c) => openRetypeDialog({
+    ...NAS_DIALOG,
     title: T('elastic_import.adopt_title', { name: c.name }),
     icon: 'download',
     confirmIcon: 'download',

@@ -3,17 +3,21 @@
 // Opis: Komponent <tf-select> — wraper nad natywnym <select>. Dzieci <option>
 //       sa przejmowane i umieszczane w select. Emituje "change" z detail.value.
 // Przyklad: <tf-select value="rr"><option value="fa">First</option>...</tf-select>
+// Atrybuty: value, disabled, name, label (etykieta NAD polem), prefix (krotki
+//   podpis WEWNATRZ pola, przed wybrana wartoscia — np. "Instancja" w wyborze
+//   instancji aplikacji), dot (ok|warn|err — kropka stanu przed podpisem).
 // =============================================================================
 
 class TfSelect extends HTMLElement {
   static get observedAttributes() {
-    return ['value', 'disabled', 'name', 'label'];
+    return ['value', 'disabled', 'name', 'label', 'prefix', 'dot'];
   }
 
   constructor() {
     super();
     this._group = null;
     this._labelEl = null;
+    this._prefixEl = null;
     this._wrap = null;
     this._select = null;
     this._observer = null;
@@ -123,12 +127,18 @@ class TfSelect extends HTMLElement {
     topLevel.forEach((node) => select.appendChild(node));
     select.addEventListener('change', this._onChange);
 
+    const prefix = document.createElement('span');
+    prefix.className = 'tf-select-prefix';
+    prefix.setAttribute('aria-hidden', 'true');
+
+    wrap.appendChild(prefix);
     wrap.appendChild(select);
     group.appendChild(wrap);
     this.appendChild(group);
 
     this._group = group;
     this._labelEl = label;
+    this._prefixEl = prefix;
     this._wrap = wrap;
     this._select = select;
   }
@@ -143,6 +153,34 @@ class TfSelect extends HTMLElement {
     const labelText = this.getAttribute('label') || '';
     this._labelEl.textContent = labelText;
     this._labelEl.style.display = labelText ? '' : 'none';
+    this._updatePrefix();
+  }
+
+  // The prefix sits over the field's left padding, so the padding follows its
+  // measured width; the accessible name carries the same words for readers
+  // that do not see the decorative span.
+  _updatePrefix() {
+    const text = this.getAttribute('prefix') || '';
+    const dot = String(this.getAttribute('dot') || '').toLowerCase();
+    const tone = ['ok', 'warn', 'err'].includes(dot) ? dot : '';
+    this._prefixEl.innerHTML = '';
+    if (tone) {
+      const d = document.createElement('span');
+      d.className = `tf-select-dot tf-select-dot--${tone}`;
+      this._prefixEl.appendChild(d);
+    }
+    if (text) this._prefixEl.appendChild(document.createTextNode(text));
+    const on = Boolean(text || tone);
+    this._wrap.classList.toggle('tf-select-wrap--prefix', on);
+    if (text) this._select.setAttribute('aria-label', text);
+    else if (this._select.getAttribute('aria-label') && !this.hasAttribute('aria-label')) this._select.removeAttribute('aria-label');
+    if (!on) { this._select.style.paddingLeft = ''; return; }
+    const measure = () => {
+      const w = this._prefixEl.offsetWidth;
+      if (w > 0) this._select.style.paddingLeft = `${w + 22}px`;
+    };
+    measure();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(measure);
   }
 
   _onChange(e) {
