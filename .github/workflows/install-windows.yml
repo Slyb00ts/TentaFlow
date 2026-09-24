@@ -108,6 +108,10 @@ jobs:
 
       - name: The service and the CLI agree
         run: |
+          # The PATH of a new terminal: this step inherits the runner's, taken
+          # before the installer added GStreamer and `current` to the machine's.
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + $env:Path
+          trap { Write-Host "::error title=CLI check line $($_.InvocationInfo.ScriptLineNumber)::$($_.Exception.Message)"; exit 1 }
           $service = Get-Service TentaFlow
           if ($service.Status -ne 'Running' -or $service.StartType -ne 'Automatic') {
             Write-Host "::error::service is $($service.Status)/$($service.StartType), expected Running/Automatic"; exit 1
