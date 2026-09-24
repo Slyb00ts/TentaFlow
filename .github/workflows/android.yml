@@ -1,23 +1,20 @@
 # =============================================================================
 # File:        .github/workflows/android.yml
-# Description: Builds the Android app to prove it still compiles. NOT a release
-#              path: the APK it produces is debug-signed, so it installs by
-#              sideload but can never be upgraded by a properly signed build,
-#              and Google Play refuses it outright. When a release keystore
-#              exists, this job grows a signing step and starts attaching the
-#              APK to releases; until then the artifact is for testing only.
+# Description: Builds the Android app (arm64-v8a). release.yml calls it and
+#              publishes the APK next to the desktop archives, so a release is
+#              installable on a phone too. The APK is debug-signed: it installs
+#              by sideloading, a future properly signed build cannot upgrade it
+#              in place, and Google Play refuses it. When a release keystore
+#              exists, this job grows a signing step.
 #
-#              Separate from release.yml on purpose. The native cross-build for
-#              one ABI takes the better part of an hour, and a mobile break
-#              should not hold back a Linux/macOS release that is fine.
-#              Uruchamiany ręcznie, dla wskazanych PR i po tagach v*.
+#              Also runs by hand and for pull requests that touch the mobile
+#              app or the native-library scripts.
 # =============================================================================
 name: android
 
 on:
+  workflow_call:
   workflow_dispatch:
-  push:
-    tags: ['v*']
   pull_request:
     paths:
       - 'tentaflow-mobile/**'
@@ -48,7 +45,7 @@ jobs:
           sudo apt-get install -y build-essential cmake ninja-build pkg-config \
             python3 protobuf-compiler unzip curl git ca-certificates
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -113,8 +110,18 @@ jobs:
       - name: Verify APK native libraries
         run: python3 scripts/ci-local/check-android-apk.py tentaflow-mobile/android/app/build/outputs/apk/debug/app-debug.apk --abi arm64-v8a
 
+      - name: Name the APK like a release asset
+        run: |
+          # The release publishes every tentaflow-* artifact as it is, so the
+          # file carries the tag, the ABI and the fact that it is debug-signed.
+          mkdir -p dist
+          apk="dist/tentaflow-${GITHUB_REF_NAME}-android-arm64-v8a-debug.apk"
+          cp tentaflow-mobile/android/app/build/outputs/apk/debug/app-debug.apk "$apk"
+          (cd dist && sha256sum "$(basename "$apk")" > "$(basename "$apk").sha256")
+
       - uses: actions/upload-artifact@v4
         with:
-          name: tentaflow-android-debug-apk
-          path: tentaflow-mobile/android/app/build/outputs/apk/debug/*.apk
-          retention-days: 14
+          name: tentaflow-android-arm64-v8a-debug
+          path: |
+            dist/tentaflow-*.apk
+            dist/tentaflow-*.apk.sha256

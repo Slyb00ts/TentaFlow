@@ -920,8 +920,12 @@ jobs:
     name: build (windows)
     uses: ./.github/workflows/build-windows.yml
 
+  build-android:
+    name: build (android)
+    uses: ./.github/workflows/android.yml
+
   publish:
-    needs: [build, build-macos, build-windows, verify]
+    needs: [build, build-macos, build-windows, build-android, verify]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -1007,4 +1011,12 @@ jobs:
             CUDA piece the machine needs. By hand: install the GStreamer runtime named in
             `REQUIREMENTS.txt`, unzip, run `tentaflow.exe init-config --output config.toml`,
             then `tentaflow.exe --config config.toml`.
+
+            ### Android (arm64-v8a)
+
+            `tentaflow-<tag>-android-arm64-v8a-debug.apk` — debug-signed, installed by
+            sideloading. A future properly signed build cannot upgrade it in place, so
+            uninstall it before installing one.
+
+            What changed: [CHANGELOG.md](https://github.com/Slyb00ts/TentaFlow/blob/main/CHANGELOG.md).
           generate_release_notes: true

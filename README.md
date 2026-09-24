@@ -31,7 +31,18 @@ curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/ins
 Linux on x86_64 and arm64 (glibc ≥ 2.35 — Ubuntu 22.04+, Debian 12+, Fedora, Arch, RHEL 10+) and
 macOS on Apple Silicon. The installer detects the GPU and picks the build to match — CUDA, Vulkan or
 Metal, or the slim edition with no local inference — pulls the dependencies your system needs,
-registers the service (systemd or launchd) and starts it. Then:
+registers the service (systemd or launchd) and starts it.
+
+**Windows** (x86_64, Windows 10 1809 / Server 2019 or newer) — in PowerShell started with
+*Run as administrator*:
+
+```powershell
+irm https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.ps1 | iex
+```
+
+It installs TentaFlow as the `TentaFlow` Windows service, together with the GStreamer runtime the
+`full` edition needs. Open a new terminal afterwards so `tentaflow` is on `PATH`. Then, on every
+platform:
 
 ```bash
 tentaflow status          # service state, autostart, /health
@@ -431,6 +442,58 @@ Installer options (`TENTAFLOW_EDITION` is required without a terminal):
 First login: **admin / admin** — change the password immediately.
 `uninstall.sh` removes the application; `--purge` also removes data and configuration.
 
+#### Windows
+
+In PowerShell started with *Run as administrator*:
+
+```powershell
+irm https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.ps1 | iex
+```
+
+The installer asks for the edition just like `install.sh` (`full` or `slim`; an empty answer
+asks again) and proposes the GPU backend of `full`: `cuda13` for an NVIDIA card with compute
+capability 7.5+ and a 580-series or newer driver, `vulkan` for everything else. Then it:
+
+- downloads the archive from GitHub Releases and verifies its SHA-256;
+- for `full`, installs the GStreamer runtime the camera and video pipeline links
+  (the exact version the build names, checksum-verified, machine-wide);
+- installs into `%ProgramFiles%\TentaFlow\versions\<version>` behind a `current` junction and
+  adds it to the system `PATH`;
+- writes `%ProgramData%\TentaFlow\config.toml` (an existing one is kept) and keeps data and
+  logs in `%ProgramData%\TentaFlow\data` — readable only by the service and administrators;
+- opens the API and mesh ports in Windows Firewall;
+- registers the `TentaFlow` service under its own virtual account (`NT SERVICE\TentaFlow`),
+  with automatic start and restart after a failure, starts it and waits for `/health`.
+
+Open a **new** terminal afterwards so `tentaflow` is on `PATH`. `tentaflow status`,
+`tentaflow start | stop | restart` and `tentaflow update` (as Administrator) drive the service
+exactly as on Linux; the service log is in `%ProgramData%\TentaFlow\data\logs`.
+
+Without a console (automation), set the choices in the environment:
+
+```powershell
+$env:TENTAFLOW_EDITION = 'full'      # or 'slim'
+$env:TENTAFLOW_VARIANT = 'vulkan'    # or 'cuda13'; full only
+irm https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.ps1 | iex
+```
+
+Other options: `TENTAFLOW_VERSION=v0.3.0-beta`, `TENTAFLOW_BIND=0.0.0.0:8090`,
+`TENTAFLOW_PREFIX`, `TENTAFLOW_ASSET_FILE` (install a downloaded `.zip`),
+`TENTAFLOW_NO_AUTOSTART=1`, `TENTAFLOW_SKIP_DEPS=1` (do not install GStreamer).
+
+To uninstall (data and configuration are kept unless you add `-Purge`; GStreamer stays,
+it has its own entry in *Settings → Apps*):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/uninstall.ps1))) -Purge
+```
+
+#### Android
+
+Each release carries a debug-signed APK (`arm64-v8a`). Download it from the release page and
+sideload it (allow installing from unknown sources). A debug-signed build cannot be upgraded in
+place by a future properly signed one — uninstall it first.
+
 #### LAN access after an earlier installation
 
 If an earlier installer saved `127.0.0.1:8090`, running the installer again
@@ -462,10 +525,9 @@ A listening socket does not confirm connectivity through firewalls or across net
 Debian 12+, Fedora, Arch/CachyOS, RHEL 10+. The installer checks this floor before it
 installs anything.
 
-macOS support (Apple Silicon, macOS 15+, launchd) is written and the installer handles
-it, but no macOS archive has been published yet — until one is, the one-liner has
-nothing to download there. Older Linux (RHEL 9, Debian 11, Ubuntu 20.04) and Linux
-aarch64 have to build from source; Windows is packaged separately.
+Linux aarch64 with the same floor; macOS on Apple Silicon (macOS 15+, launchd); Windows
+x86_64 (Windows 10 1809 / Server 2019 or newer). Older Linux (RHEL 9, Debian 11,
+Ubuntu 20.04) has to build from source.
 
 ### Prerequisites (building from source)
 

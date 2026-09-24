@@ -1,99 +1,198 @@
 # Changelog
 
-Najważniejsze zmiany w TentaFlow.
+Notable changes to TentaFlow.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Aplikacje, TentaBus i konta agentów
+## [0.3.0-beta] — 2026-09-24
 
-- Konta agentów CLI przechodzą w całości do rejestru kont dostawców. Po aktualizacji
-  każde przeniesione konto zaczyna jako „wymaga zalogowania", a poświadczenia
-  zapisane w starym miejscu (tabela w bazie treści Code Studio i logowania
-  przechowywane na dysku przez bridge) **nie są** przenoszone — nie da się ich
-  odszyfrować kluczem innego węzła, więc operator loguje się do każdego konta
-  jednokrotnie. Przy starcie węzeł wypisuje w logu, ile wierszy poświadczeń
-  usunięto, osobno dla każdego węzła i silnika — łącznie z sumą — żeby utrata
-  starych wpisów nie wyglądała na cichy zanik danych.
-- Karta konta (A03) nie twierdzi już, że konto nie ma sesji, gdy widzi tylko
-  sesje tego węzła. Ekran rozdziela cztery stany: konto z domem na tym węźle (lub
-  bez domu) zachowuje dotychczasowe brzmienie; konto z domem na innym, dostępnym
-  węźle nazywa ten węzeł i pokazuje własny podzbiór; konto z domem na węźle,
-  który nie odpowiada, pokazuje „brak danych" zamiast pustej listy (wymóg §H.4
-  projektu technicznego); braku macierzy węzłów nie da się już pomylić z domem
-  na tym węźle i ekran mówi wprost, że zakres jest nieznany.
+Changes since `0.2.0-beta`. That tag never produced a published release (its
+builds failed), so this is the first release published after `0.1.0-beta`: the
+`0.2.0-beta` notes below apply to it as well.
+
+### Upgrade notes
+
+- **Update every mesh node together.** The binary protocol moved from schema 29
+  to 32; an older and a newer node reject each other's handshake.
+- **Sign in to agent CLI accounts again.** Agent CLI accounts now live in the
+  provider-account registry. Every migrated account starts as "sign-in
+  required": credentials stored in the old places (the Code Studio content
+  database and the bridge's on-disk logins) are **not** carried over, because
+  they cannot be decrypted with another node's key. At startup the node logs how
+  many credential rows it removed, per node and engine and in total, so the
+  loss of old entries never looks like silent data loss.
+
+### Windows
+
+- Release archives for Windows x86_64 — `slim`, `full-vulkan` and `full-cuda13`
+  — built in CI by the same `setup.ps1` → `build-all.ps1` → `build.ps1` scripts
+  a developer runs. Each archive carries its Visual C++ runtime (and cuBLAS for
+  `full-cuda13`); CI starts every archive from a bare `PATH` before publishing.
+- `install.ps1` installs TentaFlow as the `TentaFlow` Windows service: explicit
+  edition choice, verified download, the GStreamer runtime the `full` editions
+  need (checksum-verified), a virtual service account, automatic start with
+  restart on failure, firewall rules and a data directory only the service and
+  administrators can read. `uninstall.ps1` removes it (`-Purge` also removes
+  the data).
+- `tentaflow start|stop|restart|status` drive the Windows service, and
+  `tentaflow update` updates a Windows installation, including a newer
+  GStreamer runtime when the release needs one.
+- CI installs, upgrades, drives and uninstalls every Windows archive on a clean
+  runner before a release is published.
+- Host telemetry on Windows: GPU utilisation and VRAM (DXGI + PDH, independent
+  of the UI language), disks, and network interface details now report real
+  values instead of zeros.
+
+### Android
+
+- The Android debug APK (arm64-v8a) is attached to the release. It is
+  debug-signed: it installs by sideloading, and a future properly signed build
+  will not upgrade it in place.
+
+### TentaNAS and storage
+
+- Elastic Array: isolated mounts for new arrays, a durable service mode, a
+  verified single-disk cache tier and a mover that relocates files from the
+  cache to the data disks automatically, on a schedule or on demand — without
+  freezing the share.
+- Scheduled sync and scrub (every array is scrubbed monthly); a failed parity
+  run is recorded as a cause instead of wedging the array, a Sync over a fault
+  needs an explicit acknowledgement, and an unfinished disk add can be resumed
+  or undone.
+- Repair, grow and dissolve an array; share and adopt arrays between nodes;
+  export an array over NFS; clear a disk only behind a namespace-proof guard
+  and a retyped name.
+- Disk health: correct SMART and NVMe self-test decoding, one self-test per
+  disk at a time, failures that reach the health verdict, and a dashboard that
+  tells a failing disk from a warning.
+- Multi-tenancy: jobs, alerts, disks, approvals, share sources and targets are
+  scoped to the asking organisation; internal configuration rows stay hidden
+  from tenants.
+- The UI names nodes, users and disks instead of showing identifiers, and
+  patches the dashboard, pool and array views in place instead of rebuilding
+  them.
+
+### TentaBus
+
+- Package 1: field policies reach the dead-letter queue, per-action ACLs,
+  instance isolation, quota enforcement and validation.
+- Schema-registry REST API with per-action API-key scopes; the compliance
+  retention floor applies to bus topics.
+- Hardened replication transport; failover audit names the instance.
+- Lag without side effects, truthful deprecation, lag history, and the first
+  TentaBus screen (shell and overview).
+
+### Agents, Code Studio and provider accounts
+
+- Provider accounts: an on-demand runtime, CLI sign-in with a login GUI,
+  sessions, shared accounts and credentials that sync between nodes.
+- The account card no longer claims an account has no sessions when it only
+  sees this node's. It tells apart an account homed on this node, one homed on
+  another reachable node (named, with its own subset) and one homed on a node
+  that does not answer ("no data" instead of an empty list).
+- Coding agents run on Linux and Windows; only the Code Harness that Code
+  Studio actually runs is kept; agents without a model get a chat model.
+
+### Robotics (Go2)
+
+- Cloud onboarding, the `data2=3` handshake with a per-device AES key and GPU
+  camera anonymisation with tighter privacy regions.
+- Shared map: a persistent occupancy model, frame carving, chunk storage, a
+  control plane and relocalisation against the shared map by branch-and-bound
+  scan matching.
+
+### Inference, vision and voice
+
+- ONNX Runtime never falls back to the CPU with device-bound inputs, and cuDNN
+  is preloaded for the CUDA provider.
+- Addon model requirements can be installed from the addon's settings.
+- GPU detection runs in a child process, so a crashing driver cannot take the
+  node down.
+- A bundled Jarvis voice clone for Supertonic TTS.
+
+### Mesh and sync
+
+- Baseline adoption and node-log catch-up no longer block between nodes; a
+  donor that refuses a fuller requester adopts from it instead; a replicated
+  flow version whose number is already taken locally is kept.
+- Security and mesh audit findings closed.
+
+### Build
+
+- The `slim` edition compiles again; Arch Linux setup and macOS build errors
+  are fixed; generated browser assets are no longer tracked in Git.
+- Native library and toolchain versions live in one file,
+  `scripts/versions.env`, read by every build script on every platform.
 
 ## [0.2.0-beta] — 2026-09-08
 
-Najważniejsze zmiany względem ostatniego opublikowanego wydania `0.1.0-beta`.
+The main changes since the last published release, `0.1.0-beta`.
 
-### TentaNAS i pamięć masowa
+### TentaNAS and storage
 
-- Nowa aplikacja do zarządzania dyskami, pulami ZFS, datasetami, snapshotami,
-  udziałami sieciowymi i magazynem blokowym we flocie. Obejmuje harmonogramy,
-  audyt dostępu, ograniczony helper uprzywilejowany i zatwierdzanie wybranych
-  operacji przez drugiego administratora.
-- Elastic Array łączy dyski danych i cache przez mergerfs z okresową parzystością
-  SnapRAID. Dodano wykonywanie operacji z trwałym zapisem zamiaru, przenoszenie
-  danych z cache, ręczne sync/scrub, odtwarzanie montowań oraz widoczność danych
-  oczekujących na objęcie ochroną.
+- A new application for managing disks, ZFS pools, datasets, snapshots, network
+  shares and block storage across the fleet, with schedules, an access audit, a
+  restricted privileged helper and second-administrator approval for selected
+  operations.
+- Elastic Array joins data and cache disks through mergerfs with periodic
+  SnapRAID parity. Operations run with a durable intent record; data moves off
+  the cache, sync and scrub run on demand, mounts can be restored, and data still
+  waiting for parity protection is visible.
 
-### Aplikacje, TentaBus i konta agentów
+### Applications, TentaBus and agent accounts
 
-- Wiele instancji aplikacji z osobnymi danymi, uprawnieniami i cyklem życia.
-  TentaBus otrzymał trwały log, replikację, rejestr schematów, polityki pól
-  oraz integrację z flow, REST i SDK. Poprawiono izolację instancji i odtwarzanie
-  po zmianie lidera.
-- Code Studio obsługuje zarządzane konta agentów CLI, odseparowane katalogi pracy
-  i przenoszenie kont między węzłami. Dodano podstawy TentaVM: rejestr hostów,
-  sondowanie możliwości oraz nadawanie i wnioskowanie o dostęp.
+- Multiple application instances with separate data, permissions and lifecycle.
+  TentaBus gained a durable log, replication, a schema registry, field policies
+  and integration with flows, REST and the SDK; instance isolation and recovery
+  after a leader change were fixed.
+- Code Studio manages agent CLI accounts, isolated working directories and moving
+  accounts between nodes. TentaVM foundations: a host registry, capability
+  probing, and granting and requesting access.
 
 ### TentaQuant
 
-- Nowe studio obwodów kwantowych i notatnik z parserem podzbioru OpenQASM 3,
-  symulacją CPU/WGPU, wykonaniem w przeglądarce przez WASM i eksportem Qiskit.
-  Zadania obsługują anulowanie, strumieniowanie wyników, wizualizację stanu
-  oraz porównywanie i eksport rezultatów.
+- A new quantum-circuit studio and notebook with an OpenQASM 3 subset parser,
+  CPU/WGPU simulation, in-browser execution through WASM and Qiskit export. Jobs
+  can be cancelled, stream their results, visualise the state, and compare and
+  export results.
 
-### Mesh, klastry i przetwarzanie
+### Mesh, clusters and processing
 
-- Lista Mesh pokazuje lokalny węzeł, urządzenia wykryte przez mDNS i zaufane
-  węzły, zachowując zaufanie przechodnie; relay nie tworzy globalnego katalogu urządzeń.
-- Aktualizacja iroh i poprawki ponownego łączenia po restarcie lub zmianie adresu.
-  Synchronizacja klastrów korzysta z dziennika zmian, a odtwarzanie modeli
-  uwzględnia dostępność peerów i czas rozruchu.
-- Ujednolicono obsługę domyślnego flow rozmów. Poprawiono odświeżanie konfiguracji
-  node'ów w edytorze oraz wybrane ścieżki głosu i przetwarzania obrazu.
+- The Mesh list shows the local node, devices discovered over mDNS and trusted
+  nodes, keeping transitive trust; the relay does not create a global device
+  directory.
+- iroh update and reconnection fixes after a restart or an address change.
+  Cluster sync uses a change log, and model recovery takes peer availability and
+  startup time into account.
+- One way of handling the default conversation flow. Node configuration refreshes
+  correctly in the editor; selected voice and image-processing paths were fixed.
 
-### Budowanie, zależności i cache
+### Build, dependencies and cache
 
-- Jeden workspace Cargo, wspólny lockfile oraz centralne wersje zależności
-  i profile, sprawdzane przez CI. Eksport źródeł zachowuje samodzielne konteksty
-  kontenerów i SDK; usunięto nieużywane zależności i dostosowano kod do nowych API.
-- ThinLTO w wydaniu, przyrostowy `release-fast` i automatyczna retencja artefaktów
-  we wspólnych skryptach. Ograniczono powielanie zasobów i zbędne przebudowy.
-  [Pomiary i zasady cache](docs/build-performance.md) opisano oddzielnie.
+- One Cargo workspace, a shared lockfile and central dependency versions and
+  profiles, checked by CI. Source exports keep self-contained container and SDK
+  contexts; unused dependencies were removed and code adapted to new APIs.
+- ThinLTO for releases, an incremental `release-fast` profile and automatic
+  artefact retention in the shared scripts; less duplicated output and fewer
+  needless rebuilds. [Measurements and cache rules](docs/build-performance.md)
+  are documented separately.
 
-### Dodatki i integracje
+### Addons and integrations
 
-- Outlook, SharePoint RAG i Teams przeniesiono do wspólnego katalogu addonów.
-  Usunięto osobny addon WASM `teams-bot`; natywna aplikacja Meeting Bot pozostaje.
+- Outlook, SharePoint RAG and Teams moved into the shared addons directory. The
+  separate `teams-bot` WASM addon was removed; the native Meeting Bot remains.
 
-### Instalacja i dystrybucja
+### Installation and distribution
 
-- Jawny wybór Full/Slim także przy instalacji z potoku. Nowa konfiguracja ma
-  włączony mesh i dostęp HTTPS z LAN; systemowy instalator Linuxa ustawia porty
-  w aktywnych UFW/firewalld, zachowując istniejący config i ostrzegając o loopback.
-- Archiwum macOS Metal wymaga Meeting Bota. Przed publikacją workflow sprawdza
-  jego obecność, uprawnienia wykonania, architekturę, zależności i start `--help`.
-- Windows x86_64: archiwa `slim`, `full-vulkan` i `full-cuda13` budowane w CI oraz
-  instalator `install.ps1` (PowerShell jako Administrator). Instaluje wersję do
-  `%ProgramFiles%\TentaFlow\versions\<ver>` za junction `current`, dla edycji `full`
-  pobiera i weryfikuje runtime GStreamera, rejestruje usługę Windows `TentaFlow`
-  (konto wirtualne, autostart, restart po awarii) i reguły zapory. Działają
-  `tentaflow start|stop|restart|status` oraz `tentaflow update`; `uninstall.ps1`
-  usuwa instalację (`-Purge` także dane).
+- An explicit Full/Slim choice also when the installer is piped. A new
+  configuration has mesh enabled and HTTPS reachable from the LAN; the Linux
+  system installer opens the ports in an active UFW/firewalld, keeps an existing
+  configuration and warns about a loopback bind.
+- The macOS Metal archive requires the Meeting Bot: before publishing, the
+  workflow checks it is present, executable, built for the right architecture,
+  has its dependencies and starts with `--help`.
 
 ## [0.1.0-beta] - 2026-09-02
 
