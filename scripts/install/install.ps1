@@ -207,8 +207,14 @@ function Get-Archive($work, $chosenEdition, $chosenVariant) {
 # start without it. The archive names the exact runtime it was built against
 # (gstreamer.json); it is installed machine-wide, runtime only, because the
 # service account cannot see a per-user install.
+# /DIR names the product directory; the installer itself puts the files one
+# level below, in 1.0\msvc_x86_64.
+function Get-GstreamerDir {
+    return (Join-Path $env:ProgramFiles 'gstreamer')
+}
+
 function Get-GstreamerRoot {
-    return (Join-Path $env:ProgramFiles 'gstreamer\1.0\msvc_x86_64')
+    return (Join-Path (Get-GstreamerDir) '1.0\msvc_x86_64')
 }
 
 function Get-GstreamerVersion($root) {
@@ -250,7 +256,7 @@ function Install-Gstreamer($releaseDir) {
         # with a space carries its own quotes.
         $proc = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/ALLUSERS', '/TYPE=runtime',
-            "/DIR=`"$root`"", '/TASKS=""')
+            "/DIR=`"$(Get-GstreamerDir)`"", '/TASKS=""')
         if ($proc.ExitCode -ne 0) { Die "The GStreamer installer failed (exit $($proc.ExitCode))." }
     } finally {
         Remove-Item -LiteralPath $setup -Force -ErrorAction SilentlyContinue
@@ -462,7 +468,15 @@ function Register-TentaflowService {
 
 function Wait-Healthy($port) {
     Log 'Starting the service'
-    Start-Service -Name $ServiceName
+    try {
+        Start-Service -Name $ServiceName
+    } catch {
+        # Start-Service says only "cannot start"; the reason (logon refused,
+        # access denied, the process ending early) is the innermost exception.
+        $reason = $_.Exception
+        while ($reason.InnerException) { $reason = $reason.InnerException }
+        Die "The service did not start: $($reason.Message) Log: $(Join-Path $HomeDir 'logs')"
+    }
     (Get-Service -Name $ServiceName).WaitForStatus('Running', [TimeSpan]::FromMinutes(1))
     # First start generates the TLS identity and the database before the socket
     # opens. curl.exe ships with Windows and takes the self-signed certificate.

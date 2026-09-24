@@ -143,9 +143,12 @@ jobs:
           $logs = Join-Path $env:ProgramData 'TentaFlow\data\logs'
           Get-ChildItem $logs -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 |
             ForEach-Object { Annotate "service log $($_.Name)" (Get-Content $_.FullName -Tail 60) }
-          $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 8 -ErrorAction SilentlyContinue |
-            ForEach-Object { "$($_.TimeCreated.ToString('HH:mm:ss')) $($_.Message)" }
-          Annotate 'SCM events' $events
+          # Errors and warnings only: a start that fails logs 7000/7009/7034/7038,
+          # which the informational state changes of other services would bury.
+          $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Level = 2, 3 } -MaxEvents 8 -ErrorAction SilentlyContinue |
+            ForEach-Object { "$($_.TimeCreated.ToString('HH:mm:ss')) [$($_.Id)] $($_.Message)" }
+          Annotate 'SCM errors' $events
+          Annotate 'ACLs' ((& icacls (Join-Path $env:ProgramData 'TentaFlow')) + (& icacls (Join-Path $env:ProgramFiles 'TentaFlow\current\tentaflow.exe')))
           $app = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 2 } -MaxEvents 5 -ErrorAction SilentlyContinue |
             ForEach-Object { "$($_.TimeCreated.ToString('HH:mm:ss')) $($_.ProviderName): $($_.Message)" }
           Annotate 'Application errors' $app

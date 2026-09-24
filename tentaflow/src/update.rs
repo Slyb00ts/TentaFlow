@@ -325,10 +325,13 @@ fn ensure_gstreamer(client: &reqwest::blocking::Client, release: &Path, work: &P
     }
     let spec: GstreamerSpec = serde_json::from_str(&std::fs::read_to_string(&spec_path)?)
         .with_context(|| format!("reading {}", spec_path.display()))?;
-    let root = PathBuf::from(
+    // /DIR names the product directory; the installer puts the files one
+    // level below it, in 1.0\msvc_x86_64.
+    let product = PathBuf::from(
         std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into()),
     )
-    .join("gstreamer\\1.0\\msvc_x86_64");
+    .join("gstreamer");
+    let root = product.join("1.0\\msvc_x86_64");
     let dll = root.join("bin\\gstreamer-1.0-0.dll");
     if dll.is_file() {
         // The DLL's version resource is the one version a runtime-only install
@@ -367,7 +370,7 @@ fn ensure_gstreamer(client: &reqwest::blocking::Client, release: &Path, work: &P
             "/ALLUSERS",
             "/TYPE=runtime",
         ])
-        .raw_arg(format!("/DIR=\"{}\"", root.display()))
+        .raw_arg(format!("/DIR=\"{}\"", product.display()))
         .raw_arg("/TASKS=\"\"")
         .status()
         .context("running the GStreamer installer")?;
