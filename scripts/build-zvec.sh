@@ -222,18 +222,16 @@ case "$PLATFORM" in
     # global visibility and INTERPOSE the same symbols in any other library the
     # host loads — notably the system onnxruntime used by the camera-CV engine,
     # whose protobuf/libstdc++ then bind to zvec's incompatible copies and
-    # segfault. The version script exports only the `zvec_*` C API and localizes
-    # everything else (same isolation we apply to the whisper dylib). Only the
-    # final `zvec_c_api` shared object is built shared here (deps are static
-    # archives), so a global SHARED_LINKER flag is safe.
-    ZVEC_EXPORT_MAP="$SRC_DIR/tentaflow_zvec_exports.map"
-    printf '{ global: zvec_*; local: *; };\n' > "$ZVEC_EXPORT_MAP"
+    # segfault. Upstream's own version script (src/binding/c/exported_symbols.lds)
+    # keeps only the `zvec_*` C API global and localizes everything else — the
+    # same isolation we apply to the whisper dylib. A second script of ours
+    # cannot be added: GNU ld refuses to combine two anonymous version tags. The
+    # isolation is therefore verified on the built library below, not re-declared.
     if linux_native_zvec_ok; then
       echo "  Build natywny: gcc-$(gcc-11 -dumpversion) / cmake $(cmake_major_version).$(cmake_minor_version) / ninja (bez Dockera)"
       ( cd "$SRC_DIR" && rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
-          "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--version-script=$ZVEC_EXPORT_MAP" \
           -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON ..
         ninja zvec_c_api -j"$(nproc)" )
     else
@@ -277,11 +275,16 @@ case "$PLATFORM" in
         mkdir build_zvec
         cd build_zvec
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
-          "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--version-script=/src/tentaflow_zvec_exports.map" \
           -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON ..
         ninja zvec_c_api -j"$(nproc)"
         chown -R '"$(id -u):$(id -g)"' /src/build_zvec
       '
+    fi
+    leaked="$(nm -D --defined-only "$SRC_DIR/build_zvec/lib/libzvec_c_api.so" | awk '{print $3}' | grep -v '^zvec_' || true)"
+    if [ -n "$leaked" ]; then
+      echo "BLAD: libzvec_c_api.so eksportuje symbole spoza C API zvec (brak izolacji):" >&2
+      printf '%s\n' "$leaked" | head -20 >&2
+      exit 1
     fi
     cp -f "$SRC_DIR/build_zvec/lib/libzvec_c_api.so" "$OUT_LIB_DIR/libzvec_c_api.so"
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.so"

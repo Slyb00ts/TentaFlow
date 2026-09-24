@@ -88,7 +88,16 @@ jobs:
           # The hosted image ships the NDK under $ANDROID_HOME/ndk/<version>,
           # which find_android_ndk already looks through — no third-party action
           # needed to place a toolchain.
-          bash tentaflow-mobile/android/scripts/build-rust.sh
+          set -o pipefail
+          bash tentaflow-mobile/android/scripts/build-rust.sh 2>&1 | tee build-rust.log
+
+      - name: Quote the failed native build
+        if: failure()
+        run: |
+          # Annotations are readable without the rights the job log needs.
+          test -f build-rust.log || exit 0
+          tail -n 80 build-rust.log | sed 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }' > tail.txt
+          echo "::error title=build-rust.sh::$(cat tail.txt)"
 
       - name: The JNI libraries must actually be there
         run: |
