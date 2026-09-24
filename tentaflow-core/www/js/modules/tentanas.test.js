@@ -217,7 +217,9 @@ test('routing Elastic zachowuje nazwę po mount i wyklucza pool/dataset', async 
   Screen.setLocation();
   assert.match(window.location.hash, /array=media/);
   assert.doesNotMatch(window.location.hash, /[?&]pool=|dataset=/);
-  click(root.querySelector('.nas-elastic-detail .nas-crumbs a'));
+  // The array pane names its place through the shell's breadcrumb
+  // (`screen.setCrumbTail`), like the pool detail — not a crumb of its own.
+  click([...root.querySelectorAll('#nas-crumbs a.tf-breadcrumb-item')].find((a) => a.textContent.trim() === 'Pule'));
   await flush();
   assert.equal(Screen.array, null);
   assert.ok(root.querySelector('#nas-pools-list'));
@@ -346,7 +348,11 @@ test('fleet alerts and resources aggregate every node and keep an unreachable no
     ...fixtures,
     tentaNasAlertsListRequest: (payload, options) => {
       if (options.targetNodeId === REMOTE) throw new Error('mesh timeout');
-      return { alerts: [{ alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'sda', title: 'sda: 3 realokacje', detail: 'w 7 dni', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null }] };
+      return { alerts: [{
+        alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'sda', title: 'Disk sda: warning', detail: '3 reallocated sectors',
+        code: 'disk_health', params: { health: 'warning', name: 'sda', name_source: 'live' }, reasons: [{ code: 'reallocated', params: { count: '3' } }],
+        raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null,
+      }] };
     },
     tentaNasSharesListRequest: (payload, options) => {
       if (options.targetNodeId === REMOTE) throw new Error('mesh timeout');
@@ -359,7 +365,13 @@ test('fleet alerts and resources aggregate every node and keep an unreachable no
 
   const alerts = root.querySelector('#nas-fleet-alerts').rows;
   assert.equal(alerts.length, 2, 'one alert plus one offline row');
-  assert.match(alerts[0].alert, /3 realokacje/);
+  // Worded from the codes the way the mockup writes it (n01:298, "sdd: 3 nowe
+  // realokowane sektory w 7 dni"): the disk's name and its reason as a
+  // sentence, never the n03 chip abbreviation; the node's English is the
+  // cell's tooltip only.
+  assert.match(alerts[0].alert, /<div class="l1">sda: 3 realokowane sektory<\/div><div class="l2"><\/div>/);
+  assert.match(alerts[0].alert, /title="Disk sda: warning — 3 reallocated sectors"/);
+  assert.equal(alerts[0].alert.replace(/title="[^"]*"/g, '').includes('reallocated'), false, 'no English outside the tooltip');
   // n01 spells the level as an alert severity, never as the disk-health word.
   assert.match(alerts[0].level, /label="ostrzeżenie"/);
   assert.ok(!/Uwaga/.test(alerts[0].level), 'the disk-health wording stays on n03/n04');
@@ -1082,14 +1094,22 @@ test('n02: a poll with changed ARC numbers, job progress and a newer alert time 
 
 // MINOR 6 (critic-round2-wave1-2026-09-22.md): `alertRowSkeleton`'s comment
 // claimed "everything here is fixed for the life of an alert", but
-// `raise_alert` refreshes title, detail and severity on the node, and a
-// cache-stuck alert's detail carries a wait time that changes every minute
-// below 1 h and every hour above. Before the fix, both were baked into the
-// row's markup, so `patchKeyedList` rebuilt the whole row — Ack and
+// `raise_coded_alert` refreshes the code, its parameters and the English on
+// the node, and a cache-stuck alert's wait time changes every minute below
+// 1 h and every hour above. Before the fix, title and detail were baked into
+// the row's markup, so `patchKeyedList` rebuilt the whole row — Ack and
 // "Szczegóły" buttons included — every time either one ticked.
 test('n02: an alert whose title/detail change keeps its row and its Ack/"Szczegóły" buttons (MINOR 6)', async () => {
-  const alertV1 = { alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'nvme0n1', title: 'nvme0n1: pending sectors', detail: 'w 7 dni', raisedAt: '2026-08-01 10:00:00', ackedAt: null, resolvedAt: null };
-  const alertV2 = { ...alertV1, title: 'nvme0n1: cache stuck', detail: 'w 42 min' };
+  const alertV1 = {
+    alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'nvme0n1', title: 'Disk nvme0n1: warning', detail: '2 pending sectors',
+    code: 'disk_health', params: { health: 'warning', name: 'nvme0n1', name_source: 'live' }, reasons: [{ code: 'pending_sectors', params: { count: '2' } }],
+    raisedAt: '2026-08-01 10:00:00', ackedAt: null, resolvedAt: null,
+  };
+  // The disk left the inventory and its pending count grew.
+  const alertV2 = {
+    ...alertV1, title: 'Disk last seen as nvme0n1: warning', detail: '5 pending sectors',
+    params: { ...alertV1.params, name_source: 'last_known' }, reasons: [{ code: 'pending_sectors', params: { count: '5' } }],
+  };
   let poll = 0;
   stubTransport({
     ...fixtures,
@@ -1102,8 +1122,8 @@ test('n02: an alert whose title/detail change keeps its row and its Ack/"Szczeg�
     const alertRow1 = root.querySelector('#nas-ov-alerts .alert-row');
     const gotoBtn1 = alertRow1.querySelector('[data-goto]');
     const ackBtn1 = alertRow1.querySelector('[data-ack]');
-    assert.match(alertRow1.querySelector('.a-title').textContent, /pending sectors/);
-    assert.match(alertRow1.querySelector('.a-sub').textContent, /w 7 dni/);
+    assert.equal(alertRow1.querySelector('.a-title').textContent, 'nvme0n1: 2 sektory czekają na realokację');
+    assert.equal(alertRow1.querySelector('.a-title').getAttribute('title'), 'Disk nvme0n1: warning — 2 pending sectors');
 
     poll = 1;
     await Screen.refreshOverview(body);
@@ -1113,8 +1133,141 @@ test('n02: an alert whose title/detail change keeps its row and its Ack/"Szczeg�
     assert.ok(alertRow2 === alertRow1, 'the alert row is the SAME node after title/detail changed');
     assert.ok(alertRow2.querySelector('[data-goto]') === gotoBtn1, 'its "Szczegóły" button is the SAME node');
     assert.ok(alertRow2.querySelector('[data-ack]') === ackBtn1, 'its "Potwierdź" button is the SAME node');
-    assert.match(alertRow2.querySelector('.a-title').textContent, /cache stuck/, 'the title actually updated');
-    assert.match(alertRow2.querySelector('.a-sub').textContent, /w 42 min/, 'the detail actually updated');
+    assert.equal(alertRow2.querySelector('.a-title').textContent, 'Dysk ostatnio widziany jako nvme0n1: 5 sektorów czeka na realokację', 'the title actually updated');
+    assert.equal(alertRow2.querySelector('.a-title').getAttribute('title'), 'Disk last seen as nvme0n1: warning — 5 pending sectors', 'and its tooltip');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// Wave-4 round-2 critic minor 1: a disk alert with one reason has it in the
+// title and an EMPTY detail, and the sub-line read "· dysk · 2 dni temu".
+// The detail's separator is shown with the detail, patched in place.
+test('n02: the alert sub-line joins only the parts it has, in place across polls', async () => {
+  const oneReason = {
+    alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'wwn-0x5000c500a1b2c3d4', title: 'Disk sdd: warning', detail: '3 reallocated sectors',
+    code: 'disk_health', params: { health: 'warning', name: 'sdd', name_source: 'live' }, reasons: [{ code: 'reallocated', params: { count: '3' } }],
+    raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null,
+  };
+  const twoReasons = { ...oneReason, reasons: [...oneReason.reasons, { code: 'crc_errors', params: { count: '1' } }] };
+  let poll = 0;
+  stubTransport({ ...fixtures, tentaNasAlertsListRequest: () => ({ alerts: [poll === 0 ? oneReason : twoReasons] }) });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const body = root.querySelector('#nas-tab-body');
+  try {
+    const sub = root.querySelector('#nas-ov-alerts .a-sub');
+    assert.equal(root.querySelector('#nas-ov-alerts .a-title').textContent, 'sdd: 3 realokowane sektory');
+    assert.match(sub.textContent, /^dysk · /, 'no leading separator before an empty detail');
+    assert.doesNotMatch(sub.textContent, /wwn-/);
+    assert.equal(sub.getAttribute('title'), null, 'and the disk id is not the tooltip');
+
+    poll = 1;
+    await Screen.refreshOverview(body);
+    await flush();
+    const sub2 = root.querySelector('#nas-ov-alerts .a-sub');
+    assert.ok(sub2 === sub, 'the same sub-line, patched');
+    assert.match(sub2.textContent, /^1 błąd CRC \(kabel lub backplane\) · dysk · /, 'a detail gets its separator');
+
+    poll = 0;
+    await Screen.refreshOverview(body);
+    await flush();
+    assert.match(root.querySelector('#nas-ov-alerts .a-sub').textContent, /^dysk · /, 'and loses it with the detail');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// Wave-4 round-2 critic minor 4: the "Treść węzła" section and the tooltip
+// are the node's own text, and ids in it are taken out — a node id the fleet
+// knows becomes that node's name, anything else a neutral word. The same on
+// the n01 fleet cell.
+test('n01/n02: the node text section and the alert tooltips carry no id', async () => {
+  const HEX = 'c'.repeat(64);
+  const uuid = '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70';
+  const alert = {
+    alertId: 'a1', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'media', title: 'Macierz wymaga interwencji',
+    detail: `forwarded from ${HEX}`,
+    code: 'elastic_needs_attention', params: { array: 'media', helper_detail: `rename stuck on .tentanas-transfer-${uuid}-2` }, reasons: [],
+    raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null,
+  };
+  const nodes = {
+    ...fixtures.tentaNasNodesListRequest,
+    nodes: [...fixtures.tentaNasNodesListRequest.nodes, node({ nodeId: HEX, nodeName: 'atlas', isLocal: false, online: false })],
+  };
+  stubTransport({
+    ...fixtures,
+    tentaNasNodesListRequest: nodes,
+    tentaNasAlertsListRequest: (payload, options) => {
+      // An unreachable node's error is node text too.
+      if (options?.targetNodeId === REMOTE) throw new Error(`forward via ${HEX} timed out`);
+      return { alerts: [alert] };
+    },
+  });
+  let root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const row = root.querySelector('#nas-ov-alerts .alert-row');
+    const nodeText = row.querySelector('[data-role="node-text"]').textContent;
+    assert.equal(row.querySelector('[data-role="node"]').hidden, false);
+    assert.match(nodeText, /forwarded from atlas/, 'a known node id reads as its name');
+    assert.match(nodeText, /\.tentanas-transfer-\[identyfikator\]-2/, 'an operation uuid as the neutral word');
+    for (const el of [row, ...row.querySelectorAll('*')]) {
+      assert.doesNotMatch(`${el.getAttribute('title') || ''} ${el.textContent}`, /0191f2c0|c{32,}/, el.tagName);
+    }
+  } finally {
+    Screen.unmount();
+  }
+
+  root = await mountScreen();
+  await flush();
+  await flush();
+  try {
+    const rows = root.querySelector('#nas-fleet-alerts').rows;
+    const cells = rows.filter((r) => r._row.alert).map((r) => `${r.node}${r.alert}`);
+    assert.ok(cells.length > 0);
+    for (const cell of cells) {
+      assert.doesNotMatch(cell, /0191f2c0|c{32,}/, cell);
+      assert.match(cell, /forwarded from atlas/);
+    }
+    const offline = rows.find((r) => r._row.error);
+    assert.match(offline.alert, /forward via atlas timed out/);
+    assert.doesNotMatch(`${offline.node}${offline.alert}`, /c{32,}/);
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// M1: an alert raised by an older node (no code) or with a code this build
+// does not know is shown on n02 as a translated generic alert, the node's own
+// text only as the tooltip (the n01 cell goes through the same `alertText`,
+// see the fleet alert test).
+test('n02: an uncoded or unknown alert reads as a generic translated alert with the node text as its tooltip', async () => {
+  const old = { alertId: 'a1', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'produkt', title: 'Macierz wymaga interwencji', detail: 'rezerwacje zachowane', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null };
+  const future = { ...old, alertId: 'a2', code: 'array_on_fire', params: { array: 'produkt' }, reasons: [], title: 'Array produkt: on fire', detail: 'call someone' };
+  stubTransport({ ...fixtures, tentaNasAlertsListRequest: { alerts: [old, future] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const rows = [...root.querySelectorAll('#nas-ov-alerts .alert-row')];
+    assert.equal(rows.length, 2);
+    for (const [row, alert] of [[rows[0], old], [rows[1], future]]) {
+      const title = row.querySelector('.a-title');
+      assert.equal(title.textContent, 'Alert węzła');
+      assert.equal(title.getAttribute('title'), `${alert.title} — ${alert.detail}`);
+      assert.match(row.querySelector('[data-role="detail"]').textContent, /w treści węzła/);
+      // Wave-4 critic minor 13: a tooltip cannot be reached on a phone, so the
+      // same node text sits one tap away — collapsed, and never the row's
+      // own title or detail line.
+      const node = row.querySelector('[data-role="node"]');
+      assert.equal(node.tagName, 'DETAILS');
+      assert.equal(node.hidden, false, 'offered where the detail points at it');
+      assert.equal(node.open, false, 'collapsed until tapped');
+      assert.equal(node.querySelector('[data-role="node-text"]').textContent, `${alert.title} — ${alert.detail}`);
+      const outside = row.cloneNode(true);
+      outside.querySelector('[data-role="node"]').remove();
+      assert.doesNotMatch(outside.textContent, /on fire|call someone|interwencji/, 'the node text is never the row text');
+    }
   } finally {
     Screen.unmount();
   }
@@ -1287,8 +1440,9 @@ test('an alert subline prints a subject name but never a machine id', async () =
   // The node passes a NAME as `subjectId` for most kinds, and the row prints it
   // ("target vm-store"). A disk alert carries `wwn-<hex>` instead and an
   // approval carries the request UUID — neither says anything the title has
-  // not said, and the mockups show no identifier in an alert row at all. The
-  // value stays reachable as the tooltip.
+  // not said, and the mockups show no identifier in an alert row at all. Not
+  // as a tooltip either (owner's rule: no ids anywhere in the GUI; wave-4
+  // round-2 critic minor 5).
   stubTransport({
     ...fixtures,
     tentaNasAlertsListRequest: {
@@ -1307,13 +1461,18 @@ test('an alert subline prints a subject name but never a machine id', async () =
   const rows = [...root.querySelectorAll('#nas-ov-alerts .alert-row')];
   assert.equal(rows.length, 4);
   assert.doesNotMatch(rows[3].querySelector('.a-sub').textContent, /dev-vdb/);
-  assert.equal(rows[3].querySelector('.a-sub').getAttribute('title'), 'dev-vdb');
 
   const disk = rows[0].querySelector('.a-sub');
   assert.doesNotMatch(disk.textContent, /wwn-/);
-  assert.equal(disk.getAttribute('title'), 'wwn-5000cca27dc7a4c6');
 
   assert.doesNotMatch(rows[1].querySelector('.a-sub').textContent, /0191f2c0/);
+  // No id in any attribute of any row: not the sub-line's tooltip, not the
+  // title's, not a node-text section.
+  for (const row of rows) {
+    for (const el of [row, ...row.querySelectorAll('*')]) {
+      if (el.getAttribute('title')) assert.doesNotMatch(el.getAttribute('title'), /wwn-|dev-vdb|0191f2c0/, el.outerHTML);
+    }
+  }
 
   // …and a real name still shows, next to the translated kind — the raw
   // `elastic-array` enum never reaches the Polish sentence.
@@ -1346,8 +1505,8 @@ test('a pool/target name is never hidden as an id, even in a disk-id shape', asy
   Screen.unmount();
 });
 
-// The exact same `wwn-…` string is a disk id on a `disk` alert (hidden,
-// tooltip only — already covered above) but a plain name on any other
+// The exact same `wwn-…` string is a disk id on a `disk` alert (hidden —
+// already covered above) but a plain name on any other
 // subject kind, because only a disk alert's subject can BE a disk id.
 test('a wwn- shaped subject is hidden only for a disk alert, shown for other kinds', async () => {
   const wwn = 'wwn-0x5000c500a1b2c3d4';
@@ -1360,7 +1519,7 @@ test('a wwn- shaped subject is hidden only for a disk alert, shown for other kin
   await flush();
   const rows = [...root.querySelectorAll('#nas-ov-alerts .alert-row')];
   assert.doesNotMatch(rows[0].querySelector('.a-sub').textContent, /wwn-/, 'hidden for the disk alert');
-  assert.equal(rows[0].querySelector('.a-sub').getAttribute('title'), wwn);
+  assert.equal(rows[0].querySelector('.a-sub').getAttribute('title'), null, 'and not the tooltip either');
   assert.match(rows[1].querySelector('.a-sub').textContent, /wwn-/, 'shown for the target alert');
   Screen.unmount();
 });
@@ -1398,7 +1557,7 @@ test('an Elastic Array alert opens that array, from the node and from the fleet'
 // The node sends an EMPTY name when neither the peer store nor the sync
 // registry knows one; it used to send the 64-hex node id, and every fleet
 // surface printed that as the name. One helper names such a node, and the id
-// is only a tooltip.
+// is not even a tooltip (owner's rule: no ids anywhere in the GUI).
 test('a node with no known hostname is "Node bez nazwy" everywhere, never its id', async () => {
   const nameless = {
     ...fixtures,
@@ -1417,11 +1576,11 @@ test('a node with no known hostname is "Node bez nazwy" everywhere, never its id
   await flush();
   const name = root.querySelector(`.node-card[data-node="${REMOTE}"] .nc-name`);
   assert.equal(name.textContent.trim(), 'Node bez nazwy');
-  assert.equal(name.getAttribute('title'), REMOTE, 'the id is the tooltip');
+  assert.equal(name.getAttribute('title'), null, 'the id is not the tooltip');
   assert.doesNotMatch(root.textContent, /bbbbbbbbbbbb/, 'no visible text carries the node id');
   const offline = root.querySelector('#nas-fleet-alerts').rows.find((r) => r._row.node?.nodeId === REMOTE);
   assert.match(offline.node, />Node bez nazwy</);
-  assert.match(offline.node, new RegExp(`title="${REMOTE}"`));
+  assert.doesNotMatch(offline.node, new RegExp(REMOTE), 'nor the offline row\'s tooltip');
   Screen.unmount();
 });
 
@@ -1469,8 +1628,8 @@ test('a job row marks a last-known subject and keeps a disk id out of the text',
 });
 
 test('the fleet node table names a node instead of printing its node id', async () => {
-  // n16 prints `atlas` and `orion`. The 64-hex node id is not a name; it is the
-  // tooltip, for the one case two nodes answer to the same hostname.
+  // n16 prints `atlas` and `orion`. The 64-hex node id is not a name, and
+  // not even the tooltip (owner's rule: no ids anywhere in the GUI).
   stubTransport(fixtures);
   const root = await mountScreen({ node: LOCAL });
   await flush();
@@ -1482,7 +1641,7 @@ test('the fleet node table names a node instead of printing its node id', async 
   for (const row of others) {
     assert.match(row.name, new RegExp(row._node.nodeName), 'the node is named');
     assert.doesNotMatch(row.name, /class="l2 mono"/, 'no id sub-line');
-    assert.match(row.name, new RegExp(`title="${row._node.nodeId}"`), 'the id is the tooltip');
+    assert.doesNotMatch(row.name, new RegExp(row._node.nodeId), 'the id is not even the tooltip');
   }
   Screen.unmount();
 });
@@ -2834,7 +2993,9 @@ test('a fleet poll runs one render pass per table, not two', async () => {
   try {
     await Screen.refreshFleet();
     await flush();
-    assert.equal(renders, 1, `one render pass per poll, got ${renders}`);
+    // An unchanged poll now hands the alert table no rows at all
+    // (`setRowsIfChanged`), and never more than one pass.
+    assert.ok(renders <= 1, `at most one render pass per poll, got ${renders}`);
   } finally {
     table._render = real;
     Screen.unmount();
@@ -3710,6 +3871,65 @@ test('the fleet header names each version and its nodes when the fleet runs more
 });
 
 // m26: the pool detail's "Pule › tank" is the tail of the shell's one bar.
+// Wave-4 critic minor 6: the shell cleared the tail for an ARRAY detail
+// (only a ZFS pool was exempt), and the array detail wrote it back — the bar
+// was rebuilt twice on every draw of the array.
+test('the Elastic Array detail writes its breadcrumb once, and a redraw rewrites nothing', async () => {
+  const array = { name: 'media', kind: 'elastic-array', state: 'active', enabled: true, filesystem: 'xfs', unionPath: '/mnt/media', dataDisks: [], parityDisks: [], protection: { status: 'unprotected' }, snapraid: {} };
+  stubTransport({ ...fixtures, tentaNasElasticArrayGetRequest: { array } });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'pools', array: 'media' });
+    await flush();
+    const bar = root.querySelector('#nas-crumbs');
+    assert.deepEqual([...bar.querySelectorAll('.tf-breadcrumb-item')].map((a) => a.textContent), ['TentaNas', 'orion', 'Pule', 'media']);
+    const items = [...bar.querySelectorAll('tf-breadcrumb-item')];
+    const tails = [];
+    const real = Screen.setCrumbTail;
+    Screen.setCrumbTail = function spy(tail) { tails.push(tail); return real.call(this, tail); };
+    try {
+      Screen.drawTab();
+      await flush();
+    } finally {
+      Screen.setCrumbTail = real;
+    }
+    assert.ok(tails.every((t) => t.length > 0), `the tail is never cleared on the way: ${JSON.stringify(tails)}`);
+    const after = [...bar.querySelectorAll('tf-breadcrumb-item')];
+    assert.equal(after.length, items.length);
+    assert.ok(after.every((el, i) => el === items[i]), 'the bar keeps its items');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// Wave-4 critic minor 7: n19 has no heading and no back button of its own —
+// the shell's one breadcrumb names the target under "Udostępnianie".
+test('the block target detail names its tail in the shell breadcrumb, and "Udostępnianie" walks back', async () => {
+  const target = {
+    targetId: 't1', name: 'vm-store', protocol: 'iscsi', wwn: 'iqn.2026-09.local.tentaflow:orion.vm-store', enabled: true,
+    luns: [], portals: [], auth: { method: 'none' }, initiators: [], portGroups: [], sessions: 0, sessionsKnown: true, state: 'active', stateDetail: '',
+  };
+  stubTransport({
+    ...fixtures,
+    tentaNasTargetGetRequest: { target, sessions: [], configPreview: '' },
+    tentaNasTargetsListRequest: { targets: [target], services: [], capabilities: null },
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'shares', target: 't1' });
+    await flush();
+    await flush();
+    const bar = root.querySelector('#nas-crumbs');
+    assert.deepEqual([...bar.querySelectorAll('.tf-breadcrumb-item')].map((a) => a.textContent), ['TentaNas', 'orion', 'Udostępnianie', 'vm-store']);
+    assert.equal(root.querySelector('.nas-target-detail [data-act="back"]'), null, 'no second way back');
+    click([...bar.querySelectorAll('a.tf-breadcrumb-item')].find((a) => a.textContent.trim() === 'Udostępnianie'));
+    await flush();
+    assert.equal(Screen.targetId, null, '"Udostępnianie" returns to the list');
+    assert.equal(Screen.tab, 'shares');
+    assert.deepEqual([...bar.querySelectorAll('.tf-breadcrumb-item')].map((a) => a.textContent), ['TentaNas', 'orion']);
+  } finally {
+    Screen.unmount();
+  }
+});
+
 test('the pool detail puts its tail into the one shell breadcrumb, and "Pule" walks back', async () => {
   stubTransport({ ...fixtures, tentaNasPoolGetRequest: { pool, properties: [], datasets: [], alerts: [], history: [] } });
   try {
@@ -3799,7 +4019,8 @@ test('n03 replacement advice reads in the reader\'s language, the node\'s senten
     const reason = (id) => row(id).querySelector('[data-role="advice-reason"]');
     const kind = (id) => row(id).querySelector('tf-chip').getAttribute('label');
 
-    assert.equal(reason('sde').textContent, 'Awaria od 3 dni; ZFS: awaria (FAULTED); 3 realok.');
+    // Whole phrases, not the n03 chip abbreviations: the advice is a sentence.
+    assert.equal(reason('sde').textContent, 'Awaria od 3 dni; ZFS wyłączył dysk jako uszkodzony (FAULTED); 3 realokowane sektory');
     assert.equal(reason('sde').getAttribute('title'), FAULTED_ADVICE.reason);
     assert.equal(kind('sde'), 'pilne');
 
@@ -3830,7 +4051,8 @@ test('n04 replacement advice reads in the reader\'s language, the node\'s senten
     await flush();
     await flush();
     const box = () => root.querySelector('#nas-dd-advice .wizard-warning');
-    assert.equal(box().textContent, 'Wymień ten dysk teraz: Awaria od 3 dni; ZFS: awaria (FAULTED); 3 realok.. brak spare w puli — przygotuj dysk zastępczy.');
+    assert.equal(box().textContent, 'Wymień ten dysk teraz: Awaria od 3 dni; ZFS wyłączył dysk jako uszkodzony (FAULTED); 3 realokowane sektory. brak spare w puli — przygotuj dysk zastępczy.');
+    assert.doesNotMatch(box().textContent, /\.\./, 'no abbreviation runs into the full stop');
     assert.equal(box().getAttribute('title'), FAULTED_ADVICE.reason);
     assert.ok(box().classList.contains('danger'));
 
@@ -3847,6 +4069,83 @@ test('n04 replacement advice reads in the reader\'s language, the node\'s senten
     assert.equal(box().textContent, 'Węzeł zaleca wymianę tego dysku. brak spare w puli — przygotuj dysk zastępczy.');
     assert.equal(box().getAttribute('title'), OTHER_ADVICE.reason);
     assert.ok(!ENGLISH_ADVICE.test(root.querySelector('#nas-dd-advice').textContent));
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// C3: an Elastic Array member gets `spareAvailable: false` from the node like
+// a pool disk with no spare, and was told "Wymień ten dysk teraz … brak spare
+// w puli — przygotuj dysk zastępczy" — but replacing an array disk does not
+// exist in this version. It is told what applies instead, on n03 and n04.
+const ARRAY_DISK = { diskId: 'sdq', name: 'sdq', health: 'critical', healthReason: '3 pending sectors', healthReasons: [R('pending_sectors', { count: '3' })], memberOf: 'media', role: 'array_member', arrayRole: 'data' };
+const ARRAY_ADVICE = {
+  diskId: 'sdq', name: 'sdq', severity: 'urgent',
+  reason: 'critical for 3 days; 3 pending sectors',
+  reasons: [R('unhealthy_for_days', { health: 'critical', days: '3' }), R('pending_sectors', { count: '3' })],
+  warningDays: 3, reallocated: 0, reallocatedWeekAgo: 0, memberOf: 'media', spareAvailable: false,
+};
+
+test('C3: an Elastic Array disk is never told to be replaced or to get a spare (n03 and n04)', async () => {
+  let listed = { disks: [disk(ARRAY_DISK)], advice: [ARRAY_ADVICE] };
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: () => ({ ...fixtures.tentaNasDisksListRequest, ...listed }),
+    tentaNasDiskGetRequest: () => ({
+      disk: disk(ARRAY_DISK), advice: ARRAY_ADVICE, attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
+    }),
+  });
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+    await flush();
+    const card = () => root.querySelector('#nas-disk-advice');
+    const spare = (id) => card().querySelector(`[data-advice="${id}"] [data-role="advice-spare"]`).textContent;
+    assert.equal(spare('sdq'), 'macierz Elastic — wymiana dysku niedostępna w tej wersji');
+    assert.match(card().querySelector('.section-card-head .title').textContent, /Dyski macierzy Elastic wymagające uwagi/);
+    assert.doesNotMatch(card().textContent, /spare|Zalecana wymiana|Wymień/, 'no replacement wording for an array disk');
+    const arrayRow = card().querySelector('[data-advice="sdq"]');
+
+    // Wave-4 critic minor 8: advice this build cannot word on an ARRAY row
+    // is "a problem", never "the node recommends replacing this disk", and
+    // its chip is not the "zaplanuj" of a disk one can replace.
+    listed = { disks: [disk(ARRAY_DISK)], advice: [{ ...ARRAY_ADVICE, severity: 'advice', reasons: [R('spindle_stall')] }] };
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    const vague = card().querySelector('[data-advice="sdq"]');
+    assert.equal(vague.querySelector('[data-role="advice-reason"]').textContent, 'węzeł zgłasza problem z tym dyskiem');
+    assert.equal(vague.querySelector('tf-chip').getAttribute('label'), 'obserwuj');
+    assert.doesNotMatch(card().textContent, /zaleca wymianę|zaplanuj/);
+    assert.ok(vague !== arrayRow, 'the changed row is rebuilt');
+    listed = { disks: [disk(ARRAY_DISK)], advice: [ARRAY_ADVICE] };
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+
+    // Beside a pool disk the card is about replacement again, and only the
+    // pool disk's row talks about a spare.
+    listed = { disks: [disk(ARRAY_DISK), disk(FAULTED_DISK)], advice: [ARRAY_ADVICE, FAULTED_ADVICE] };
+    const before = { card: card().firstElementChild, sdq: card().querySelector('[data-advice="sdq"]') };
+    await Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.match(card().querySelector('.section-card-head .title').textContent, /Zalecana wymiana dysku/);
+    assert.equal(spare('sdq'), 'macierz Elastic — wymiana dysku niedostępna w tej wersji');
+    assert.equal(spare('sde'), 'brak spare w puli — przygotuj dysk zastępczy');
+    // Wave-4 critic minor 14: a second disk joining the card patches the
+    // card — its title and one new row — and rebuilds nothing else.
+    assert.ok(card().firstElementChild === before.card, 'the card is the same node');
+    assert.ok(card().querySelector('[data-advice="sdq"]') === before.sdq, 'the unchanged row is the same node');
+    card().querySelector('[data-advice="sde"] [data-act="advice-open"]').click();
+    assert.equal(Screen.diskId, 'sde', 'a row added later still opens its disk');
+  } finally {
+    Screen.unmount();
+  }
+  try {
+    const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sdq' });
+    await flush();
+    await flush();
+    const box = root.querySelector('#nas-dd-advice .wizard-warning');
+    assert.equal(box.textContent, 'Ten dysk macierzy Elastic wymaga uwagi: Awaria od 3 dni; 3 sektory czekają na realokację. Wymiana dysku macierzy nie jest dostępna w tej wersji.');
+    assert.doesNotMatch(box.textContent, /spare|Wymień/);
+    assert.equal(box.getAttribute('title'), ARRAY_ADVICE.reason);
   } finally {
     Screen.unmount();
   }

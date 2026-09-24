@@ -295,7 +295,7 @@ export async function drawTasks(screen, body) {
     jobsTable.rows = rows.map((j) => ({
       _job: j,
       task: historyTaskHtml(j),
-      node: `<span class="tf-table__cell--mono" title="${escapeAttr(node?.nodeId || '')}">${escapeHtml(nodeLabel(node))}</span>`,
+      node: `<span class="tf-table__cell--mono">${escapeHtml(nodeLabel(node))}</span>`,
       startedAt: `<span class="tf-table__cell--mono">${escapeHtml(fmtDate(j.startedAt))}</span>`,
       duration: `<span class="tf-table__cell--mono">${escapeHtml(jobDuration(j))}</span>`,
       result: `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(j.error)}</div>` : ''}`,
@@ -392,46 +392,63 @@ export async function drawTasks(screen, body) {
   const pollSchedules = async () => { await refreshSchedules(); if (!screen.disposed && body.isConnected) screen.later(pollSchedules, POLL_SCHEDULES_MS); };
 
   // Two columns of labelled rows: what protects the data (snapshots) on the
-  // left, what checks it (scrub, SMART) on the right.
+  // left, what checks it (scrub, SMART) on the right. Each row is keyed by
+  // what it describes and is built once; its value is a keyed set of parts
+  // (a chip, or plain text) whose attributes are written in place. "last run
+  // 5 min ago" ticks on every schedules poll, and rebuilding the strip for it
+  // blinked every chip in both columns.
   const paintProtection = () => {
+    const host = body.querySelector('#nas-prot');
+    if (!host) return;
     const rows = state.schedules?.rows || [];
     const smart = state.schedules?.smart || {};
     const scrub = rows.filter((r) => r.kind === 'scrub');
     const snaps = rows.filter((r) => r.kind === 'snapshot');
-    const chip = (status, label) => `<tf-chip size="sm" dot status="${status}" label="${escapeAttr(label)}"></tf-chip>`;
+    const chip = (status, label) => ({ kind: 'chip', status, label });
     // A protected schedule gets a second chip: the snapshots it takes cannot
     // be deleted from this app at all, which is worth seeing next to "last run".
     const protectDays = (dataset) => Number(state.snapshotSchedules.find((s) => s.dataset === dataset)?.protectDays) || 0;
-    const left = snaps.length ? snaps.map((r) => `
-      <div class="sr"><span class="k">${sprite('save')} ${escapeHtml(T('schedules.prot_snapshots_of', { dataset: r.subject }))}</span><span class="v">${
+    const left = snaps.length ? snaps.map((r) => ({
+      key: `snapshot:${r.subject}`, icon: 'save', label: T('schedules.prot_snapshots_of', { dataset: r.subject }),
+      parts: [
         !r.enabled ? chip('warn', T('schedule.off'))
           : outcomeOf(r)?.failed ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(r.lastRunAt) }))
-            : r.lastRunAt ? chip('ok', T('schedules.prot_last', { t: fmtAgo(r.lastRunAt) })) : chip('info', T('schedules.prot_pending', { t: fmtIn(r.nextRunAt) }))}${
-        protectDays(r.subject) ? ` ${chip('ok', T('schedules.prot_protected', { n: protectDays(r.subject) }))}` : ''}</span></div>`).join('')
-      : `<div class="sr"><span class="k">${sprite('save')} ${escapeHtml(T('schedules.prot_snapshots'))}</span><span class="v">${chip('warn', T('schedules.prot_none'))}</span></div>`;
+            : r.lastRunAt ? chip('ok', T('schedules.prot_last', { t: fmtAgo(r.lastRunAt) })) : chip('info', T('schedules.prot_pending', { t: fmtIn(r.nextRunAt) })),
+        protectDays(r.subject) ? chip('ok', T('schedules.prot_protected', { n: protectDays(r.subject) })) : null,
+      ],
+    })) : [{ key: 'snapshot:none', icon: 'save', label: T('schedules.prot_snapshots'), parts: [chip('warn', T('schedules.prot_none'))] }];
+    const shortRow = rows.find((r) => r.kind === 'smart_short');
     const right = [
-      ...(scrub.length ? scrub.map((r) => `
-        <div class="sr"><span class="k">${sprite('refresh')} ${escapeHtml(T('schedules.prot_scrub_of', { pool: r.subject }))}</span><span class="v">${
+      ...(scrub.length ? scrub.map((r) => ({
+        key: `scrub:${r.subject}`, icon: 'refresh', label: T('schedules.prot_scrub_of', { pool: r.subject }),
+        parts: [
           !r.enabled ? chip('warn', T('schedule.off'))
             : outcomeOf(r)?.failed ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(r.lastRunAt) }))
-              : escapeHtml(r.nextRunAt ? T('schedules.prot_next', { t: fmtIn(r.nextRunAt), when: fmtSchedule(r.schedule) }) : '—')}</span></div>`)
-        : [`<div class="sr"><span class="k">${sprite('refresh')} ${escapeHtml(T('schedules.prot_scrub'))}</span><span class="v">${chip('warn', T('schedules.prot_none'))}</span></div>`]),
+              : { kind: 'text', text: r.nextRunAt ? T('schedules.prot_next', { t: fmtIn(r.nextRunAt), when: fmtSchedule(r.schedule) }) : '—' },
+        ],
+      })) : [{ key: 'scrub:none', icon: 'refresh', label: T('schedules.prot_scrub'), parts: [chip('warn', T('schedules.prot_none'))] }]),
       // The wire has NO real pass/fail for SMART here: `smart` (NasSmartSchedule)
       // carries only timestamps, and the core always sends `last_result:
       // String::new()` for the smart_short/smart_long rows too (§5.10). A
       // green "OK" the moment a timestamp exists would be invented — the last
       // run's actual result is honored when the row ever carries one, and
       // otherwise this says only THAT it ran, in a neutral tone, never OK.
-      (() => {
-        const shortRow = rows.find((r) => r.kind === 'smart_short');
-        return `<div class="sr"><span class="k">${sprite('cylinder')} ${escapeHtml(T('schedules.prot_smart'))}</span><span class="v">${
+      {
+        key: 'smart', icon: 'cylinder', label: T('schedules.prot_smart'),
+        parts: [
           !smart.enabled ? chip('warn', T('schedule.off'))
             : !smart.lastShortAt ? chip('info', T('schedules.prot_pending', { t: fmtIn(smart.nextShortAt) }))
               : outcomeOf(shortRow)?.failed ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(smart.lastShortAt) }))
-                : chip('info', T('schedules.prot_last', { t: fmtAgo(smart.lastShortAt) }))}</span></div>`;
-      })(),
-    ].join('');
-    patchHtml(body.querySelector('#nas-prot'), `<div class="stat-rows">${left}</div><div class="stat-rows">${right}</div>`);
+                : chip('info', T('schedules.prot_last', { t: fmtAgo(smart.lastShortAt) })),
+        ],
+      },
+    ];
+    patchKeyedList(host, [
+      { key: 'protects', html: '<div class="stat-rows" data-col="protects"></div>' },
+      { key: 'checks', html: '<div class="stat-rows" data-col="checks"></div>' },
+    ]);
+    paintProtectionColumn(host.querySelector('[data-col="protects"]'), left);
+    paintProtectionColumn(host.querySelector('[data-col="checks"]'), right);
   };
 
   // One key per row: kind+subject already identifies a schedule uniquely on
@@ -806,4 +823,29 @@ export function openSmartScheduleEditor(screen, smart, onDone) {
     }
   });
   return win;
+}
+
+// One column of the protection strip. A row's markup is only its label, which
+// its key already fixes, so the row element stays the same node for as long
+// as the schedule exists. Its value parts are keyed by slot and kind — a chip
+// that stays a chip keeps its node and only its status and label change.
+function paintProtectionColumn(col, specs) {
+  if (!col) return;
+  patchKeyedList(col, specs.map((s) => ({
+    key: s.key,
+    html: `<div class="sr" data-prot="${escapeAttr(s.key)}"><span class="k">${sprite(s.icon)} ${escapeHtml(s.label)}</span><span class="v"></span></div>`,
+  })));
+  specs.forEach((s, i) => {
+    const v = col.children[i]?.querySelector('.v');
+    const parts = s.parts.filter(Boolean);
+    patchKeyedList(v, parts.map((p, n) => ({
+      key: `${n}:${p.kind}`,
+      html: p.kind === 'chip' ? '<tf-chip size="sm" dot></tf-chip>' : '<span></span>',
+    })));
+    parts.forEach((p, n) => {
+      const el = v?.children[n];
+      if (p.kind === 'chip') { setAttr(el, 'status', p.status); setAttr(el, 'label', p.label); }
+      else setText(el, p.text);
+    });
+  });
 }

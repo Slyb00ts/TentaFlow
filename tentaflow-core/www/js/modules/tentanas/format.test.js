@@ -110,6 +110,7 @@ const { join } = await import('node:path');
 const { WWW_ROOT, I18n } = await import('./_test-setup.js');
 const {
   diskReasonWord, firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, poolReasonsText,
+  DISK_SENTENCE_CODES, DISK_WORD_CODES, fmtCoarseWait, errCode,
 } = await import('./format.js');
 
 function R(code, params = {}) {
@@ -140,6 +141,30 @@ test('every disk and advice code the node produces has words in every locale', a
         const word = diskReasonWord(R(code, ALL_PARAMS));
         assert.ok(word, `${code} has a word in ${lang}`);
         assert.doesNotMatch(word, /tentanas\.|\{/, `${code} in ${lang} is a real sentence: ${word}`);
+      }
+    }
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});
+
+// The n01/n02 disk alert and the replacement advice word the same codes as
+// whole phrases (DISK_REASON_SENTENCES); a code with a chip word but no
+// phrase would drop out of the alert's title.
+test('every disk and advice code the node produces has a whole phrase in every locale', async () => {
+  const codes = producedCodes('disks.rs');
+  assert.deepEqual([...DISK_SENTENCE_CODES].sort(), [...DISK_WORD_CODES].sort(), 'the two dictionaries word the same codes');
+  try {
+    for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(lang);
+      for (const code of codes) {
+        assert.ok(DISK_SENTENCE_CODES.includes(code), `${code} has a phrase`);
+        const text = alertText(A('disk_health', { health: 'warning', name: 'sdd', name_source: 'live' }, { reasons: [R(code, ALL_PARAMS)] }));
+        const phrase = code === 'reallocated_grew' || code === 'unhealthy_for_days'
+          ? replacementAdviceText({ severity: 'advice', reasons: [R(code, ALL_PARAMS)] }).text
+          : text.title;
+        assert.ok(phrase, `${code} is worded in ${lang}`);
+        assert.doesNotMatch(phrase, /tentanas\.|\{|\.\.$/, `${code} in ${lang} is a real phrase: ${phrase}`);
       }
     }
   } finally {
@@ -210,11 +235,15 @@ test('replacementAdviceText words the advice from its codes', () => {
       reasons: [R('reallocated_grew', { from: '3', to: '8' })] },
     'realokacje wzrosły z 3 do 8 w 7 dni'],
     [{ severity: 'advice', reason: 'warning for 5 days; 54°C; 1 UDMA CRC errors (cable/backplane)',
-      reasons: [R('unhealthy_for_days', { health: 'warning', days: '5' }), R('temperature_high', { celsius: '54' }), R('crc_errors', { count: '1' })] },
-    'Uwaga od 5 dni; 54°C; 1 CRC'],
+      reasons: [R('unhealthy_for_days', { health: 'warning', days: '5' }), R('temperature_high', { celsius: '54', limit: '50' }), R('crc_errors', { count: '1' })] },
+    'Uwaga od 5 dni; temperatura 54°C przekracza próg 50°C; 1 błąd CRC (kabel lub backplane)'],
     [{ severity: 'urgent', reason: 'reallocated sectors grew from 4 to 9 in the last 7 days; critical for 2 days; SMART overall status FAILED',
       reasons: [R('reallocated_grew', { from: '4', to: '9' }), R('unhealthy_for_days', { health: 'critical', days: '2' }), R('smart_failed')] },
-    'realokacje wzrosły z 4 do 9 w 7 dni; Awaria od 2 dni; SMART: awaria'],
+    'realokacje wzrosły z 4 do 9 w 7 dni; Awaria od 2 dni; SMART zgłasza awarię dysku'],
+    // The critic's "3 oczek. sekt.. Wymiana…": a phrase, no abbreviation.
+    [{ severity: 'urgent', reason: 'critical for 3 days; 3 pending sectors',
+      reasons: [R('unhealthy_for_days', { health: 'critical', days: '3' }), R('pending_sectors', { count: '3' })] },
+    'Awaria od 3 dni; 3 sektory czekają na realokację'],
     // one whole day: the Polish singular form
     [{ severity: 'advice', reason: '87% worn', reasons: [R('unhealthy_for_days', { health: 'warning', days: '1' }), R('wear', { pct: '87' })] },
     'Uwaga od 1 dnia; zużycie 87%'],
@@ -223,7 +252,9 @@ test('replacementAdviceText words the advice from its codes', () => {
     const out = replacementAdviceText(advice);
     assert.deepEqual(out, { known: true, text, title: advice.reason });
   }
-  const generic = { known: false, text: 'węzeł zaleca wymianę tego dysku' };
+  // Who the generic words are for — a pool disk or an array disk — is the
+  // caller's to say (n03 card, n04 box): no text of its own.
+  const generic = { known: false, text: '' };
   // An advice kind this build does not know.
   assert.deepEqual(replacementAdviceText({ severity: 'retire_soon', reason: 'firmware recall', reasons: [R('smart_failed')] }), { ...generic, title: 'firmware recall' });
   // An older node: no codes at all.
@@ -257,4 +288,287 @@ test('poolReasonsText words the pool card reason from its codes', () => {
   assert.equal(scrub(12), 'ostatni scrub znalazł 12 błędów');
   // A healthy pool has nothing to say.
   assert.deepEqual(poolReasonsText({ health: 'ok', healthReason: '', healthReasons: [] }), { text: '', title: '' });
+});
+
+// ----- Alerts worded from the node's codes -----------------------------------
+
+const { alertText, ALERT_CODES } = await import('./format.js');
+
+// Every alert code the node raises, read from the Rust raisers
+// (`AlertText::new("…")`) — a code added there without words here fails
+// this test instead of showing the generic "Alert węzła" on screen.
+function raisedAlertCodes() {
+  const codes = new Set();
+  for (const file of ['disks.rs', 'elastic.rs', 'scheduler.rs', 'approvals.rs', 'targets.rs']) {
+    const source = readFileSync(join(WWW_ROOT, '..', 'src', 'tentanas', file), 'utf8').split('mod tests {')[0];
+    for (const m of source.matchAll(/AlertText::new\(\s*"(\w+)"/g)) codes.add(m[1]);
+  }
+  return [...codes];
+}
+// Every code NasAlert::code documents, the reserved ones included.
+function documentedAlertCodes() {
+  const source = readFileSync(join(WWW_ROOT, '..', '..', 'tentaflow-protocol', 'src', 'tentanas.rs'), 'utf8');
+  const start = source.indexOf('pub struct NasAlert {');
+  const doc = source.slice(start, source.indexOf('pub code: String', start));
+  // One bullet per code: `/// - 'code' {params}`.
+  return [...new Set([...doc.matchAll(/\/\/\/ - '([a-z_]+)' \{/g)].map((m) => m[1]))];
+}
+// Parameters every alert code may carry, all well-formed, so only the CODE decides.
+const ALERT_PARAMS = {
+  health: 'warning', name: 'sdq', name_source: 'live', operation: 'pool_destroy', subject: 'tank', array: 'media',
+  runs: '4', oldest_secs: '32400', limit_secs: '28800', cause: 'files_busy', count: '2', alerted: '1',
+  sweep_failed: 'true', error: 'EIO', target: 'vm-a',
+};
+const A = (code, params = ALERT_PARAMS, extra = {}) => ({
+  alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'x', title: 'English title', detail: 'English detail', code, params, reasons: [], ...extra,
+});
+
+test('every alert code the node raises or documents has words in every locale', async () => {
+  const raised = raisedAlertCodes();
+  const documented = documentedAlertCodes();
+  assert.ok(raised.length >= 11, `the scan found the raisers (${raised.join(', ')})`);
+  assert.ok(documented.length >= 17, `the scan found the documented codes (${documented.join(', ')})`);
+  for (const code of raised) assert.ok(documented.includes(code), `${code} is raised but not documented on NasAlert`);
+  try {
+    for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(lang);
+      for (const code of documented) {
+        assert.ok(ALERT_CODES.includes(code), `${code} has a composer`);
+        const text = alertText(A(code));
+        assert.equal(text.known, true, `${code} is worded in ${lang}`);
+        for (const part of [text.title, text.detail]) {
+          assert.doesNotMatch(part, /tentanas\.|\{|English/, `${code} in ${lang} is a real sentence: ${part}`);
+        }
+        assert.ok(text.tooltip.startsWith('English title — English detail'), `the English is only the tooltip: ${text.tooltip}`);
+      }
+    }
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});
+
+test('a disk health alert is worded from its grade, its name and its reason codes', () => {
+  const live = A('disk_health', { health: 'critical', name: 'sde', name_source: 'live' }, {
+    title: 'Disk sde: critical', detail: 'ZFS reports this disk FAULTED; 3 reallocated sectors',
+    reasons: [R('zfs_faulted'), R('reallocated', { count: '3' })],
+  });
+  // Wave-4 critic M4: the mockups' form (n01:298, n02:315) — the name and
+  // the first reason as a phrase, the rest as the detail; the grade is the
+  // row's severity chip, not a word of the title.
+  assert.deepEqual(alertText(live), {
+    title: 'sde: ZFS wyłączył dysk jako uszkodzony (FAULTED)',
+    detail: '3 realokowane sektory',
+    tooltip: 'Disk sde: critical — ZFS reports this disk FAULTED; 3 reallocated sectors',
+    known: true,
+    nodeText: false,
+  });
+  const growing = A('disk_health', { health: 'warning', name: 'sdd', name_source: 'live' }, {
+    reasons: [R('reallocated_growing', { from: '5', to: '8' }), R('temperature_high', { celsius: '54', limit: '50' })],
+  });
+  assert.equal(alertText(growing).title, 'sdd: 3 nowe realokowane sektory w 7 dni', 'the mockup, word for word');
+  assert.equal(alertText(growing).detail, 'temperatura 54°C przekracza próg 50°C');
+  const hot = (limit) => alertText(A('disk_health', { health: 'warning', name: 'sdf', name_source: 'live' }, {
+    reasons: [R('temperature_high', limit ? { celsius: '54', limit } : { celsius: '54' })],
+  })).title;
+  assert.equal(hot('50'), 'sdf: temperatura 54°C przekracza próg 50°C');
+  assert.equal(hot(null), 'sdf: temperatura 54°C', 'a row stored before the threshold was sent');
+  // Polish plural forms of the counted phrases.
+  const count = (code, n) => alertText(A('disk_health', { health: 'warning', name: 'sdd', name_source: 'live' }, { reasons: [R(code, { count: String(n) })] })).title;
+  assert.equal(count('reallocated', 1), 'sdd: 1 realokowany sektor');
+  assert.equal(count('reallocated', 22), 'sdd: 22 realokowane sektory');
+  assert.equal(count('reallocated', 12), 'sdd: 12 realokowanych sektorów');
+  assert.equal(count('media_errors', 1), 'sdd: 1 błąd nośnika');
+  assert.equal(count('pending_sectors', 5), 'sdd: 5 sektorów czeka na realokację');
+  assert.doesNotMatch(alertText(live).title, /Awaria|Uwaga/, 'no disk-health grade word in the title');
+  const lastKnown = A('disk_health', { health: 'warning', name: 'sdq', name_source: 'last_known' }, { reasons: [R('wear', { pct: '91' })] });
+  assert.equal(alertText(lastKnown).title, 'Dysk ostatnio widziany jako sdq: zużycie 91%');
+  assert.equal(alertText(A('disk_health', { health: 'warning', name_source: 'unknown' }, { reasons: [R('no_smart_data')] })).title, 'Dysk: brak danych SMART');
+  // With no reason this build can word, the title falls back to the grade.
+  assert.equal(alertText(A('disk_health', { health: 'warning', name: 'sdq', name_source: 'last_known' })).title, 'Dysk ostatnio widziany jako sdq: Uwaga');
+  assert.equal(alertText(A('disk_health', { health: 'warning', name_source: 'unknown' })).title, 'Dysk: Uwaga');
+  // A backfilled row (migration 21) has its grade and name, no reason codes:
+  // the detail points at the node's text rather than printing the English,
+  // and the row offers that text on touch too.
+  const backfilled = alertText(A('disk_health', { health: 'warning', name: 'sdg', name_source: 'last_known' }, { detail: '8 reallocated sectors' }));
+  assert.equal(backfilled.detail, 'Szczegóły są w treści węzła');
+  assert.equal(backfilled.nodeText, true);
+  assert.match(backfilled.tooltip, /8 reallocated sectors/);
+  // A grade that is no alert grade, or a name that is missing, is no word.
+  assert.equal(alertText(A('disk_health', { health: 'ok', name: 'sdq', name_source: 'live' })).known, false);
+  assert.equal(alertText(A('disk_health', { health: 'warning', name_source: 'live' })).known, false);
+});
+
+// Wave-4 round-2 critic minor 4 and M-B: the tooltip and the "Treść węzła"
+// section are the node's own text, so every id in it is taken out — the
+// operation uuid in a helper's transfer path, a node id in a title or an
+// error — and a node id the caller's fleet knows reads as the node's name.
+test('the node text of an alert carries no id: a placeholder, or the node\'s name', () => {
+  const uuid = '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70';
+  const nodeId = '9f'.repeat(32);
+  const attention = A('elastic_needs_attention', { array: 'media', helper_detail: `rename stuck on .tentanas-transfer-${uuid}-2` });
+  const text = alertText(attention);
+  assert.equal(text.nodeText, true);
+  assert.doesNotMatch(text.tooltip, /0191f2c0|[0-9a-f]{32,}/i, text.tooltip);
+  assert.match(text.tooltip, /\.tentanas-transfer-\[identyfikator\]-2/);
+
+  // A parked import stored before the title was resolved (M-B), and a
+  // forwarded error that names a node.
+  const parked = A('approval_pending', { operation: 'config_import' }, {
+    title: `a red-path operation on '${nodeId}' waits for a second admin`,
+    detail: `overwrites 1: nightly (from ${nodeId})`,
+  });
+  assert.doesNotMatch(alertText(parked).tooltip, /[0-9a-f]{32,}/i);
+  const named = alertText(parked, { nameOf: (id) => (id === nodeId ? 'atlas' : '') });
+  assert.equal(named.tooltip, "a red-path operation on 'atlas' waits for a second admin — overwrites 1: nightly (from atlas)");
+  // The generic fallback's tooltip goes through the same filter.
+  const old = { alertId: 'a1', severity: 'warning', subjectKind: 'approval', subjectId: uuid, title: `request ${uuid} waits`, detail: '' };
+  assert.equal(alertText(old).tooltip, 'request [identyfikator] waits');
+});
+
+test('an unknown code, an old uncoded row or broken parameters fall back to a translated generic alert', () => {
+  const generic = { title: 'Alert węzła', detail: 'Pełny alert jest w treści węzła — ta wersja nie ma jego tłumaczenia', known: false, nodeText: true };
+  // A row from an older node: no code, no params, no reasons at all.
+  const old = { alertId: 'a1', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'media', title: 'Macierz wymaga interwencji', detail: 'x' };
+  assert.deepEqual(alertText(old), { ...generic, tooltip: 'Macierz wymaga interwencji — x' });
+  assert.deepEqual(alertText(A('pool_on_fire')), { ...generic, tooltip: 'English title — English detail' });
+  assert.equal(alertText(A('constructor')).known, false, 'a prototype name is not a code');
+  // A number that is not one, a cause this build does not know.
+  assert.equal(alertText(A('elastic_mover_settle_stopped', { array: 'media', runs: 'many' })).known, false);
+  assert.equal(alertText(A('elastic_cache_stuck', { ...ALERT_PARAMS, cause: 'gremlins' })).known, false);
+  assert.equal(alertText(A('approval_pending', { subject: 'tank' })).known, false, 'no operation');
+  // Only a title: no detail and no tooltip separator.
+  assert.equal(alertText({ title: 'only title' }).tooltip, 'only title');
+});
+
+test('the Elastic and approval alerts word their parameters, never the node text', () => {
+  const stuck = alertText(A('elastic_cache_stuck', { array: 'media', oldest_secs: '32400', limit_secs: '28800', cause: 'unresolved_operation' }));
+  assert.equal(stuck.title, 'Pliki zbyt długo czekają na cache macierzy media');
+  // Wave-4 critic minor 2: the node cut the wait to one unit, and only that
+  // unit is worded — "9 h", not the "9 h 0 min" of a precision it threw away.
+  assert.match(stuck.detail, /czeka na dysku cache 9 h \(alarm po 8 h\)/);
+  assert.match(stuck.detail, /nierozwiązana operacja/);
+  assert.equal(fmtCoarseWait(3 * 86400), '3 d');
+  assert.equal(fmtCoarseWait(47 * 3600), '47 h', 'below two days the node cut to hours');
+  assert.equal(fmtCoarseWait(3600), '1 h');
+  assert.equal(fmtCoarseWait(50 * 60), '50 min');
+
+  // Wave-4 critic M2: WHERE the other version is, as a place — never the
+  // helper's quarantine name, which carries the operation's uuid.
+  const uuid = '01a0cf8c-5a61-7283-8410-924a0fceb01f';
+  const conflict = alertText(A('elastic_conflict', { array: 'media', count: '3' }, {
+    detail: `docs/a.odt: … /mnt/tentanas-branches/media/cache/nvme2n1/.tentanas-quarantine-${uuid}-3`,
+    reasons: [
+      { code: 'conflict_file', params: { path: 'docs/a.odt', visible: '/mnt/media/docs/a.odt', kept_kind: 'quarantine', kept_disk: 'nvme2n1' } },
+      { code: 'conflict_file', params: { path: 'foto/b.jpg', visible: '/mnt/media/foto/b.jpg', kept_kind: 'data', kept_disk: 'd2' } },
+      { code: 'conflict_file', params: { path: 'c.txt', visible: '/mnt/media/c.txt', kept_kind: 'branch' } },
+      { code: 'conflict_file', params: { path: 'd.txt', visible: '/mnt/media/d.txt', kept: `/x/.tentanas-quarantine-${uuid}-1` } },
+      { code: 'mystery_line', params: {} },
+    ],
+  }));
+  assert.equal(conflict.title, 'Macierz media: 3 pliki zachowane w dwóch wersjach');
+  assert.match(conflict.detail, /docs\/a\.odt: wersja widoczna \/mnt\/media\/docs\/a\.odt, druga — kopia w kwarantannie na dysku cache nvme2n1/);
+  assert.match(conflict.detail, /foto\/b\.jpg: wersja widoczna \/mnt\/media\/foto\/b\.jpg, druga pod tą samą ścieżką na dysku danych d2/);
+  assert.match(conflict.detail, /c\.txt: wersja widoczna \/mnt\/media\/c\.txt, druga na jednym z dysków macierzy$/);
+  assert.doesNotMatch(conflict.detail, /quarantine-|d\.txt/, 'an old-shape line (a raw `kept` path) is left out, not printed');
+  assert.ok(!`${conflict.title} ${conflict.detail}`.includes(uuid), 'no uuid on screen');
+  assert.equal(alertText(A('elastic_conflict', { array: 'media', count: '5' })).title, 'Macierz media: 5 plików zachowanych w dwóch wersjach');
+
+  const approval = alertText(A('approval_pending', { operation: 'pool_destroy', subject: 'tank' }));
+  assert.equal(approval.title, 'Zniszczenie puli „tank” czeka na drugiego administratora');
+  // Wave-4 critic minor 12: a config import whose node the fleet cannot name
+  // arrives with no subject (dispatch `config_import_subject`) and names the
+  // operation alone — never the node's id.
+  const unnamed = alertText(A('approval_pending', { operation: 'config_import' }));
+  assert.equal(unnamed.known, true);
+  assert.equal(unnamed.title, "Import konfiguracji (nadpisujący) czeka na drugiego administratora");
+  // An operation this build has no label for reads as the queue's generic one.
+  assert.match(alertText(A('approval_pending', { operation: 'warp_drive', subject: 'tank' })).title, /^Operacja „tank”/);
+
+  // Wave-4 critic M3: the node's free text — the helper's note, a step's
+  // error, the kernel's refusal — is never the detail line. The line is a
+  // translated sentence; the raw text is the tooltip (and the touch text).
+  const raws = [
+    ['elastic_needs_attention', { array: 'media', helper_detail: 'nazwa tymczasowa bez prefiksu transferu' }, 'nazwa tymczasowa bez prefiksu transferu'],
+    ['elastic_result_unconfirmed', { array: 'media', error: 'Helper Elastic zwrócił błąd 1' }, 'Helper Elastic zwrócił błąd 1'],
+    ['elastic_replace_unconfirmed', { array: 'media', error: 'service: EIO' }, 'service: EIO'],
+    ['elastic_add_disk_unconfirmed', { array: 'media', error: 'EIO on sdq' }, 'EIO on sdq'],
+    ['target_not_applied', { target: 'vm-a', error: 'configfs: Invalid argument' }, 'configfs: Invalid argument'],
+    ['target_still_in_kernel', { target: 'vm-a', error: 'Device or resource busy' }, 'Device or resource busy'],
+  ];
+  for (const [code, params, raw] of raws) {
+    const text = alertText(A(code, params));
+    assert.equal(text.known, true, code);
+    assert.ok(!text.detail.includes(raw) && !text.title.includes(raw), `${code}: the raw text is not the line (${text.detail})`);
+    assert.ok(text.tooltip.includes(raw), `${code}: the raw text is the tooltip (${text.tooltip})`);
+    assert.equal(text.nodeText, true, `${code}: and reachable on touch`);
+    assert.doesNotMatch(text.detail, /\{|tentanas\./, code);
+  }
+  assert.equal(alertText(A('elastic_needs_attention', { array: 'media', helper_detail: 'x' })).detail, 'Macierz wymaga interwencji; rezerwacje zachowane. Opis helpera jest w treści węzła');
+  assert.equal(alertText(A('elastic_needs_attention', { array: 'media' })).detail, 'Macierz wymaga interwencji; rezerwacje zachowane');
+  assert.equal(alertText(A('elastic_needs_attention', { array: 'media' })).nodeText, false);
+  // A raw text the node's own detail already carries is not said twice.
+  assert.equal(alertText(A('target_not_applied', { target: 'vm-a', error: 'busy' }, { detail: 'the kernel refused: busy' })).tooltip, 'English title — the kernel refused: busy');
+
+  // The node sweep alert says who can read the names only as far as it holds.
+  const sweep = (alerted) => alertText(A('targets_sweep_failing', { count: '3', alerted: String(alerted), sweep_failed: 'false' })).detail;
+  assert.match(sweep(3), /organizacja każdego z nich ma alert/);
+  assert.match(sweep(1), /1 z nich ma alert/);
+  const sweepOf = (count, alerted) => alertText(A('targets_sweep_failing', { count: String(count), alerted: String(alerted), sweep_failed: 'false' })).detail;
+  assert.match(sweepOf(5, 2), /2 z nich mają alert/, 'Polish plural');
+  assert.match(sweepOf(9, 5), /5 z nich ma alert/);
+  assert.match(sweep(0), /log węzła je nazywa$/);
+  assert.match(alertText(A('target_not_applied', { target: 'vm-a' })).detail, /pełny błąd jest w logu węzła/);
+});
+
+// ----- Refusals the node sends as codes ------------------------------------
+
+const { errMessage } = await import('./format.js');
+
+test('every refusal code the node sends is worded in every locale, an unknown one is shown as sent', async () => {
+  const codes = new Set();
+  for (const file of ['db.rs', 'approvals.rs']) {
+    const source = readFileSync(join(WWW_ROOT, '..', 'src', 'tentanas', file), 'utf8');
+    for (const m of source.matchAll(/"refusal:([a-z0-9_]+)"/g)) codes.add(m[1]);
+  }
+  assert.ok(codes.has('share_user_in_use_elsewhere') && codes.has('approval_own_request'), `the scan found the codes (${[...codes].join(', ')})`);
+  assert.ok(codes.size >= 8, [...codes].join(', '));
+  try {
+    for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(lang);
+      for (const code of codes) {
+        const text = errMessage(new Error(`refusal:${code}`));
+        assert.doesNotMatch(text, /refusal:|tentanas\./, `${code} is worded in ${lang}: ${text}`);
+      }
+    }
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+  assert.equal(errMessage(new Error('refusal:approval_own_request')), 'Autor zgłoszenia nie może go zatwierdzić — potrzebny jest drugi administrator');
+  // A code this build does not know, and a plain message, pass through as sent.
+  assert.equal(errMessage(new Error('refusal:quota_exceeded')), 'refusal:quota_exceeded');
+  assert.equal(errMessage(new Error('Macierz nie istnieje w tej instancji')), 'Macierz nie istnieje w tej instancji');
+  assert.equal(errMessage('mesh timeout'), 'mesh timeout');
+  // A refusal code inside a longer message is not a refusal code — but the
+  // client's own `protocol error <Code>: ` wrapping is not "a longer message"
+  // (the real wrapped error is produced by the client itself in
+  // refusal-wire.test.js).
+  assert.equal(errMessage(new Error('failed: refusal:approval_expired')), 'failed: refusal:approval_expired');
+});
+
+test('errCode reads the wire enum from the client wrapping or from .code', () => {
+  assert.equal(errCode(new Error('protocol error NotFound: target not found on this node')), 'NotFound');
+  assert.equal(errCode(Object.assign(new Error('x'), { code: 'Conflict' })), 'Conflict');
+  assert.equal(errCode(new Error('mesh timeout')), '');
+  assert.equal(errCode('protocol error PolicyDenied: refusal:approval_own_request'), 'PolicyDenied');
+});
+
+test('the sweep alert counts in English agree with their verb', async () => {
+  try {
+    await I18n.setLanguage('en');
+    const sweep = (alerted) => alertText(A('targets_sweep_failing', { count: '3', alerted: String(alerted), sweep_failed: 'false' })).detail;
+    assert.match(sweep(1), /1 of them has an alert/);
+    assert.match(sweep(2), /2 of them have an alert/);
+  } finally {
+    await I18n.setLanguage('pl');
+  }
 });

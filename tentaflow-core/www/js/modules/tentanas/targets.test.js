@@ -217,6 +217,11 @@ test('the detail window shows the allowlist, both warnings and the redacted conf
   assert.ok(!/password = \w/.test(shown.replace('***', '')), shown);
   // The allowlist is editable text, one initiator per line.
   assert.equal(win.querySelector('#nas-td-initiators').getAttribute('value'), 'iqn.1998-01.com.vmware:esx01');
+  // n19 writes the method and the user as "CHAP mutual · vmware01" (wave-4
+  // round-2 critic minor 8): the separator is there, and only with a user.
+  const authLine = win.querySelector('[data-f="auth-method"]').parentElement;
+  assert.equal(authLine.textContent.replace(/\s+/g, ' ').trim(), 'CHAP mutual·vmware01');
+  assert.equal(authLine.querySelector('.nas-auth-user .text-3').textContent, '·');
   screen.dispose();
 });
 
@@ -728,6 +733,229 @@ test('every hide-below on the targets table is a breakpoint tf-table honours', a
     const got = [...table.shadowRoot.querySelectorAll('thead th')].flatMap((th) => [...th.classList]
       .filter((c) => c.startsWith('tf-table__col--hide-below-')).map((c) => c.slice('tf-table__col--hide-below-'.length)));
     assert.deepEqual(got, wanted);
+  } finally {
+    screen.dispose();
+  }
+});
+
+// n19 / critic n11-n19 M22: every reload did `win.innerHTML = …`, a failed
+// one replaced the pane with the error, and nothing refreshed on its own.
+// The detail is a skeleton now: a poll reads the target again, writes only
+// what changed, and a failed read keeps the last good one under an error line.
+function detailScreen(answers) {
+  let n = 0;
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: () => {
+      const a = answers[Math.min(n, answers.length - 1)];
+      n += 1;
+      if (a instanceof Error) throw a;
+      return a;
+    },
+    tentaNasTargetsListRequest: listAnswer([iscsiTarget()]),
+  });
+  screen.polls = [];
+  screen.later = (fn, ms) => { screen.polls.push({ fn, ms }); };
+  screen.crumbs = [];
+  screen.setCrumbTail = (tail) => { screen.crumbs.push(tail); };
+  return screen;
+}
+async function runPoll(screen) {
+  const next = screen.polls.shift();
+  assert.ok(next, 'a poll is scheduled');
+  await next.fn();
+  await flush();
+}
+const detailNodes = (win) => ({
+  wwn: win.querySelector('[data-f="wwn"]'),
+  count: win.querySelector('[data-testid="target-sessions-count"]'),
+  portal: win.querySelector('[data-testid="portal_configured"]'),
+  group: win.querySelector('#nas-td-groups .sr'),
+  hosts: win.querySelector('#nas-td-hosts'),
+  field: win.querySelector('#nas-td-initiators'),
+  preview: win.querySelector('#nas-td-preview'),
+  pause: win.querySelector('[data-act="pause"]'),
+  details: win.querySelector('details'),
+});
+
+test('the target detail polls, and an unchanged read replaces no node', async () => {
+  const answer = { target: iscsiTarget(), sessions: [], configPreview: 'mkdir x' };
+  const screen = detailScreen([answer]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    assert.equal(screen.polls.length, 1);
+    assert.ok(screen.polls[0].ms >= 5000 && screen.polls[0].ms <= 30000, `a modest cadence (${screen.polls[0].ms} ms)`);
+    const before = detailNodes(win);
+    for (const [name, el] of Object.entries(before)) assert.ok(el, `${name} is painted`);
+    // n19: no heading of its own; the shell's one breadcrumb names the target
+    // under "Udostępnianie", which links back to the list.
+    const tail = screen.crumbs.at(-1);
+    assert.deepEqual(tail.map((c) => c.label), ['Udostępnianie', 'vm-store']);
+    assert.equal(tail[0].act, 'shares');
+    assert.equal(win.querySelector('[data-act="back"]'), null, 'no second way back in the pane');
+    assert.equal(win.querySelector('h2'), null);
+    const hostRows = before.hosts.rows;
+    before.details.open = true;
+
+    await runPoll(screen);
+    const after = detailNodes(win);
+    for (const name of Object.keys(before)) assert.ok(after[name] === before[name], `${name} survives the poll`);
+    assert.ok(before.hosts.rows === hostRows, 'the hosts table was not handed new rows');
+    assert.equal(before.details.open, true, 'the open allowlist editor stays open');
+    assert.equal(screen.polls.length, 1, 'the next poll is scheduled');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('a failed reload keeps the last good read under an error line, and the next good one clears it', async () => {
+  const screen = detailScreen([
+    { target: iscsiTarget(), sessions: [], configPreview: 'mkdir x' },
+    new Error('node unreachable'),
+    { target: iscsiTarget({ sessions: 3 }), sessions: [], configPreview: 'mkdir x' },
+  ]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const before = detailNodes(win);
+    assert.equal(win.querySelector('[data-testid="target-load-error"]'), null);
+
+    await runPoll(screen);
+    const error = win.querySelector('[data-testid="target-load-error"]');
+    assert.ok(error, 'the failure is said');
+    assert.match(error.textContent, /node unreachable/);
+    assert.ok(win.querySelector('[data-f="wwn"]') === before.wwn, 'the last good read stays on screen');
+    assert.equal(before.wwn.textContent, 'iqn.2026-09.local.tentaflow:helios.vm-store');
+    assert.equal(screen.polls.length, 1, 'a failure does not stop the poll');
+
+    // The manual reload goes through the same path and patches in place.
+    click(win.querySelector('[data-act="refresh"]'));
+    await flush();
+    await flush();
+    assert.equal(win.querySelector('[data-testid="target-load-error"]'), null, 'a good read clears the error line');
+    assert.ok(win.querySelector('[data-testid="target-sessions-count"]') === before.count);
+    assert.equal(before.count.textContent, '3', 'the changed value is written into the same node');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('a first read that fails says so, and a later good one builds the detail', async () => {
+  const screen = detailScreen([new Error('timeout'), { target: iscsiTarget(), sessions: [], configPreview: '' }]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    assert.match(win.querySelector('[data-testid="target-load-error"]').textContent, /timeout/);
+    assert.equal(win.querySelector('[data-f="wwn"]'), null, 'nothing is invented before a read');
+    assert.doesNotMatch(win.textContent, /Ładowanie|Loading/, 'the loading line gives way to the error');
+    await runPoll(screen);
+    assert.equal(win.querySelector('[data-testid="target-load-error"]'), null);
+    assert.equal(win.querySelector('[data-f="wwn"]').textContent, 'iqn.2026-09.local.tentaflow:helios.vm-store');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('the drift banner and the state line come and go with the data, the rest stays', async () => {
+  const drifted = iscsiTarget({ portals: [{ interface: 'storage0', address: '10.10.0.99', port: 3260, transport: 'tcp' }], stateDetail: 'portal moved' });
+  const screen = detailScreen([
+    { target: iscsiTarget(), sessions: [], configPreview: '' },
+    { target: drifted, sessions: [], configPreview: '' },
+    { target: iscsiTarget(), sessions: [], configPreview: '' },
+  ]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const before = detailNodes(win);
+    assert.equal(win.querySelector('[data-testid="portal-drift-banner"]'), null);
+
+    await runPoll(screen);
+    const banner = win.querySelector('[data-testid="portal-drift-banner"]');
+    assert.ok(banner, 'the drift is shown when the portal address left its interface');
+    assert.match(banner.textContent, /portal moved/);
+    assert.ok(win.querySelector('#nas-td-interfaces'), 'the interfaces to pick from are listed');
+    assert.ok(win.querySelector('[data-testid="portal_configured"]') === before.portal, 'the portal row is patched in place');
+    assert.equal(before.portal.textContent, '10.10.0.99:3260');
+    assert.ok(win.querySelector('[data-f="wwn"]') === before.wwn);
+
+    await runPoll(screen);
+    assert.equal(win.querySelector('[data-testid="portal-drift-banner"]'), null, 'the banner goes when the drift does');
+    assert.equal(win.querySelector('#nas-td-interfaces'), null);
+    assert.ok(win.querySelector('[data-f="wwn"]') === before.wwn);
+  } finally {
+    screen.dispose();
+  }
+});
+
+// Wave-4 critic minor 9. For an NVMe-oF target TargetGet and TargetsList each
+// cost the node a privileged session read, and the detail sent both every
+// 10 s. A poll sends TargetGet alone; the list comes on the first read, on
+// an explicit refresh, and once a minute.
+test('a detail poll sends one request, and the target list only once a minute', async () => {
+  const screen = detailScreen([{ target: iscsiTarget(), sessions: [], configPreview: '' }]);
+  const kinds = (from) => screen.calls.slice(from).map((c) => c.kind);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    assert.deepEqual(kinds(0).sort(), ['tentaNasTargetGetRequest', 'tentaNasTargetsListRequest'], 'the first read has both');
+    const polls = [];
+    for (let i = 0; i < 6; i += 1) {
+      const from = screen.calls.length;
+      await runPoll(screen);
+      polls.push(kinds(from));
+    }
+    for (const sent of polls.slice(0, 5)) assert.deepEqual(sent, ['tentaNasTargetGetRequest'], 'a poll is one request');
+    assert.deepEqual(polls[5].sort(), ['tentaNasTargetGetRequest', 'tentaNasTargetsListRequest'], 'the list once a minute');
+
+    const from = screen.calls.length;
+    win.querySelector('[data-act="refresh"]').click();
+    await flush();
+    await flush();
+    assert.deepEqual(kinds(from).sort(), ['tentaNasTargetGetRequest', 'tentaNasTargetsListRequest'], 'a refresh reads everything');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('a target deleted under an open detail stops the poll and says it is gone', async () => {
+  const gone = new Error('protocol error NotFound: target not found on this node');
+  const screen = detailScreen([{ target: iscsiTarget(), sessions: [], configPreview: '' }, gone]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    assert.ok(win.querySelector('[data-act="delete"]'), 'the premise: a live Delete button');
+    await runPoll(screen);
+    const empty = win.querySelector('[data-testid="target-gone"]');
+    assert.ok(empty, 'the gone state is shown');
+    assert.equal(empty.getAttribute('title'), 'Tego targetu już nie ma');
+    assert.equal(win.querySelector('[data-testid="target-load-error"]'), null, 'not an error line to retry');
+    assert.equal(win.querySelector('[data-act="delete"]'), null, 'no Delete under a target that is gone');
+    assert.equal(win.querySelector('[data-act="save"]'), null);
+    assert.doesNotMatch(win.textContent, /NotFound|not found on this node/);
+    assert.equal(screen.polls.length, 0, 'the poll ends');
+    assert.deepEqual(screen.crumbs.at(-1).map((c) => c.label), ['Udostępnianie', 'vm-store'], 'the way back stays: the shell crumb');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('the poll stops once the detail is no longer on screen', async () => {
+  const screen = detailScreen([{ target: iscsiTarget(), sessions: [], configPreview: '' }]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const calls = screen.calls.length;
+    win.remove();
+    await runPoll(screen);
+    assert.equal(screen.calls.length, calls, 'a gone pane sends no request');
+    assert.equal(screen.polls.length, 0, 'and schedules nothing more');
   } finally {
     screen.dispose();
   }

@@ -21,11 +21,11 @@ import {
   T, sprite, channelMode, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
   layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
-  firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS,
+  firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS, alertText,
 } from '/js/modules/tentanas/format.js';
-import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, setRowsIfChanged } from '/js/modules/tentanas/dom-patch.js';
 import { nodeT, nodeHeadSub } from '/js/modules/tentanas/node-phrase.js';
-import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
+import { isOpaqueId, isDiskIdShape, scrubIds } from '/js/modules/tentanas/machine-id.js';
 import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
@@ -217,34 +217,65 @@ function paintArrayMini(row, a) {
 // n02 overview alert row: a stable skeleton keyed by `alertId`. `severity`,
 // `subject` and whether the alert is acked decide the row's SHAPE (its class,
 // icon and which of Ack/acked-chip it offers) and stay fixed here — a change
-// to any of those really is a different row. `title` and `detail` are NOT
-// fixed: `raise_alert` refreshes both on the node on every re-raise, and a
-// cache-stuck alert's detail carries a wait time that changes every minute
-// below 1 h and every hour above (elastic.rs repair_blocker/cache wording).
-// So, like `fmtAgo(a.raisedAt)`, they are left as empty slots here and
-// written into place by `paintAlertRow` — baking them into this markup, as
-// the old code did, rebuilt the whole row (Ack button included) every time
-// either one ticked, not just once a minute.
+// to any of those really is a different row. The title and detail are NOT
+// fixed: `raise_coded_alert` refreshes the code, its parameters and the
+// English on the node on every re-raise, and a cache-stuck alert's wait time
+// moves every minute below 1 h and every hour above (elastic.rs
+// `coarse_wait_secs`). So, like `fmtAgo(a.raisedAt)`, they are left as empty
+// slots here and written into place by `paintAlertRow` — baking them into
+// this markup, as the old code did, rebuilt the whole row (Ack button
+// included) every time either one ticked, not just once a minute.
+//
+// Both are worded by `alertText` (format.js) from the alert's code; the
+// node's English is the title's tooltip, never the text.
+//
+// The sub-line joins only what is there: a disk alert with one reason has
+// it in the title and an EMPTY detail, so the detail's separator is a slot
+// of its own, written by `paintAlertRow` with the detail and emptied without
+// it. No part of the row is an id, not even as a tooltip (owner's rule): the
+// subject is named by `alertSubjectName`, or by its kind alone.
 function alertRowSkeleton(a) {
   const target = alertTarget(a);
   const subjectLabel = [subjectKindLabel(a.subjectKind), alertSubjectName(a.subjectId, a.subjectKind)].filter(Boolean).join(' ');
+  const subject = subjectLabel ? `${escapeHtml(subjectLabel)} · ` : '';
   return `
       <div class="alert-row ${escapeAttr(a.severity)} ${a.ackedAt ? 'acked' : ''}" data-alert="${escapeAttr(a.alertId)}">
         ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
         <div class="a-main">
           <div class="a-title" data-role="title"></div>
-          <div class="a-sub" title="${escapeAttr(a.subjectId)}"><span data-role="detail"></span> · ${escapeHtml(subjectLabel)} · <span data-role="ago"></span></div>
+          <div class="a-sub"><span data-role="detail"></span><span data-role="detail-sep"></span>${subject}<span data-role="ago"></span></div>
+          <details class="a-node" data-role="node" hidden><summary>${escapeHtml(T('alerts.node_text'))}</summary><div class="a-node-text" data-role="node-text"></div></details>
         </div>
         ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
         <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${escapeAttr(a.alertId)}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
       </div>`;
 }
 
-function paintAlertRow(row, a) {
+function paintAlertRow(row, a, nameOf) {
   if (!row) return;
-  setText(row.querySelector('[data-role="title"]'), a.title);
-  setText(row.querySelector('[data-role="detail"]'), a.detail);
+  const text = alertText(a, { nameOf });
+  const title = row.querySelector('[data-role="title"]');
+  setText(title, text.title);
+  setAttr(title, 'title', text.tooltip);
+  setText(row.querySelector('[data-role="detail"]'), text.detail);
+  setText(row.querySelector('[data-role="detail-sep"]'), text.detail ? ' · ' : '');
   setText(row.querySelector('[data-role="ago"]'), fmtAgo(a.raisedAt));
+  // A detail that points at the node's text ("…w treści węzła") must reach
+  // it without a hover too: the same text behind a tap (wave-4 critic minor
+  // 13). Patched in place, so an opened one stays open across polls.
+  setAttr(row.querySelector('[data-role="node"]'), 'hidden', !text.nodeText);
+  setText(row.querySelector('[data-role="node-text"]'), text.nodeText ? text.tooltip : '');
+}
+
+// The n01 fleet table's alert cell, worded like the n02 row (`alertText`);
+// the node's English is the cell's tooltip, and — when the detail points at
+// it — also one tap away, for a reader with no hover.
+function fleetAlertCellHtml(alert, nameOf) {
+  const text = alertText(alert, { nameOf });
+  const node = text.nodeText
+    ? `<details class="l2"><summary>${escapeHtml(T('alerts.node_text'))}</summary>${escapeHtml(text.tooltip)}</details>`
+    : '';
+  return `<div class="cell-2" title="${escapeAttr(text.tooltip)}"><div class="l1">${escapeHtml(text.title)}</div><div class="l2">${escapeHtml(text.detail)}</div>${node}</div>`;
 }
 
 // One square per fleet node, in node order: the mount state of a share.
@@ -816,6 +847,13 @@ const TentaNasScreen = {
     this.later(() => this.refreshFleet(), POLL_FLEET_MS);
   },
 
+  // A node id -> the fleet's name for it ('' when none): how a node's own
+  // text that carries a node id names it instead (`scrubIds`, machine-id.js).
+  nodeNameOf() {
+    const names = new Map((this.nodes || []).map((n) => [String(n.nodeId || '').toLowerCase(), String(n.nodeName || '').trim()]));
+    return (id) => names.get(String(id || '').toLowerCase()) || '';
+  },
+
   // One row per active alert plus one row per node that did not answer.
   fleetAlertRows() {
     return (this.fleet?.rows || []).flatMap((r) => (typeof r.alerts === 'string'
@@ -829,19 +867,23 @@ const TentaNasScreen = {
   paintFleetAlerts() {
     const table = this.root.querySelector('#nas-fleet-alerts');
     if (!table) return;
-    table.rows = this.fleetAlertRows().map((r) => (r.error ? {
+    // Only when the rows really changed: `rows =` rebuilds every cell, and
+    // with it any node text a reader has just opened. The node is named, and
+    // its id is not even the tooltip (owner's rule: no ids in the GUI).
+    const nameOf = this.nodeNameOf();
+    setRowsIfChanged(table, this.fleetAlertRows().map((r) => (r.error ? {
       _row: r,
       level: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('fleet.node_offline'))}"></tf-chip>`,
-      node: `<span class="mono" title="${escapeAttr(r.node.nodeId)}">${escapeHtml(nodeLabel(r.node))}</span>`,
-      alert: escapeHtml(T('fleet.node_unreachable', { error: r.error })),
+      node: `<span class="mono">${escapeHtml(nodeLabel(r.node))}</span>`,
+      alert: escapeHtml(T('fleet.node_unreachable', { error: scrubIds(r.error, T('alerts.id_hidden'), nameOf) })),
       since: '—',
     } : {
       _row: r,
       level: `<tf-chip size="sm" status="${r.alert.severity === 'critical' ? 'err' : r.alert.severity === 'warning' ? 'warn' : 'info'}" dot label="${escapeAttr(T('fleet.severity_' + (['critical', 'warning'].includes(r.alert.severity) ? r.alert.severity : 'info')))}"></tf-chip>`,
-      node: `<span class="mono" title="${escapeAttr(r.node.nodeId)}">${escapeHtml(nodeLabel(r.node))}</span>`,
-      alert: `<div class="cell-2"><div class="l1">${escapeHtml(r.alert.title)}</div><div class="l2">${escapeHtml(r.alert.detail)}</div></div>`,
+      node: `<span class="mono">${escapeHtml(nodeLabel(r.node))}</span>`,
+      alert: fleetAlertCellHtml(r.alert, nameOf),
       since: fmtAgo(r.alert.raisedAt),
-    }));
+    })));
   },
 
   paintFleetResources() {
@@ -860,7 +902,7 @@ const TentaNasScreen = {
       })),
       ...offline.map((r) => ({
         _node: r.node,
-        resource: `<span class="mono" title="${escapeAttr(r.node.nodeId)}">${escapeHtml(nodeLabel(r.node))}</span>`,
+        resource: `<span class="mono">${escapeHtml(nodeLabel(r.node))}</span>`,
         protocol: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('fleet.node_offline'))}"></tf-chip>`,
         source: escapeHtml(T('fleet.node_unreachable', { error: r.shares })),
         mounts: '—',
@@ -912,7 +954,7 @@ const TentaNasScreen = {
         <div class="nc-head">
           <span class="health-dot ${healthClass(unsupported || !n.online ? 'unknown' : health)}"></span>
           <div style="flex:1;min-width:0">
-            <div class="nc-name" title="${escapeAttr(n.nodeId)}">${escapeHtml(nodeLabel(n))}</div>
+            <div class="nc-name">${escapeHtml(nodeLabel(n))}</div>
             <div class="nc-sub">${escapeHtml(sub)}</div>
           </div>
           ${statusChip}
@@ -1023,7 +1065,7 @@ const TentaNasScreen = {
   crumbAction(act) {
     if (act === 'fleet') { this.nodeId = null; this.diskId = null; this.draw(); return; }
     if (act === 'node') { this.switchTab('overview'); return; }
-    if (act === 'disks' || act === 'pools') this.switchTab(act);
+    if (act === 'disks' || act === 'pools' || act === 'shares') this.switchTab(act);
   },
 
   async refreshJobsBadge() {
@@ -1110,9 +1152,12 @@ const TentaNasScreen = {
     if (this.environmentError) return this.drawProbeFailed(body);
     if (!this.environment) return this.drawProbePending(body);
     if (this.forceSetup || this.channelUnusable()) return this.drawSetupStep(body);
-    // The disk and ZFS pool details write their own tail into the shell's
-    // breadcrumb; every other view is the node's top level.
-    if (!(this.tab === 'disks' && this.diskId) && !(this.tab === 'pools' && this.pool && !this.array)) this.setCrumbTail([]);
+    // The disk, ZFS pool, Elastic Array and block target details write their own tail into
+    // the shell's breadcrumb, once, as they open; every other view is the
+    // node's top level. Clearing it first for a detail rebuilt the bar twice
+    // on every draw of that detail.
+    if (!(this.tab === 'disks' && this.diskId) && !(this.tab === 'pools' && (this.pool || this.array))
+      && !(this.tab === 'shares' && this.targetId)) this.setCrumbTail([]);
     switch (this.tab) {
       case 'disks': return this.diskId ? this.drawDiskDetail(body) : this.drawDisks(body);
       case 'pools': return this.array ? drawElasticDetail(this, body) : this.pool ? drawPoolDetail(this, body) : drawPools(this, body);
@@ -1949,7 +1994,8 @@ const TentaNasScreen = {
     el.__tfAlertsOnChange = onChange;
     el.__tfAlertsByKey = new Map(alerts.map((a) => [String(a.alertId), a]));
     patchKeyedList(el, alerts.map((a) => ({ key: a.alertId, html: alertRowSkeleton(a) })));
-    alerts.forEach((a, i) => paintAlertRow(el.children[i], a));
+    const nameOf = this.nodeNameOf();
+    alerts.forEach((a, i) => paintAlertRow(el.children[i], a, nameOf));
   },
 
   // ---------------------------------------------------------------------------
@@ -2160,33 +2206,61 @@ const TentaNasScreen = {
     if (!advice.length) { patchHtml(host, ''); return; }
     // The text is worded from the advice's codes (`replacementAdviceText`);
     // the node's English `reason` is only the tooltip.
-    const html = `
+    //
+    // An Elastic Array member is never told to be replaced (C3): the node
+    // sends it `spareAvailable: false` like a pool disk with no spare, but
+    // replacing an array disk does not exist in this version, so "brak spare
+    // w puli — przygotuj dysk zastępczy" was advice nobody could follow. Its
+    // row says so instead — its chip says "obserwuj", not "zaplanuj", and a
+    // reason this build cannot word is "a problem", never "the node
+    // recommends replacing" (wave-4 critic minor 8) — and a card of array
+    // disks only is not titled "replacement".
+    //
+    // Patched in place (owner's rule): the card is built once, its title,
+    // count and hint are written into it, and the rows are keyed by disk, so
+    // one disk's advice changing rebuilds that one row and nothing else.
+    const forArray = advice.map((a) => adviceIsForArray(a, this.disks));
+    const arrayOnly = forArray.every(Boolean);
+    if (patchHtml(host, `
       <div class="section-card">
         <div class="section-card-head">
-          <div class="title">${sprite('alert')} ${escapeHtml(T('replace_advice.title'))} <tf-chip size="sm" status="warn" label="${escapeAttr(String(advice.length))}"></tf-chip></div>
-          <span class="hint">${escapeHtml(T('replace_advice.hint'))}</span>
+          <div class="title">${sprite('alert')} <span data-role="advice-title"></span> <tf-chip size="sm" status="warn" data-role="advice-count"></tf-chip></div>
+          <span class="hint" data-role="advice-hint"></span>
         </div>
-        <div class="stat-rows">${advice.map((a) => {
-          const why = replacementAdviceText(a);
-          const kind = ADVICE_KINDS.has(a.severity) ? a.severity : 'other';
-          return `
+        <div class="stat-rows" data-role="advice-rows"></div>
+      </div>`)) {
+      host.querySelector('[data-role="advice-rows"]').addEventListener('click', (e) => {
+        const open = e.target.closest('[data-act="advice-open"]');
+        const row = open?.closest('[data-advice]');
+        if (row) this.openDisk(row.dataset.advice);
+      });
+    }
+    setText(host.querySelector('[data-role="advice-title"]'), T(arrayOnly ? 'replace_advice.array_title' : 'replace_advice.title'));
+    setAttr(host.querySelector('[data-role="advice-count"]'), 'label', String(advice.length));
+    setText(host.querySelector('[data-role="advice-hint"]'), T(arrayOnly ? 'replace_advice.array_hint' : 'replace_advice.hint'));
+    patchKeyedList(host.querySelector('[data-role="advice-rows"]'), advice.map((a, i) => {
+      const why = replacementAdviceText(a);
+      const text = why.known ? why.text : T(forArray[i] ? 'replace_advice.array_reason_other' : 'replace_advice.reason_other');
+      const spare = forArray[i] ? T('replace_advice.array_no_replace')
+        : a.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare');
+      const kind = ADVICE_KINDS.has(a.severity) ? a.severity : 'other';
+      const severity = T((forArray[i] ? 'replace_advice.array_severity_' : 'replace_advice.severity_') + kind);
+      return {
+        key: a.diskId,
+        html: `
           <div class="sr" data-advice="${escapeAttr(a.diskId)}">
             <span class="k">
-              <tf-chip size="sm" dot status="${a.severity === 'urgent' ? 'err' : 'warn'}" label="${escapeAttr(T('replace_advice.severity_' + kind))}"></tf-chip>
+              <tf-chip size="sm" dot status="${a.severity === 'urgent' ? 'err' : 'warn'}" label="${escapeAttr(severity)}"></tf-chip>
               <span class="mono fw-700">${escapeHtml(a.name)}</span>${a.memberOf ? ` <span class="text-3">${escapeHtml(a.memberOf)}</span>` : ''}
             </span>
             <span class="v">
-              <span data-role="advice-reason"${why.title ? ` title="${escapeAttr(why.title)}"` : ''}>${escapeHtml(why.text)}</span>
-              <span class="text-3">${escapeHtml(a.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare'))}</span>
+              <span data-role="advice-reason"${why.title ? ` title="${escapeAttr(why.title)}"` : ''}>${escapeHtml(text)}</span>
+              <span class="text-3" data-role="advice-spare">${escapeHtml(spare)}</span>
               <tf-button size="sm" variant="secondary" icon="chevron-right" data-act="advice-open">${escapeHtml(T('disks.details'))}</tf-button>
             </span>
-          </div>`;
-        }).join('')}</div>
-      </div>`;
-    if (!patchHtml(host, html)) return;
-    host.querySelectorAll('[data-advice]').forEach((row) => {
-      row.querySelector('[data-act="advice-open"]')?.addEventListener('click', () => this.openDisk(row.dataset.advice));
-    });
+          </div>`,
+      };
+    }));
   },
 
   // The filter chips carry their own counts and the pool selector is built
@@ -2581,8 +2655,12 @@ const TentaNasScreen = {
     // node's English sentence is only the tooltip.
     const adviceHost = body.querySelector('#nas-dd-advice');
     const adviceWhy = advice ? replacementAdviceText(advice) : null;
+    // An Elastic Array member has no replacement to plan (C3, see
+    // `paintReplacementAdvice`): its own sentence, with no spare in it.
+    const adviceKey = (isArrayMember(d) ? 'replace_advice.array_' : 'replace_advice.disk_')
+      + (adviceWhy?.known ? advice.severity : 'other');
     patchHtml(adviceHost, advice
-      ? warningHtml(advice.severity === 'urgent' ? 'danger' : 'info', T('replace_advice.disk_' + (adviceWhy.known ? advice.severity : 'other'), {
+      ? warningHtml(advice.severity === 'urgent' ? 'danger' : 'info', T(adviceKey, {
         reason: adviceWhy.text,
         spare: advice.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare'),
       }))
@@ -2648,7 +2726,7 @@ const TentaNasScreen = {
       <tf-column key="trend" label="${escapeAttr(T('disk.attr_trend'))}" renderer="html" nowrap hide-below="1024"></tf-column>
       <tf-column key="status" label="${escapeAttr(T('disks.col_health'))}" renderer="chip"></tf-column>
     </tf-table>` : `<div class="muted">${escapeHtml(d.smartAvailable ? T('disk.smart_no_attrs') : T('disk.smart_unavailable'))}</div>`);
-    setTableRows(attrsHost.querySelector('#nas-attr-table'), attrs.map((a) => ({
+    setRowsIfChanged(attrsHost.querySelector('#nas-attr-table'), attrs.map((a) => ({
       id: String(a.id),
       name: a.name,
       value: a.value,
@@ -2664,7 +2742,7 @@ const TentaNasScreen = {
       <tf-column key="result" label="${escapeAttr(T('disk.st_col_result'))}" renderer="html" fill></tf-column>
       <tf-column key="hours" label="${escapeAttr(T('disk.st_col_hours'))}" renderer="text" nowrap width="150"></tf-column>
     </tf-table>` : `<div class="muted">${escapeHtml(T('disk.no_self_tests'))}</div>`);
-    setTableRows(testsHost.querySelector('#nas-st-table'), tests.map((t) => ({
+    setRowsIfChanged(testsHost.querySelector('#nas-st-table'), tests.map((t) => ({
       date: t.startedAt ? fmtDate(t.startedAt) : '—',
       kind: { status: t.kind.toLowerCase().includes('extended') || t.kind.toLowerCase().includes('long') ? 'accent' : 'neutral', label: t.kind },
       result: `<tf-chip size="sm" status="${t.status === 'passed' ? 'ok' : t.status === 'running' ? 'info' : t.status === 'failed' ? 'err' : 'warn'}" dot label="${escapeAttr(T('disk.st_status_' + (['passed', 'failed', 'running'].includes(t.status) ? t.status : 'unknown')))}"></tf-chip> <span class="text-3">${escapeHtml(t.detail || '')}</span>`,
@@ -3065,9 +3143,9 @@ const TentaNasScreen = {
     otable.rows = others.map((n) => ({
       _node: n,
       // The node id is NOT a name and the mockups never show one (n16 prints
-      // `atlas`, `orion`). It stays reachable as the tooltip, for the one case
-      // two nodes answer to the same hostname.
-      name: `<div class="cell-2" title="${escapeAttr(n.nodeId)}"><div class="l1">${escapeHtml(nodeLabel(n))}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div></div>`,
+      // `atlas`, `orion`) — not as text and not as a tooltip (owner's rule:
+      // no ids anywhere in the GUI).
+      name: `<div class="cell-2"><div class="l1">${escapeHtml(nodeLabel(n))}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div></div>`,
       platform: n.instanceStatus === 'ready' ? (n.osName || '—') : T('instance.' + n.instanceStatus),
       channel: { status: channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok', label: T('elevation.mode_' + channelMode(n.elevationMode)), dot: true },
       features: (n.features || []).join(' · ') || (n.instanceStatus === 'ready' ? T('env.features_unknown') : T('instance.' + n.instanceStatus)),
@@ -3745,6 +3823,14 @@ function isArrayMember(disk) {
   return disk?.role === 'array_member' || disk?.role === 'other_org_array';
 }
 
+// Whether a replacement advice is about an Elastic Array member. The advice
+// carries no role of its own, so the disk is looked up in the list the same
+// poll brought (`refreshDisks`); a disk not in it is taken as a pool disk,
+// the advice's own wording.
+function adviceIsForArray(advice, disks) {
+  return isArrayMember((disks || []).find((d) => d.diskId === advice.diskId));
+}
+
 // The SMART jobs of THIS disk that are still in flight. The node names a
 // SMART job by the disk's kernel name (`disks::disk_name`), falling back to
 // the disk id when it has none, so both are matched.
@@ -3823,14 +3909,6 @@ function diskReasonChip(d) {
 // a disk (SMART attributes, the self-test log) move only when the node
 // re-reads SMART, minutes apart, so an unchanged poll must not pay for a
 // full render pass over them.
-function setTableRows(table, rows) {
-  if (!table) return;
-  const sig = JSON.stringify(rows);
-  if (table.__tfRows === sig) return;
-  table.__tfRows = sig;
-  table.rows = rows;
-}
-
 function trendHtml(now, weekAgo) {
   const a = Number(now) || 0;
   const b = Number(weekAgo) || 0;

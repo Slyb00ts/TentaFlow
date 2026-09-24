@@ -6548,7 +6548,118 @@
         "node": "node",
         "elastic-array": "Elastic Array"
       },
-      "history": "Alert history"
+      "history": "Alert history",
+      "untranslated_title": "Node alert",
+      "untranslated_detail": "The full alert is in the node's text — this version has no translation for it",
+      "detail_in_node_text": "The details are in the node's text",
+      "code": {
+        "disk_health": {
+          "title_live": "Disk {name}: {grade}",
+          "title_last_known": "Disk last seen as {name}: {grade}",
+          "title_unnamed": "Disk: {grade}",
+          "title_live_reason": "{name}: {reason}",
+          "title_last_known_reason": "Disk last seen as {name}: {reason}",
+          "title_unnamed_reason": "Disk: {reason}"
+        },
+        "approval_pending": {
+          "title": "{operation} “{subject}” waits for a second admin",
+          "detail": "Approve or reject it in the Tasks queue",
+          "title_unnamed": "{operation} waits for a second admin"
+        },
+        "elastic_sync_held": {
+          "title": "Array {array}: scheduled Sync held, parity reports errors",
+          "detail": "A scrub reported errors nothing has repaired yet. A scheduled Sync would drop from the content file the files the scrub could not read. Run the repair from parity, then a scrub; a manual Sync stays available."
+        },
+        "elastic_mover_settle_stopped": {
+          "title": "Array {array}: automatic move completion paused",
+          "detail": "{runs} consecutive move {runs|run|runs} failed, so the node no longer starts more by itself. Check the cause in the move history and start a move manually."
+        },
+        "elastic_cache_stuck": {
+          "title": "Files wait too long on the cache of array {array}",
+          "detail": "The oldest file has waited on the cache disk for {oldest} (alarm after {limit}) and parity does not protect it until it moves to the data disks: {cause}.",
+          "cause_unresolved_operation": "an unresolved operation of this array holds the move",
+          "cause_files_busy": "the oldest files are open or assigned to a failed move, so they cannot be moved",
+          "cause_schedule_window": "moving is restricted to the schedule window",
+          "cause_last_run_moved_nothing": "the last move took no file off the cache (check its result in the task history, e.g. no space on the data disks)",
+          "cause_not_started": "the automatic move could not start (check the array state)"
+        },
+        "elastic_conflict": {
+          "title": "Array {array}: {count} {count|file|files} kept in two versions",
+          "detail": "An interrupted move left two versions of files and neither was removed. Compare them and remove the one you do not need; the alert goes away once one remains.",
+          "file_quarantine": "{path}: visible version {visible}, the other is a quarantined copy on cache disk {disk}",
+          "file_data": "{path}: visible version {visible}, the other is at the same path on data disk {disk}",
+          "file_branch": "{path}: visible version {visible}, the other is on one of the array's disks"
+        },
+        "elastic_needs_attention": {
+          "title": "Array {array} needs intervention",
+          "detail": "The array needs intervention; reservations are kept",
+          "detail_helper": "The array needs intervention; reservations are kept. The helper's note is in the node's text"
+        },
+        "elastic_result_unconfirmed": {
+          "title": "Array {array}: operation result not confirmed",
+          "detail": "A step failed, and a lost answer does not prove that I/O stopped. The step's error is in the node's text"
+        },
+        "elastic_replace_unconfirmed": {
+          "title": "Array {array}: disk replacement not confirmed",
+          "detail": "The disk replacement was not confirmed. The step's error is in the node's text"
+        },
+        "elastic_add_disk_unconfirmed": {
+          "title": "Array {array}: disk addition not confirmed",
+          "detail": "The disk was not added to the array. The step's error is in the node's text"
+        },
+        "elastic_restore_waiting": {
+          "title": "Array {array} is waiting to be restored",
+          "detail": "No unattended root channel; an explicit Restore is required"
+        },
+        "target_portal_moved": {
+          "title": "Target {target}: the portal address moved",
+          "detail": "The portal is no longer on the chosen interface; the export is unreachable until the address returns or the interface is picked again."
+        },
+        "target_not_applied": {
+          "title": "Target {target}: not applied to the kernel",
+          "detail": "The kernel refused the change; its error is in the node's text",
+          "detail_hidden": "The kernel refused the change; the node log has the full error"
+        },
+        "target_still_in_kernel": {
+          "title": "Target {target}: still in the kernel although this node decided to stop it",
+          "detail": "The kernel did not let go of the object; its error is in the node's text",
+          "detail_hidden": "The kernel did not let go of the object; the node log has the full error"
+        },
+        "elevation_unarmed": {
+          "title": "The privilege channel is not armed — this node cannot reach the kernel",
+          "detail": "Block targets are waiting to be applied or removed. configfs is empty after a reboot and only this app restores it, so exports stay down until the channel is armed (Environment → provision)."
+        },
+        "targets_sweep_failing": {
+          "title": "Block targets: this node cannot reach the state it decided on",
+          "detail_targets": "{count} block {count|target is|targets are} not in the state this node decided on",
+          "detail_sweep": "the reconcile itself could not run; the node log has the error",
+          "who_all": "each one's organisation has an alert naming it",
+          "who_some": "{alerted} of them {alerted|has|have} an alert naming it for its organisation; the node log names them all",
+          "who_none": "the node log names them"
+        },
+        "targets_sweep_stale": {
+          "title": "Block targets: this node cannot reach the state it decided on",
+          "detail": "Block targets on this node were not in the state it decided on before it restarted; the next reconcile replaces this with the current count"
+        }
+      },
+      "node_text": "The node's text",
+      "id_hidden": "[identifier]",
+      "disk_reason": {
+        "smart_failed": "SMART reports the disk as failing",
+        "self_test_failed": "the last SMART self-test failed",
+        "pending_sectors": "{n} {n|sector waits|sectors wait} for reallocation",
+        "media_errors": "{n} media {n|error|errors}",
+        "reallocated_growing": "{n} new reallocated {n|sector|sectors} in 7 days",
+        "reallocated": "{n} reallocated {n|sector|sectors}",
+        "temperature_over_limit": "temperature {t}°C is over the {limit}°C limit",
+        "temperature_high": "temperature {t}°C",
+        "temperature_high_limit": "temperature {t}°C is over the {limit}°C threshold",
+        "crc_errors": "{n} CRC {n|error|errors} (cable or backplane)",
+        "wear": "{n}% worn",
+        "no_smart_data": "no SMART data",
+        "zfs_faulted": "ZFS took the disk out as faulted (FAULTED)",
+        "zfs_unavail": "ZFS cannot see the disk (UNAVAIL)"
+      }
     },
     "role": {
       "free": "Free",
@@ -7111,7 +7222,6 @@
       "mounted": "Mounted",
       "present": "Present",
       "disk_details": "Disk details: {name}",
-      "back": "Back to pools",
       "refresh": "Refresh",
       "snapshot_only": "Parity describes the last sync. Later writes have no confirmed protection.",
       "tolerance": "Checkpoint tolerance: {n} {n|disk|disks|disks}",
@@ -8138,7 +8248,9 @@
       "dh": "{d} d {h} h",
       "hm": "{h} h {m} min",
       "m": "{m} min",
-      "s": "{s} s"
+      "s": "{s} s",
+      "d": "{d} d",
+      "h": "{h} h"
     },
     "fleet": {
       "head_scope": "fleet",
@@ -8348,13 +8460,22 @@
       "reason_grew": "reallocated sectors grew from {from} to {to} in 7 days",
       "reason_for_days": "{status} for {days} {days|day|days}",
       "reason_other": "the node recommends replacing this disk",
-      "disk_other": "The node recommends replacing this disk. {spare}."
+      "disk_other": "The node recommends replacing this disk. {spare}.",
+      "array_urgent": "This Elastic Array disk needs attention: {reason}. Replacing an array disk is not available in this version.",
+      "array_advice": "Keep an eye on this Elastic Array disk: {reason}. Replacing an array disk is not available in this version.",
+      "array_other": "The node reports a problem with this Elastic Array disk. Replacing an array disk is not available in this version.",
+      "array_no_replace": "Elastic Array — disk replacement not available in this version",
+      "array_title": "Elastic Array disks that need attention",
+      "array_hint": "From this node's history; replacing an Elastic Array disk is not available in this version.",
+      "array_reason_other": "the node reports a problem with this disk",
+      "array_severity_urgent": "urgent",
+      "array_severity_advice": "watch it",
+      "array_severity_other": "attention"
     },
     "targets": {
       "sessions_unmeasured": "Unknown does not mean zero",
       "host_shared": "Also used by",
       "context_changed": "The node or target context changed. Open the detail again.",
-      "back_to_list": "Back to sharing",
       "session_identity": "Client / initiator",
       "edit_initiators": "Add or edit hosts",
       "initiators_draft": "Confirm list changes with Save.",
@@ -8457,7 +8578,9 @@
       "delete_keep_volume": "The volume {source} and its data stay untouched.",
       "service_missing": "{proto}: {detail}",
       "created": "Created",
-      "key_in_kernel": "The key goes into the kernel (configfs). nvmet creates it world-readable, so the node tightens the file mode to root only and checks the result — a mismatch goes into the job log. On a node with local users treat it as a secret shared with that node."
+      "key_in_kernel": "The key goes into the kernel (configfs). nvmet creates it world-readable, so the node tightens the file mode to root only and checks the result — a mismatch goes into the job log. On a node with local users treat it as a secret shared with that node.",
+      "gone_title": "This target is gone",
+      "gone_detail": "It was deleted on this node (by another admin, for example). Go back to the sharing list."
     },
     "wizard_target": {
       "title": "New target",
@@ -8562,6 +8685,16 @@
       "this_org": "another TentaNas instance of this organisation",
       "this_org_named": "the “{name}” instance of this organisation",
       "other_installation": "another TentaNas installation"
+    },
+    "refusal": {
+      "share_user_in_use_elsewhere": "This account is still in use on this node — it cannot be deleted",
+      "approval_not_found": "This request is not on this node",
+      "approval_own_request": "The author of a request may not approve it — a second admin has to",
+      "approval_already_approved": "This request has already been approved",
+      "approval_already_rejected": "This request has already been rejected",
+      "approval_already_expired": "This request has already expired",
+      "approval_closed": "This request has already been decided",
+      "approval_expired": "The request expired before anybody decided on it"
     }
   },
   "agent_accounts": {

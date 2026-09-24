@@ -112,3 +112,24 @@ test('a viewer gets no create buttons and no row actions', async () => {
   assert.equal(table.rowActions(table.rows[1]), null);
   screen.dispose();
 });
+
+// tf-table drops a hide-below outside its breakpoint allowlist, so a column
+// asked to hide at 1000/1100/1200 px never hid at all. Every value asked for
+// must come back as the column class the shadow header actually carries.
+test('every hide-below of the datasets table is a breakpoint tf-table honours', async () => {
+  const screen = fakeScreen(fixtures());
+  try {
+    const host = mount();
+    await drawDatasets(screen, host, { pool: 'tank' });
+    await flush();
+    const table = host.querySelector('#nas-ds-table');
+    const wanted = [...table.querySelectorAll('tf-column[hide-below]')].map((c) => c.getAttribute('hide-below'));
+    const got = [...table.shadowRoot.querySelectorAll('thead th')].flatMap((th) => [...th.classList]
+      .filter((c) => c.startsWith('tf-table__col--hide-below-')).map((c) => c.slice('tf-table__col--hide-below-'.length)));
+    assert.deepEqual(got, wanted);
+    assert.equal(wanted.length, 4);
+    host.remove();
+  } finally {
+    screen.dispose();
+  }
+});

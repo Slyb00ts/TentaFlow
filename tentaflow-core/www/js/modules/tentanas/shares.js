@@ -381,7 +381,7 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
           ${screen.isAdmin ? `<div class="actions"><tf-button size="sm" variant="ghost" icon="refresh" data-act="refresh-mounts">${escapeHtml(T('shares.refresh_mounts'))}</tf-button></div>` : ''}
         </div>
         ${mounts.length ? `<div class="stat-rows" id="nas-sd-mounts">${mounts.map((m) => `
-          <div class="sr" data-node="${escapeAttr(m.nodeId)}"><span class="k mono" title="${escapeAttr(m.nodeId)}">${escapeHtml(nodeLabel(m))}</span><span class="v">${mountChipHtml(m.state, m.transport)}${m.mountpoint ? `<span class="mono text-3">${escapeHtml(m.mountpoint)}</span>` : ''}${m.detail ? `<span class="text-3">${escapeHtml(m.detail)}</span>` : ''}${
+          <div class="sr" data-node="${escapeAttr(m.nodeId)}"><span class="k mono">${escapeHtml(nodeLabel(m))}</span><span class="v">${mountChipHtml(m.state, m.transport)}${m.mountpoint ? `<span class="mono text-3">${escapeHtml(m.mountpoint)}</span>` : ''}${m.detail ? `<span class="text-3">${escapeHtml(m.detail)}</span>` : ''}${
             screen.isAdmin && m.nodeId === localNodeId && (m.state === 'pending' || m.state === 'error') ? `<tf-button size="sm" variant="ghost" icon="refresh" data-act="retry-mount">${escapeHtml(T('shares.retry_mount'))}</tf-button>` : ''}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('shares.fleet_none'))}</div>`}
         <div class="section-card-head"><div class="title">${sprite('users')} ${escapeHtml(T('shares.sessions_title'))} <tf-chip size="sm" status="neutral" label="${state.sessions.length}"></tf-chip></div></div>

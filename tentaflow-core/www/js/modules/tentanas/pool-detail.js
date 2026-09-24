@@ -9,12 +9,12 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
-  T, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
+  T, poolCrumbTail, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
   fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
   layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel,
 } from '/js/modules/tentanas/format.js';
 import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
-import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass } from '/js/modules/tentanas/dom-patch.js';
+import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass, setRowsIfChanged } from '/js/modules/tentanas/dom-patch.js';
 import { openScheduleEditor } from '/js/modules/tentanas/schedule-editor.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { scrubAction, trimAction } from '/js/modules/tentanas/pools.js';
@@ -157,10 +157,7 @@ const freeOf = (disks) => disks.filter((d) => d.role === 'free');
 // its tail. The "Pule" level walks back to the pool list through the shell's
 // `pools` crumb action.
 function setCrumbs(screen, name) {
-  screen.setCrumbTail?.([
-    { label: T('tabs.pools'), act: 'pools', query: `node=${screen.nodeId}&tab=pools` },
-    { label: name },
-  ]);
+  screen.setCrumbTail?.(poolCrumbTail(screen.nodeId, name));
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,15 +1008,9 @@ function paintProperties(screen, host, state, refresh) {
     name: `<span class="tf-table__cell--mono">${escapeHtml(pr.name)}</span>`,
     value: `<span class="tf-table__cell--mono">${escapeHtml(pr.value ?? '—')}</span>${pr.name === 'compression' && p.compressRatio ? ` <tf-chip size="sm" status="ok" label="${escapeAttr(T('pool.ratio_chip', { ratio: fmtRatio(p.compressRatio) }))}"></tf-chip>` : ''}${pr.inheritedFrom ? `<div class="tf-table__cell-sub">${escapeHtml(T('props.inherited_from', { from: pr.inheritedFrom }))}</div>` : ''}`,
   }));
-  // `rows =` is a full table render (M10): every cell, every row-action
-  // button and any hover on them is rebuilt. The properties of a pool change
-  // when someone edits one, not on a 5 s poll, so the assignment happens only
-  // when the rows really differ from what the table was last given.
-  const sig = JSON.stringify(rows);
-  if (table.__tfRows !== sig) {
-    table.__tfRows = sig;
-    table.rows = rows;
-  }
+  // `rows =` is a full table render (M10); the properties of a pool change
+  // when someone edits one, not on a 5 s poll.
+  setRowsIfChanged(table, rows);
 
   const destroyRow = host.querySelector('[data-act="destroy"]')?.closest('.dz-row');
   if (destroyRow) {

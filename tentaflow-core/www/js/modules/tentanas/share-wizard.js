@@ -295,7 +295,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
           <tf-toggle id="nas-sw-fleet" ${state.fleetMount ? 'checked' : ''}></tf-toggle>
         </div>
         ${state.fleetMount ? `<div class="stat-rows" id="nas-sw-fleet-plan">${plan.map((p) => `
-          <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k"><span class="mono fw-700" title="${escapeAttr(p.nodeId)}">${escapeHtml(nodeLabel(p))}</span></span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
+          <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k"><span class="mono fw-700">${escapeHtml(nodeLabel(p))}</span></span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('wizard_share.fleet_off_note'))}</div>`}
         ${editing ? toggleCard('nas-sw-enabled', T('wizard_share.enabled'), T('wizard_share.enabled_sub'), state.enabled) : ''}
         <div class="stat-rows mt-md">

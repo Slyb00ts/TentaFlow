@@ -14,7 +14,7 @@ import '../../sdk-runtime/_dom-test-harness.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { setText, patchHtml, patchKeyedList } = await import('./dom-patch.js');
+const { setText, patchHtml, patchKeyedList, setRowsIfChanged } = await import('./dom-patch.js');
 
 function freshHost() {
   document.body.innerHTML = '';
@@ -137,4 +137,19 @@ test('an item whose html has no root element is parsed once, not on every poll',
   try { patchKeyedList(host, items); } finally { document.createElement = real; }
   assert.equal(created, 0, `an unchanged poll re-parses nothing, got ${created} createElement call(s)`);
   assert.equal(host.children.length, 1, 'and the real card is still there');
+});
+
+// The one "hand a tf-table its rows only when they changed" helper — targets,
+// the pool properties, the disk detail tables and the n01 alert table used
+// three copies of it with two expando names.
+test('setRowsIfChanged assigns rows only when they differ', () => {
+  let assigned = 0;
+  const table = { set rows(v) { assigned += 1; this._rows = v; }, get rows() { return this._rows; } };
+  assert.equal(setRowsIfChanged(table, [{ a: 1 }]), true);
+  assert.equal(setRowsIfChanged(table, [{ a: 1 }]), false, 'an equal set is not assigned');
+  assert.equal(assigned, 1);
+  assert.equal(setRowsIfChanged(table, [{ a: 2 }]), true);
+  assert.equal(assigned, 2);
+  assert.deepEqual(table.rows, [{ a: 2 }]);
+  assert.equal(setRowsIfChanged(null, []), false, 'no table, nothing to do');
 });

@@ -136,17 +136,27 @@ pub enum ApprovalError {
     Expired,
 }
 
+/// Written as a REFUSAL CODE (`refusal:<code>`), not a sentence: this text is
+/// the message of the `ProtocolError` the Tasks queue shows
+/// (`dispatch::tentanas::approval_error`), and the screen words the code in
+/// the reader's language (`errMessage`, format.js). The English sentences
+/// this used to print were the only English in an otherwise Polish toast.
+/// A status `Closed` carries that is not one of the three a request closes
+/// with reads as the generic "already decided".
 impl std::fmt::Display for ApprovalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "the request is not on this node"),
-            Self::OwnRequest => write!(
-                f,
-                "the author of a request may not approve it — a second admin has to"
-            ),
-            Self::Closed(status) => write!(f, "the request is already {status}"),
-            Self::Expired => write!(f, "the request expired before anybody decided on it"),
-        }
+        let code = match self {
+            Self::NotFound => "approval_not_found",
+            Self::OwnRequest => "approval_own_request",
+            Self::Closed(status) => match status.as_str() {
+                "approved" => "approval_already_approved",
+                "rejected" => "approval_already_rejected",
+                "expired" => "approval_already_expired",
+                _ => "approval_closed",
+            },
+            Self::Expired => "approval_expired",
+        };
+        write!(f, "refusal:{code}")
     }
 }
 
@@ -281,6 +291,23 @@ pub fn park(
     detail: &str,
     payload: &TentaNasPayload,
 ) -> Result<NasPendingApproval> {
+    park_shown(a, operation, subject, subject, detail, payload)
+}
+
+/// `park` for a subject that is not its own name: `subject` is stored (the
+/// request, the alert's `subject` parameter) and resolved at the read
+/// boundary, while the alert's English title — forwarded to syslog and
+/// webhooks as written — names `shown_subject`, or no subject when it is
+/// empty. A config import from an export without a node name stores the
+/// node's id; its title must never carry it (owner's rule: no ids).
+pub fn park_shown(
+    a: &Actor<'_>,
+    operation: &str,
+    subject: &str,
+    shown_subject: &str,
+    detail: &str,
+    payload: &TentaNasPayload,
+) -> Result<NasPendingApproval> {
     let ttl_hours = settings(a.main_db, a.checker, a.org_id, a.addon_id).ttl_hours;
     let now = chrono::Utc::now();
     let approval = NasPendingApproval {
@@ -306,14 +333,13 @@ pub fn park(
         approval: approval.clone(),
     };
     store::insert_approval(a.nas_db, &row)?;
-    let _ = store::raise_alert(
+    let _ = store::raise_coded_alert(
         a.nas_db,
         &alert_key(&approval.request_id),
         "warning",
         "approval",
         &approval.request_id,
-        &format!("a red-path operation on '{subject}' waits for a second admin"),
-        detail,
+        &approval_alert_text(operation, subject, shown_subject, detail),
     );
     audit_as(a, "nas.approval.requested", &approval, "pending");
     Ok(approval)
@@ -475,6 +501,28 @@ fn load(a: &Actor<'_>, request_id: &str) -> Result<store::ApprovalRow, ApprovalE
         return Err(ApprovalError::Expired);
     }
     Ok(row)
+}
+
+/// The parked request's alert (code 'approval_pending'): the operation code
+/// and the subject are what a screen words ("Zniszczenie puli 'tank' czeka
+/// na drugiego administratora"); the English title and the request's own
+/// detail stay for forwarding and the tooltip.
+fn approval_alert_text(operation: &str, subject: &str, shown_subject: &str, detail: &str) -> store::AlertText {
+    store::AlertText::new("approval_pending", approval_alert_title(shown_subject), detail)
+        .param("operation", operation)
+        .param("subject", subject)
+}
+
+/// The English title of a parked request's alert, naming `shown_subject` —
+/// or, when it is empty, the operation alone. Also what the read boundary
+/// rewrites a config import's stored title to once it has resolved the node
+/// (`dispatch::tentanas::alerts_list`).
+pub fn approval_alert_title(shown_subject: &str) -> String {
+    if shown_subject.trim().is_empty() {
+        "a red-path operation waits for a second admin".to_string()
+    } else {
+        format!("a red-path operation on '{shown_subject}' waits for a second admin")
+    }
 }
 
 fn alert_key(request_id: &str) -> String {
@@ -990,6 +1038,24 @@ mod tests {
         assert!(expire_due(&f.main, &f.nas, "node-test").is_empty());
     }
 
+    /// Every refusal the Tasks queue can show is a code the screen words,
+    /// never an English sentence (M1).
+    #[test]
+    fn every_approval_refusal_reaches_the_screen_as_a_code() {
+        let cases = [
+            (ApprovalError::NotFound, "refusal:approval_not_found"),
+            (ApprovalError::OwnRequest, "refusal:approval_own_request"),
+            (ApprovalError::Closed("approved".to_string()), "refusal:approval_already_approved"),
+            (ApprovalError::Closed("rejected".to_string()), "refusal:approval_already_rejected"),
+            (ApprovalError::Closed("expired".to_string()), "refusal:approval_already_expired"),
+            (ApprovalError::Closed("closed".to_string()), "refusal:approval_closed"),
+            (ApprovalError::Expired, "refusal:approval_expired"),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.to_string(), code);
+        }
+    }
+
     #[test]
     fn a_pending_operation_raises_an_alert_that_the_decision_resolves() {
         let f = fixture(&["u-anna", "u-piotr"], &[]);
@@ -998,9 +1064,39 @@ mod tests {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].subject_kind, "approval");
         assert_eq!(open[0].subject_id, parked.request_id);
+        // Coded: the operation and the subject a screen words, never the id.
+        assert_eq!(open[0].code, "approval_pending");
+        assert_eq!(open[0].params.get("operation").map(String::as_str), Some(parked.operation.as_str()));
+        assert_eq!(open[0].params.get("subject").map(String::as_str), Some(parked.subject.as_str()));
 
         claim(&f.actor("u-piotr"), &parked.request_id).expect("claim");
         assert!(store::list_alerts(&f.nas, true).expect("alerts").is_empty());
+    }
+
+    /// Wave-4 round-2 critic M-B: a config import from an export without a
+    /// node name is stored under the node's id, and the alert's English
+    /// title — forwarded as written, and the screens' tooltip — read "a
+    /// red-path operation on '<64 hex>' …". The title names what the caller
+    /// resolved, or no subject; the id stays only in the stored parameter,
+    /// which the read boundary resolves.
+    #[test]
+    fn a_parked_import_s_alert_title_names_the_node_or_nothing_never_its_id() {
+        let f = fixture(&["u-anna", "u-piotr"], &[]);
+        let node_id = "9f".repeat(32);
+        let import = TentaNasPayload::ConfigImportApplyRequest { json: "{}".into(), sudo_password: None };
+        let title_of = |shown: &str| {
+            let parked = park_shown(&f.actor("u-anna"), OP_CONFIG_IMPORT, &node_id, shown, "overwrites 1: nightly", &import)
+                .expect("park");
+            let alert = store::list_alerts(&f.nas, true)
+                .expect("alerts")
+                .into_iter()
+                .find(|a| a.subject_id == parked.request_id)
+                .expect("the alert");
+            assert_eq!(alert.params.get("subject"), Some(&node_id), "the stored subject is resolved on read");
+            alert.title
+        };
+        assert_eq!(title_of(""), "a red-path operation waits for a second admin");
+        assert_eq!(title_of("helios"), "a red-path operation on 'helios' waits for a second admin");
     }
 
     /// §5.10: a protection comes off through exactly TWO doors — the approval

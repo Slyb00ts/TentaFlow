@@ -1476,7 +1476,13 @@ pub fn score_health(
                 &[("celsius", t.to_string()), ("limit", temp_limit.to_string())],
             ));
         } else if t >= temp_warn {
-            warning.push(coded_reason("temperature_high", &[("celsius", t.to_string())]));
+            // The threshold travels with the reading: the alert reads
+            // "temperature 54°C is over the 50°C threshold" (mockups n01/n02),
+            // and which threshold applies depends on the drive's kind.
+            warning.push(coded_reason(
+                "temperature_high",
+                &[("celsius", t.to_string()), ("limit", temp_warn.to_string())],
+            ));
         }
     }
     if let Some(c) = s.crc_errors.filter(|v| *v > 0) {
@@ -1591,10 +1597,10 @@ pub struct DiskGrade {
 /// keeps it), and the membership is already a column of its own.
 ///
 /// SMART's sentence and its codes come in apart (`smart_reason`,
-/// `smart_reasons`) because they can disagree for one reason only: after a
-/// restart the codes are re-derived from the stored SMART document, and when
-/// that does not reproduce the stored sentence the codes stay empty rather
-/// than claim something the node did not measure (`live_from_persisted`).
+/// `smart_reasons`) because they can disagree for one reason only: a row
+/// stored before migration 21 kept the sentence without its codes, and a
+/// restart seeds the codes empty rather than claim something the node did
+/// not measure (`live_from_persisted`).
 pub fn grade_disk_health(
     smart_health: &str,
     smart_reason: &str,
@@ -2084,23 +2090,15 @@ where
     //
     // Read ONLY for a disk this process has not seen yet: a disk already in
     // the live state keeps its live record (the `Some` arm below) and never
-    // looks at the row. Reading every disk's row and week-old sample on every
-    // pass was two queries per disk on the pass that holds the health gate,
+    // looks at the row. Reading every disk's row on every pass was a query
+    // per disk on the pass that holds the health gate,
     // for an answer thrown away. The live set is stable while the gate is
     // held: only this pass replaces `st.disks`.
     let known: std::collections::HashSet<String> = cell.read().disks.keys().cloned().collect();
     let mut persisted = HashMap::new();
     for d in first_seen(&found, &known) {
         if let Some(row) = store::disk_row(db, &d.disk_id)? {
-            // The week-old sample re-derives the reason codes from the stored
-            // SMART document (`live_from_persisted`); only a row with a
-            // document has codes to re-derive.
-            let week_ago = if row.smart_json.is_some() {
-                store::attribute_week_ago(db, &d.disk_id, "reallocated").unwrap_or(None)
-            } else {
-                None
-            };
-            persisted.insert(d.disk_id.clone(), (row, week_ago));
+            persisted.insert(d.disk_id.clone(), row);
         }
     }
     let mut st = cell.write();
@@ -2134,11 +2132,8 @@ where
                 old
             }
             None => {
-                let (row, week_ago) = match persisted.get(&d.disk_id) {
-                    Some((row, week_ago)) => (Some(row), *week_ago),
-                    None => (None, None),
-                };
-                live_from_persisted(d, row, week_ago)
+                let row = persisted.get(&d.disk_id);
+                live_from_persisted(d, row)
             }
         };
         regrades.extend(regrade_leaf(&mut live, leaf_states.as_ref()));
@@ -2174,24 +2169,24 @@ where
 /// (`refresh_smart` stores it before the leaf state is applied), so it seeds
 /// `smart_health` as it is.
 ///
-/// The row keeps SMART's sentence but not its codes (`nas_disks` has no
-/// column for them). They are re-derived by grading the stored SMART
-/// document again (`score_health`, with the reallocated sample of a week
-/// ago as the SMART pass reads it) and taken ONLY when that reproduces the
-/// stored grade and sentence exactly. When it does not — the week-old sample
-/// has moved on since, or the row predates the document — the disk shows no
-/// codes until its next SMART read, and a screen falls back to the
-/// translated grade with the stored sentence as its tooltip: an honest gap,
-/// never a reason the node did not measure.
-fn live_from_persisted(
-    mut d: NasDisk,
-    row: Option<&store::DiskRow>,
-    reallocated_week_ago: Option<i64>,
-) -> Live {
+/// The row keeps SMART's reasons both as the sentence and as codes
+/// (`nas_disks.health_reasons`, migration 21, written by the same statement
+/// in `store_smart`), so the codes come back as they were measured.
+///
+/// WHY stored rather than re-derived: grading the stored document again
+/// needs the reallocated sample of a week ago, and that sample moves on
+/// every minute — a restart a day after the read graded a different week and
+/// had to drop the codes whenever the answer differed, leaving the screen on
+/// the bare grade until the next SMART read. A row written before the column
+/// existed has '[]': the disk shows the translated grade with the stored
+/// sentence as its tooltip until its next SMART read — an honest gap, never
+/// a reason the node did not measure.
+fn live_from_persisted(mut d: NasDisk, row: Option<&store::DiskRow>) -> Live {
     let mut smart = SmartSummary::default();
     if let Some(row) = row {
         d.health = row.health.clone();
         d.health_reason = row.health_reason.clone();
+        d.health_reasons = row.health_reasons.clone();
         d.smart_read_at = row.smart_read_at.clone();
         if let Some(doc) = row
             .smart_json
@@ -2200,10 +2195,6 @@ fn live_from_persisted(
         {
             smart = summarize_smart(&doc);
             apply_summary(&mut d, &smart);
-            let (health, reasons) = score_health(&smart, &d.kind, reallocated_week_ago);
-            if health == row.health && disk_reasons_text(&reasons) == row.health_reason {
-                d.health_reasons = reasons;
-            }
         }
     }
     Live {
@@ -2230,6 +2221,8 @@ struct LeafRegrade {
     leaf: Option<String>,
     health: String,
     reason: String,
+    /// `reason` as codes, for the alert's coded detail.
+    reasons: Vec<NasHealthReason>,
 }
 
 /// One inventory pass's regrade of one disk by its leaf state.
@@ -2274,6 +2267,7 @@ fn regrade_leaf(
         leaf,
         health,
         reason,
+        reasons: live.disk.health_reasons.clone(),
     })
 }
 
@@ -2303,7 +2297,7 @@ fn settle_leaf_alerts(db: &DbPool, regrades: Vec<LeafRegrade>) -> Vec<(LeafRegra
     regrades
         .into_iter()
         .filter_map(|r| {
-            write_health_alert(db, &r.disk_id, &r.health, &r.reason)
+            write_health_alert(db, &r.disk_id, &r.health, &r.reason, &r.reasons)
                 .err()
                 .map(|e| (r, e))
         })
@@ -2324,10 +2318,16 @@ fn settle_leaf_alerts(db: &DbPool, regrades: Vec<LeafRegrade>) -> Vec<(LeafRegra
 ///
 /// The SMART pass writes through here too: after a failed write the shown
 /// grade it would otherwise move from is not what the table holds either.
-fn write_health_alert(db: &DbPool, disk_id: &str, health: &str, reason: &str) -> Result<()> {
+fn write_health_alert(
+    db: &DbPool,
+    disk_id: &str,
+    health: &str,
+    reason: &str,
+    reasons: &[NasHealthReason],
+) -> Result<()> {
     let open = store::open_alert_severity(db, &health_alert_key(disk_id))?;
     let from = open.as_deref().unwrap_or("ok");
-    sync_health_alert(db, disk_id, from, health, reason)
+    sync_health_alert(db, disk_id, from, health, reason, reasons)
 }
 
 fn health_alert_key(disk_id: &str) -> String {
@@ -2449,21 +2449,21 @@ fn settle_smart_read(
 ) {
     // SMART's verdict is what persists: the leaf state is re-read on every
     // inventory pass, and a stored FAULTED would outlive the fault across a
-    // restart. Its sentence, not its codes: `nas_disks` has no column for
-    // them, and `live_from_persisted` re-derives them from this document.
-    let smart_reason = disk_reasons_text(&smart_reasons);
-    if let Err(e) = store::store_smart(db, id, &doc.to_string(), smart_health, &smart_reason) {
+    // restart. Its sentence AND its codes, in one statement, so a restart
+    // shows the codes this read measured (`live_from_persisted`).
+    if let Err(e) = store::store_smart(db, id, &doc.to_string(), smart_health, &smart_reasons) {
         tracing::warn!("tentanas: SMART verdict of disk {id} not stored: {e}");
     }
-    let (health, reason) = {
+    let (health, reason, reasons) = {
         let mut st = cell.write();
         let Some(live) = st.disks.get_mut(id) else { return };
         apply_summary(&mut live.disk, &summary);
         live.disk.smart_read_at = Some(store::now());
         live.smart = summary;
-        apply_smart_verdict(live, smart_health, smart_reasons)
+        let (health, reason) = apply_smart_verdict(live, smart_health, smart_reasons);
+        (health, reason, live.disk.health_reasons.clone())
     };
-    if let Err(e) = write_health_alert(db, id, &health, &reason) {
+    if let Err(e) = write_health_alert(db, id, &health, &reason, &reasons) {
         tracing::warn!("tentanas: health alert of disk {id} not written, retried next pass: {e}");
         if let Some(live) = cell.write().disks.get_mut(id) {
             live.alert_settled = false;
@@ -2573,7 +2573,38 @@ pub(super) fn smartctl_failure_detail(out: &broker::CommandOutput) -> String {
     }
 }
 
-fn sync_health_alert(db: &DbPool, disk_id: &str, previous: &str, health: &str, reason: &str) -> Result<()> {
+/// The disk's health alert (code 'disk_health', see `NasAlert::code`): the
+/// grade and the name as parameters, the reasons as coded lines. The English
+/// title and detail are written beside them for forwarding and the tooltip.
+fn health_alert_text(
+    health: &str,
+    name: &ShownDiskName,
+    reason: &str,
+    reasons: &[NasHealthReason],
+) -> store::AlertText {
+    let (title, source, shown) = match name {
+        ShownDiskName::Live(name) => (format!("Disk {name}: {health}"), "live", Some(name)),
+        ShownDiskName::LastKnown(name) => (format!("Disk last seen as {name}: {health}"), "last_known", Some(name)),
+        ShownDiskName::Unknown => (format!("Disk: {health}"), "unknown", None),
+    };
+    let text = store::AlertText::new("disk_health", title, reason)
+        .param("health", health)
+        .param("name_source", source)
+        .reasons(reasons.to_vec());
+    match shown {
+        Some(name) => text.param("name", name),
+        None => text,
+    }
+}
+
+fn sync_health_alert(
+    db: &DbPool,
+    disk_id: &str,
+    previous: &str,
+    health: &str,
+    reason: &str,
+    reasons: &[NasHealthReason],
+) -> Result<()> {
     let key = health_alert_key(disk_id);
     match health {
         "critical" | "warning" => {
@@ -2586,12 +2617,8 @@ fn sync_health_alert(db: &DbPool, disk_id: &str, previous: &str, health: &str, r
             // inventory is exactly the one whose alert matters most: it is
             // titled by the name it was last seen under, said as such, and
             // never by its id — which stays the alert's subject, not its text.
-            let title = match shown_disk_name(db, disk_id, None) {
-                ShownDiskName::Live(name) => format!("Disk {name}: {health}"),
-                ShownDiskName::LastKnown(name) => format!("Disk last seen as {name}: {health}"),
-                ShownDiskName::Unknown => format!("Disk: {health}"),
-            };
-            store::raise_alert(db, &key, health, "disk", disk_id, &title, reason)?;
+            let text = health_alert_text(health, &shown_disk_name(db, disk_id, None), reason, reasons);
+            store::raise_coded_alert(db, &key, health, "disk", disk_id, &text)?;
         }
         _ => store::resolve_alert(db, &key)?,
     }
@@ -4010,7 +4037,7 @@ mod tests {
         assert_eq!(health, "warning");
         assert_eq!(
             codes(&reasons),
-            vec![code("reallocated", &[("count", "3")]), code("temperature_high", &[("celsius", "70")])]
+            vec![code("reallocated", &[("count", "3")]), code("temperature_high", &[("celsius", "70"), ("limit", "65")])]
         );
         assert_eq!(disk_reasons_text(&reasons), "3 reallocated sectors; 70°C");
         // No verdict at all is a code too; a healthy drive has none.
@@ -4037,50 +4064,98 @@ mod tests {
         assert_eq!((g.health.as_str(), g.reasons), ("warning", smart));
     }
 
-    /// A restart has the stored sentence but no stored codes. They come back
-    /// from the stored SMART document only when grading it again says
-    /// exactly what the row says; otherwise the disk carries no codes (the
-    /// screen shows the grade) rather than codes the node did not measure.
-    #[test]
-    fn a_restart_rederives_the_codes_only_when_they_reproduce_the_stored_sentence() {
+    /// A restart shows the codes the last SMART read MEASURED: `store_smart`
+    /// writes them beside the sentence, and the first inventory pass of a new
+    /// process (an empty live state) seeds the disk from that row. The
+    /// week-old sample moved on since the read — which made the old
+    /// re-derivation drop the codes — and changes nothing now.
+    #[tokio::test]
+    async fn a_restart_keeps_the_reason_codes_the_last_smart_read_stored() {
+        let db = leaf_db(true);
+        let disk = NasDisk { disk_id: "wwn-leaf".to_string(), name: "sde".to_string(), ..used_disk() };
+        store::upsert_disk_seen(
+            &db,
+            &DiskIdentity {
+                disk_id: &disk.disk_id,
+                name: &disk.name,
+                model: &disk.model,
+                serial: &disk.serial,
+                wwn: disk.wwn.as_deref(),
+                size_bytes: disk.size_bytes,
+                kind: &disk.kind,
+            },
+        )
+        .unwrap();
+        let measured = vec![
+            coded_reason("reallocated", &[("count", "8".to_string())]),
+            coded_reason("crc_errors", &[("count", "3".to_string())]),
+        ];
         let doc = serde_json::json!({
             "smart_status": {"passed": true},
-            "temperature": {"current": 41},
             "ata_smart_attributes": {"table": [
                 {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100, "thresh": 10, "when_failed": "", "raw": {"value": 8, "string": "8"}},
                 {"id": 199, "name": "UDMA_CRC_Error_Count", "value": 200, "worst": 200, "thresh": 0, "when_failed": "", "raw": {"value": 3, "string": "3"}}
             ]}
         });
-        let row = store::DiskRow {
-            disk_id: "wwn-leaf".to_string(),
-            first_seen_at: "2026-09-01T00:00:00Z".to_string(),
-            last_seen_at: "2026-09-22T00:00:00Z".to_string(),
-            smart_json: Some(doc.to_string()),
-            smart_read_at: Some("2026-09-22T00:00:00Z".to_string()),
-            health: "warning".to_string(),
-            health_reason: "8 reallocated sectors; 3 UDMA CRC errors (cable/backplane)".to_string(),
-        };
-        let disk = || NasDisk { disk_id: "wwn-leaf".to_string(), name: "sde".to_string(), ..used_disk() };
+        store::store_smart(&db, "wwn-leaf", &doc.to_string(), "warning", &measured).unwrap();
+        // The week-old sample has moved on: grading the document again
+        // would now say "growing", which the read did not.
+        let week_ago = (chrono::Utc::now() - chrono::Duration::days(8)).format("%Y-%m-%dT%H:%M:00Z").to_string();
+        store::insert_samples(
+            &db,
+            &[SampleInsert {
+                disk_id: "wwn-leaf",
+                at: &week_ago,
+                temperature_c: None,
+                reallocated: Some(2),
+                pending: None,
+                crc_errors: None,
+                media_errors: None,
+                read_bps: 0,
+                write_bps: 0,
+                await_ms: 0.0,
+            }],
+        )
+        .unwrap();
 
-        let live = live_from_persisted(disk(), Some(&row), Some(8));
+        // The restart: a process with nothing live meets the disk.
+        let cell = RwLock::new(State::new());
+        let gate = tokio::sync::Mutex::new(());
+        let found = disk.clone();
+        inventory_pass(&db, &cell, &gate, move || async move {
+            Ok::<InventoryRead, anyhow::Error>((vec![found], HashMap::new(), None))
+        })
+        .await
+        .unwrap();
+        let st = cell.read();
+        let live = &st.disks["wwn-leaf"];
+        assert_eq!(live.disk.health, "warning");
         assert_eq!(
             codes(&live.disk.health_reasons),
             vec![code("reallocated", &[("count", "8")]), code("crc_errors", &[("count", "3")])]
         );
+        assert_eq!(live.disk.health_reason, "8 reallocated sectors; 3 UDMA CRC errors (cable/backplane)");
         assert_eq!(live.smart_reasons, live.disk.health_reasons, "SMART's codes are kept for the regrade");
+        assert_eq!(live.disk.reallocated_sectors, Some(8), "the stored document still fills the counters");
+    }
 
-        // The week-old sample moved on since the row was written: grading the
-        // document again would say "growing", which the row does not.
-        let moved = live_from_persisted(disk(), Some(&row), Some(2));
-        assert!(moved.disk.health_reasons.is_empty(), "{:?}", moved.disk.health_reasons);
-        assert_eq!(moved.disk.health_reason, row.health_reason, "the stored sentence stays the tooltip");
-        assert_eq!(moved.disk.health, "warning");
-
-        // And a FAULTED regrade on top of no codes still leads with its own.
-        let mut moved = moved;
-        let regrade = regrade_leaf(&mut moved, Some(&leaves("faulted"))).expect("a change");
-        assert_eq!(regrade.reason, format!("ZFS reports this disk FAULTED; {}", row.health_reason));
-        assert_eq!(codes(&moved.disk.health_reasons), vec![code("zfs_faulted", &[])]);
+    /// A row stored before migration 21 has the sentence and '[]'. The disk
+    /// comes back with no codes — the screen shows the translated grade with
+    /// the sentence as its tooltip — and a FAULTED regrade on top of it still
+    /// leads with its own code.
+    #[test]
+    fn a_restart_over_a_row_without_codes_shows_no_codes_rather_than_guessed_ones() {
+        let mut live = restarted_live("warning", "8 reallocated sectors; 3 UDMA CRC errors (cable/backplane)");
+        assert!(live.disk.health_reasons.is_empty(), "{:?}", live.disk.health_reasons);
+        assert_eq!(live.disk.health_reason, "8 reallocated sectors; 3 UDMA CRC errors (cable/backplane)");
+        assert_eq!(live.disk.health, "warning");
+        let regrade = regrade_leaf(&mut live, Some(&leaves("faulted"))).expect("a change");
+        assert_eq!(
+            regrade.reason,
+            "ZFS reports this disk FAULTED; 8 reallocated sectors; 3 UDMA CRC errors (cable/backplane)"
+        );
+        assert_eq!(codes(&live.disk.health_reasons), vec![code("zfs_faulted", &[])]);
+        assert_eq!(regrade.reasons, live.disk.health_reasons, "the alert gets the codes the disk shows");
     }
 
     // ----- regrading by the ZFS leaf state -----------------------------------------
@@ -4097,8 +4172,10 @@ mod tests {
             smart_read_at: Some("2026-09-22T00:00:00Z".to_string()),
             health: smart_health.to_string(),
             health_reason: smart_reason.to_string(),
+            // A row from before migration 21: the sentence, no codes.
+            health_reasons: Vec::new(),
         };
-        live_from_persisted(disk, Some(&row), None)
+        live_from_persisted(disk, Some(&row))
     }
 
     fn leaves(state: &str) -> HashMap<String, String> {
@@ -4206,6 +4283,11 @@ mod tests {
         assert_ne!(raised.raised_at, "2026-09-01T00:00:00Z");
         assert_eq!(raised.acked_at, None);
         assert_eq!(raised.detail, "ZFS reports this disk FAULTED; 3 reallocated sectors");
+        // And as codes: the grade the row was raised at, the pool's verdict
+        // as its coded line (the restarted row had no SMART codes).
+        assert_eq!(raised.code, "disk_health");
+        assert_eq!(raised.params.get("health").map(String::as_str), Some("critical"));
+        assert_eq!(codes(&raised.reasons), vec![code("zfs_faulted", &[])]);
         let all = store::alerts_for_subject(&db, "disk", "wwn-leaf").unwrap();
         assert_eq!(all.iter().filter(|a| a.resolved_at.is_none()).count(), 1);
         assert!(all.iter().any(|a| a.alert_id == old.alert_id && a.resolved_at.is_some()));
@@ -4419,7 +4501,7 @@ mod tests {
             },
         )
         .unwrap();
-        store::store_smart(&db, "wwn-leaf", "{}", "ok", "").unwrap();
+        store::store_smart(&db, "wwn-leaf", "{}", "ok", &[]).unwrap();
 
         let disk = &disk;
         let reading = move |state: &str| -> Result<InventoryRead> {
@@ -4496,7 +4578,8 @@ mod tests {
             .unwrap()
         };
         seen(&disk);
-        store::store_smart(&db, "wwn-leaf", "{}", "warning", "8 reallocated sectors").unwrap();
+        store::store_smart(&db, "wwn-leaf", "{}", "warning", &[coded_reason("reallocated", &[("count", "8".to_string())])])
+            .unwrap();
         let reading = |disks: Vec<NasDisk>| {
             move || async move { Ok::<InventoryRead, anyhow::Error>((disks, HashMap::new(), None)) }
         };
@@ -5053,7 +5136,8 @@ mod tests {
         )
         .expect("record the disk");
         assert!(disk_name(id).is_none(), "the disk is not in the live inventory");
-        sync_health_alert(&db, id, "ok", "warning", "2 reallocated sectors").expect("raise");
+        let reasons = [coded_reason("reallocated", &[("count", "2".to_string())])];
+        sync_health_alert(&db, id, "ok", "warning", "2 reallocated sectors", &reasons).expect("raise");
         let alert = store::list_alerts(&db, false)
             .expect("alerts")
             .into_iter()
@@ -5061,16 +5145,29 @@ mod tests {
             .expect("the alert is raised");
         assert_eq!(alert.title, "Disk last seen as sdq: warning");
         assert!(!alert.title.contains("wwn-"), "{}", alert.title);
+        // The same, as the codes a screen words: the name as last known.
+        assert_eq!(alert.code, "disk_health");
+        assert_eq!(
+            alert.params.clone().into_iter().collect::<Vec<_>>(),
+            vec![
+                ("health".to_string(), "warning".to_string()),
+                ("name".to_string(), "sdq".to_string()),
+                ("name_source".to_string(), "last_known".to_string()),
+            ]
+        );
+        assert_eq!(alert.reasons, reasons.to_vec());
 
         // A disk the node never recorded: still never the id.
         let unknown = "wwn-never-recorded-5000cca27dc7a4c7";
-        sync_health_alert(&db, unknown, "ok", "critical", "8 reallocated sectors").expect("raise");
+        sync_health_alert(&db, unknown, "ok", "critical", "8 reallocated sectors", &[]).expect("raise");
         let alert = store::list_alerts(&db, false)
             .expect("alerts")
             .into_iter()
             .find(|a| a.subject_id == unknown)
             .expect("the alert is raised");
         assert_eq!(alert.title, "Disk: critical");
+        assert_eq!(alert.params.get("name_source").map(String::as_str), Some("unknown"));
+        assert!(!alert.params.contains_key("name"), "no name, and never the id: {:?}", alert.params);
     }
 
     #[test]

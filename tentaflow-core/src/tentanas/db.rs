@@ -10,8 +10,8 @@
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tentaflow_protocol::tentanas::{
-    NasAccessEvent, NasAlert, NasDiskSample, NasJob, NasNfsOptions, NasSchedule, NasShareAccess,
-    NasShareUser, NasSmartSchedule, NasSmbOptions, NasSnapshotSchedule, NasTargetLun,
+    NasAccessEvent, NasAlert, NasDiskSample, NasHealthReason, NasJob, NasNfsOptions, NasSchedule,
+    NasShareAccess, NasShareUser, NasSmartSchedule, NasSmbOptions, NasSnapshotSchedule, NasTargetLun,
     NasTargetPortGroup, NasTargetPortal,
 };
 
@@ -827,6 +827,69 @@ const MIGRATIONS: &[(i64, &str)] = &[(
     CREATE INDEX nas_share_users_org ON nas_share_users(org_id);
     CREATE INDEX nas_targets_org ON nas_targets(org_id);
     CREATE INDEX nas_access_events_org ON nas_access_events(org_id, at DESC);",
+), (
+    21,
+    // Codes instead of English (M1). The screens word a disk's health and an
+    // alert in the reader's language from a code and its parameters; the
+    // English columns stay as the tooltip, the forwarded syslog/webhook text,
+    // and what an older build reads.
+    //
+    // `nas_disks.health_reasons` is SMART's verdict as `NasHealthReason[]`
+    // JSON, written beside `health_reason` by the same statement. Before it a
+    // restart could only re-derive the codes from the stored document, and
+    // lost them whenever the week-old sample had moved on. Old rows get '[]':
+    // the screen shows the translated grade with the stored sentence as its
+    // tooltip until the next SMART read writes both.
+    //
+    // `nas_alerts.code` / `params` (JSON object of strings) / `reasons`
+    // (`NasHealthReason[]` JSON): see `NasAlert`. Old rows are backfilled
+    // only where the code follows from structured columns alone, never from
+    // the English text:
+    //   * a parked approval's alert — its request row names the operation
+    //     and the subject;
+    //   * a disk's health alert — its severity IS the grade. An OPEN row is
+    //     named by the disk row's name, marked 'last_known': every raise of
+    //     an open row rewrote it with the name the disk had then, the disk row
+    //     keeps the name it was last seen under, and nothing here proves the
+    //     disk is still present (the first inventory pass after the upgrade
+    //     rewrites a present disk's alert with its live name and reasons). A
+    //     RESOLVED row gets no name ('unknown'): sdX names move between
+    //     reboots, so today's name of its disk is not the name it was raised
+    //     under, and no structured column kept that one (its English title is
+    //     not parsed). No reasons are backfilled: the detail sentence is not
+    //     parsed back into codes either.
+    //   * the node-wide target sweep alert ('targets:reconcile'), OPEN AND
+    //     RESOLVED: an older build wrote "{name}: {error}" for every failing
+    //     target of every organisation into this row, which every tenant
+    //     lists (`alerts_for_subject` returns resolved rows too). Its text is
+    //     replaced by the neutral one `targets::rewrite_stale_sweep_alert`
+    //     gives an open row at startup — the same title and detail, byte for
+    //     byte (a test pins them to targets.rs) — and coded
+    //     'targets_sweep_stale': no count that anyone measured.
+    // Every other row keeps code '' and is shown as an uncoded alert.
+    "ALTER TABLE nas_disks ADD COLUMN health_reasons TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE nas_alerts ADD COLUMN code TEXT NOT NULL DEFAULT '';
+    ALTER TABLE nas_alerts ADD COLUMN params TEXT NOT NULL DEFAULT '{}';
+    ALTER TABLE nas_alerts ADD COLUMN reasons TEXT NOT NULL DEFAULT '[]';
+    UPDATE nas_alerts SET code = 'approval_pending',
+           params = (SELECT json_object('operation', p.operation, 'subject', p.subject)
+                       FROM nas_pending_approvals p WHERE p.request_id = nas_alerts.subject_id)
+     WHERE subject_kind = 'approval'
+       AND EXISTS (SELECT 1 FROM nas_pending_approvals p WHERE p.request_id = nas_alerts.subject_id);
+    UPDATE nas_alerts SET code = 'disk_health',
+           params = COALESCE(
+               (SELECT json_object('health', nas_alerts.severity, 'name', d.name, 'name_source', 'last_known')
+                  FROM nas_disks d WHERE d.disk_id = nas_alerts.subject_id AND trim(d.name) <> ''
+                   AND nas_alerts.resolved_at IS NULL),
+               json_object('health', nas_alerts.severity, 'name_source', 'unknown'))
+     WHERE subject_kind = 'disk'
+       AND dedupe_key = 'disk:' || subject_id || ':health'
+       AND severity IN ('warning', 'critical');
+    UPDATE nas_alerts SET code = 'targets_sweep_stale', params = '{}', reasons = '[]',
+           title = 'Block targets: this node cannot reach the state it decided on',
+           detail = 'block targets on this node were not in the state it decided on before it restarted; \
+the next reconcile replaces this with the current count'
+     WHERE dedupe_key = 'targets:reconcile';",
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -938,6 +1001,11 @@ pub struct DiskRow {
     pub smart_read_at: Option<String>,
     pub health: String,
     pub health_reason: String,
+    /// SMART's verdict as codes, the ones `health_reason` is the sentence
+    /// of (migration 21). Empty for a row written before the column existed,
+    /// and for one whose JSON does not parse — no codes is an honest gap (the
+    /// screen shows the grade), a guessed code is not.
+    pub health_reasons: Vec<NasHealthReason>,
 }
 
 pub struct DiskIdentity<'a> {
@@ -980,10 +1048,11 @@ pub fn disk_row(pool: &DbPool, disk_id: &str) -> Result<Option<DiskRow>> {
     Ok(conn
         .query_row(
             "SELECT disk_id, first_seen_at, last_seen_at, smart_json, smart_read_at,
-                    health, health_reason
+                    health, health_reason, health_reasons
              FROM nas_disks WHERE disk_id = ?1",
             params![disk_id],
             |r| {
+                let reasons: String = r.get(7)?;
                 Ok(DiskRow {
                     disk_id: r.get(0)?,
                     first_seen_at: r.get(1)?,
@@ -992,6 +1061,7 @@ pub fn disk_row(pool: &DbPool, disk_id: &str) -> Result<Option<DiskRow>> {
                     smart_read_at: r.get(4)?,
                     health: r.get(5)?,
                     health_reason: r.get(6)?,
+                    health_reasons: serde_json::from_str(&reasons).unwrap_or_default(),
                 })
             },
         )
@@ -1012,27 +1082,24 @@ pub fn disk_last_name(pool: &DbPool, disk_id: &str) -> Result<Option<String>> {
         .filter(|name| !name.is_empty()))
 }
 
+/// Stores one SMART read: the document, SMART's grade, and its reasons both
+/// as the English sentence and as codes. One statement, so a restart never
+/// reads a sentence and codes from two different reads.
 pub fn store_smart(
     pool: &DbPool,
     disk_id: &str,
     smart_json: &str,
     health: &str,
-    health_reason: &str,
+    health_reasons: &[NasHealthReason],
 ) -> Result<()> {
+    let health_reason = super::disks::disk_reasons_text(health_reasons);
+    let reasons_json = serde_json::to_string(health_reasons)?;
     let conn = write(pool)?;
     conn.execute(
-        "UPDATE nas_disks SET smart_json = ?2, smart_read_at = ?3, health = ?4, health_reason = ?5
+        "UPDATE nas_disks SET smart_json = ?2, smart_read_at = ?3, health = ?4, health_reason = ?5,
+                              health_reasons = ?6
          WHERE disk_id = ?1",
-        params![disk_id, smart_json, now(), health, health_reason],
-    )?;
-    Ok(())
-}
-
-pub fn store_health(pool: &DbPool, disk_id: &str, health: &str, reason: &str) -> Result<()> {
-    let conn = write(pool)?;
-    conn.execute(
-        "UPDATE nas_disks SET health = ?2, health_reason = ?3 WHERE disk_id = ?1",
-        params![disk_id, health, reason],
+        params![disk_id, smart_json, now(), health, health_reason, reasons_json],
     )?;
     Ok(())
 }
@@ -1204,7 +1271,24 @@ pub fn prune_samples(pool: &DbPool) -> Result<usize> {
 
 // ----- alerts ------------------------------------------------------------------
 
+/// A column of JSON the node wrote itself (`params`, `reasons`), read back
+/// leniently: a row that does not parse loses its codes and is shown as an
+/// uncoded alert — its English title and detail are still there — rather
+/// than failing the whole alert list over one row.
 fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasAlert> {
+    let code: String = r.get(9)?;
+    let params: String = r.get(10)?;
+    let reasons: String = r.get(11)?;
+    // A code without its parameters would be worded with holes, so an
+    // unparsable row is uncoded as a whole.
+    let parsed = (
+        serde_json::from_str::<BTreeMap<String, String>>(&params),
+        serde_json::from_str::<Vec<NasHealthReason>>(&reasons),
+    );
+    let (code, params, reasons) = match parsed {
+        (Ok(params), Ok(reasons)) => (code, params, reasons),
+        _ => (String::new(), BTreeMap::new(), Vec::new()),
+    };
     Ok(NasAlert {
         alert_id: r.get(0)?,
         severity: r.get(1)?,
@@ -1215,11 +1299,45 @@ fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasAlert> {
         raised_at: r.get(6)?,
         acked_at: r.get(7)?,
         resolved_at: r.get(8)?,
+        code,
+        params,
+        reasons,
     })
 }
 
 const ALERT_COLUMNS: &str = "alert_id, severity, subject_kind, subject_id, title, detail, \
-                             raised_at, acked_at, resolved_at";
+                             raised_at, acked_at, resolved_at, code, params, reasons";
+
+/// What an alert says, in both forms: a code with parameters (and coded
+/// detail lines) that the screens word in the reader's language, and the
+/// node's own English title and detail — the text syslog and webhook
+/// forwarding send (machine-facing), what an older build shows, and the
+/// tooltip. Every raiser fills both, so neither reader is left without.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlertText {
+    pub code: String,
+    pub params: BTreeMap<String, String>,
+    pub reasons: Vec<NasHealthReason>,
+    pub title: String,
+    pub detail: String,
+}
+
+impl AlertText {
+    pub fn new(code: &str, title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { code: code.to_string(), title: title.into(), detail: detail.into(), ..Self::default() }
+    }
+
+    /// One parameter, in its decimal or wire spelling (`NasAlert::params`).
+    pub fn param(mut self, key: &str, value: impl ToString) -> Self {
+        self.params.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    pub fn reasons(mut self, reasons: Vec<NasHealthReason>) -> Self {
+        self.reasons = reasons;
+        self
+    }
+}
 
 /// The organisation an alert belongs to, as an SQL expression over two
 /// `raise_alert` parameters: `kind` names the subject kind's placeholder and
@@ -1280,15 +1398,27 @@ const VISIBLE_TO_ORG_SQL: &str = "(org_id IS NULL OR (org_id = ?1 AND ?1 <> ''))
 /// "since" time must be B's, not A's. Neither is touched when the owner is
 /// unchanged, which is why the CASE compares the OLD `org_id` (read before
 /// this statement's own SET runs) against the freshly computed owner.
-pub fn raise_alert(
+///
+/// The SUBJECT is refreshed too. The dedupe key is what identifies the
+/// condition (a target's alert is keyed by its id), while `subject_id` is the
+/// name it is shown and owned by: a target renamed while its alert is open
+/// must not keep naming — and being owned through — the old name.
+///
+/// The CODES are part of the text (migration 21): a refresh rewrites `code`,
+/// `params` and `reasons` with the English, and a change in any of them is
+/// a reason to refresh — the first pass after an upgrade codes an open row
+/// whose English did not change at all. `params` is a `BTreeMap`, so its
+/// JSON is written in one key order and equal parameters compare equal.
+pub fn raise_coded_alert(
     pool: &DbPool,
     dedupe_key: &str,
     severity: &str,
     subject_kind: &str,
     subject_id: &str,
-    title: &str,
-    detail: &str,
+    text: &AlertText,
 ) -> Result<bool> {
+    let params_json = serde_json::to_string(&text.params)?;
+    let reasons_json = serde_json::to_string(&text.reasons)?;
     let conn = write(pool)?;
     let owner = alert_owner_sql("?5", "?6");
     // Bound once and reused for the refresh's `raised_at` below: the insert
@@ -1298,12 +1428,25 @@ pub fn raise_alert(
     let updated = conn.execute(
         &format!(
             "UPDATE nas_alerts SET severity = ?2, title = ?3, detail = ?4, org_id = ({owner}),
+                 subject_id = ?6, code = ?8, params = ?9, reasons = ?10,
                  acked_at = CASE WHEN org_id IS NOT ({owner}) THEN NULL ELSE acked_at END,
                  raised_at = CASE WHEN org_id IS NOT ({owner}) THEN ?7 ELSE raised_at END
              WHERE dedupe_key = ?1 AND resolved_at IS NULL
-               AND (severity <> ?2 OR title <> ?3 OR detail <> ?4 OR org_id IS NOT ({owner}))"
+               AND (severity <> ?2 OR title <> ?3 OR detail <> ?4 OR org_id IS NOT ({owner})
+                    OR subject_id <> ?6 OR code <> ?8 OR params <> ?9 OR reasons <> ?10)"
         ),
-        params![dedupe_key, severity, title, detail, subject_kind, subject_id, refresh_now],
+        params![
+            dedupe_key,
+            severity,
+            text.title,
+            text.detail,
+            subject_kind,
+            subject_id,
+            refresh_now,
+            text.code,
+            params_json,
+            reasons_json
+        ],
     )?;
     if updated == 1 {
         return Ok(false);
@@ -1315,8 +1458,8 @@ pub fn raise_alert(
         &format!(
             "INSERT OR IGNORE INTO nas_alerts
                 (alert_id, severity, subject_kind, subject_id, title, detail, raised_at, dedupe_key,
-                 org_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {})",
+                 org_id, code, params, reasons)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {}, ?9, ?10, ?11)",
             alert_owner_sql("?3", "?4")
         ),
         params![
@@ -1324,13 +1467,33 @@ pub fn raise_alert(
             severity,
             subject_kind,
             subject_id,
-            title,
-            detail,
+            text.title,
+            text.detail,
             now(),
-            dedupe_key
+            dedupe_key,
+            text.code,
+            params_json,
+            reasons_json
         ],
     )?;
     Ok(inserted == 1)
+}
+
+/// `raise_coded_alert` with no code: English only, shown by the screens as
+/// an uncoded alert (a generic translated title, the text as its tooltip).
+/// For tests that only care about the row's lifecycle, and compiled for
+/// nothing else: a production raiser has to word its alert as a code.
+#[cfg(test)]
+pub fn raise_alert(
+    pool: &DbPool,
+    dedupe_key: &str,
+    severity: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    title: &str,
+    detail: &str,
+) -> Result<bool> {
+    raise_coded_alert(pool, dedupe_key, severity, subject_kind, subject_id, &AlertText::new("", title, detail))
 }
 
 pub fn resolve_alert(pool: &DbPool, dedupe_key: &str) -> Result<()> {
@@ -5649,10 +5812,14 @@ pub fn upsert_share_user(pool: &DbPool, org_id: &str, name: &str, description: &
     Ok(())
 }
 
-/// The sentence a delete of a still-granted account is refused with. It
-/// names neither the share nor its organisation: the asking tenant may not
-/// learn either, only that the account is not free to go.
-pub const SHARE_USER_IN_USE_ELSEWHERE: &str = "this account is still in use on this node";
+/// What a delete of a still-granted account is refused with. It names
+/// neither the share nor its organisation: the asking tenant may not learn
+/// either, only that the account is not free to go.
+///
+/// A REFUSAL CODE, not a sentence (M1): it reaches the share-accounts window
+/// as the message of a `bad_request`, and the screen words it in the
+/// reader's language (`errMessage`, format.js).
+pub const SHARE_USER_IN_USE_ELSEWHERE: &str = "refusal:share_user_in_use_elsewhere";
 
 /// `?1` = account name, `?2` = the org asking. One statement for the
 /// read-only check and the in-transaction guard, so they cannot disagree.
@@ -9851,5 +10018,303 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unowned, 0, "every legacy row has an owner that can manage it");
+    }
+
+    // ----- migration 21: codes instead of English -----------------------------
+
+    /// Rows raised before migration 21 are coded only where the code follows
+    /// from structured columns: a parked request's alert from its request
+    /// row, a disk's health alert from its severity and the disk's recorded
+    /// name — as LAST KNOWN, since nothing proves the disk is still there.
+    /// Everything else stays uncoded ('' / '{}' / '[]') and is shown as such;
+    /// no English sentence is parsed back into a code.
+    #[test]
+    fn migration_21_backfills_alert_codes_only_from_structured_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..20]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_disks (disk_id,name,model,serial,size_bytes,kind,first_seen_at,last_seen_at,
+                                    health,health_reason) VALUES
+               ('wwn-a','sdq','HGST','S1',1,'hdd','2026-09-01T00:00:00Z','2026-09-22T00:00:00Z',
+                'warning','8 reallocated sectors');
+             INSERT INTO nas_pending_approvals (request_id,operation,subject,detail,payload_json,status,
+                                                org_id,addon_id,requested_by,requested_at,expires_at) VALUES
+               ('req-1','pool_destroy','tank','destroys the pool','{}','pending','org-a','nas','u',
+                '2026-09-22T00:00:00Z','2026-09-23T00:00:00Z');
+             INSERT INTO nas_alerts (alert_id,severity,subject_kind,subject_id,title,detail,raised_at,dedupe_key) VALUES
+               ('a-disk','warning','disk','wwn-a','Disk sdq: warning','8 reallocated sectors','2026-09-22T00:00:00Z','disk:wwn-a:health'),
+               ('a-gone','critical','disk','wwn-b','Disk: critical','ZFS reports this disk FAULTED','2026-09-22T00:00:00Z','disk:wwn-b:health'),
+               ('a-temp','warning','disk','wwn-a','hot','','2026-09-22T00:00:00Z','disk:wwn-a:temp'),
+               ('a-appr','warning','approval','req-1','a red-path operation on ''tank'' waits','x','2026-09-22T00:00:00Z','approval:req-1'),
+               ('a-lost','warning','approval','req-gone','a red-path operation','x','2026-09-22T00:00:00Z','approval:req-gone'),
+               ('a-arr','warning','elastic-array','media','Macierz wymaga interwencji','x','2026-09-22T00:00:00Z','elastic:m:restore');
+             INSERT INTO nas_alerts (alert_id,severity,subject_kind,subject_id,title,detail,raised_at,resolved_at,dedupe_key) VALUES
+               ('a-old','warning','disk','wwn-a','Disk sdy: warning','8 reallocated sectors','2026-09-01T00:00:00Z',
+                '2026-09-02T00:00:00Z','disk:wwn-a:health');",
+        )
+        .unwrap();
+
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+        let p: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let alerts = list_alerts(&p, true).unwrap();
+        let by_id = |id: &str| alerts.iter().find(|a| a.alert_id == id).unwrap_or_else(|| panic!("{id}")).clone();
+        let params = |a: &NasAlert| a.params.clone().into_iter().collect::<Vec<_>>();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+
+        let disk = by_id("a-disk");
+        assert_eq!(disk.code, "disk_health");
+        assert_eq!(
+            params(&disk),
+            vec![pair("health", "warning"), pair("name", "sdq"), pair("name_source", "last_known")]
+        );
+        assert!(disk.reasons.is_empty(), "the English detail is not parsed back into codes");
+        assert_eq!(disk.detail, "8 reallocated sectors", "the English stays as the tooltip");
+
+        let gone = by_id("a-gone");
+        assert_eq!(gone.code, "disk_health");
+        assert_eq!(params(&gone), vec![pair("health", "critical"), pair("name_source", "unknown")]);
+
+        // Wave-4 critic minor 1: a RESOLVED row of the same disk was raised
+        // when the disk was called sdy. Its disk is sdq today, and naming the
+        // old row sdq would be a claim nothing stored; the title is not parsed.
+        let old = alerts_for_subject(&p, "disk", "wwn-a")
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alert_id == "a-old")
+            .expect("the closed row");
+        assert!(old.resolved_at.is_some(), "the premise: a closed row");
+        assert_eq!(old.code, "disk_health");
+        assert_eq!(params(&old), vec![pair("health", "warning"), pair("name_source", "unknown")]);
+        assert_eq!(old.title, "Disk sdy: warning", "the English stays as the tooltip");
+
+        let approval = by_id("a-appr");
+        assert_eq!(approval.code, "approval_pending");
+        assert_eq!(params(&approval), vec![pair("operation", "pool_destroy"), pair("subject", "tank")]);
+
+        for uncoded in ["a-temp", "a-lost", "a-arr"] {
+            let a = by_id(uncoded);
+            assert!(a.code.is_empty() && a.params.is_empty() && a.reasons.is_empty(), "{a:?}");
+            assert!(!a.title.is_empty(), "{uncoded} keeps its text for the fallback");
+        }
+
+        // And a disk row from before the migration has no codes: '[]'.
+        assert!(disk_row(&p, "wwn-a").unwrap().unwrap().health_reasons.is_empty());
+    }
+
+    /// `store_smart` writes the codes beside the sentence it derives from
+    /// them, and `disk_row` reads both back — what a restart seeds from.
+    #[test]
+    fn a_smart_read_stores_its_reason_codes_beside_the_sentence() {
+        let p = pool();
+        upsert_disk_seen(
+            &p,
+            &DiskIdentity {
+                disk_id: "wwn-a",
+                name: "sdq",
+                model: "HGST",
+                serial: "S1",
+                wwn: None,
+                size_bytes: 1,
+                kind: "hdd",
+            },
+        )
+        .unwrap();
+        let reasons = vec![
+            super::super::disks::coded_reason("temperature_over_limit", &[("celsius", "61".into()), ("limit", "55".into())]),
+            super::super::disks::coded_reason("crc_errors", &[("count", "3".into())]),
+        ];
+        store_smart(&p, "wwn-a", "{}", "critical", &reasons).unwrap();
+        let row = disk_row(&p, "wwn-a").unwrap().unwrap();
+        assert_eq!(row.health, "critical");
+        assert_eq!(row.health_reasons, reasons);
+        assert_eq!(row.health_reason, "61°C (over the 55°C limit); 3 UDMA CRC errors (cable/backplane)");
+
+        // A column that does not parse is no codes, not a failed read.
+        p.write().unwrap().execute("UPDATE nas_disks SET health_reasons = 'nope'", []).unwrap();
+        let row = disk_row(&p, "wwn-a").unwrap().unwrap();
+        assert!(row.health_reasons.is_empty());
+        assert_eq!(row.health, "critical");
+    }
+
+    /// The codes are part of an alert's text: an open row raised uncoded (an
+    /// older build) is coded by the next raise even when its English did not
+    /// change, keeping its `raised_at`; an identical raise writes nothing.
+    #[test]
+    fn a_raise_codes_an_open_uncoded_row_in_place_and_an_identical_one_writes_nothing() {
+        let p = pool();
+        assert!(raise_alert(&p, "disk:a:health", "warning", "disk", "a", "Disk sda: warning", "2 pending sectors").unwrap());
+        p.write()
+            .unwrap()
+            .execute("UPDATE nas_alerts SET raised_at = '2026-09-01T00:00:00Z'", [])
+            .unwrap();
+        let text = AlertText::new("disk_health", "Disk sda: warning", "2 pending sectors")
+            .param("health", "warning")
+            .param("name", "sda")
+            .param("name_source", "live")
+            .reasons(vec![super::super::disks::coded_reason("pending_sectors", &[("count", "2".into())])]);
+        assert!(!raise_coded_alert(&p, "disk:a:health", "warning", "disk", "a", &text).unwrap(), "not a new event");
+        let open = list_alerts(&p, true).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].code, "disk_health");
+        assert_eq!(open[0].params.get("name").map(String::as_str), Some("sda"));
+        assert_eq!(open[0].reasons, text.reasons);
+        assert_eq!(open[0].raised_at, "2026-09-01T00:00:00Z", "the condition began when it began");
+
+        // Identical: the refresh matches no row (nothing changed), and the
+        // insert is refused by the open-dedupe index.
+        let changed = |p: &DbPool| p.read().unwrap().query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0)).unwrap();
+        let before = changed(&p);
+        assert!(!raise_coded_alert(&p, "disk:a:health", "warning", "disk", "a", &text).unwrap());
+        assert_eq!(changed(&p), before, "an identical raise writes nothing");
+
+        // A changed parameter alone is a refresh.
+        let hotter = text.clone().param("name_source", "last_known");
+        raise_coded_alert(&p, "disk:a:health", "warning", "disk", "a", &hotter).unwrap();
+        assert_eq!(list_alerts(&p, true).unwrap()[0].params.get("name_source").map(String::as_str), Some("last_known"));
+    }
+
+    /// One row whose coded columns do not parse is listed uncoded — its
+    /// English is still there for the fallback — instead of failing the
+    /// whole list, which would blank the alert table over one row.
+    #[test]
+    fn an_alert_whose_codes_do_not_parse_is_listed_uncoded() {
+        let p = pool();
+        let text = AlertText::new("elastic_sync_held", "Sync wstrzymany", "x").param("array", "media");
+        raise_coded_alert(&p, "elastic:media:repair", "warning", "elastic-array", "media", &text).unwrap();
+        raise_coded_alert(&p, "disk:b:health", "warning", "disk", "b", &AlertText::new("disk_health", "Disk sdb: warning", ""))
+            .unwrap();
+        p.write()
+            .unwrap()
+            .execute("UPDATE nas_alerts SET params = '{broken' WHERE dedupe_key = 'disk:b:health'", [])
+            .unwrap();
+        let alerts = list_alerts(&p, true).unwrap();
+        assert_eq!(alerts.len(), 2);
+        let broken = alerts.iter().find(|a| a.subject_id == "b").unwrap();
+        assert!(broken.code.is_empty() && broken.params.is_empty(), "{broken:?}");
+        assert_eq!(broken.title, "Disk sdb: warning");
+        let fine = alerts.iter().find(|a| a.subject_id == "media").unwrap();
+        assert_eq!(fine.code, "elastic_sync_held");
+    }
+
+    /// Every alert TentaNas raises is coded: no production raiser in the
+    /// files converted by M1 calls the uncoded `raise_alert`, and every code
+    /// they raise is non-empty and documented on `NasAlert::code` — the list
+    /// the screens word.
+    #[test]
+    fn every_alert_kind_tentanas_raises_carries_a_documented_code() {
+        let protocol = include_str!("../../../tentaflow-protocol/src/tentanas.rs");
+        // The doc comment of `NasAlert::code`: from the struct to the field.
+        let start = protocol.find("pub struct NasAlert {").expect("NasAlert");
+        let doc = &protocol[start..];
+        let doc = &doc[..doc.find("pub code: String").expect("the code field")];
+        let sources = [
+            ("disks.rs", include_str!("disks.rs")),
+            ("pools.rs", include_str!("pools.rs")),
+            ("elastic.rs", include_str!("elastic.rs")),
+            ("scheduler.rs", include_str!("scheduler.rs")),
+            ("approvals.rs", include_str!("approvals.rs")),
+            ("fleet.rs", include_str!("fleet.rs")),
+            ("forward.rs", include_str!("forward.rs")),
+            ("shares.rs", include_str!("shares.rs")),
+            ("targets.rs", include_str!("targets.rs")),
+        ];
+        let mut raised = Vec::new();
+        for (file, source) in sources {
+            // Everything above the file's test module (`mod tests {`, or
+            // elastic.rs's `pub(crate) mod tests {`); a lone `#[cfg(test)]`
+            // helper above it is scanned too, which only makes this stricter.
+            let production = source.split("mod tests {").next().unwrap_or(source);
+            assert!(
+                !production.contains("store::raise_alert(") && !production.contains(" raise_alert("),
+                "{file} raises an uncoded alert"
+            );
+            let mut rest = production;
+            while let Some(at) = rest.find("AlertText::new(") {
+                rest = &rest[at + "AlertText::new(".len()..];
+                let code = rest.trim_start().strip_prefix('"').and_then(|r| r.split('"').next()).unwrap_or("");
+                raised.push((file, code.to_string()));
+            }
+        }
+        let codes: std::collections::BTreeSet<&str> = raised.iter().map(|(_, c)| c.as_str()).collect();
+        assert!(codes.len() >= 10, "the scan found the raisers: {raised:?}");
+        for (file, code) in &raised {
+            assert!(!code.is_empty(), "{file} raises an alert with an empty code");
+            assert!(doc.contains(&format!("'{code}'")), "{file}: '{code}' is not documented on NasAlert::code");
+        }
+    }
+
+    /// The node-wide sweep alert ('targets:reconcile') of an older build
+    /// named other organisations' targets in its detail. Migration 21
+    /// rewrites every such row — the RESOLVED ones too, which the disk and
+    /// alert history still returns — to the neutral text the startup rewrite
+    /// in targets.rs gives an open one, and codes it 'targets_sweep_stale'.
+    /// Pinned to targets.rs's own constants, so the two never drift apart.
+    #[test]
+    fn migration_21_scrubs_every_old_node_sweep_alert_to_the_startup_rewrite_text() {
+        /// A `const NAME: &str = "…";` of targets.rs, as the compiler reads
+        /// it (a `\` at a line end drops the newline and the next line's
+        /// leading whitespace).
+        fn targets_const(name: &str) -> String {
+            let source = include_str!("targets.rs");
+            let head = format!("const {name}: &str = \"");
+            let start = source.find(&head).unwrap_or_else(|| panic!("{name} in targets.rs")) + head.len();
+            let literal = &source[start..start + source[start..].find("\";").expect("end of literal")];
+            let mut parts = literal.split("\\\n");
+            let mut out = parts.next().unwrap_or("").to_string();
+            for part in parts {
+                out.push_str(part.trim_start());
+            }
+            out
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..20]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_alerts (alert_id,severity,subject_kind,subject_id,title,detail,raised_at,resolved_at,dedupe_key) VALUES
+               ('s-old','warning','node','targets','Block targets: old wording','vm-ksiegowosc: configfs refused; vm-b: busy',
+                '2026-09-01T00:00:00Z','2026-09-02T00:00:00Z','targets:reconcile'),
+               ('s-open','warning','node','targets','Block targets: old wording','vm-ksiegowosc: configfs refused',
+                '2026-09-03T00:00:00Z',NULL,'targets:reconcile');",
+        )
+        .unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+        let rows: Vec<(String, String, String, String, String, String)> = conn
+            .prepare("SELECT alert_id, title, detail, code, params, raised_at FROM nas_alerts ORDER BY alert_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (id, title, detail, code, params, _) in &rows {
+            assert_eq!(title, &targets_const("SWEEP_ALERT_TITLE"), "{id}");
+            assert_eq!(detail, &targets_const("SWEEP_ALERT_RESTARTED"), "{id}");
+            assert!(!detail.contains("vm-"), "{id}: no target name survives");
+            assert_eq!(code, "targets_sweep_stale", "{id}");
+            assert_eq!(params, "{}", "{id}");
+        }
+        assert_eq!((rows[1].0.as_str(), rows[1].5.as_str()), ("s-open", "2026-09-03T00:00:00Z"), "the open row keeps since when");
+    }
+
+    /// A refresh moves the SUBJECT with the text: the dedupe key identifies
+    /// the condition (a target's alert is keyed by its id), the subject is
+    /// the name it is shown and owned by — a rename must not leave the open
+    /// alert naming, and owned through, the old name. The row stays the
+    /// same row (a rename is not a new event).
+    #[test]
+    fn a_refresh_moves_the_alert_to_its_subjects_new_name() {
+        let p = pool();
+        let text = AlertText::new("target_portal_moved", "Target vm-a: the portal address moved", "")
+            .param("target", "vm-a");
+        assert!(raise_coded_alert(&p, "target:t1:drift", "warning", "target", "vm-a", &text).unwrap());
+        let before = list_alerts(&p, true).unwrap();
+        let renamed = text.clone().param("target", "vm-b");
+        assert!(!raise_coded_alert(&p, "target:t1:drift", "warning", "target", "vm-b", &renamed).unwrap(), "not a new event");
+        let after = list_alerts(&p, true).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].alert_id, before[0].alert_id);
+        assert_eq!(after[0].subject_id, "vm-b");
+        // Even when nothing else changed: the subject alone is a refresh.
+        raise_coded_alert(&p, "target:t1:drift", "warning", "target", "vm-c", &renamed).unwrap();
+        assert_eq!(list_alerts(&p, true).unwrap()[0].subject_id, "vm-c");
     }
 }

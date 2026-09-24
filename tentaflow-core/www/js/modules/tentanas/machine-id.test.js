@@ -15,7 +15,7 @@ import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { isOpaqueId, isDiskIdShape } = await import('./machine-id.js');
+const { isOpaqueId, isDiskIdShape, scrubIds } = await import('./machine-id.js');
 
 // Disk-id shapes: the by-id/by-path prefixes `disks.rs` and `zfs.rs` build
 // disk ids and by-id ZFS leaf basenames from. Valid disk ids, but NOT opaque
@@ -103,4 +103,30 @@ test('empty, null and whitespace-only values are not ids under either rule', () 
     assert.equal(fn(undefined), false);
     assert.equal(fn('   '), false);
   }
+});
+
+// Wave-4 round-2 critic minor 4: the "Treść węzła" section shows a node's
+// own text, and nothing makes that text name things by name. `scrubIds`
+// takes the ids out of it and leaves every name and number a reader needs.
+test('scrubIds replaces the ids in a node\'s free text and keeps the names', () => {
+  const P = '[id]';
+  const uuid = '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70';
+  const nodeId = '9f'.repeat(32);
+  // A helper's transfer path carries the operation's uuid inside a token.
+  assert.equal(
+    scrubIds(`rename failed: /srv/tentanas/elastic/media/data/d1/.tentanas-transfer-${uuid}-3: No space left`, P),
+    `rename failed: /srv/tentanas/elastic/media/data/d1/.tentanas-transfer-${P}-3: No space left`,
+  );
+  // A node id: its name when the caller knows one, the placeholder when not.
+  assert.equal(scrubIds(`forward to ${nodeId} timed out`, P), `forward to ${P} timed out`);
+  assert.equal(scrubIds(`forward to '${nodeId}' timed out`, P, (id) => (id === nodeId ? 'atlas' : '')), "forward to 'atlas' timed out");
+  // Disk ids: a by-id path, a bare wwn with a trailing colon, a ZFS GUID.
+  assert.equal(scrubIds('cannot open /dev/disk/by-id/usb-WD_Elements_25A3-0:0-part1', P), `cannot open /dev/disk/by-id/${P}`);
+  assert.equal(scrubIds('wwn-0x5000c500a1b2c3d4: I/O error', P), `${P}: I/O error`);
+  assert.equal(scrubIds('vdev 11805298034538519219 is UNAVAIL', P), `vdev ${P} is UNAVAIL`);
+  // What stays: kernel names, human names in a disk-id shape, byte counts.
+  const kept = 'sdd, nvme0n1, dm-0, share dev-backups, pool nvme-cache, target pci-store: need 2000398934016 bytes in 2024';
+  assert.equal(scrubIds(kept, P), kept);
+  assert.equal(scrubIds('', P), '');
+  assert.equal(scrubIds(null, P), '');
 });

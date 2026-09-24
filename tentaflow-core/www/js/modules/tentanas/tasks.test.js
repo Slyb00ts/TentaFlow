@@ -129,9 +129,9 @@ test('a viewer sees the toggles disabled and no run/edit actions', async () => {
 // The owner's rule: a machine id is never shown as a name. The node sends an
 // EMPTY `nodeName` when its hostname is unknown (it used to send its 64-hex
 // id); the "node" column of the job history must fall back to the Polish
-// "Węzeł bez nazwy" label — through `nodeLabel` — and keep the id available
-// only as a `title=` tooltip, never as visible text.
-test('the job history node column falls back to "Node bez nazwy" for an unnamed node, with the id in a tooltip', async () => {
+// "Węzeł bez nazwy" label — through `nodeLabel` — and the id is neither
+// visible text nor a `title=` tooltip (no ids anywhere in the GUI).
+test('the job history node column falls back to "Node bez nazwy" for an unnamed node, with no id even as a tooltip', async () => {
   const screen = fakeScreen(fixtures());
   screen.currentNode = () => ({ nodeId: 'node-64hex-abcdef', nodeName: '', isLocal: true });
   const body = mount();
@@ -143,7 +143,7 @@ test('the job history node column falls back to "Node bez nazwy" for an unnamed 
   wrap.innerHTML = history.rows[0].node;
   assert.doesNotMatch(wrap.textContent, /node-64hex-abcdef/, 'the id is not visible text');
   assert.match(wrap.textContent, /Node bez nazwy/);
-  assert.equal(wrap.querySelector('span').getAttribute('title'), 'node-64hex-abcdef');
+  assert.equal(wrap.querySelector('span').getAttribute('title'), null, 'nor the tooltip');
   screen.dispose();
 });
 
@@ -971,6 +971,57 @@ test('every hide-below of the history table is a breakpoint tf-table honours', a
       .filter((c) => c.startsWith('tf-table__col--hide-below-')).map((c) => c.slice('tf-table__col--hide-below-'.length)));
     assert.deepEqual(got, wanted);
     assert.ok(wanted.includes('1024'));
+  } finally {
+    screen.dispose();
+  }
+});
+
+// n15 (backlog 2026-09-21): the protection strip was one `patchHtml` over both
+// columns, so a single "last run" tick rebuilt every row and every chip in it.
+// Rows are keyed now, and a chip that stays a chip keeps its node while its
+// status and label change in place.
+test('a changed schedule patches only its own protection row, in place', async () => {
+  let current = schedules;
+  const screen = fakeScreen(fixtures({ tentaNasSchedulesListRequest: () => current }));
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  try {
+    const body = mount();
+    await drawTasks(screen, body);
+    await flush();
+    const rowOf = (key) => body.querySelector(`#nas-prot [data-prot="${key}"]`);
+    const before = { snap: rowOf('snapshot:tank/home'), scrub: rowOf('scrub:tank'), smart: rowOf('smart') };
+    assert.ok(before.snap && before.scrub && before.smart, 'all three rows are painted');
+    const snapChip = before.snap.querySelector('tf-chip');
+    const protectChip = before.snap.querySelectorAll('tf-chip')[1];
+    const smartChip = before.smart.querySelector('tf-chip');
+    assert.equal(snapChip.getAttribute('label'), 'wyłączony');
+    assert.equal(snapChip.getAttribute('status'), 'warn');
+    assert.ok(protectChip, 'the protected schedule carries a second chip');
+
+    current = {
+      ...schedules,
+      rows: schedules.rows.map((r) => (r.kind === 'snapshot' ? { ...r, enabled: true, lastRunAt: '2026-09-02 02:00:00', lastResult: 'ok' } : r)),
+    };
+    for (const fn of scheduled.splice(0)) await fn();
+    await flush();
+
+    assert.ok(rowOf('snapshot:tank/home') === before.snap, 'the changed row is patched, not rebuilt');
+    assert.ok(rowOf('scrub:tank') === before.scrub, 'the scrub row is untouched');
+    assert.ok(rowOf('smart') === before.smart, 'the SMART row is untouched');
+    assert.ok(before.snap.querySelector('tf-chip') === snapChip, 'the state chip keeps its node');
+    assert.ok(before.snap.querySelectorAll('tf-chip')[1] === protectChip, 'the protection chip keeps its node');
+    assert.ok(before.smart.querySelector('tf-chip') === smartChip);
+    assert.equal(snapChip.getAttribute('status'), 'ok');
+    assert.match(snapChip.getAttribute('label'), /^ostatni/);
+
+    // Dropping the schedule takes its row with it and brings the "none" row.
+    current = { ...schedules, rows: schedules.rows.filter((r) => r.kind !== 'snapshot') };
+    for (const fn of scheduled.splice(0)) await fn();
+    await flush();
+    assert.equal(rowOf('snapshot:tank/home'), null);
+    assert.ok(rowOf('snapshot:none'), 'the empty state row replaces it');
+    assert.ok(rowOf('scrub:tank') === before.scrub, 'the other column is still untouched');
   } finally {
     screen.dispose();
   }

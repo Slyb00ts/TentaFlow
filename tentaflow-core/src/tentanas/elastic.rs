@@ -937,29 +937,101 @@ pub fn conflict_alert_key(array: &str) -> String {
 /// What the conflict alert says, or `None` when there is nothing to say: one
 /// line per file, naming where clients see it and where the other version is.
 /// The alert stands for as long as the helper still finds a second version.
-pub fn conflict_alert(conflicts: &[ElasticConflict]) -> Option<(String, String)> {
+///
+/// Coded 'elastic_conflict' {array, count}, with one 'conflict_file'
+/// {path, visible, kept_kind, kept_disk?} line per file: the paths are data,
+/// the sentence around them is the screen's.
+///
+/// WHERE the other version is goes out as a place, not as the helper's path
+/// (wave-4 critic M2): a quarantined original sits in the cache root under
+/// `.tentanas-quarantine-<operation uuid>-<seq>`, and that uuid is not
+/// something a screen may show. The file's own path (`path`) is what the
+/// admin knows it by.
+pub fn conflict_alert(array: &str, conflicts: &[ElasticConflict]) -> Option<store::AlertText> {
     if conflicts.is_empty() {
         return None;
     }
+    let files = conflicts
+        .iter()
+        .map(|conflict| {
+            let (kind, disk) = kept_place(array, &conflict.kept);
+            let mut params: BTreeMap<String, String> = [
+                ("path".to_string(), conflict.path.clone()),
+                ("visible".to_string(), conflict.visible.clone()),
+                ("kept_kind".to_string(), kind.to_string()),
+            ]
+            .into_iter()
+            .collect();
+            if let Some(disk) = disk {
+                params.insert("kept_disk".to_string(), disk);
+            }
+            tentaflow_protocol::tentanas::NasHealthReason {
+                code: "conflict_file".to_string(),
+                params,
+            }
+        })
+        .collect();
     let lines = conflicts
         .iter()
-        .map(|conflict| format!("{}: wersja widoczna {}, druga wersja zachowana w {}", conflict.path, conflict.visible, conflict.kept))
+        .map(|conflict| {
+            let other = match kept_place(array, &conflict.kept) {
+                ("quarantine", Some(disk)) => format!("kopia w kwarantannie na dysku cache {disk}"),
+                ("data", Some(disk)) => format!("pod tą samą ścieżką na dysku danych {disk}"),
+                _ => "na jednym z dysków macierzy".to_string(),
+            };
+            format!("{}: wersja widoczna {}, druga wersja: {other}", conflict.path, conflict.visible)
+        })
         .collect::<Vec<_>>()
         .join("; ");
-    Some((
-        format!("Pliki zachowane w dwóch wersjach: {}", conflicts.len()),
-        format!(
-            "Przerwane przenoszenie zostawiło dwie wersje plików i żadna nie została usunięta. \
-             Porównaj je i usuń zbędną; alert zniknie, gdy zostanie jedna. {lines}"
-        ),
-    ))
+    Some(
+        store::AlertText::new(
+            "elastic_conflict",
+            format!("Pliki zachowane w dwóch wersjach: {}", conflicts.len()),
+            format!(
+                "Przerwane przenoszenie zostawiło dwie wersje plików i żadna nie została usunięta. \
+                 Porównaj je i usuń zbędną; alert zniknie, gdy zostanie jedna. {lines}"
+            ),
+        )
+        .param("array", array)
+        .param("count", conflicts.len())
+        .reasons(files),
+    )
+}
+
+/// The prefix the helper gives a quarantined original in the cache root
+/// (`tentanas_helper::elastic_transfer::QUARANTINE_PREFIX`, which is not
+/// public outside the helper).
+const QUARANTINE_PREFIX: &str = ".tentanas-quarantine-";
+
+/// Where the other version of a conflicted file is, as the helper's `kept`
+/// path says it: `('quarantine', cache disk)` for a quarantined original in
+/// a cache branch's root, `('data', data disk)` for a copy under a data
+/// branch, and `('branch', None)` for a path of any other shape — still
+/// said to be on the array's disks, and still never shown.
+fn kept_place(array: &str, kept: &str) -> (&'static str, Option<String>) {
+    let root = format!("{}{array}/", tentanas_helper::elastic::BRANCH_ROOT);
+    let Some(rest) = kept.strip_prefix(&root) else {
+        return ("branch", None);
+    };
+    let mut parts = rest.splitn(3, '/');
+    let (Some(role), Some(disk), Some(tail)) = (parts.next(), parts.next(), parts.next()) else {
+        return ("branch", None);
+    };
+    if disk.is_empty() || tail.is_empty() {
+        return ("branch", None);
+    }
+    match role {
+        "cache" if !tail.contains('/') && tail.starts_with(QUARANTINE_PREFIX) => ("quarantine", Some(disk.to_string())),
+        "data" => ("data", Some(disk.to_string())),
+        _ => ("branch", None),
+    }
 }
 
 /// Raises or resolves the conflict alert from one observation of the array.
 pub fn record_conflict_alert(db: &DbPool, array: &str, conflicts: &[ElasticConflict]) -> Result<()> {
     let key = conflict_alert_key(array);
-    match conflict_alert(conflicts) {
-        Some((title, detail)) => store::raise_alert(db, &key, "warning", "elastic-array", array, &title, &detail).map(|_| ()),
+    match conflict_alert(array, conflicts) {
+        Some(text) => store::raise_coded_alert(db, &key, "warning", "elastic-array", array, &text).map(|_| ()),
         None => store::resolve_alert(db, &key),
     }
 }
@@ -1408,8 +1480,8 @@ pub fn mover_trigger(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheStuckVerdict {
     /// A file has waited past `cache_stuck_after_secs` and nothing was started
-    /// to move it.
-    Raise { title: String, detail: String },
+    /// to move it. Coded 'elastic_cache_stuck' (see `NasAlert::code`).
+    Raise(store::AlertText),
     /// Nothing on the cache has waited that long.
     Clear,
     /// A run was just started for these files; the next probe after it is the
@@ -1438,25 +1510,32 @@ pub fn cache_stuck_verdict(
     if run_started {
         return CacheStuckVerdict::Keep;
     }
-    let reason = if array.unresolved_operation {
-        "przenoszenie wstrzymuje nierozwiązana operacja tej macierzy"
+    let (cause, reason) = if array.unresolved_operation {
+        ("unresolved_operation", "przenoszenie wstrzymuje nierozwiązana operacja tej macierzy")
     } else if age.due_files == 0 {
-        "najstarsze pliki są otwarte albo przypisane do nieudanego przeniesienia, więc nie mogą zostać przeniesione"
+        ("files_busy", "najstarsze pliki są otwarte albo przypisane do nieudanego przeniesienia, więc nie mogą zostać przeniesione")
     } else if restricted_to_schedule(array) {
-        "przenoszenie jest ograniczone do okna harmonogramu"
+        ("schedule_window", "przenoszenie jest ograniczone do okna harmonogramu")
     } else if last_run_moved_nothing(array) {
-        "ostatnie przenoszenie nie zabrało z cache żadnego pliku (sprawdź jego wynik w historii zadań, np. brak miejsca na dyskach danych)"
+        ("last_run_moved_nothing", "ostatnie przenoszenie nie zabrało z cache żadnego pliku (sprawdź jego wynik w historii zadań, np. brak miejsca na dyskach danych)")
     } else {
-        "automatyczne przenoszenie nie mogło wystartować (sprawdź stan macierzy)"
+        ("not_started", "automatyczne przenoszenie nie mogło wystartować (sprawdź stan macierzy)")
     };
-    CacheStuckVerdict::Raise {
-        title: format!("Pliki zbyt długo czekają na cache macierzy {}", array.name),
-        detail: format!(
-            "Najstarszy plik czeka na dysku cache {} (alarm po {}) i do przeniesienia na dyski danych nie chroni go parity: {reason}.",
-            wait_text(oldest),
-            wait_text(limit)
-        ),
-    }
+    CacheStuckVerdict::Raise(
+        store::AlertText::new(
+            "elastic_cache_stuck",
+            format!("Pliki zbyt długo czekają na cache macierzy {}", array.name),
+            format!(
+                "Najstarszy plik czeka na dysku cache {} (alarm po {}) i do przeniesienia na dyski danych nie chroni go parity: {reason}.",
+                wait_text(oldest),
+                wait_text(limit)
+            ),
+        )
+        .param("array", &array.name)
+        .param("oldest_secs", coarse_wait_secs(oldest))
+        .param("limit_secs", coarse_wait_secs(limit))
+        .param("cause", cause),
+    )
 }
 
 /// A waiting time for the alert sentence, coarse on purpose: the sentence is
@@ -1466,6 +1545,17 @@ fn wait_text(secs: u64) -> String {
         s if s >= 2 * 86_400 => format!("{} dni", s / 86_400),
         s if s >= 3_600 => format!("{} h", s / 3_600),
         s => format!("{} min", s / 60),
+    }
+}
+
+/// `wait_text`'s rounding as seconds, for the alert's parameters: cut down to
+/// the unit the sentence shows, so the coded row changes exactly when the
+/// sentence does and a refresh does not rewrite it on every probe.
+fn coarse_wait_secs(secs: u64) -> u64 {
+    match secs {
+        s if s >= 2 * 86_400 => s / 86_400 * 86_400,
+        s if s >= 3_600 => s / 3_600 * 3_600,
+        s => s / 60 * 60,
     }
 }
 
@@ -3515,8 +3605,15 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
             store::finish_elastic_operation(h.db(), &spec.owner, &operation_id, Ok(&result))?;
             if result.stage != ElasticStage::Ready {
                 let detail = result.detail.as_deref().unwrap_or("Macierz wymaga interwencji; rezerwacje zachowane");
-                store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec.name,
-                    "Macierz wymaga interwencji", detail)?;
+                // The helper's own text, when it gave one, is shown as-is;
+                // without it the screen words the default itself.
+                let text = store::AlertText::new("elastic_needs_attention", "Macierz wymaga interwencji", detail)
+                    .param("array", &spec.name);
+                let text = match result.detail.as_deref() {
+                    Some(helper) => text.param("helper_detail", helper),
+                    None => text,
+                };
+                store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec.name, &text)?;
                 return Err(anyhow!(detail.to_string()));
             }
             store::resolve_alert(h.db(), &key)?;
@@ -3528,8 +3625,10 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
             store::finish_elastic_operation(h.db(), &spec.owner, &operation_id, Err(&detail))?;
             // Refused as busy, nothing ran: no alert, and the caller asks again.
             if !error.to_string().contains(tentanas_helper::elastic::ELASTIC_BUSY) {
-                store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec.name,
-                    "Niepotwierdzony wynik macierzy", &detail)?;
+                let text = store::AlertText::new("elastic_result_unconfirmed", "Niepotwierdzony wynik macierzy", &detail)
+                    .param("array", &spec.name)
+                    .param("error", &error);
+                store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec.name, &text)?;
             }
             Err(error)
         }
@@ -4230,15 +4329,10 @@ async fn execute_replace_disk_job(
             let _ = spec_before;
             let detail = format!("{error}; wymiana dysku nie została potwierdzona");
             store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
-            store::raise_alert(
-                h.db(),
-                &key,
-                "warning",
-                "elastic-array",
-                &spec_after.name,
-                "Niepotwierdzona wymiana dysku",
-                &detail,
-            )?;
+            let text = store::AlertText::new("elastic_replace_unconfirmed", "Niepotwierdzona wymiana dysku", &detail)
+                .param("array", &spec_after.name)
+                .param("error", &error);
+            store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name, &text)?;
             Err(error)
         }
     }
@@ -4304,8 +4398,10 @@ async fn execute_add_disk_job(
         Err(error) => {
             let detail = format!("{error}; dysk nie został dopisany do macierzy");
             store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
-            store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name,
-                "Niepotwierdzone dodanie dysku", &detail)?;
+            let text = store::AlertText::new("elastic_add_disk_unconfirmed", "Niepotwierdzone dodanie dysku", &detail)
+                .param("array", &spec_after.name)
+                .param("error", &error);
+            store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name, &text)?;
             Err(error)
         }
     }
@@ -4832,9 +4928,10 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
             }
             for row in rows {
                 let spec = row.persisted_spec()?;
-                store::raise_alert(&db,&format!("elastic:{}:restore",spec.array_id),"warning",
-                    "elastic-array",&row.name,"Macierz oczekuje na przywrócenie",
-                    "Brak bezobsługowego kanału roota; wymagane jawne Przywróć")?;
+                let text = store::AlertText::new("elastic_restore_waiting", "Macierz oczekuje na przywrócenie",
+                    "Brak bezobsługowego kanału roota; wymagane jawne Przywróć").param("array", &row.name);
+                store::raise_coded_alert(&db,&format!("elastic:{}:restore",spec.array_id),"warning",
+                    "elastic-array",&row.name,&text)?;
             }
             Ok::<_,anyhow::Error>(())
         }.await;
@@ -5813,14 +5910,78 @@ pub(crate) mod tests {
                 .filter(|alert| alert.subject_id == spec.name && alert.title.starts_with("Pliki zachowane w dwóch wersjach"))
                 .collect::<Vec<_>>()
         };
-        record_conflict_alert(&db, &spec.name, &[conflict]).unwrap();
+        record_conflict_alert(&db, &spec.name, &[conflict.clone()]).unwrap();
         let alerts = conflict_alerts(&db);
         assert_eq!(alerts.len(), 1);
-        for place in ["docs/report.odt", "/mnt/conflicted/docs/report.odt", ".tentanas-quarantine-x-1"] {
+        for place in ["docs/report.odt", "/mnt/conflicted/docs/report.odt", "kopia w kwarantannie na dysku cache c1"] {
             assert!(alerts[0].detail.contains(place), "{place}: {}", alerts[0].detail);
         }
+        // Wave-4 critic M2: the quarantine name carries the operation's uuid,
+        // and neither the node's sentence nor a parameter may carry it.
+        assert!(!alerts[0].detail.contains(".tentanas-quarantine-"), "{}", alerts[0].detail);
+        // Coded: the count, and each file's three paths as data.
+        assert_eq!(alerts[0].code, "elastic_conflict");
+        assert_eq!(alerts[0].params.get("count").map(String::as_str), Some("1"));
+        assert_eq!(alerts[0].reasons.len(), 1);
+        assert_eq!(alerts[0].reasons[0].code, "conflict_file");
+        assert_eq!(
+            alerts[0].reasons[0].params.clone().into_iter().collect::<Vec<_>>(),
+            vec![
+                ("kept_disk".to_string(), "c1".to_string()),
+                ("kept_kind".to_string(), "quarantine".to_string()),
+                ("path".to_string(), conflict.path.clone()),
+                ("visible".to_string(), conflict.visible.clone()),
+            ]
+        );
+        assert!(
+            alerts[0].reasons[0].params.values().all(|v| !v.contains(&conflict.operation_id) && !v.contains("quarantine-")),
+            "no parameter carries the quarantine name: {:?}",
+            alerts[0].reasons[0].params
+        );
         record_conflict_alert(&db, &spec.name, &[]).unwrap();
         assert!(conflict_alerts(&db).is_empty());
+    }
+
+    /// The three places the helper's `kept` path can name, and a shape it
+    /// does not: only the disk's name leaves the node, never the path.
+    #[test]
+    fn the_other_version_of_a_conflicted_file_is_named_by_its_disk_never_by_its_quarantine_name() {
+        let uuid = "01a0cf8c-5a61-7283-8410-924a0fceb01f";
+        assert_eq!(
+            kept_place("media", &format!("/mnt/tentanas-branches/media/cache/nvme2n1/.tentanas-quarantine-{uuid}-3")),
+            ("quarantine", Some("nvme2n1".to_string()))
+        );
+        assert_eq!(
+            kept_place("media", "/mnt/tentanas-branches/media/data/d2/docs/a.odt"),
+            ("data", Some("d2".to_string()))
+        );
+        // Another array's branch, a nested name under the cache, a path
+        // outside the branches: the place is not guessed.
+        for other in [
+            "/mnt/tentanas-branches/other/cache/c1/.tentanas-quarantine-x-1".to_string(),
+            format!("/mnt/tentanas-branches/media/cache/c1/sub/.tentanas-quarantine-{uuid}-1"),
+            "/srv/elsewhere/a.odt".to_string(),
+            "/mnt/tentanas-branches/media/cache/c1/".to_string(),
+        ] {
+            assert_eq!(kept_place("media", &other), ("branch", None), "{other}");
+        }
+        let conflict = |kept: String| ElasticConflict {
+            operation_id: uuid.into(),
+            path: "docs/a.odt".into(),
+            visible: "/mnt/media/docs/a.odt".into(),
+            kept,
+        };
+        let text = conflict_alert("media", &[
+            conflict(format!("/mnt/tentanas-branches/media/cache/nvme2n1/.tentanas-quarantine-{uuid}-3")),
+            conflict("/srv/elsewhere/a.odt".into()),
+        ])
+        .expect("an alert");
+        assert!(!text.detail.contains(uuid) && !text.detail.contains("/srv/elsewhere"), "{}", text.detail);
+        for line in &text.reasons {
+            assert!(line.params.values().all(|v| !v.contains(uuid)), "{:?}", line.params);
+        }
+        assert_eq!(text.reasons[1].params.get("kept_kind").map(String::as_str), Some("branch"));
+        assert!(!text.reasons[1].params.contains_key("kept_disk"));
     }
 
     #[test]
@@ -6608,7 +6769,7 @@ pub(crate) mod tests {
         assert!(!array.unresolved_operation, "nothing for the stuck alert to blame");
         assert_eq!(array.mover_history[0].outcome, "partial");
         assert_eq!(mover_to_protocol(&result.run).outcome, "partial");
-        let CacheStuckVerdict::Raise { detail, .. } = cache_stuck_verdict(
+        let CacheStuckVerdict::Raise(store::AlertText { detail, .. }) = cache_stuck_verdict(
             &array,
             &ElasticCacheAge { due_files: 0, due_bytes: 0, held_files: 1, oldest_secs: Some(10 * 86_400) },
             false,
@@ -8618,19 +8779,38 @@ pub(crate) mod tests {
         // Past it with nothing started: raised, and the reason is named.
         let held = ElasticCacheAge { due_files: 0, due_bytes: 0, held_files: 1, oldest_secs: Some(limit + 3_600) };
         match cache_stuck_verdict(&a, &held, false) {
-            CacheStuckVerdict::Raise { title, detail } => {
-                assert!(title.contains("media"), "{title}");
-                assert!(detail.contains("9 h"), "{detail}");
-                assert!(detail.contains("alarm po 8 h"), "{detail}");
-                assert!(detail.contains("otwarte"), "{detail}");
+            CacheStuckVerdict::Raise(text) => {
+                assert!(text.title.contains("media"), "{}", text.title);
+                assert!(text.detail.contains("9 h"), "{}", text.detail);
+                assert!(text.detail.contains("alarm po 8 h"), "{}", text.detail);
+                assert!(text.detail.contains("otwarte"), "{}", text.detail);
+                // The same, coded: the waits cut to the unit the sentence
+                // shows, and the cause as a word the screen translates.
+                assert_eq!(text.code, "elastic_cache_stuck");
+                assert_eq!(
+                    text.params.into_iter().collect::<Vec<_>>(),
+                    vec![
+                        ("array".to_string(), "media".to_string()),
+                        ("cause".to_string(), "files_busy".to_string()),
+                        ("limit_secs".to_string(), (8 * 3_600).to_string()),
+                        ("oldest_secs".to_string(), (9 * 3_600).to_string()),
+                    ]
+                );
             }
             other => panic!("expected a raise, got {other:?}"),
         }
         a.unresolved_operation = true;
-        let CacheStuckVerdict::Raise { detail, .. } = cache_stuck_verdict(&a, &aged(2, Some(limit)), false) else {
+        let CacheStuckVerdict::Raise(text) = cache_stuck_verdict(&a, &aged(2, Some(limit)), false) else {
             panic!("an unresolved operation past the threshold is stuck");
         };
-        assert!(detail.contains("nierozwiązana operacja"), "{detail}");
+        assert!(text.detail.contains("nierozwiązana operacja"), "{}", text.detail);
+        assert_eq!(text.params.get("cause").map(String::as_str), Some("unresolved_operation"));
+        // A minute later the sentence reads the same, so the coded row must
+        // too — or every probe would rewrite the open alert.
+        let CacheStuckVerdict::Raise(later) = cache_stuck_verdict(&a, &aged(2, Some(limit + 59)), false) else {
+            panic!("still stuck");
+        };
+        assert_eq!(later, text, "a probe a minute later leaves the alert as it was");
 
         // No age rule still leaves four cooldowns; a daily window adds a day.
         a.mover.min_age_secs = 0;

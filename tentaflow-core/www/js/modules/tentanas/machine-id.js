@@ -64,3 +64,54 @@ export const isDiskIdShape = (value) => {
   const v = String(value || '').trim();
   return DISK_ID_PREFIX.test(v) || OPAQUE_ID.test(v);
 };
+
+// ----- Ids inside a node's free text -----------------------------------------
+//
+// A node's own text — a helper's journal note, a failed step's error chain,
+// the kernel's refusal — is shown in the "Treść węzła" section and as a
+// tooltip, and nothing guarantees it names things by name: a transfer path
+// carries `.tentanas-transfer-<operation uuid>-`, a by-id path a `wwn-…`, a
+// forwarded error a 64-hex node id. `scrubIds` replaces every such id in
+// the text with `placeholder`, or with the name `nameOf(id)` returns for it
+// (a node id the fleet knows).
+//
+// Free text is not a value, so the two predicates above are applied per
+// TOKEN, with the shapes that are unambiguous in prose:
+// - a UUID anywhere, even inside a longer token (the transfer path);
+// - a token that `isOpaqueId` calls an id, except a short all-digit run —
+//   in prose a 12-15 digit number is a byte count (a 2 TB disk is 13
+//   digits), so a digit run counts from 16 digits, as a ZFS GUID does;
+// - a hex run of 32 or more (a node id, a hash);
+// - a token with a by-id prefix that no prose word starts with. `dev-`,
+//   `usb-`, `pci-`, `nvme-`, `virtio-` or `md-name-` also begin real names
+//   (`dev-backups`, `nvme-cache`), so, as `isDiskIdShape` says, they are
+//   taken for ids only where the text KNOWS it names a disk: right after
+//   `/dev/disk/by-…/`.
+// A kernel name (`sdd`, `nvme0n1`, `dm-0`) and a human name are never ids.
+
+const EMBEDDED_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const TEXT_TOKEN = /[^\s'"`„”«»()[\]{}<>,;|=]+/g;
+const TEXT_DISK_ID_PREFIX = /^(wwn-|sn-|eui\.|nvme-eui\.|nvme-uuid\.|ata-|scsi-|dm-uuid-|md-uuid-|lvm-pv-uuid-)/i;
+const BY_DISK_PATH = /^(\/dev\/disk\/by-[a-z]+\/)(.+)$/i;
+
+function isTextId(token) {
+  if (/^\d+$/.test(token)) return token.length >= 16;
+  return isOpaqueId(token) || /^[0-9a-f]{32,}$/i.test(token) || TEXT_DISK_ID_PREFIX.test(token);
+}
+
+/** `text` with every id replaced by `placeholder` — or by `nameOf(id)` when
+ *  that returns a name. See the section comment for what counts as an id. */
+export function scrubIds(text, placeholder, nameOf = () => '') {
+  const shown = (id) => String(nameOf(id) || '').trim() || placeholder;
+  return String(text ?? '')
+    .replace(EMBEDDED_UUID, (id) => shown(id))
+    .replace(TEXT_TOKEN, (token) => {
+      const byPath = BY_DISK_PATH.exec(token);
+      if (byPath) return byPath[1] + placeholder;
+      // Path segments are judged one by one ("…/wwn-0x5…/part1").
+      return token.split('/').map((segment) => {
+        const bare = segment.replace(/[:.!?]+$/, '');
+        return bare && isTextId(bare) ? shown(bare) + segment.slice(bare.length) : segment;
+      }).join('/');
+    });
+}

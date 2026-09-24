@@ -6599,7 +6599,118 @@
         "node": "node",
         "elastic-array": "macierz Elastic"
       },
-      "history": "Historia alertów"
+      "history": "Historia alertów",
+      "untranslated_title": "Alert węzła",
+      "untranslated_detail": "Pełny alert jest w treści węzła — ta wersja nie ma jego tłumaczenia",
+      "detail_in_node_text": "Szczegóły są w treści węzła",
+      "code": {
+        "disk_health": {
+          "title_live": "Dysk {name}: {grade}",
+          "title_last_known": "Dysk ostatnio widziany jako {name}: {grade}",
+          "title_unnamed": "Dysk: {grade}",
+          "title_live_reason": "{name}: {reason}",
+          "title_last_known_reason": "Dysk ostatnio widziany jako {name}: {reason}",
+          "title_unnamed_reason": "Dysk: {reason}"
+        },
+        "approval_pending": {
+          "title": "{operation} „{subject}” czeka na drugiego administratora",
+          "detail": "Zatwierdź albo odrzuć w kolejce Zadań",
+          "title_unnamed": "{operation} czeka na drugiego administratora"
+        },
+        "elastic_sync_held": {
+          "title": "Macierz {array}: zaplanowany Sync wstrzymany, parity zgłasza błędy",
+          "detail": "Scrub zgłosił błędy, których nic jeszcze nie naprawiło. Zaplanowany Sync usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny."
+        },
+        "elastic_mover_settle_stopped": {
+          "title": "Macierz {array}: automatyczne dokończenie przenoszenia wstrzymane",
+          "detail": "{runs} {runs|kolejny przebieg przenoszenia zakończył|kolejne przebiegi przenoszenia zakończyły|kolejnych przebiegów przenoszenia zakończyło} się niepowodzeniem, więc node nie uruchamia następnych sam. Sprawdź przyczynę w historii przenoszenia i uruchom przenoszenie ręcznie."
+        },
+        "elastic_cache_stuck": {
+          "title": "Pliki zbyt długo czekają na cache macierzy {array}",
+          "detail": "Najstarszy plik czeka na dysku cache {oldest} (alarm po {limit}) i do przeniesienia na dyski danych nie chroni go parity: {cause}.",
+          "cause_unresolved_operation": "przenoszenie wstrzymuje nierozwiązana operacja tej macierzy",
+          "cause_files_busy": "najstarsze pliki są otwarte albo przypisane do nieudanego przeniesienia, więc nie mogą zostać przeniesione",
+          "cause_schedule_window": "przenoszenie jest ograniczone do okna harmonogramu",
+          "cause_last_run_moved_nothing": "ostatnie przenoszenie nie zabrało z cache żadnego pliku (sprawdź jego wynik w historii zadań, np. brak miejsca na dyskach danych)",
+          "cause_not_started": "automatyczne przenoszenie nie mogło wystartować (sprawdź stan macierzy)"
+        },
+        "elastic_conflict": {
+          "title": "Macierz {array}: {count} {count|plik zachowany|pliki zachowane|plików zachowanych} w dwóch wersjach",
+          "detail": "Przerwane przenoszenie zostawiło dwie wersje plików i żadna nie została usunięta. Porównaj je i usuń zbędną; alert zniknie, gdy zostanie jedna.",
+          "file_quarantine": "{path}: wersja widoczna {visible}, druga — kopia w kwarantannie na dysku cache {disk}",
+          "file_data": "{path}: wersja widoczna {visible}, druga pod tą samą ścieżką na dysku danych {disk}",
+          "file_branch": "{path}: wersja widoczna {visible}, druga na jednym z dysków macierzy"
+        },
+        "elastic_needs_attention": {
+          "title": "Macierz {array} wymaga interwencji",
+          "detail": "Macierz wymaga interwencji; rezerwacje zachowane",
+          "detail_helper": "Macierz wymaga interwencji; rezerwacje zachowane. Opis helpera jest w treści węzła"
+        },
+        "elastic_result_unconfirmed": {
+          "title": "Macierz {array}: niepotwierdzony wynik operacji",
+          "detail": "Krok się nie powiódł, a utrata odpowiedzi nie dowodzi zatrzymania I/O. Błąd kroku jest w treści węzła"
+        },
+        "elastic_replace_unconfirmed": {
+          "title": "Macierz {array}: niepotwierdzona wymiana dysku",
+          "detail": "Wymiana dysku nie została potwierdzona. Błąd kroku jest w treści węzła"
+        },
+        "elastic_add_disk_unconfirmed": {
+          "title": "Macierz {array}: niepotwierdzone dodanie dysku",
+          "detail": "Dysk nie został dopisany do macierzy. Błąd kroku jest w treści węzła"
+        },
+        "elastic_restore_waiting": {
+          "title": "Macierz {array} oczekuje na przywrócenie",
+          "detail": "Brak bezobsługowego kanału roota; wymagane jawne Przywróć"
+        },
+        "target_portal_moved": {
+          "title": "Target {target}: adres portalu się przeniósł",
+          "detail": "Portal nie jest już na wybranym interfejsie; export jest nieosiągalny, dopóki adres nie wróci albo interfejs nie zostanie wybrany ponownie."
+        },
+        "target_not_applied": {
+          "title": "Target {target}: nie został zastosowany w jądrze",
+          "detail": "Jądro odrzuciło zmianę; jego błąd jest w treści węzła",
+          "detail_hidden": "Jądro odrzuciło zmianę; pełny błąd jest w logu węzła"
+        },
+        "target_still_in_kernel": {
+          "title": "Target {target}: wciąż w jądrze, choć node postanowił go zatrzymać",
+          "detail": "Jądro nie zwolniło obiektu; jego błąd jest w treści węzła",
+          "detail_hidden": "Jądro nie zwolniło obiektu; pełny błąd jest w logu węzła"
+        },
+        "elevation_unarmed": {
+          "title": "Kanał uprawnień nie jest uzbrojony — node nie dosięga jądra",
+          "detail": "Targety blokowe czekają na zastosowanie albo usunięcie. Po restarcie configfs jest pusty i tylko ta aplikacja go odtwarza, więc eksporty stoją, dopóki kanał nie zostanie uzbrojony (Środowisko → konfiguracja)."
+        },
+        "targets_sweep_failing": {
+          "title": "Targety blokowe: node nie może osiągnąć stanu, który ustalił",
+          "detail_targets": "{count} {count|target blokowy nie jest|targety blokowe nie są|targetów blokowych nie jest} w stanie ustalonym przez node",
+          "detail_sweep": "samo uzgadnianie nie mogło się wykonać; błąd jest w logu węzła",
+          "who_all": "organizacja każdego z nich ma alert, który go nazywa",
+          "who_some": "{alerted} z nich {alerted|ma|mają|ma} alert nazywający go dla jego organizacji; log węzła nazywa wszystkie",
+          "who_none": "log węzła je nazywa"
+        },
+        "targets_sweep_stale": {
+          "title": "Targety blokowe: node nie może osiągnąć stanu, który ustalił",
+          "detail": "Przed restartem targety blokowe tego węzła nie były w ustalonym stanie; następne uzgadnianie zastąpi to bieżącą liczbą"
+        }
+      },
+      "node_text": "Treść węzła",
+      "id_hidden": "[identyfikator]",
+      "disk_reason": {
+        "smart_failed": "SMART zgłasza awarię dysku",
+        "self_test_failed": "ostatni test SMART zakończył się błędem",
+        "pending_sectors": "{n} {n|sektor czeka|sektory czekają|sektorów czeka} na realokację",
+        "media_errors": "{n} {n|błąd nośnika|błędy nośnika|błędów nośnika}",
+        "reallocated_growing": "{n} {n|nowy realokowany sektor|nowe realokowane sektory|nowych realokowanych sektorów} w 7 dni",
+        "reallocated": "{n} {n|realokowany sektor|realokowane sektory|realokowanych sektorów}",
+        "temperature_over_limit": "temperatura {t}°C przekracza limit {limit}°C",
+        "temperature_high": "temperatura {t}°C",
+        "temperature_high_limit": "temperatura {t}°C przekracza próg {limit}°C",
+        "crc_errors": "{n} {n|błąd|błędy|błędów} CRC (kabel lub backplane)",
+        "wear": "zużycie {n}%",
+        "no_smart_data": "brak danych SMART",
+        "zfs_faulted": "ZFS wyłączył dysk jako uszkodzony (FAULTED)",
+        "zfs_unavail": "ZFS nie widzi dysku (UNAVAIL)"
+      }
     },
     "role": {
       "free": "Wolny",
@@ -7162,7 +7273,6 @@
       "mounted": "Zamontowany",
       "present": "Obecny",
       "disk_details": "Szczegóły dysku {name}",
-      "back": "Powrót do pul",
       "refresh": "Odśwież",
       "snapshot_only": "Parity opisuje ostatni sync. Późniejsze zapisy nie mają potwierdzonej ochrony.",
       "tolerance": "Odporność checkpointu: {n} {n|dysk|dyski|dysków}",
@@ -8189,7 +8299,9 @@
       "dh": "{d} d {h} h",
       "hm": "{h} h {m} min",
       "m": "{m} min",
-      "s": "{s} s"
+      "s": "{s} s",
+      "d": "{d} d",
+      "h": "{h} h"
     },
     "fleet": {
       "head_scope": "flota",
@@ -8399,13 +8511,22 @@
       "reason_grew": "realokacje wzrosły z {from} do {to} w 7 dni",
       "reason_for_days": "{status} od {days} {days|dnia|dni|dni}",
       "reason_other": "węzeł zaleca wymianę tego dysku",
-      "disk_other": "Węzeł zaleca wymianę tego dysku. {spare}."
+      "disk_other": "Węzeł zaleca wymianę tego dysku. {spare}.",
+      "array_urgent": "Ten dysk macierzy Elastic wymaga uwagi: {reason}. Wymiana dysku macierzy nie jest dostępna w tej wersji.",
+      "array_advice": "Obserwuj ten dysk macierzy Elastic: {reason}. Wymiana dysku macierzy nie jest dostępna w tej wersji.",
+      "array_other": "Węzeł zgłasza problem z tym dyskiem macierzy Elastic. Wymiana dysku macierzy nie jest dostępna w tej wersji.",
+      "array_no_replace": "macierz Elastic — wymiana dysku niedostępna w tej wersji",
+      "array_title": "Dyski macierzy Elastic wymagające uwagi",
+      "array_hint": "Z historii tego noda; wymiana dysku macierzy Elastic nie jest dostępna w tej wersji.",
+      "array_reason_other": "węzeł zgłasza problem z tym dyskiem",
+      "array_severity_urgent": "pilne",
+      "array_severity_advice": "obserwuj",
+      "array_severity_other": "uwaga"
     },
     "targets": {
       "sessions_unmeasured": "Nie wiadomo — to nie znaczy zero",
       "host_shared": "Używany też przez",
       "context_changed": "Kontekst noda lub targetu zmienił się. Otwórz detal ponownie.",
-      "back_to_list": "Powrót do udostępniania",
       "session_identity": "Klient / initiator",
       "edit_initiators": "Dodaj lub edytuj hosty",
       "initiators_draft": "Zmiany listy zatwierdza przycisk Zapisz.",
@@ -8508,7 +8629,9 @@
       "delete_keep_volume": "Wolumen {source} i jego dane zostają nietknięte.",
       "service_missing": "{proto}: {detail}",
       "created": "Utworzony",
-      "key_in_kernel": "Klucz trafia do jądra (configfs). nvmet tworzy go czytelnym dla wszystkich, więc node zawęża prawa pliku do roota i sprawdza wynik — rozbieżność trafia do logu zadania. Na nodzie z dostępem lokalnym traktuj go jak sekret współdzielony z tym nodem."
+      "key_in_kernel": "Klucz trafia do jądra (configfs). nvmet tworzy go czytelnym dla wszystkich, więc node zawęża prawa pliku do roota i sprawdza wynik — rozbieżność trafia do logu zadania. Na nodzie z dostępem lokalnym traktuj go jak sekret współdzielony z tym nodem.",
+      "gone_title": "Tego targetu już nie ma",
+      "gone_detail": "Został usunięty na tym węźle (np. przez innego administratora). Wróć do listy udostępniania."
     },
     "wizard_target": {
       "title": "Nowy target",
@@ -8613,6 +8736,16 @@
       "this_org": "inna instancja TentaNas tej organizacji",
       "this_org_named": "instancja „{name}” tej organizacji",
       "other_installation": "inna instalacja TentaNas"
+    },
+    "refusal": {
+      "share_user_in_use_elsewhere": "To konto jest nadal używane na tym nodzie — nie można go usunąć",
+      "approval_not_found": "Tego zgłoszenia nie ma na tym nodzie",
+      "approval_own_request": "Autor zgłoszenia nie może go zatwierdzić — potrzebny jest drugi administrator",
+      "approval_already_approved": "To zgłoszenie zostało już zatwierdzone",
+      "approval_already_rejected": "To zgłoszenie zostało już odrzucone",
+      "approval_already_expired": "To zgłoszenie już wygasło",
+      "approval_closed": "O tym zgłoszeniu już zdecydowano",
+      "approval_expired": "Zgłoszenie wygasło, zanim ktokolwiek o nim zdecydował"
     }
   },
   "agent_accounts": {

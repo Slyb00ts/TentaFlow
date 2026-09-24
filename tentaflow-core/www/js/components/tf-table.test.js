@@ -255,24 +255,85 @@ test('a tf-table outside .nas-root does not adopt the TentaNas cell sheet', asyn
 // count, so it keeps working as the screens change.
 
 const TENTANAS_DIR = join(WWW_ROOT, 'js/modules/tentanas');
-const SOURCES = [readFileSync(join(WWW_ROOT, 'js/modules/tentanas.js'), 'utf8')];
+
+// The index just past the closing `/` of the regex literal opening at `start`
+// (flags stay in the text after it). A `/` inside a `[...]` class or behind a
+// backslash does not close it.
+function regexEnd(text, start) {
+  let inClass = false;
+  for (let i = start + 1; i < text.length; i += 1) {
+    const c = text[i];
+    if (c === '\\') { i += 1; continue; }
+    if (c === '\n') return i;
+    if (inClass) { if (c === ']') inClass = false; continue; }
+    if (c === '[') inClass = true;
+    else if (c === '/') return i + 1;
+  }
+  return text.length;
+}
+
+// Blanks every `//` and `/* */` comment (newlines kept) and the body of every
+// regex literal, leaving strings and template literals alone. Prose comments
+// hold apostrophes that would open a string for the scanner below, and words
+// like `level:` that the cell-key search would take for an object property;
+// `/"/g` holds a quote just the same.
+function stripComments(text) {
+  const stack = [];
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    const top = stack[stack.length - 1];
+    if (top === "'" || top === '"' || top === '`') {
+      if (c === '\\') { out += c + (text[i + 1] ?? ''); i += 2; continue; }
+      if (c === top) stack.pop();
+      else if (top === '`' && c === '$' && text[i + 1] === '{') { stack.push('${'); out += '${'; i += 2; continue; }
+    } else if (c === '/' && (text[i + 1] === '/' || text[i + 1] === '*')) {
+      const close = text[i + 1] === '/' ? '\n' : '*/';
+      const end = text.indexOf(close, i + 2);
+      const stop = end < 0 ? text.length : (close === '\n' ? end : end + 2);
+      out += text.slice(i, stop).replace(/[^\n]/g, ' ');
+      i = stop;
+      continue;
+    } else if (c === '/' && /(^|[(,=:[!&|?{};+\-*%<>~^]|\b(?:return|typeof|case|in|of|void|await|yield))\s*$/.test(out.slice(-12))) {
+      const stop = regexEnd(text, i);
+      out += text.slice(i, stop).replace(/[^\n]/g, ' ');
+      i = stop;
+      continue;
+    } else if (c === "'" || c === '"' || c === '`') {
+      stack.push(c);
+    } else if (c === '{') {
+      stack.push('{');
+    } else if (c === '}' && (top === '{' || top === '${')) {
+      stack.pop();
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+const SOURCES = [stripComments(readFileSync(join(WWW_ROOT, 'js/modules/tentanas.js'), 'utf8'))];
 for (const f of readdirSync(TENTANAS_DIR)) {
   if (!f.endsWith('.js') || f.endsWith('.test.js') || f.startsWith('_')) continue;
-  SOURCES.push(readFileSync(join(TENTANAS_DIR, f), 'utf8'));
+  SOURCES.push(stripComments(readFileSync(join(TENTANAS_DIR, f), 'utf8')));
 }
 
 const IDENT = /^-?[A-Za-z_][\w-]*$/;
 
-// Reads an expression starting at `start`, stopping at the `,` or `}` that ends
-// the property. Quote-, template- and bracket-aware, so a cell built from a
-// nested template literal is captured whole.
-function valueExpr(text, start) {
+// Reads code starting at `start`. By default it reads one expression and stops
+// at the `,`, `}` or `;` that ends it (a property value, an arrow's expression
+// body). With `block` set, `start` must sit on a `{` and exactly that balanced
+// block is returned (an arrow's `{ … }` body). Quote-, template- and
+// bracket-aware, so a cell built from a nested template literal is captured
+// whole. It expects comment-free text (see `stripComments`).
+function valueExpr(text, start, block = false) {
   let i = start;
   const stack = [];
   let out = '';
   while (i < text.length) {
     const c = text[i];
-    if (stack.length === 0 && (c === ',' || c === '}')) break;
+    if (!block && stack.length === 0 && (c === ',' || c === '}' || c === ';')) break;
     const top = stack[stack.length - 1];
     if (top === "'" || top === '"') {
       if (c === '\\') { out += text[i] + text[i + 1]; i += 2; continue; }
@@ -285,11 +346,22 @@ function valueExpr(text, start) {
       stack.push(c);
     } else if (c === ')' || c === ']' || c === '}') {
       stack.pop();
+      if (block && stack.length === 0) return out + c;
     }
     out += c;
     i += 1;
   }
   return out;
+}
+
+// The body of an arrow function whose `=>` ends just before `start`: the
+// balanced `{ … }` block, or the expression up to the `;`, `,` or closing
+// bracket that ends it. Reading a block body as an expression ran past its
+// closing `}` into whatever followed, often to the end of the file.
+function arrowBody(text, start) {
+  let i = start;
+  while (i < text.length && /\s/.test(text[i])) i += 1;
+  return text[i] === '{' ? valueExpr(text, i, true) : valueExpr(text, i);
 }
 
 function bodyFrom(text, start) {
@@ -305,16 +377,20 @@ function bodyFrom(text, start) {
 
 // Helper bodies, so a cell built by `mountDotsHtml(...)` still contributes the
 // classes that helper writes.
-const HELPERS = new Map();
-for (const text of SOURCES) {
-  let m;
-  const reFn = /(?:export\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g;
-  while ((m = reFn.exec(text))) if (!HELPERS.has(m[1])) HELPERS.set(m[1], bodyFrom(text, m.index));
-  const reArrow = /(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g;
-  while ((m = reArrow.exec(text))) {
-    if (!HELPERS.has(m[1])) HELPERS.set(m[1], valueExpr(text, m.index + m[0].length));
+function helpersIn(sources) {
+  const helpers = new Map();
+  for (const text of sources) {
+    let m;
+    const reFn = /(?:export\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g;
+    while ((m = reFn.exec(text))) if (!helpers.has(m[1])) helpers.set(m[1], bodyFrom(text, m.index));
+    const reArrow = /(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g;
+    while ((m = reArrow.exec(text))) {
+      if (!helpers.has(m[1])) helpers.set(m[1], arrowBody(text, m.index + m[0].length));
+    }
   }
+  return helpers;
 }
+const HELPERS = helpersIn(SOURCES);
 
 // `class="md ${cls}"` and `class="${bad ? 'num-err' : ''}"` both occur: take the
 // static tokens plus the string literals inside the interpolation.
@@ -387,20 +463,23 @@ function requiredClasses(scope) {
 
 test('the scoped cell sheets cover every class a TentaNas html cell emits', () => {
   // Guard against a silently empty parse: if the extraction ever stops finding
-  // cells, this test must fail loudly rather than pass vacuously. The floors are
-  // far below the real counts so ordinary screen churn cannot trip them.
-  // Measured 2026-09-13: a healthy parse yields 50; a crippled parser (helper
-  // body following disabled) yields exactly 25, and reducing the call-follow
-  // depth to 1 yields 45. A floor of 25 therefore sat exactly on the boundary
-  // and this line alone would not have moved. The per-scope floors below DID
-  // catch that regression (required drops 35 -> 14 and 27 -> 7), so the test as
-  // a whole was never blind — this floor is tightened to 40 so it fails on its
-  // own rather than relying on them.
-  assert.ok(CELL_CLASSES.size >= 40, `parsed too few cell classes (${CELL_CLASSES.size})`);
-
+  // cells, this test must fail loudly rather than pass vacuously.
+  // Measured 2026-09-23, after the scanner stopped reading arrow helpers past
+  // their own end: a healthy parse yields 28. The 50 measured on 2026-09-13
+  // was inflated by that overrun — dialog and panel markup (`tc-text`,
+  // `stat-rows`, `sched-pill`, ...) counted as cell classes. Disabling helper
+  // body following now yields 25 and loses exactly `md`, `mount-dots` and
+  // `icon`, so a count floor cannot tell the two apart without sitting on the
+  // boundary; the classes only a followed helper can produce are pinned
+  // instead, and the count floor only catches a parse that finds nothing.
+  assert.ok(CELL_CLASSES.size >= 20, `parsed too few cell classes (${CELL_CLASSES.size})`);
+  for (const viaHelper of ['mount-dots', 'md']) {
+    assert.ok(CELL_CLASSES.has(viaHelper), `helper bodies were not followed: .${viaHelper} (mountDotsHtml) is missing`);
+  }
+  // Per scope, measured the same day: .nas-root requires 16, .nas-modal 7.
   for (const [scope, sheetPath, floor] of [
-    ['nas-root', 'css/tentanas-cells.css', 20],
-    ['nas-modal', 'css/tentanas-modal-cells.css', 15],
+    ['nas-root', 'css/tentanas-cells.css', 12],
+    ['nas-modal', 'css/tentanas-modal-cells.css', 5],
   ]) {
     const required = requiredClasses(scope);
     assert.ok(
@@ -420,6 +499,53 @@ test('the scoped cell sheets cover every class a TentaNas html cell emits', () =
         + `${missing.length === 1 ? 'it' : 'them'}, so ${missing.length === 1 ? 'it renders' : 'they render'} unstyled inside the shadow root`,
     );
   }
+});
+
+// The scanner above once read an arrow helper assigned to a `const` from its
+// `=>` to the next top-level `,` or `}` — for `(…) => (…);` and `(…) => { … };`
+// alike that is somewhere far below the helper, often the end of the file, so
+// a dialog's markup was counted as cell classes and the coverage test demanded
+// cell styles for classes no cell emits. Each helper body must end where the
+// helper ends.
+test('the helper scanner ends an arrow helper where its body ends', () => {
+  const src = [
+    "const chip = (x) => (`<span class=\"chip-a\">${x}</span>`);",
+    'const row = (x) => {',
+    "  // it's a comment with an apostrophe and a } brace",
+    '  const y = { a: 1, b: 2 };',
+    '  return `<div class="row-b">${chip(y.a)}</div>`;',
+    '};',
+    'const bare = x => `<i class="bare-c">${x}</i>`;',
+    'const other = 1;',
+    'function openDialog() {',
+    '  return `<div class="dialog-only">${row(1)}</div>`;',
+    '}',
+    'const tail = { later: `<p class="after-all"></p>` };',
+    '// a prose comment naming level: `<b class="comment-only">` is no code',
+    "const url = `http://example.test/${'//'}`;",
+    "const esc = (s) => String(s).replace(/\"/g, '&quot;').replace(/[/']/g, '');",
+    'const after = (x) => `<b class="esc-after">${x}</b>`;',
+  ].join('\n');
+  const helpers = helpersIn([stripComments(src)]);
+
+  assert.equal(helpers.get('chip'), "(`<span class=\"chip-a\">${x}</span>`)");
+  assert.ok(helpers.get('row').startsWith('{') && helpers.get('row').endsWith('}'), helpers.get('row'));
+  assert.match(helpers.get('row'), /row-b/);
+  assert.equal(helpers.get('bare'), '`<i class="bare-c">${x}</i>`');
+  for (const name of ['chip', 'row', 'bare']) {
+    assert.doesNotMatch(helpers.get(name), /dialog-only|after-all/, `${name} ran past its own end`);
+  }
+  assert.match(helpers.get('openDialog'), /dialog-only/);
+  assert.doesNotMatch(helpers.get('openDialog'), /after-all/);
+
+  const stripped = stripComments(src);
+  assert.doesNotMatch(stripped, /comment-only|apostrophe/, 'comments are blanked');
+  assert.match(stripped, /http:\/\/example\.test\/\$\{'\/\/'\}/, 'a // inside a template or string is kept');
+  assert.equal(stripped.split('\n').length, src.split('\n').length, 'line structure is kept');
+  // A quote inside a regex literal opens no string: the helper after it is
+  // still found, and `esc` ends at its own `;`.
+  assert.equal(helpers.get('after'), '`<b class="esc-after">${x}</b>`');
+  assert.doesNotMatch(helpers.get('esc'), /esc-after/);
 });
 
 // `empty-message` was passed by 19 call sites across 11 screens and did

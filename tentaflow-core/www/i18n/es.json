@@ -5472,7 +5472,6 @@
       "mounted": "Montado",
       "present": "Presente",
       "disk_details": "Detalles del disco {name}",
-      "back": "Volver a los pools",
       "refresh": "Actualizar",
       "snapshot_only": "La paridad describe la última sincronización. Las escrituras posteriores no tienen protección confirmada.",
       "tolerance": "Tolerancia del punto de control: {n} {n|disco|discos|discos}",
@@ -6613,7 +6612,118 @@
         "node": "nodo",
         "elastic-array": "matriz Elastic"
       },
-      "history": "Historial de alertas"
+      "history": "Historial de alertas",
+      "untranslated_title": "Alerta del nodo",
+      "untranslated_detail": "La alerta completa está en el texto del nodo: esta versión no la traduce",
+      "detail_in_node_text": "Los detalles están en el texto del nodo",
+      "code": {
+        "disk_health": {
+          "title_live": "Disco {name}: {grade}",
+          "title_last_known": "Disco visto por última vez como {name}: {grade}",
+          "title_unnamed": "Disco: {grade}",
+          "title_live_reason": "{name}: {reason}",
+          "title_last_known_reason": "Disco visto por última vez como {name}: {reason}",
+          "title_unnamed_reason": "Disco: {reason}"
+        },
+        "approval_pending": {
+          "title": "{operation} «{subject}» espera a un segundo administrador",
+          "detail": "Apruébala o recházala en la cola de Tareas",
+          "title_unnamed": "{operation} espera a un segundo administrador"
+        },
+        "elastic_sync_held": {
+          "title": "Matriz {array}: Sync programado detenido, la paridad informa de errores",
+          "detail": "Un scrub informó de errores que nada ha reparado todavía. Un Sync programado quitaría del archivo content los archivos que el scrub no pudo leer. Ejecuta la reparación desde la paridad y después un scrub; el Sync manual sigue disponible."
+        },
+        "elastic_mover_settle_stopped": {
+          "title": "Matriz {array}: finalización automática del movimiento en pausa",
+          "detail": "{runs} {runs|ejecución consecutiva de movimiento falló|ejecuciones consecutivas de movimiento fallaron}, así que el nodo ya no inicia más por sí solo. Revisa la causa en el historial de movimientos e inicia el movimiento manualmente."
+        },
+        "elastic_cache_stuck": {
+          "title": "Los archivos esperan demasiado en la caché de la matriz {array}",
+          "detail": "El archivo más antiguo lleva {oldest} en el disco de caché (alarma tras {limit}) y la paridad no lo protege hasta que pase a los discos de datos: {cause}.",
+          "cause_unresolved_operation": "una operación sin resolver de esta matriz detiene el movimiento",
+          "cause_files_busy": "los archivos más antiguos están abiertos o asignados a un movimiento fallido, así que no se pueden mover",
+          "cause_schedule_window": "el movimiento está limitado a la ventana de la programación",
+          "cause_last_run_moved_nothing": "el último movimiento no sacó ningún archivo de la caché (revisa su resultado en el historial de tareas, p. ej. falta de espacio en los discos de datos)",
+          "cause_not_started": "el movimiento automático no pudo iniciarse (revisa el estado de la matriz)"
+        },
+        "elastic_conflict": {
+          "title": "Matriz {array}: {count} {count|archivo conservado|archivos conservados} en dos versiones",
+          "detail": "Un movimiento interrumpido dejó dos versiones de archivos y ninguna se eliminó. Compáralas y elimina la sobrante; la alerta desaparecerá cuando quede una.",
+          "file_quarantine": "{path}: versión visible {visible}, la otra es una copia en cuarentena en el disco de caché {disk}",
+          "file_data": "{path}: versión visible {visible}, la otra está en la misma ruta en el disco de datos {disk}",
+          "file_branch": "{path}: versión visible {visible}, la otra está en uno de los discos de la matriz"
+        },
+        "elastic_needs_attention": {
+          "title": "La matriz {array} requiere intervención",
+          "detail": "La matriz requiere intervención; las reservas se conservan",
+          "detail_helper": "La matriz requiere intervención; las reservas se conservan. La nota del helper está en el texto del nodo"
+        },
+        "elastic_result_unconfirmed": {
+          "title": "Matriz {array}: resultado de la operación sin confirmar",
+          "detail": "Un paso falló, y perder la respuesta no demuestra que la E/S se haya detenido. El error del paso está en el texto del nodo"
+        },
+        "elastic_replace_unconfirmed": {
+          "title": "Matriz {array}: sustitución de disco sin confirmar",
+          "detail": "La sustitución del disco no se confirmó. El error del paso está en el texto del nodo"
+        },
+        "elastic_add_disk_unconfirmed": {
+          "title": "Matriz {array}: adición de disco sin confirmar",
+          "detail": "El disco no se añadió a la matriz. El error del paso está en el texto del nodo"
+        },
+        "elastic_restore_waiting": {
+          "title": "La matriz {array} espera ser restaurada",
+          "detail": "No hay un canal root desatendido; se requiere un Restaurar explícito"
+        },
+        "target_portal_moved": {
+          "title": "Destino {target}: la dirección del portal se movió",
+          "detail": "El portal ya no está en la interfaz elegida; la exportación es inalcanzable hasta que vuelva la dirección o se elija de nuevo la interfaz."
+        },
+        "target_not_applied": {
+          "title": "Destino {target}: no aplicado en el kernel",
+          "detail": "El kernel rechazó el cambio; su error está en el texto del nodo",
+          "detail_hidden": "El kernel rechazó el cambio; el registro del nodo tiene el error completo"
+        },
+        "target_still_in_kernel": {
+          "title": "Destino {target}: sigue en el kernel aunque el nodo decidió detenerlo",
+          "detail": "El kernel no liberó el objeto; su error está en el texto del nodo",
+          "detail_hidden": "El kernel no liberó el objeto; el registro del nodo tiene el error completo"
+        },
+        "elevation_unarmed": {
+          "title": "El canal de privilegios no está armado: el nodo no llega al kernel",
+          "detail": "Hay destinos de bloque esperando a aplicarse o eliminarse. Tras un reinicio configfs está vacío y solo esta aplicación lo restaura, así que las exportaciones siguen caídas hasta que se arme el canal (Entorno → aprovisionamiento)."
+        },
+        "targets_sweep_failing": {
+          "title": "Destinos de bloque: el nodo no puede alcanzar el estado que decidió",
+          "detail_targets": "{count} {count|destino de bloque no está|destinos de bloque no están} en el estado que decidió el nodo",
+          "detail_sweep": "la propia reconciliación no pudo ejecutarse; el registro del nodo tiene el error",
+          "who_all": "la organización de cada uno tiene una alerta que lo nombra",
+          "who_some": "{alerted} de ellos {alerted|tiene|tienen} una alerta que lo nombra para su organización; el registro del nodo los nombra a todos",
+          "who_none": "el registro del nodo los nombra"
+        },
+        "targets_sweep_stale": {
+          "title": "Destinos de bloque: el nodo no puede alcanzar el estado que decidió",
+          "detail": "Antes del reinicio, los destinos de bloque de este nodo no estaban en el estado decidido; la próxima reconciliación lo sustituirá por el recuento actual"
+        }
+      },
+      "node_text": "Texto del nodo",
+      "id_hidden": "[identificador]",
+      "disk_reason": {
+        "smart_failed": "SMART informa de un fallo del disco",
+        "self_test_failed": "la última autoprueba SMART falló",
+        "pending_sectors": "{n} {n|sector espera|sectores esperan} reasignación",
+        "media_errors": "{n} {n|error|errores} de soporte",
+        "reallocated_growing": "{n} {n|sector reasignado nuevo|sectores reasignados nuevos} en 7 días",
+        "reallocated": "{n} {n|sector reasignado|sectores reasignados}",
+        "temperature_over_limit": "la temperatura de {t}°C supera el límite de {limit}°C",
+        "temperature_high": "temperatura de {t}°C",
+        "temperature_high_limit": "la temperatura de {t}°C supera el umbral de {limit}°C",
+        "crc_errors": "{n} {n|error|errores} CRC (cable o backplane)",
+        "wear": "{n}% de desgaste",
+        "no_smart_data": "sin datos SMART",
+        "zfs_faulted": "ZFS retiró el disco como averiado (FAULTED)",
+        "zfs_unavail": "ZFS no ve el disco (UNAVAIL)"
+      }
     },
     "role": {
       "free": "Libre",
@@ -6922,7 +7032,9 @@
       "dh": "{d} d {h} h",
       "hm": "{h} h {m} min",
       "m": "{m} min",
-      "s": "{s} s"
+      "s": "{s} s",
+      "d": "{d} d",
+      "h": "{h} h"
     },
     "fleet": {
       "head_scope": "flota",
@@ -7132,13 +7244,22 @@
       "reason_grew": "los sectores reasignados pasaron de {from} a {to} en 7 días",
       "reason_for_days": "{status} desde hace {days} {days|día|días}",
       "reason_other": "el nodo recomienda sustituir este disco",
-      "disk_other": "El nodo recomienda sustituir este disco. {spare}."
+      "disk_other": "El nodo recomienda sustituir este disco. {spare}.",
+      "array_urgent": "Este disco de la matriz Elastic requiere atención: {reason}. Sustituir un disco de la matriz no está disponible en esta versión.",
+      "array_advice": "Vigila este disco de la matriz Elastic: {reason}. Sustituir un disco de la matriz no está disponible en esta versión.",
+      "array_other": "El nodo informa de un problema con este disco de la matriz Elastic. Sustituir un disco de la matriz no está disponible en esta versión.",
+      "array_no_replace": "matriz Elastic: la sustitución del disco no está disponible en esta versión",
+      "array_title": "Discos de la matriz Elastic que requieren atención",
+      "array_hint": "Según el historial de este nodo; sustituir un disco de la matriz Elastic no está disponible en esta versión.",
+      "array_reason_other": "el nodo informa de un problema con este disco",
+      "array_severity_urgent": "urgente",
+      "array_severity_advice": "vigílalo",
+      "array_severity_other": "atención"
     },
     "targets": {
       "sessions_unmeasured": "Desconocido no significa cero",
       "host_shared": "También usado por",
       "context_changed": "El contexto del nodo o target ha cambiado. Abre de nuevo los detalles.",
-      "back_to_list": "Volver a recursos compartidos",
       "session_identity": "Cliente / iniciador",
       "edit_initiators": "Añadir o editar hosts",
       "initiators_draft": "Confirma los cambios de la lista con Guardar.",
@@ -7241,7 +7362,9 @@
       "delete_keep_volume": "El volumen {source} y sus datos quedan intactos.",
       "service_missing": "{proto}: {detail}",
       "created": "Creado",
-      "key_in_kernel": "La clave va al kernel (configfs). nvmet la crea legible para todos, así que el nodo restringe el modo del archivo solo a root y comprueba el resultado; cualquier discrepancia queda en el registro de la tarea. En un nodo con usuarios locales trátala como un secreto compartido con ese nodo."
+      "key_in_kernel": "La clave va al kernel (configfs). nvmet la crea legible para todos, así que el nodo restringe el modo del archivo solo a root y comprueba el resultado; cualquier discrepancia queda en el registro de la tarea. En un nodo con usuarios locales trátala como un secreto compartido con ese nodo.",
+      "gone_title": "Este destino ya no existe",
+      "gone_detail": "Se eliminó en este nodo (por ejemplo, otro administrador). Vuelve a la lista de uso compartido."
     },
     "wizard_target": {
       "title": "Nuevo destino",
@@ -7346,6 +7469,16 @@
       "this_org": "otra instancia de TentaNas de esta organización",
       "this_org_named": "la instancia «{name}» de esta organización",
       "other_installation": "otra instalación de TentaNas"
+    },
+    "refusal": {
+      "share_user_in_use_elsewhere": "Esta cuenta todavía se usa en este nodo; no se puede eliminar",
+      "approval_not_found": "Esta solicitud no está en este nodo",
+      "approval_own_request": "El autor de una solicitud no puede aprobarla: tiene que hacerlo un segundo administrador",
+      "approval_already_approved": "Esta solicitud ya se aprobó",
+      "approval_already_rejected": "Esta solicitud ya se rechazó",
+      "approval_already_expired": "Esta solicitud ya caducó",
+      "approval_closed": "Ya se decidió sobre esta solicitud",
+      "approval_expired": "La solicitud caducó antes de que nadie decidiera sobre ella"
     }
   },
   "agent_accounts": {

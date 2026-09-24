@@ -12,8 +12,8 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage } from '/js/modules/tentanas/format.js';
-import { setAttr, patchHtml } from '/js/modules/tentanas/dom-patch.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage, errCode } from '/js/modules/tentanas/format.js';
+import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl, setRowsIfChanged } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns } from '/js/modules/tentanas/target-wizard.js';
 import '/js/components/tf-table.js';
@@ -360,34 +360,82 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
   const win = document.createElement('section');
   const sourceNodeId = screen.nodeId;
   const isCurrent = () => win.isConnected && !screen.disposed && screen.nodeId === sourceNodeId;
+  const admin = Boolean(screen.isAdmin);
   win.className = 'nas-target-detail';
-  win.innerHTML = `<div class="nas-target-page-head"><tf-button variant="ghost" icon="arrow-left" data-act="back">${escapeHtml(T('targets.back_to_list'))}</tf-button></div>
-    <div slot="body" class="stack"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>`;
+  // Built once for the visit. Everything that comes from the node is written
+  // into addressed places by `paint`, so neither a poll nor a manual reload
+  // replaces a node whose value did not change — the open "edit hosts" field
+  // keeps its caret, and a failed reload leaves the last good read on screen
+  // under an error line instead of blanking the pane.
+  //
+  // No heading or back button of its own (n19): the shell's one breadcrumb
+  // reads "TentaNas › helios › Udostępnianie › vm-store", and its
+  // "Udostępnianie" level is the way back — also once the target is gone.
+  const setCrumbs = (name) => screen.setCrumbTail?.([
+    { label: T('tabs.shares'), act: 'shares', query: `node=${sourceNodeId}&tab=shares` },
+    ...(name ? [{ label: name }] : []),
+  ]);
+  setCrumbs(null);
+  win.innerHTML = `<div slot="body" class="stack"><div data-part="error" ${SLOT}></div><div data-part="content" ${SLOT}></div></div>
+    <div data-part="footer" ${SLOT}></div>`;
   body.replaceChildren(win);
-  win.querySelector('[data-act="back"]').addEventListener('click', () => screen.openTarget(null));
-  const state = { target: null, sessions: [], preview: '', initiatorsText: '', capabilities, siblings };
+  const content = win.querySelector('[data-part="content"]');
+  slotEl(content, true, 'loading', `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`);
+  const state = { target: null, sessions: [], preview: '', initiatorsText: '', capabilities, siblings, error: '', gone: false };
+  let loadSeq = 0;
+  // TargetGet-only reads since the list was last read (see LIST_EVERY_POLLS).
+  let listAge = Infinity;
 
-  const load = async () => {
-    if (!isCurrent()) return false;
+  // `withList` asks for the node's target list too. It is what the shared-
+  // host warning and the portal card read, and for an NVMe-oF target it
+  // costs the node a privileged session read of its own — the same one
+  // TargetGet already makes. So a poll sends TargetGet alone, and the list
+  // rides along on the first read, on an admin's refresh or edit, and once
+  // every LIST_EVERY_POLLS reads (wave-4 critic minor 9).
+  const load = async ({ withList = false } = {}) => {
+    if (!isCurrent() || state.gone) return false;
+    const seq = ++loadSeq;
     const requestDraft = state.initiatorsText;
     const hasDraft = state.target && state.initiatorsText !== (state.target.initiators || []).join('\n');
+    // One read in every LIST_EVERY_POLLS carries the list.
+    const readList = withList || listAge + 1 >= LIST_EVERY_POLLS;
     try {
       const [r, list] = await Promise.all([
         screen.nas('tentaNasTargetGetRequest', { targetId }),
-        screen.nas('tentaNasTargetsListRequest', {}).catch(() => null),
+        readList ? screen.nas('tentaNasTargetsListRequest', {}).catch(() => null) : null,
       ]);
-      if (!isCurrent()) return false;
-      state.capabilities = list?.capabilities || null;
-      state.siblings = list?.targets || siblings;
+      // A newer read (the poll and a click can overlap) owns the screen.
+      if (!isCurrent() || seq !== loadSeq) return false;
+      // The list is a second, optional read: when only it fails, what the
+      // last one said about the node's interfaces and other targets stands.
+      if (list) {
+        state.capabilities = list.capabilities || null;
+        state.siblings = list.targets || siblings;
+        listAge = 0;
+      } else {
+        listAge += 1;
+      }
       state.target = r.target;
       state.sessions = r.sessions || [];
       state.preview = r.configPreview || '';
+      state.error = '';
       if (!hasDraft && state.initiatorsText === requestDraft) state.initiatorsText = (r.target.initiators || []).join('\n');
     } catch (e) {
-      if (isCurrent()) win.querySelector('[slot="body"]').innerHTML = `<div class="num-err">${escapeHtml(errMessage(e))}</div>`;
+      if (!isCurrent() || seq !== loadSeq) return false;
+      // Another admin deleted it (or it left this organisation): that is not
+      // a transient read error to retry every 10 s under a live Delete
+      // button. The pane says the target is gone and the poll ends.
+      if (errCode(e) === 'NotFound') {
+        state.gone = true;
+        state.error = '';
+        paint();
+        return false;
+      }
+      state.error = errMessage(e);
+      paint();
       return false;
     }
-    if (isCurrent()) draw();
+    paint();
     return true;
   };
 
@@ -424,145 +472,27 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     return sharedHtml + invalidHtml;
   };
 
-  const draw = () => {
+  const updateHosts = () => {
     const t = state.target;
-    const drifted = portalDrifted(t, state.capabilities);
-    const portal = (t.portals || [])[0];
-    const interfaces = state.capabilities?.interfaces;
-    const owners = Array.isArray(interfaces) && portal
-      ? [...new Set(interfaces.filter((i) => i.supported && i.address === portal.address).map((i) => i.name))]
-      : null;
-    const portalRows = portal ? [
-      ['targets.portal_configured', `${portal.address}:${portal.port}`],
-      ['targets.portal_expected', portal.interface || T('targets.all_interfaces')],
-      ['targets.portal_current_addresses', Array.isArray(interfaces) ? bindableAddresses(state.capabilities, portal.interface).join(', ') || '—' : T('targets.portal_unknown')],
-      ['targets.portal_actual', !portal.interface ? T('targets.all_interfaces') : owners ? owners.join(', ') || T('targets.portal_no_owner') : T('targets.portal_unknown')],
-      ['targets.portal_transport', [...new Set(t.portals.map((p) => transportLabel(p.transport)))].join(' + ')],
-      ['targets.portal_exposure', T('targets.portal_unknown')],
-    ].map(([key, value]) => `<div class="sr"><span class="k">${escapeHtml(T(key))}</span><span class="v mono" data-testid="${key.slice('targets.'.length)}">${escapeHtml(value)}</span></div>`) : [];
-    const lun = (t.luns || [])[0];
-    const authRows = t.auth?.method && t.auth.method !== 'none' ? (t.protocol === 'nvmet' ? [
-      [T('targets.auth_hash'), t.auth.dhchapHash || '—'],
-      [T('targets.auth_dhgroup'), t.auth.dhchapDhgroup || '—'],
-      [T('wizard_target.dhchap_key'), t.auth.secretSet ? '••••••••••••' : '—'],
-      [T('wizard_target.dhchap_ctrl_key'), t.auth.mutualSecretSet ? '••••••••••••' : '—'],
-    ] : [
-      [T('wizard_target.auth_user'), t.auth.username || '—'],
-      [T('wizard_target.auth_secret'), t.auth.secretSet ? '••••••••••••' : '—'],
-      [T('wizard_target.auth_mutual_user'), t.auth.mutualUsername || '—'],
-      [T('wizard_target.auth_mutual_secret'), t.auth.mutualSecretSet ? '••••••••••••' : '—'],
-    ]).map(([label, value]) => `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v mono">${escapeHtml(value)}</span></div>`) : [];
-    const groups = (t.portGroups || []).map((g) => `<div class="sr"><span class="k">${escapeHtml(T('targets.port_group_row', { n: g.groupId }))}</span><span class="v">${escapeHtml(groupStateLabel(g.state))}${g.preferred ? ` · ${escapeHtml(T('targets.group_preferred'))}` : ''}</span></div>`).join('');
-    win.innerHTML = `
-      <div class="section-card-head nas-target-page-head"><div class="row"><tf-button variant="ghost" icon="arrow-left" data-act="back">${escapeHtml(T('targets.back_to_list'))}</tf-button><h2>${escapeHtml(t.name)}</h2></div></div>
-      <div slot="body" class="stack">
-        ${drifted ? `<div class="wizard-warning danger" data-testid="portal-drift-banner">${sprite('alert')}<div>
-          <b>${escapeHtml(T('targets.portal_drift_title'))}</b>
-          <p>${escapeHtml(T('targets.portal_drift_note'))}</p>
-          ${t.stateDetail ? `<p>${escapeHtml(t.stateDetail)}</p>` : ''}
-          <div class="row">
-            ${screen.isAdmin ? `<tf-button variant="primary" icon="globe" data-act="repick-portal">${escapeHtml(T('targets.portal_repick'))}</tf-button>` : ''}
-            <tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('targets.portal_refresh'))}</tf-button>
-          </div>
-        </div></div>` : ''}
-        <section class="nas-target-card">
-        <div class="section-card-head"><h3 class="title">${sprite('target')} ${escapeHtml(t.name)}</h3><div class="row">
-          ${protocolChipHtml(t.protocol)}
-          ${stateChip(t) || `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('targets.state_active'))}"></tf-chip>`}
-        </div></div>
-        ${t.stateDetail && !drifted ? `<p class="text-3">${escapeHtml(t.stateDetail)}</p>` : ''}
-        <div class="nas-target-grid"><div class="stat-rows">
-          <div class="sr"><span class="k">${escapeHtml(T('targets.wwn'))}</span><span class="v mono">${escapeHtml(t.wwn)}</span></div>
-          <div class="sr"><span class="k">${escapeHtml(T('targets.lun'))}</span><span class="v mono">${lun ? `${escapeHtml(lun.source)} · ${escapeHtml(fmtBytes(lun.sizeBytes))}${lun.thin ? ' · thin' : ''}` : '—'}</span></div>
-        </div><div class="stat-rows">
-          <div class="sr"><span class="k">${escapeHtml(T('targets.sessions_title'))}</span><span class="v" data-testid="target-sessions-count">${escapeHtml(sessionsCountLabel(t))}</span></div>
-          <div class="sr"><span class="k">${escapeHtml(T('targets.created'))}</span><span class="v">${escapeHtml(t.createdAt ? fmtAgo(t.createdAt) : '—')}</span></div>
-        </div></div></section>
-        <section class="nas-target-card" data-testid="target-portal-card">
-        <div class="section-card-head"><h3 class="title">${sprite('globe')} ${escapeHtml(T('targets.portal_section'))}</h3>
-          ${!drifted ? `<tf-button size="sm" variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('targets.portal_refresh'))}</tf-button>` : ''}
-        </div>
-        <div class="nas-target-grid"><div class="stat-rows">${portalRows.slice(0, 3).join('')}</div><div class="stat-rows">${portalRows.slice(3).join('')}</div></div>
-        <div class="section-card-head"><h3 class="title">${sprite('layers')} ${escapeHtml(T('targets.port_groups'))}</h3></div>
-        <div class="stat-rows" id="nas-td-groups">${groups}</div>
-        ${drifted ? `<div class="section-card-head"><h3 class="title">${sprite('globe')} ${escapeHtml(T('targets.portal_available'))}</h3></div>
-          <p class="muted">${escapeHtml(T('targets.portal_available_note'))}</p><tf-table id="nas-td-interfaces">
-            <tf-column key="address" label="${escapeAttr(T('targets.portal_address'))}"></tf-column>
-            <tf-column key="interface" label="${escapeAttr(T('wizard_target.portal_label'))}"></tf-column>
-            <tf-column key="network" label="${escapeAttr(T('targets.portal_network'))}"></tf-column>
-          </tf-table>` : ''}
-        </section>
-        <section class="nas-target-card">
-        <div class="section-card-head"><h3 class="title">${sprite('users')} ${escapeHtml(T('targets.sessions_title'))}</h3> <tf-chip size="sm" status="neutral" label="${escapeAttr(sessionsCountLabel(t))}"></tf-chip></div>
-        ${state.sessions.length
-          ? `<tf-table id="nas-td-sessions"><tf-column key="client" label="${escapeAttr(T('targets.session_identity'))}" fill></tf-column><tf-column key="identity" label="IQN / NQN" renderer="html" fill></tf-column></tf-table>`
-          : t.sessionsKnown !== true ? `<tf-empty-state icon="users" title="${escapeAttr(T('targets.sessions_unmeasured'))}" message="${escapeAttr(sessionsEmptyText(t))}"></tf-empty-state>` : `<div class="muted">${escapeHtml(sessionsEmptyText(t))}</div>`}
-        </section>
-        <section class="nas-target-card">
-        <div class="section-card-head"><h3 class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</h3></div>
-        <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}"><tf-column key="identity" label="IQN / NQN" fill></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column></tf-table>
-        ${screen.isAdmin ? `<details><summary>${escapeHtml(T('targets.edit_initiators'))}</summary>
-          <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}" value="${escapeAttr(state.initiatorsText)}"></tf-input>
-          </details><p class="muted" data-testid="initiators-draft-hint">${escapeHtml(T('targets.initiators_draft'))}</p>` : ''}
-        <div id="nas-td-shared">${sharedWarningHtml(t)}</div>
-        ${warningHtml('info', T('targets.allowlist_note'))}
-        </section>
-        <section class="nas-target-card">
-        <div class="section-card-head"><h3 class="title">${sprite('lock')} ${escapeHtml(T('targets.col_auth'))}</h3>${authChipHtml(t.auth)}</div>
-        <div class="stat-rows"><div class="sr"><span class="k">${escapeHtml(T('targets.col_auth'))}</span><span class="v">${escapeHtml(authLabel(t.auth?.method))}${t.auth?.username ? ` · <span class="mono">${escapeHtml(t.auth.username)}</span>` : ''}</span></div></div>
-        <div class="nas-target-grid"><div class="stat-rows">${authRows.slice(0, 2).join('')}</div><div class="stat-rows">${authRows.slice(2).join('')}</div></div>
-        <p class="muted">${escapeHtml(T('targets.auth_stored_note'))}</p>
-        </section>
-        ${warningHtml('danger', T('targets.raw_disk_note'))}
-        <section class="nas-target-card">
-        <div class="section-card-head"><h3 class="title">${sprite('terminal')} ${escapeHtml(T('targets.config_preview'))}</h3></div><p class="muted">${escapeHtml(T('targets.config_preview_hint'))}</p>
-        <pre class="cmd" id="nas-td-preview">${escapeHtml(state.preview)}</pre>
-        </section>
-        ${screen.isAdmin ? `<section class="nas-target-card nas-target-danger">
-          <h3 class="title">${escapeHtml(T('targets.delete_title', { name: t.name }))}</h3>
-          <p>${escapeHtml(T('targets.delete_keep_volume', { source: lun?.source || '—' }))}</p>
-          <div><tf-button variant="danger" icon="trash" data-act="delete">${escapeHtml(T('targets.delete'))}</tf-button></div>
-        </section>` : ''}
-      </div>
-      <div slot="footer">
-        ${screen.isAdmin ? `<tf-button variant="ghost" icon="${t.enabled ? 'pause' : 'play'}" data-act="pause">${escapeHtml(t.enabled ? T('targets.pause') : T('targets.resume'))}</tf-button>` : ''}
-        <span class="spacer"></span>
-        ${screen.isAdmin ? `<tf-button variant="secondary" icon="edit" data-act="edit">${escapeHtml(T('targets.edit'))}</tf-button>
-        <tf-button variant="primary" icon="check" data-act="save">${escapeHtml(T('targets.save'))}</tf-button>` : ''}
-      </div>`;
-    const openPortalSelection = (portalSelection = null) => {
-      openTargetWizard(screen, { target: t, capabilities: state.capabilities, targets: state.siblings, onDone: () => { onChange?.(); load(); }, selectPortal: true, portalSelection, isCurrent });
-    };
-    const interfaceTable = win.querySelector('#nas-td-interfaces');
-    if (interfaceTable) {
-      if (screen.isAdmin) interfaceTable.rowActions = (row, idx, currentRow) => {
-        const live = () => currentRow?.() ?? row;
-        const button = document.createElement('tf-button');
-        button.setAttribute('size', 'sm');
-        button.setAttribute('variant', 'secondary');
-        button.setAttribute('data-act', 'pick-interface');
-        button.textContent = T('targets.portal_pick_interface');
-        if (!row._supported || row.address !== primaryAddress(state.capabilities, row.interface)) {
-          button.setAttribute('disabled', '');
-          button.setAttribute('title', T('targets.portal_available_note'));
-        }
-        button.addEventListener('click', () => openPortalSelection(live().interface));
-        return button;
-      };
-      interfaceTable.rows = interfaces.map((i) => ({ address: i.address, interface: i.name, network: T(i.shared ? 'targets.portal_network_shared' : 'targets.portal_network_storage'), _supported: i.supported }));
-    }
-    const sessionTable = win.querySelector('#nas-td-sessions');
-    if (sessionTable) sessionTable.rows = state.sessions.map((s) => ({ client: s.client || '—', identity: sessionLine({ user: s.user }) }));
     const hostsTable = win.querySelector('#nas-td-hosts');
-    const updateHosts = () => {
-      hostsTable.rows = parseInitiators(state.initiatorsText).map((identity) => ({
-        identity,
-        auth: authChipHtml(t.auth),
-        shared: state.capabilities ? state.siblings.filter((other) => other.targetId !== t.targetId && other.protocol === t.protocol && (other.initiators || []).includes(identity)).map((other) => other.name).join(', ') || '—' : T('targets.portal_unknown'),
-      }));
-      win.querySelector('#nas-td-shared').innerHTML = sharedWarningHtml(t);
-    };
-    if (screen.isAdmin) hostsTable.rowActions = (row, idx, currentRow) => {
+    if (!t || !hostsTable) return;
+    setRowsIfChanged(hostsTable, parseInitiators(state.initiatorsText).map((identity) => ({
+      identity,
+      auth: authChipHtml(t.auth),
+      shared: state.capabilities ? state.siblings.filter((other) => other.targetId !== t.targetId && other.protocol === t.protocol && (other.initiators || []).includes(identity)).map((other) => other.name).join(', ') || '—' : T('targets.portal_unknown'),
+    })));
+    patchHtml(win.querySelector('#nas-td-shared'), sharedWarningHtml(t));
+  };
+
+  const openPortalSelection = (portalSelection = null) => {
+    openTargetWizard(screen, { target: state.target, capabilities: state.capabilities, targets: state.siblings, onDone: () => { onChange?.(); load({ withList: true }); }, selectPortal: true, portalSelection, isCurrent });
+  };
+
+  // Listeners belong to the skeleton, so they are bound exactly once, when it
+  // is built; every handler reads the CURRENT target at the time it runs.
+  const wireDetail = () => {
+    const hostsTable = win.querySelector('#nas-td-hosts');
+    if (admin) hostsTable.rowActions = (row, idx, currentRow) => {
       const live = () => currentRow?.() ?? row;
       const button = document.createElement('tf-button');
       button.setAttribute('variant', 'ghost');
@@ -578,27 +508,165 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       });
       return button;
     };
-    updateHosts();
     win.querySelector('#nas-td-initiators')?.addEventListener('input', (e) => { state.initiatorsText = e.target.value; updateHosts(); });
-    win.querySelector('[data-act="back"]').addEventListener('click', () => screen.openTarget(null));
-    win.querySelector('[data-act="save"]')?.addEventListener('click', () => saveAllowlist());
-    win.querySelector('[data-act="edit"]')?.addEventListener('click', () => {
+  };
+
+  const paint = () => {
+    const errorHost = win.querySelector('[data-part="error"]');
+    setText(slotEl(errorHost, Boolean(state.error), 'error', '<div class="num-err" data-testid="target-load-error"></div>'), state.error);
+    if (state.gone) {
+      // Nothing of the target is left to act on: no footer, no detail.
+      slotEl(win.querySelector('[data-part="footer"]'), false);
+      slotEl(content, true, 'gone', `<tf-empty-state icon="target" data-testid="target-gone" title="${escapeAttr(T('targets.gone_title'))}" message="${escapeAttr(T('targets.gone_detail'))}"></tf-empty-state>`);
+      return;
+    }
+    const t = state.target;
+    if (!t) {
+      // Nothing read yet: the error line is the whole pane.
+      slotEl(content, !state.error, 'loading', `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`);
+      return;
+    }
+    const built = content.firstElementChild?.dataset.part !== 'detail';
+    slotEl(content, true, 'detail', targetDetailHtml(admin));
+    slotEl(win.querySelector('[data-part="footer"]'), true, 'footer', targetFooterHtml(admin));
+    if (built) wireDetail();
+
+    const drifted = portalDrifted(t, state.capabilities);
+    const portal = (t.portals || [])[0];
+    const interfaces = state.capabilities?.interfaces;
+    const owners = Array.isArray(interfaces) && portal
+      ? [...new Set(interfaces.filter((i) => i.supported && i.address === portal.address).map((i) => i.name))]
+      : null;
+    const field = (name) => win.querySelector(`[data-f="${name}"]`);
+
+    // Written on every paint and changed only when the name does
+    // (`setCrumbTail` compares its markup): once, in practice.
+    setCrumbs(t.name);
+    const drift = slotEl(win.querySelector('[data-part="drift"]'), drifted, 'drift', driftBannerHtml(admin));
+    if (drift) setText(slotEl(drift.querySelector('[data-part="drift-detail"]'), Boolean(t.stateDetail), 'detail', '<p></p>'), t.stateDetail);
+    setText(field('name'), t.name);
+    const protocolChip = protocolChipHtml(t.protocol);
+    slotEl(win.querySelector('[data-part="protocol"]'), true, protocolChip, protocolChip);
+    const stateHtml = stateChip(t) || `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('targets.state_active'))}"></tf-chip>`;
+    slotEl(win.querySelector('[data-part="state"]'), true, stateHtml, stateHtml);
+    setText(slotEl(win.querySelector('[data-part="state-detail"]'), Boolean(t.stateDetail) && !drifted, 'detail', '<p class="text-3"></p>'), t.stateDetail);
+    const lun = (t.luns || [])[0];
+    setText(field('wwn'), t.wwn);
+    setText(field('lun'), lun ? `${lun.source} · ${fmtBytes(lun.sizeBytes)}${lun.thin ? ' · thin' : ''}` : '—');
+    setText(field('sessions-count'), sessionsCountLabel(t));
+    setText(field('created'), t.createdAt ? fmtAgo(t.createdAt) : '—');
+
+    // Portal: the rows are keyed by what they name, and only their values move.
+    const portalRows = portal ? [
+      ['targets.portal_configured', `${portal.address}:${portal.port}`],
+      ['targets.portal_expected', portal.interface || T('targets.all_interfaces')],
+      ['targets.portal_current_addresses', Array.isArray(interfaces) ? bindableAddresses(state.capabilities, portal.interface).join(', ') || '—' : T('targets.portal_unknown')],
+      ['targets.portal_actual', !portal.interface ? T('targets.all_interfaces') : owners ? owners.join(', ') || T('targets.portal_no_owner') : T('targets.portal_unknown')],
+      ['targets.portal_transport', [...new Set(t.portals.map((p) => transportLabel(p.transport)))].join(' + ')],
+      ['targets.portal_exposure', T('targets.portal_unknown')],
+    ] : [];
+    const rowSpec = ([key, value]) => ({ key, label: T(key), value, testid: key.slice('targets.'.length), mono: true });
+    paintValueRows(win.querySelector('[data-part="portal-a"]'), portalRows.slice(0, 3).map(rowSpec));
+    paintValueRows(win.querySelector('[data-part="portal-b"]'), portalRows.slice(3).map(rowSpec));
+    slotEl(win.querySelector('[data-part="portal-refresh"]'), !drifted, 'refresh', `<tf-button size="sm" variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('targets.portal_refresh'))}</tf-button>`);
+    paintValueRows(win.querySelector('#nas-td-groups'), (t.portGroups || []).map((g) => ({
+      key: `group:${g.groupId}`,
+      label: T('targets.port_group_row', { n: g.groupId }),
+      value: `${groupStateLabel(g.state)}${g.preferred ? ` · ${T('targets.group_preferred')}` : ''}`,
+    })));
+    const interfacesBox = slotEl(win.querySelector('[data-part="interfaces"]'), drifted, 'interfaces', interfacesSectionHtml());
+    const interfaceTable = interfacesBox?.querySelector('#nas-td-interfaces');
+    if (interfaceTable) {
+      if (admin && !interfaceTable.rowActions) interfaceTable.rowActions = (row, idx, currentRow) => {
+        const live = () => currentRow?.() ?? row;
+        const button = document.createElement('tf-button');
+        button.setAttribute('size', 'sm');
+        button.setAttribute('variant', 'secondary');
+        button.setAttribute('data-act', 'pick-interface');
+        button.textContent = T('targets.portal_pick_interface');
+        if (!row._supported || row.address !== primaryAddress(state.capabilities, row.interface)) {
+          button.setAttribute('disabled', '');
+          button.setAttribute('title', T('targets.portal_available_note'));
+        }
+        button.addEventListener('click', () => openPortalSelection(live().interface));
+        return button;
+      };
+      setRowsIfChanged(interfaceTable, (interfaces || []).map((i) => ({ address: i.address, interface: i.name, network: T(i.shared ? 'targets.portal_network_shared' : 'targets.portal_network_storage'), _supported: i.supported })));
+    }
+
+    // Sessions: a table, the "not measured" state or a measured zero.
+    setAttr(field('sessions-chip'), 'label', sessionsCountLabel(t));
+    const sessionsHost = win.querySelector('[data-part="sessions"]');
+    if (state.sessions.length) {
+      const table = slotEl(sessionsHost, true, 'table', `<tf-table id="nas-td-sessions"><tf-column key="client" label="${escapeAttr(T('targets.session_identity'))}" fill></tf-column><tf-column key="identity" label="IQN / NQN" renderer="html" fill></tf-column></tf-table>`);
+      setRowsIfChanged(table, state.sessions.map((s) => ({ client: s.client || '—', identity: sessionLine({ user: s.user }) })));
+    } else if (t.sessionsKnown !== true) {
+      const empty = slotEl(sessionsHost, true, 'unmeasured', `<tf-empty-state icon="users" title="${escapeAttr(T('targets.sessions_unmeasured'))}"></tf-empty-state>`);
+      setAttr(empty, 'message', sessionsEmptyText(t));
+    } else {
+      setText(slotEl(sessionsHost, true, 'none', '<div class="muted"></div>'), sessionsEmptyText(t));
+    }
+
+    // The allowlist field follows the node only while the admin has no draft
+    // of their own in it (`load` keeps `initiatorsText` in that case).
+    setAttr(win.querySelector('#nas-td-initiators'), 'value', state.initiatorsText);
+    updateHosts();
+
+    const authChip = authChipHtml(t.auth);
+    slotEl(win.querySelector('[data-part="auth-chip"]'), true, authChip, authChip);
+    setText(field('auth-method'), authLabel(t.auth?.method));
+    // "CHAP · initiator1", as n19 writes it: the separator travels with the
+    // user name, so a method without one ends the line.
+    const authUser = slotEl(win.querySelector('[data-part="auth-user"]'), Boolean(t.auth?.username), 'user', '<span class="nas-auth-user"><span class="text-3">·</span><span class="mono"></span></span>');
+    setText(authUser?.querySelector('.mono'), t.auth?.username || '');
+    const secret = (set) => (set ? '••••••••••••' : '—');
+    const authRows = t.auth?.method && t.auth.method !== 'none' ? (t.protocol === 'nvmet' ? [
+      ['targets.auth_hash', t.auth.dhchapHash || '—'],
+      ['targets.auth_dhgroup', t.auth.dhchapDhgroup || '—'],
+      ['wizard_target.dhchap_key', secret(t.auth.secretSet)],
+      ['wizard_target.dhchap_ctrl_key', secret(t.auth.mutualSecretSet)],
+    ] : [
+      ['wizard_target.auth_user', t.auth.username || '—'],
+      ['wizard_target.auth_secret', secret(t.auth.secretSet)],
+      ['wizard_target.auth_mutual_user', t.auth.mutualUsername || '—'],
+      ['wizard_target.auth_mutual_secret', secret(t.auth.mutualSecretSet)],
+    ]).map(([key, value]) => ({ key, label: T(key), value, mono: true })) : [];
+    paintValueRows(win.querySelector('[data-part="auth-a"]'), authRows.slice(0, 2));
+    paintValueRows(win.querySelector('[data-part="auth-b"]'), authRows.slice(2));
+
+    setText(win.querySelector('#nas-td-preview'), state.preview);
+    setText(field('delete-title'), T('targets.delete_title', { name: t.name }));
+    setText(field('delete-keep'), T('targets.delete_keep_volume', { source: lun?.source || '—' }));
+    const pause = win.querySelector('[data-act="pause"]');
+    setAttr(pause, 'icon', t.enabled ? 'pause' : 'play');
+    setAttr(pause, 'label', t.enabled ? T('targets.pause') : T('targets.resume'));
+  };
+
+  // ONE click listener for the visit: buttons come and go with the data (the
+  // drift banner's, the portal card's refresh), and each handler acts on the
+  // target as it is NOW, never as it was when a button was made.
+  win.addEventListener('click', (event) => {
+    const el = event.target.closest?.('[data-act]');
+    if (!el || !win.contains(el) || el.hasAttribute('disabled')) return;
+    const act = el.dataset.act;
+    if (act === 'refresh') { load({ withList: true }); return; }
+    const t = state.target;
+    if (!t || !isCurrent()) return;
+    switch (act) {
+      case 'save': saveAllowlist(); return;
       // The node's real target list, not `[t]`: `sharedHostTargets` excludes
       // the target being edited, so a one-element list always filtered to
       // empty and this path — the ordinary way to edit an existing target —
       // showed no shared-host warning at all.
-      openTargetWizard(screen, { target: t, capabilities: state.capabilities, targets: state.siblings, onDone: () => { onChange?.(); load(); }, isCurrent });
-    });
-    win.querySelector('[data-act="repick-portal"]')?.addEventListener('click', () => openPortalSelection());
-    win.querySelector('[data-act="refresh"]')?.addEventListener('click', () => load());
-    win.querySelector('[data-act="delete"]')?.addEventListener('click', () => {
-      openTargetDeleteDialog(screen, t, () => { onChange?.(); if (isCurrent()) screen.openTarget(null); }, isCurrent);
-    });
-    win.querySelector('[data-act="pause"]')?.addEventListener('click', async () => {
-      await setTargetEnabled(screen, t, !t.enabled, onChange, isCurrent);
-      if (win.isConnected) load();
-    });
-  };
+      case 'edit': openTargetWizard(screen, { target: t, capabilities: state.capabilities, targets: state.siblings, onDone: () => { onChange?.(); load({ withList: true }); }, isCurrent }); return;
+      case 'repick-portal': openPortalSelection(); return;
+      case 'delete': openTargetDeleteDialog(screen, t, () => { onChange?.(); if (isCurrent()) screen.openTarget(null); }, isCurrent); return;
+      case 'pause':
+        setTargetEnabled(screen, t, !t.enabled, onChange, isCurrent).then(() => { if (win.isConnected) load(); });
+        return;
+      default:
+    }
+  });
 
   const saveAllowlist = async () => {
     const t = state.target;
@@ -640,8 +708,127 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     if (win.isConnected) load();
   };
 
-  load();
+  // n19: "Odczyt z jądra przy każdym odświeżeniu" — the node reads the kernel
+  // on every TargetGet, so a modest poll keeps the sessions, the state and
+  // the portal owner current while the detail is open. It stops by itself
+  // once the pane is gone (another target, another tab, another node), and
+  // once the TARGET is gone.
+  const poll = async () => {
+    await load();
+    if (isCurrent() && !state.gone) screen.later(poll, POLL_TARGET_DETAIL_MS);
+  };
+  poll();
   return win;
+}
+
+// How many TargetGet-only reads pass between two reads of the node's target
+// list in the open detail: once a minute at POLL_TARGET_DETAIL_MS.
+const LIST_EVERY_POLLS = 6;
+
+// How often the open target detail reads the target again. The node answers
+// TargetGet from the kernel, so this is what keeps the sessions and the state
+// honest while the admin looks at them — modest, because nothing here moves
+// by the second.
+const POLL_TARGET_DETAIL_MS = 10_000;
+
+// The detail's skeleton: labels, section heads and addressed empty places.
+// Nothing in it comes from the target, so it is built once per visit; `paint`
+// fills it.
+function targetDetailHtml(admin) {
+  return `<div class="stack" data-part="detail">
+    <div data-part="drift" ${SLOT}></div>
+    <section class="nas-target-card">
+    <div class="section-card-head"><h3 class="title">${sprite('target')} <span data-f="name"></span></h3><div class="row"><span data-part="protocol" ${SLOT}></span><span data-part="state" ${SLOT}></span></div></div>
+    <div data-part="state-detail" ${SLOT}></div>
+    <div class="nas-target-grid"><div class="stat-rows">
+      <div class="sr"><span class="k">${escapeHtml(T('targets.wwn'))}</span><span class="v mono" data-f="wwn"></span></div>
+      <div class="sr"><span class="k">${escapeHtml(T('targets.lun'))}</span><span class="v mono" data-f="lun"></span></div>
+    </div><div class="stat-rows">
+      <div class="sr"><span class="k">${escapeHtml(T('targets.sessions_title'))}</span><span class="v" data-testid="target-sessions-count" data-f="sessions-count"></span></div>
+      <div class="sr"><span class="k">${escapeHtml(T('targets.created'))}</span><span class="v" data-f="created"></span></div>
+    </div></div></section>
+    <section class="nas-target-card" data-testid="target-portal-card">
+    <div class="section-card-head"><h3 class="title">${sprite('globe')} ${escapeHtml(T('targets.portal_section'))}</h3><span data-part="portal-refresh" ${SLOT}></span></div>
+    <div class="nas-target-grid"><div class="stat-rows" data-part="portal-a"></div><div class="stat-rows" data-part="portal-b"></div></div>
+    <div class="section-card-head"><h3 class="title">${sprite('layers')} ${escapeHtml(T('targets.port_groups'))}</h3></div>
+    <div class="stat-rows" id="nas-td-groups"></div>
+    <div data-part="interfaces" ${SLOT}></div>
+    </section>
+    <section class="nas-target-card">
+    <div class="section-card-head"><h3 class="title">${sprite('users')} ${escapeHtml(T('targets.sessions_title'))}</h3> <tf-chip size="sm" status="neutral" data-f="sessions-chip"></tf-chip></div>
+    <div data-part="sessions" ${SLOT}></div>
+    </section>
+    <section class="nas-target-card">
+    <div class="section-card-head"><h3 class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</h3></div>
+    <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}"><tf-column key="identity" label="IQN / NQN" fill></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column></tf-table>
+    ${admin ? `<details><summary>${escapeHtml(T('targets.edit_initiators'))}</summary>
+      <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}"></tf-input>
+      </details><p class="muted" data-testid="initiators-draft-hint">${escapeHtml(T('targets.initiators_draft'))}</p>` : ''}
+    <div id="nas-td-shared"></div>
+    ${warningHtml('info', T('targets.allowlist_note'))}
+    </section>
+    <section class="nas-target-card">
+    <div class="section-card-head"><h3 class="title">${sprite('lock')} ${escapeHtml(T('targets.col_auth'))}</h3><span data-part="auth-chip" ${SLOT}></span></div>
+    <div class="stat-rows"><div class="sr"><span class="k">${escapeHtml(T('targets.col_auth'))}</span><span class="v"><span data-f="auth-method"></span><span data-part="auth-user" ${SLOT}></span></span></div></div>
+    <div class="nas-target-grid"><div class="stat-rows" data-part="auth-a"></div><div class="stat-rows" data-part="auth-b"></div></div>
+    <p class="muted">${escapeHtml(T('targets.auth_stored_note'))}</p>
+    </section>
+    ${warningHtml('danger', T('targets.raw_disk_note'))}
+    <section class="nas-target-card">
+    <div class="section-card-head"><h3 class="title">${sprite('terminal')} ${escapeHtml(T('targets.config_preview'))}</h3></div><p class="muted">${escapeHtml(T('targets.config_preview_hint'))}</p>
+    <pre class="cmd" id="nas-td-preview"></pre>
+    </section>
+    ${admin ? `<section class="nas-target-card nas-target-danger">
+      <h3 class="title" data-f="delete-title"></h3>
+      <p data-f="delete-keep"></p>
+      <div><tf-button variant="danger" icon="trash" data-act="delete">${escapeHtml(T('targets.delete'))}</tf-button></div>
+    </section>` : ''}
+  </div>`;
+}
+
+function targetFooterHtml(admin) {
+  return `<div slot="footer">
+    ${admin ? `<tf-button variant="ghost" icon="pause" data-act="pause" label="${escapeAttr(T('targets.pause'))}"></tf-button>` : ''}
+    <span class="spacer"></span>
+    ${admin ? `<tf-button variant="secondary" icon="edit" data-act="edit">${escapeHtml(T('targets.edit'))}</tf-button>
+    <tf-button variant="primary" icon="check" data-act="save">${escapeHtml(T('targets.save'))}</tf-button>` : ''}
+  </div>`;
+}
+
+function driftBannerHtml(admin) {
+  return `<div class="wizard-warning danger" data-testid="portal-drift-banner">${sprite('alert')}<div>
+    <b>${escapeHtml(T('targets.portal_drift_title'))}</b>
+    <p>${escapeHtml(T('targets.portal_drift_note'))}</p>
+    <div data-part="drift-detail" ${SLOT}></div>
+    <div class="row">
+      ${admin ? `<tf-button variant="primary" icon="globe" data-act="repick-portal">${escapeHtml(T('targets.portal_repick'))}</tf-button>` : ''}
+      <tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('targets.portal_refresh'))}</tf-button>
+    </div>
+  </div></div>`;
+}
+
+function interfacesSectionHtml() {
+  return `<div class="stack">
+    <div class="section-card-head"><h3 class="title">${sprite('globe')} ${escapeHtml(T('targets.portal_available'))}</h3></div>
+    <p class="muted">${escapeHtml(T('targets.portal_available_note'))}</p>
+    <tf-table id="nas-td-interfaces">
+      <tf-column key="address" label="${escapeAttr(T('targets.portal_address'))}"></tf-column>
+      <tf-column key="interface" label="${escapeAttr(T('wizard_target.portal_label'))}"></tf-column>
+      <tf-column key="network" label="${escapeAttr(T('targets.portal_network'))}"></tf-column>
+    </tf-table>
+  </div>`;
+}
+
+// Label/value rows keyed by what they name: a row is built when it first
+// appears (its label is part of its key's meaning) and afterwards only its
+// value text is written, and only when it changed.
+function paintValueRows(host, specs) {
+  if (!host) return;
+  patchKeyedList(host, specs.map((s) => ({
+    key: s.key,
+    html: `<div class="sr"><span class="k">${escapeHtml(s.label)}</span><span class="v${s.mono ? ' mono' : ''}"${s.testid ? ` data-testid="${escapeAttr(s.testid)}"` : ''}></span></div>`,
+  })));
+  specs.forEach((s, i) => setText(host.children[i]?.querySelector('.v'), s.value));
 }
 
 // ---------------------------------------------------------------------------

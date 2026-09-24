@@ -190,8 +190,23 @@ fn park(
     detail: &str,
     payload: &P,
 ) -> Result<MessageBody, ProtocolError> {
+    park_shown(ctx, g, operation, subject, subject, detail, payload)
+}
+
+/// `park` for a stored subject that is not a name (a config import's node
+/// id): the alert's English title names `shown_subject` instead
+/// (`approvals::park_shown`).
+fn park_shown(
+    ctx: &HandlerContext,
+    g: &Gate,
+    operation: &str,
+    subject: &str,
+    shown_subject: &str,
+    detail: &str,
+    payload: &P,
+) -> Result<MessageBody, ProtocolError> {
     let a = actor(ctx, g)?;
-    let approval = tentanas::approvals::park(&a, operation, subject, detail, payload)
+    let approval = tentanas::approvals::park_shown(&a, operation, subject, shown_subject, detail, payload)
         .map_err(|e| internal("approvals", e))?;
     Ok(tn(P::ApprovalPendingResponse { approval }))
 }
@@ -366,6 +381,9 @@ fn name_jobs(
         // (`www/js/modules/tentanas/tasks.js`), which drops a machine-id shape
         // (`wwn-…`, `sn-…`, `dev-…`) from the visible text and keeps it as the
         // tooltip.
+        if job.kind == "config_import" {
+            job.subject = config_import_subject(&job.subject, |id| tentanas::fleet::node_name(ctx, id));
+        }
         if job.kind == "smart_test" {
             if let Some((name, last_known)) = smart_subject_name(&job.subject, |id| {
                 match db {
@@ -377,6 +395,26 @@ fn name_jobs(
                 job.subject_last_known = last_known;
             }
         }
+    }
+}
+
+/// The shown subject of a config import. An export with no `node_name` gives
+/// the import its `node_id` as the subject — stored that way in the parked
+/// request, its alert and the job, and kept so, like a job's author. It is
+/// resolved HERE, at the read boundary, through the fleet's names
+/// (`fleet::node_name`, via `name_of`). A subject in a node-id shape the
+/// fleet has no name for is shown as nothing, never as the id: the screens
+/// then name the operation alone (owner's rule: no ids on screen).
+fn config_import_subject(subject: &str, name_of: impl FnOnce(&str) -> String) -> String {
+    let name = name_of(subject);
+    if !name.trim().is_empty() {
+        return name;
+    }
+    let id_shaped = subject.len() >= 32 && subject.bytes().all(|b| b.is_ascii_hexdigit());
+    if id_shaped {
+        String::new()
+    } else {
+        subject.to_string()
     }
 }
 
@@ -2788,11 +2826,11 @@ fn spawn_target_job(
     let name = subject.to_string();
     let scope = target_id.to_string();
     let org_id = g.org_id.clone();
-    // The asking organisation's job. Only the KERNEL half of the apply is
-    // scoped to its target: the judging half re-evaluates every target on
-    // the node and logs each one whose state changed, so the log is cut to
-    // the lines this organisation may read (`apply_for_org`), exactly as the
-    // delete and the import cut theirs.
+    // The asking organisation's job. The KERNEL half of the apply reaches
+    // its target and only while this organisation owns it; the judging half
+    // re-evaluates every target on the node, and only the lines of this
+    // organisation's own targets reach the job log (`apply_for_org`), the
+    // same rule the delete and the import follow.
     let job = tentanas::jobs::spawn_owned(&g.db, kind, subject, &g.user_id, Some(g.org_id.as_str()), None, None, move |h| async move {
         let db = h.db().clone();
         for line in
@@ -3292,12 +3330,18 @@ async fn target_delete(
                 "the target is still in the kernel; it was not deleted"
             ));
         }
-        // Node-wide, deliberately: the row is already gone, so there is
-        // nothing to scope to — and this is the one path that produces
-        // orphans (a delete whose job then failed), which is what the
-        // unscoped apply sweeps. Its LOG and its ERROR are scoped: this job
-        // is one organisation's, and a node-wide apply speaks about — and
-        // fails with the names of — every target (`apply_for_org`).
+        // This organisation's rows only, plus the orphan sweep: the delete
+        // is the path that produces orphans (a delete whose job then
+        // failed), so it is where they are swept. It does NOT re-apply the
+        // other organisations' targets. `remove` above took out one target
+        // and nothing another target serves (a shared nvmet port or host
+        // object is left while anybody still links it), so none of theirs
+        // needs re-applying — and a node-wide apply's log is the helper's
+        // plan of every tenant's targets (backstore names, client host NQNs,
+        // portal addresses), which no filter of this job's log can be
+        // trusted to cut out. Their rows are the node's own reconcile's
+        // business, logged in the node log; this job mentions neither
+        // them nor the orphans it sweeps (`apply_for_org`).
         for line in tentanas::targets::apply_for_org(&db, &cipher, explicit.as_deref(), None, &org_id).await? {
             h.log(line);
         }
@@ -3397,11 +3441,16 @@ async fn config_import_apply(
         let (items, _) = tentanas::config_io::plan(&document, &live);
         let overwritten = tentanas::config_io::overwritten(&items);
         if !overwritten.is_empty() && tentanas::approvals::required(&actor(ctx, &g)?) {
-            return park(
+            // The stored subject stays what the document says (resolved on
+            // every read); the alert's English title is forwarded as written,
+            // so it names the node now, or nothing — never its id.
+            let shown = config_import_subject(&subject, |id| tentanas::fleet::node_name(ctx, id));
+            return park_shown(
                 ctx,
                 &g,
                 tentanas::approvals::OP_CONFIG_IMPORT,
                 &subject,
+                &shown,
                 &format!("overwrites {}: {}", overwritten.len(), overwritten.join(", ")),
                 &P::ConfigImportApplyRequest {
                     json: json.to_string(),
@@ -3496,12 +3545,39 @@ async fn snapshot_browse(
     Ok(tn(P::SnapshotBrowseResponse { path, entries }))
 }
 
+/// A parked config import names the exporting node; see
+/// `config_import_subject`. An unnamed one loses the parameter, and the
+/// screen words the alert without a subject. The English title (the
+/// tooltip) is rewritten from the same resolution: a row parked before the
+/// title was resolved at raise time carries the node's id in it, and a node
+/// named since then is named now.
+fn resolve_import_alerts(alerts: &mut [tentaflow_protocol::tentanas::NasAlert], name_of: impl Fn(&str) -> String) {
+    for alert in alerts.iter_mut() {
+        let import = alert.code == "approval_pending"
+            && alert.params.get("operation").map(String::as_str) == Some(tentanas::approvals::OP_CONFIG_IMPORT);
+        if !import {
+            continue;
+        }
+        let Some(subject) = alert.params.get("subject").cloned() else {
+            continue;
+        };
+        let shown = config_import_subject(&subject, &name_of);
+        alert.title = tentanas::approvals::approval_alert_title(&shown);
+        if shown.is_empty() {
+            alert.params.remove("subject");
+        } else {
+            alert.params.insert("subject".to_string(), shown);
+        }
+    }
+}
+
 fn alerts_list(ctx: &HandlerContext, include_acked: bool) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     // Scoped like the job list: shared hardware for everyone, an alert about
     // an array only for the organisation that owns it (migration 18).
-    let alerts = store::list_alerts_for_org(&g.db, &g.org_id, include_acked)
+    let mut alerts = store::list_alerts_for_org(&g.db, &g.org_id, include_acked)
         .map_err(|e| internal("alerts", e))?;
+    resolve_import_alerts(&mut alerts, |id| tentanas::fleet::node_name(ctx, id));
     Ok(tn(P::AlertsListResponse { alerts }))
 }
 
@@ -3669,6 +3745,9 @@ fn approvals_view(
     for row in approvals.iter_mut() {
         if let Some(name) = names.get(&row.requested_by) {
             row.requested_by = name.clone();
+        }
+        if row.operation == tentanas::approvals::OP_CONFIG_IMPORT {
+            row.subject = config_import_subject(&row.subject, |id| tentanas::fleet::node_name(ctx, id));
         }
         if let Some(name) = row.decided_by.as_ref().and_then(|id| names.get(id)).cloned() {
             row.decided_by = Some(name);
@@ -4101,7 +4180,7 @@ async fn elastic_snapraid(
                 // the repair is the operation to take first.
                 match tentanas::elastic::unresolved_parity_fault(&array.snapraid_history) {
                     Some(run) => format!(
-                        "Zapisuje nowy checkpoint parity i content. UWAGA: scrub tej macierzy zgłosił {} błędów,                          których nic jeszcze nie naprawiło. Zaznaczone bloki pozostaną naprawialne, ale pliki,                          których scrub nie mógł odczytać, zostaną usunięte z content i parity przestanie je                          obejmować. Najpierw uruchom naprawę z parity.",
+                        "Zapisuje nowy checkpoint parity i content. UWAGA: scrub tej macierzy zgłosił {} błędów, których nic jeszcze nie naprawiło. Zaznaczone bloki pozostaną naprawialne, ale pliki, których scrub nie mógł odczytać, zostaną usunięte z content i parity przestanie je obejmować. Najpierw uruchom naprawę z parity.",
                         run.errors.unwrap_or_default()
                     ),
                     None => "Zapisuje nowy checkpoint parity i content".to_string(),
@@ -4134,7 +4213,7 @@ async fn elastic_snapraid(
                 // approver who believed it would refuse a safe operation — or
                 // approve it expecting deleted files back.
                 format!(
-                    "Zapisuje z parity bloki zaznaczone przez ostatni scrub, w plikach niezmienionych od                      ostatniego Sync; operacja jest zapisana przy dysku '{disk}'"
+                    "Zapisuje z parity bloki zaznaczone przez ostatni scrub, w plikach niezmienionych od ostatniego Sync; operacja jest zapisana przy dysku '{disk}'"
                 ),
             ),
         };
@@ -5763,6 +5842,71 @@ register_tentanas_variant!(
     "TentaNasElasticFolderCacheSetRequest",
     "tentaflow_ws_handler_nas_elastic_folder_cache_set"
 );
+
+#[cfg(test)]
+mod config_import_subject_tests {
+    use super::{config_import_subject, resolve_import_alerts};
+    use tentaflow_protocol::tentanas::NasAlert;
+
+    fn import_alert(title: &str, subject: &str) -> NasAlert {
+        NasAlert {
+            alert_id: "a-1".into(),
+            code: "approval_pending".into(),
+            title: title.into(),
+            params: [
+                ("operation".to_string(), crate::tentanas::approvals::OP_CONFIG_IMPORT.to_string()),
+                ("subject".to_string(), subject.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..NasAlert::default()
+        }
+    }
+
+    fn has_hex_run(text: &str) -> bool {
+        text.split(|c: char| !c.is_ascii_hexdigit()).any(|run| run.len() >= 32)
+    }
+
+    /// Wave-4 round-2 critic M-B: only `params.subject` was resolved, and
+    /// the English title — the n01/n02 tooltip — still read "a red-path
+    /// operation on '<64 hex>' …". A row stored that way is rewritten on
+    /// read: by the node's name when the fleet knows it, without a subject
+    /// when it does not.
+    #[test]
+    fn a_parked_import_alert_s_title_never_carries_the_node_id() {
+        let id = "9f".repeat(32);
+        let stored = format!("a red-path operation on '{id}' waits for a second admin");
+
+        let mut named = vec![import_alert(&stored, &id)];
+        resolve_import_alerts(&mut named, |_| "helios".to_string());
+        assert_eq!(named[0].title, "a red-path operation on 'helios' waits for a second admin");
+        assert_eq!(named[0].params.get("subject").map(String::as_str), Some("helios"));
+
+        let mut unnamed = vec![import_alert(&stored, &id)];
+        resolve_import_alerts(&mut unnamed, |_| String::new());
+        assert!(!has_hex_run(&unnamed[0].title), "{}", unnamed[0].title);
+        assert_eq!(unnamed[0].title, "a red-path operation waits for a second admin");
+        assert!(!unnamed[0].params.contains_key("subject"));
+
+        // Another operation's alert is not touched.
+        let mut other = vec![import_alert("a red-path operation on 'tank' waits for a second admin", "tank")];
+        other[0].params.insert("operation".into(), crate::tentanas::approvals::OP_POOL_DESTROY.into());
+        resolve_import_alerts(&mut other, |_| "helios".to_string());
+        assert_eq!(other[0].title, "a red-path operation on 'tank' waits for a second admin");
+    }
+
+    /// Wave-4 critic minor 12: an export without a node name parks its
+    /// import under the node id, and "Import konfiguracji „<64 hex>”" is what
+    /// the alert read. The id is resolved to the fleet's name, or dropped.
+    #[test]
+    fn a_config_import_is_shown_by_the_node_s_name_and_never_by_its_id() {
+        let id = "9f".repeat(32);
+        assert_eq!(config_import_subject(&id, |_| "helios".to_string()), "helios");
+        assert_eq!(config_import_subject(&id, |_| String::new()), "", "an unknown node is not its id");
+        assert_eq!(config_import_subject("helios", |_| String::new()), "helios", "a name stays a name");
+        assert_eq!(config_import_subject("local", |_| String::new()), "local");
+    }
+}
 
 #[cfg(test)]
 mod registration_tests {

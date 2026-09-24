@@ -1260,9 +1260,10 @@ pub async fn apply_with(
         step(handle, &mut done);
     }
 
-    // Both applies below are NODE-WIDE and speak about every tenant's rows;
-    // this job is the importing organisation's, so their lines are scoped
-    // (`shares::scope_log`, `targets::apply_for_org`). Owners that cannot be
+    // The share apply below is NODE-WIDE and speaks about every tenant's
+    // rows; this job is the importing organisation's, so its lines are
+    // scoped (`shares::scope_log`). The target apply reaches only this
+    // organisation's rows (`targets::apply_for_org`). Owners that cannot be
     // read withhold the log.
     if shares_changed {
         let lines = super::shares::apply(&db, main_db, addon_id, explicit, super::shares::ApplyTrigger::Change).await?;
@@ -1279,10 +1280,14 @@ pub async fn apply_with(
         // Only the unauthenticated ones are enabled, so this reconcile puts
         // exactly those into the kernel; the rest wait for their secret.
         let cipher = SettingsCipher::new(&crate::crypto::load_or_create_master_key()?);
-        // Node-wide: an import can create, change and drop several targets at
-        // once, so there is no single row to scope to. Its log AND its error
-        // are the importing organisation's (`apply_for_org`): another
-        // tenant's failing target is counted, never named.
+        // The importing organisation's rows — an import can create several
+        // at once, so there is no single row to scope to — and never another
+        // organisation's: an import only ever creates rows of its own, so
+        // nothing of anybody else's needs the kernel touched, and the plan
+        // of a target it did touch would carry that tenant's backstore
+        // names, host NQNs and portals into this job's log. The other rows
+        // are not mentioned; leftover kernel objects are swept for the node
+        // log (`apply_for_org`).
         for line in super::targets::apply_for_org(&db, &cipher, explicit, None, &live.org_id).await? {
             handle.log(line);
         }
@@ -1940,11 +1945,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_import_never_names_another_organisations_failing_target_in_its_error() {
-        // The import's target apply is node-wide, so it reconciles EVERY
-        // tenant's rows — and a failure of one of them used to come back as
-        // this job's error with the other organisation's target name in it.
-        // The log was scoped by hand; the error was not.
+    async fn an_import_never_touches_or_names_another_organisations_target() {
+        // The import's target apply used to be node-wide: it re-applied EVERY
+        // tenant's rows, a failure of one of them came back as this job's
+        // error with the other organisation's target name in it, and the
+        // helper's plan of their target (`tentanas_obcy_vm_lun0`, their
+        // clients, their portal) went into this job's log past a filter that
+        // looked for `obcy-vm`. It now reaches the importing organisation's
+        // rows only (critic N1); the plan text itself is covered with the real
+        // renderer in `targets::tests`.
         let conn = rusqlite::Connection::open_in_memory().expect("db");
         super::super::db::migrate(&conn).expect("migrate");
         let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
@@ -2035,26 +2044,21 @@ mod tests {
             .expect("the job row")
             .log;
         assert!(
-            !log.iter().any(|l| l.contains("obcy-vm")),
-            "the job log names another organisation's target:\n{log:#?}"
+            !log.iter().any(|l| l.contains("obcy")),
+            "the job log carries another organisation's object (any spelling):\n{log:#?}"
         );
-        // Whether org-b's row is judged `Apply` is this host's kernel's
-        // answer (`kernel_support`), not something a unit test can inject from
-        // here. Where it is, the reconcile MUST fail, and the error is the
-        // assertion that matters.
-        if super::super::targets::kernel_support("iscsi").0 {
-            let error = outcome
-                .expect_err("org-b's target cannot be applied on a test host")
-                .to_string();
-            assert!(!error.contains("obcy-vm"), "{error}");
-            // Counted, not named. Not pinned to "1": on a node that serves
-            // real targets their kernel objects are orphans to this
-            // in-memory database, and they are counted the same way.
-            assert!(error.contains("other target(s) on this node could not be reconciled"), "{error}");
-        } else {
-            eprintln!("NOTE: this host cannot serve iSCSI; the foreign failure is not reached here");
-            outcome.expect("nothing failed");
-        }
+        // org-b's row is never applied by this job, whatever this host's
+        // kernel can serve, so its apply — which would fail here, with no
+        // privilege channel and a secret that is not a ciphertext — is not
+        // what this job reports. A leftover object of this app in THIS host's
+        // kernel (a real node running the suite) does not fail it either: it
+        // is counted, never named (wave-4 critic minor 10).
+        outcome.expect("org-a's import succeeds");
+        // Wave-4 critic M1: not even how many targets org-b has.
+        assert!(
+            !log.iter().any(|l| l.contains("other organisations")),
+            "the job log counts another organisation's targets:\n{log:#?}"
+        );
     }
 
     #[test]

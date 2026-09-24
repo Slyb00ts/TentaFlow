@@ -1476,14 +1476,18 @@ fn evaluate_rows(
         // raw disk and not.
         let key = drift_alert_key(&target.target_id);
         let outcome = if verdict == Disposition::Freeze {
-            store::raise_alert(
+            store::raise_coded_alert(
                 db,
                 &key,
                 "warning",
                 "target",
                 &target.name,
-                &format!("Target {}: the portal address moved", target.name),
-                &detail,
+                &store::AlertText::new(
+                    "target_portal_moved",
+                    format!("Target {}: the portal address moved", target.name),
+                    &detail,
+                )
+                .param("target", &target.name),
             )
             .map(|_| ())
         } else {
@@ -1988,10 +1992,11 @@ fn apply_lock() -> &'static tokio::sync::Mutex<()> {
 /// that a wizard save runs is what the instance runs when it starts. There is
 /// no second path and no `saveconfig` (§3.4).
 ///
-/// `scope` is which target the KERNEL half is for. `None` is the whole node —
-/// the restore, the config import and the delete, which also wants the orphan
-/// sweep. `Some(target_id)` is one row and nothing else, which is what a
-/// wizard save or a pause/resume gets.
+/// Node-wide: the restore is the one caller, and it has to put EVERY
+/// organisation's targets back, and with them the orphan sweep. A job one
+/// organisation owns never comes here: it goes through `apply_for_org`, whose
+/// kernel half reaches that organisation's rows and nobody else's (and whose
+/// `scope` is what narrows a save to one row).
 ///
 /// WHY the scope exists (owner decision 2026-09-04): every mutation used to
 /// re-render every target on the node. Nothing about that was unsafe —
@@ -2006,32 +2011,69 @@ pub async fn apply(
     db: &DbPool,
     cipher: &SettingsCipher,
     explicit: Option<&ElevationToken>,
-    scope: Option<&str>,
 ) -> Result<Vec<String>> {
-    let (log, failed) = apply_report(db, cipher, explicit, scope).await?;
-    if !failed.is_empty() {
-        return Err(anyhow!("{}", joined(&failed)));
+    let report = apply_report(db, cipher, explicit, Reach::Node, &Executor::Helper).await?;
+    if !report.failed.is_empty() {
+        return Err(anyhow!("{}", joined(&report.failed)));
     }
-    Ok(log)
+    Ok(report.log)
 }
 
-/// `apply`, for a job ONE organisation owns: the same reconcile, with its log
-/// and its failures cut down to what `org_id` may read.
+/// `apply`, for a job ONE organisation owns: a reconcile whose KERNEL half
+/// touches that organisation's rows and nothing of anybody else's, and whose
+/// log and error say only what `org_id` may read.
 ///
-/// WHY: the kernel half of `apply` is scoped to `scope`, but the judging half
-/// is node-wide by design (the drift alert has to be right for every row), so
-/// its log carries `"{name}: {state}"` for EVERY target whose state changed
-/// and `"{name}: the drift alert was not written"` for any of them — and a
-/// `None` scope (the delete) reports every failing target of the node in its
-/// error. A job is its organisation's (`spawn_owned`); a tenant never reads
-/// another organisation's target names, not even in a log line.
+/// `scope = Some(target_id)` is a wizard save, a pause or a resume: that one
+/// row, and only while `org_id` owns it. `None` is the target delete and the
+/// config import: every row `org_id` owns, plus the orphan sweep.
 ///
-/// Orphans are foreign to everybody: their row is gone, so their owner is
-/// unknown, and their WWN embeds the name the target had. They are read
-/// BEFORE the apply, which is what takes them out.
+/// WHY the kernel half is cut rather than its log (wave-3 critic N1). The
+/// delete and the import used to run the NODE-WIDE apply and filter its log
+/// by the names of the other organisations' targets. The log of an apply is
+/// the helper's rendered plan, and a plan names far more than the target:
+/// `mkdir …/core/iblock_0/tentanas_<name>_lun0` (the backstore, where `-`
+/// becomes `_` and the name is glued between underscores, so no token match
+/// can find it), `…/hosts/<host nqn>` of the other tenant's clients,
+/// `…/addr_traddr = <its portal>`. A denylist over that text leaks whatever
+/// the list forgot. Neither operation needs another tenant's rows re-applied
+/// — so it does not touch them, and there is nothing of theirs to filter:
+///
+///   * the delete takes out ONE target through `remove`, which unlinks a
+///     shared nvmet port or host object only when this target was the last
+///     one using it (`remove_nvmet`), and a LIO target owns its whole tree —
+///     nothing another target serves changes, so nothing needs re-applying;
+///   * the import creates only the importing organisation's rows;
+///   * whatever of another organisation's IS out of step, the node's own
+///     reconcile (`sweep_applies`/`sweep_removals` on every armed tick, the
+///     restore after a reboot) puts right, unscoped, with its log in the node
+///     log — which is where a tenant's job log has no business reaching.
+///
+/// Orphans are foreign to everybody: their row is gone, their owner unknown,
+/// and their WWN and backstore embed the name they had. They are still
+/// swept here — the delete is where they come from — but the job does not
+/// mention them, not even as a count (wave-4 round-2 critic minor 3): "1
+/// leftover was taken out" tells the tenant that some delete failed on this
+/// node earlier, and nothing proves it was theirs. Their kernel lines, the
+/// counts (`Report::orphans_removed`, `Report::orphans_failed`) and any
+/// teardown error go to the node log. An orphan whose teardown FAILS does not
+/// fail the job either: the caller could not act on it.
+///
+/// The other organisations' rows are not mentioned at all — not even as a
+/// count (wave-4 critic M1): a tenant cannot learn how many targets other
+/// organisations have on this node any other way, and a count repeated in
+/// every delete's log would tell it that number over time.
+///
+/// The judging half stays node-wide (the drift alert has to be right for
+/// every row); of its lines, only those that start with one of `org_id`'s own
+/// target names reach the job. Everything that does reach it still goes
+/// through `scope_log`, as a second guard for text the helper wrote about a
+/// row of ours that mentions somebody else's (a port another subsystem holds,
+/// say). The foreign names are read BEFORE and AFTER the apply and both lists
+/// are used: a target another organisation deletes while this runs is gone
+/// from the second read but may already be in a line of the first.
 ///
 /// When the owners cannot be read, NOTHING is shown: an unscoped log is
-/// exactly what this exists to prevent. The apply itself still ran.
+/// exactly what this exists to prevent.
 pub async fn apply_for_org(
     db: &DbPool,
     cipher: &SettingsCipher,
@@ -2039,24 +2081,44 @@ pub async fn apply_for_org(
     scope: Option<&str>,
     org_id: &str,
 ) -> Result<Vec<String>> {
-    let orphan_wwns: Vec<String> = if scope.is_none() {
-        store::list_targets(db)
-            .map(|rows| orphans(&rows).into_iter().map(|(_, wwn)| wwn).collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let (log, failed) = apply_report(db, cipher, explicit, scope).await?;
+    apply_for_org_with(db, cipher, explicit, scope, org_id, &Executor::Helper).await
+}
+
+/// `apply_for_org` with the kernel half injected. Production passes the
+/// helper; a test passes an executor that renders the helper's real plan
+/// without touching a kernel, which is the only way a unit test can see the
+/// text a tenant's job log would really receive.
+async fn apply_for_org_with(
+    db: &DbPool,
+    cipher: &SettingsCipher,
+    explicit: Option<&ElevationToken>,
+    scope: Option<&str>,
+    org_id: &str,
+    executor: &Executor,
+) -> Result<Vec<String>> {
+    let before = foreign_target_markers(db, org_id);
+    let report = apply_report(
+        db,
+        cipher,
+        explicit,
+        Reach::Org {
+            org_id,
+            target: scope,
+        },
+        executor,
+    )
+    .await?;
     let seen = store::target_owners(db).and_then(|owners| {
-        let mut markers = foreign_target_markers(db, org_id)?;
-        markers.extend(orphan_wwns);
+        let mut markers = before?;
+        markers.extend(foreign_target_markers(db, org_id)?);
+        markers.extend(report.orphan_wwns.iter().cloned());
         Ok((owners, markers))
     });
     let (owners, markers) = match seen {
         Ok(seen) => seen,
         Err(e) => {
             tracing::warn!("tentanas targets: the apply log is withheld: {e}");
-            if failed.is_empty() {
+            if report.failed.is_empty() {
                 return Ok(vec![format!(
                     "the apply log is withheld: the target owners could not be read ({e})"
                 )]);
@@ -2066,25 +2128,39 @@ pub async fn apply_for_org(
             ));
         }
     };
-    let (log, error) = scope_outcome(log, &failed, &owners, &markers, org_id);
-    match error {
-        Some(error) => {
-            tracing::warn!("tentanas targets: reconcile failed: {}", joined(&failed));
-            Err(anyhow!("{error}"))
-        }
-        None => Ok(log),
+    let (log, error) = scope_outcome(report.log, &report.failed, &owners, &markers, org_id);
+    if let Some(error) = error {
+        tracing::warn!("tentanas targets: reconcile failed: {}", joined(&report.failed));
+        return Err(anyhow!("{error}"));
     }
+    // The leftovers this run swept are the node's business, not the job's.
+    if report.orphans_removed + report.orphans_failed > 0 {
+        tracing::info!(
+            "tentanas targets: a reconcile for an organisation swept {} leftover kernel object(s), {} of them not removed",
+            report.orphans_removed + report.orphans_failed,
+            report.orphans_failed
+        );
+    }
+    Ok(log)
 }
 
 /// The part of one reconcile `org_id` may read: the log lines that name no
 /// other organisation's target, and — when anything failed — the error of its
-/// OWN targets, with the others reduced to a count.
+/// OWN targets.
 ///
 /// A failure of the caller's own target whose TEXT mentions a foreign target
 /// (a helper refusing because of another subsystem, say) keeps the target's
 /// name and loses the text: the tenant must still learn its target failed.
-/// A foreign failure is only counted — the job did fail, and saying so is
-/// the truth; saying whose is not ours to say.
+/// An orphan never reaches this: an organisation's reconcile sweeps a failed
+/// orphan for the node log and does not fail over it (`apply_for_org`).
+///
+/// Every failure IS the caller's: `apply_report` under `Reach::Org` only
+/// touches rows it read as `org_id`'s, under the lock that lists them. There
+/// used to be an "{n} other target(s) could not be reconciled" count for the
+/// rest, which could never be non-zero (wave-4 round-2 critic minor 7). The
+/// owner check stays as a guard against a failure it cannot name — a row
+/// deleted after that locked read no longer has an owner in `owners` — and
+/// such a failure is said without a name, so the job never fails silently.
 fn scope_outcome(
     log: Vec<String>,
     failed: &[TargetFailure],
@@ -2099,16 +2175,13 @@ fn scope_outcome(
     let own = |f: &TargetFailure| {
         !org_id.is_empty() && owners.get(&f.target_id).map(String::as_str) == Some(org_id)
     };
-    let mut parts: Vec<String> = failed
+    let parts: Vec<String> = failed
         .iter()
         .filter(|f| own(f))
         .map(|f| format!("{}: {}", f.name, failure_detail(&f.error, markers)))
         .collect();
-    let foreign = failed.iter().filter(|f| !own(f)).count();
-    if foreign > 0 {
-        parts.push(format!(
-            "{foreign} other target(s) on this node could not be reconciled"
-        ));
+    if parts.is_empty() {
+        return (log, Some("a target of this job changed while it was reconciled; the node log has the error".to_string()));
     }
     (log, Some(parts.join("; ")))
 }
@@ -2117,11 +2190,17 @@ fn scope_outcome(
 /// unless it mentions a target of ANOTHER organisation (`markers`), in which
 /// case only the fact survives. The full text is in the node log.
 fn failure_detail(error: &str, markers: &[String]) -> String {
-    if super::shares::scope_log(vec![error.to_string()], markers).is_empty() {
-        "the kernel refused the change; the node log has the full error".to_string()
-    } else {
+    if failure_error_visible(error, markers) {
         error.to_string()
+    } else {
+        "the kernel refused the change; the node log has the full error".to_string()
     }
+}
+
+/// Whether the kernel's error may be shown to the target's owner: it names
+/// no other organisation's object.
+fn failure_error_visible(error: &str, markers: &[String]) -> bool {
+    !super::shares::scope_log(vec![error.to_string()], markers).is_empty()
 }
 
 /// One target a reconcile could not bring to its verdict. Kept structured —
@@ -2155,28 +2234,181 @@ fn joined(failed: &[TargetFailure]) -> String {
         .join("; ")
 }
 
-/// The body of `apply`: the log, plus the targets it could not bring to their
-/// verdict. `Err` is a failure of the reconcile ITSELF (the database), which
-/// names no target.
+/// Which rows the KERNEL half of one reconcile may touch. The judging half is
+/// node-wide whatever this says.
+#[derive(Debug, Clone, Copy)]
+enum Reach<'a> {
+    /// Every row, plus the orphan sweep: the restore — the SERVING side, which
+    /// has to put every organisation's targets back after a reboot.
+    Node,
+    /// The rows `org_id` owns — all of them, or the one `target` names —
+    /// and, when `target` is `None`, the orphan sweep with its kernel lines
+    /// kept out of the returned log. See `apply_for_org`.
+    Org {
+        org_id: &'a str,
+        target: Option<&'a str>,
+    },
+}
+
+/// What one reconcile did.
+#[derive(Debug, Default)]
+struct Report {
+    /// The log of the rows in reach (for `Reach::Org`, the judging lines of
+    /// the caller's own rows only).
+    log: Vec<String>,
+    /// The rows (and, with an empty id, the orphans) it could not bring to
+    /// their verdict.
+    failed: Vec<TargetFailure>,
+    /// `Reach::Org` only: how many orphans were taken out. Their lines went to
+    /// the node log, not to `log`.
+    orphans_removed: usize,
+    /// `Reach::Org` only: how many orphans could NOT be taken out. Their
+    /// errors went to the node log; they do not fail the organisation's job.
+    orphans_failed: usize,
+    /// `Reach::Org` only: the WWNs of the orphans it swept, for the markers
+    /// of whatever text of ours might still mention one.
+    orphan_wwns: Vec<String>,
+}
+
+/// Who carries out the kernel half of a reconcile.
+///
+/// An enum and not a trait: there is one production executor, the test one
+/// exists only under `cfg(test)`, and a plain `match` keeps the futures of
+/// `apply_report` exactly as `Send` as they were — the jobs that await them
+/// are spawned on the runtime.
+enum Executor {
+    /// The privileged helper, through the broker.
+    Helper,
+    /// Renders the plan the helper would print for each apply and touches no
+    /// kernel. See `tests::RenderingKernel`.
+    #[cfg(test)]
+    Rendering(tests::RenderingKernel),
+}
+
+impl Executor {
+    /// Whether this node can serve `protocol` — the verdict's input.
+    fn can_serve(&self, protocol: &str) -> bool {
+        match self {
+            Executor::Helper => kernel_can_serve(protocol),
+            #[cfg(test)]
+            Executor::Rendering(k) => k.can_serve(protocol),
+        }
+    }
+
+    /// Whether the target's configfs object is there now — the removal gate.
+    fn in_kernel(&self, target: &TargetRow) -> bool {
+        match self {
+            Executor::Helper => object_in_kernel(target),
+            #[cfg(test)]
+            Executor::Rendering(k) => k.in_kernel(target),
+        }
+    }
+
+    /// The objects under this app's WWN authority with no row behind them.
+    fn orphans(&self, rows: &[TargetRow]) -> Vec<(String, String)> {
+        match self {
+            Executor::Helper => orphans(rows),
+            #[cfg(test)]
+            Executor::Rendering(k) => k.orphans(rows),
+        }
+    }
+
+    async fn apply(
+        &self,
+        db: &DbPool,
+        cipher: &SettingsCipher,
+        target: &TargetRow,
+        explicit: Option<&ElevationToken>,
+        log: &mut Vec<String>,
+    ) -> Result<()> {
+        match self {
+            Executor::Helper => apply_one(db, cipher, target, explicit, log).await,
+            #[cfg(test)]
+            Executor::Rendering(k) => k.apply(target, log),
+        }
+    }
+
+    async fn remove(
+        &self,
+        db: &DbPool,
+        target: &TargetRow,
+        explicit: Option<&ElevationToken>,
+        log: &mut Vec<String>,
+    ) -> Result<()> {
+        match self {
+            Executor::Helper => remove_one(db, target, explicit, log).await,
+            #[cfg(test)]
+            Executor::Rendering(k) => k.remove(target, log),
+        }
+    }
+}
+
+/// The body of `apply` and `apply_for_org`: judge every row, then carry out
+/// the verdicts of the rows in `reach`. `Err` is a failure of the reconcile
+/// ITSELF (the database), which names no target.
 async fn apply_report(
     db: &DbPool,
     cipher: &SettingsCipher,
     explicit: Option<&ElevationToken>,
-    scope: Option<&str>,
-) -> Result<(Vec<String>, Vec<TargetFailure>)> {
+    reach: Reach<'_>,
+    executor: &Executor,
+) -> Result<Report> {
     let _guard = apply_lock().lock().await;
     let mut targets = store::list_targets(db)?;
-    let mut log = Vec::new();
+    // Read under the same lock as the rows, so the owner of every row this
+    // run touches is the owner it had when it was listed. Only an
+    // organisation's reconcile needs it — and it needs it BEFORE the kernel
+    // half, because "whose row is this" is what decides whether it is touched
+    // at all. Unreadable means nothing is touched.
+    let owners = match reach {
+        Reach::Org { .. } => Some(store::target_owners(db)?),
+        _ => None,
+    };
+    let own = |target: &TargetRow| match (reach, &owners) {
+        (Reach::Org { org_id, .. }, Some(owners)) => {
+            !org_id.is_empty() && owners.get(&target.target_id).map(String::as_str) == Some(org_id)
+        }
+        _ => true,
+    };
+    // The kernel half only ever touches the rows in reach. A target nobody
+    // changed is left exactly as it is — including a broken one, whose error
+    // belongs to its own save and not to somebody else's.
+    let in_reach = |target: &TargetRow| match reach {
+        Reach::Node => true,
+        Reach::Org { target: only, .. } => {
+            own(target) && only.is_none_or(|id| id == target.target_id)
+        }
+    };
+
     // What to do with each row, keyed by target id. It cannot live on
     // `TargetRow` — the row is the DESIRED state and this is a verdict about
     // the node — and the two loops below need it after the judging loop ends.
+    let mut judged = Vec::new();
     let disposition = evaluate_rows(
         db,
         &mut targets,
-        &kernel_can_serve,
+        &|protocol: &str| executor.can_serve(protocol),
         RetryMemory::global(),
-        &mut log,
+        &mut judged,
     )?;
+    // Every judging line is `"{name}: …"`. An organisation's job keeps the
+    // lines of ITS rows by that prefix — an allowlist, which a name it does
+    // not know cannot slip through (a name holds no ':' or ' ', `name_valid`).
+    let mut log: Vec<String> = match reach {
+        Reach::Org { .. } => {
+            let prefixes: Vec<String> = targets
+                .iter()
+                .filter(|t| own(t))
+                .map(|t| format!("{}: ", t.name))
+                .collect();
+            judged
+                .into_iter()
+                .filter(|line| prefixes.iter().any(|p| line.starts_with(p.as_str())))
+                .collect()
+        }
+        _ => judged,
+    };
+    let mut report = Report::default();
 
     // A frozen target is left ALONE — not removed, not re-applied — so both
     // loops below have to skip it. Reading the verdict rather than the state
@@ -2188,10 +2420,6 @@ async fn apply_report(
             .copied()
             .unwrap_or(Disposition::Remove)
     };
-    // The kernel half only ever touches the scoped row. A target nobody
-    // changed is left exactly as it is — including a broken one, whose error
-    // belongs to its own save and not to somebody else's.
-    let in_scope = |target: &TargetRow| scope.is_none_or(|id| id == target.target_id);
 
     let mut failed: Vec<TargetFailure> = Vec::new();
 
@@ -2204,10 +2432,12 @@ async fn apply_report(
     // reaches the kernel — so this path cannot drift away from the tick's the
     // way it did when the grace period was added to one of them and not the
     // other. That is not hypothetical: this loop used to have its own
-    // predicate, and `apply(None)` is reached by the delete, the config import
-    // and the restore, so a pool re-importing while an admin deleted an
-    // unrelated target tore a live export out with no grace at all.
-    failed.extend(enact_removals(db, &targets, &disposition, scope, explicit, &mut log).await);
+    // predicate, and the node-wide apply was then reached by the delete, the
+    // config import and the restore, so a pool re-importing while an admin
+    // deleted an unrelated target tore a live export out with no grace at all.
+    failed.extend(
+        enact_removals(db, &targets, &disposition, &in_reach, executor, explicit, &mut log).await,
+    );
 
     // Orphans: an object this app created whose row is gone. It happens when a
     // delete removed the row and its job then failed (no channel, mode B with
@@ -2216,20 +2446,47 @@ async fn apply_report(
     // would keep exporting until the next reboot, which is the orphan §5.8
     // forbids. Only names under this app's own WWN authority are touched.
     //
-    // Node-wide by definition, so it belongs to a node-wide apply: an orphan
-    // has no target id to be in scope of. The delete path, which is where
-    // orphans come from, is one of the callers that passes `None`.
-    if scope.is_none() {
-        for (protocol, wwn) in orphans(&targets) {
-            log.push(format!("{wwn}: no row behind it any more, removing"));
+    // Node-wide by definition — an orphan has no target id to be in scope of —
+    // so it runs for the restore and for an organisation's delete or import,
+    // never for a one-row save. For an organisation its lines are the helper's
+    // teardown of an object that may have been ANOTHER organisation's target
+    // (backstore names, host NQNs), so they go to the node log and the job
+    // gets a count.
+    let sweep_orphans = match reach {
+        Reach::Node => true,
+        Reach::Org { target, .. } => target.is_none(),
+    };
+    if sweep_orphans {
+        let tenant = matches!(reach, Reach::Org { .. });
+        for (protocol, wwn) in executor.orphans(&targets) {
             let row = TargetRow {
                 name: wwn.clone(),
                 protocol,
-                wwn,
+                wwn: wwn.clone(),
                 ..Default::default()
             };
-            if let Err(e) = remove_one(db, &row, explicit, &mut log).await {
-                failed.push(TargetFailure::of(&row, &e));
+            if tenant {
+                let mut node_only = vec![format!("{wwn}: no row behind it any more, removing")];
+                let outcome = executor.remove(db, &row, explicit, &mut node_only).await;
+                for line in &node_only {
+                    tracing::info!("tentanas targets: {line}");
+                }
+                report.orphan_wwns.push(wwn);
+                match outcome {
+                    Ok(()) => report.orphans_removed += 1,
+                    // Not the tenant's failure: nothing proves the object was
+                    // theirs. The node log keeps the error; the restore
+                    // sweeps orphans again.
+                    Err(e) => {
+                        tracing::warn!("tentanas targets: {}: leftover not removed: {e}", row.wwn);
+                        report.orphans_failed += 1;
+                    }
+                }
+            } else {
+                log.push(format!("{wwn}: no row behind it any more, removing"));
+                if let Err(e) = executor.remove(db, &row, explicit, &mut log).await {
+                    failed.push(TargetFailure::of(&row, &e));
+                }
             }
         }
     }
@@ -2247,9 +2504,9 @@ async fn apply_report(
     // legitimately different answers.
     for target in targets
         .iter()
-        .filter(|t| in_scope(t) && verdict_of(t) == Disposition::Apply)
+        .filter(|t| in_reach(t) && verdict_of(t) == Disposition::Apply)
     {
-        let outcome = apply_one(db, cipher, target, explicit, &mut log).await;
+        let outcome = executor.apply(db, cipher, target, explicit, &mut log).await;
         // Remembered either way — see `RetryMemory`. A plan that died
         // halfway leaves the target's configfs directory behind, so the
         // "is it in the kernel" gate would read it as finished and never come
@@ -2260,7 +2517,9 @@ async fn apply_report(
             failed.push(TargetFailure::of(target, &e));
         }
     }
-    Ok((log, failed))
+    report.log = log;
+    report.failed = failed;
+    Ok(report)
 }
 
 /// Takes out of the kernel every row the node has judged `Remove` and whose
@@ -2290,8 +2549,9 @@ async fn apply_report(
 ///
 /// The orphan sweep is deliberately NOT here. An orphan has no row and no
 /// verdict, its detection is a `read_dir` of two directories, and the full
-/// `apply(None)` that the restore, the import and the delete all run is where
-/// it belongs. This is about rows the node has already judged.
+/// reconciles — the restore's `apply`, and the delete's and the
+/// import's `apply_for_org(None)` — are where it belongs. This is about rows
+/// the node has already judged.
 ///
 /// Errors are RETURNED, not logged and forgotten: a removal the kernel refuses
 /// is a target still handing a client a raw disk, and the caller backs off and
@@ -2309,7 +2569,18 @@ pub async fn sweep_removals(db: &DbPool, explicit: Option<&ElevationToken>) -> R
         &mut log,
     )?;
     let mut out = Vec::new();
-    let failed = enact_removals(db, &targets, &disposition, None, explicit, &mut out).await;
+    // Every row: this is the node's own reconcile, the serving side, and its
+    // log goes to the node log only.
+    let failed = enact_removals(
+        db,
+        &targets,
+        &disposition,
+        &|_: &TargetRow| true,
+        &Executor::Helper,
+        explicit,
+        &mut out,
+    )
+    .await;
     Ok(Sweep { log: out, failed })
 }
 
@@ -2332,20 +2603,20 @@ pub struct Sweep {
 /// other one kept the old behaviour: round 5 gave `Remove` an executor on the
 /// tick and left `Apply` without one; round 6 fixed that and left the 90 s
 /// grace period living only in `sweep_removals`, so the removal loop inside
-/// `apply` — reached by the delete, the config import and the one-shot restore,
-/// all node-wide — tore a live export out on the first missed `stat`. Each time
+/// `apply` — then reached by the delete, the config import and the one-shot
+/// restore, all node-wide — tore a live export out on the first missed `stat`. Each time
 /// the trigger was fixed and the shape was not.
 ///
 /// So the selection and the doing are the same function. A caller that wants to
 /// act on the `Remove` VERDICT cannot get the rows without also getting
 /// `rows_to_remove`'s three conditions — verdict, `in_kernel`, and
 /// `removal_is_due`: `rows_to_remove` has exactly two callers, the gate in
-/// `evaluate` and this function, and this function has exactly two, `apply`
-/// and `sweep_removals`.
+/// `evaluate` and this function, and this function has exactly two,
+/// `apply_report` (behind `apply` and `apply_for_org`) and `sweep_removals`.
 ///
 /// `remove_one` itself has three OTHER callers, none of which is acting on a
 /// verdict and none of which may be read as a way around this one:
-///   * the orphan loop in `apply` — a configfs object with no row at all, so
+///   * the orphan loop in `apply_report` — a configfs object with no row at all, so
 ///     there is no verdict to consult and a synthetic `TargetRow` is built
 ///     from the object's own name;
 ///   * `remove()` — the admin deleted the target; the row is already out of
@@ -2354,8 +2625,10 @@ pub struct Sweep {
 ///     deliberately including `Freeze`d rows: the point is to leave nothing of
 ///     this app in the kernel, and a frozen row is still an export.
 ///
-/// `scope` narrows it to one target for the mutation path; `None` is the whole
-/// node. It narrows WHICH rows, never WHETHER the conditions apply.
+/// `in_reach` narrows WHICH rows — one target for a save, one organisation's
+/// rows for its delete or import, every row for the node's own reconcile — and
+/// never WHETHER the conditions apply. `executor` is who asks the kernel and
+/// who acts on it (`Executor`).
 ///
 /// Returns the failures. A removal that did not happen is a target still
 /// handing a client a raw disk, so it never ends as a log line alone.
@@ -2363,15 +2636,22 @@ async fn enact_removals(
     db: &DbPool,
     targets: &[TargetRow],
     disposition: &BTreeMap<String, Disposition>,
-    scope: Option<&str>,
+    in_reach: &(dyn Fn(&TargetRow) -> bool + Sync),
+    executor: &Executor,
     explicit: Option<&ElevationToken>,
     log: &mut Vec<String>,
 ) -> Vec<TargetFailure> {
     let mut failed = Vec::new();
-    for target in rows_to_remove(targets, disposition, &object_in_kernel, &removal_is_due)
-        .into_iter()
-        .filter(|t| scope.is_none_or(|id| id == t.target_id))
-    {
+    let due: Vec<&TargetRow> = rows_to_remove(
+        targets,
+        disposition,
+        &|t: &TargetRow| executor.in_kernel(t),
+        &removal_is_due,
+    )
+    .into_iter()
+    .filter(|t| in_reach(*t))
+    .collect();
+    for target in due {
         log.push(format!(
             "{}: judged '{}', taking it out of the kernel",
             target.name,
@@ -2381,7 +2661,7 @@ async fn enact_removals(
                 target.state_detail.as_str()
             }
         ));
-        if let Err(e) = remove_one(db, target, explicit, log).await {
+        if let Err(e) = executor.remove(db, target, explicit, log).await {
             failed.push(TargetFailure::of(target, &e));
         }
     }
@@ -2706,6 +2986,50 @@ const RESTORE_RETRY_MAX: Duration = Duration::from_secs(300);
 /// 'target' alert per failing target (`report_target_failures`).
 const SWEEP_ALERT_KEY: &str = "targets:reconcile";
 
+/// The title of that alert. One constant, because the startup rewrite below
+/// refreshes the row through `raise_coded_alert`, which writes the title too.
+const SWEEP_ALERT_TITLE: &str = "Block targets: this node cannot reach the state it decided on";
+
+/// The detail an OPEN sweep alert gets when the process starts, before this
+/// run of the reconcile has counted anything. Names nothing.
+const SWEEP_ALERT_RESTARTED: &str = "block targets on this node were not in the state it decided on \
+     before it restarted; the next reconcile replaces this with the current count";
+
+/// Rewrites the detail of a node sweep alert that is still open from before
+/// this process started.
+///
+/// WHY (wave-3 critic MINOR 3): a build before the per-target alerts wrote
+/// `"{name}: {error}"` for every failing target of every organisation into
+/// this node-wide row, which every tenant lists. The new build only rewrites
+/// the row on a failing tick past the threshold or closes it on a settled
+/// one — and a mode-B node nobody has armed does neither, so the old names
+/// would stay readable indefinitely. Rewriting it once at startup (not
+/// closing it: the condition may well still be true, and its `raised_at`
+/// should keep saying since when) removes them. It is also honest for a row
+/// this build wrote: the retry clocks live in memory, so after a restart the
+/// count in it no longer describes anything this process has seen.
+///
+/// Only an OPEN row: `raise_coded_alert` inserts when none is open, and inventing an
+/// alert at startup would be a false one.
+fn rewrite_stale_sweep_alert(db: &DbPool) {
+    match store::open_alert_keys_like(db, SWEEP_ALERT_KEY) {
+        Ok(keys) if keys.iter().any(|k| k == SWEEP_ALERT_KEY) => {
+            if let Err(e) = store::raise_coded_alert(
+                db,
+                SWEEP_ALERT_KEY,
+                "warning",
+                "node",
+                "targets",
+                &store::AlertText::new("targets_sweep_stale", SWEEP_ALERT_TITLE, SWEEP_ALERT_RESTARTED),
+            ) {
+                tracing::warn!("tentanas targets: the node sweep alert was not rewritten: {e}");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("tentanas targets: the node sweep alert was not read: {e}"),
+    }
+}
+
 /// Which periodic sweep a target failed in. Two keys per target, not one,
 /// because the two sweeps run on separate clocks: a tick on which only the
 /// removal sweep is due must not close an alert only the apply sweep can
@@ -2739,12 +3063,31 @@ fn reconcile_alert_target(kind: SweepKind, key: &str) -> Option<&str> {
 }
 
 /// The detail of the node-wide sweep alert: how many targets, never which.
-fn node_sweep_detail(failing_targets: usize, sweep_failed: bool) -> String {
+///
+/// `alerted` is how many of the `failing_targets` really got an alert their
+/// organisation can read on this tick (`report_target_failures`). The
+/// sentence used to say "each one's organisation has an alert naming it"
+/// whatever that number was — and it was not always true: the node alert
+/// goes up when EITHER sweep's clock reaches the threshold, while a sweep
+/// raises its per-target alerts only on its OWN clock, and a target with no
+/// owner, or an owners read that failed, gets no readable alert at all. The
+/// claim is made only when it holds; the node log names every one of them
+/// (the `tracing::warn` beside each sweep), which is always true.
+fn node_sweep_detail(failing_targets: usize, alerted: usize, sweep_failed: bool) -> String {
     let mut parts = Vec::new();
     if failing_targets > 0 {
+        let who = if alerted >= failing_targets {
+            "each one's organisation has an alert naming it".to_string()
+        } else if alerted > 0 {
+            let verb = if alerted == 1 { "has" } else { "have" };
+            format!(
+                "{alerted} of them {verb} an alert naming it for its organisation; the node log names them all"
+            )
+        } else {
+            "the node log names them".to_string()
+        };
         parts.push(format!(
-            "{failing_targets} block target(s) on this node are not in the state it decided on; \
-             each one's organisation has an alert naming it"
+            "{failing_targets} block target(s) on this node are not in the state it decided on; {who}"
         ));
     }
     if sweep_failed {
@@ -2769,7 +3112,12 @@ fn node_sweep_detail(failing_targets: usize, sweep_failed: bool) -> String {
 ///
 /// Errors are logged, never returned: a missed alert write must not stop the
 /// reconcile, and the next tick writes it again.
-fn report_target_failures(db: &DbPool, kind: SweepKind, failed: &[TargetFailure], raise: bool) {
+///
+/// Returns how many failing targets now have an open alert their own
+/// organisation can read — written without error, for a target with a known
+/// owner (`alert_owner_sql` stamps '' otherwise, which no tenant lists). The
+/// node alert's sentence is built from that number (`node_sweep_detail`).
+fn report_target_failures(db: &DbPool, kind: SweepKind, failed: &[TargetFailure], raise: bool) -> usize {
     let failing: std::collections::BTreeSet<&str> = failed
         .iter()
         .map(|f| f.target_id.as_str())
@@ -2791,15 +3139,16 @@ fn report_target_failures(db: &DbPool, kind: SweepKind, failed: &[TargetFailure]
         Err(e) => tracing::warn!("tentanas targets: reconcile alerts not read: {e}"),
     }
     if !raise || failing.is_empty() {
-        return;
+        return 0;
     }
     let owners = match store::target_owners(db) {
         Ok(owners) => owners,
         Err(e) => {
             tracing::warn!("tentanas targets: reconcile alerts not raised: {e}");
-            return;
+            return 0;
         }
     };
+    let mut alerted = 0usize;
     let mut markers_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for failure in failed.iter().filter(|f| !f.target_id.is_empty()) {
         let owner = owners.get(&failure.target_id).cloned().unwrap_or_default();
@@ -2814,19 +3163,34 @@ fn report_target_failures(db: &DbPool, kind: SweepKind, failed: &[TargetFailure]
                 }
             }
         }
+        let visible = failure_error_visible(&failure.error, &markers_of[&owner]);
         let detail = failure_detail(&failure.error, &markers_of[&owner]);
-        let title = match kind {
-            SweepKind::Apply => format!("Target {}: not applied to the kernel", failure.name),
-            SweepKind::Remove => format!(
-                "Target {}: still in the kernel although this node decided to stop it",
-                failure.name
+        // Each code spelled out at its own `AlertText::new`: the test that
+        // holds every raised code to the `NasAlert::code` doc reads them there.
+        let text = match kind {
+            SweepKind::Apply => store::AlertText::new(
+                "target_not_applied",
+                format!("Target {}: not applied to the kernel", failure.name),
+                detail,
+            ),
+            SweepKind::Remove => store::AlertText::new(
+                "target_still_in_kernel",
+                format!("Target {}: still in the kernel although this node decided to stop it", failure.name),
+                detail,
             ),
         };
+        let mut text = text.param("target", &failure.name);
+        if visible {
+            text = text.param("error", &failure.error);
+        }
         let key = reconcile_alert_key(kind, &failure.target_id);
-        if let Err(e) = store::raise_alert(db, &key, "warning", "target", &failure.name, &title, &detail) {
-            tracing::warn!("tentanas targets: alert {key} not raised: {e}");
+        match store::raise_coded_alert(db, &key, "warning", "target", &failure.name, &text) {
+            Ok(_) if !owner.is_empty() => alerted += 1,
+            Ok(_) => {}
+            Err(e) => tracing::warn!("tentanas targets: alert {key} not raised: {e}"),
         }
     }
+    alerted
 }
 
 /// How many consecutive failures before that alert goes up. One failure is a
@@ -2928,6 +3292,7 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                 return;
             }
         };
+        rewrite_stale_sweep_alert(&db);
         let mut restored = false;
         // When the next restore ATTEMPT may run, and how long the wait after
         // the next failure is. Both reset the moment an attempt succeeds or
@@ -3006,14 +3371,13 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                 // three things that kept the previous version untested.
                 match channel_alert(armed, &pending) {
                     Some((severity, subject, summary, detail)) => {
-                        let _ = store::raise_alert(
+                        let _ = store::raise_coded_alert(
                             &db,
                             ELEVATION_ALERT_KEY,
                             severity,
                             "elevation",
                             subject,
-                            summary,
-                            detail,
+                            &store::AlertText::new("elevation_unarmed", summary, detail),
                         );
                     }
                     None => {
@@ -3043,6 +3407,9 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                     // (`report_target_failures`) and is only COUNTED here.
                     let mut node_trouble: Vec<String> = Vec::new();
                     let mut failing_targets = 0usize;
+                    // How many of those have an alert their organisation can
+                    // read — what the node alert's sentence may claim.
+                    let mut alerted = 0usize;
                     if !pending.removals_pending {
                         remove_retry.succeeded();
                         report_target_failures(&db, SweepKind::Remove, &[], false);
@@ -3062,7 +3429,7 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                                     );
                                 }
                                 failing_targets += sweep.failed.len();
-                                report_target_failures(
+                                alerted += report_target_failures(
                                     &db,
                                     SweepKind::Remove,
                                     &sweep.failed,
@@ -3094,7 +3461,7 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                                     );
                                 }
                                 failing_targets += sweep.failed.len();
-                                report_target_failures(
+                                alerted += report_target_failures(
                                     &db,
                                     SweepKind::Apply,
                                     &sweep.failed,
@@ -3141,14 +3508,20 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                         if remove_retry.failures >= SWEEP_ALERT_AFTER
                             || apply_retry.failures >= SWEEP_ALERT_AFTER
                         {
-                            if let Err(e) = store::raise_alert(
+                            if let Err(e) = store::raise_coded_alert(
                                 &db,
                                 SWEEP_ALERT_KEY,
                                 "warning",
                                 "node",
                                 "targets",
-                                "Block targets: this node cannot reach the state it decided on",
-                                &node_sweep_detail(failing_targets, !node_trouble.is_empty()),
+                                &store::AlertText::new(
+                                    "targets_sweep_failing",
+                                    SWEEP_ALERT_TITLE,
+                                    node_sweep_detail(failing_targets, alerted, !node_trouble.is_empty()),
+                                )
+                                .param("count", failing_targets)
+                                .param("alerted", alerted)
+                                .param("sweep_failed", !node_trouble.is_empty()),
                             ) {
                                 tracing::warn!("tentanas targets: alert not raised: {e}");
                             }
@@ -3159,7 +3532,7 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                         // Node-wide: this IS the restore, and after a reboot
                         // every row has to reach the kernel. It is also the
                         // one place the orphan sweep can run.
-                        match apply(&db, &cipher, None, None).await {
+                        match apply(&db, &cipher, None).await {
                             Ok(log) => {
                                 restored = true;
                                 retry_at = None;
@@ -4863,6 +5236,9 @@ mod tests {
         assert_eq!(open.len(), 1, "{open:?}");
         assert_eq!(open[0].subject_kind, "target");
         assert_eq!(open[0].subject_id, row.name);
+        // Coded, so the screen words it in the reader's language.
+        assert_eq!(open[0].code, "target_portal_moved");
+        assert_eq!(open[0].params.get("target"), Some(&row.name));
         assert!(
             open[0].detail.contains("tentanas-nie-ma-takiego0"),
             "{:?}",
@@ -5646,6 +6022,467 @@ mod tests {
         }
     }
 
+    /// One kernel object `RenderingKernel` can tear down: what the helper's
+    /// real `remove_iscsi` walks.
+    #[derive(Debug, Clone)]
+    pub(super) struct KernelObject {
+        pub(super) wwn: String,
+        pub(super) backstores: Vec<String>,
+        /// `"<address>:<port>"`, the name LIO gives a network portal.
+        pub(super) portals: Vec<String>,
+        pub(super) initiators: Vec<String>,
+    }
+
+    /// The kernel half as the helper carries it out, with no kernel and no
+    /// privilege — `Executor::Rendering`.
+    ///
+    /// An APPLY is the target's REAL plan: `preview_in` against configfs roots
+    /// that do not exist is `block::observe_*` + `block::plan_*` +
+    /// `block::render` for a first install, which is the text the helper
+    /// prints into the job log (`iscsi_target_apply`); its secrets are `***`
+    /// there as well. A REMOVAL runs the helper's real `remove_iscsi` over a
+    /// copy of the object built in a temporary tree, so its lines are the
+    /// helper's own. Hand-written lines are exactly what let the backstore
+    /// names through last time (critic N1): the old test fed `scope_log`
+    /// sentences shaped like the ones it already caught.
+    pub(super) struct RenderingKernel {
+        /// WWNs whose configfs object is "there".
+        pub(super) in_kernel: std::collections::BTreeSet<String>,
+        /// Objects under this app's authority with no row behind them.
+        pub(super) orphans: Vec<KernelObject>,
+        /// Every removal refuses, with the helper's own kind of sentence —
+        /// which names the object and its backstore.
+        pub(super) fail_removals: bool,
+        /// `"apply <wwn>"` / `"remove <wwn>"`, in the order they happened.
+        pub(super) touched: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RenderingKernel {
+        pub(super) fn new(orphans: Vec<KernelObject>) -> Self {
+            Self {
+                in_kernel: Default::default(),
+                orphans,
+                fail_removals: false,
+                touched: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(super) fn can_serve(&self, _protocol: &str) -> bool {
+            true
+        }
+
+        pub(super) fn in_kernel(&self, target: &TargetRow) -> bool {
+            self.in_kernel.contains(&target.wwn)
+        }
+
+        pub(super) fn orphans(&self, rows: &[TargetRow]) -> Vec<(String, String)> {
+            self.orphans
+                .iter()
+                .filter(|o| !rows.iter().any(|r| r.wwn == o.wwn))
+                .map(|o| ("iscsi".to_string(), o.wwn.clone()))
+                .collect()
+        }
+
+        pub(super) fn apply(&self, target: &TargetRow, log: &mut Vec<String>) -> Result<()> {
+            self.touched
+                .lock()
+                .expect("touched")
+                .push(format!("apply {}", target.wwn));
+            let nowhere = Path::new("/nonexistent/tentanas-rendering-kernel");
+            // The judge needs a volume that exists on the host running the
+            // suite (`/dev/null`, see `crowded_node`); the helper's catalog
+            // exports nothing outside /dev/zvol. The plan is rendered for the
+            // path the node itself would have for that source.
+            let mut rendered = target.clone();
+            for lun in &mut rendered.luns {
+                if lun.device_path == "/dev/null" {
+                    lun.device_path = format!("/dev/zvol/{}", lun.source);
+                }
+            }
+            let plan = preview_in(&rendered, nowhere, nowhere)?;
+            log.push("channel: rendering".to_string());
+            log.extend(plan.lines().map(str::to_string));
+            Ok(())
+        }
+
+        pub(super) fn remove(&self, target: &TargetRow, log: &mut Vec<String>) -> Result<()> {
+            self.touched
+                .lock()
+                .expect("touched")
+                .push(format!("remove {}", target.wwn));
+            let object = self
+                .orphans
+                .iter()
+                .find(|o| o.wwn == target.wwn)
+                .cloned()
+                .unwrap_or_else(|| KernelObject {
+                    wwn: target.wwn.clone(),
+                    backstores: lun_specs(target).into_iter().map(|l| l.name).collect(),
+                    portals: target
+                        .portals
+                        .iter()
+                        .map(|p| format!("{}:{}", p.address, p.port))
+                        .collect(),
+                    initiators: target.initiators.clone(),
+                });
+            if self.fail_removals {
+                let error = format!(
+                    "iSCSI target {} is still in the kernel: {}/core/iblock_0/{} not removed: \
+                     Device or resource busy",
+                    object.wwn,
+                    block::TARGET_CONFIGFS,
+                    object.backstores.join(", ")
+                );
+                log.push(error.clone());
+                return Err(anyhow!("{error}"));
+            }
+            let tree = TempTree::new(&format!("remove-{}", object.wwn.replace([':', '.'], "-")));
+            let tpg = format!("iscsi/{}/tpgt_1", object.wwn);
+            tree.dir(&tpg);
+            for portal in &object.portals {
+                tree.dir(&format!("{tpg}/np/{portal}"));
+            }
+            for initiator in &object.initiators {
+                tree.dir(&format!("{tpg}/acls/{initiator}"));
+            }
+            for (index, backstore) in object.backstores.iter().enumerate() {
+                let device = tree.dir(&format!("core/iblock_0/{backstore}"));
+                let lun = tree.dir(&format!("{tpg}/lun/lun_{index}"));
+                std::os::unix::fs::symlink(&device, lun.join(backstore)).expect("lun link");
+            }
+            let lines = block::remove_iscsi(&tree.0, &object.wwn).map_err(|e| anyhow!("{e}"))?;
+            log.extend(lines);
+            Ok(())
+        }
+    }
+
+    /// One node, three organisations' worth of block objects, in a real
+    /// database:
+    ///   * org-a: `vm-a` (iSCSI, portal 10.10.0.5);
+    ///   * org-b: `kadry` (iSCSI, portal 10.20.0.7, client
+    ///     `iqn.1998-01.com.vmware:esx-kadry`), `ksiegowosc-vm` (NVMe-oF,
+    ///     portal 10.20.0.9, client host `…:uuid:ksiegowosc-host`) and
+    ///     `archiwum` (iSCSI, stopped but still in the kernel, portal
+    ///     10.20.0.13, client `…:esx-archiwum`);
+    ///   * an orphan: `stary-dysk`, a target whose row is gone (portal
+    ///     10.20.0.11, client `…:esx-stary`).
+    /// Every volume is `/dev/null` and every portal is on "every interface"
+    /// with an explicit address, so each row is judged on any host exactly
+    /// as it would be on a node: no drift, a volume that exists.
+    fn crowded_node() -> (DbPool, RenderingKernel) {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let row = |id: &str, name: &str, protocol: &str, address: &str, clients: &[&str]| {
+            let mut t = target(protocol);
+            t.target_id = format!("0191f2c0-0000-7000-8000-00000000{id}");
+            t.name = name.to_string();
+            t.wwn = wwn_for(protocol, "helios", name);
+            t.luns[0].source = format!("tank/{name}");
+            t.luns[0].device_path = "/dev/null".to_string();
+            t.luns[0].uuid = format!("0191f2c0-0000-7000-8000-0000000{id}ff");
+            t.portals[0].interface = String::new();
+            t.portals[0].address = address.to_string();
+            t.initiators = clients.iter().map(|c| c.to_string()).collect();
+            t
+        };
+        let ours = row("a001", "vm-a", "iscsi", "10.10.0.5", &["iqn.1998-01.com.vmware:esx-own"]);
+        let kadry = row("b001", "kadry", "iscsi", "10.20.0.7", &["iqn.1998-01.com.vmware:esx-kadry"]);
+        let mut ksiegowosc = row(
+            "b002",
+            "ksiegowosc-vm",
+            "nvmet",
+            "10.20.0.9",
+            &["nqn.2014-08.org.nvmexpress:uuid:ksiegowosc-host"],
+        );
+        // The shape the dh-chap preview test renders: authentication puts the
+        // host objects — and their NQNs — into the plan.
+        ksiegowosc.auth_method = "dhchap-bidi".into();
+        ksiegowosc.auth_secret = "encb:one".into();
+        ksiegowosc.auth_mutual_secret = "encb:two".into();
+        let mut archiwum = row("b003", "archiwum", "iscsi", "10.20.0.13", &["iqn.1998-01.com.vmware:esx-archiwum"]);
+        archiwum.enabled = false;
+        store::upsert_target(&db, "org-a", &ours).expect("ours");
+        for theirs in [&kadry, &ksiegowosc, &archiwum] {
+            store::upsert_target(&db, "org-b", theirs).expect("theirs");
+        }
+        let mut kernel = RenderingKernel::new(vec![KernelObject {
+            wwn: wwn_for("iscsi", "helios", "stary-dysk"),
+            backstores: vec!["tentanas_stary_dysk_lun0".into()],
+            portals: vec!["10.20.0.11:3260".into()],
+            initiators: vec!["iqn.1998-01.com.vmware:esx-stary".into()],
+        }]);
+        kernel.in_kernel.insert(archiwum.wwn.clone());
+        (db, kernel)
+    }
+
+    /// Everything of org-b's (and of the orphan's) that a plan or a teardown
+    /// prints: names in every spelling the kernel uses, client identities,
+    /// portal addresses, backstores.
+    const ORG_B_FRAGMENTS: &[&str] = &[
+        "kadry",
+        "ksiegowosc",
+        "archiwum",
+        "stary",
+        "esx-kadry",
+        "ksiegowosc-host",
+        "esx-archiwum",
+        "esx-stary",
+        "10.20.0.7",
+        "10.20.0.9",
+        "10.20.0.11",
+        "10.20.0.13",
+    ];
+
+    fn leaks<'a>(text: &str, fragments: &[&'a str]) -> Vec<&'a str> {
+        fragments.iter().copied().filter(|f| text.contains(*f)).collect()
+    }
+
+    #[tokio::test]
+    async fn the_node_wide_reconcile_still_serves_every_organisations_targets_and_its_plans_name_them() {
+        // The SERVING side — the restore's `apply` — must stay what it
+        // was: every organisation's rows reach the kernel, due removals are
+        // carried out, orphans are swept, and it is all in its (node) log.
+        //
+        // This is also the proof that the other test below is not vacuous:
+        // the very executor it uses DOES print org-b's backstore names, host
+        // NQNs and portals when it is allowed to touch org-b's rows.
+        let (db, kernel) = crowded_node();
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let executor = Executor::Rendering(kernel);
+        let report = apply_report(&db, &cipher, None, Reach::Node, &executor)
+            .await
+            .expect("reconcile");
+        let Executor::Rendering(kernel) = &executor else {
+            unreachable!()
+        };
+        let touched = kernel.touched.lock().expect("touched").clone();
+        for wwn in [
+            wwn_for("iscsi", "helios", "vm-a"),
+            wwn_for("iscsi", "helios", "kadry"),
+            wwn_for("nvmet", "helios", "ksiegowosc-vm"),
+        ] {
+            assert!(touched.contains(&format!("apply {wwn}")), "{wwn} not applied: {touched:?}");
+        }
+        assert!(
+            touched.contains(&format!("remove {}", wwn_for("iscsi", "helios", "archiwum"))),
+            "the stopped target is taken out: {touched:?}"
+        );
+        assert!(
+            touched.contains(&format!("remove {}", wwn_for("iscsi", "helios", "stary-dysk"))),
+            "the orphan is swept: {touched:?}"
+        );
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!((report.orphans_removed, report.orphans_failed), (0, 0), "counts are an organisation's");
+
+        let text = report.log.join("\n");
+        // The spellings N1 was about, straight out of the real renderer.
+        for expected in [
+            "core/iblock_0/tentanas_kadry_lun0",
+            "nvmet/hosts/nqn.2014-08.org.nvmexpress:uuid:ksiegowosc-host",
+            "10.20.0.9",
+            "10.20.0.7",
+            "acls/iqn.1998-01.com.vmware:esx-kadry",
+            "tentanas_stary_dysk_lun0 removed",
+            "tentanas_archiwum_lun0 removed",
+        ] {
+            assert!(text.contains(expected), "the node log lacks {expected}:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delete_or_import_job_log_carries_nothing_of_another_organisations_kernel_objects() {
+        // Critic N1. The target delete and the config import both call
+        // `apply_for_org(.., None, org_id)` — this is that call, with the
+        // helper replaced by the real renderer. They used to re-apply EVERY
+        // organisation's targets and filter the plan's text by name; the
+        // backstore `tentanas_kadry_lun0`, the host NQN and the portal went
+        // straight through.
+        let (db, kernel) = crowded_node();
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let executor = Executor::Rendering(kernel);
+        let log = apply_for_org_with(&db, &cipher, None, None, "org-a", &executor)
+            .await
+            .expect("org-a's reconcile succeeds");
+        let text = log.join("\n");
+        assert!(leaks(&text, ORG_B_FRAGMENTS).is_empty(), "leaked {:?}:\n{text}", leaks(&text, ORG_B_FRAGMENTS));
+
+        // Not an empty log that passes by saying nothing: org-a's own plan is
+        // there. The leftover was swept (see `touched` below) and is not even
+        // counted: nothing proves it was org-a's (wave-4 round-2 minor 3).
+        assert!(text.contains("core/iblock_0/tentanas_vm_a_lun0"), "{text}");
+        assert!(text.contains("10.10.0.5"), "{text}");
+        assert!(!text.contains("leftover"), "{text}");
+        // Wave-4 critic M1: how many targets the other organisations have is
+        // not a tenant's to read, not even as a count.
+        assert!(!text.contains("other organisations"), "{text}");
+
+        // STRUCTURAL, not textual: org-b's rows never reached the kernel half.
+        let Executor::Rendering(kernel) = &executor else {
+            unreachable!()
+        };
+        let touched = kernel.touched.lock().expect("touched").clone();
+        assert_eq!(
+            touched,
+            vec![
+                format!("remove {}", wwn_for("iscsi", "helios", "stary-dysk")),
+                format!("apply {}", wwn_for("iscsi", "helios", "vm-a")),
+            ],
+            "only the leftover and org-a's own row are touched"
+        );
+
+        // The same from org-b's side: its own objects, nothing of org-a's.
+        let (db, kernel) = crowded_node();
+        let executor = Executor::Rendering(kernel);
+        let log = apply_for_org_with(&db, &cipher, None, None, "org-b", &executor)
+            .await
+            .expect("org-b's reconcile succeeds");
+        let text = log.join("\n");
+        for fragment in ["vm-a", "vm_a", "10.10.0.5", "esx-own", "stary"] {
+            assert!(!text.contains(fragment), "org-b reads {fragment}:\n{text}");
+        }
+        assert!(text.contains("tentanas_kadry_lun0"), "{text}");
+        assert!(!text.contains("other organisations"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_leftover_the_delete_cannot_remove_is_not_in_the_job_and_does_not_fail_it() {
+        // The error half: the orphan's teardown fails with the helper's own
+        // kind of sentence, which names the object and its backstore. Nothing
+        // proves the object was org-a's — it may be another organisation's
+        // old target — and org-a cannot act on it, so org-a's job does not
+        // fail over it (wave-4 critic minor 10). Its error goes to the node
+        // log only, and since wave-4 round-2 (critic minor 3) so does the
+        // count: the job does not mention it at all.
+        let (db, mut kernel) = crowded_node();
+        kernel.fail_removals = true;
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let executor = Executor::Rendering(kernel);
+        let log = apply_for_org_with(&db, &cipher, None, None, "org-a", &executor)
+            .await
+            .expect("a leftover that stays does not fail org-a's job");
+        let text = log.join("\n");
+        assert!(leaks(&text, ORG_B_FRAGMENTS).is_empty(), "{text}");
+        assert!(!text.contains("leftover"), "not counted in the tenant's job: {text}");
+        assert!(!text.contains("stary"), "{text}");
+        // The job still carries org-a's own work, so its silence about the
+        // leftover is not an empty log.
+        assert!(text.contains("core/iblock_0/tentanas_vm_a_lun0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_one_target_save_never_touches_a_row_of_another_organisation() {
+        // `Some(target_id)` is the wizard save: one row, and only while the
+        // caller owns it — an id of another organisation's target reaches
+        // nothing, and no orphan is swept by a save.
+        let (db, kernel) = crowded_node();
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let executor = Executor::Rendering(kernel);
+        let theirs = "0191f2c0-0000-7000-8000-00000000b001";
+        let log = apply_for_org_with(&db, &cipher, None, Some(theirs), "org-a", &executor)
+            .await
+            .expect("nothing to do is success");
+        let Executor::Rendering(kernel) = &executor else {
+            unreachable!()
+        };
+        assert!(kernel.touched.lock().expect("touched").is_empty());
+        let text = log.join("\n");
+        assert!(leaks(&text, ORG_B_FRAGMENTS).is_empty(), "{text}");
+        assert!(!text.contains("other organisations"), "a save has nobody else to account for: {text}");
+
+        let ours = "0191f2c0-0000-7000-8000-00000000a001";
+        apply_for_org_with(&db, &cipher, None, Some(ours), "org-a", &executor)
+            .await
+            .expect("our save");
+        assert_eq!(
+            *kernel.touched.lock().expect("touched"),
+            vec![format!("apply {}", wwn_for("iscsi", "helios", "vm-a"))]
+        );
+    }
+
+    #[test]
+    fn the_node_alert_claims_an_alert_per_target_only_for_the_targets_that_really_got_one() {
+        // Critic MINOR 2: "each one's organisation has an alert naming it"
+        // was written whatever had been raised.
+        let (db, ours, _) = two_org_targets();
+        let mut ghost = ours.clone();
+        ghost.target_id = "t-without-a-row".into();
+        ghost.name = "widmo".into();
+        // A failing target nobody owns: its alert is written, and no tenant
+        // can list it — so it does not count.
+        let raised = report_target_failures(
+            &db,
+            SweepKind::Remove,
+            &[failure(&ours, "busy"), failure(&ghost, "busy")],
+            true,
+        );
+        assert_eq!(raised, 1);
+
+        let all = node_sweep_detail(2, 2, false);
+        assert!(all.contains("each one's organisation has an alert naming it"), "{all}");
+        let some = node_sweep_detail(3, 1, false);
+        assert!(!some.contains("each one's"), "{some}");
+        assert!(some.contains("1 of them has an alert"), "{some}");
+        assert!(node_sweep_detail(3, 2, false).contains("2 of them have an alert"));
+        assert!(some.contains("the node log names them all"), "{some}");
+        let none = node_sweep_detail(2, 0, true);
+        assert!(!none.contains("alert naming"), "{none}");
+        assert!(none.starts_with("2 block target(s)"), "{none}");
+        assert!(none.contains("the node log names them"), "{none}");
+        assert!(none.contains("the reconcile itself could not run"), "{none}");
+    }
+
+    #[test]
+    fn an_open_node_alert_from_before_a_restart_loses_its_old_detail_and_none_is_invented() {
+        // Critic MINOR 3: an older build wrote every failing target's name
+        // into this node-wide row, which every tenant lists.
+        let (db, _, theirs) = two_org_targets();
+
+        // Nothing open: the rewrite must not raise an alert out of nothing.
+        rewrite_stale_sweep_alert(&db);
+        assert!(store::list_alerts(&db, true).expect("alerts").is_empty());
+
+        store::raise_alert(
+            &db,
+            SWEEP_ALERT_KEY,
+            "warning",
+            "node",
+            "targets",
+            SWEEP_ALERT_TITLE,
+            &format!("{}: configfs refused the write", theirs.name),
+        )
+        .expect("the old build's row");
+        let before = store::list_alerts_for_org(&db, "org-a", true).expect("org-a");
+        assert!(before[0].detail.contains("ksiegowosc-vm"), "the premise: org-a reads it");
+
+        rewrite_stale_sweep_alert(&db);
+        let after = store::list_alerts_for_org(&db, "org-a", true).expect("org-a");
+        assert_eq!(after.len(), 1, "still open — the condition may still hold");
+        assert_eq!(after[0].alert_id, before[0].alert_id);
+        assert_eq!(after[0].raised_at, before[0].raised_at, "since when is kept");
+        assert_eq!(after[0].detail, SWEEP_ALERT_RESTARTED);
+        assert!(!after[0].detail.contains("ksiegowosc"));
+        assert_eq!(after[0].code, "targets_sweep_stale");
+        assert!(after[0].params.is_empty(), "{:?}", after[0].params);
+    }
+
+    #[test]
+    fn a_saved_target_keeps_its_name_so_its_alert_subject_cannot_go_stale() {
+        // Critic MINOR 7: a refreshed alert keeps its `subject_id` while its
+        // owner is looked up from the name passed now — harmless only as long
+        // as a target cannot be renamed. The name is the last component of
+        // the IQN/NQN, and `upsert_target`'s conflict branch never writes it;
+        // this pins that, so a rename feature has to come through here and
+        // meet the alert first.
+        let (db, ours, _) = two_org_targets();
+        let mut renamed = ours.clone();
+        renamed.name = "vm-b".into();
+        store::upsert_target(&db, "org-a", &renamed).expect("save");
+        let rows = store::list_targets(&db).expect("rows");
+        let row = rows.iter().find(|t| t.target_id == ours.target_id).expect("row");
+        assert_eq!(row.name, "vm-a");
+    }
+
     #[test]
     fn a_target_job_log_never_names_another_organisations_target() {
         // The critic's MAJOR 1: a save of org A's target is scoped in the
@@ -5667,16 +6504,17 @@ mod tests {
         assert!(error.is_none(), "nothing failed");
 
         // A failure of our own target is named; its text is kept unless it
-        // names the other organisation's target, and theirs is only counted.
+        // names the other organisation's target. A failure that is not ours
+        // cannot reach here (`apply_report` touches only our rows), and if
+        // one did it would be neither named nor counted.
         let failed = vec![
             failure(&ours, "the helper refused the plan"),
             failure(&theirs, "the helper refused the plan"),
         ];
         let (_, error) = scope_outcome(log.clone(), &failed, &owners, &markers, "org-a");
         let error = error.expect("the job fails");
-        assert!(error.contains("vm-a: the helper refused the plan"), "{error}");
-        assert!(error.contains("1 other target(s)"), "{error}");
-        assert!(!error.contains("ksiegowosc-vm"), "{error}");
+        assert_eq!(error, "vm-a: the helper refused the plan");
+        assert!(!error.contains("other target"), "{error}");
 
         let leaking = vec![failure(&ours, &format!("port 3260 is held by {}", theirs.wwn))];
         let (_, error) = scope_outcome(log.clone(), &leaking, &owners, &markers, "org-a");
@@ -5690,9 +6528,12 @@ mod tests {
         assert!(seen_b.iter().all(|l| !l.contains("vm-a:")), "{seen_b:?}");
         assert!(seen_b.iter().any(|l| l.contains("ksiegowosc-vm")), "{seen_b:?}");
 
-        // An empty org id owns nothing: every failure is somebody else's.
+        // An empty org id owns nothing: the job still fails, naming nothing.
         let (_, error) = scope_outcome(Vec::new(), &failed, &owners, &markers, "");
-        assert_eq!(error.as_deref(), Some("2 other target(s) on this node could not be reconciled"));
+        assert_eq!(
+            error.as_deref(),
+            Some("a target of this job changed while it was reconciled; the node log has the error")
+        );
     }
 
     #[test]
@@ -5707,23 +6548,31 @@ mod tests {
         ];
 
         // Below the clock's threshold nothing is raised.
-        report_target_failures(&db, SweepKind::Apply, &failed, false);
+        assert_eq!(report_target_failures(&db, SweepKind::Apply, &failed, false), 0);
         assert!(store::list_alerts(&db, true).expect("alerts").is_empty());
 
-        report_target_failures(&db, SweepKind::Apply, &failed, true);
+        let alerted = report_target_failures(&db, SweepKind::Apply, &failed, true);
+        assert_eq!(alerted, 2, "both targets have an owner, so both alerts are readable");
         let a = store::list_alerts_for_org(&db, "org-a", true).expect("org-a");
         assert_eq!(a.len(), 1, "{a:?}");
         assert_eq!(a[0].subject_kind, "target");
         assert!(a[0].title.contains("vm-a"), "{}", a[0].title);
         assert_eq!(a[0].detail, "configfs refused the write");
+        assert_eq!(a[0].code, "target_not_applied");
+        assert_eq!(a[0].params.get("target").map(String::as_str), Some("vm-a"));
+        assert_eq!(a[0].params.get("error").map(String::as_str), Some("configfs refused the write"));
         let b = store::list_alerts_for_org(&db, "org-b", true).expect("org-b");
         assert_eq!(b.len(), 1, "{b:?}");
         assert!(b[0].title.contains("ksiegowosc-vm"));
         assert!(!b[0].detail.contains(&ours.wwn), "org B never reads org A's target: {}", b[0].detail);
+        // The withheld error is withheld from the parameters too.
+        assert_eq!(b[0].code, "target_not_applied");
+        assert!(!b[0].params.contains_key("error"), "{:?}", b[0].params);
+        assert!(!format!("{:?}", b[0].params).contains(&ours.wwn));
         assert!(!format!("{a:?}").contains("ksiegowosc"), "org A reads nothing of org B's: {a:?}");
 
         // The node-wide sentence: how many, never which.
-        let node = node_sweep_detail(failed.len(), true);
+        let node = node_sweep_detail(failed.len(), alerted, true);
         assert!(node.starts_with("2 block target(s)"), "{node}");
         assert!(!node.contains("vm-a") && !node.contains("ksiegowosc"), "{node}");
 

@@ -63,7 +63,7 @@ export function approvalsCardHtml(admin) {
         <tf-column key="operation" label="${escapeAttr(T('approvals.col_operation'))}" renderer="html" fill></tf-column>
         <tf-column key="subject" label="${escapeAttr(T('approvals.col_subject'))}" renderer="html" nowrap hide-below="900"></tf-column>
         <tf-column key="requested" label="${escapeAttr(T('approvals.col_requested'))}" renderer="html" nowrap></tf-column>
-        <tf-column key="expires" label="${escapeAttr(T('approvals.col_expires'))}" renderer="html" nowrap hide-below="1000"></tf-column>
+        <tf-column key="expires" label="${escapeAttr(T('approvals.col_expires'))}" renderer="html" nowrap hide-below="1024"></tf-column>
         <tf-column key="status" label="${escapeAttr(T('approvals.col_status'))}" renderer="html" nowrap></tf-column>
       </tf-table>
     </div>`;
@@ -92,7 +92,7 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
       return {
         _approval: a,
         operation: `<span class="tf-table__cell-title">${escapeHtml(operationLabel(a.operation))}</span><div class="tf-table__cell-sub">${escapeHtml(a.detail)}</div>`,
-        subject: `<span class="tf-table__cell--mono">${escapeHtml(a.subject)}</span>`,
+        subject: a.subject ? `<span class="tf-table__cell--mono">${escapeHtml(a.subject)}</span>` : '—',
         requested: `<span>${escapeHtml(fmtAgo(a.requestedAt))}</span><div class="tf-table__cell-sub"${requester.title ? ` title="${escapeAttr(requester.title)}"` : ''}>${escapeHtml(T('approvals.requested_by', { user: requester.label }))}</div>`,
         expires: `<span class="tf-table__cell--mono">${escapeHtml(a.status === 'pending' ? fmtIn(a.expiresAt) : fmtDate(a.expiresAt))}</span>`,
         status: `<tf-chip size="sm" dot status="${statusTone(a.status)}" label="${escapeAttr(T('approvals.status_' + a.status))}"></tf-chip>${
@@ -178,7 +178,9 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
     const surface = body.querySelector('#nas-approvals-table');
     const isCurrent = () => !screen.disposed && body.isConnected && surface?.isConnected && screen.currentNode()?.nodeId === nodeId;
     if (!isCurrent()) return;
-    const detail = `${operationLabel(approval.operation)} — ${approval.subject}`;
+    // A config import the fleet has no node name for arrives with no subject
+    // (dispatch `config_import_subject`): the operation alone, never an id.
+    const detail = approval.subject ? `${operationLabel(approval.operation)} — ${approval.subject}` : operationLabel(approval.operation);
     const note = await askDecision(approve, detail);
     if (note === null || !isCurrent()) return;
     // Approving RUNS the operation, so it needs the approver's own sudo
@@ -290,7 +292,7 @@ export function reportParked(approval) {
       <div class="explain-box">${escapeHtml(T('approvals.parked_detail', { t: fmtIn(approval.expiresAt) }))}</div>
       <div class="stat-rows">
         <div class="sr"><span class="k">${escapeHtml(T('approvals.col_operation'))}</span><span class="v">${escapeHtml(operationLabel(approval.operation))}</span></div>
-        <div class="sr"><span class="k">${escapeHtml(T('approvals.col_subject'))}</span><span class="v">${escapeHtml(approval.subject)}</span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('approvals.col_subject'))}</span><span class="v">${escapeHtml(approval.subject || '—')}</span></div>
       </div>
     </div>
     <div slot="footer">

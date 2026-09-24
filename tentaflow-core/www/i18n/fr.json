@@ -5472,7 +5472,6 @@
       "mounted": "Monté",
       "present": "Présent",
       "disk_details": "Détails du disque {name}",
-      "back": "Retour aux pools",
       "refresh": "Actualiser",
       "snapshot_only": "La parité décrit la dernière synchronisation. La protection des écritures ultérieures n’est pas confirmée.",
       "tolerance": "Tolérance du point de contrôle : {n} {n|disque|disques|disques}",
@@ -6613,7 +6612,118 @@
         "node": "nœud",
         "elastic-array": "matrice Elastic"
       },
-      "history": "Historique des alertes"
+      "history": "Historique des alertes",
+      "untranslated_title": "Alerte du nœud",
+      "untranslated_detail": "L'alerte complète est dans le texte du nœud — cette version ne la traduit pas",
+      "detail_in_node_text": "Les détails sont dans le texte du nœud",
+      "code": {
+        "disk_health": {
+          "title_live": "Disque {name} : {grade}",
+          "title_last_known": "Disque vu pour la dernière fois comme {name} : {grade}",
+          "title_unnamed": "Disque : {grade}",
+          "title_live_reason": "{name} : {reason}",
+          "title_last_known_reason": "Disque vu pour la dernière fois comme {name} : {reason}",
+          "title_unnamed_reason": "Disque : {reason}"
+        },
+        "approval_pending": {
+          "title": "{operation} « {subject} » attend un second administrateur",
+          "detail": "Approuvez ou refusez-la dans la file des Tâches",
+          "title_unnamed": "{operation} attend un second administrateur"
+        },
+        "elastic_sync_held": {
+          "title": "Matrice {array} : Sync planifié suspendu, la parité signale des erreurs",
+          "detail": "Un scrub a signalé des erreurs que rien n'a encore réparées. Un Sync planifié retirerait du fichier content les fichiers que le scrub n'a pas pu lire. Lancez la réparation depuis la parité, puis un scrub ; le Sync manuel reste disponible."
+        },
+        "elastic_mover_settle_stopped": {
+          "title": "Matrice {array} : achèvement automatique du déplacement suspendu",
+          "detail": "{runs} {runs|exécution consécutive du déplacement a échoué|exécutions consécutives du déplacement ont échoué}, le nœud n'en lance donc plus de lui-même. Vérifiez la cause dans l'historique des déplacements et lancez le déplacement manuellement."
+        },
+        "elastic_cache_stuck": {
+          "title": "Des fichiers attendent trop longtemps sur le cache de la matrice {array}",
+          "detail": "Le fichier le plus ancien attend sur le disque de cache depuis {oldest} (alarme après {limit}) et la parité ne le protège pas avant son passage sur les disques de données : {cause}.",
+          "cause_unresolved_operation": "une opération non résolue de cette matrice bloque le déplacement",
+          "cause_files_busy": "les fichiers les plus anciens sont ouverts ou affectés à un déplacement échoué, ils ne peuvent donc pas être déplacés",
+          "cause_schedule_window": "le déplacement est limité à la fenêtre de la planification",
+          "cause_last_run_moved_nothing": "le dernier déplacement n'a retiré aucun fichier du cache (vérifiez son résultat dans l'historique des tâches, p. ex. manque de place sur les disques de données)",
+          "cause_not_started": "le déplacement automatique n'a pas pu démarrer (vérifiez l'état de la matrice)"
+        },
+        "elastic_conflict": {
+          "title": "Matrice {array} : {count} {count|fichier conservé|fichiers conservés} en deux versions",
+          "detail": "Un déplacement interrompu a laissé deux versions de fichiers et aucune n'a été supprimée. Comparez-les et supprimez celle en trop ; l'alerte disparaîtra quand il n'en restera qu'une.",
+          "file_quarantine": "{path} : version visible {visible}, l’autre est une copie en quarantaine sur le disque de cache {disk}",
+          "file_data": "{path} : version visible {visible}, l’autre est au même chemin sur le disque de données {disk}",
+          "file_branch": "{path} : version visible {visible}, l’autre est sur l’un des disques de la matrice"
+        },
+        "elastic_needs_attention": {
+          "title": "La matrice {array} nécessite une intervention",
+          "detail": "La matrice nécessite une intervention ; les réservations sont conservées",
+          "detail_helper": "La matrice nécessite une intervention ; les réservations sont conservées. La note du helper est dans le texte du nœud"
+        },
+        "elastic_result_unconfirmed": {
+          "title": "Matrice {array} : résultat de l'opération non confirmé",
+          "detail": "Une étape a échoué, et une réponse perdue ne prouve pas l’arrêt des E/S. L’erreur de l’étape est dans le texte du nœud"
+        },
+        "elastic_replace_unconfirmed": {
+          "title": "Matrice {array} : remplacement du disque non confirmé",
+          "detail": "Le remplacement du disque n’a pas été confirmé. L’erreur de l’étape est dans le texte du nœud"
+        },
+        "elastic_add_disk_unconfirmed": {
+          "title": "Matrice {array} : ajout du disque non confirmé",
+          "detail": "Le disque n’a pas été ajouté à la matrice. L’erreur de l’étape est dans le texte du nœud"
+        },
+        "elastic_restore_waiting": {
+          "title": "La matrice {array} attend sa restauration",
+          "detail": "Aucun canal root sans surveillance ; une Restauration explicite est requise"
+        },
+        "target_portal_moved": {
+          "title": "Cible {target} : l'adresse du portail a changé",
+          "detail": "Le portail n'est plus sur l'interface choisie ; l'export est injoignable jusqu'au retour de l'adresse ou au nouveau choix de l'interface."
+        },
+        "target_not_applied": {
+          "title": "Cible {target} : non appliquée dans le noyau",
+          "detail": "Le noyau a refusé la modification ; son erreur est dans le texte du nœud",
+          "detail_hidden": "Le noyau a refusé la modification ; le journal du nœud contient l'erreur complète"
+        },
+        "target_still_in_kernel": {
+          "title": "Cible {target} : toujours dans le noyau alors que le nœud a décidé de l'arrêter",
+          "detail": "Le noyau n’a pas libéré l’objet ; son erreur est dans le texte du nœud",
+          "detail_hidden": "Le noyau n'a pas libéré l'objet ; le journal du nœud contient l'erreur complète"
+        },
+        "elevation_unarmed": {
+          "title": "Le canal de privilèges n'est pas armé — le nœud n'atteint pas le noyau",
+          "detail": "Des cibles bloc attendent d'être appliquées ou retirées. Après un redémarrage configfs est vide et seule cette application le restaure, les exports restent donc arrêtés jusqu'à ce que le canal soit armé (Environnement → provisionnement)."
+        },
+        "targets_sweep_failing": {
+          "title": "Cibles bloc : le nœud n'atteint pas l'état qu'il a décidé",
+          "detail_targets": "{count} {count|cible bloc n'est pas|cibles bloc ne sont pas} dans l'état décidé par le nœud",
+          "detail_sweep": "la réconciliation elle-même n'a pas pu s'exécuter ; le journal du nœud contient l'erreur",
+          "who_all": "l'organisation de chacune a une alerte qui la nomme",
+          "who_some": "{alerted} d’entre elles {alerted|a|ont} une alerte qui la nomme pour son organisation ; le journal du nœud les nomme toutes",
+          "who_none": "le journal du nœud les nomme"
+        },
+        "targets_sweep_stale": {
+          "title": "Cibles bloc : le nœud n'atteint pas l'état qu'il a décidé",
+          "detail": "Avant le redémarrage, des cibles bloc de ce nœud n'étaient pas dans l'état décidé ; la prochaine réconciliation remplacera ceci par le nombre actuel"
+        }
+      },
+      "node_text": "Texte du nœud",
+      "id_hidden": "[identifiant]",
+      "disk_reason": {
+        "smart_failed": "SMART signale une défaillance du disque",
+        "self_test_failed": "le dernier autotest SMART a échoué",
+        "pending_sectors": "{n} {n|secteur attend|secteurs attendent} une réallocation",
+        "media_errors": "{n} {n|erreur|erreurs} de support",
+        "reallocated_growing": "{n} {n|nouveau secteur réalloué|nouveaux secteurs réalloués} en 7 jours",
+        "reallocated": "{n} {n|secteur réalloué|secteurs réalloués}",
+        "temperature_over_limit": "la température de {t}°C dépasse la limite de {limit}°C",
+        "temperature_high": "température de {t}°C",
+        "temperature_high_limit": "la température de {t}°C dépasse le seuil de {limit}°C",
+        "crc_errors": "{n} {n|erreur|erreurs} CRC (câble ou fond de panier)",
+        "wear": "usure de {n} %",
+        "no_smart_data": "aucune donnée SMART",
+        "zfs_faulted": "ZFS a retiré le disque comme défaillant (FAULTED)",
+        "zfs_unavail": "ZFS ne voit pas le disque (UNAVAIL)"
+      }
     },
     "role": {
       "free": "Libre",
@@ -6922,7 +7032,9 @@
       "dh": "{d} j {h} h",
       "hm": "{h} h {m} min",
       "m": "{m} min",
-      "s": "{s} s"
+      "s": "{s} s",
+      "d": "{d} j",
+      "h": "{h} h"
     },
     "fleet": {
       "head_scope": "flotte",
@@ -7132,13 +7244,22 @@
       "reason_grew": "secteurs réalloués passés de {from} à {to} en 7 jours",
       "reason_for_days": "{status} depuis {days} {days|jour|jours}",
       "reason_other": "le nœud recommande de remplacer ce disque",
-      "disk_other": "Le nœud recommande de remplacer ce disque. {spare}."
+      "disk_other": "Le nœud recommande de remplacer ce disque. {spare}.",
+      "array_urgent": "Ce disque de la matrice Elastic demande votre attention : {reason}. Le remplacement d’un disque de matrice n’est pas disponible dans cette version.",
+      "array_advice": "Surveillez ce disque de la matrice Elastic : {reason}. Le remplacement d’un disque de matrice n’est pas disponible dans cette version.",
+      "array_other": "Le nœud signale un problème avec ce disque de la matrice Elastic. Le remplacement d’un disque de matrice n’est pas disponible dans cette version.",
+      "array_no_replace": "matrice Elastic — remplacement du disque indisponible dans cette version",
+      "array_title": "Disques de la matrice Elastic qui demandent votre attention",
+      "array_hint": "D’après l’historique de ce nœud ; le remplacement d’un disque de matrice Elastic n’est pas disponible dans cette version.",
+      "array_reason_other": "le nœud signale un problème avec ce disque",
+      "array_severity_urgent": "urgent",
+      "array_severity_advice": "à surveiller",
+      "array_severity_other": "attention"
     },
     "targets": {
       "sessions_unmeasured": "Inconnu ne signifie pas zéro",
       "host_shared": "Également utilisé par",
       "context_changed": "Le contexte du nœud ou de la cible a changé. Rouvrez les détails.",
-      "back_to_list": "Retour aux partages",
       "session_identity": "Client / initiateur",
       "edit_initiators": "Ajouter ou modifier les hôtes",
       "initiators_draft": "Confirmez les modifications de la liste avec Enregistrer.",
@@ -7241,7 +7362,9 @@
       "delete_keep_volume": "Le volume {source} et ses données restent intacts.",
       "service_missing": "{proto}: {detail}",
       "created": "Créée",
-      "key_in_kernel": "La clé va dans le noyau (configfs). nvmet la crée lisible par tous, donc le nœud restreint le mode du fichier à root seul et vérifie le résultat — tout écart est consigné dans le journal de la tâche. Sur un nœud avec des utilisateurs locaux, considérez-la comme un secret partagé avec ce nœud."
+      "key_in_kernel": "La clé va dans le noyau (configfs). nvmet la crée lisible par tous, donc le nœud restreint le mode du fichier à root seul et vérifie le résultat — tout écart est consigné dans le journal de la tâche. Sur un nœud avec des utilisateurs locaux, considérez-la comme un secret partagé avec ce nœud.",
+      "gone_title": "Cette cible n’existe plus",
+      "gone_detail": "Elle a été supprimée sur ce nœud (par un autre administrateur, par exemple). Revenez à la liste des partages."
     },
     "wizard_target": {
       "title": "Nouvelle cible",
@@ -7346,6 +7469,16 @@
       "this_org": "une autre instance TentaNas de cette organisation",
       "this_org_named": "l'instance « {name} » de cette organisation",
       "other_installation": "une autre installation TentaNas"
+    },
+    "refusal": {
+      "share_user_in_use_elsewhere": "Ce compte est encore utilisé sur ce nœud — il ne peut pas être supprimé",
+      "approval_not_found": "Cette demande n'est pas sur ce nœud",
+      "approval_own_request": "L'auteur d'une demande ne peut pas l'approuver — un second administrateur doit le faire",
+      "approval_already_approved": "Cette demande a déjà été approuvée",
+      "approval_already_rejected": "Cette demande a déjà été refusée",
+      "approval_already_expired": "Cette demande a déjà expiré",
+      "approval_closed": "Cette demande a déjà fait l’objet d’une décision",
+      "approval_expired": "La demande a expiré avant que quiconque n'en décide"
     }
   },
   "agent_accounts": {

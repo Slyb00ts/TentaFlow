@@ -58,10 +58,10 @@ export async function drawDatasets(screen, host, { pool, onChange = null }) {
         <tf-table id="nas-ds-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('datasets.none'))}">
           <tf-column key="name" label="${escapeAttr(T('datasets.col_name'))}" renderer="html" fill></tf-column>
           <tf-column key="compression" label="${escapeAttr(T('datasets.col_compression'))}" renderer="html" nowrap hide-below="900"></tf-column>
-          <tf-column key="quota" label="${escapeAttr(T('datasets.col_quota'))}" renderer="html" nowrap hide-below="1000"></tf-column>
+          <tf-column key="quota" label="${escapeAttr(T('datasets.col_quota'))}" renderer="html" nowrap hide-below="1024"></tf-column>
           <tf-column key="usage" label="${escapeAttr(T('datasets.col_usage'))}" renderer="html" width="220"></tf-column>
-          <tf-column key="snapshots" label="${escapeAttr(T('datasets.col_snapshots'))}" renderer="html" nowrap hide-below="1100"></tf-column>
-          <tf-column key="shares" label="${escapeAttr(T('datasets.col_shares'))}" renderer="html" hide-below="1200"></tf-column>
+          <tf-column key="snapshots" label="${escapeAttr(T('datasets.col_snapshots'))}" renderer="html" nowrap hide-below="1180"></tf-column>
+          <tf-column key="shares" label="${escapeAttr(T('datasets.col_shares'))}" renderer="html" hide-below="1280"></tf-column>
         </tf-table>
       </div>
       <div id="nas-ds-detail"></div>

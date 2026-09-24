@@ -336,7 +336,8 @@ pub struct NasDisk {
 ///   last 7 days;
 /// - 'reallocated' {count} — reallocated sectors, not growing;
 /// - 'temperature_over_limit' {celsius, limit};
-/// - 'temperature_high' {celsius} — over the warning limit only;
+/// - 'temperature_high' {celsius, limit?} — over the warning threshold
+///   (`limit`) only; `limit` is absent from rows written before it was sent;
 /// - 'crc_errors' {count} — UDMA CRC errors (cable or backplane);
 /// - 'wear' {pct} — SSD / NVMe wear;
 /// - 'no_smart_data' — the drive reported no SMART verdict;
@@ -410,11 +411,74 @@ pub struct NasAlert {
     /// 'disk' | 'pool' | 'elevation' | 'environment'.
     pub subject_kind: String,
     pub subject_id: String,
+    /// DEPRECATED FOR DISPLAY, like `NasDisk::health_reason`: the node's own
+    /// sentence ("Disk sde: critical"), kept for syslog / webhook forwarding
+    /// (machine-facing), for rows raised before `code` existed, and as a
+    /// tooltip. A screen words `code` + `params` + `reasons` instead.
     pub title: String,
+    /// DEPRECATED FOR DISPLAY, see `title`.
     pub detail: String,
     pub raised_at: String,
     pub acked_at: Option<String>,
     pub resolved_at: Option<String>,
+    /// What the alert is about, as a code the screen words in the reader's
+    /// language. Empty on a row raised by an older build (or by a raiser not
+    /// converted yet): a screen then shows a translated generic title with
+    /// `title` / `detail` as the tooltip. Codes and their `params`:
+    /// - 'disk_health' {health, name_source, name?} — `health` is
+    ///   'warning' | 'critical'; `name_source` is 'live' | 'last_known' |
+    ///   'unknown' (`name` absent for 'unknown'); `reasons` are the disk's
+    ///   `NasHealthReason`s, worst first;
+    /// - 'approval_pending' {operation, subject} — `operation` is the
+    ///   `NasPendingApproval::operation` code;
+    /// - 'elastic_sync_held' {array} — the scheduled Sync is skipped over a
+    ///   scrub's unrepaired errors;
+    /// - 'elastic_mover_settle_stopped' {array, runs};
+    /// - 'elastic_cache_stuck' {array, oldest_secs, limit_secs, cause} —
+    ///   `cause` is 'unresolved_operation' | 'files_busy' | 'schedule_window'
+    ///   | 'last_run_moved_nothing' | 'not_started'; the seconds are coarse
+    ///   (whole days from two days up, whole hours from one hour up, whole
+    ///   minutes below) so a refresh does not rewrite the row every probe;
+    /// - 'elastic_conflict' {array, count} — `reasons` holds one coded line
+    ///   per file, code 'conflict_file' with {path, visible, kept_kind,
+    ///   kept_disk?}: `path` is the file's path in the array, `visible` where
+    ///   clients see it, `kept_kind` where the other version is —
+    ///   'quarantine' (a quarantined copy in the root of cache disk
+    ///   `kept_disk`), 'data' (under the same path on data disk `kept_disk`)
+    ///   or 'branch' (somewhere else on the array's disks, no `kept_disk`).
+    ///   The quarantine file's own name carries the operation id and is never
+    ///   sent;
+    /// - 'elastic_needs_attention' {array, helper_detail?} — `helper_detail`
+    ///   is the helper's own text: a tooltip, never the screen's sentence;
+    /// - 'elastic_result_unconfirmed' {array, error} — `error` is the raw
+    ///   error text of the failed step: a tooltip, never the screen's
+    ///   sentence (so for the next two);
+    /// - 'elastic_replace_unconfirmed' {array, error} — raised by the disk
+    ///   replacement job, which is withdrawn (dormant) until that feature
+    ///   returns;
+    /// - 'elastic_add_disk_unconfirmed' {array, error};
+    /// - 'elastic_restore_waiting' {array};
+    /// - 'targets_sweep_stale' {} — the node-wide target sweep alert as a
+    ///   restart (and migration 21) leaves it: no count measured yet;
+    /// - 'target_portal_moved' {target};
+    /// - 'target_not_applied' {target, error?} — `error` is the kernel's
+    ///   text, a tooltip only, and absent when it names another
+    ///   organisation's object;
+    /// - 'target_still_in_kernel' {target, error?} — as the one above;
+    /// - 'elevation_unarmed' {};
+    /// - 'targets_sweep_failing' {count, alerted, sweep_failed} — `alerted`
+    ///   is how many of `count` have an alert their organisation can read,
+    ///   `sweep_failed` is 'true' | 'false'.
+    ///
+    /// Every parameter is a string, as in `NasHealthReason`.
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+    /// Coded lines of the alert's detail (a disk's health reasons, a
+    /// conflict's files). Empty for a code that has none.
+    #[serde(default)]
+    pub reasons: Vec<NasHealthReason>,
 }
 
 /// One audited file access of an SMB share (§5.10), as one row of the
@@ -3673,6 +3737,36 @@ mod tests {
         let bare: NasHealthReason = without(&coded[0], "params");
         assert_eq!(bare.code, "capacity");
         assert!(bare.params.is_empty());
+    }
+
+    /// An alert from a node built before alert codes existed carries only its
+    /// English title and detail. It must still decode — to no code, which the
+    /// screen words as a generic title with the text as its tooltip — or one
+    /// old node would blank the fleet alert table for every node.
+    #[test]
+    fn an_alert_without_codes_decodes_to_an_uncoded_alert() {
+        let alert = NasAlert {
+            alert_id: "a1".to_string(),
+            title: "Disk sde: critical".to_string(),
+            code: "disk_health".to_string(),
+            params: [("health".to_string(), "critical".to_string())].into_iter().collect(),
+            reasons: vec![NasHealthReason { code: "zfs_faulted".to_string(), ..Default::default() }],
+            ..Default::default()
+        };
+        let bytes = crate::cbor::encode(&alert).expect("encode");
+        let mut doc: ciborium::value::Value = crate::cbor::decode(&bytes).expect("decode");
+        let ciborium::value::Value::Map(entries) = &mut doc else {
+            panic!("a struct encodes as a map");
+        };
+        let before = entries.len();
+        entries.retain(|(key, _)| !matches!(key.as_text(), Some("code" | "params" | "reasons")));
+        assert_eq!(entries.len(), before - 3, "the fixture must really omit the three fields");
+        let old: NasAlert = crate::cbor::decode(&crate::cbor::encode(&doc).expect("encode")).expect("decode");
+        assert_eq!(old.title, "Disk sde: critical");
+        assert!(old.code.is_empty() && old.params.is_empty() && old.reasons.is_empty(), "{old:?}");
+        // And a coded one round-trips whole.
+        let back: NasAlert = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, alert);
     }
 
     #[test]

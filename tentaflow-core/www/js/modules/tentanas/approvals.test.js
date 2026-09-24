@@ -78,6 +78,23 @@ test('the pending list names the operation, who asked and when it expires', asyn
   screen.dispose();
 });
 
+// Wave-4 critic minor 12: a config import from an export the fleet has no
+// node name for arrives with no subject (the node drops the id at the read
+// boundary) — the row says nothing rather than a blank or an id.
+test('a config import with no node name shows no subject, not an id', async () => {
+  const screen = fakeScreen({
+    tentaNasApprovalsListRequest: { approvals: [pending({ operation: 'config_import', subject: '' })], settings: settings() },
+  });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const row = body.querySelector('#nas-approvals-table').rows[0];
+  assert.equal(row.subject, '—');
+  assert.match(row.operation, /Import konfiguracji/);
+  screen.dispose();
+});
+
 // The owner's rule (format.js `jobAuthor`): a machine id is never shown as a
 // name. `requestedBy`/`decidedBy` used to be printed raw, so an account the
 // server could not resolve (deleted, or one that exists only on the node that
@@ -385,4 +402,25 @@ test('reportParked names the operation and the resource it would have touched', 
   assert.match(win.textContent, /projekty/);
   win.remove();
   document.body.innerHTML = '';
+});
+
+// tf-table drops a hide-below outside its breakpoint allowlist, so the
+// "expires" column asked to hide at 1000 px never hid at all.
+test('every hide-below of the approvals table is a breakpoint tf-table honours', async () => {
+  const screen = fakeScreen({ tentaNasApprovalsListRequest: { approvals: [pending()], settings: settings() } });
+  try {
+    const body = mount();
+    const { refresh } = wireApprovals(screen, body);
+    await refresh();
+    await flush();
+    const table = body.querySelector('#nas-approvals-table');
+    const wanted = [...table.querySelectorAll('tf-column[hide-below]')].map((c) => c.getAttribute('hide-below'));
+    const got = [...table.shadowRoot.querySelectorAll('thead th')].flatMap((th) => [...th.classList]
+      .filter((c) => c.startsWith('tf-table__col--hide-below-')).map((c) => c.slice('tf-table__col--hide-below-'.length)));
+    assert.deepEqual(got, wanted);
+    assert.equal(wanted.length, 2);
+    body.remove();
+  } finally {
+    screen.dispose();
+  }
 });

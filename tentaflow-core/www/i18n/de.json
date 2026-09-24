@@ -5472,7 +5472,6 @@
       "mounted": "Eingehängt",
       "present": "Vorhanden",
       "disk_details": "Datenträgerdetails: {name}",
-      "back": "Zurück zu Pools",
       "refresh": "Aktualisieren",
       "snapshot_only": "Parität beschreibt den letzten Sync. Spätere Schreibvorgänge sind nicht bestätigt geschützt.",
       "tolerance": "Checkpoint-Toleranz: {n} {n|Datenträger|Datenträger|Datenträger}",
@@ -6613,7 +6612,118 @@
         "node": "Knoten",
         "elastic-array": "Elastic Array"
       },
-      "history": "Warnungsverlauf"
+      "history": "Warnungsverlauf",
+      "untranslated_title": "Knotenalarm",
+      "untranslated_detail": "Der vollständige Alarm steht im Text des Knotens — diese Version hat keine Übersetzung dafür",
+      "detail_in_node_text": "Die Details stehen im Text des Knotens",
+      "code": {
+        "disk_health": {
+          "title_live": "Laufwerk {name}: {grade}",
+          "title_last_known": "Laufwerk, zuletzt gesehen als {name}: {grade}",
+          "title_unnamed": "Laufwerk: {grade}",
+          "title_live_reason": "{name}: {reason}",
+          "title_last_known_reason": "Laufwerk, zuletzt gesehen als {name}: {reason}",
+          "title_unnamed_reason": "Laufwerk: {reason}"
+        },
+        "approval_pending": {
+          "title": "{operation} „{subject}“ wartet auf einen zweiten Administrator",
+          "detail": "In der Aufgabenliste genehmigen oder ablehnen",
+          "title_unnamed": "{operation} wartet auf einen zweiten Administrator"
+        },
+        "elastic_sync_held": {
+          "title": "Array {array}: geplanter Sync angehalten, Parity meldet Fehler",
+          "detail": "Ein Scrub hat Fehler gemeldet, die noch nichts repariert hat. Ein geplanter Sync würde die Dateien, die der Scrub nicht lesen konnte, aus der Content-Datei entfernen. Führen Sie die Reparatur aus der Parity und danach einen Scrub aus; ein manueller Sync bleibt verfügbar."
+        },
+        "elastic_mover_settle_stopped": {
+          "title": "Array {array}: automatischer Abschluss des Verschiebens pausiert",
+          "detail": "{runs} {runs|aufeinanderfolgender Verschiebelauf ist|aufeinanderfolgende Verschiebeläufe sind} fehlgeschlagen, daher startet der Knoten keine weiteren selbst. Prüfen Sie die Ursache im Verschiebeverlauf und starten Sie das Verschieben manuell."
+        },
+        "elastic_cache_stuck": {
+          "title": "Dateien warten zu lange auf dem Cache von Array {array}",
+          "detail": "Die älteste Datei wartet seit {oldest} auf dem Cache-Laufwerk (Alarm nach {limit}), und bis zum Verschieben auf die Datenlaufwerke schützt sie keine Parity: {cause}.",
+          "cause_unresolved_operation": "eine ungelöste Operation dieses Arrays hält das Verschieben an",
+          "cause_files_busy": "die ältesten Dateien sind geöffnet oder einem fehlgeschlagenen Verschieben zugeordnet und können nicht verschoben werden",
+          "cause_schedule_window": "das Verschieben ist auf das Zeitplanfenster beschränkt",
+          "cause_last_run_moved_nothing": "der letzte Lauf hat keine Datei vom Cache genommen (prüfen Sie sein Ergebnis im Aufgabenverlauf, z. B. kein Platz auf den Datenlaufwerken)",
+          "cause_not_started": "das automatische Verschieben konnte nicht starten (prüfen Sie den Zustand des Arrays)"
+        },
+        "elastic_conflict": {
+          "title": "Array {array}: {count} {count|Datei|Dateien} in zwei Versionen erhalten",
+          "detail": "Ein unterbrochenes Verschieben hat zwei Versionen von Dateien hinterlassen, keine wurde gelöscht. Vergleichen Sie sie und löschen Sie die überflüssige; der Alarm verschwindet, sobald eine übrig ist.",
+          "file_quarantine": "{path}: sichtbare Version {visible}, die andere ist eine Kopie in Quarantäne auf dem Cache-Laufwerk {disk}",
+          "file_data": "{path}: sichtbare Version {visible}, die andere liegt unter demselben Pfad auf dem Datenlaufwerk {disk}",
+          "file_branch": "{path}: sichtbare Version {visible}, die andere liegt auf einem der Laufwerke des Arrays"
+        },
+        "elastic_needs_attention": {
+          "title": "Array {array} erfordert einen Eingriff",
+          "detail": "Das Array erfordert einen Eingriff; Reservierungen bleiben erhalten",
+          "detail_helper": "Das Array erfordert einen Eingriff; Reservierungen bleiben erhalten. Die Notiz des Helpers steht im Text des Knotens"
+        },
+        "elastic_result_unconfirmed": {
+          "title": "Array {array}: Ergebnis der Operation nicht bestätigt",
+          "detail": "Ein Schritt ist fehlgeschlagen, und eine verlorene Antwort beweist nicht, dass die E/A gestoppt ist. Der Fehler des Schritts steht im Text des Knotens"
+        },
+        "elastic_replace_unconfirmed": {
+          "title": "Array {array}: Austausch des Laufwerks nicht bestätigt",
+          "detail": "Der Austausch des Laufwerks wurde nicht bestätigt. Der Fehler des Schritts steht im Text des Knotens"
+        },
+        "elastic_add_disk_unconfirmed": {
+          "title": "Array {array}: Hinzufügen des Laufwerks nicht bestätigt",
+          "detail": "Das Laufwerk wurde dem Array nicht hinzugefügt. Der Fehler des Schritts steht im Text des Knotens"
+        },
+        "elastic_restore_waiting": {
+          "title": "Array {array} wartet auf die Wiederherstellung",
+          "detail": "Kein unbeaufsichtigter Root-Kanal; ein ausdrückliches Wiederherstellen ist erforderlich"
+        },
+        "target_portal_moved": {
+          "title": "Target {target}: die Portaladresse ist umgezogen",
+          "detail": "Das Portal liegt nicht mehr auf der gewählten Schnittstelle; der Export ist unerreichbar, bis die Adresse zurückkehrt oder die Schnittstelle neu gewählt wird."
+        },
+        "target_not_applied": {
+          "title": "Target {target}: nicht im Kernel angewendet",
+          "detail": "Der Kernel hat die Änderung abgelehnt; sein Fehler steht im Text des Knotens",
+          "detail_hidden": "Der Kernel hat die Änderung abgelehnt; der vollständige Fehler steht im Knotenprotokoll"
+        },
+        "target_still_in_kernel": {
+          "title": "Target {target}: noch im Kernel, obwohl der Knoten es stoppen wollte",
+          "detail": "Der Kernel hat das Objekt nicht freigegeben; sein Fehler steht im Text des Knotens",
+          "detail_hidden": "Der Kernel hat das Objekt nicht freigegeben; der vollständige Fehler steht im Knotenprotokoll"
+        },
+        "elevation_unarmed": {
+          "title": "Der Rechtekanal ist nicht aktiviert — der Knoten erreicht den Kernel nicht",
+          "detail": "Block-Targets warten darauf, angewendet oder entfernt zu werden. Nach einem Neustart ist configfs leer und nur diese App stellt es wieder her, daher bleiben die Exporte aus, bis der Kanal aktiviert ist (Umgebung → Einrichtung)."
+        },
+        "targets_sweep_failing": {
+          "title": "Block-Targets: der Knoten erreicht den beschlossenen Zustand nicht",
+          "detail_targets": "{count} {count|Block-Target ist|Block-Targets sind} nicht im vom Knoten beschlossenen Zustand",
+          "detail_sweep": "der Abgleich selbst konnte nicht laufen; der Fehler steht im Knotenprotokoll",
+          "who_all": "die Organisation jedes Targets hat einen Alarm, der es nennt",
+          "who_some": "{alerted} davon {alerted|hat|haben} einen Alarm, der es für seine Organisation nennt; das Knotenprotokoll nennt alle",
+          "who_none": "das Knotenprotokoll nennt sie"
+        },
+        "targets_sweep_stale": {
+          "title": "Block-Targets: der Knoten erreicht den beschlossenen Zustand nicht",
+          "detail": "Vor dem Neustart waren Block-Targets dieses Knotens nicht im beschlossenen Zustand; der nächste Abgleich ersetzt dies durch die aktuelle Anzahl"
+        }
+      },
+      "node_text": "Text des Knotens",
+      "id_hidden": "[Kennung]",
+      "disk_reason": {
+        "smart_failed": "SMART meldet einen Ausfall des Laufwerks",
+        "self_test_failed": "der letzte SMART-Selbsttest ist fehlgeschlagen",
+        "pending_sectors": "{n} {n|Sektor wartet|Sektoren warten} auf Reallokation",
+        "media_errors": "{n} {n|Medienfehler|Medienfehler}",
+        "reallocated_growing": "{n} {n|neuer reallozierter Sektor|neue reallozierte Sektoren} in 7 Tagen",
+        "reallocated": "{n} {n|reallozierter Sektor|reallozierte Sektoren}",
+        "temperature_over_limit": "Temperatur {t}°C liegt über dem Limit von {limit}°C",
+        "temperature_high": "Temperatur {t}°C",
+        "temperature_high_limit": "Temperatur {t}°C liegt über der Schwelle von {limit}°C",
+        "crc_errors": "{n} CRC-{n|Fehler|Fehler} (Kabel oder Backplane)",
+        "wear": "{n}% abgenutzt",
+        "no_smart_data": "keine SMART-Daten",
+        "zfs_faulted": "ZFS hat das Laufwerk als defekt entfernt (FAULTED)",
+        "zfs_unavail": "ZFS sieht das Laufwerk nicht (UNAVAIL)"
+      }
     },
     "role": {
       "free": "Frei",
@@ -6922,7 +7032,9 @@
       "dh": "{d} T {h} Std.",
       "hm": "{h} Std. {m} Min.",
       "m": "{m} Min.",
-      "s": "{s} s"
+      "s": "{s} s",
+      "d": "{d} T",
+      "h": "{h} Std."
     },
     "fleet": {
       "head_scope": "Flotte",
@@ -7132,13 +7244,22 @@
       "reason_grew": "reallozierte Sektoren stiegen in 7 Tagen von {from} auf {to}",
       "reason_for_days": "{status} seit {days} {days|Tag|Tagen}",
       "reason_other": "der Knoten empfiehlt, diese Platte zu tauschen",
-      "disk_other": "Der Knoten empfiehlt, diese Platte zu tauschen. {spare}."
+      "disk_other": "Der Knoten empfiehlt, diese Platte zu tauschen. {spare}.",
+      "array_urgent": "Dieses Laufwerk des Elastic Array erfordert Aufmerksamkeit: {reason}. Der Austausch eines Array-Laufwerks ist in dieser Version nicht verfügbar.",
+      "array_advice": "Behalten Sie dieses Laufwerk des Elastic Array im Blick: {reason}. Der Austausch eines Array-Laufwerks ist in dieser Version nicht verfügbar.",
+      "array_other": "Der Knoten meldet ein Problem mit diesem Laufwerk des Elastic Array. Der Austausch eines Array-Laufwerks ist in dieser Version nicht verfügbar.",
+      "array_no_replace": "Elastic Array — Austausch des Laufwerks in dieser Version nicht verfügbar",
+      "array_title": "Laufwerke des Elastic Array, die Aufmerksamkeit erfordern",
+      "array_hint": "Aus dem Verlauf dieses Knotens; der Austausch eines Laufwerks des Elastic Array ist in dieser Version nicht verfügbar.",
+      "array_reason_other": "der Knoten meldet ein Problem mit diesem Laufwerk",
+      "array_severity_urgent": "dringend",
+      "array_severity_advice": "beobachten",
+      "array_severity_other": "Hinweis"
     },
     "targets": {
       "sessions_unmeasured": "Unbekannt bedeutet nicht null",
       "host_shared": "Auch verwendet von",
       "context_changed": "Der Knoten- oder Target-Kontext wurde geändert. Öffnen Sie die Details erneut.",
-      "back_to_list": "Zurück zu Freigaben",
       "session_identity": "Client / Initiator",
       "edit_initiators": "Hosts hinzufügen oder bearbeiten",
       "initiators_draft": "Listenänderungen mit Speichern bestätigen.",
@@ -7241,7 +7362,9 @@
       "delete_keep_volume": "Das Volume {source} und seine Daten bleiben unangetastet.",
       "service_missing": "{proto}: {detail}",
       "created": "Erstellt",
-      "key_in_kernel": "Der Schlüssel geht in den Kernel (configfs). nvmet legt ihn für alle lesbar an, deshalb engt der Knoten den Dateimodus auf root ein und prüft das Ergebnis — eine Abweichung landet im Auftragsprotokoll. Auf einem Knoten mit lokalen Benutzern gilt er als mit diesem Knoten geteiltes Geheimnis."
+      "key_in_kernel": "Der Schlüssel geht in den Kernel (configfs). nvmet legt ihn für alle lesbar an, deshalb engt der Knoten den Dateimodus auf root ein und prüft das Ergebnis — eine Abweichung landet im Auftragsprotokoll. Auf einem Knoten mit lokalen Benutzern gilt er als mit diesem Knoten geteiltes Geheimnis.",
+      "gone_title": "Dieses Target gibt es nicht mehr",
+      "gone_detail": "Es wurde auf diesem Knoten gelöscht (z. B. von einem anderen Administrator). Kehren Sie zur Freigabeliste zurück."
     },
     "wizard_target": {
       "title": "Neues Target",
@@ -7346,6 +7469,16 @@
       "this_org": "eine andere TentaNas-Instanz dieser Organisation",
       "this_org_named": "die Instanz „{name}“ dieser Organisation",
       "other_installation": "eine andere TentaNas-Installation"
+    },
+    "refusal": {
+      "share_user_in_use_elsewhere": "Dieses Konto wird auf diesem Knoten noch verwendet — es kann nicht gelöscht werden",
+      "approval_not_found": "Diese Anfrage ist nicht auf diesem Knoten",
+      "approval_own_request": "Der Autor einer Anfrage darf sie nicht genehmigen — ein zweiter Administrator muss es tun",
+      "approval_already_approved": "Diese Anfrage wurde bereits genehmigt",
+      "approval_already_rejected": "Diese Anfrage wurde bereits abgelehnt",
+      "approval_already_expired": "Diese Anfrage ist bereits abgelaufen",
+      "approval_closed": "Über diese Anfrage wurde bereits entschieden",
+      "approval_expired": "Die Anfrage ist abgelaufen, bevor jemand darüber entschieden hat"
     }
   },
   "agent_accounts": {

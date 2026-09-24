@@ -122,8 +122,9 @@ test('detal ma prawdziwe role, ścieżki, null ochrony oraz działający link dy
   assert.match(body.querySelector('.nas-mover').textContent, /nie ma czego przenosić/);
   click(body.querySelector('[data-act="disk"]'));
   assert.deepEqual(screen.openedDisks, ['serial-1']);
-  click(body.querySelector('[data-act="back"]'));
-  assert.equal(screen.array, null);
+  // n11: the shell's breadcrumb ("… › Pule › media") is the way back; the
+  // pane has no second one.
+  assert.equal(body.querySelector('[data-act="back"]'), null);
   screen.dispose();
 });
 
@@ -1333,7 +1334,7 @@ const standing = (body) => ({
   danger: body.querySelector('.danger-zone'),
   cell: body.querySelector('.disk-cell[data-branch="d1"]'),
   fix: body.querySelector('.disk-cell[data-branch="d1"] [data-act="fix"]'),
-  buttons: ['refresh', 'back', 'sync', 'scrub', 'mover', 'mover-schedule', 'add-disk', 'destroy'].map((act) => body.querySelector(`[data-act="${act}"]`)),
+  buttons: ['refresh', 'sync', 'scrub', 'mover', 'mover-schedule', 'add-disk', 'destroy'].map((act) => body.querySelector(`[data-act="${act}"]`)),
   run: body.querySelector('.nas-snapraid-history li'),
 });
 
@@ -1391,7 +1392,7 @@ test('a poll that changes the mover, the history and the cache figure patches va
     let release;
     screen.withSudo = async (fn) => { await new Promise((resolve) => { release = resolve; }); return fn('x'); };
     click(body.querySelector('[data-act="sync"]'));
-    assert.ok(before.buttons[2].hasAttribute('disabled'), 'sync is disabled while its request is pending');
+    assert.ok(before.buttons[1].hasAttribute('disabled'), 'sync is disabled while its request is pending');
     assertSameNodes(before, { ...standing(body), run: body.querySelectorAll('.nas-snapraid-history li')[1] });
     release();
     await flush();
@@ -1466,4 +1467,27 @@ test('błędy parity mówią, z jakiego okna są liczone', async () => {
     assert.equal(r.querySelector('.k').textContent, 'Błędy parity (30 dni)');
     assert.equal(r.querySelector('.v').textContent, '0');
   } finally { screen.dispose(); }
+});
+
+// m26 / backlog 2026-09-21: the array detail drew a second breadcrumb bar
+// ("Pule › media") under the shell's "TentaNas › helios". n11 has one bar,
+// so the view hands its tail to the shell exactly as the ZFS pool detail does
+// — before the first read, so a failed read still has the way back.
+test('the array detail names its tail in the shell breadcrumb and draws no bar of its own', async () => {
+  const screen = fakeScreen({ tentaNasElasticArrayGetRequest: () => { throw new Error('offline'); } });
+  screen.array = 'media';
+  screen.nodeId = 'node-orion';
+  screen.openArray = (name) => { screen.array = name; };
+  screen.crumbTails = [];
+  screen.setCrumbTail = (tail) => { screen.crumbTails.push(tail); };
+  try {
+    const body = document.createElement('div');
+    document.body.appendChild(body);
+    await drawElasticDetail(screen, body);
+    await flush();
+    assert.equal(body.querySelectorAll('tf-breadcrumb, .nas-crumbs').length, 0, 'no second bar in the pane');
+    assert.deepEqual(screen.crumbTails, [[{ label: 'Pule', act: 'pools', query: 'node=node-orion&tab=pools' }, { label: 'media' }]]);
+  } finally {
+    screen.dispose();
+  }
 });

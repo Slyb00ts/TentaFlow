@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, fmtOptionalBytes, fmtBytes, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/modules/tentanas/dom-patch.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
@@ -14,7 +14,6 @@ import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-stat-card.js';
-import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-toggle.js';
@@ -1028,8 +1027,13 @@ export async function drawElasticDetail(screen, body) {
   // pane below it is `[data-part="main"]`, a keyed host that holds the error,
   // the loading line or the pane skeleton — so a failed read swaps the pane
   // out and a good one puts it back, and nothing else ever replaces it.
-  view.innerHTML = `<tf-breadcrumb class="nas-crumbs"><tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item><tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item></tf-breadcrumb><div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
-      <tf-button variant="ghost" data-act="back">${escapeHtml(T('elastic.back'))}</tf-button><tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
+  // The shell owns the one breadcrumb of the node view ("TentaNas › helios ›
+  // Pule › media", n11); this view only names its tail, exactly as the ZFS
+  // pool detail does. Set before the first read, so a failed one still has
+  // the way back.
+  screen.setCrumbTail?.(poolCrumbTail(screen.nodeId, name));
+  view.innerHTML = `<div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
+      <tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
     <div data-part="main" ${SLOT}></div>`;
   body.replaceChildren(view);
   const main = view.querySelector('[data-part="main"]');
@@ -1227,17 +1231,10 @@ export async function drawElasticDetail(screen, body) {
   view.addEventListener('click', (event) => {
     if (!isCurrent()) return;
     const target = event.target;
-    if (target.closest?.('.nas-crumbs')) {
-      if (!target.closest('a')) return;
-      event.preventDefault();
-      screen.openArray(null);
-      return;
-    }
     const el = target.closest?.('[data-act]');
     if (!el || !view.contains(el) || el.hasAttribute('disabled')) return;
     const act = el.dataset.act;
     switch (act) {
-      case 'back': screen.openArray(null); return;
       case 'refresh': refresh(); return;
       case 'jobs': screen.switchTab('jobs'); return;
       case 'disk': screen.openDisk(el.closest('[data-disk]').dataset.disk); return;

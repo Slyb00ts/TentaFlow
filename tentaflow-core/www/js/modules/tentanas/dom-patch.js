@@ -27,6 +27,21 @@ export function setAttr(el, name, value) {
   if (el.getAttribute(name) !== next) el.setAttribute(name, next);
 }
 
+/// Hands a tf-table its `rows` only when they differ from what it was last
+/// given. `rows =` is a full table render — every cell, every row-action
+/// button and any hover on them is rebuilt — so a poll that read the same
+/// thing must not assign at all. The rows are compared as JSON, which is why
+/// they must be plain data (an object kept for a row action, like pool-detail's
+/// `_prop`, is plain too).
+export function setRowsIfChanged(table, rows) {
+  if (!table) return false;
+  const sig = JSON.stringify(rows);
+  if (table.__tfRowsSig === sig) return false;
+  table.__tfRowsSig = sig;
+  table.rows = rows;
+  return true;
+}
+
 export function setText(el, text) {
   if (!el) return;
   const next = String(text);

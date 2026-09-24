@@ -414,14 +414,20 @@ async fn run_due_elastic_tasks(
             if task == store::ElasticTask::Sync {
             let repair_key = super::elastic::repair_alert_key(&array.name);
             let alerted = match &parity_fault {
-                Some(_) => store::raise_alert(
+                Some(_) => store::raise_coded_alert(
                     db,
                     &repair_key,
                     "warning",
                     "elastic-array",
                     &array.name,
-                    "Zaplanowany Sync wstrzymany: parity zgłasza błędy",
-                    "Scrub tej macierzy zgłosił błędy, których nic jeszcze nie naprawiło. Node nie uruchamia                      zaplanowanego Sync, bo usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom                      naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
+                    &store::AlertText::new(
+                        "elastic_sync_held",
+                        "Zaplanowany Sync wstrzymany: parity zgłasza błędy",
+                        "Scrub tej macierzy zgłosił błędy, których nic jeszcze nie naprawiło. Node nie uruchamia \
+                         zaplanowanego Sync, bo usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom \
+                         naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
+                    )
+                    .param("array", &array.name),
                 )
                 .map(|_| ()),
                 None => store::resolve_alert(db, &repair_key),
@@ -556,18 +562,23 @@ async fn run_automatic_movers(
         // once, and the alert goes when a run succeeds.
         let settle_key = super::elastic::settle_alert_key(&array.name);
         let settle_recorded = if array.mover_settles_unresolved && array.mover_failed_runs >= super::elastic::SETTLE_ATTEMPTS {
-            store::raise_alert(
+            store::raise_coded_alert(
                 db,
                 &settle_key,
                 "warning",
                 "elastic-array",
                 &array.name,
-                "Automatyczne dokończenie przenoszenia wstrzymane",
-                &format!(
-                    "{} kolejnych przebiegów przenoszenia zakończyło się niepowodzeniem, więc node nie uruchamia \
-                     następnych sam. Sprawdź przyczynę w historii przenoszenia i uruchom przenoszenie ręcznie.",
-                    array.mover_failed_runs
-                ),
+                &store::AlertText::new(
+                    "elastic_mover_settle_stopped",
+                    "Automatyczne dokończenie przenoszenia wstrzymane",
+                    format!(
+                        "{} kolejnych przebiegów przenoszenia zakończyło się niepowodzeniem, więc node nie uruchamia \
+                         następnych sam. Sprawdź przyczynę w historii przenoszenia i uruchom przenoszenie ręcznie.",
+                        array.mover_failed_runs
+                    ),
+                )
+                .param("array", &array.name)
+                .param("runs", array.mover_failed_runs),
             )
             .map(|_| ())
         } else {
@@ -642,16 +653,9 @@ async fn run_automatic_movers(
         if let Some(age) = observed.cache_age.as_ref() {
             let key = super::elastic::protection_alert_key(&array.name);
             let recorded = match super::elastic::cache_stuck_verdict(array, age, run_started) {
-                CacheStuckVerdict::Raise { title, detail } => store::raise_alert(
-                    db,
-                    &key,
-                    "warning",
-                    "elastic-array",
-                    &array.name,
-                    &title,
-                    &detail,
-                )
-                .map(|_| ()),
+                CacheStuckVerdict::Raise(text) => {
+                    store::raise_coded_alert(db, &key, "warning", "elastic-array", &array.name, &text).map(|_| ())
+                }
                 CacheStuckVerdict::Clear => store::resolve_alert(db, &key),
                 CacheStuckVerdict::Keep => Ok(()),
             };
@@ -1228,6 +1232,8 @@ mod tests {
         assert_eq!(alert.severity, "warning");
         assert_eq!(alert.subject_kind, "elastic-array");
         assert!(alert.detail.contains("naprawę"), "{}", alert.detail);
+        assert_eq!(alert.code, "elastic_sync_held", "worded by the screen, not by this text");
+        assert_eq!(alert.params.get("array").map(String::as_str), Some("media"));
 
         // THE SCRUB SLOT STILL RUNS: a full scrub writes no parity, and it is
         // how the array gets re-measured after a repair.
@@ -1768,6 +1774,8 @@ mod tests {
         assert_eq!(open[0].severity, "warning");
         assert!(open[0].detail.contains("otwarte"), "{}", open[0].detail);
         assert!(open[0].resolved_at.is_none());
+        assert_eq!(open[0].code, "elastic_cache_stuck");
+        assert_eq!(open[0].params.get("cause").map(String::as_str), Some("files_busy"));
 
         let drained = Canned::new(90, waiting(0, 0, 120));
         run_automatic_movers(&p, &arrays, &MoverClock::new(), &drained).await;
@@ -2059,6 +2067,12 @@ mod tests {
             stuck_alerts(&p, "media").iter().any(|alert| alert.title.contains("wstrzymane")),
             "the admin is told"
         );
+        let settle = stuck_alerts(&p, "media")
+            .into_iter()
+            .find(|alert| alert.code == "elastic_mover_settle_stopped")
+            .expect("the settle alert is coded");
+        let runs: u32 = settle.params.get("runs").and_then(|r| r.parse().ok()).expect("runs is a number");
+        assert!(runs >= crate::tentanas::elastic::SETTLE_ATTEMPTS, "{runs}");
         // W3: a busy refusal after the failed run is not an operation that
         // settled anything, and it must not switch the settling off.
         let p = db();
