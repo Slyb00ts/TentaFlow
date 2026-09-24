@@ -390,6 +390,9 @@ impl TransportRegistry {
 /// bypass), after a pre-Hello environment gate mirroring the mesh's own
 /// trust-check gate.
 struct DuplexTransport {
+    /// The dialing node's own id — what the accepting side sees as the
+    /// stream's authenticated peer, as iroh reports the remote endpoint id.
+    local_node_id: String,
     local_env: NodeEnvironment,
     registry: Arc<TransportRegistry>,
 }
@@ -416,13 +419,10 @@ impl Transport for DuplexTransport {
         let (a, b) = tokio::io::duplex(4 * 1024 * 1024);
         let (our_r, our_w) = split(a);
         let (their_r, their_w) = split(b);
+        let peer = self.local_node_id.clone();
         tokio::spawn(async move {
             manager
-                .accept_stream(
-                    "test-peer".to_string(),
-                    Box::new(their_r),
-                    Box::new(their_w),
-                )
+                .accept_stream(peer, Box::new(their_r), Box::new(their_w))
                 .await;
         });
         Ok((Box::new(our_r), Box::new(our_w)))
@@ -499,6 +499,7 @@ fn build_node(
 
     let provider: Arc<dyn PartitionProvider> = Arc::clone(&svc) as Arc<dyn PartitionProvider>;
     let transport: Arc<dyn Transport> = Arc::new(DuplexTransport {
+        local_node_id: id.to_string(),
         local_env: env,
         registry: Arc::clone(&registry),
     });
@@ -966,19 +967,40 @@ async fn publish_refuses_with_not_enough_replicas_once_both_followers_are_down()
         updated_at_ms: 0,
     });
 
+    // The epoch-2 row keeps A as leader, so A re-stamps its entry in place
+    // and swaps leader handles: `apply_assignment` stops the epoch-1 handle
+    // (the stop flushes partition meta on the engine's writer thread) and
+    // only then attaches the epoch-2 one. In between, the entry already
+    // reads `Leader { epoch: 2 }` with the new static ISR `{A}` — which is
+    // what `snapshot` falls back to without a handle — while `preflight`
+    // refuses every publish, because nothing could replicate or count acks
+    // for it, and `BusService` reports that as `NotLeader { None, 2 }`. So
+    // neither the role nor the snapshot tells this test the swap is over;
+    // only a publish does. A `NotLeader` naming no leader at A's own new
+    // epoch is that bounded swap and is retried; anything else, or the
+    // swap outlasting the deadline, fails. Measured: 0-26 ms over 20 runs.
     assert!(
         wait_until(Duration::from_secs(5), || {
-            let snap = a.manager.snapshot(ORG, Some(TOPIC));
-            snap.partitions
-                .first()
-                .map(|p| p.isr.len() < 2)
-                .unwrap_or(false)
+            a.manager.role(ORG, TOPIC, 0) == PartitionRole::Leader { epoch: 2 }
         })
         .await,
         "leader never materialized the reassigned (under-replicated) assignment"
     );
-
-    let err = publish_text(a, Some(0), "no-quorum").await.unwrap_err();
+    let swap_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let err = loop {
+        let err = publish_text(a, Some(0), "no-quorum").await.unwrap_err();
+        let mid_swap = matches!(
+            err,
+            BusServiceError::NotLeader {
+                leader_node_id: None,
+                leader_epoch: 2
+            }
+        );
+        if !mid_swap || tokio::time::Instant::now() >= swap_deadline {
+            break err;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert!(
         matches!(err, BusServiceError::NotEnoughReplicas { .. }),
         "expected NotEnoughReplicas, got {err:?}"
@@ -1008,6 +1030,7 @@ async fn z12_environment_mismatch_is_rejected_by_the_transport_gate_and_by_hello
     );
 
     let transport = DuplexTransport {
+        local_node_id: "PROD".to_string(),
         local_env: NodeEnvironment::Prod,
         registry: Arc::clone(&registry),
     };
@@ -2042,8 +2065,10 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         let (client, server) = tokio::io::duplex(16 * 1024);
         let (mut client_recv, mut client_send) = split(client);
         let (server_recv, server_send) = split(server);
+        // A leader dials its followers itself, so the stream's peer is the
+        // leader the Hello names.
         tokio::spawn(router::route_stream(
-            "peer".to_string(),
+            hello.leader_node_id.clone(),
             Box::new(server_recv),
             Box::new(server_send),
         ));

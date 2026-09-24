@@ -42,19 +42,20 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use parking_lot::{Condvar, Mutex};
 use tentaflow_bus::{BusError, Partition, PartitionReader};
 use tentaflow_protocol::environment::NodeEnvironment;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{broadcast, mpsc, watch, Notify};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 
 use super::frames::{
-    read_frame, write_frame, ReplAck, ReplBatchHeader, ReplCodecError, ReplFrame, ReplHeartbeat,
+    write_frame, FrameReader, ReplAck, ReplBatchHeader, ReplCodecError, ReplFrame, ReplHeartbeat,
     ReplHello, ReplOffsets, ReplProducerMark, ReplReject, ReplTruncate,
 };
 use super::metrics::LeaderMetrics;
@@ -66,17 +67,17 @@ use crate::bus::AckOutcome;
 /// test wanting faster cadences constructs its own value instead of
 /// mutating shared constants (same pattern `follower.rs`'s
 /// `FollowerConfig` uses).
-/// Diagnostic hook invoked synchronously from `reconcile_follower` whenever
-/// it emits an `IsrEvent` (TentaBus 1C, OTWARTE-POZYCJE.md
+/// Diagnostic hook invoked synchronously for every `IsrEvent` — lag-driven
+/// shrink/expand from `reconcile_follower`, stream attach/detach from
+/// `register_follower`/`remove_follower` (TentaBus 1C, OTWARTE-POZYCJE.md
 /// `P7-pipeline-flake-open`, added 2026-09-22): before this, no ISR
 /// shrink/expand instrumentation existed anywhere reachable from a bench or
 /// test, which is exactly why the leading hypothesis for `bus_replication`'s
 /// P7 flake — a spurious ISR eviction under scheduler contention on a
 /// shared host — had never been investigated. `LeaderConfig::isr_event_hook`
-/// defaulting to `None` costs nothing beyond one branch per
-/// `reconcile_follower` call; a caller (e.g. `benches/bus_replication.rs`'s
-/// `gate_p7`) installs one to `eprintln!` every transition with its reason
-/// during a measurement window.
+/// defaulting to `None` costs nothing beyond one branch per event; a caller
+/// (e.g. `benches/bus_replication.rs`'s `gate_p7`) installs one to
+/// `eprintln!` every transition with its reason during a measurement window.
 pub type IsrEventHook = Arc<dyn Fn(&IsrEvent) + Send + Sync>;
 
 #[derive(Clone)]
@@ -170,6 +171,25 @@ pub enum IsrEvent {
         node_id: String,
         isr_size: u32,
     },
+    /// A follower's replication stream completed its handshake and the
+    /// follower was (re-)admitted, in the ISR (`register_follower`).
+    Attached {
+        node_id: String,
+        isr_size: u32,
+    },
+    /// A follower's replication stream ended and the follower was dropped
+    /// from this leader's bookkeeping until the supervisor reconnects it
+    /// (`remove_follower`). Distinct from `Shrink`: the replica did not fall
+    /// behind, its stream is gone — `reason` is the stream's end cause. A
+    /// replica that leaves this way contributes nothing to `acks` either,
+    /// so without this event a quorum wait failing with `acked=1` and NO
+    /// `Shrink` was indistinguishable from a healthy ISR.
+    Detached {
+        node_id: String,
+        reason: String,
+        isr_size: u32,
+        min_isr: u32,
+    },
 }
 
 /// K-M2-5 note fed through `PartitionLeader::note_offset_commit`/
@@ -209,29 +229,66 @@ fn compute_min_isr(replica_count: usize) -> u32 {
 }
 
 /// Wakes every pending `await_acks` call whenever any follower's
-/// acknowledged offset or ISR membership changes. A single shared
-/// `tokio::sync::Notify` — rather than literal per-offset waiter lists —
-/// is enough: every `await_acks` call recomputes its own readiness
-/// condition fresh on each wakeup, so any state change that could
-/// possibly satisfy ANY pending waiter always fires this, and a spurious
-/// wakeup only costs one cheap recheck over a handful of followers.
+/// acknowledged offset or ISR membership changes. One shared generation
+/// counter + condvar rather than per-offset waiter lists: every waiter
+/// recomputes its own readiness on each wakeup, so any change that could
+/// satisfy ANY waiter bumps it, and a spurious wakeup costs one cheap
+/// recheck over a handful of followers.
+///
+/// A waiter samples `generation` BEFORE checking readiness and sleeps only
+/// while it is still that value, so an ack landing between the check and
+/// the sleep is never lost (a bare `notify_waiters` stores no permit and
+/// would leave that waiter asleep until some later, unrelated change).
+/// Blocking on a condvar, not a tokio primitive, because the only caller is
+/// `ReplicationCoordinator::await_acks` — a synchronous trait method on the
+/// publish path (see `GlueLeaderHandle::await_acks`).
 struct AckWaiters {
-    notify: Notify,
+    generation: Mutex<u64>,
+    changed: Condvar,
+    closed: AtomicBool,
 }
 
 impl AckWaiters {
     fn new() -> Self {
         Self {
-            notify: Notify::new(),
+            generation: Mutex::new(0),
+            changed: Condvar::new(),
+            closed: AtomicBool::new(false),
         }
     }
 
-    fn notify_all(&self) {
-        self.notify.notify_waiters();
+    fn generation(&self) -> u64 {
+        *self.generation.lock()
     }
 
-    async fn wait(&self) {
-        self.notify.notified().await;
+    fn notify_all(&self) {
+        *self.generation.lock() += 1;
+        self.changed.notify_all();
+    }
+
+    /// Ends every current and future wait immediately: nothing will ever
+    /// ack through a leader whose streams were stopped.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Sleeps until `generation` moves past `seen` or `deadline` passes.
+    fn wait_for_change(&self, seen: u64, deadline: std::time::Instant) {
+        let mut generation = self.generation.lock();
+        while *generation == seen {
+            if self
+                .changed
+                .wait_until(&mut generation, deadline)
+                .timed_out()
+            {
+                return;
+            }
+        }
     }
 }
 
@@ -431,10 +488,11 @@ impl PartitionLeader {
     /// truncated a too-far-ahead `initial_leo` down to the authority offset,
     /// and the clamp here covers the remaining callers/tests.
     pub fn register_follower(&self, node_id: impl Into<String>, initial_leo: u64, initial_hw: u64) {
+        let node_id = node_id.into();
         let own_leo = self.partition.log_end_offset();
         let own_hw = self.partition.high_watermark();
         self.followers.insert(
-            node_id.into(),
+            node_id.clone(),
             FollowerState {
                 leo: initial_leo.min(own_leo),
                 hw: initial_hw.min(own_hw),
@@ -443,15 +501,35 @@ impl PartitionLeader {
                 lag_bytes: 0,
             },
         );
-        self.metrics.record_isr_size(self.isr_size());
+        let isr_size = self.isr_size();
+        self.metrics.record_isr_size(isr_size);
+        self.emit(IsrEvent::Attached { node_id, isr_size });
         self.recompute_hw();
     }
 
-    pub fn remove_follower(&self, node_id: &str) {
+    /// Drops `node_id` from this leader's bookkeeping because its stream
+    /// ended; `reason` is that end cause, carried on `IsrEvent::Detached`.
+    pub fn remove_follower(&self, node_id: &str, reason: &str) {
         if self.followers.remove(node_id).is_some() {
-            self.metrics.record_isr_size(self.isr_size());
+            let isr_size = self.isr_size();
+            self.metrics.record_isr_size(isr_size);
+            self.emit(IsrEvent::Detached {
+                node_id: node_id.to_string(),
+                reason: reason.to_string(),
+                isr_size,
+                min_isr: self.min_isr,
+            });
             self.recompute_hw();
         }
+    }
+
+    /// Delivers one membership event to the diagnostic hook and to every
+    /// `subscribe_events` receiver.
+    fn emit(&self, event: IsrEvent) {
+        if let Some(hook) = &self.config.isr_event_hook {
+            hook(&event);
+        }
+        let _ = self.events_tx.send(event);
     }
 
     /// Applies one `Ack` frame's contents plus the feeder's freshly
@@ -532,16 +610,12 @@ impl PartitionLeader {
             let isr_size = self.isr_size();
             self.metrics.record_isr_shrink();
             self.metrics.record_isr_size(isr_size);
-            let event = IsrEvent::Shrink {
+            self.emit(IsrEvent::Shrink {
                 node_id: node_id.to_string(),
                 reason,
                 isr_size,
                 min_isr: self.min_isr,
-            };
-            if let Some(hook) = &self.config.isr_event_hook {
-                hook(&event);
-            }
-            let _ = self.events_tx.send(event);
+            });
             self.recompute_hw();
         } else if !snapshot.in_isr && !lag_too_high && !ack_stale {
             if let Some(mut fs) = self.followers.get_mut(node_id) {
@@ -549,14 +623,10 @@ impl PartitionLeader {
             }
             let isr_size = self.isr_size();
             self.metrics.record_isr_size(isr_size);
-            let event = IsrEvent::Expand {
+            self.emit(IsrEvent::Expand {
                 node_id: node_id.to_string(),
                 isr_size,
-            };
-            if let Some(hook) = &self.config.isr_event_hook {
-                hook(&event);
-            }
-            let _ = self.events_tx.send(event);
+            });
             self.recompute_hw();
         } else {
             self.metrics.record_isr_size(self.isr_size());
@@ -674,59 +744,45 @@ impl PartitionLeader {
         self.hw_tx.subscribe()
     }
 
-    /// Blocks (up to `timeout`) until at least `required_for(acks)`
-    /// in-ISR replicas have reached `next_offset`, or the timeout elapses
-    /// — whichever comes first. `AckOutcome::hw` is always the engine's
-    /// actual (topic-`acks`-paced) watermark, which may differ from
-    /// `next_offset`'s own `acks`-level commit point if the caller passed
-    /// a different `acks` than this partition's configured one (see
-    /// `PartitionLeader::new`'s doc).
-    pub async fn await_acks(&self, next_offset: u64, acks: Acks, timeout: Duration) -> AckOutcome {
-        let started = Instant::now();
-        let deadline = started + timeout;
-        loop {
-            let leos = self.isr_leos();
-            let required = self.required_for(acks, leos.len());
-            if let Some(outcome) = self.ack_outcome_if_ready(next_offset, required, started) {
-                return outcome;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                self.metrics.record_ack_wait(started.elapsed());
-                return self.ack_outcome_now(next_offset, required);
-            }
-            let _ = tokio::time::timeout(remaining, self.ack_waiters.wait()).await;
-        }
-    }
-
-    /// `await_acks`'s twin for a caller that has already computed its own
-    /// `required` count from an ack POLICY (`manager.rs`'s
-    /// `ReplicationCoordinator::await_acks`, which turns `Acks` into a raw
-    /// count before calling `LeaderHandle::await_acks` — PLAN-M2 §1e's
-    /// trait takes `required: u32`, not `Acks`, since the manager may be
-    /// asked to honor a caller-specified ack level that differs from this
-    /// partition's own configured one). Bypasses `required_for` entirely:
-    /// `required` is used exactly as given, on every loop iteration, rather
-    /// than recomputed from `acks`/`isr_leos().len()` each time.
-    pub async fn await_acks_required(
+    /// Blocks the calling thread (up to `timeout`) until at least
+    /// `required` in-ISR replicas have reached `next_offset`, the timeout
+    /// elapses, or `close_ack_waiters` ends the wait — whichever comes
+    /// first. `required` is used exactly as given: the caller
+    /// (`manager.rs`'s `ReplicationCoordinator::await_acks`) turns an ack
+    /// POLICY into a count itself, since it may honor a level other than
+    /// this partition's configured one. `AckOutcome::hw` is always the
+    /// engine's actual (topic-`acks`-paced) watermark.
+    ///
+    /// Must not run on a thread the acks themselves need: they are recorded
+    /// by this partition's `run_follower_stream` tasks, so a caller on a
+    /// Tokio worker hands that worker off first (`BusService::
+    /// publish_async`'s `block_in_place`).
+    pub fn await_acks_blocking(
         &self,
         next_offset: u64,
         required: u32,
         timeout: Duration,
     ) -> AckOutcome {
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let deadline = started + timeout;
         loop {
+            let seen = self.ack_waiters.generation();
             if let Some(outcome) = self.ack_outcome_if_ready(next_offset, required, started) {
                 return outcome;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if self.ack_waiters.is_closed() || std::time::Instant::now() >= deadline {
                 self.metrics.record_ack_wait(started.elapsed());
                 return self.ack_outcome_now(next_offset, required);
             }
-            let _ = tokio::time::timeout(remaining, self.ack_waiters.wait()).await;
+            self.ack_waiters.wait_for_change(seen, deadline);
         }
+    }
+
+    /// Fails every pending and future `await_acks_blocking` right away with
+    /// the acks gathered so far — called when this leader's streams are
+    /// stopped, after which no ack can ever arrive through it.
+    pub fn close_ack_waiters(&self) {
+        self.ack_waiters.close();
     }
 
     fn ack_outcome_now(&self, next_offset: u64, required: u32) -> AckOutcome {
@@ -745,7 +801,7 @@ impl PartitionLeader {
         &self,
         next_offset: u64,
         required: u32,
-        started: Instant,
+        started: std::time::Instant,
     ) -> Option<AckOutcome> {
         let leos = self.isr_leos();
         let offset = Self::nth_largest(&leos, required);
@@ -938,7 +994,7 @@ async fn feed<W: AsyncWrite + Unpin>(
 pub async fn run_follower_stream<R, W>(
     leader: Arc<PartitionLeader>,
     follower_node_id: String,
-    mut reader: R,
+    reader: R,
     mut writer: W,
     producer_mark: Option<ProducerMarkLookup>,
     mut truncate_rx: mpsc::UnboundedReceiver<u64>,
@@ -969,7 +1025,11 @@ where
     };
     write_frame(&mut writer, &ReplFrame::Hello(hello)).await?;
 
-    let ack = match read_frame(&mut reader).await? {
+    // One buffered reader for the stream's whole life: the ack intake below
+    // sits in a `select!`, so its read must survive cancellation (see
+    // `FrameReader`'s doc).
+    let mut frames = FrameReader::new(reader);
+    let ack = match frames.next_frame().await? {
         ReplFrame::HelloAck(a) => a,
         other => {
             return Err(FollowerStreamError::UnexpectedFrame {
@@ -1028,8 +1088,12 @@ where
     let mut last_frame_sent_at = Instant::now();
     let mut truncate_open = true;
 
-    let mut heartbeat_ticker = tokio::time::interval(leader.config().heartbeat_interval);
-    heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let heartbeat_interval = leader.config().heartbeat_interval;
+    // ISR thresholds are re-checked on the heartbeat cadence even while
+    // frames flow; the heartbeat itself is scheduled from the last frame
+    // sent (below), not from this ticker.
+    let mut isr_check_ticker = tokio::time::interval(heartbeat_interval);
+    isr_check_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut offsets_ticker = tokio::time::interval(leader.config().offsets_coalesce_interval);
     offsets_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1051,12 +1115,14 @@ where
     loop {
         // Deliberately NOT `biased`: `heartbeat_interval` and
         // `offsets_coalesce_interval` default to the same duration
-        // (PLAN-M2 §1b, both 500 ms), so both tickers become ready at
+        // (PLAN-M2 §1b, both 500 ms), so the timer arms become ready at
         // nearly the same wall-clock moment on every cycle. A `biased`
         // select checks arms top-to-bottom and would let the heartbeat
         // arm systematically win that race every time, starving
         // `ReplOffsets` forever whenever the two intervals coincide.
-        // Unbiased `select!` picks fairly among whichever arms are ready.
+        // Unbiased `select!` picks fairly among whichever arms are ready —
+        // which is exactly why the ack read below must be cancel-safe.
+        let heartbeat_due = last_frame_sent_at + heartbeat_interval;
         tokio::select! {
             changed = leo_rx.changed() => {
                 if changed.is_err() {
@@ -1086,7 +1152,7 @@ where
                 }
             }
 
-            frame = read_frame(&mut reader) => {
+            frame = frames.next_frame() => {
                 match frame? {
                     ReplFrame::Ack(a) => {
                         let lag = inflight.ack(a.follower_leo);
@@ -1136,16 +1202,21 @@ where
                 }
             }
 
-            _ = heartbeat_ticker.tick() => {
+            _ = isr_check_ticker.tick() => {
                 leader.reconcile_follower(&follower_node_id);
-                if last_frame_sent_at.elapsed() >= leader.config().heartbeat_interval {
-                    write_frame(&mut writer, &ReplFrame::Heartbeat(ReplHeartbeat {
-                        leader_epoch: leader.epoch(),
-                        hw: leader.high_watermark(),
-                        leader_leo: leader.log_end_offset(),
-                    })).await?;
-                    last_frame_sent_at = Instant::now();
-                }
+            }
+
+            // PLAN-M2 §1b "co 500 ms w ciszy": due exactly `heartbeat_interval`
+            // after the last frame of any kind. A fixed ticker that skipped a
+            // tick whenever a frame had gone out less than one interval ago
+            // stretched real silences to almost two intervals.
+            _ = tokio::time::sleep_until(heartbeat_due) => {
+                write_frame(&mut writer, &ReplFrame::Heartbeat(ReplHeartbeat {
+                    leader_epoch: leader.epoch(),
+                    hw: leader.high_watermark(),
+                    leader_leo: leader.log_end_offset(),
+                })).await?;
+                last_frame_sent_at = Instant::now();
             }
 
             _ = offsets_ticker.tick() => {
@@ -1170,7 +1241,9 @@ mod tests {
     use bytes::Bytes;
     use tentaflow_bus::{BatchBuilder, Durability, HwTracking, RecordInput, RollPolicy};
 
-    use super::super::frames::ReplHelloAck;
+    use tokio::io::AsyncWriteExt;
+
+    use super::super::frames::{read_frame, ReplHelloAck};
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1654,17 +1727,17 @@ mod tests {
 
     // ===== await_acks =====
 
-    #[tokio::test]
-    async fn await_acks_resolves_once_enough_followers_ack() {
+    #[test]
+    fn await_acks_resolves_once_enough_followers_ack() {
         let part = temp_partition("await-resolve");
-        part.append_batch_async(one_record_batch(1)).await.unwrap();
+        part.append_batch(one_record_batch(1)).unwrap();
         let leader = make_leader(part, &["leader", "f1", "f2"], Acks::Quorum, fast_config());
         leader.register_follower("f1", 0, 0);
         leader.register_follower("f2", 0, 0);
 
         let leader2 = leader.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        let acker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
             leader2.record_ack(
                 "f1",
                 &ReplAck {
@@ -1676,25 +1749,22 @@ mod tests {
             );
         });
 
-        let outcome = leader
-            .await_acks(1, Acks::Quorum, Duration::from_secs(2))
-            .await;
+        let outcome = leader.await_acks_blocking(1, leader.min_isr(), Duration::from_secs(2));
+        acker.join().unwrap();
         assert_eq!(outcome.hw, 1);
         assert_eq!(outcome.required, 2);
         assert!(outcome.acked_nodes >= 2);
     }
 
-    #[tokio::test]
-    async fn await_acks_times_out_when_not_enough_replicas_ack() {
+    #[test]
+    fn await_acks_times_out_when_not_enough_replicas_ack() {
         let part = temp_partition("await-timeout");
-        part.append_batch_async(one_record_batch(1)).await.unwrap();
+        part.append_batch(one_record_batch(1)).unwrap();
         let leader = make_leader(part, &["leader", "f1", "f2"], Acks::Quorum, fast_config());
         leader.register_follower("f1", 0, 0);
         leader.register_follower("f2", 0, 0);
 
-        let outcome = leader
-            .await_acks(1, Acks::Quorum, Duration::from_millis(50))
-            .await;
+        let outcome = leader.await_acks_blocking(1, leader.min_isr(), Duration::from_millis(50));
         // NOT asserting `outcome.hw == 0` here: `hw` is always the
         // engine's actual `high_watermark()`, and this build's engine
         // still auto-advances that to `log_end_offset` on every local
@@ -1707,6 +1777,82 @@ mod tests {
             outcome.acked_nodes, 1,
             "only the leader itself has reached offset 1"
         );
+        assert!(outcome.acked_nodes < outcome.required);
+    }
+
+    /// The wait samples the change generation BEFORE its readiness check,
+    /// so an ack that lands in the gap between that check and the sleep
+    /// still wakes it. Many rounds of "ack from another thread while the
+    /// waiter is entering the wait": with a permit-less wakeup a lost race
+    /// shows up as a round that sits out its whole 5 s timeout.
+    #[test]
+    fn await_acks_never_misses_an_ack_racing_the_wait() {
+        let part = temp_partition("await-race");
+        let leader = make_leader(part, &["leader", "f1", "f2"], Acks::Quorum, fast_config());
+        leader.register_follower("f1", 0, 0);
+        leader.register_follower("f2", 0, 0);
+        for round in 1..=200u64 {
+            leader.partition.append_batch(one_record_batch(1)).unwrap();
+            let leader2 = leader.clone();
+            let acker = std::thread::spawn(move || {
+                leader2.record_ack(
+                    "f1",
+                    &ReplAck {
+                        leader_epoch: TEST_EPOCH,
+                        follower_leo: round,
+                        follower_hw: 0,
+                    },
+                    0,
+                );
+            });
+            let started = std::time::Instant::now();
+            let outcome =
+                leader.await_acks_blocking(round, leader.min_isr(), Duration::from_secs(5));
+            acker.join().unwrap();
+            assert!(outcome.acked_nodes >= 2, "round {round}: {outcome:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "round {round}: the ack was missed and the wait ran to its timeout"
+            );
+        }
+    }
+
+    /// The lost-wakeup window itself, forced: the change lands after the
+    /// waiter sampled the generation and checked readiness, but before it
+    /// went to sleep. A permit-less notify (the old `notify_waiters` shape)
+    /// would sleep through it to the deadline; the generation must end the
+    /// wait at once.
+    #[test]
+    fn a_change_between_the_readiness_check_and_the_sleep_is_not_lost() {
+        let waiters = AckWaiters::new();
+        let seen = waiters.generation();
+        // ... readiness checked here and found wanting ...
+        waiters.notify_all();
+        let started = std::time::Instant::now();
+        waiters.wait_for_change(seen, started + Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the wait slept through a change that landed before it began"
+        );
+    }
+
+    #[test]
+    fn closing_ack_waiters_ends_a_pending_wait_without_the_quorum() {
+        let part = temp_partition("await-close");
+        part.append_batch(one_record_batch(1)).unwrap();
+        let leader = make_leader(part, &["leader", "f1", "f2"], Acks::Quorum, fast_config());
+        leader.register_follower("f1", 0, 0);
+        leader.register_follower("f2", 0, 0);
+        let leader2 = leader.clone();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            leader2.close_ack_waiters();
+        });
+        let started = std::time::Instant::now();
+        let outcome = leader.await_acks_blocking(1, leader.min_isr(), Duration::from_secs(10));
+        closer.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(outcome.acked_nodes, 1);
         assert!(outcome.acked_nodes < outcome.required);
     }
 
@@ -1758,15 +1904,18 @@ mod tests {
         assert!(!fs.in_isr);
     }
 
-    /// `LeaderConfig::isr_event_hook` must observe BOTH transitions, with
-    /// the shrink's real reason. This is the mechanism `benches/
+    /// `LeaderConfig::isr_event_hook` must observe every membership
+    /// transition — stream attach/detach as well as lag-driven
+    /// shrink/expand — with the real reason. This is the mechanism `benches/
     /// bus_replication.rs`'s `gate_p7` installs to make an ISR eviction
     /// visible during a measurement window (TentaBus 1C
     /// `P7-pipeline-flake-open`) — without this test, "the hook logged
     /// nothing" could equally mean "no shrink happened" or "the hook never
-    /// fires", and those two readings point at opposite root causes.
+    /// fires", and those two readings point at opposite root causes. The
+    /// detach case is the one the 2026-09-22 P7 run could not see: a torn
+    /// down stream used to leave the ISR with no event at all.
     #[test]
-    fn isr_event_hook_observes_both_shrink_and_expand() {
+    fn isr_event_hook_observes_every_membership_transition() {
         let seen: Arc<std::sync::Mutex<Vec<IsrEvent>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
@@ -1777,10 +1926,7 @@ mod tests {
 
         let part = temp_partition("isr-hook");
         let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, config);
-        // `register_follower` admits a follower to the ISR directly (no
-        // event), so the hook must be silent until a real transition.
         leader.register_follower("f1", 0, 0);
-        assert!(seen.lock().unwrap().is_empty());
 
         leader.set_follower_lag_bytes("f1", 65 * 1024 * 1024);
         leader.record_ack(
@@ -1792,29 +1938,46 @@ mod tests {
             },
             0, // caught up again
         );
+        leader.remove_follower("f1", "codec error: unknown frame kind");
+        // Removing an already-removed follower is not a second transition.
+        leader.remove_follower("f1", "again");
 
         let events = seen.lock().unwrap();
         assert_eq!(
             events.len(),
-            2,
-            "expected one shrink + one expand: {events:?}"
+            4,
+            "expected attach, shrink, expand, detach: {events:?}"
+        );
+        assert!(
+            matches!(&events[0], IsrEvent::Attached { node_id, isr_size: 2 } if node_id == "f1"),
+            "first event must be the attach: {:?}",
+            events[0]
         );
         assert!(
             matches!(
-                &events[0],
+                &events[1],
                 IsrEvent::Shrink {
                     node_id,
                     reason: IsrShrinkReason::LagBytes { .. },
                     ..
                 } if node_id == "f1"
             ),
-            "first event must be the lag-bytes shrink: {:?}",
-            events[0]
+            "second event must be the lag-bytes shrink: {:?}",
+            events[1]
         );
         assert!(
-            matches!(&events[1], IsrEvent::Expand { node_id, .. } if node_id == "f1"),
-            "second event must be the expand: {:?}",
-            events[1]
+            matches!(&events[2], IsrEvent::Expand { node_id, .. } if node_id == "f1"),
+            "third event must be the expand: {:?}",
+            events[2]
+        );
+        assert!(
+            matches!(
+                &events[3],
+                IsrEvent::Detached { node_id, reason, isr_size: 1, min_isr: 2 }
+                    if node_id == "f1" && reason.contains("unknown frame kind")
+            ),
+            "fourth event must be the detach with its cause: {:?}",
+            events[3]
         );
     }
 
@@ -1916,6 +2079,81 @@ mod tests {
         drop(foll_r);
         drop(foll_w);
         let _ = handle.await;
+    }
+
+    /// ANALIZA-REPLIKACJA §3.3 H1, reproduced over the in-memory duplex: an
+    /// `Ack` whose bytes arrive in two parts, with heartbeats (30 ms here)
+    /// firing while only the first part is in. The unbiased `select!` drops
+    /// the read future each time another arm wins; with a read that keeps
+    /// its partial frame inside the future the ack was lost and the stream
+    /// desynchronized. The ack must land and the stream must stay up.
+    #[tokio::test]
+    async fn an_ack_split_across_heartbeats_is_not_lost() {
+        let part = temp_partition("split-ack");
+        part.append_batch_async(one_record_batch(1)).await.unwrap();
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, fast_config());
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+        });
+
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo: 0,
+                follower_hw: 0,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+            }),
+        )
+        .await
+        .unwrap();
+        // Keep draining the leader's side (the batch, then heartbeats) so
+        // its writes never back up behind this test.
+        let drain = tokio::spawn(async move { while read_frame(&mut foll_r).await.is_ok() {} });
+
+        let mut ack = Vec::new();
+        write_frame(
+            &mut ack,
+            &ReplFrame::Ack(ReplAck {
+                leader_epoch: TEST_EPOCH,
+                follower_leo: 1,
+                follower_hw: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        foll_w.write_all(&ack[..3]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        foll_w.write_all(&ack[3..]).await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if handle.is_finished() {
+                panic!(
+                    "the stream ended instead of reading the split ack: {:?}",
+                    handle.await
+                );
+            }
+            if leader.follower_state("f1").map(|f| f.leo) == Some(1) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the split ack never reached the leader's bookkeeping"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // `drain` holds the other half of the split stream, so dropping
+        // `foll_w` alone would never close it; stop both tasks outright.
+        drain.abort();
+        handle.abort();
     }
 
     #[tokio::test]

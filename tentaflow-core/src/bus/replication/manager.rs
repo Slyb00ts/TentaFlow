@@ -136,6 +136,33 @@ pub const ASSIGNMENT_AWAIT: Duration = Duration::from_millis(2_000);
 /// exists for).
 const ASSIGNMENT_AWAIT_RETRY: Duration = Duration::from_millis(100);
 
+/// One quorum wait's view of the leader handle it waits on, captured with
+/// it so `successor_leader` can tell whether a rebuilt handle continues the
+/// same log.
+struct AckWait {
+    handle: Arc<dyn LeaderHandle>,
+    epoch: u32,
+    leadership: u64,
+    truncations: u64,
+    required: u32,
+}
+
+/// The replica count `acks` asks for under `assignment` — recomputed for
+/// every handle a wait moves onto, since a rebuild may have changed the
+/// replica set.
+fn required_acks(acks: Acks, assignment: &PartitionAssignment) -> u32 {
+    match acks {
+        Acks::Leader => 1,
+        Acks::Quorum => election::min_isr_required(assignment.replicas.len()) as u32,
+        Acks::All => assignment.isr.len().max(1) as u32,
+    }
+}
+
+/// `successor_leader`'s re-read tick while a same-node rebuild is between
+/// stopping the old leader handle and attaching the new one (the old
+/// handle's `stop()` flushes partition meta, measured at 124-302 ms).
+const SUCCESSOR_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -229,6 +256,9 @@ pub trait LeaderHandle: Send + Sync {
     }
     fn high_watermark(&self) -> u64;
     fn log_end_offset(&self) -> u64;
+    /// How many truncations have discarded records from the local log this
+    /// handle leads (`tentaflow_bus::Partition::truncation_count`).
+    fn truncation_count(&self) -> u64;
     /// Blocks (up to `timeout`) until `next_offset` is acknowledged by
     /// `required` replicas (this node included).
     fn await_acks(&self, next_offset: u64, required: u32, timeout: Duration) -> AckOutcome;
@@ -371,10 +401,49 @@ pub trait ReplAudit: Send + Sync {
 struct PartitionEntry {
     assignment: PartitionAssignment,
     role: LocalRole,
-    leader: Option<Box<dyn LeaderHandle>>,
+    /// `Arc`, not `Box`: `await_acks` clones the handle out of the registry
+    /// and blocks on the clone, so no DashMap shard guard is held for a
+    /// publish's whole quorum wait (see `ReplicationCoordinator::await_acks`
+    /// below).
+    leader: Option<Arc<dyn LeaderHandle>>,
     follower: Option<Box<dyn FollowerRunner>>,
     promotion: PromotionState,
+    /// Identifies one unbroken stretch of this node's leadership of the
+    /// partition: drawn fresh from `ReplicationManager::next_leadership`
+    /// when the entry is created and every time its role leaves `Leader`,
+    /// never while it stays `Leader` across a handle rebuild. A quorum wait
+    /// may move onto a rebuilt handle only while this value is unchanged
+    /// (`successor_leader`): once the role has left `Leader`, another
+    /// node's authority may have cut this node's log below the offset
+    /// being waited on.
+    leadership: u64,
 }
+
+/// The ledger materializer's admission order for leadership claims
+/// (`core_materializer::apply_bus_partition_assignment`): a higher epoch
+/// wins, and at an equal epoch the lexicographically lower leader node id
+/// wins. An empty `current` leader — a node that stepped down without
+/// learning its successor (`check_stale_leadership`) — is outranked by every
+/// named leader of the same epoch.
+fn claim_outranks(epoch: u32, leader: &str, current: &PartitionAssignment) -> bool {
+    epoch > current.leader_epoch
+        || (epoch == current.leader_epoch
+            && (current.leader_node_id.is_empty() || leader < current.leader_node_id.as_str()))
+}
+
+/// `claim_outranks`' complement for a claim that is neither newer nor the
+/// same one — the one kind `apply_assignment` and `accept_hello` refuse.
+fn claim_superseded(epoch: u32, leader: &str, current: &PartitionAssignment) -> bool {
+    let same = epoch == current.leader_epoch && leader == current.leader_node_id;
+    !same && !claim_outranks(epoch, leader, current)
+}
+
+/// How many epochs past this node's ledger row an inbound `Hello` may claim
+/// and still be adopted. A promotion reaches the ledger through majority
+/// admission before its leader dials, so a live leader is at most a term or
+/// two ahead of a lagging follower's row; a larger gap is a claim nobody
+/// admitted, and adopting it would pin the entry above every real row.
+const MAX_HELLO_EPOCH_LEAD: u32 = 2;
 
 // ===== ReplicationManager ===================================================
 
@@ -453,6 +522,9 @@ pub struct ReplicationManager {
     /// therefore not counted — an honest undercount rather than a
     /// fabricated precise one.
     isr_shrink_total: AtomicU64,
+    /// Source of `PartitionEntry::leadership` values; monotonic, so a
+    /// removed-and-recreated entry never reuses one.
+    leadership_seq: AtomicU64,
 }
 
 fn reject_ack(environment: NodeEnvironment, reject: ReplReject) -> ReplHelloAck {
@@ -484,7 +556,12 @@ impl ReplicationManager {
             shutdown: CancellationToken::new(),
             assignments_changed: watch::channel(()).0,
             isr_shrink_total: AtomicU64::new(0),
+            leadership_seq: AtomicU64::new(0),
         })
+    }
+
+    fn next_leadership(&self) -> u64 {
+        self.leadership_seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn local_node_id(&self) -> &str {
@@ -558,11 +635,11 @@ impl ReplicationManager {
     /// own startup is behind". The environment gate deliberately stays
     /// BEFORE that wait: a peer from another environment gets no DB reads
     /// and no hold at all (PLAN §4.4 Z12).
-    pub async fn accept_stream(&self, _remote_hex: String, mut recv: BusRecv, send: BusSend) {
+    pub async fn accept_stream(&self, remote_hex: String, mut recv: BusRecv, send: BusSend) {
         let first = frames::read_frame(&mut recv).await;
         match first {
             Ok(ReplFrame::Hello(hello)) => {
-                self.accept_hello(hello, recv, send).await;
+                self.accept_hello(&remote_hex, hello, recv, send).await;
             }
             Ok(ReplFrame::LeoQuery(query)) => {
                 self.answer_leo_query(query, send).await;
@@ -656,7 +733,19 @@ impl ReplicationManager {
     /// — so a `Hello` that reaches this manager WITHOUT having gone through
     /// the router (a direct test call, or a future bug) is still refused
     /// rather than answered from a registry that is not its own.
-    pub(crate) async fn accept_hello(&self, hello: ReplHello, recv: BusRecv, mut send: BusSend) {
+    ///
+    /// `remote_node_id` is the dialing peer's authenticated mesh identity
+    /// (the iroh endpoint id, which IS the node id in this mesh — see
+    /// `IrohMeshManager::node_id`). A leader always dials its followers
+    /// itself, so a `Hello` naming any other leader is refused before it can
+    /// fence, adopt or be followed.
+    pub(crate) async fn accept_hello(
+        &self,
+        remote_node_id: &str,
+        hello: ReplHello,
+        recv: BusRecv,
+        mut send: BusSend,
+    ) {
         if hello.instance_id != self.instance_id {
             // W5 review finding D4: this arm is only reachable when
             // `replication::router` already matched `hello.instance_id` to
@@ -689,12 +778,53 @@ impl ReplicationManager {
             let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
             return;
         }
+        if hello.leader_node_id != remote_node_id {
+            tracing::warn!(
+                peer = %remote_node_id,
+                claimed_leader = %hello.leader_node_id,
+                org_id = %hello.org_id, topic = %hello.topic, partition = hello.partition,
+                "replication: refused a Hello whose leader is not the dialing peer"
+            );
+            let ack = reject_ack(self.local_env, ReplReject::LeaderIdentityMismatch);
+            let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
+            return;
+        }
         let key: PartitionKey = (hello.org_id.clone(), hello.topic.clone(), hello.partition);
 
         // A registry miss is not yet an answer: resolve it against the
         // ledger's own row first, so a leader that dialed this node before
         // its materialization poll caught up is held, not bounced.
         self.await_local_assignment(&key).await;
+
+        // A claim far past this node's ledger row was admitted by nobody;
+        // fencing to it or adopting it would pin the entry above every real
+        // assignment (`MAX_HELLO_EPOCH_LEAD`). The ledger row, not the
+        // registry, is the reference: the registry already carries earlier
+        // adoptions and would let a chain of Hellos ratchet the cap upward.
+        let ledger_epoch = match self
+            .assignments
+            .get(&self.instance_id, &key.0, &key.1, key.2)
+        {
+            Ok(Some(row)) => Some(row.leader_epoch),
+            _ => self.registry.get(&key).map(|e| e.assignment.leader_epoch),
+        };
+        if let Some(ledger_epoch) = ledger_epoch {
+            if hello.leader_epoch > ledger_epoch.saturating_add(MAX_HELLO_EPOCH_LEAD) {
+                tracing::warn!(
+                    org_id = %key.0, topic = %key.1, partition = key.2,
+                    peer = %remote_node_id,
+                    hello_epoch = hello.leader_epoch,
+                    ledger_epoch,
+                    "replication: refused a Hello too far ahead of this node's ledger"
+                );
+                let ack = reject_ack(
+                    self.local_env,
+                    ReplReject::EpochAheadOfLedger { ledger_epoch },
+                );
+                let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
+                return;
+            }
+        }
 
         // P8 exclusive promotion, half 1 — fencing ON the Hello. A node
         // that currently serves this partition as LEADER but is staring at
@@ -718,49 +848,51 @@ impl ReplicationManager {
         // by the follower stream's own four checks), and a peer that does
         // NOT beat this node by the deterministic rule still gets the
         // plain `NotAReplica`/`StaleEpoch` rejection it always got.
-        if let Some(entry) = self.registry.get(&key) {
-            let peer_wins = hello.leader_epoch > entry.assignment.leader_epoch
-                || (hello.leader_epoch == entry.assignment.leader_epoch
-                    && hello.leader_node_id < self.local_node_id);
-            let self_assigned = hello.replicas.iter().any(|r| r == &self.local_node_id);
-            if entry.role == LocalRole::Leader && peer_wins && self_assigned {
-                drop(entry);
-                tracing::warn!(
-                    org_id = %key.0, topic = %key.1, partition = key.2,
-                    peer = %hello.leader_node_id,
-                    peer_epoch = hello.leader_epoch,
-                    "replication: fencing own leadership on a newer peer Hello \
-                     (equal epochs resolve to the lower node id)"
-                );
-                if let Some(mut entry) = self.registry.get_mut(&key) {
-                    // Stop serving first (`stop` aborts the feeder tasks —
-                    // no further bytes leave this node under the old
-                    // claim), then adopt the peer's view so the accept
-                    // below sees a `Follower` entry at the peer's epoch.
-                    if let Some(leader) = entry.leader.take() {
-                        leader.stop();
-                    }
-                    entry.assignment = PartitionAssignment {
-                        leader_node_id: hello.leader_node_id.clone(),
-                        leader_epoch: hello.leader_epoch,
-                        // The Hello carries no ISR of its own; the full
-                        // replica set is the honest upper bound until this
-                        // node's own poll materializes the ledger row (the
-                        // live ISR the leader tracks needs no static
-                        // answer from here).
-                        isr: hello.replicas.clone(),
-                        replicas: hello.replicas.clone(),
-                        updated_at_ms: now_ms(),
-                        ..entry.assignment.clone()
-                    };
-                    entry.role = LocalRole::Follower;
-                    entry.follower = None;
-                    // A promotion in flight on this entry is moot: the
-                    // deterministic winner just dialed us.
-                    entry.promotion = PromotionState::Idle;
-                }
-                self.assignments_changed.send_replace(());
+        let self_assigned = hello.replicas.iter().any(|r| r == &self.local_node_id);
+        let mut fenced = None;
+        if let Some(mut entry) = self.registry.get_mut(&key) {
+            // Judged under the write guard it acts on, so a concurrent
+            // re-stamp cannot slip between the check and the fence.
+            if entry.role == LocalRole::Leader
+                && self_assigned
+                && claim_outranks(hello.leader_epoch, &hello.leader_node_id, &entry.assignment)
+            {
+                // Stop serving first (`stop` aborts the feeder tasks — no
+                // further bytes leave this node under the old claim), then
+                // adopt the peer's view so the accept below sees a
+                // `Follower` entry at the peer's epoch.
+                fenced = entry.leader.take();
+                entry.assignment = PartitionAssignment {
+                    leader_node_id: hello.leader_node_id.clone(),
+                    leader_epoch: hello.leader_epoch,
+                    // The Hello carries no ISR of its own; the full replica
+                    // set is the honest upper bound until this node's own
+                    // poll materializes the ledger row (the live ISR the
+                    // leader tracks needs no static answer from here).
+                    isr: hello.replicas.clone(),
+                    replicas: hello.replicas.clone(),
+                    updated_at_ms: now_ms(),
+                    ..entry.assignment.clone()
+                };
+                entry.role = LocalRole::Follower;
+                entry.leadership = self.next_leadership();
+                entry.follower = None;
+                // A promotion in flight on this entry is moot: the
+                // deterministic winner just dialed us.
+                entry.promotion = PromotionState::Idle;
             }
+        }
+        if let Some(leader) = fenced {
+            tracing::warn!(
+                org_id = %key.0, topic = %key.1, partition = key.2,
+                peer = %hello.leader_node_id,
+                peer_epoch = hello.leader_epoch,
+                "replication: fencing own leadership on a newer peer Hello \
+                 (equal epochs resolve to the lower node id)"
+            );
+            // Outside the guard: `stop()` flushes partition meta.
+            leader.stop();
+            self.assignments_changed.send_replace(());
         }
 
         // Snapshot the verdict synchronously so no DashMap guard is ever
@@ -774,7 +906,16 @@ impl ReplicationManager {
             Some(entry) if entry.role != LocalRole::Follower => {
                 Verdict::Reject(ReplReject::NotAReplica)
             }
-            Some(entry) if hello.leader_epoch < entry.assignment.leader_epoch => {
+            // The same order the ledger and the fence above use: an older
+            // epoch, or an equal epoch led by a node ranked above the one
+            // this entry follows, is not a claim this node may follow.
+            Some(entry)
+                if claim_superseded(
+                    hello.leader_epoch,
+                    &hello.leader_node_id,
+                    &entry.assignment,
+                ) =>
+            {
                 Verdict::Reject(ReplReject::StaleEpoch {
                     have: entry.assignment.leader_epoch,
                 })
@@ -791,10 +932,46 @@ impl ReplicationManager {
             Verdict::Accept(a) => a,
         };
 
+        let mut assignment = assignment;
+        let mut overtaken = None;
+        let mut replaced_runner = None;
         if let Some(mut entry) = self.registry.get_mut(&key) {
-            if let Some(old) = entry.follower.take() {
-                old.stop();
+            if claim_superseded(hello.leader_epoch, &hello.leader_node_id, &entry.assignment) {
+                // The verdict above was read under a guard that is gone: a
+                // newer ledger row may have landed since. Never follow a
+                // claim that is superseded by now.
+                overtaken = Some(entry.assignment.leader_epoch);
+            } else {
+                // An accepted Hello from a term this entry does not know yet
+                // — the ledger row for it has not reached this node — is the
+                // term this node now actually follows, so the registry
+                // adopts it the way the leader-side fence above does. Left at
+                // the older row, `role()` named a leader this node no longer
+                // followed, and the newer row's later arrival looked like a
+                // leader change: a rebuild that stopped this very stream in
+                // the middle of the leader's writes. Adopted, that row is a
+                // metadata update.
+                if claim_outranks(hello.leader_epoch, &hello.leader_node_id, &entry.assignment) {
+                    entry.assignment = PartitionAssignment {
+                        leader_node_id: hello.leader_node_id.clone(),
+                        leader_epoch: hello.leader_epoch,
+                        isr: hello.replicas.clone(),
+                        replicas: hello.replicas.clone(),
+                        updated_at_ms: now_ms(),
+                        ..entry.assignment.clone()
+                    };
+                    assignment = entry.assignment.clone();
+                }
+                replaced_runner = entry.follower.take();
             }
+        }
+        if let Some(have) = overtaken {
+            let ack = reject_ack(self.local_env, ReplReject::StaleEpoch { have });
+            let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
+            return;
+        }
+        if let Some(old) = replaced_runner {
+            old.stop();
         }
         match self.follower_factory.spawn(&assignment, hello, recv, send) {
             Ok(runner) => {
@@ -947,6 +1124,36 @@ impl ReplicationManager {
             assignment.topic.clone(),
             assignment.partition,
         );
+        // Epochs only grow (K-M2-1), and the registry can be AHEAD of the
+        // ledger row this call carries: a winning peer's `Hello` fences this
+        // node straight to the peer's term (`accept_hello`) and a refused
+        // `Hello` raises it on step-down, both before the ledger delivers
+        // that term's row. Applying the older row afterwards — typically
+        // this node's own create-time placement — re-promoted a follower to
+        // a superseded term and tore down the live leader's stream mid-write
+        // until its own stale `Hello` was refused again. Checked here for the
+        // log line and again under each write guard below, since an adoption
+        // or fence can land in between.
+        if let Some(current) = self.registry.get(&key) {
+            if claim_superseded(
+                assignment.leader_epoch,
+                &assignment.leader_node_id,
+                &current.assignment,
+            ) {
+                // Rate-bounded by the callers: the poll loop applies each
+                // distinct row once (its fingerprint cache), and the other
+                // callers act on a row once per event.
+                tracing::warn!(
+                    org_id = %key.0, topic = %key.1, partition = key.2,
+                    current_leader = %current.assignment.leader_node_id,
+                    current_epoch = current.assignment.leader_epoch,
+                    stale_leader = %assignment.leader_node_id,
+                    stale_epoch = assignment.leader_epoch,
+                    "replication: ignoring an assignment older than the term this node already follows"
+                );
+                return;
+            }
+        }
         let is_replica = assignment.replicas.iter().any(|r| r == &self.local_node_id);
         let new_role = if !is_replica {
             LocalRole::NotReplica
@@ -973,9 +1180,15 @@ impl ReplicationManager {
             MetadataOnly,
             Rebuild,
         }
+        let mut previous: Option<(LocalRole, String, u32)> = None;
         let plan = match self.registry.get(&key) {
             None => Reconcile::Rebuild,
             Some(e) => {
+                previous = Some((
+                    e.role,
+                    e.assignment.leader_node_id.clone(),
+                    e.assignment.leader_epoch,
+                ));
                 if e.role == new_role && e.assignment == assignment {
                     Reconcile::Nothing
                 } else if e.role == new_role
@@ -996,12 +1209,31 @@ impl ReplicationManager {
                 // dropped, and writing it as a single expression would let a
                 // later edit hold both guards on the same shard and deadlock.
                 if let Some(mut e) = self.registry.get_mut(&key) {
-                    e.assignment = assignment;
+                    if !claim_superseded(
+                        assignment.leader_epoch,
+                        &assignment.leader_node_id,
+                        &e.assignment,
+                    ) {
+                        e.assignment = assignment;
+                    }
                 }
                 self.assignments_changed.send_replace(());
                 return;
             }
-            Reconcile::Rebuild => {}
+            Reconcile::Rebuild => {
+                // A rebuild stops the current leader handle / follower
+                // runner, which ends every replication stream of this
+                // partition; without this line a stream teardown seen on a
+                // peer has no visible cause here.
+                tracing::info!(
+                    org_id = %key.0, topic = %key.1, partition = key.2,
+                    previous = ?previous,
+                    new_role = ?new_role,
+                    new_leader = %assignment.leader_node_id,
+                    new_epoch = assignment.leader_epoch,
+                    "replication: rebuilding partition role"
+                );
+            }
         }
 
         // Re-stamped IN PLACE, handles taken but the entry never removed.
@@ -1020,9 +1252,20 @@ impl ReplicationManager {
         let mut old_follower = None;
         let mut restamped = false;
         if let Some(mut e) = self.registry.get_mut(&key) {
+            // The check above ran under a read guard that is gone now.
+            if claim_superseded(
+                assignment.leader_epoch,
+                &assignment.leader_node_id,
+                &e.assignment,
+            ) {
+                return;
+            }
             old_leader = e.leader.take();
             old_follower = e.follower.take();
             e.assignment = assignment.clone();
+            if new_role != LocalRole::Leader {
+                e.leadership = self.next_leadership();
+            }
             e.role = new_role;
             e.promotion = PromotionState::Idle;
             restamped = true;
@@ -1092,6 +1335,7 @@ impl ReplicationManager {
                             leader: None,
                             follower: None,
                             promotion: PromotionState::Idle,
+                            leadership: self.next_leadership(),
                         },
                     );
                 }
@@ -1101,6 +1345,100 @@ impl ReplicationManager {
         // path above returns first. Wakes anything parked in
         // `await_local_assignment` without waiting for its own re-read tick.
         self.assignments_changed.send_replace(());
+    }
+
+    /// The handle that replaced `wait.handle` as this node's leader for
+    /// `key` once `apply_assignment` has attached it, with the `required`
+    /// count recomputed from the successor's assignment — or `None` when no
+    /// successor may finish a publish begun under the stopped handle, or
+    /// `deadline` passes first.
+    ///
+    /// A rebuild that keeps this node as leader (an epoch bump on the same
+    /// node, a replica-set change) stops the old handle, which ends every
+    /// quorum wait on it at once. While this node has led the partition
+    /// without a break, the record such a publish appended is still at its
+    /// offset in this node's log and the successor replicates that log, so
+    /// its acks answer the same question. Every condition below guards that
+    /// premise:
+    /// - `leadership` unchanged: the role never left `Leader`. A fence or
+    ///   step-down in between hands the log to another node's authority,
+    ///   whose handshake may truncate this node below the waited offset —
+    ///   even if this node leads again later, possibly at the very epoch it
+    ///   was fenced to.
+    /// - no truncation of the local log since the wait began, and the
+    ///   successor's log still reaches `next_offset`: the offset names the
+    ///   same record.
+    /// - at most one term later: a larger jump means terms passed that this
+    ///   node did not lead.
+    fn successor_leader(
+        &self,
+        key: &PartitionKey,
+        wait: &AckWait,
+        next_offset: u64,
+        acks: Acks,
+        deadline: Instant,
+    ) -> Option<AckWait> {
+        loop {
+            {
+                let entry = self.registry.get(key)?;
+                let epoch = entry.assignment.leader_epoch;
+                if entry.role != LocalRole::Leader
+                    || entry.leadership != wait.leadership
+                    || entry.assignment.leader_node_id != self.local_node_id
+                    || epoch > wait.epoch.saturating_add(1)
+                {
+                    return None;
+                }
+                // `None` here is the rebuild window: the entry is already
+                // re-stamped, the new handle not yet attached.
+                if let Some(handle) = entry.leader.as_ref() {
+                    if !std::ptr::addr_eq(Arc::as_ptr(handle), Arc::as_ptr(&wait.handle)) {
+                        if handle.truncation_count() != wait.truncations
+                            || handle.log_end_offset() < next_offset
+                        {
+                            return None;
+                        }
+                        return Some(AckWait {
+                            handle: Arc::clone(handle),
+                            epoch,
+                            leadership: entry.leadership,
+                            truncations: wait.truncations,
+                            required: required_acks(acks, &entry.assignment),
+                        });
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(SUCCESSOR_POLL_INTERVAL);
+        }
+    }
+
+    /// Drops this node's replication state for `key` — stops the leader
+    /// handle and follower runner and removes the entry — once the ledger no
+    /// longer lists this node as a replica of it: the topic was deleted
+    /// (`reassign(.., &[])`, then the rows themselves), or this node was
+    /// moved off the replica set. Without it the entry outlived the topic,
+    /// its handles kept running against a dead incarnation, and a recreated
+    /// topic's epoch-1 placement was refused as older than the dead
+    /// incarnation's last term.
+    pub(crate) fn forget_partition(&self, key: &PartitionKey) {
+        if let Some((_, mut entry)) = self.registry.remove(key) {
+            tracing::info!(
+                org_id = %key.0, topic = %key.1, partition = key.2,
+                epoch = entry.assignment.leader_epoch,
+                role = ?entry.role,
+                "replication: dropping a partition this node no longer replicates"
+            );
+            if let Some(leader) = entry.leader.take() {
+                leader.stop();
+            }
+            if let Some(follower) = entry.follower.take() {
+                follower.stop();
+            }
+            self.assignments_changed.send_replace(());
+        }
     }
 
     /// Puts the leader handle `apply_assignment` just spawned into the
@@ -1124,20 +1462,30 @@ impl ReplicationManager {
     /// that does not make this handle stale. Anything more than that means
     /// another call has taken the key over with newer information, and the
     /// handle spawned here is the one to throw away.
+    ///
+    /// A handle another task already attached for the same term is kept and
+    /// the one spawned here is thrown away instead (a promotion and the
+    /// assignment poll both install the promotion's own row). Swapping would
+    /// stop a leader whose replica streams are already up, and each follower
+    /// would see its stream end and hand-shake again — an ISR dip right after
+    /// a failover for no reason.
     fn attach_leader(
         &self,
         key: &PartitionKey,
         assignment: &PartitionAssignment,
         handle: Box<dyn LeaderHandle>,
-    ) -> Option<Box<dyn LeaderHandle>> {
+    ) -> Option<Arc<dyn LeaderHandle>> {
+        let handle: Arc<dyn LeaderHandle> = Arc::from(handle);
         match self.registry.get_mut(key) {
             Some(mut e) => {
                 if e.role == LocalRole::Leader
+                    && e.leader.is_none()
                     && e.assignment.leader_node_id == assignment.leader_node_id
                     && e.assignment.replicas == assignment.replicas
                     && e.assignment.leader_epoch == assignment.leader_epoch
                 {
-                    e.leader.replace(handle)
+                    e.leader = Some(handle);
+                    None
                 } else {
                     Some(handle)
                 }
@@ -1155,6 +1503,7 @@ impl ReplicationManager {
                         leader: Some(handle),
                         follower: None,
                         promotion: PromotionState::Idle,
+                        leadership: self.next_leadership(),
                     },
                 );
                 None
@@ -1281,6 +1630,7 @@ impl ReplicationManager {
             // role + epoch, never on this field.
             entry.assignment.leader_node_id = String::new();
             entry.role = LocalRole::Follower;
+            entry.leadership = self.next_leadership();
             entry.follower = None;
             entry.promotion = PromotionState::Idle;
             drop(entry);
@@ -1607,24 +1957,73 @@ impl ReplicationManager {
         // removed. Every replica stream is the glue supervisor's job.
         match self.leader_factory.spawn_deferred(&assignment, Vec::new()) {
             Ok(handle) => {
-                for (node, to) in &truncates {
-                    handle.send_truncate(node, *to);
-                }
-                if let Some((_, mut old)) = self.registry.remove(key) {
-                    if let Some(follower) = old.follower.take() {
-                        follower.stop();
+                let handle: Arc<dyn LeaderHandle> = Arc::from(handle);
+                // Switched IN PLACE, never removed and re-inserted. The old
+                // follower runner's `stop()` blocks (it flushes partition
+                // meta), and a key left absent for that long was measured
+                // being picked up by the assignment poll, which applies this
+                // very promotion's row: finding no entry, it spawned a second
+                // leader handle, which the re-insert then overwrote without
+                // stopping. Two live leaders of one partition kept replacing
+                // each other's stream on every follower, so the new leader's
+                // ISR kept dipping below quorum right after the failover.
+                let mut old_follower = None;
+                let mut old_leader = None;
+                let mut spare = None;
+                let serving = match self.registry.get_mut(key) {
+                    Some(mut e) => {
+                        let same_term = e.role == LocalRole::Leader
+                            && e.assignment.leader_node_id == assignment.leader_node_id
+                            && e.assignment.replicas == assignment.replicas
+                            && e.assignment.leader_epoch == assignment.leader_epoch;
+                        match e.leader.as_ref() {
+                            // The poll already installed this term: keep its
+                            // handle, whose replica streams may be up.
+                            Some(existing) if same_term => {
+                                spare = Some(Arc::clone(&handle));
+                                Arc::clone(existing)
+                            }
+                            _ => {
+                                old_follower = e.follower.take();
+                                old_leader = e.leader.replace(Arc::clone(&handle));
+                                if e.role != LocalRole::Leader {
+                                    e.leadership = self.next_leadership();
+                                }
+                                e.assignment = assignment.clone();
+                                e.role = LocalRole::Leader;
+                                e.promotion = PromotionState::Idle;
+                                handle
+                            }
+                        }
                     }
+                    None => {
+                        self.registry.insert(
+                            key.clone(),
+                            PartitionEntry {
+                                assignment: assignment.clone(),
+                                role: LocalRole::Leader,
+                                leader: Some(Arc::clone(&handle)),
+                                follower: None,
+                                promotion: PromotionState::Idle,
+                                leadership: self.next_leadership(),
+                            },
+                        );
+                        handle
+                    }
+                };
+                // The election's truncate targets belong to the term, not to
+                // the handle that happened to be spawned for it.
+                for (node, to) in &truncates {
+                    serving.send_truncate(node, *to);
                 }
-                self.registry.insert(
-                    key.clone(),
-                    PartitionEntry {
-                        assignment: assignment.clone(),
-                        role: LocalRole::Leader,
-                        leader: Some(handle),
-                        follower: None,
-                        promotion: PromotionState::Idle,
-                    },
-                );
+                // Outside the guard: every `stop()` blocks on the engine.
+                for stale in [spare, old_leader].into_iter().flatten() {
+                    stale.stop();
+                }
+                if let Some(follower) = old_follower {
+                    follower.stop();
+                }
+                self.assignments_changed.send_replace(());
                 self.audit.failover(
                     &key.0,
                     &key.1,
@@ -1730,25 +2129,49 @@ impl ReplicationCoordinator for ReplicationManager {
         timeout: Duration,
     ) -> Result<AckOutcome, ReplError> {
         let key: PartitionKey = (org.to_string(), topic.to_string(), partition);
-        let entry = self
-            .registry
-            .get(&key)
-            .ok_or_else(|| ReplError::NoAssignment {
-                topic: topic.to_string(),
-                partition,
-            })?;
-        let Some(leader) = entry.leader.as_ref() else {
-            return Err(ReplError::NoAssignment {
-                topic: topic.to_string(),
-                partition,
-            });
+        // The quorum wait can last `timeout` (30 s by default); holding the
+        // shard's read guard that long would block every `get_mut` on the
+        // same shard — Hello fencing, stale-leadership step-down, role
+        // changes — on whichever thread reaches it, a tokio worker
+        // included. Resolve everything under the guard, then drop it.
+        let deadline = Instant::now() + timeout;
+        let mut wait = {
+            let entry = self
+                .registry
+                .get(&key)
+                .ok_or_else(|| ReplError::NoAssignment {
+                    topic: topic.to_string(),
+                    partition,
+                })?;
+            let Some(handle) = entry.leader.clone() else {
+                return Err(ReplError::NoAssignment {
+                    topic: topic.to_string(),
+                    partition,
+                });
+            };
+            AckWait {
+                truncations: handle.truncation_count(),
+                handle,
+                epoch: entry.assignment.leader_epoch,
+                leadership: entry.leadership,
+                required: required_acks(acks, &entry.assignment),
+            }
         };
-        let required = match acks {
-            Acks::Leader => 1,
-            Acks::Quorum => election::min_isr_required(entry.assignment.replicas.len()) as u32,
-            Acks::All => entry.assignment.isr.len().max(1) as u32,
-        };
-        Ok(leader.await_acks(next_offset, required, timeout))
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let outcome = wait
+                .handle
+                .await_acks(next_offset, wait.required, remaining);
+            if outcome.acked_nodes >= outcome.required || Instant::now() >= deadline {
+                return Ok(outcome);
+            }
+            // Back before the deadline without the quorum: the handle was
+            // stopped under this publish. See `successor_leader`.
+            match self.successor_leader(&key, &wait, next_offset, acks, deadline) {
+                Some(next) => wait = next,
+                None => return Ok(outcome),
+            }
+        }
     }
 
     fn note_offset_commit(
@@ -1855,6 +2278,7 @@ impl ReplicationCoordinator for ReplicationManager {
                         // Corrected to `Follower`/`NotReplica` by the next
                         // `apply_assignment` once the op materializes back.
                         entry.role = LocalRole::NotReplica;
+                        entry.leadership = self.next_leadership();
                     }
                 }
                 self.audit.transfer(
@@ -1909,6 +2333,12 @@ impl ReplicationCoordinator for ReplicationManager {
             assignment.leader_epoch = election::next_epoch(assignment.leader_epoch);
             assignment.updated_at_ms = now_ms();
             self.assignments.propose(assignment)?;
+            // An empty replica set is `delete_topic`/`purge_org`'s "stop
+            // replicating this" signal: tear the local state down now rather
+            // than when the assignment poll notices the rows are gone.
+            if replicas.is_empty() {
+                self.forget_partition(&key);
+            }
             touched += 1;
         }
         Ok(touched)
@@ -2376,6 +2806,14 @@ mod tests {
         truncated: Mutex<Vec<(String, u64)>>,
         stopped: AtomicBool,
         stale_epoch: AtomicU32,
+        /// How long `await_acks` blocks before answering — stands in for a
+        /// quorum that takes its time.
+        ack_hold: Mutex<Duration>,
+        /// How long `await_acks` still takes to return once the handle is
+        /// stopped — a waiter thread descheduled right after its wait ended,
+        /// which is when the registry can move on underneath it.
+        stop_grace: Mutex<Duration>,
+        truncations: AtomicU64,
     }
 
     impl FakeLeaderHandle {
@@ -2387,6 +2825,9 @@ mod tests {
                 truncated: Mutex::new(Vec::new()),
                 stopped: AtomicBool::new(false),
                 stale_epoch: AtomicU32::new(0),
+                ack_hold: Mutex::new(Duration::ZERO),
+                stop_grace: Mutex::new(Duration::ZERO),
+                truncations: AtomicU64::new(0),
             }
         }
 
@@ -2406,15 +2847,32 @@ mod tests {
         fn isr(&self) -> Vec<String> {
             self.isr.lock().clone()
         }
+        fn truncation_count(&self) -> u64 {
+            self.truncations.load(Ordering::SeqCst)
+        }
         fn high_watermark(&self) -> u64 {
             self.hw.load(Ordering::SeqCst)
         }
         fn log_end_offset(&self) -> u64 {
             self.leo.load(Ordering::SeqCst)
         }
-        fn await_acks(&self, _next_offset: u64, required: u32, _timeout: Duration) -> AckOutcome {
+        /// Holds for `ack_hold` (capped at `timeout`) like a quorum that
+        /// takes its time, but — like the real handle's closed waiters —
+        /// returns as soon as the handle is stopped, with only the leader's
+        /// own ack.
+        fn await_acks(&self, _next_offset: u64, required: u32, timeout: Duration) -> AckOutcome {
+            let until = std::time::Instant::now() + (*self.ack_hold.lock()).min(timeout);
+            while std::time::Instant::now() < until && !self.stopped.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let acked_nodes = if self.stopped.load(Ordering::SeqCst) {
+                std::thread::sleep(*self.stop_grace.lock());
+                1
+            } else {
+                self.isr.lock().len() as u32
+            };
             AckOutcome {
-                acked_nodes: self.isr.lock().len() as u32,
+                acked_nodes,
                 required,
                 hw: self.high_watermark(),
             }
@@ -2441,6 +2899,10 @@ mod tests {
         // manager: the live-ISR test below needs to keep mutating the SAME
         // handle (`set_isr`) after the manager already owns it.
         handles: Mutex<Vec<Arc<FakeLeaderHandle>>>,
+        /// `log_end_offset` / `truncation_count` of every handle spawned
+        /// from now on — the local log a rebuilt leader handle would see.
+        spawn_leo: AtomicU64,
+        spawn_truncations: AtomicU64,
     }
 
     impl FakeLeaderFactory {
@@ -2449,6 +2911,8 @@ mod tests {
                 spawned: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(false),
                 handles: Mutex::new(Vec::new()),
+                spawn_leo: AtomicU64::new(0),
+                spawn_truncations: AtomicU64::new(0),
             })
         }
     }
@@ -2461,6 +2925,9 @@ mod tests {
     impl LeaderHandle for SharedFakeLeaderHandle {
         fn isr(&self) -> Vec<String> {
             self.0.isr()
+        }
+        fn truncation_count(&self) -> u64 {
+            self.0.truncation_count()
         }
         fn high_watermark(&self) -> u64 {
             self.0.high_watermark()
@@ -2496,7 +2963,15 @@ mod tests {
                 return Err(ReplError::Internal("forced leader spawn failure".into()));
             }
             self.spawned.lock().push(assignment.clone());
-            let handle = Arc::new(FakeLeaderHandle::new(assignment.isr.clone(), 0, 0));
+            let handle = Arc::new(FakeLeaderHandle::new(
+                assignment.isr.clone(),
+                0,
+                self.spawn_leo.load(Ordering::SeqCst),
+            ));
+            handle.truncations.store(
+                self.spawn_truncations.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             self.handles.lock().push(Arc::clone(&handle));
             Ok(Box::new(SharedFakeLeaderHandle(handle)))
         }
@@ -3119,6 +3594,319 @@ mod tests {
         assert_eq!(snap.partitions[0].isr.len(), 3);
     }
 
+    /// An epoch bump that keeps this node as leader rebuilds the leader
+    /// handle, and stopping the old one ends its quorum wait at once. The
+    /// record is in this node's log either way, so a publish in flight must
+    /// finish on the successor handle instead of failing with the old one's
+    /// partial count (measured: the chaos test's steady-state phase failing
+    /// with `acked=1, required=2` 0.5 s into a 1.5 s ack timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ack_wait_carries_over_to_the_same_nodes_rebuilt_leader() {
+        let fx = build("l");
+        let replicas = ["l", "f1", "f2"];
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 1))
+            .await;
+        *fx.leader_factory.handles.lock()[0].ack_hold.lock() = Duration::from_secs(30);
+        fx.leader_factory.spawn_leo.store(1, Ordering::SeqCst);
+
+        let manager = fx.manager.clone();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let outcome =
+                manager.await_acks("org", "orders", 0, 1, Acks::Quorum, Duration::from_secs(10));
+            (outcome, started.elapsed())
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 2))
+            .await;
+        assert_eq!(
+            fx.leader_factory.handles.lock().len(),
+            2,
+            "rebuilt at epoch 2"
+        );
+
+        let (outcome, elapsed) = waiter.join().unwrap();
+        let outcome = outcome.expect("the partition still has a leader here");
+        assert!(
+            outcome.acked_nodes >= outcome.required,
+            "the wait must finish on the successor handle: {outcome:?}"
+        );
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// Starts a publish's quorum wait (offset 1, 10 s budget) on `fx`'s
+    /// first leader handle, held open until that handle is stopped.
+    fn pending_ack_wait(
+        fx: &Fixture,
+    ) -> std::thread::JoinHandle<(Result<AckOutcome, ReplError>, Duration)> {
+        *fx.leader_factory.handles.lock()[0].ack_hold.lock() = Duration::from_secs(30);
+        let manager = fx.manager.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let outcome =
+                manager.await_acks("org", "orders", 0, 1, Acks::Quorum, Duration::from_secs(10));
+            (outcome, started.elapsed())
+        })
+    }
+
+    /// Asserts the wait ended promptly WITHOUT the quorum — the publish
+    /// fails, it is not confirmed through a handle that may not own its
+    /// record.
+    fn assert_not_carried_over(
+        waiter: std::thread::JoinHandle<(Result<AckOutcome, ReplError>, Duration)>,
+    ) {
+        let (outcome, elapsed) = waiter.join().unwrap();
+        let outcome = outcome.expect("an outcome, not an error");
+        assert!(
+            outcome.acked_nodes < outcome.required,
+            "must not carry over: {outcome:?}"
+        );
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// Review finding 1: L leads at N with a publish pending; X's Hello at
+    /// N+1 fences L (and X's handshake may truncate L's log below the
+    /// offset); then L's own ledger row names L at N+1 — L ranks below X, so
+    /// it outranks X's claim and L leads again at the very epoch it was
+    /// fenced to. The epoch alone looks like "one term later, same node",
+    /// yet another node's authority held the log in between: the wait must
+    /// not move onto the new handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ack_wait_does_not_carry_over_a_break_in_leadership() {
+        let fx = build("L");
+        let replicas = ["L", "M", "X"];
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "L", &replicas, &replicas, 1))
+            .await;
+        fx.leader_factory.spawn_leo.store(1, Ordering::SeqCst);
+        // The waiter only looks for a successor after the fence AND the
+        // re-promotion below have both landed — the interleaving where the
+        // epoch, the role and the handle all look like a same-node rebuild.
+        *fx.leader_factory.handles.lock()[0].stop_grace.lock() = Duration::from_millis(1500);
+        let waiter = pending_ack_wait(&fx);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let ack = hello_roundtrip(
+            Arc::clone(&fx.manager),
+            hello_from(&assignment(
+                "org", "orders", 0, "X", &replicas, &replicas, 2,
+            )),
+        )
+        .await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "L", &replicas, &replicas, 2))
+            .await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 2 }
+        ));
+        assert_not_carried_over(waiter);
+    }
+
+    /// Two terms later with no break in the local role still means terms
+    /// passed that this node's handle did not lead through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ack_wait_does_not_carry_over_two_terms() {
+        let fx = build("l");
+        let replicas = ["l", "f1", "f2"];
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 1))
+            .await;
+        fx.leader_factory.spawn_leo.store(1, Ordering::SeqCst);
+        let waiter = pending_ack_wait(&fx);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 3))
+            .await;
+        assert_not_carried_over(waiter);
+    }
+
+    /// A truncation of the local log since the wait began, or a successor
+    /// whose log no longer reaches the waited offset, means the offset may
+    /// name a different record now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ack_wait_does_not_carry_over_a_truncated_log() {
+        for (leo, truncations) in [(1, 1), (0, 0)] {
+            let fx = build("l");
+            let replicas = ["l", "f1", "f2"];
+            fx.manager
+                .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 1))
+                .await;
+            fx.leader_factory.spawn_leo.store(leo, Ordering::SeqCst);
+            fx.leader_factory
+                .spawn_truncations
+                .store(truncations, Ordering::SeqCst);
+            let waiter = pending_ack_wait(&fx);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            fx.manager
+                .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 2))
+                .await;
+            assert_not_carried_over(waiter);
+        }
+    }
+
+    /// Review finding 2: `delete_topic` signals `reassign(.., None, &[])`.
+    /// The local entry must go with it — handles stopped — so the same
+    /// topic recreated later places at epoch 1 and is applied, instead of
+    /// being refused as older than the dead incarnation's last term.
+    #[tokio::test]
+    async fn a_deleted_topic_can_be_recreated_at_epoch_one() {
+        let fx = build("l");
+        let replicas = ["l", "f1", "f2"];
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 4))
+            .await;
+        let old = fx.leader_factory.handles.lock()[0].clone();
+
+        fx.manager.reassign("org", "orders", None, &[]).unwrap();
+        assert!(
+            old.stopped.load(Ordering::SeqCst),
+            "the dead incarnation's handle is stopped"
+        );
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Unavailable { .. }
+        ));
+
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 1))
+            .await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 1 }
+        ));
+    }
+
+    /// The carry-over is only for this node staying leader: a rebuild that
+    /// hands the partition to another node ends the wait promptly with the
+    /// partial count, not at the ack timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ack_wait_ends_promptly_when_this_node_stops_leading() {
+        let fx = build("l");
+        let replicas = ["l", "f1", "f2"];
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 1))
+            .await;
+        *fx.leader_factory.handles.lock()[0].ack_hold.lock() = Duration::from_secs(30);
+
+        let manager = fx.manager.clone();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let outcome =
+                manager.await_acks("org", "orders", 0, 1, Acks::Quorum, Duration::from_secs(10));
+            (outcome, started.elapsed())
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fx.manager
+            .apply_assignment(assignment(
+                "org", "orders", 0, "f1", &replicas, &replicas, 2,
+            ))
+            .await;
+
+        let (outcome, elapsed) = waiter.join().unwrap();
+        let outcome = outcome.unwrap();
+        assert!(outcome.acked_nodes < outcome.required, "{outcome:?}");
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// The registry can be ahead of the ledger: a winning peer's Hello
+    /// fences this node to the peer's term before the ledger row for that
+    /// term arrives. The older row — here this node's own create-time
+    /// placement — must not then roll the partition back to an earlier
+    /// term. Measured in the chaos test: a follower at epoch 2 re-promoted
+    /// itself to leader at epoch 1 in the middle of the steady-state phase,
+    /// tearing down the real leader's stream.
+    #[tokio::test]
+    async fn an_older_assignment_never_rolls_back_a_newer_term() {
+        let fx = build("f1");
+        let replicas = ["l", "f1", "f2"];
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "l", &replicas, &replicas, 2))
+            .await;
+        let followed = fx.manager.role("org", "orders", 0);
+
+        let mut own_placement = assignment("org", "orders", 0, "f1", &replicas, &replicas, 1);
+        own_placement.updated_at_ms += 1;
+        fx.manager.apply_assignment(own_placement).await;
+        assert_eq!(fx.manager.role("org", "orders", 0), followed, "older term");
+
+        // Same term, a leader ranked above the current one: the ledger's own
+        // tie-break (lower node id wins) would refuse it too.
+        fx.manager
+            .apply_assignment(assignment(
+                "org",
+                "orders",
+                0,
+                "z",
+                &["l", "f1", "z"],
+                &["l", "f1", "z"],
+                2,
+            ))
+            .await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            followed,
+            "same term, higher id"
+        );
+        assert!(
+            fx.leader_factory.handles.lock().is_empty(),
+            "never promoted"
+        );
+
+        // A newer term still applies.
+        fx.manager
+            .apply_assignment(assignment(
+                "org", "orders", 0, "f1", &replicas, &replicas, 3,
+            ))
+            .await;
+        assert_eq!(
+            fx.leader_factory.handles.lock().len(),
+            1,
+            "promoted at epoch 3"
+        );
+    }
+
+    /// A publish's quorum wait can last the whole ack timeout (30 s by
+    /// default). It must not keep the registry shard's read guard for that
+    /// long: Hello fencing, stale-leadership step-down and role changes all
+    /// take the same entry with `get_mut`, and would stall — on a Tokio
+    /// worker — until the unrelated publish gave up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_ack_wait_does_not_hold_the_registry_entry() {
+        let fx = build("l");
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            1,
+        );
+        fx.manager.apply_assignment(a).await;
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        *handle.ack_hold.lock() = Duration::from_secs(3);
+
+        let manager = fx.manager.clone();
+        let waiter = std::thread::spawn(move || {
+            manager.await_acks("org", "orders", 0, 1, Acks::Quorum, Duration::from_secs(5))
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let key: PartitionKey = ("org".to_string(), "orders".to_string(), 0);
+        let started = std::time::Instant::now();
+        drop(fx.manager.registry.get_mut(&key).expect("registry entry"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "get_mut waited {:?} behind a pending ack wait",
+            started.elapsed()
+        );
+        assert!(waiter.join().unwrap().is_ok());
+    }
+
     // ---- transfer_leader ----------------------------------------------------
 
     #[tokio::test]
@@ -3476,16 +4264,24 @@ mod tests {
     /// of the leader side stay alive until the ack is read, so a `200 OK`
     /// means "accepted on this stream", not "accepted then hung up".
     async fn hello_roundtrip(manager: Arc<ReplicationManager>, hello: ReplHello) -> ReplHelloAck {
+        let remote = hello.leader_node_id.clone();
+        hello_roundtrip_from(manager, &remote, hello).await
+    }
+
+    /// `hello_roundtrip` with the dialing peer's mesh identity given
+    /// explicitly, for Hellos that claim a leader other than their sender.
+    async fn hello_roundtrip_from(
+        manager: Arc<ReplicationManager>,
+        remote: &str,
+        hello: ReplHello,
+    ) -> ReplHelloAck {
+        let remote = remote.to_string();
         let (leader_side, follower_side) = tokio::io::duplex(16 * 1024);
         let (mut leader_recv, mut leader_send) = split(leader_side);
         let (follower_recv, follower_send) = split(follower_side);
         tokio::spawn(async move {
             manager
-                .accept_stream(
-                    "leader".to_string(),
-                    Box::new(follower_recv),
-                    Box::new(follower_send),
-                )
+                .accept_stream(remote, Box::new(follower_recv), Box::new(follower_send))
                 .await;
         });
         frames::write_frame(&mut leader_send, &ReplFrame::Hello(hello))
@@ -3978,6 +4774,163 @@ mod tests {
         ));
     }
 
+    /// A follower whose registry still holds an older term (the ledger
+    /// row for the new one has not arrived) adopts the term of the Hello it
+    /// accepts, and the newer ledger row arriving afterwards is then a
+    /// metadata update, not a rebuild that stops the live stream. Measured
+    /// in the chaos test: followers kept reporting `Follower { leader: C,
+    /// epoch: 1 }` while streaming from A at epoch 2, and the epoch-2 row's
+    /// arrival tore A's stream down in the middle of its writes.
+    #[tokio::test]
+    async fn a_follower_adopts_the_newer_term_of_the_hello_it_accepts() {
+        let fx = build("F");
+        let replicas = ["A", "C", "F"];
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "C", &replicas, &replicas, 1))
+            .await;
+        let newer = assignment("org", "orders", 0, "A", &replicas, &replicas, 2);
+        let ack = hello_roundtrip(Arc::clone(&fx.manager), hello_from(&newer)).await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower {
+                leader_node_id: "A".to_string(),
+                epoch: 2,
+            }
+        );
+        let runner = fx.follower_factory.handles.lock()[0].clone();
+        fx.manager.apply_assignment(newer).await;
+        assert!(
+            !runner.stopped.load(Ordering::SeqCst),
+            "the ledger row for the adopted term must not rebuild the live follower stream"
+        );
+    }
+
+    /// Review finding 3: a Hello must come from the leader it names. One
+    /// relayed or spoofed by another peer can neither fence this node nor be
+    /// followed — refused before it touches the registry.
+    #[tokio::test]
+    async fn a_hello_naming_a_leader_other_than_its_sender_is_refused() {
+        let fx = build("C");
+        fx.manager
+            .apply_assignment(assignment(
+                "org",
+                "orders",
+                0,
+                "C",
+                &["B", "C"],
+                &["B", "C"],
+                1,
+            ))
+            .await;
+        let own = fx.leader_factory.handles.lock()[0].clone();
+        let ack = hello_roundtrip_from(
+            Arc::clone(&fx.manager),
+            "E",
+            hello_from(&assignment(
+                "org",
+                "orders",
+                0,
+                "B",
+                &["B", "C"],
+                &["B", "C"],
+                2,
+            )),
+        )
+        .await;
+        assert_eq!(ack.reject, Some(ReplReject::LeaderIdentityMismatch));
+        assert!(
+            !own.stopped.load(Ordering::SeqCst),
+            "no fence on a spoofed claim"
+        );
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 1 }
+        ));
+    }
+
+    /// Review finding 3: a claim far past this node's ledger row is refused
+    /// — neither fenced to nor adopted — so a bogus huge epoch cannot pin
+    /// the entry above every real assignment. Within the lead it is taken.
+    #[tokio::test]
+    async fn a_hello_too_far_ahead_of_the_ledger_is_refused() {
+        let fx = build("F");
+        let replicas = ["A", "F"];
+        let row = assignment("org", "orders", 0, "A", &replicas, &replicas, 3);
+        fx.assignments.seed(row.clone());
+        fx.manager.apply_assignment(row).await;
+
+        let far = 3 + MAX_HELLO_EPOCH_LEAD + 1;
+        let ack = hello_roundtrip(
+            Arc::clone(&fx.manager),
+            hello_from(&assignment(
+                "org", "orders", 0, "A", &replicas, &replicas, far,
+            )),
+        )
+        .await;
+        assert_eq!(
+            ack.reject,
+            Some(ReplReject::EpochAheadOfLedger { ledger_epoch: 3 })
+        );
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower {
+                leader_node_id: "A".to_string(),
+                epoch: 3,
+            },
+            "the refused claim must not be adopted"
+        );
+
+        let near = 3 + MAX_HELLO_EPOCH_LEAD;
+        let ack = hello_roundtrip(
+            Arc::clone(&fx.manager),
+            hello_from(&assignment(
+                "org", "orders", 0, "A", &replicas, &replicas, near,
+            )),
+        )
+        .await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+    }
+
+    /// Review finding 5: at an equal epoch the materializer admits only the
+    /// lower leader id, so a follower of B must refuse C's equal-epoch Hello
+    /// rather than stream from it (the adoption rule already refused to
+    /// adopt it, leaving `role()` and the live stream disagreeing).
+    #[tokio::test]
+    async fn an_equal_epoch_hello_from_a_higher_ranked_leader_is_refused() {
+        let fx = build("F");
+        let replicas = ["B", "C", "F"];
+        fx.manager
+            .apply_assignment(assignment("org", "orders", 0, "B", &replicas, &replicas, 2))
+            .await;
+        let ack = hello_roundtrip(
+            Arc::clone(&fx.manager),
+            hello_from(&assignment(
+                "org", "orders", 0, "C", &replicas, &replicas, 2,
+            )),
+        )
+        .await;
+        assert_eq!(ack.reject, Some(ReplReject::StaleEpoch { have: 2 }));
+        assert!(
+            fx.follower_factory.handles.lock().is_empty(),
+            "no stream from C"
+        );
+
+        // The leader it follows, and a lower-ranked one, are still accepted.
+        for leader in ["B", "A"] {
+            let mut replicas: Vec<&str> = replicas.to_vec();
+            replicas.push("A");
+            let ack = hello_roundtrip(
+                Arc::clone(&fx.manager),
+                hello_from(&assignment(
+                    "org", "orders", 0, leader, &replicas, &replicas, 2,
+                )),
+            )
+            .await;
+            assert!(ack.accepted, "{leader}: {:?}", ack.reject);
+        }
+    }
+
     /// The inverse direction must stay a rejection: the node that WINS the
     /// deterministic rule (lower id at an equal epoch) does NOT step down
     /// for the loser's Hello — that is what makes the resolution converge
@@ -4155,5 +5108,76 @@ mod tests {
             "the settled election must still promote normally"
         );
         assert_eq!(fx.leader_factory.spawned.lock().len(), 1);
+    }
+
+    /// The assignment poll can apply a promotion's own row before the
+    /// promotion installs its handle. The promotion must then keep the handle
+    /// the poll attached for the same term — its replica streams may already
+    /// be up — stop its own, and still deliver the election's truncate target.
+    #[tokio::test]
+    async fn a_promotion_keeps_the_leader_handle_the_poll_already_installed_for_its_term() {
+        let fx = build("f1");
+        let key: PartitionKey = ("org".to_string(), "orders".to_string(), 0u32);
+        let base = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            5,
+        );
+        fx.manager.apply_assignment(base).await;
+        let promoted = assignment(
+            "org",
+            "orders",
+            0,
+            "f1",
+            &["l", "f1", "f2"],
+            &["f1", "f2"],
+            6,
+        );
+        fx.assignments.seed(promoted.clone());
+        fx.manager.apply_assignment(promoted.clone()).await;
+        assert_eq!(fx.leader_factory.handles.lock().len(), 1);
+
+        fx.manager
+            .execute_promotion_actions(
+                &key,
+                &promoted,
+                vec![
+                    PromotionAction::SetLeaderEpoch(6),
+                    PromotionAction::StartFeeders,
+                    PromotionAction::SendTruncate {
+                        node: "f2".to_string(),
+                        to: 5,
+                    },
+                ],
+            )
+            .await;
+
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 6 }
+        );
+        let handles = fx.leader_factory.handles.lock();
+        assert_eq!(
+            handles.len(),
+            2,
+            "the promotion spawns its own handle first"
+        );
+        assert!(
+            !handles[0].stopped.load(Ordering::SeqCst),
+            "the handle the poll installed for this term must keep serving"
+        );
+        assert!(
+            handles[1].stopped.load(Ordering::SeqCst),
+            "the promotion's surplus handle must be stopped, not leaked"
+        );
+        assert_eq!(
+            *handles[0].truncated.lock(),
+            vec![("f2".to_string(), 5)],
+            "the election's truncate target must reach the serving handle"
+        );
     }
 }

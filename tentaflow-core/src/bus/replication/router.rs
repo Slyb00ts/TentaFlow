@@ -342,7 +342,7 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                 .ok()
                 .and_then(|id| managers().get(&id).map(|e| e.value().clone()));
             match target {
-                Some(mgr) => mgr.accept_hello(hello, recv, send).await,
+                Some(mgr) => mgr.accept_hello(&remote_hex, hello, recv, send).await,
                 None => {
                     tracing::warn!(
                         peer = %remote_hex,

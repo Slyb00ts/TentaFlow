@@ -1,13 +1,15 @@
 // ===== File: partition.rs — single-writer partition, monotonic offsets, readers =====
 //
 // PLAN.md §5.3.4/§2.2: exactly one writer per partition, fed by a bounded
-// `tokio::sync::mpsc` channel; a full channel returns `Throttled` instead of
-// growing a buffer. The channel's blocking variants (`try_send`,
-// `blocking_recv`) do not need an active Tokio `Runtime`, so this whole
-// module — including the dedicated writer thread — stays synchronous by
-// default; `append_batch_async` is the async twin for callers already
-// running on a Tokio worker thread, where `append_batch`'s
-// `resp_rx.blocking_recv()` would panic.
+// `std::sync::mpsc::sync_channel`; a full channel returns `Throttled`
+// instead of growing a buffer. Producers only ever `try_send`, and the
+// writer thread waits with `recv`/`recv_timeout` — the timeout is what
+// drives `Durability::FsyncInterval`'s fsync (see `writer_loop`). None of
+// that needs a Tokio `Runtime`, so this whole module — including the
+// dedicated writer thread — stays synchronous by default;
+// `append_batch_async` is the async twin for callers already running on a
+// Tokio worker thread, where `append_batch`'s `resp_rx.blocking_recv()`
+// would panic.
 //
 // Offset assignment is the writer's job, not the producer's: a batch built
 // with `BatchBuilder` carries a placeholder `base_offset`, and the writer
@@ -18,11 +20,15 @@
 // Group commit: the writer thread drains the channel up to a small
 // job/byte budget before performing any I/O, does one positional write per
 // job, then exactly one fsync covering the whole group, then acks every job
-// in the group. Per-producer durability is unchanged — a producer's
-// `oneshot` only resolves once the fsync covering *its* batch has completed
-// — but N batches now share one fsync instead of paying for N, which is
-// what keeps a single-fsync-per-append cost from becoming the throughput
-// ceiling under concurrent producers.
+// in the group. Per-producer durability is unchanged — under the per-batch
+// policies a producer's `oneshot` only resolves once the fsync covering
+// *its* batch has completed — but N batches now share one fsync instead of
+// paying for N, which is what keeps a single-fsync-per-append cost from
+// becoming the throughput ceiling under concurrent producers.
+// `Durability::FsyncInterval` never fsyncs inside a group at all: its
+// producers are acked before the fsync by definition (the `standard`
+// class's bounded loss window), so the fsync runs from the writer's own
+// timer instead — see `writer_loop`.
 //
 // A group's fsync only ever covers the *currently active* segment, so a
 // failure that follows a roll partway through the same group needs two
@@ -74,15 +80,14 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-// Two independent `mpsc`s in this module, deliberately never confused:
-// `mpsc` (tokio's) carries `WriterCommand`s to the writer thread, whose
-// `Sender::try_send`/hot-path `Receiver::blocking_recv()` are safe without
-// an active Runtime by design; `std_mpsc` (std's) carries the *reply* for
-// `Truncate`/`PersistMeta` specifically because tokio's own
-// `blocking_send`/`blocking_recv` panic when called from *any* Tokio
-// runtime context — see `send_and_wait_via_writer_thread`'s doc.
+// `std_mpsc` carries `WriterCommand`s to the writer thread and the *reply*
+// for `Truncate`/`PersistMeta`: std's channels have no Tokio awareness, so
+// blocking on them never trips tokio's "cannot block from within a
+// runtime" panic (see `send_and_wait_via_writer_thread`'s doc), and the
+// command channel's `recv_timeout` is the writer's fsync timer. Append
+// replies are tokio `oneshot`s so `append_batch_async` can await them.
 use std::sync::mpsc as std_mpsc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::batch::{BatchHeader, BatchView, BATCH_HEADER_LEN};
 use crate::error::{BusError, Result};
@@ -125,7 +130,14 @@ pub enum Durability {
     /// durability barrier PLAN §5.3.6 calls out, falling back to the same
     /// behavior as `FsyncBatch` on every other platform.
     FsyncBatchFull,
-    /// fsync at most once per interval, batching fsyncs across appends.
+    /// fsync from the writer's own timer, never inside an append: every
+    /// write is fsynced at most this long after it landed (plus the fsync
+    /// itself and, if the writer is mid-group at the deadline, that group),
+    /// including the last writes before the partition goes quiet. Producers
+    /// are acked before that fsync — PLAN §5.3.5's `standard` class loss
+    /// window. A failed timer fsync poisons the partition
+    /// (`BusError::PartitionPoisoned`): the writes it covered were already
+    /// acknowledged and cannot be rolled back.
     FsyncInterval(Duration),
 }
 
@@ -330,6 +342,16 @@ struct PartitionState {
     /// caller-facing error) is different: the writer thread here is not
     /// panicking, it is refusing to risk reusing an offset.
     fsync_poisoned: AtomicBool,
+    /// Completed fsyncs of the active segment by the writer — per group
+    /// under the per-batch policies, per timer tick under `FsyncInterval`.
+    /// Observability only (`Partition::fsync_count`).
+    fsync_count: AtomicU64,
+    /// Completed truncations that actually discarded records
+    /// (`Partition::truncation_count`).
+    truncations: AtomicU64,
+    /// Test-only fault injection: the next timer fsync reports failure.
+    #[cfg(test)]
+    fail_interval_fsync: AtomicBool,
     /// Set once by `Partition::detach` (the owning topic/organization was
     /// deleted). Every read/write operation checks this before touching
     /// `segments`, which `detach` has cleared.
@@ -386,11 +408,53 @@ fn prealloc_bytes(roll_policy: &RollPolicy) -> u64 {
     }
 }
 
+/// `Partition::open`'s check of one sealed segment: it must begin where the
+/// previous segment ended (`expected_start`, when known), and its first
+/// batch must carry the offset the segment is named after. Either mismatch
+/// refuses the open — see `BusError::SegmentOffsetMismatch`.
+fn check_segment_start(
+    seg: &Segment,
+    dir: &Path,
+    base_offset: u64,
+    expected_start: Option<u64>,
+) -> Result<()> {
+    let path = segment::log_path(dir, base_offset);
+    if let Some(expected) = expected_start {
+        if expected != base_offset {
+            return Err(BusError::SegmentOffsetMismatch {
+                path,
+                expected_offset: expected,
+                found_offset: base_offset,
+            });
+        }
+    }
+    if let Some(first) = seg.batch_header_at(0)? {
+        if first.base_offset != base_offset {
+            return Err(BusError::SegmentOffsetMismatch {
+                path,
+                expected_offset: base_offset,
+                found_offset: first.base_offset,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Seals the active segment and opens the next one at `next_base_offset` —
+/// the offset of the batch about to be appended, i.e. the writer's group
+/// cursor. NOT `state.log_end_offset`: that is published only after the
+/// whole group lands (`process_group`), so a roll partway through a group
+/// read a stale value and named the new segment after an offset the
+/// previous segment still holds. A reader's floor lookup then picked the new
+/// segment for those offsets and returned a later batch — replication feeds
+/// failed their `OffsetInvariant` check on every reconnect (the pipelined
+/// P7 stall) and a consumer fetch at those offsets skipped records.
 fn roll(
     dir: &Path,
     roll_policy: &RollPolicy,
     state: &PartitionState,
     handles: &mut WriterHandles,
+    next_base_offset: u64,
 ) -> Result<()> {
     // Seal the outgoing segment durably regardless of the durability policy
     // — a segment boundary is a natural, infrequent point to pay for fsync
@@ -400,7 +464,6 @@ fn roll(
     handles.active_segment.fsync()?;
     handles.active_segment.truncate_to_len()?;
 
-    let next_base_offset = state.log_end_offset.load(Ordering::Acquire);
     let new_segment = Segment::create_new(dir, next_base_offset, prealloc_bytes(roll_policy))?;
     let new_offset_index =
         OffsetIndex::open_or_create(segment::offset_index_path(dir, next_base_offset))?;
@@ -504,7 +567,7 @@ fn append_one(
     base_offset: u64,
 ) -> Result<Landed> {
     if handles.active_segment.should_roll(roll_policy) {
-        roll(dir, roll_policy, state, handles)?;
+        roll(dir, roll_policy, state, handles, base_offset)?;
     }
 
     let (header, patched, skip_hw) = match kind {
@@ -643,6 +706,79 @@ fn plan_fsync_failure_response(
     (rollback, straddled)
 }
 
+/// Runs one fsync of the active segment, feeding the `fsync_us` reservoir
+/// and `fsync_count`; `Some(error)` on failure.
+fn timed_fsync(state: &PartitionState, fsync: impl FnOnce() -> Result<()>) -> Option<BusError> {
+    let fsync_start = Instant::now();
+    let result = fsync();
+    crate::metrics::record_fsync_us(fsync_start.elapsed().as_micros() as u64);
+    match result {
+        Ok(()) => {
+            state.fsync_count.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+        Err(e) => Some(e),
+    }
+}
+
+/// `Durability::FsyncInterval`'s timer tick: fsyncs every write since the
+/// last one. On failure the partition is poisoned, the same response the
+/// append path gives an fsync failure it cannot roll back: the writes
+/// covered here were already acknowledged, so nothing may be appended (and
+/// no offset reused) on top of a log whose recent tail may not be on disk
+/// until the directory is reopened and crash recovery re-validates it.
+fn sync_interval_tail(
+    state: &PartitionState,
+    handles: &WriterHandles,
+    unsynced_since: &mut Option<Instant>,
+) -> LoopControl {
+    #[cfg(test)]
+    if state.fail_interval_fsync.load(Ordering::Acquire) {
+        let injected = BusError::io(
+            handles.active_segment.path(),
+            std::io::Error::other("injected interval fsync failure"),
+        );
+        return settle_interval_fsync(
+            state,
+            handles.active_segment.path(),
+            unsynced_since,
+            Some(injected),
+        );
+    }
+    let outcome = timed_fsync(state, || handles.active_segment.fsync());
+    settle_interval_fsync(
+        state,
+        handles.active_segment.path(),
+        unsynced_since,
+        outcome,
+    )
+}
+
+/// `sync_interval_tail`'s decision, separate from the syscall so the
+/// failure branch is testable (this crate cannot force a real fsync error).
+fn settle_interval_fsync(
+    state: &PartitionState,
+    path: &Path,
+    unsynced_since: &mut Option<Instant>,
+    outcome: Option<BusError>,
+) -> LoopControl {
+    match outcome {
+        None => {
+            *unsynced_since = None;
+            LoopControl::Continue
+        }
+        Some(e) => {
+            state.fsync_poisoned.store(true, Ordering::Release);
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "interval fsync failed; partition is now poisoned, reopen it to resume writing"
+            );
+            LoopControl::Stop
+        }
+    }
+}
+
 /// Processes one drained group of jobs: appends every job's batch (each
 /// independently succeeding or failing), performs exactly one fsync for the
 /// whole group per the durability policy, then publishes every successful
@@ -660,7 +796,7 @@ fn process_group(
     durability: Durability,
     state: &PartitionState,
     handles: &mut WriterHandles,
-    last_fsync: &mut Instant,
+    unsynced_since: &mut Option<Instant>,
     jobs: Vec<AppendJob>,
 ) -> bool {
     let mut cursor = state.log_end_offset.load(Ordering::Acquire);
@@ -687,38 +823,23 @@ fn process_group(
     let any_ok = landed.iter().any(|(_, r)| r.is_ok());
     // Metrics (PLAN §8.4): each branch below records `fsync_us` only when
     // it actually calls `fsync`/`fsync_full` — `Durability::Os` never
-    // fsyncs, and `FsyncInterval` skips it between ticks — so the
-    // `tentaflow_bus_fsync_p99_us` reservoir stays empty on a durability
-    // policy or cadence that never runs an fsync.
+    // fsyncs, and `FsyncInterval` fsyncs from `writer_loop`'s timer, not
+    // here — so the `tentaflow_bus_fsync_p99_us` reservoir stays empty on a
+    // durability policy that never runs an fsync.
     let fsync_err: Option<String> = if any_ok {
         match durability {
             Durability::Os => None,
             Durability::FsyncBatch => {
-                let fsync_start = Instant::now();
-                let r = handles.active_segment.fsync().err().map(|e| e.to_string());
-                crate::metrics::record_fsync_us(fsync_start.elapsed().as_micros() as u64);
-                r
+                timed_fsync(state, || handles.active_segment.fsync()).map(|e| e.to_string())
             }
             Durability::FsyncBatchFull => {
-                let fsync_start = Instant::now();
-                let r = handles
-                    .active_segment
-                    .fsync_full()
-                    .err()
-                    .map(|e| e.to_string());
-                crate::metrics::record_fsync_us(fsync_start.elapsed().as_micros() as u64);
-                r
+                timed_fsync(state, || handles.active_segment.fsync_full()).map(|e| e.to_string())
             }
-            Durability::FsyncInterval(interval) => {
-                if last_fsync.elapsed() >= interval {
-                    let fsync_start = Instant::now();
-                    let r = handles.active_segment.fsync().err().map(|e| e.to_string());
-                    crate::metrics::record_fsync_us(fsync_start.elapsed().as_micros() as u64);
-                    *last_fsync = Instant::now();
-                    r
-                } else {
-                    None
-                }
+            Durability::FsyncInterval(_) => {
+                // The deadline runs from the OLDEST unsynced write, so a
+                // later write never postpones the fsync of an earlier one.
+                unsynced_since.get_or_insert_with(Instant::now);
+                None
             }
         }
     } else {
@@ -819,11 +940,12 @@ fn process_group(
             // Published regardless of `HwTracking`/`skip_hw`: `subscribe_leo`
             // tracks `log_end_offset`, not `high_watermark` — see its own
             // doc. This send happens strictly after the `log_end_offset`
-            // store above and strictly after the fsync this whole
-            // publish loop only runs once decided, so a receiver that
-            // observes this change is guaranteed the corresponding bytes
-            // are already durable (group-commit fsync) and visible to
-            // readers (`desc.len` was just published above too).
+            // store above and strictly after this group's durability
+            // decision, so a receiver that observes this change is
+            // guaranteed the corresponding bytes are as durable as the
+            // policy promises at ack time (fsynced under the per-batch
+            // policies; within `FsyncInterval`'s window otherwise) and
+            // visible to readers (`desc.len` was just published above too).
             let _ = state.leo_watch_tx.send(l.next_offset);
             l.append_result
         });
@@ -986,6 +1108,9 @@ fn truncate(
     };
     drop(segments);
 
+    // Counted before the new `log_end_offset` is published, so a reader that
+    // sees the lowered offset also sees the count move.
+    state.truncations.fetch_add(1, Ordering::AcqRel);
     state.log_end_offset.store(new_leo, Ordering::Release);
     let _ = state.leo_watch_tx.send(new_leo);
 
@@ -1034,10 +1159,10 @@ fn run_append_group(
     durability: Durability,
     state: &PartitionState,
     handles: &mut WriterHandles,
-    last_fsync: &mut Instant,
+    unsynced_since: &mut Option<Instant>,
     jobs: Vec<AppendJob>,
 ) -> LoopControl {
-    // `&mut handles`/`&mut last_fsync` are not `UnwindSafe` by default
+    // `&mut handles`/`&mut unsynced_since` are not `UnwindSafe` by default
     // (mutable references), hence the explicit assertion.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         process_group(
@@ -1046,7 +1171,7 @@ fn run_append_group(
             durability,
             state,
             handles,
-            last_fsync,
+            unsynced_since,
             jobs,
         )
     }));
@@ -1080,7 +1205,7 @@ fn run_append_group(
 /// instead of being silently dropped or reordered behind appends that
 /// arrived *after* it on the channel.
 fn drain_append_group(
-    rx: &mut mpsc::Receiver<WriterCommand>,
+    rx: &std_mpsc::Receiver<WriterCommand>,
     jobs: &mut Vec<AppendJob>,
     group_bytes: &mut usize,
 ) -> Option<WriterCommand> {
@@ -1171,29 +1296,35 @@ fn persist_meta_and_track(
 /// The 500 ms `partition.meta` persistence cadence (PLAN-M2 §1a) is
 /// applied opportunistically right after whatever this loop iteration just
 /// did, rather than on a dedicated timer thread: an idle writer (blocked in
-/// `rx.blocking_recv()` below) has no in-flight `high_watermark` change to
+/// `next_writer_command` below) has no in-flight `high_watermark` change to
 /// miss, because every way `high_watermark` can change in this build
 /// (`AppendReplicated`/`Truncate` applying a leader's frames, or a direct
 /// `flush_meta`/`PersistMeta` call) itself keeps this thread busy — there
 /// is no code path that advances `high_watermark` without also sending
 /// this thread a command.
+///
+/// Unsynced data is different: under `Durability::FsyncInterval` the last
+/// writes before a quiet period would otherwise stay unsynced until the next
+/// command, roll or shutdown, so `next_writer_command` bounds its wait by
+/// the fsync deadline (see `Durability::FsyncInterval`).
 fn writer_loop(
     dir: PathBuf,
     roll_policy: RollPolicy,
     durability: Durability,
-    mut rx: mpsc::Receiver<WriterCommand>,
+    rx: std_mpsc::Receiver<WriterCommand>,
     state: Arc<PartitionState>,
     mut handles: WriterHandles,
 ) {
-    let mut last_fsync = Instant::now();
+    let mut unsynced_since: Option<Instant> = None;
     let mut last_meta_flush = Instant::now();
     let mut last_persisted_hw = state.high_watermark.load(Ordering::Acquire);
 
     loop {
-        let first = match rx.blocking_recv() {
-            Some(cmd) => cmd,
-            None => break,
-        };
+        let first =
+            match next_writer_command(&rx, durability, &state, &handles, &mut unsynced_since) {
+                Some(cmd) => cmd,
+                None => break,
+            };
 
         let mut pending_control: Option<WriterCommand> = None;
         let control = match first {
@@ -1203,14 +1334,14 @@ fn writer_loop(
                     kind: AppendKind::Fresh(batch),
                     resp,
                 }];
-                pending_control = drain_append_group(&mut rx, &mut jobs, &mut group_bytes);
+                pending_control = drain_append_group(&rx, &mut jobs, &mut group_bytes);
                 run_append_group(
                     &dir,
                     &roll_policy,
                     durability,
                     &state,
                     &mut handles,
-                    &mut last_fsync,
+                    &mut unsynced_since,
                     jobs,
                 )
             }
@@ -1227,14 +1358,14 @@ fn writer_loop(
                     },
                     resp,
                 }];
-                pending_control = drain_append_group(&mut rx, &mut jobs, &mut group_bytes);
+                pending_control = drain_append_group(&rx, &mut jobs, &mut group_bytes);
                 run_append_group(
                     &dir,
                     &roll_policy,
                     durability,
                     &state,
                     &mut handles,
-                    &mut last_fsync,
+                    &mut unsynced_since,
                     jobs,
                 )
             }
@@ -1324,9 +1455,53 @@ fn writer_loop(
     let _ = handles.active_segment.fsync();
 }
 
+/// Next command for the writer, or `None` once the channel is closed or an
+/// interval fsync failed. Waits no longer than the `FsyncInterval` deadline
+/// of the oldest unsynced write and runs that fsync when it comes due —
+/// checked BEFORE receiving, so a writer kept busy by back-to-back commands
+/// still fsyncs on time (a zero-timeout receive would hand it the next
+/// command instead).
+fn next_writer_command(
+    rx: &std_mpsc::Receiver<WriterCommand>,
+    durability: Durability,
+    state: &PartitionState,
+    handles: &WriterHandles,
+    unsynced_since: &mut Option<Instant>,
+) -> Option<WriterCommand> {
+    loop {
+        // `checked_add`: an interval too large for `Instant` (a
+        // misconfigured `Duration::MAX`, say) means "never by timer" rather
+        // than a panic on the writer thread; roll and shutdown still fsync.
+        let deadline = match (durability, *unsynced_since) {
+            (Durability::FsyncInterval(interval), Some(since)) => {
+                match since.checked_add(interval) {
+                    Some(deadline) => deadline,
+                    None => return rx.recv().ok(),
+                }
+            }
+            _ => return rx.recv().ok(),
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            if matches!(
+                sync_interval_tail(state, handles, unsynced_since),
+                LoopControl::Stop
+            ) {
+                return None;
+            }
+            continue;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(cmd) => return Some(cmd),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
 struct PartitionInner {
     state: Arc<PartitionState>,
-    tx: Option<mpsc::Sender<WriterCommand>>,
+    tx: Option<std_mpsc::SyncSender<WriterCommand>>,
     writer_thread: Option<JoinHandle<()>>,
     throttle_hint_ms: u32,
     /// Held for the partition's lifetime purely for its `Drop` effect:
@@ -1348,7 +1523,7 @@ const WRITER_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 impl Drop for PartitionInner {
     fn drop(&mut self) {
         // Dropping the sender closes the channel, which unblocks the
-        // writer thread's `blocking_recv()` with `None` and ends its loop.
+        // writer thread's receive as disconnected and ends its loop.
         self.tx.take();
         if let Some(handle) = self.writer_thread.take() {
             // `handle.join()` itself has no timeout, so a watcher thread
@@ -1384,43 +1559,16 @@ impl Drop for PartitionInner {
     }
 }
 
-/// How long `send_writer_command_blocking` waits between `try_send` retries
-/// while the writer's command queue is momentarily full. `Truncate`/
-/// `PersistMeta` are rare, administrative operations (one per failover,
-/// leader-epoch change, or explicit flush) racing a channel whose normal
-/// occupant is the hot append path, so a short fixed backoff — rather than
-/// `blocking_send`'s internal parking — is simplest and, unlike
-/// `blocking_send`, never risks tokio's "cannot block from within a
-/// runtime" panic (`try_send` does not check for a Tokio runtime at all).
-const CONTROL_COMMAND_RETRY_INTERVAL: Duration = Duration::from_millis(1);
-
-/// Sends `cmd` to the writer thread, retrying `try_send` until it succeeds
-/// or the channel is closed. Deliberately never uses tokio's
-/// `Sender::blocking_send`: that method panics with "Cannot block the
-/// current thread from within a runtime" whenever called from *any* Tokio
-/// runtime context (current-thread or multi-thread alike), which is
-/// exactly the situation `Truncate`/`PersistMeta` callers are in when
-/// `Partition::truncate_to_offset`/`flush_meta`/`set_leader_epoch` (all
-/// frozen-contract sync fns with no async twin) are invoked from async
-/// code such as `bus::replication::follower`. `try_send` performs no such
-/// check — it is a plain, always-safe non-blocking attempt — so retrying
-/// it in a loop sidesteps the panic entirely, at the cost of a small fixed
-/// poll interval instead of being woken the instant a slot frees up; an
-/// acceptable trade for operations this rare.
+/// Sends a control command (`Truncate`/`PersistMeta`) to the writer
+/// thread, blocking while its queue is full. std's `SyncSender::send` has
+/// no Tokio awareness, so this never trips tokio's "cannot block from
+/// within a runtime" panic; callers on a multi-thread worker still wrap the
+/// whole exchange in `send_and_wait_via_writer_thread`.
 fn send_writer_command_blocking(
-    tx: &mpsc::Sender<WriterCommand>,
-    mut cmd: WriterCommand,
+    tx: &std_mpsc::SyncSender<WriterCommand>,
+    cmd: WriterCommand,
 ) -> Result<()> {
-    loop {
-        match tx.try_send(cmd) {
-            Ok(()) => return Ok(()),
-            Err(mpsc::error::TrySendError::Full(returned)) => {
-                cmd = returned;
-                std::thread::sleep(CONTROL_COMMAND_RETRY_INTERVAL);
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(BusError::WriterClosed),
-        }
-    }
+    tx.send(cmd).map_err(|_| BusError::WriterClosed)
 }
 
 /// Runs `wait` (send `cmd` to the writer thread, then block on `resp_rx`
@@ -1551,10 +1699,20 @@ impl Partition {
             let (sealed, last_slice) = base_offsets.split_at(base_offsets.len() - 1);
             let last_base = last_slice[0];
 
+            // Where the next segment must begin: the previous sealed
+            // segment's end, when its index names its last batch.
+            let mut expected_next: Option<u64> = None;
             for &base_offset in sealed {
                 let seg = Segment::open_sealed(&dir, base_offset)?;
+                check_segment_start(&seg, &dir, base_offset, expected_next)?;
                 let oidx =
                     OffsetIndex::open_or_create(segment::offset_index_path(&dir, base_offset))?;
+                expected_next = match oidx.last() {
+                    Some(last) => seg
+                        .batch_header_at(u64::from(last.file_pos))?
+                        .map(|h| h.next_offset()),
+                    None => None,
+                };
                 let tidx = TimeIndex::open_or_create(segment::time_index_path(&dir, base_offset))?;
                 segments_state.push(Arc::new(SegmentDescriptor {
                     base_offset,
@@ -1566,6 +1724,15 @@ impl Partition {
                 }));
             }
 
+            if let Some(expected) = expected_next {
+                if expected != last_base {
+                    return Err(BusError::SegmentOffsetMismatch {
+                        path: segment::log_path(&dir, last_base),
+                        expected_offset: expected,
+                        found_offset: last_base,
+                    });
+                }
+            }
             let (seg, recovered) = Segment::open_active_with_recovery(&dir, last_base)?;
             let mut oidx =
                 OffsetIndex::open_or_create(segment::offset_index_path(&dir, last_base))?;
@@ -1666,10 +1833,14 @@ impl Partition {
             leo_watch_tx,
             poisoned: AtomicBool::new(false),
             fsync_poisoned: AtomicBool::new(false),
+            fsync_count: AtomicU64::new(0),
+            truncations: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_interval_fsync: AtomicBool::new(false),
             detached: AtomicBool::new(false),
         });
 
-        let (tx, rx) = mpsc::channel(channel_capacity.max(1));
+        let (tx, rx) = std_mpsc::sync_channel(channel_capacity.max(1));
         let handles = WriterHandles {
             active_segment,
             active_offset_index,
@@ -1737,7 +1908,7 @@ impl Partition {
             resp: resp_tx,
         }) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(cmd)) => {
+            Err(std_mpsc::TrySendError::Full(cmd)) => {
                 let batch = match cmd {
                     WriterCommand::Append { batch, .. } => batch,
                     _ => unreachable!("this call only ever sends WriterCommand::Append"),
@@ -1747,7 +1918,7 @@ impl Partition {
                     batch,
                 });
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(BusError::WriterClosed),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => return Err(BusError::WriterClosed),
         }
         resp_rx
             .blocking_recv()
@@ -1778,7 +1949,7 @@ impl Partition {
             resp: resp_tx,
         }) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(cmd)) => {
+            Err(std_mpsc::TrySendError::Full(cmd)) => {
                 let batch = match cmd {
                     WriterCommand::Append { batch, .. } => batch,
                     _ => unreachable!("this call only ever sends WriterCommand::Append"),
@@ -1788,13 +1959,29 @@ impl Partition {
                     batch,
                 });
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(BusError::WriterClosed),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => return Err(BusError::WriterClosed),
         }
         resp_rx.await.map_err(|_| BusError::WriterClosed)?
     }
 
     pub fn log_end_offset(&self) -> u64 {
         self.inner.state.log_end_offset.load(Ordering::Acquire)
+    }
+
+    /// How many fsyncs of the active segment the writer has completed —
+    /// one per group under the per-batch policies, one per timer tick under
+    /// `Durability::FsyncInterval`. An fsync counted after an append was
+    /// acknowledged covers that append.
+    pub fn fsync_count(&self) -> u64 {
+        self.inner.state.fsync_count.load(Ordering::Relaxed)
+    }
+
+    /// How many truncations have discarded records from this partition
+    /// since it was opened. An offset observed before and after with the
+    /// count unchanged still names the same record; a changed count means
+    /// the log may have been cut below it and regrown with different bytes.
+    pub fn truncation_count(&self) -> u64 {
+        self.inner.state.truncations.load(Ordering::Acquire)
     }
 
     /// The offset up to which records are visible to consumers (PLAN-M2
@@ -1913,7 +2100,7 @@ impl Partition {
             resp: resp_tx,
         }) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(cmd)) => {
+            Err(std_mpsc::TrySendError::Full(cmd)) => {
                 let batch = match cmd {
                     WriterCommand::AppendReplicated { batch, .. } => batch,
                     _ => unreachable!("this call only ever sends WriterCommand::AppendReplicated"),
@@ -1923,7 +2110,7 @@ impl Partition {
                     batch,
                 });
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(BusError::WriterClosed),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => return Err(BusError::WriterClosed),
         }
         resp_rx
             .blocking_recv()
@@ -1947,7 +2134,7 @@ impl Partition {
             resp: resp_tx,
         }) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(cmd)) => {
+            Err(std_mpsc::TrySendError::Full(cmd)) => {
                 let batch = match cmd {
                     WriterCommand::AppendReplicated { batch, .. } => batch,
                     _ => unreachable!("this call only ever sends WriterCommand::AppendReplicated"),
@@ -1957,7 +2144,7 @@ impl Partition {
                     batch,
                 });
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(BusError::WriterClosed),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => return Err(BusError::WriterClosed),
         }
         resp_rx.await.map_err(|_| BusError::WriterClosed)?
     }
@@ -3755,36 +3942,270 @@ mod tests {
         reopened.append_batch(one_record_batch(0, 8)).unwrap();
     }
 
-    // ===== M2 (PLAN-M2 §1a): high_watermark/leader_epoch/replication contract =====
-
-    /// A1/A2 (PLAN-M2 §4.1): no `partition.meta` file exists yet, so both a
-    /// brand-new partition and one reopened after writes (simulating an M1
-    /// partition upgraded in place) must observe `hw == leo` — the
-    /// fallback this wave's contract promises.
+    /// A roll that falls in the middle of a group commit must name the new
+    /// segment after the batch that opens it. Bursts of queued appends make
+    /// the writer group several jobs, and `max_batches: 3` puts roll points
+    /// inside those groups; afterwards every batch must be found at its own
+    /// offset (the floor contract) and every segment must start at its name.
+    /// With the new segment named after the pre-group `log_end_offset`, a
+    /// fetch at the offsets between that stale name and the real first batch
+    /// returned the later batch instead.
     #[test]
-    fn high_watermark_tracks_log_end_offset_with_no_replication_coordinator() {
-        let dir = temp_dir("partition-hw-default");
-        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
-        assert_eq!(part.high_watermark(), 0);
-        assert_eq!(part.high_watermark(), part.log_end_offset());
-
-        part.append_batch(one_record_batch(0, 8)).unwrap();
-        part.append_batch(one_record_batch(0, 8)).unwrap();
-        assert_eq!(part.high_watermark(), 2);
-        assert_eq!(part.high_watermark(), part.log_end_offset());
+    fn a_roll_inside_a_group_names_the_new_segment_after_its_first_batch() {
+        let dir = temp_dir("partition-mid-group-roll");
+        let policy = RollPolicy {
+            max_batches: 3,
+            ..RollPolicy::default()
+        };
+        let part = Partition::open(&dir, policy, Durability::FsyncBatch, 64).unwrap();
+        const BURSTS: u64 = 6;
+        const PER_BURST: u64 = 8;
+        for _ in 0..BURSTS {
+            let target = part.log_end_offset() + PER_BURST;
+            // Enqueue the whole burst without waiting for any ack: the writer
+            // is still fsyncing the burst's first job when the rest arrive,
+            // so they are drained as one group.
+            for _ in 0..PER_BURST {
+                let _ = poll_once(part.append_batch_async(one_record_batch(0, 8)));
+            }
+            let started = Instant::now();
+            while part.log_end_offset() < target {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "burst never fully landed: leo {} of {target}",
+                    part.log_end_offset()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(part.log_end_offset(), BURSTS * PER_BURST);
 
         let reader = part.open_reader();
-        assert_eq!(reader.high_watermark(), 2);
+        for offset in 0..BURSTS * PER_BURST {
+            let batches = reader.fetch_from_offset(offset, 1).unwrap();
+            assert_eq!(
+                batches.first().map(|b| b.header().base_offset),
+                Some(offset),
+                "fetch at {offset} must return the batch holding it"
+            );
+        }
+        assert!(
+            part.sealed_segments()
+                .iter()
+                .any(|s| s.base_offset % PER_BURST != 0),
+            "no segment boundary fell inside a burst — the scenario was not exercised"
+        );
+        for segment in part.sealed_segments() {
+            let first = reader
+                .fetch_from_offset(segment.base_offset, 1)
+                .unwrap()
+                .first()
+                .map(|b| b.header().base_offset);
+            assert_eq!(first, Some(segment.base_offset), "segment {segment:?}");
+        }
+    }
 
-        drop(part);
-        drop(reader);
+    /// `Durability::FsyncInterval` (the `standard` class): the last write
+    /// before a partition goes quiet must still be fsynced within the
+    /// interval. Nothing is appended after it, so only the writer's own
+    /// timer can cover it — the write path used to fsync solely on the next
+    /// append, leaving a quiet partition's tail unsynced indefinitely. The
+    /// second write proves the timer re-arms after it has fired once.
+    #[test]
+    fn interval_fsync_covers_a_quiet_partitions_last_write() {
+        let dir = temp_dir("partition-interval-quiet");
+        let interval = Duration::from_millis(50);
+        let part = Partition::open(
+            &dir,
+            RollPolicy::default(),
+            Durability::FsyncInterval(interval),
+            8,
+        )
+        .unwrap();
+        // Generous against a loaded host; the bound under test is "happens
+        // without another append", not the exact deadline.
+        let budget = Duration::from_secs(5);
+        for expected in 1..=2u64 {
+            part.append_batch(one_record_batch(0, 8)).unwrap();
+            let acked_at = Instant::now();
+            while part.fsync_count() < expected {
+                assert!(
+                    acked_at.elapsed() < budget,
+                    "write {expected} of a quiet partition was never fsynced \
+                     (fsync_count={}, waited {:?})",
+                    part.fsync_count(),
+                    acked_at.elapsed()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
 
-        // Reopen: no partition.meta exists, so hw must fall back to leo,
-        // not reset to 0.
+    /// A writer that never goes idle must still fsync on the interval — the
+    /// deadline is checked before every receive, not only when a receive
+    /// times out.
+    #[test]
+    fn interval_fsync_keeps_its_cadence_under_back_to_back_appends() {
+        let dir = temp_dir("partition-interval-busy");
+        let part = Partition::open(
+            &dir,
+            RollPolicy::default(),
+            Durability::FsyncInterval(Duration::from_millis(20)),
+            64,
+        )
+        .unwrap();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(300) {
+            part.append_batch(one_record_batch(0, 8)).unwrap();
+        }
+        assert!(
+            part.fsync_count() >= 3,
+            "300 ms of continuous appends at a 20 ms interval fsynced only {} times",
+            part.fsync_count()
+        );
+    }
+
+    /// A failed interval fsync cannot be rolled back — the writes it covered
+    /// were already acknowledged — so it must poison the partition exactly
+    /// like the append path's unrecoverable fsync failure, and stop the
+    /// writer thread: nothing more may be appended on top of a tail that may
+    /// not be on disk.
+    #[test]
+    fn failed_interval_fsync_poisons_the_partition_and_stops_the_writer() {
+        let dir = temp_dir("partition-interval-poison");
+        let part = Partition::open(
+            &dir,
+            RollPolicy::default(),
+            Durability::FsyncInterval(Duration::from_millis(20)),
+            8,
+        )
+        .unwrap();
+        part.inner
+            .state
+            .fail_interval_fsync
+            .store(true, Ordering::Release);
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+
+        let writer = part.inner.writer_thread.as_ref().unwrap();
+        let started = Instant::now();
+        while !writer.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the writer thread kept running after its interval fsync failed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(part.inner.state.fsync_poisoned.load(Ordering::Acquire));
+        assert!(matches!(
+            part.append_batch(one_record_batch(0, 8)),
+            Err(BusError::PartitionPoisoned)
+        ));
+        assert_eq!(part.fsync_count(), 0, "the failed fsync is not counted");
+    }
+
+    /// An interval too large to add to an `Instant` must not panic the
+    /// writer thread; it degrades to "no timer fsync".
+    #[test]
+    fn an_unrepresentable_fsync_interval_does_not_panic_the_writer() {
+        let dir = temp_dir("partition-interval-max");
+        let part = Partition::open(
+            &dir,
+            RollPolicy::default(),
+            Durability::FsyncInterval(Duration::MAX),
+            8,
+        )
+        .unwrap();
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+        assert_eq!(part.log_end_offset(), 2);
+        assert!(!part.inner.writer_thread.as_ref().unwrap().is_finished());
+    }
+
+    /// A segment whose name does not match its first batch — what the
+    /// pre-fix mid-group roll wrote — must refuse to open, not be cut back:
+    /// the cut would drop acknowledged records and later reuse their
+    /// offsets. Covers the active segment (named below the previous
+    /// segment's end) and a sealed one in the middle of the log.
+    #[test]
+    fn a_misnamed_segment_refuses_to_open_instead_of_truncating() {
+        for misnamed in [4u64, 2] {
+            let dir = temp_dir("partition-misnamed-segment");
+            let policy = RollPolicy {
+                max_batches: 2,
+                ..RollPolicy::default()
+            };
+            {
+                let part = Partition::open(&dir, policy, Durability::FsyncBatch, 8).unwrap();
+                for _ in 0..6 {
+                    part.append_batch(one_record_batch(0, 8)).unwrap();
+                }
+                let bases: Vec<u64> = part
+                    .sealed_segments()
+                    .iter()
+                    .map(|s| s.base_offset)
+                    .collect();
+                assert_eq!(bases, vec![0, 2], "segments 0, 2 sealed; 4 active");
+            }
+            let wrong = misnamed - 1;
+            for path_of in [
+                log_path,
+                segment::offset_index_path,
+                segment::time_index_path,
+            ] {
+                std::fs::rename(path_of(&dir, misnamed), path_of(&dir, wrong)).unwrap();
+            }
+            let len_before = std::fs::metadata(log_path(&dir, wrong)).unwrap().len();
+
+            match Partition::open(&dir, policy, Durability::FsyncBatch, 8) {
+                Err(BusError::SegmentOffsetMismatch { .. }) => {}
+                Err(other) => panic!("segment {misnamed}: wrong error {other:?}"),
+                Ok(_) => panic!("segment {misnamed}: a misnamed segment must not open"),
+            }
+            assert_eq!(
+                std::fs::metadata(log_path(&dir, wrong)).unwrap().len(),
+                len_before,
+                "segment {misnamed}: the refused segment must keep every byte"
+            );
+        }
+    }
+
+    /// `partition.meta` can hold a high watermark above what the log still
+    /// has after a crash — the persisted value outlived a tail that never
+    /// reached the disk (e.g. a failed interval fsync, then a restart).
+    /// Recovery must clamp it to the recovered log end, or consumers would
+    /// be told records exist that the log cannot serve.
+    #[test]
+    fn reopen_clamps_a_persisted_high_watermark_to_the_recovered_log_end() {
+        let dir = temp_dir("partition-hw-clamp");
+        {
+            let part =
+                Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+            for _ in 0..5 {
+                part.append_batch(one_record_batch(0, 8)).unwrap();
+            }
+            assert_eq!(part.high_watermark(), 5);
+            part.flush_meta().unwrap();
+        }
+        // Lose the last batch and a half, as a crash before the tail's
+        // fsync would.
+        let log = log_path(&dir, 0);
+        let len = std::fs::metadata(&log).unwrap().len();
+        let one = len / 5;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_len(len - one - one / 2)
+            .unwrap();
+
         let reopened =
             Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
-        assert_eq!(reopened.log_end_offset(), 2);
-        assert_eq!(reopened.high_watermark(), 2);
+        assert_eq!(reopened.log_end_offset(), 3);
+        assert_eq!(
+            reopened.high_watermark(),
+            3,
+            "hw clamped to the recovered log end"
+        );
     }
 
     #[test]
@@ -4197,9 +4618,17 @@ mod tests {
         assert_eq!(part.log_end_offset(), 5);
         let full_len = std::fs::metadata(log_path(&dir, 0)).unwrap().len();
 
+        assert_eq!(part.truncation_count(), 0);
+        assert_eq!(part.truncate_to_offset(7).unwrap(), 5, "nothing to discard");
+        assert_eq!(
+            part.truncation_count(),
+            0,
+            "a no-op truncate is not counted"
+        );
         let new_leo = part.truncate_to_offset(3).unwrap();
         assert_eq!(new_leo, 3);
         assert_eq!(part.log_end_offset(), 3);
+        assert_eq!(part.truncation_count(), 1);
         // hw is untouched by a truncate at/above it.
         assert_eq!(part.high_watermark(), 0);
 

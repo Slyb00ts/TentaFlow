@@ -507,77 +507,88 @@ async fn build_replicated_trio(
     })
 }
 
+/// One P6 measurement: n=1000 sequential `acks=quorum` publishes of one
+/// ~1 MiB batch each on a fresh trio whose followers run `follower_config`.
+/// `Err((stage, detail))` when no measurement was possible.
+async fn measure_p6(
+    label: &str,
+    follower_config: FollowerConfig,
+) -> Result<LatencyReport, (String, String)> {
+    let trio = build_replicated_trio(label, follower_config, LeaderConfig::default())
+        .await
+        .map_err(|e| ("trio never reached a quorum-ready ISR".to_string(), e))?;
+    let ctx = trio.leader.ctx.clone();
+    let svc = trio.leader.svc.clone();
+
+    // n=1000 (M2-WYNIKI recommendation 12): at the measured mean (~3.9 ms)
+    // this costs ~4 s of wall time, and a p99 gate is only certifiable
+    // once n is large enough to describe the tail — at n=60 the sorted
+    // "p99" was in practice the worst sample, not a percentile estimate.
+    const N: usize = 1000;
+    let mut warmup_left = 5;
+    let mut latencies = Vec::with_capacity(N);
+    let mut seed = 0u64;
+    while latencies.len() < N {
+        seed += 1;
+        let batch = publish_batch(seed);
+        let started = Instant::now();
+        let result = svc.publish_async(&ctx, TOPIC, batch).await;
+        let elapsed = started.elapsed();
+        match result {
+            Ok(_) => {
+                if warmup_left > 0 {
+                    warmup_left -= 1;
+                } else {
+                    latencies.push(elapsed);
+                }
+            }
+            Err(e) => {
+                return Err((
+                    format!(
+                        "publish refused at sample {} — the live ISR held all three \
+                         replicas before the loop started, so this is the replication \
+                         path itself, not bench setup",
+                        latencies.len()
+                    ),
+                    e.to_string(),
+                ));
+            }
+        }
+    }
+    latencies.sort();
+    Ok(LatencyReport::from_sorted(&latencies))
+}
+
 /// PLAN.md §5.2 P6: p99 publish->ACK, `acks=quorum`, RF=3, class `standard`
 /// — measured ONLY in `standard` (PLAN-M2 §1g's own honesty note: `critical`
 /// would fold local fsync latency on top, making the ≤15 ms target
 /// physically unreachable and the gate dishonest, mirroring M1-WYNIKI.md's
-/// P5 redefinition). `FollowerConfig{ack_every_n_batches: 1, ack_interval:
-/// ZERO}` — an isolated, low-rate publish must not wait out the PRODUCTION
-/// DEFAULT coalescing window (8 batches / 500 ms, `follower.rs`'s own
-/// `Default` — batched for THROUGHPUT, not per-call latency) or this gate
-/// would measure the coalescing window, not the replication path.
+/// P5 redefinition). The verdict line keeps the historical
+/// `FollowerConfig{ack_every_n_batches: 1, ack_interval: ZERO}` (ack after
+/// every frame) so it stays comparable with every banked P6 number; a second
+/// line measures the PRODUCTION DEFAULT cadence, which since the
+/// drained-queue ack rule (ANALIZA-REPLIKACJA F1) no longer holds a lone
+/// batch's ack back for the 500 ms interval — what the gate is meant to
+/// describe is what ships.
 fn gate_p6(_c: &mut Criterion) {
+    init_bench_log();
+    if !selected("p6") {
+        return;
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        let trio = match build_replicated_trio(
-            "p6",
-            FollowerConfig {
-                ack_every_n_batches: 1,
-                ack_interval: Duration::ZERO,
-                ..FollowerConfig::default()
-            },
-            LeaderConfig::default(),
-        )
-        .await
-        {
-            Ok(trio) => trio,
-            Err(e) => {
-                gate_blocked("P6", "trio never reached a quorum-ready ISR", &e);
+        let every_frame = FollowerConfig {
+            ack_every_n_batches: 1,
+            ack_interval: Duration::ZERO,
+            ..FollowerConfig::default()
+        };
+        let report = match measure_p6("p6", every_frame).await {
+            Ok(report) => report,
+            Err((stage, detail)) => {
+                gate_blocked("P6", &stage, &detail);
                 return;
             }
         };
-        let ctx = trio.leader.ctx.clone();
-        let svc = trio.leader.svc.clone();
-
-        // n=1000 (M2-WYNIKI recommendation 12): at the measured mean (~3.9 ms)
-        // this costs ~4 s of wall time, and a p99 gate is only certifiable
-        // once n is large enough to describe the tail — at n=60 the sorted
-        // "p99" was in practice the worst sample, not a percentile estimate.
-        const N: usize = 1000;
-        let mut warmup_left = 5;
-        let mut latencies = Vec::with_capacity(N);
-        let mut seed = 0u64;
-        while latencies.len() < N {
-            seed += 1;
-            let batch = publish_batch(seed);
-            let started = Instant::now();
-            let result = svc.publish_async(&ctx, TOPIC, batch).await;
-            let elapsed = started.elapsed();
-            match result {
-                Ok(_) => {
-                    if warmup_left > 0 {
-                        warmup_left -= 1;
-                    } else {
-                        latencies.push(elapsed);
-                    }
-                }
-                Err(e) => {
-                    gate_blocked(
-                        "P6",
-                        &format!(
-                            "publish refused at sample {} — the live ISR held all three \
-                             replicas before the loop started, so this is the replication \
-                             path itself, not bench setup",
-                            latencies.len()
-                        ),
-                        &e.to_string(),
-                    );
-                    return;
-                }
-            }
-        }
-        latencies.sort();
-        let report = LatencyReport::from_sorted(&latencies);
         eprintln!(
             "P6 (publish->ACK, acks=quorum, RF=3, class standard, n={}): p50={:?} p95={:?} p99={:?} p999={:?} mean={:?}",
             report.n, report.p50, report.p95, report.p99, report.p999, report.mean
@@ -593,74 +604,55 @@ fn gate_p6(_c: &mut Criterion) {
                 "FAIL"
             }
         );
+
+        match measure_p6("p6prod", FollowerConfig::default()).await {
+            Ok(report) => eprintln!(
+                "P6 production-default FollowerConfig (n={}): p50={:?} p95={:?} p99={:?} p999={:?} mean={:?}",
+                report.n, report.p50, report.p95, report.p99, report.p999, report.mean
+            ),
+            Err((stage, detail)) => {
+                eprintln!("P6 production-default FollowerConfig: NO MEASUREMENT — {stage}: {detail}")
+            }
+        }
     });
 }
 
 /// PLAN.md §5.2 P7: throughput at RF=3/`acks=quorum`, 1 KiB records, vs the
 /// M1 P1 baseline (class `standard`, single producer/single partition:
-/// 779.4k-1051.2k msg/s, `M1-WYNIKI.md`). Uses PRODUCTION DEFAULT
-/// `FollowerConfig` (ack coalescing every 8 batches/500 ms) — unlike P6,
-/// this gate measures sustained throughput, where coalesced acks are the
-/// realistic production behavior, not an artifact to eliminate.
+/// 779.4k-1051.2k msg/s, `M1-WYNIKI.md`). Uses the PRODUCTION DEFAULT
+/// `FollowerConfig`.
 ///
 /// TWO windows are measured and reported under distinct labels (final-tree
 /// pass, M2-WYNIKI recommendation 13):
-/// * "P7 sequential" — one `await` at a time. With `ack_every_n_batches = 8`
-///   a strictly sequential producer keeps exactly one batch in flight, so
-///   the coalescing threshold is unreachable and every ack fires from the
-///   500 ms timer; this window is a HARNESS-SHAPE lower bound (it measures
-///   `1 / ack_interval`, not the replication path) and is kept only for
-///   continuity with the banked 30.08 numbers.
-/// * "P7 pipelined" — `P7_PIPELINE_DEPTH` batches in flight (8 = exactly the
-///   coalescing threshold, the smallest depth that lets the production ack
-///   path fire on batch count rather than on the timer). This is the window
-///   the gate's wording describes.
+/// * "P7 sequential" — one `await` at a time, so exactly one batch in
+///   flight: single-producer throughput at depth 1, bounded by one
+///   replication round trip per batch. (Before the follower's drained-queue
+///   ack rule it measured two leader heartbeat periods per batch instead —
+///   the banked 1.0k msg/s.)
+/// * "P7 pipelined" — `P7_PIPELINE_DEPTH` producer tasks with one publish
+///   in flight each. This is the window the gate's wording describes.
 fn gate_p7(_c: &mut Criterion) {
-    // INVESTIGATION 2026-09-22 (TentaBus 1C `P7-pipeline-flake-open`) —
-    // the standing hypothesis was MEASURED AND FALSIFIED; do not re-apply
-    // it without new evidence.
+    if !selected("p7") {
+        return;
+    }
+    // The pipelined window used to stall intermittently for the whole 30 s
+    // ack timeout with `acked=1, required=2` and no ISR Shrink event. Root
+    // cause (found 2026-09-23 with the `p7repeat` probe and `BUS_BENCH_LOG`):
+    // a segment roll falling inside a multi-job group commit named the new
+    // segment after the stale pre-group `log_end_offset` (`tentaflow-bus`
+    // `roll()`), so the leader's feed for the offsets between that name and
+    // the segment's real first batch got a later batch, failed its
+    // `OffsetInvariant` check and tore both follower streams down again on
+    // every reconnect. Only concurrent producers form multi-job groups, and
+    // only a 256 MiB roll that lands mid-group triggers it — hence pipelined
+    // only, and intermittent. The teardown was invisible because a stream
+    // ending took the follower out of the ISR through `remove_follower`,
+    // which emitted no event then; it is now `IsrEvent::Detached`, printed by
+    // the hook below with the stream's end cause.
     //
-    // The flake: the pipelined window below intermittently produces NO
-    // measurement, failing its first publish with `acked=1, required=2`
-    // after the 30 s `DEFAULT_PUBLISH_ACK_TIMEOUT` (`bus/mod.rs`). The
-    // long-standing hypothesis (OTWARTE-POZYCJE.md) was a SPURIOUS ISR
-    // EVICTION: `publish_async` wraps the sync `publish` in
-    // `block_in_place`, and that path's quorum wait
-    // (`PartitionLeaderGlue::await_acks`, `replication/glue.rs`) spawns a
-    // fresh OS thread + runtime PER CALL, so a `P7_PIPELINE_DEPTH`-deep
-    // window plus this runtime's own tasks could, on a loaded host, delay
-    // a follower's ack past `replica_lag_max_ms` (5 s) and make
-    // `reconcile_follower` drop it from the ISR — leaving `Acks::Quorum`
-    // (min_isr = 2) permanently unsatisfiable inside the ack wait.
-    //
-    // To test that, `LeaderConfig::isr_event_hook` was added
-    // (`replication/leader.rs`) and is installed below: it fires on EVERY
-    // ISR Shrink/Expand, with the reason. A run on 2026-09-22 reproduced
-    // the flake EXACTLY (`P7 pipelined: NO MEASUREMENT — ... acked=1,
-    // required=2`) and printed **ZERO** ISR events — the ISR never shrank
-    // at all, so an ISR eviction is NOT the cause. (`register_follower`
-    // admits a follower silently, so quiet startup is expected; that the
-    // hook really does fire on both transitions is pinned by
-    // `leader.rs::tests::isr_event_hook_observes_both_shrink_and_expand`,
-    // which is what makes "no events logged" readable as "no shrink
-    // happened" rather than "the hook is broken".)
-    //
-    // So the real cause is downstream of ISR membership: both followers
-    // stayed in-sync and simply never acked the offset the first pipelined
-    // publish was waiting on. That is a feed/ack-progress question
-    // (`leader::feed`, the follower ack loop, and the 4 MiB in-memory
-    // `DuplexTransport` between them), NOT an ISR-membership one, and it
-    // remains OPEN — deliberately not "fixed" here by widening a timeout,
-    // which would only hide it.
-    //
-    // What IS kept from this pass: an explicitly sized multi-thread
-    // runtime (so the harness's own worker pool is never the variable
-    // under test — `Runtime::new()` ties worker count to visible CPUs,
-    // which on a shared host is whatever the other agents left) and the
-    // diagnostic hook itself, so the next occurrence is readable instead
-    // of mute. `replica_lag_max_ms` is deliberately left at its PRODUCTION
-    // default: the measurement above shows there is nothing here for a
-    // laxer ISR window to fix.
+    // The runtime is sized explicitly so the harness's own worker pool is
+    // never the variable under test (`Runtime::new()` ties worker count to
+    // visible CPUs, which on a shared host is whatever other builds left).
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(P7_PIPELINE_DEPTH + 4)
         .enable_all()
@@ -757,10 +749,8 @@ fn gate_p7(_c: &mut Criterion) {
             }
         );
 
-        // ---- Pipelined window on the same trio (see gate_p7's doc): eight
-        // producer tasks, one publish in flight each, disjoint seeds per
-        // slot. `publish_async` is `block_in_place`-wrapped, so the
-        // multi-thread runtime runs the slots concurrently.
+        // ---- Pipelined window on the same trio (see gate_p7's doc and
+        // `pipelined_window`).
         const PIPELINE_WARMUP_BATCHES: usize = 8;
         for _ in 0..PIPELINE_WARMUP_BATCHES {
             seed += 1;
@@ -772,57 +762,14 @@ fn gate_p7(_c: &mut Criterion) {
                 return;
             }
         }
-        let pipeline_deadline = Instant::now() + Duration::from_secs(MEASURE_SECS);
-        let pipeline_started = Instant::now();
-        let mut slots = Vec::with_capacity(P7_PIPELINE_DEPTH);
-        for slot in 0..P7_PIPELINE_DEPTH {
-            let slot_svc = svc.clone();
-            let slot_ctx = ctx.clone();
-            slots.push(tokio::spawn(async move {
-                // Disjoint seed streams: slot s publishes seeds
-                // 1_000_000 + s + k * P7_PIPELINE_DEPTH, never colliding with
-                // the sequential window's seeds or with another slot's.
-                let mut slot_seed = 1_000_000u64 + slot as u64;
-                let mut slot_records = 0u64;
-                let mut slot_bytes = 0u64;
-                while Instant::now() < pipeline_deadline {
-                    slot_seed += P7_PIPELINE_DEPTH as u64;
-                    let result = slot_svc
-                        .publish_async(&slot_ctx, TOPIC, publish_batch(slot_seed))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    slot_records += result.accepted as u64;
-                    slot_bytes += result.accepted as u64 * RECORD_BYTES as u64;
-                }
-                Ok::<(u64, u64), String>((slot_records, slot_bytes))
-            }));
-        }
-        let mut pipelined_records: u64 = 0;
-        let mut pipelined_bytes: u64 = 0;
-        for slot in slots {
-            match slot.await {
-                Ok(Ok((records, bytes))) => {
-                    pipelined_records += records;
-                    pipelined_bytes += bytes;
-                }
-                Ok(Err(e)) => {
-                    gate_blocked(
-                        "P7 pipelined",
-                        &format!(
-                            "publish after {} records already counted",
-                            pipelined_records
-                        ),
-                        &e,
-                    );
-                    return;
-                }
+        let (pipelined_records, pipelined_bytes, pipeline_elapsed) =
+            match pipelined_window(&svc, &ctx, Duration::from_secs(MEASURE_SECS)).await {
+                Ok(window) => window,
                 Err(e) => {
-                    gate_blocked("P7 pipelined", "producer task panicked", &e.to_string());
+                    gate_blocked("P7 pipelined", "pipelined window", &e);
                     return;
                 }
-            }
-        }
-        let pipeline_elapsed = pipeline_started.elapsed();
+            };
         let p_msg_per_s = pipelined_records as f64 / elaped_secs(pipeline_elapsed);
         let p_mib_per_s =
             (pipelined_bytes as f64 / (1024.0 * 1024.0)) / elaped_secs(pipeline_elapsed);
@@ -856,6 +803,162 @@ fn gate_p7(_c: &mut Criterion) {
     });
 }
 
+/// `P7_PIPELINE_DEPTH` producer tasks, one publish in flight each, disjoint
+/// seeds per slot, for `window`. `publish_async` is `block_in_place`-wrapped,
+/// so the caller's multi-thread runtime runs the slots concurrently. Returns
+/// `(records, bytes, elapsed)` or the first refused publish.
+async fn pipelined_window(
+    svc: &Arc<bus::BusService>,
+    ctx: &BusCallContext,
+    window: Duration,
+) -> Result<(u64, u64, Duration), String> {
+    let pipeline_deadline = Instant::now() + window;
+    let pipeline_started = Instant::now();
+    let mut slots = Vec::with_capacity(P7_PIPELINE_DEPTH);
+    for slot in 0..P7_PIPELINE_DEPTH {
+        let slot_svc = svc.clone();
+        let slot_ctx = ctx.clone();
+        slots.push(tokio::spawn(async move {
+            // Slot s publishes seeds 1_000_000 + s + k * P7_PIPELINE_DEPTH,
+            // never colliding with the sequential window's seeds or with
+            // another slot's.
+            let mut slot_seed = 1_000_000u64 + slot as u64;
+            let mut slot_records = 0u64;
+            let mut slot_bytes = 0u64;
+            while Instant::now() < pipeline_deadline {
+                slot_seed += P7_PIPELINE_DEPTH as u64;
+                let result = slot_svc
+                    .publish_async(&slot_ctx, TOPIC, publish_batch(slot_seed))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                slot_records += result.accepted as u64;
+                slot_bytes += result.accepted as u64 * RECORD_BYTES as u64;
+            }
+            Ok::<(u64, u64), String>((slot_records, slot_bytes))
+        }));
+    }
+    let mut records = 0u64;
+    let mut bytes = 0u64;
+    for slot in slots {
+        match slot.await {
+            Ok(Ok((r, b))) => {
+                records += r;
+                bytes += b;
+            }
+            Ok(Err(e)) => return Err(format!("publish after {records} records counted: {e}")),
+            Err(e) => return Err(format!("producer task panicked: {e}")),
+        }
+    }
+    Ok((records, bytes, pipeline_started.elapsed()))
+}
+
+/// Flake-rate probe for the pipelined P7 window (SUM/tentabus/
+/// ANALIZA-REPLIKACJA-2026-09-23.md §3.5): `BUS_REPLICATION_P7_REPEAT` fresh
+/// trios (default 20), each running only the 8-publish warmup and one
+/// pipelined window, counting runs that produced no measurement. A single
+/// pipelined window inside `gate_p7` cannot tell "fixed" from "lucky" — the
+/// failure was intermittent (1 of 2 recorded runs). On a failure it prints
+/// the leader's live replication view, so "followers present but silent"
+/// and "followers torn down" read differently. Opt-in via
+/// `BUS_REPLICATION_GATES` (see `selected`), never part of the default run.
+fn gate_p7_pipelined_repeat(_c: &mut Criterion) {
+    if !selected("p7repeat") {
+        return;
+    }
+    let runs: usize = std::env::var("BUS_REPLICATION_P7_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(P7_PIPELINE_DEPTH + 4)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let mut failures = 0usize;
+    let mut rates = Vec::with_capacity(runs);
+    for run in 0..runs {
+        rt.block_on(async {
+            let leader_config = LeaderConfig {
+                isr_event_hook: Some(Arc::new(move |event: &IsrEvent| {
+                    eprintln!("[P7 repeat {run}] ISR event: {event:?}");
+                })),
+                ..LeaderConfig::default()
+            };
+            let trio = match build_replicated_trio(
+                &format!("p7r{run}"),
+                FollowerConfig::default(),
+                leader_config,
+            )
+            .await
+            {
+                Ok(trio) => trio,
+                Err(e) => {
+                    failures += 1;
+                    eprintln!("[P7 repeat {run}] BLOCKED at setup: {e}");
+                    return;
+                }
+            };
+            let ctx = trio.leader.ctx.clone();
+            let svc = trio.leader.svc.clone();
+            for seed in 0..8u64 {
+                if let Err(e) = svc.publish_async(&ctx, TOPIC, publish_batch(seed)).await {
+                    failures += 1;
+                    eprintln!("[P7 repeat {run}] BLOCKED at warmup {seed}: {e}");
+                    return;
+                }
+            }
+            match pipelined_window(&svc, &ctx, Duration::from_secs(5)).await {
+                Ok((records, _, elapsed)) => {
+                    let rate = records as f64 / elaped_secs(elapsed);
+                    rates.push(rate);
+                    eprintln!("[P7 repeat {run}] ok: {:.1}k msg/s", rate / 1000.0);
+                }
+                Err(e) => {
+                    failures += 1;
+                    let snap = trio._manager.snapshot(&ctx.org_id, Some(TOPIC));
+                    let view = snap.partitions.first().map(|p| {
+                        format!(
+                            "isr={:?} lagging={:?} hw={} leo={}",
+                            p.isr, p.lagging, p.high_watermark, p.log_end_offset
+                        )
+                    });
+                    eprintln!("[P7 repeat {run}] FAILED: {e}; leader view: {view:?}");
+                }
+            }
+        });
+    }
+    rates.sort_by(|a, b| a.partial_cmp(b).expect("finite rate"));
+    let median = rates.get(rates.len() / 2).copied().unwrap_or(0.0);
+    eprintln!(
+        "P7 pipelined repeat: {failures}/{runs} runs produced no measurement; \
+         median of successful runs {:.1}k msg/s",
+        median / 1000.0
+    );
+}
+
+/// `BUS_REPLICATION_GATES` (comma list of `p6`, `p7`, `p9`, `p7repeat`)
+/// selects which gates run; unset means the default gate set (everything
+/// except the opt-in `p7repeat` probe).
+fn selected(gate: &str) -> bool {
+    match std::env::var("BUS_REPLICATION_GATES") {
+        Ok(list) => list.split(',').any(|g| g.trim() == gate),
+        Err(_) => gate != "p7repeat",
+    }
+}
+
+/// `BUS_BENCH_LOG` (an `EnvFilter` directive, e.g.
+/// `tentaflow_core::bus::replication=debug`) installs a stderr subscriber, so
+/// stream teardowns and reconnects inside a timed window are visible — a
+/// bench with no subscriber is blind to every `tracing` line on this path.
+fn init_bench_log() {
+    if let Ok(filter) = std::env::var("BUS_BENCH_LOG") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+}
+
 fn elaped_secs(d: Duration) -> f64 {
     d.as_secs_f64().max(1e-9)
 }
@@ -868,6 +971,9 @@ fn elaped_secs(d: Duration) -> f64 {
 /// path" from any real ledger round-trip cost (measured separately, across
 /// real processes, by the chaos test's own wall-clock).
 fn gate_p9(_c: &mut Criterion) {
+    if !selected("p9") {
+        return;
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         const N: usize = 20;
@@ -1015,5 +1121,5 @@ fn gate_p9(_c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, gate_p6, gate_p7, gate_p9);
+criterion_group!(benches, gate_p6, gate_p7, gate_p9, gate_p7_pipelined_repeat);
 criterion_main!(benches);

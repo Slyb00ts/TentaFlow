@@ -460,20 +460,6 @@ impl Segment {
                 Ok(h) => h,
                 Err(_) => break, // not a valid batch boundary — stop here
             };
-            if header.base_offset != expected_offset {
-                // Either genuine corruption of an unprotected header field,
-                // or (equally) the tail of a torn write that happened to
-                // decode as a plausible-looking header. Either way, nothing
-                // past this point in the file can be trusted.
-                tracing::warn!(
-                    path = %path.display(),
-                    pos,
-                    expected_offset,
-                    found_base_offset = header.base_offset,
-                    "segment recovery stopped: batch base_offset breaks the expected offset chain"
-                );
-                break;
-            }
             let total = BATCH_HEADER_LEN as u64 + header.body_len as u64;
             if pos + total > full_len {
                 break; // declared body_len runs past EOF: torn write
@@ -484,6 +470,17 @@ impl Segment {
             }
             if crc32c::crc32c(&body_buf) != header.crc32c {
                 break; // header landed intact, body is torn/corrupt
+            }
+            if header.base_offset != expected_offset {
+                // A whole, checksummed batch at the wrong offset is not a
+                // torn write, and cutting the file back here would silently
+                // drop records that may have been acknowledged — see
+                // `BusError::SegmentOffsetMismatch`.
+                return Err(BusError::SegmentOffsetMismatch {
+                    path,
+                    expected_offset,
+                    found_offset: header.base_offset,
+                });
             }
             expected_offset = header.next_offset();
             recovered.push(RecoveredBatch {
@@ -515,6 +512,17 @@ impl Segment {
             created_at: Instant::now(),
         };
         Ok((segment, recovered))
+    }
+
+    /// The header of the batch starting at `pos`, or `None` when fewer than
+    /// a header's bytes remain there.
+    pub fn batch_header_at(&self, pos: u64) -> Result<Option<BatchHeader>> {
+        if pos + BATCH_HEADER_LEN as u64 > self.len {
+            return Ok(None);
+        }
+        let mut hdr_buf = [0u8; BATCH_HEADER_LEN];
+        pread_exact(&self.file, pos, &mut hdr_buf).map_err(|e| BusError::io(&self.path, e))?;
+        BatchHeader::decode(&hdr_buf).map(Some)
     }
 
     /// Whether this segment should be sealed and rolled before the next
@@ -835,10 +843,11 @@ mod tests {
 
     /// A header that is otherwise well-formed (valid magic, in-bounds
     /// `body_len`, matching body CRC) but whose `base_offset` does not
-    /// continue the segment's offset chain must stop recovery at that point
-    /// rather than being accepted.
+    /// continue the segment's offset chain is not a torn write: recovery
+    /// must refuse the segment and leave every byte in place, rather than
+    /// cut it back and drop records that may have been acknowledged.
     #[test]
-    fn recovery_stops_at_offset_chain_break() {
+    fn recovery_refuses_an_offset_chain_break_without_truncating() {
         let dir = temp_dir("segment-recovery-chain-break");
         {
             let mut seg = Segment::create_new(&dir, 0, TEST_PREALLOC).unwrap();
@@ -851,23 +860,28 @@ mod tests {
         // of the expected 4) — simulating a corrupted `base_offset` field
         // that happens not to affect the body/CRC at all.
         let wrong_chain_batch = build_batch(10, 3);
-        {
-            let path = log_path(&dir, 0);
+        let path = log_path(&dir, 0);
+        let len_with_break = {
             let file = OpenOptions::new().write(true).open(&path).unwrap();
             let good_len = std::fs::metadata(&path).unwrap().len();
             file.write_all_at(&wrong_chain_batch, good_len).unwrap();
-        }
+            good_len + wrong_chain_batch.len() as u64
+        };
 
-        let (seg, recovered) = Segment::open_active_with_recovery(&dir, 0).unwrap();
+        match Segment::open_active_with_recovery(&dir, 0) {
+            Err(BusError::SegmentOffsetMismatch {
+                expected_offset,
+                found_offset,
+                ..
+            }) => assert_eq!((expected_offset, found_offset), (4, 10)),
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("a chain break with a valid batch must not be recovered"),
+        }
         assert_eq!(
-            recovered.len(),
-            1,
-            "only the first, chain-consistent batch is kept"
+            std::fs::metadata(&path).unwrap().len(),
+            len_with_break,
+            "nothing may be truncated"
         );
-        assert_eq!(recovered[0].header.base_offset, 0);
-        // The chain-breaking batch's bytes must be physically truncated
-        // away, exactly like a torn write.
-        assert_eq!(seg.len(), build_batch(0, 4).len() as u64);
     }
 
     #[test]

@@ -27,7 +27,8 @@
 // module's plain `#[derive(Serialize, Deserialize)]` structs without any
 // hand-written encode/decode per field.
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tentaflow_protocol::environment::NodeEnvironment;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -111,6 +112,17 @@ pub enum ReplReject {
     /// frame that skipped the trust boundary) or a shape-valid id for an
     /// instance that is not installed/enabled/running on this node.
     UnknownInstance,
+    /// The `Hello` named a leader other than the peer that dialed. A leader
+    /// always dials its followers itself, so this is a spoofed or relayed
+    /// claim and must neither fence nor be followed.
+    LeaderIdentityMismatch,
+    /// The `Hello`'s epoch is more than `MAX_HELLO_EPOCH_LEAD` past this
+    /// node's ledger row for the partition — a term nobody admitted yet.
+    /// `ledger_epoch` is that row's epoch; the leader retries on its normal
+    /// backoff and is accepted once the follower's ledger catches up.
+    EpochAheadOfLedger {
+        ledger_epoch: u32,
+    },
     /// A reason this build does not know, because the peer that sent it
     /// runs a NEWER TentaBus that added the variant after this binary was
     /// compiled. `reason` is the name that was on the wire, so a log line
@@ -168,6 +180,10 @@ impl<'de> Deserialize<'de> for ReplReject {
             have: u32,
         }
         #[derive(Deserialize)]
+        struct EpochAheadOfLedgerFields {
+            ledger_epoch: u32,
+        }
+        #[derive(Deserialize)]
         struct UnknownFields {
             reason: String,
         }
@@ -180,6 +196,7 @@ impl<'de> Deserialize<'de> for ReplReject {
                 "TopicUnknown" => ReplReject::TopicUnknown,
                 "Detached" => ReplReject::Detached,
                 "UnknownInstance" => ReplReject::UnknownInstance,
+                "LeaderIdentityMismatch" => ReplReject::LeaderIdentityMismatch,
                 other => ReplReject::Unknown {
                     reason: other.to_string(),
                 },
@@ -205,6 +222,13 @@ impl<'de> Deserialize<'de> for ReplReject {
                         let f: StaleEpochFields =
                             payload.deserialized().map_err(D::Error::custom)?;
                         Ok(ReplReject::StaleEpoch { have: f.have })
+                    }
+                    "EpochAheadOfLedger" => {
+                        let f: EpochAheadOfLedgerFields =
+                            payload.deserialized().map_err(D::Error::custom)?;
+                        Ok(ReplReject::EpochAheadOfLedger {
+                            ledger_epoch: f.ledger_epoch,
+                        })
                     }
                     // This build's OWN `Unknown`, round-tripped: a peer
                     // that relays a rejection it did not understand must
@@ -428,47 +452,198 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Reads one frame written by `write_frame`. Both length prefixes are
-/// checked against `MAX_FRAME_BYTES` BEFORE the corresponding buffer is
-/// allocated, so a malicious/corrupt length prefix can never itself be
-/// used to force a large allocation — the read simply fails fast with
-/// `FrameTooLarge` instead of `read_exact`-ing (or trying to) an
-/// attacker-controlled number of bytes.
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<ReplFrame, ReplCodecError> {
-    let kind = r.read_u8().await?;
-    let cbor_len = r.read_u32().await? as usize;
+/// `[u8 kind][u32 cbor_len]` — the fixed part in front of every frame.
+const FRAME_PREFIX_LEN: usize = 1 + 4;
+
+/// Validates one frame's two length prefixes against `MAX_FRAME_BYTES`.
+/// Called BEFORE the buffer for the corresponding section is allocated, so a
+/// malicious/corrupt length prefix can never itself force a large
+/// allocation — the read fails fast with `FrameTooLarge` instead.
+fn check_cbor_len(cbor_len: usize) -> Result<(), ReplCodecError> {
     if cbor_len > MAX_FRAME_BYTES {
         return Err(ReplCodecError::FrameTooLarge { len: cbor_len });
     }
+    Ok(())
+}
+
+fn check_raw_len(cbor_len: usize, raw_len: usize) -> Result<(), ReplCodecError> {
+    if raw_len > MAX_FRAME_BYTES || cbor_len.saturating_add(raw_len) > MAX_FRAME_BYTES {
+        return Err(ReplCodecError::FrameTooLarge {
+            len: cbor_len.saturating_add(raw_len),
+        });
+    }
+    Ok(())
+}
+
+fn decode_frame(kind: u8, cbor: &[u8], raw: Bytes) -> Result<ReplFrame, ReplCodecError> {
+    Ok(match kind {
+        KIND_HELLO => ReplFrame::Hello(decode_cbor(cbor)?),
+        KIND_HELLO_ACK => ReplFrame::HelloAck(decode_cbor(cbor)?),
+        KIND_BATCH => ReplFrame::Batch {
+            header: decode_cbor(cbor)?,
+            bytes: raw,
+        },
+        KIND_ACK => ReplFrame::Ack(decode_cbor(cbor)?),
+        KIND_HEARTBEAT => ReplFrame::Heartbeat(decode_cbor(cbor)?),
+        KIND_TRUNCATE => ReplFrame::Truncate(decode_cbor(cbor)?),
+        KIND_LEO_QUERY => ReplFrame::LeoQuery(decode_cbor(cbor)?),
+        KIND_LEO_REPLY => ReplFrame::LeoReply(decode_cbor(cbor)?),
+        KIND_OFFSETS => ReplFrame::Offsets(decode_cbor(cbor)?),
+        other => return Err(ReplCodecError::UnknownKind(other)),
+    })
+}
+
+/// Reads exactly one frame written by `write_frame` and nothing past it.
+///
+/// NOT cancel-safe: it is five sequential reads, and dropping the future
+/// after the first of them returned loses the bytes already consumed — the
+/// stream is then desynchronized for good. Use it only where the read is
+/// never raced (a handshake awaited on its own, a one-shot probe); a read
+/// that sits in a `select!` must go through `FrameReader`. Kept alongside
+/// `FrameReader` because routing code (`router.rs`, `manager.rs`) reads the
+/// opening `Hello` and then hands the raw stream on: a buffered reader
+/// could have pulled bytes past the `Hello` that the next owner would never
+/// see.
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<ReplFrame, ReplCodecError> {
+    let kind = r.read_u8().await?;
+    let cbor_len = r.read_u32().await? as usize;
+    check_cbor_len(cbor_len)?;
     let mut cbor_buf = vec![0u8; cbor_len];
     r.read_exact(&mut cbor_buf).await?;
 
     let raw_len = r.read_u32().await? as usize;
-    if raw_len > MAX_FRAME_BYTES || cbor_len.saturating_add(raw_len) > MAX_FRAME_BYTES {
-        return Err(ReplCodecError::FrameTooLarge {
-            len: cbor_len + raw_len,
-        });
-    }
+    check_raw_len(cbor_len, raw_len)?;
     let mut raw_buf = vec![0u8; raw_len];
     if raw_len > 0 {
         r.read_exact(&mut raw_buf).await?;
     }
+    decode_frame(kind, &cbor_buf, Bytes::from(raw_buf))
+}
 
-    Ok(match kind {
-        KIND_HELLO => ReplFrame::Hello(decode_cbor(&cbor_buf)?),
-        KIND_HELLO_ACK => ReplFrame::HelloAck(decode_cbor(&cbor_buf)?),
-        KIND_BATCH => ReplFrame::Batch {
-            header: decode_cbor(&cbor_buf)?,
-            bytes: Bytes::from(raw_buf),
-        },
-        KIND_ACK => ReplFrame::Ack(decode_cbor(&cbor_buf)?),
-        KIND_HEARTBEAT => ReplFrame::Heartbeat(decode_cbor(&cbor_buf)?),
-        KIND_TRUNCATE => ReplFrame::Truncate(decode_cbor(&cbor_buf)?),
-        KIND_LEO_QUERY => ReplFrame::LeoQuery(decode_cbor(&cbor_buf)?),
-        KIND_LEO_REPLY => ReplFrame::LeoReply(decode_cbor(&cbor_buf)?),
-        KIND_OFFSETS => ReplFrame::Offsets(decode_cbor(&cbor_buf)?),
-        other => return Err(ReplCodecError::UnknownKind(other)),
-    })
+/// Smallest read issued while a frame's size is still unknown, so a run of
+/// small control frames (Ack/Heartbeat, tens of bytes each) arrives in one
+/// read instead of one per frame.
+const MIN_READ_CHUNK: usize = 8 * 1024;
+
+struct FrameLayout {
+    total: usize,
+    cbor_len: usize,
+}
+
+/// Cancel-safe frame reader for a long-lived replication stream.
+///
+/// WHY: both stream loops (`leader::run_follower_stream`'s ack intake and
+/// `follower::run_follower_stream_with_hello`) poll their read inside a
+/// `select!` next to timers and feed wakeups. `read_frame` there drops every
+/// byte it had consumed whenever another arm wins mid-frame, and the next
+/// read parses the middle of a frame as a new one (a lost `kind` byte of an
+/// `Ack` reads the following `0x00` as `Hello`, and so on) — a desync that
+/// tears the stream down. A mid-frame `Pending` is ordinary on QUIC (chunks
+/// arrive separately) and also happens on the in-memory duplex, whose reads
+/// charge the tokio coop budget.
+///
+/// Every byte read lands in `buf`, which lives in this struct, not in the
+/// future; the only await is `AsyncReadExt::read_buf`, which tokio documents
+/// as cancel-safe (a cancelled call reads nothing). A dropped `next_frame`
+/// therefore loses nothing: the next call resumes from the same buffer.
+/// Batch payloads are split off the buffer without copying or zero-filling.
+pub struct FrameReader<R> {
+    inner: R,
+    buf: BytesMut,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: BytesMut::new(),
+        }
+    }
+
+    /// Next whole frame. Cancel-safe — see the type doc.
+    pub async fn next_frame(&mut self) -> Result<ReplFrame, ReplCodecError> {
+        loop {
+            if let Some(frame) = self.decode_buffered()? {
+                return Ok(frame);
+            }
+            if self.inner.read_buf(&mut self.buf).await? == 0 {
+                return Err(ReplCodecError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "replication stream closed mid-frame or before the next frame",
+                )));
+            }
+        }
+    }
+
+    /// `true` when a whole frame can be returned by `next_frame` without
+    /// waiting: one is already buffered, or the transport hands over the
+    /// missing bytes right now. Never blocks and never loses data (each
+    /// one-shot poll of `read_buf` is cancel-safe). A partially arrived frame
+    /// counts as NOT ready — the caller asking "has anything more already
+    /// arrived?" must not wait for the rest of a 1 MiB batch to find out.
+    pub fn frame_ready(&mut self) -> Result<bool, ReplCodecError> {
+        loop {
+            if self.buffered_frame_len()?.is_some() {
+                return Ok(true);
+            }
+            match self.inner.read_buf(&mut self.buf).now_or_never() {
+                Some(Ok(0)) | None => return Ok(false),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Layout of the frame at the head of `buf` once all of it has arrived;
+    /// `None` (after reserving room for the rest) otherwise.
+    fn buffered_frame_len(&mut self) -> Result<Option<FrameLayout>, ReplCodecError> {
+        let have = self.buf.len();
+        if have < FRAME_PREFIX_LEN {
+            self.reserve_for(FRAME_PREFIX_LEN);
+            return Ok(None);
+        }
+        let cbor_len =
+            u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+        check_cbor_len(cbor_len)?;
+        let raw_len_at = FRAME_PREFIX_LEN + cbor_len;
+        if have < raw_len_at + 4 {
+            self.reserve_for(raw_len_at + 4);
+            return Ok(None);
+        }
+        let raw_len = u32::from_be_bytes([
+            self.buf[raw_len_at],
+            self.buf[raw_len_at + 1],
+            self.buf[raw_len_at + 2],
+            self.buf[raw_len_at + 3],
+        ]) as usize;
+        check_raw_len(cbor_len, raw_len)?;
+        let total = raw_len_at + 4 + raw_len;
+        if have < total {
+            self.reserve_for(total);
+            return Ok(None);
+        }
+        Ok(Some(FrameLayout { total, cbor_len }))
+    }
+
+    fn decode_buffered(&mut self) -> Result<Option<ReplFrame>, ReplCodecError> {
+        let Some(layout) = self.buffered_frame_len()? else {
+            return Ok(None);
+        };
+        let mut frame = self.buf.split_to(layout.total);
+        let kind = frame[0];
+        frame.advance(FRAME_PREFIX_LEN);
+        let cbor = frame.split_to(layout.cbor_len);
+        frame.advance(4);
+        decode_frame(kind, &cbor, frame.freeze()).map(Some)
+    }
+
+    /// Makes room for a frame of `needed` bytes in total (already bounded
+    /// by `MAX_FRAME_BYTES` through the length checks), with at least
+    /// `MIN_READ_CHUNK` of headroom so small frames are read in bulk.
+    fn reserve_for(&mut self, needed: usize) {
+        let missing = needed.saturating_sub(self.buf.len());
+        self.buf.reserve(missing.max(MIN_READ_CHUNK));
+    }
 }
 
 #[cfg(test)]
@@ -580,6 +755,13 @@ mod tests {
             .await,
             ReplFrame::HelloAck(hello_ack(Some(ReplReject::UnknownInstance)))
         );
+        for reject in [
+            ReplReject::LeaderIdentityMismatch,
+            ReplReject::EpochAheadOfLedger { ledger_epoch: 4 },
+        ] {
+            let frame = ReplFrame::HelloAck(hello_ack(Some(reject)));
+            assert_eq!(roundtrip(frame.clone()).await, frame);
+        }
         // `Unknown` is never sent by this build's own reject paths, but a
         // relay that decoded one and passed it on must not lose the reason
         // name — so it has to survive the codec like any other variant.
@@ -670,6 +852,120 @@ mod tests {
         server.read_exact(&mut one_byte).await.unwrap();
         let err = read_frame(&mut server).await.unwrap_err();
         assert!(matches!(err, ReplCodecError::Io(_)));
+    }
+
+    async fn encode(frame: &ReplFrame) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, frame).await.expect("encode");
+        bytes
+    }
+
+    fn ack_frame() -> ReplFrame {
+        ReplFrame::Ack(ReplAck {
+            leader_epoch: 3,
+            follower_leo: 1_000,
+            follower_hw: 990,
+        })
+    }
+
+    /// The interleaving a stream loop meets whenever a timer fires while a
+    /// frame is half-arrived: the read consumes the prefix, a competing
+    /// `select!` arm wins, the read future is dropped, the rest arrives. For
+    /// every split point of an `Ack` and a `Batch`, `FrameReader` must still
+    /// return the exact frame and then the next one.
+    #[tokio::test]
+    async fn frame_reader_survives_cancellation_at_every_byte_of_a_frame() {
+        for frame in [ack_frame(), batch_frame()] {
+            let wire = encode(&frame).await;
+            for split in 1..wire.len() {
+                let (mut client, server) = tokio::io::duplex(64 * 1024);
+                let mut frames = FrameReader::new(server);
+                client.write_all(&wire[..split]).await.unwrap();
+                tokio::select! {
+                    biased;
+                    got = frames.next_frame() => {
+                        panic!("split {split}: a partial frame must not decode: {got:?}")
+                    }
+                    _ = std::future::ready(()) => {}
+                }
+                client.write_all(&wire[split..]).await.unwrap();
+                write_frame(&mut client, &ack_frame()).await.unwrap();
+                assert_eq!(frames.next_frame().await.unwrap(), frame, "split {split}");
+                assert_eq!(
+                    frames.next_frame().await.unwrap(),
+                    ack_frame(),
+                    "split {split}"
+                );
+            }
+        }
+    }
+
+    /// The bug `FrameReader` exists for, reproduced on the in-memory duplex:
+    /// the same interruption against `read_frame` loses the consumed prefix,
+    /// and the next read parses the middle of the frame as a new one.
+    #[tokio::test]
+    async fn read_frame_cancelled_mid_frame_loses_the_frame() {
+        let wire = encode(&ack_frame()).await;
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        client.write_all(&wire[..3]).await.unwrap();
+        tokio::select! {
+            biased;
+            got = read_frame(&mut server) => panic!("a partial frame must not decode: {got:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        client.write_all(&wire[3..]).await.unwrap();
+        drop(client);
+        let next = read_frame(&mut server).await;
+        assert!(
+            !matches!(&next, Ok(f) if *f == ack_frame()),
+            "the interrupted frame cannot come back intact: {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_ready_reports_only_whole_frames_and_never_consumes_one() {
+        let wire = encode(&batch_frame()).await;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut frames = FrameReader::new(server);
+        assert!(!frames.frame_ready().unwrap(), "nothing sent yet");
+        client.write_all(&wire[..wire.len() - 1]).await.unwrap();
+        assert!(!frames.frame_ready().unwrap(), "one byte still missing");
+        client.write_all(&wire[wire.len() - 1..]).await.unwrap();
+        assert!(frames.frame_ready().unwrap());
+        assert!(
+            frames.frame_ready().unwrap(),
+            "asking twice consumes nothing"
+        );
+        assert_eq!(frames.next_frame().await.unwrap(), batch_frame());
+        assert!(!frames.frame_ready().unwrap());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_an_oversize_length_prefix_before_buffering_it() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut frames = FrameReader::new(server);
+        client.write_u8(KIND_BATCH).await.unwrap();
+        client
+            .write_u32((MAX_FRAME_BYTES + 1) as u32)
+            .await
+            .unwrap();
+        let err = frames.next_frame().await.unwrap_err();
+        assert!(
+            matches!(err, ReplCodecError::FrameTooLarge { .. }),
+            "{err:?}"
+        );
+        assert!(frames.buf.capacity() < MAX_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reports_a_stream_closed_mid_frame() {
+        let wire = encode(&ack_frame()).await;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut frames = FrameReader::new(server);
+        client.write_all(&wire[..wire.len() / 2]).await.unwrap();
+        drop(client);
+        let err = frames.next_frame().await.unwrap_err();
+        assert!(matches!(err, ReplCodecError::Io(_)), "{err:?}");
     }
 
     #[tokio::test]

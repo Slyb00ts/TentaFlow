@@ -31,9 +31,10 @@ smallvec = { workspace = true }
 rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# "sync" for the hot append/reply channels (tokio::sync::{mpsc,oneshot}),
-# driven by the single-writer partition thread's blocking variants, which
-# do not require an active Runtime by themselves. "rt-multi-thread" (which
+# "sync" for the append reply channel (tokio::sync::oneshot), which
+# `append_batch_async` awaits and `append_batch` waits on with a blocking
+# variant that needs no active Runtime; the writer's command channel is
+# `std::sync::mpsc` (its `recv_timeout` drives the interval fsync). "rt-multi-thread" (which
 # pulls in "rt") is for exactly one thing: `Partition::truncate_to_offset`/
 # `flush_meta`/`set_leader_epoch` are frozen-contract sync fns with no async
 # twin, so a caller already running on a Tokio task (e.g.
@@ -43,7 +44,7 @@ tracing = { workspace = true }
 # multi-thread runtime, `tokio::task::block_in_place` so this worker's other
 # queued tasks move to a different worker instead of stalling for the (short,
 # control-path-only) duration of the wait — both APIs need this feature.
-# The actual reply channel itself is plain `std::sync::mpsc`, not tokio's,
+# The control-command reply channel itself is plain `std::sync::mpsc`, not tokio's,
 # specifically because tokio's own `blocking_send`/`blocking_recv` panic
 # unconditionally when called from *any* Tokio runtime context (current-
 # thread included, where `block_in_place` itself is unavailable and panics).

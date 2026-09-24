@@ -524,6 +524,10 @@ fn spawn_assignment_poll_loop(
                             continue;
                         }
                     };
+                    let listed: std::collections::HashSet<manager_mod::PartitionKey> = rows
+                        .iter()
+                        .map(|a| (a.org_id.clone(), a.topic.clone(), a.partition))
+                        .collect();
                     for a in rows {
                         let key = (a.org_id.clone(), a.topic.clone(), a.partition);
                         let fingerprint = (a.leader_epoch, a.updated_at_ms);
@@ -532,6 +536,20 @@ fn spawn_assignment_poll_loop(
                         }
                         known.insert(key, fingerprint);
                         manager.apply_assignment(a).await;
+                    }
+                    // `list_for_node` only returns rows naming this node, so a
+                    // partition this node stopped replicating (its row
+                    // deleted with the topic, or rewritten without this node)
+                    // simply disappears from it — `apply_assignment` never
+                    // sees a `NotReplica` row from here.
+                    let dropped: Vec<manager_mod::PartitionKey> = known
+                        .keys()
+                        .filter(|k| !listed.contains(*k))
+                        .cloned()
+                        .collect();
+                    for key in dropped {
+                        known.remove(&key);
+                        manager.forget_partition(&key);
                     }
                 }
             }

@@ -524,7 +524,11 @@ fn spawn_follower_supervisor(
                 truncate_rx,
             )
             .await;
-            shared.leader.remove_follower(&node_id);
+            let end_reason = match &result {
+                Ok(()) => "partition closed".to_string(),
+                Err(e) => e.to_string(),
+            };
+            shared.leader.remove_follower(&node_id, &end_reason);
             shared.truncate_senders.lock().remove(&node_id);
 
             match result {
@@ -550,7 +554,12 @@ fn spawn_follower_supervisor(
                     if let FollowerStreamError::Rejected(ReplReject::StaleEpoch { have }) = &e {
                         shared.stale_epoch.fetch_max(*have, Ordering::SeqCst);
                     }
-                    tracing::debug!(
+                    // `info`, not `debug`: while the stream is down this
+                    // replica contributes nothing to `acks`, so a quorum
+                    // publish stalling here must leave a readable trace.
+                    // Rate-bounded by the reconnect backoff below.
+                    tracing::info!(
+                        org_id = %org_id, topic = %topic, partition = partition_id,
                         node_id = %node_id, error = %e,
                         "replication: leader follower-stream ended, reconnecting"
                     );
@@ -636,46 +645,21 @@ impl LeaderHandle for GlueLeaderHandle {
         self.0.leader.log_end_offset()
     }
 
-    /// Blocks the CALLING (non-async) thread on `PartitionLeader::
-    /// await_acks_required`, an async fn, per PLAN-M2 §1e's
-    /// `ReplicationCoordinator::await_acks` being a synchronous trait
-    /// method (`bus/mod.rs`, wired from `BusService::publish`'s own
-    /// synchronous call path).
-    ///
-    /// Deliberately does NOT use `tokio::task::block_in_place` +
-    /// `Handle::block_on` (an earlier version of this method did): that
-    /// pairing is documented elsewhere as tokio's sanctioned pattern for
-    /// driving an async call from sync code inside a worker, but in
-    /// practice, when the calling task is itself one of a small, fully
-    /// busy worker pool (this method's own caller loop, plus this
-    /// partition's follower-stream supervisor tasks all competing for the
-    /// SAME `multi_thread` runtime), it has been observed to leave the
-    /// wait's own future starved of a worker to run on — no panic, no
-    /// error, just an indefinite stall. Rather than depend on worker-pool
-    /// headroom this method has no way to guarantee, the wait always runs
-    /// on a genuinely independent OS thread with its own throwaway
-    /// runtime, and this thread blocks on a plain `std::sync::mpsc`
-    /// channel (no Tokio awareness at all, so it can never trip any
-    /// "blocking inside a runtime" panic either). Costs one OS thread per
-    /// call — on `publish`'s hot path (PLAN-M2 §1e) that is real overhead,
-    /// flagged here as a known follow-up (a small persistent thread pool
-    /// instead of spawning fresh each time), but correctness comes first.
+    fn truncation_count(&self) -> u64 {
+        self.0.partition.truncation_count()
+    }
+
+    /// Blocks the CALLING (non-async) thread in `PartitionLeader::
+    /// await_acks_blocking` — PLAN-M2 §1e's `ReplicationCoordinator::
+    /// await_acks` is a synchronous trait method on `BusService::publish`'s
+    /// synchronous path. A plain condvar wait: no thread, no runtime and no
+    /// Tokio awareness per call, so it can neither trip a "blocking inside a
+    /// runtime" panic nor starve on a busy worker pool the way
+    /// `block_in_place` + `Handle::block_on` was observed to.
     fn await_acks(&self, next_offset: u64, required: u32, timeout: Duration) -> AckOutcome {
-        let leader = Arc::clone(&self.0.leader);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("await_acks: build dedicated runtime");
-            let outcome = rt.block_on(leader.await_acks_required(next_offset, required, timeout));
-            let _ = tx.send(outcome);
-        });
-        rx.recv().unwrap_or(AckOutcome {
-            acked_nodes: 0,
-            required,
-            hw: 0,
-        })
+        self.0
+            .leader
+            .await_acks_blocking(next_offset, required, timeout)
     }
 
     fn note_offset_commit(&self, group: &str, _partition: u32, offset: u64, attempts: u32) {
@@ -693,6 +677,10 @@ impl LeaderHandle for GlueLeaderHandle {
         for task in self.0.tasks.lock().drain(..) {
             task.abort();
         }
+        // With every stream task gone no ack can arrive through this
+        // leader; a publish still waiting on it fails now instead of at its
+        // timeout.
+        self.0.leader.close_ack_waiters();
         // PLAN-M2 §1e item 1: only a single-replica (RF=1) partition
         // reverts to the engine's own M1 `FollowLeo` default on stop — a
         // multi-replica partition stopping here means a NEW leader is
@@ -1371,15 +1359,14 @@ mod tests {
                 if outcome.acked_nodes >= 2 {
                     return outcome;
                 }
-                // `await_acks` is BLOCKING (it parks on an mpsc recv), so
+                // `await_acks` is BLOCKING (it parks on a condvar), so
                 // without an explicit yield this loop never returns
                 // `Pending` — and a `tokio::time::timeout` wrapped around a
                 // future that never yields can never fire. A run where
                 // quorum does not arrive (followers starved by a parallel
                 // build on the same host) then hangs the whole test binary
                 // instead of failing at the 10 s budget: measured
-                // 06.09.2026 at 25 minutes and still climbing, with one
-                // fresh OS thread spawned per iteration the entire time.
+                // 06.09.2026 at 25 minutes and still climbing.
                 tokio::task::yield_now().await;
             }
         })

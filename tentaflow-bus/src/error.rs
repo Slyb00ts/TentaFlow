@@ -117,6 +117,25 @@ pub enum BusError {
         segment_base_offset: u64,
     },
 
+    /// A complete, checksummed batch sits at an offset its segment cannot
+    /// hold: the first batch of a segment does not start at the segment's
+    /// name, a later one breaks the offset chain, or two neighbouring
+    /// segments leave a gap or overlap. Not a torn write — torn tails are
+    /// truncated silently, since they were never acknowledged — so the log
+    /// is refused rather than cut back: truncating here would drop
+    /// acknowledged records and later reuse their offsets. Segments named
+    /// before the mid-group roll fix (`partition.rs`, `roll`) fail this way.
+    #[error(
+        "segment {path} holds a complete batch at offset {found_offset} where offset \
+         {expected_offset} was required; refusing to open instead of discarding \
+         acknowledged records"
+    )]
+    SegmentOffsetMismatch {
+        path: PathBuf,
+        expected_offset: u64,
+        found_offset: u64,
+    },
+
     #[error("partition directory {path} is already locked by another process/handle")]
     PartitionLocked { path: PathBuf },
 

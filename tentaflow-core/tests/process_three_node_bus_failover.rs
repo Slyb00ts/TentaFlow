@@ -250,6 +250,9 @@ const TOPIC: &str = "chaos.orders";
 const PARTITION: u32 = 0;
 const RECORD_BYTES: usize = 1024;
 const BATCH_RECORDS: usize = 1000;
+/// The term the harness's `ASSIGN` claims — see the child's `ASSIGN` arm
+/// for why it must outrank the epoch-1 create-time placements.
+const ASSIGN_EPOCH: u32 = 2;
 
 /// Matches the tracing subscriber's own timestamp format (RFC3339 UTC) so
 /// parent-side command logs can be correlated by eye against child-side
@@ -704,6 +707,54 @@ fn wait_role(node: &mut ChildNode, wants: &str, timeout: Duration) -> String {
     }
 }
 
+/// Waits until the two survivors agree on one leader and keep agreeing
+/// for longer than any competing promotion can still be in flight (its LEO
+/// query plus its majority wait — `election.rs`'s `LEO_QUERY_TIMEOUT` and
+/// `MAJORITY_AWAIT_TIMEOUT` — with margin): one reports `Leader { epoch: E }`
+/// and the other `Follower` of it at E. Returns the leader's name.
+fn wait_settled_leader(x: &mut ChildNode, y: &mut ChildNode, timeout: Duration) -> String {
+    const STABLE_FOR: Duration = Duration::from_millis(2500);
+    let deadline = Instant::now() + timeout;
+    let mut agreed: Option<(String, String, Instant)> = None;
+    loop {
+        let (rx, ry) = (role_of(x), role_of(y));
+        let follows = |follower: &str, leader: &ChildNode, leader_line: &str| {
+            follower.contains("Follower {")
+                && follower.contains(&leader.node_id)
+                && leader_epoch_of(follower) == leader_epoch_of(leader_line)
+        };
+        let view = if rx.contains("Leader {") && follows(&ry, x, &rx) {
+            Some((x.name.clone(), leader_epoch_of(&rx)))
+        } else if ry.contains("Leader {") && follows(&rx, y, &ry) {
+            Some((y.name.clone(), leader_epoch_of(&ry)))
+        } else {
+            None
+        };
+        match (view, &agreed) {
+            (Some((name, epoch)), Some((n, e, since))) if &name == n && &epoch == e => {
+                if since.elapsed() >= STABLE_FOR {
+                    return name;
+                }
+            }
+            (Some((name, epoch)), _) => agreed = Some((name, epoch, Instant::now())),
+            (None, _) => agreed = None,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "survivors never settled on one leader within {timeout:?}: {rx} / {ry}"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn leader_epoch_of(role_line: &str) -> String {
+    role_line
+        .split("epoch:")
+        .nth(1)
+        .map(|rest| rest.trim_matches(|c: char| !c.is_ascii_digit()).to_string())
+        .unwrap_or_default()
+}
+
 /// One `PUBLISH_BATCH` call = 1000 records x 1 KiB (PLAN-M2 §1g's own
 /// numbers). Returns `(base_offset, accepted, hw)` on success.
 fn publish_batch(node: &mut ChildNode, timeout: Duration) -> Result<(u64, u32, u64), String> {
@@ -764,9 +815,23 @@ fn assign_and_wait(
         if !replicas.contains(&n.node_id) {
             return true;
         }
+        // The role alone is not convergence: every node already holds a
+        // `leader = itself, epoch = 1` create-time placement, and the node
+        // with the lowest id wins that tie on every replica — the same
+        // Leader/Follower picture the ASSIGN produces, one term early. When
+        // the gate accepted it, the ASSIGN's own term landed during the
+        // steady-state phase and rebuilt every replica under a live
+        // publish (measured: `ROLE Leader { epoch: 1 }` accepted, then
+        // `acked=1, required=2` mid-phase-1). Wait for the assigned term.
         let want_leader = n.node_id == leader_node_id;
         let line = role_of(n);
-        (want_leader && line.contains("Leader")) || (!want_leader && line.contains("Follower"))
+        let term = format!("epoch: {ASSIGN_EPOCH}");
+        let role_ok = if want_leader {
+            line.contains("Leader")
+        } else {
+            line.contains("Follower") && line.contains(leader_node_id)
+        };
+        role_ok && line.contains(&term)
     };
     loop {
         let mut ok = expect(proposer);
@@ -935,7 +1000,15 @@ fn process_three_node_bus_failover_z12_environment_fencing() {
         "ASSIGN {ORG_ID} {TOPIC} {PARTITION} {leader_id} {}",
         replicas.join(",")
     ));
-    wait_role(&mut a, "Leader", Duration::from_secs(15));
+    // The assigned term, not just the role: `Leader { epoch: 1 }` is A's own
+    // create-time placement, and the ASSIGN landing after the gate rebuilt
+    // A under the publish below (measured: `not the leader for this
+    // partition (leader_node_id=None, leader_epoch=2)`).
+    wait_role(
+        &mut a,
+        &format!("Leader {{ epoch: {ASSIGN_EPOCH} }}"),
+        Duration::from_secs(15),
+    );
     wait_role(&mut b, "Follower", Duration::from_secs(15));
     // Same reason as in `assign_and_wait`: publish only after the leader's
     // live ISR actually covers the healthy pair, so a refusal here is a
@@ -1099,7 +1172,19 @@ fn process_three_node_bus_failover_chaos() {
         "P8 {p8:?} exceeds the harness budget of {p8_budget:?} (PLAN gate: <=8s)"
     );
 
-    let b_is_new_leader = new_leader_name == b.name;
+    // P8 is taken at the FIRST ack, but the first node to ack is not
+    // necessarily the leader the partition settles on. Both survivors can
+    // self-elect at the same epoch; the ledger resolves that tie to the lower
+    // node id, and the loser keeps serving — with the winner following it —
+    // until the winner's own promotion lands and fences it (measured: the
+    // higher-id survivor acked the P8 publish at epoch 3, the lower-id one
+    // took over ~0.4 s later, and the next publish to the first one got
+    // `not the leader`; the same in 2 of 10 runs of the previous tree).
+    // Phases 3-6 check the partition's leader, so they wait for it.
+    let settled = wait_settled_leader(&mut b, &mut c, Duration::from_secs(20));
+    eprintln!("chaos: leadership settled on {settled} (first ack came from {new_leader_name})");
+    let b_is_new_leader = settled == b.name;
+    let new_leader_name = settled;
     let (new_leader, other_survivor) = if b_is_new_leader {
         (&mut b, &mut c)
     } else {
@@ -1210,14 +1295,31 @@ fn process_three_node_bus_failover_chaos() {
     }
 
     // ---- Phase 6: byte-for-byte log comparison up to min(hw) ---------------
-    let (_, hw_leader, _) = partition_stats(new_leader);
-    let (_, hw_other, _) = partition_stats(other_survivor);
-    let (_, hw_a2, _) = partition_stats(&mut a2);
-    let min_hw = hw_leader.min(hw_other).min(hw_a2);
-    assert!(
-        min_hw >= total_acked,
-        "min(hw) regressed below the last known committed offset"
-    );
+    // A follower learns the leader's high watermark from the leader's next
+    // frame (a batch header or the heartbeat, `heartbeat_interval` = 500 ms
+    // in silence), so right after the last publish it can trail it by one
+    // batch with the records already in its log — measured: `STATS 0 628000
+    // 629000` on the other survivor, `629000` on the leader, read 0.8 s after
+    // that publish's ack; the same shape failed 5 of 10 runs of the tree
+    // before this patch. What must hold is that every replica REACHES the
+    // committed offset; a bound of ten heartbeat periods separates a lagging
+    // watermark from one that really regressed.
+    let hw_deadline = Instant::now() + Duration::from_secs(5);
+    let min_hw = loop {
+        let (_, hw_leader, _) = partition_stats(new_leader);
+        let (_, hw_other, _) = partition_stats(other_survivor);
+        let (_, hw_a2, _) = partition_stats(&mut a2);
+        let min_hw = hw_leader.min(hw_other).min(hw_a2);
+        if min_hw >= total_acked {
+            break min_hw;
+        }
+        assert!(
+            Instant::now() < hw_deadline,
+            "min(hw) regressed below the last known committed offset \
+             (leader {hw_leader}, other {hw_other}, rejoined {hw_a2}, committed {total_acked})"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    };
 
     let (hash_leader, count_leader) = hash_log(new_leader, min_hw);
     let (hash_other, count_other) = hash_log(other_survivor, min_hw);
@@ -1765,7 +1867,7 @@ async fn handle_child_command(
                 // reassignment on top of create-time placement, so it
                 // outranks it by epoch — the same thing a real
                 // `transfer_leader` would do.
-                leader_epoch: 2,
+                leader_epoch: ASSIGN_EPOCH,
                 updated_at_ms: now_ms(),
             };
             let op_id = assignment_store.propose(&assignment)?;

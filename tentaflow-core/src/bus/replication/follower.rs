@@ -31,8 +31,8 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::frames::{
-    read_frame, write_frame, ReplAck, ReplCodecError, ReplFrame, ReplHello, ReplHelloAck,
-    ReplLeoReply, ReplOffsets, ReplReject,
+    read_frame, write_frame, FrameReader, ReplAck, ReplCodecError, ReplFrame, ReplHello,
+    ReplHelloAck, ReplLeoReply, ReplOffsets, ReplReject,
 };
 use crate::bus::dlq::{self, DiscardStore};
 use crate::bus::groups::GroupOffsetStore;
@@ -47,13 +47,25 @@ fn now_ms() -> i64 {
 /// plan's own numbers; a test wanting a faster/slower cadence than
 /// production constructs its own `FollowerConfig` rather than mutating
 /// these constants.
+///
+/// ACK CADENCE: after appending a `Batch` the follower acks as soon as
+/// nothing more has already arrived (its inbound queue is drained) — the
+/// leader then learns the new `leo` one hop after the append, however few
+/// batches a producer keeps in flight. While frames keep arriving back to
+/// back it coalesces, acking every `ack_every_n_batches` batches, and
+/// `ack_interval` bounds the gap between two acks in every case, idle
+/// included (the ack is also the leader's ISR liveness signal). The ack
+/// never gets ahead of the follower's own durability policy: it reports the
+/// partition's published `log_end_offset`, which the writer publishes only
+/// after that policy's fsync decision.
 #[derive(Debug, Clone, Copy)]
 pub struct FollowerConfig {
-    /// Send an `Ack` after this many `Batch` frames even if
-    /// `ack_interval` has not elapsed yet.
+    /// Send an `Ack` after this many `Batch` frames even while more frames
+    /// are already queued.
     pub ack_every_n_batches: u32,
-    /// Send an `Ack` after this much wall time even if fewer than
-    /// `ack_every_n_batches` batches have landed since the last one.
+    /// Longest gap between two `Ack`s: a timer sends one with the current
+    /// offsets when nothing else did for this long. `ZERO` acks after every
+    /// frame and disables the timer.
     pub ack_interval: Duration,
     /// No `Heartbeat`/`Batch` within this long since the last one ends the
     /// stream with `FollowerExit::LeaseExpired` so the manager can start an
@@ -307,7 +319,7 @@ where
 /// already-known `hello` instead of reading it itself.
 pub async fn run_follower_stream_with_hello<R, W>(
     hello: ReplHello,
-    mut reader: R,
+    reader: R,
     mut writer: W,
     partition: Arc<Partition>,
     stores: FollowerStores,
@@ -389,14 +401,26 @@ where
     let mut follower = PartitionFollower::new(config);
     follower.note_leader(hello.leader_node_id, hello.leader_epoch);
 
+    // Cancel-safe: the read below loses the `select!` to the ack timer, the
+    // lease watchdog or the disconnect hint (see `FrameReader`'s doc).
+    let mut frames = FrameReader::new(reader);
     let mut batches_since_ack: u32 = 0;
     let mut last_ack_at = Instant::now();
+    let ack_timer_armed = !follower.config.ack_interval.is_zero();
 
     loop {
+        let ack_due = last_ack_at + follower.config.ack_interval;
         tokio::select! {
             biased;
-            frame = read_frame(&mut reader) => {
-                match frame? {
+            frame = frames.next_frame() => {
+                let frame = frame?;
+                // Only the frames that carry replication progress or the
+                // leader's liveness drive the ack cadence; a control reply
+                // (`LeoReply` to a `LeoQuery`) must stay the next frame the
+                // leader reads.
+                let cadence_frame =
+                    matches!(frame, ReplFrame::Batch { .. } | ReplFrame::Heartbeat(_));
+                match frame {
                     ReplFrame::Batch { header, bytes } => {
                         match partition
                             .append_replicated_async(bytes, header.base_offset, header.leader_epoch)
@@ -448,28 +472,10 @@ where
                         partition.set_high_watermark(header.hw);
                         follower.refresh_lease();
                         batches_since_ack += 1;
-                        maybe_send_ack(
-                            &mut writer,
-                            &partition,
-                            follower.leader_epoch(),
-                            &mut batches_since_ack,
-                            &mut last_ack_at,
-                            &follower.config,
-                        )
-                        .await?;
                     }
                     ReplFrame::Heartbeat(hb) => {
                         partition.set_high_watermark(hb.hw);
                         follower.refresh_lease();
-                        maybe_send_ack(
-                            &mut writer,
-                            &partition,
-                            follower.leader_epoch(),
-                            &mut batches_since_ack,
-                            &mut last_ack_at,
-                            &follower.config,
-                        )
-                        .await?;
                     }
                     ReplFrame::Truncate(t) => {
                         // The epoch fence comes FIRST, and it is what makes the
@@ -576,6 +582,30 @@ where
                         })
                     }
                 }
+                let ack_owed = cadence_frame
+                    && (batches_since_ack >= follower.config.ack_every_n_batches
+                        || last_ack_at.elapsed() >= follower.config.ack_interval
+                        || (batches_since_ack > 0 && !frames.frame_ready()?));
+                if ack_owed {
+                    send_ack(
+                        &mut writer,
+                        &partition,
+                        follower.leader_epoch(),
+                        &mut batches_since_ack,
+                        &mut last_ack_at,
+                    )
+                    .await?;
+                }
+            }
+            _ = tokio::time::sleep_until(ack_due), if ack_timer_armed => {
+                send_ack(
+                    &mut writer,
+                    &partition,
+                    follower.leader_epoch(),
+                    &mut batches_since_ack,
+                    &mut last_ack_at,
+                )
+                .await?;
             }
             _ = tokio::time::sleep_until(follower.lease_deadline()) => {
                 return Ok(FollowerExit::LeaseExpired);
@@ -612,24 +642,15 @@ async fn reject_hello<W: AsyncWrite + Unpin>(
     })
 }
 
-/// Sends an `Ack` once `ack_every_n_batches` batches or `ack_interval` of
-/// wall time have passed since the last one (PLAN-M2 §1b ack cadence),
-/// otherwise a no-op. Called after both `Batch` and `Heartbeat` — a
-/// heartbeat-only quiet period still keeps the leader's ISR/lag bookkeeping
-/// current.
-async fn maybe_send_ack<W: AsyncWrite + Unpin>(
+/// Sends one `Ack` with the partition's current offsets and restarts the
+/// cadence bookkeeping (`FollowerConfig`'s doc says when).
+async fn send_ack<W: AsyncWrite + Unpin>(
     writer: &mut W,
     partition: &Partition,
     leader_epoch: u32,
     batches_since_ack: &mut u32,
     last_ack_at: &mut Instant,
-    config: &FollowerConfig,
 ) -> Result<(), FollowerError> {
-    if *batches_since_ack < config.ack_every_n_batches
-        && last_ack_at.elapsed() < config.ack_interval
-    {
-        return Ok(());
-    }
     let ack = ReplAck {
         leader_epoch,
         follower_leo: partition.log_end_offset(),
@@ -710,6 +731,7 @@ mod tests {
     use fjall::Database;
     use tempfile::TempDir;
     use tentaflow_bus::{BatchBuilder, Durability, HwTracking, RecordInput, RollPolicy};
+    use tokio::io::AsyncWriteExt;
 
     use super::super::frames::{
         ReplBatchHeader, ReplHeartbeat, ReplHello, ReplLeoQuery, ReplProducerMark, ReplTruncate,
@@ -798,11 +820,132 @@ mod tests {
             // single `Heartbeat` with no batches in between, so the count
             // trigger (`ack_every_n_batches`) alone would not fire — the
             // interval trigger must fire unconditionally instead. Real
-            // `Instant::elapsed()` is always >= `Duration::ZERO`, so this
-            // makes every `maybe_send_ack` call send.
+            // `Instant::elapsed()` is always >= `Duration::ZERO`, so every
+            // `Batch`/`Heartbeat` is followed by an `Ack`.
             ack_interval: Duration::ZERO,
             leader_lease: Duration::from_millis(3000),
         }
+    }
+
+    /// Spawns a follower stream with `config`, completes the handshake and
+    /// returns the leader-side half plus the stream task.
+    async fn accepted_stream(
+        partition: Arc<Partition>,
+        stores: FollowerStores,
+        config: FollowerConfig,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<FollowerExit, FollowerError>>,
+    ) {
+        let (mut leader, follower_io) = tokio::io::duplex(64 * 1024);
+        let (follower_reader, follower_writer) = tokio::io::split(follower_io);
+        let handle = tokio::spawn(run_follower_stream(
+            follower_reader,
+            follower_writer,
+            partition,
+            stores,
+            NodeEnvironment::Prod,
+            expected(),
+            config,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+        write_frame(
+            &mut leader,
+            &ReplFrame::Hello(hello(1, NodeEnvironment::Prod)),
+        )
+        .await
+        .unwrap();
+        match read_frame(&mut leader).await.unwrap() {
+            ReplFrame::HelloAck(a) => assert!(a.accepted),
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+        (leader, handle)
+    }
+
+    /// F1 (ANALIZA-REPLIKACJA §1.2): with the PRODUCTION cadence (8 batches
+    /// / 500 ms) a lone batch — what every sequential `acks=quorum` publish
+    /// sends — is acked as soon as it is appended, because nothing else is
+    /// queued behind it. It used to wait for the 8th batch or for a
+    /// heartbeat arriving 500 ms after the last ack, which with the
+    /// leader's heartbeat suppression came to ~1 s per publish.
+    #[tokio::test]
+    async fn default_cadence_acks_a_lone_batch_once_nothing_more_is_queued() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = open_partition(part_dir.path());
+        let (_store_dir, stores) = open_stores();
+        let (mut leader, handle) =
+            accepted_stream(partition, stores, FollowerConfig::default()).await;
+
+        write_frame(&mut leader, &batch_frame(0, 0, 1, "one"))
+            .await
+            .unwrap();
+        // Well inside the 500 ms `ack_interval`: only the drained-queue
+        // rule can produce this ack.
+        let frame = tokio::time::timeout(Duration::from_millis(300), read_frame(&mut leader))
+            .await
+            .expect("a lone batch must be acked without waiting out ack_interval")
+            .unwrap();
+        match frame {
+            ReplFrame::Ack(a) => assert_eq!(a.follower_leo, 1),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        drop(leader);
+        let _ = handle.await;
+    }
+
+    /// Batches that are already queued behind the one just appended are
+    /// coalesced: three frames arriving in one write produce ONE ack, for
+    /// all three, after the last of them.
+    #[tokio::test]
+    async fn batches_already_queued_are_acked_once_after_the_last() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = open_partition(part_dir.path());
+        let (_store_dir, stores) = open_stores();
+        let (mut leader, handle) =
+            accepted_stream(partition, stores, FollowerConfig::default()).await;
+
+        let mut burst = Vec::new();
+        for (i, payload) in ["one", "two", "three"].iter().enumerate() {
+            let base = i as u64;
+            write_frame(&mut burst, &batch_frame(base, 0, 1, payload))
+                .await
+                .unwrap();
+        }
+        leader.write_all(&burst).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_millis(300), read_frame(&mut leader))
+            .await
+            .expect("the burst must be acked without waiting out ack_interval")
+            .unwrap();
+        match frame {
+            ReplFrame::Ack(a) => assert_eq!(a.follower_leo, 3, "one ack covering the whole burst"),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        drop(leader);
+        let _ = handle.await;
+    }
+
+    /// The ack timer runs on its own: with no frame at all from the leader,
+    /// the follower still acks every `ack_interval`, so the leader's ISR
+    /// liveness no longer hinges on its own heartbeats reaching us.
+    #[tokio::test]
+    async fn ack_timer_fires_without_any_frame_from_the_leader() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = open_partition(part_dir.path());
+        let (_store_dir, stores) = open_stores();
+        let config = FollowerConfig {
+            ack_interval: Duration::from_millis(50),
+            ..FollowerConfig::default()
+        };
+        let (mut leader, handle) = accepted_stream(partition, stores, config).await;
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_millis(1000), read_frame(&mut leader))
+                .await
+                .expect("the ack timer must fire with no inbound frame")
+                .unwrap();
+            assert!(matches!(frame, ReplFrame::Ack(_)), "got {frame:?}");
+        }
+        drop(leader);
+        let _ = handle.await;
     }
 
     #[tokio::test]
