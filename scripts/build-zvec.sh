@@ -332,32 +332,19 @@ case "$PLATFORM" in
     ensure_cmake_pin_on_path
     ensure_apple_libtool_shim_on_program_path
 
-    # Krok 1: protoc dla HOSTA. Cross-build odpala protoc w trakcie kompilacji,
-    # wiec potrzebny jest binarny protoc dzialajacy na macOS (nie na iOS).
-    echo "  [1/3] protoc dla hosta (macOS)..."
-    HOST_BUILD="$SRC_DIR/build_host"
-    ( cd "$SRC_DIR" && mkdir -p build_host && cd build_host
-      cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF ..
-      ninja protoc -j"$(sysctl -n hw.ncpu)" )
-    # protoc laduje jako bin/protoc-<wersja> (realny plik) + bin/protoc (symlink);
-    # bierzemy realny wykonywalny plik (symlink odpada przez -type f).
-    PROTOC_BIN="$(find "$HOST_BUILD" \( -name protoc -o -name 'protoc-*' \) -type f -perm -111 | head -n1)"
-    if [ -z "$PROTOC_BIN" ]; then
-        echo "Nie znaleziono zbudowanego protoc w $HOST_BUILD"
-        exit 1
-    fi
-
-    # Reset thirdparty miedzy buildem hosta a iOS: build hosta (non-IOS) naklada
-    # arrow.patch (arrow_fix), a konfiguracja iOS arrow.ios.patch (arrow_ios_fix) na
-    # TO SAMO zrodlo arrow — obu naraz nalozyc sie nie da. Cofamy patche (git checkout)
-    # i kasujemy markery apply_patch_once (git clean), by konfiguracja iOS nalozyla
-    # swoje patche na czyste zrodla (jak zvec/scripts/build_ios.sh robi przez stash).
-    echo "  reset thirdparty (host -> iOS)..."
+    # zvec >= 0.7 has no protobuf, so the cross-build needs no host protoc.
+    # Reset thirdparty: a desktop build in the same source tree applies
+    # arrow.patch (arrow_fix), while the iOS configuration applies
+    # arrow.ios.patch (arrow_ios_fix) to THE SAME arrow sources, and the two
+    # cannot both be applied. Undo the patches (git checkout) and drop the
+    # apply_patch_once markers (git clean) so iOS patches clean sources (as
+    # zvec/scripts/build_ios.sh does through a stash).
+    echo "  reset thirdparty (desktop -> iOS)..."
     ( cd "$SRC_DIR" && git submodule foreach --recursive \
         'git checkout -q -- . 2>/dev/null || true; git clean -fdxq' >/dev/null 2>&1 || true )
 
-    # Krok 2: cross-build zvec na iOS SDK.
-    echo "  [2/3] cross-build zvec ($PLATFORM, SDK $IOS_SDK)..."
+    # Krok 1: cross-build zvec na iOS SDK.
+    echo "  [1/2] cross-build zvec ($PLATFORM, SDK $IOS_SDK)..."
     IOS_BUILD="$SRC_DIR/build_ios_${PLATFORM}"
     # Generator: Unix Makefiles, NIE Ninja. Na iOS zvec (_add_library) tworzy cel
     # ${NAME} ORAZ ${NAME}_static — oba STATIC z tym samym OUTPUT_NAME, wiec oba pisza
@@ -374,13 +361,12 @@ case "$PLATFORM" in
         -DBUILD_TOOLS=OFF \
         -DBUILD_TESTING=OFF \
         -DBUILD_C_BINDINGS=ON \
-        -DGLOBAL_CC_PROTOBUF_PROTOC="$PROTOC_BIN" \
         -DIOS=ON \
         ..
       make zvec_c_api -j"$(sysctl -n hw.ncpu)" )
 
-    # Krok 3: scal archiwa w dwa wynikowe pliki.
-    echo "  [3/3] scalanie archiwow (libtool -static)..."
+    # Krok 2: scal archiwa w dwa wynikowe pliki.
+    echo "  [2/2] scalanie archiwow (libtool -static)..."
     OWN_LIBS=()
     for name in zvec zvec_core zvec_ailego zvec_turbo; do
         a="$IOS_BUILD/lib/lib${name}.a"
@@ -451,32 +437,14 @@ case "$PLATFORM" in
 
     ensure_cmake_pin_on_path
 
-    echo "  [1/3] protoc dla hosta..."
-    HOST_BUILD="$SRC_DIR/build_host"
-    ( cd "$SRC_DIR" && mkdir -p build_host && cd build_host
-      env \
-        -u CMAKE_C_COMPILER_LAUNCHER \
-        -u CMAKE_CXX_COMPILER_LAUNCHER \
-        cmake -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_COMPILER_LAUNCHER= \
-        -DCMAKE_CXX_COMPILER_LAUNCHER= \
-        -DBUILD_PYTHON_BINDINGS=OFF \
-        -DBUILD_TOOLS=OFF \
-        -DBUILD_TESTING=OFF \
-        ..
-      ninja protoc -j"$(nproc 2>/dev/null || echo 4)" )
-    PROTOC_BIN="$(find "$HOST_BUILD" \( -name protoc -o -name 'protoc-*' \) -type f -perm -111 | head -n1)"
-    if [ -z "$PROTOC_BIN" ]; then
-        echo "Nie znaleziono zbudowanego protoc w $HOST_BUILD"
-        exit 1
-    fi
-
-    echo "  reset thirdparty (host -> Android)..."
+    # zvec >= 0.7 has no protobuf, so the cross-build needs no host protoc. A
+    # desktop build in the same source tree leaves its arrow patch applied;
+    # undo it so the Android configuration patches clean sources.
+    echo "  reset thirdparty (desktop -> Android)..."
     ( cd "$SRC_DIR" && git submodule foreach --recursive \
         'git checkout -q -- . 2>/dev/null || true; git clean -fdxq' >/dev/null 2>&1 || true )
 
-    echo "  [2/3] cross-build zvec ($PLATFORM, ABI $ANDROID_ABI, API $ANDROID_API_LEVEL)..."
+    echo "  [1/2] cross-build zvec ($PLATFORM, ABI $ANDROID_ABI, API $ANDROID_API_LEVEL)..."
     ANDROID_BUILD="$SRC_DIR/build_android_${ANDROID_ABI}"
     rm -rf "$ANDROID_BUILD"
     ( cd "$SRC_DIR" && rm -rf "build_android_${ANDROID_ABI}" && mkdir -p "build_android_${ANDROID_ABI}" && cd "build_android_${ANDROID_ABI}"
@@ -498,11 +466,10 @@ case "$PLATFORM" in
         -DBUILD_C_BINDINGS=ON \
         -DENABLE_NATIVE=OFF \
         -DAUTO_DETECT_ARCH=OFF \
-        -DGLOBAL_CC_PROTOBUF_PROTOC="$PROTOC_BIN" \
         ..
       ninja zvec_c_api -j"$(nproc 2>/dev/null || echo 4)" )
 
-    echo "  [3/3] scalanie archiwow (llvm-ar MRI)..."
+    echo "  [2/2] scalanie archiwow (llvm-ar MRI)..."
     OWN_LIBS=()
     for name in zvec zvec_core zvec_ailego zvec_turbo; do
         a="$ANDROID_BUILD/lib/lib${name}.a"
