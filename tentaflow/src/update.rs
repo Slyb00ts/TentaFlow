@@ -309,12 +309,44 @@ fn gstreamer_satisfies(installed: &str, wanted: &str) -> bool {
     }
 }
 
+/// The uninstall entry of the GStreamer MSVC x86_64 installer (Inno Setup
+/// AppId). It records where the runtime really is — an upgrade keeps the
+/// directory of the installation it replaces, whatever /DIR asks for — and
+/// which version it is.
+#[cfg(windows)]
+const GSTREAMER_UNINSTALL_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\c20a66dc-b249-4e6d-a68a-d0f836b2b3cf_is1";
+
+/// The machine-wide GStreamer runtime: its directory and version, when its
+/// installer registered one whose files are still there. reg.exe prints the
+/// value names as stored, so the parsing does not depend on the UI language.
+#[cfg(windows)]
+fn installed_gstreamer() -> Option<(PathBuf, String)> {
+    let out = std::process::Command::new("reg.exe")
+        .args(["query", GSTREAMER_UNINSTALL_KEY])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let value = |name: &str| {
+        text.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix(name)?.trim_start();
+            Some(rest.strip_prefix("REG_SZ")?.trim().to_string())
+        })
+    };
+    let root = PathBuf::from(value("InstallLocation")?.trim_end_matches('\\'));
+    root.join(r"bin\gstreamer-1.0-0.dll")
+        .is_file()
+        .then(|| (root, value("DisplayVersion").unwrap_or_default()))
+}
+
 /// A new release may link a newer GStreamer than the machine has, and the
 /// service would then fail to load its DLLs after the swap. The runtime is
 /// installed the way install.ps1 installs it: verified against the archive's
-/// checksum, machine-wide into the same directory, so the PATH the installer
-/// gave the service still finds it. Runs with the service stopped — the
-/// installer cannot replace DLLs a running server holds open.
+/// checksum, machine-wide into the directory it already has, so the PATH the
+/// installer gave the service still finds it. Runs with the service stopped —
+/// the installer cannot replace DLLs a running server holds open.
 #[cfg(windows)]
 fn ensure_gstreamer(client: &reqwest::blocking::Client, release: &Path, work: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
@@ -325,33 +357,22 @@ fn ensure_gstreamer(client: &reqwest::blocking::Client, release: &Path, work: &P
     }
     let spec: GstreamerSpec = serde_json::from_str(&std::fs::read_to_string(&spec_path)?)
         .with_context(|| format!("reading {}", spec_path.display()))?;
-    // /DIR names the product directory; the installer puts the files one
-    // level below it, in 1.0\msvc_x86_64.
-    let product = PathBuf::from(
-        std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into()),
-    )
-    .join("gstreamer");
-    let root = product.join("1.0\\msvc_x86_64");
-    let dll = root.join("bin\\gstreamer-1.0-0.dll");
-    if dll.is_file() {
-        // The DLL's version resource is the one version a runtime-only install
-        // carries (no .pc files); PowerShell reads it without a new dependency.
-        let out = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command"])
-            .arg(format!(
-                "(Get-Item -LiteralPath '{}').VersionInfo.ProductVersion",
-                dll.display()
-            ))
-            .output()
-            .context("reading the GStreamer version")?;
-        let installed = String::from_utf8_lossy(&out.stdout);
-        if gstreamer_satisfies(&installed, &spec.version) {
+    let installed = installed_gstreamer();
+    if let Some((_, version)) = &installed {
+        if gstreamer_satisfies(version, &spec.version) {
             return Ok(());
         }
     }
+    let root = installed.map(|(root, _)| root).unwrap_or_else(|| {
+        PathBuf::from(
+            std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into()),
+        )
+        .join(r"gstreamer\1.0\msvc_x86_64")
+    });
 
     println!("Installing the GStreamer {} runtime", spec.version);
     let setup = work.join(format!("gstreamer-{}.exe", spec.version));
+    let setup_log = work.join(format!("gstreamer-{}.log", spec.version));
     download(client, &spec.url, &setup)?;
     let actual = sha256_of(&setup)?;
     if actual != spec.sha256.to_lowercase() {
@@ -370,21 +391,28 @@ fn ensure_gstreamer(client: &reqwest::blocking::Client, release: &Path, work: &P
             "/ALLUSERS",
             "/TYPE=runtime",
         ])
-        .raw_arg(format!("/DIR=\"{}\"", product.display()))
+        .raw_arg(format!("/DIR=\"{}\"", root.display()))
         .raw_arg("/TASKS=\"\"")
+        .raw_arg(format!("/LOG=\"{}\"", setup_log.display()))
         .status()
         .context("running the GStreamer installer")?;
     if !status.success() {
         bail!("the GStreamer installer failed ({status})");
     }
-    if !dll.is_file() {
-        bail!(
-            "GStreamer is not in {} after its installer finished",
-            root.display()
-        );
+    match installed_gstreamer() {
+        Some((root, version)) if gstreamer_satisfies(&version, &spec.version) => {
+            println!(
+                "GStreamer {version} runtime installed in {}",
+                root.display()
+            );
+            Ok(())
+        }
+        _ => bail!(
+            "GStreamer {} is not installed after its installer finished (log: {})",
+            spec.version,
+            setup_log.display()
+        ),
     }
-    println!("GStreamer {} runtime installed", spec.version);
-    Ok(())
 }
 
 /// Keeps the running version and the one before it — enough to roll back by

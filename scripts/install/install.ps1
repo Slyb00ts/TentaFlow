@@ -207,14 +207,15 @@ function Get-Archive($work, $chosenEdition, $chosenVariant) {
 # start without it. The archive names the exact runtime it was built against
 # (gstreamer.json); it is installed machine-wide, runtime only, because the
 # service account cannot see a per-user install.
-# /DIR names the product directory; the installer itself puts the files one
-# level below, in 1.0\msvc_x86_64.
-function Get-GstreamerDir {
-    return (Join-Path $env:ProgramFiles 'gstreamer')
-}
+# The Inno Setup AppId of the GStreamer MSVC x86_64 installer. Its uninstall
+# entry records where the runtime really is: an upgrade keeps the directory of
+# the installation it replaces, whatever /DIR asks for.
+$GstreamerUninstallKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\c20a66dc-b249-4e6d-a68a-d0f836b2b3cf_is1'
 
 function Get-GstreamerRoot {
-    return (Join-Path (Get-GstreamerDir) '1.0\msvc_x86_64')
+    $entry = Get-ItemProperty -LiteralPath "HKLM:\$GstreamerUninstallKey" -ErrorAction SilentlyContinue
+    if ($entry -and $entry.InstallLocation) { return $entry.InstallLocation.TrimEnd('\') }
+    return (Join-Path $env:ProgramFiles 'gstreamer\1.0\msvc_x86_64')
 }
 
 function Get-GstreamerVersion($root) {
@@ -244,6 +245,7 @@ function Install-Gstreamer($releaseDir) {
     }
     Log "Installing the GStreamer $($want.version) runtime (MSVC x86_64)"
     $setup = Join-Path $env:TEMP "gstreamer-$($want.version)-$PID.exe"
+    $setupLog = Join-Path $env:TEMP "gstreamer-$($want.version)-$PID.log"
     Invoke-WebRequest -Uri $want.url -OutFile $setup -UseBasicParsing
     try {
         $actual = Get-FileSha256 $setup
@@ -256,12 +258,19 @@ function Install-Gstreamer($releaseDir) {
         # with a space carries its own quotes.
         $proc = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/ALLUSERS', '/TYPE=runtime',
-            "/DIR=`"$(Get-GstreamerDir)`"", '/TASKS=""')
-        if ($proc.ExitCode -ne 0) { Die "The GStreamer installer failed (exit $($proc.ExitCode))." }
+            "/DIR=`"$root`"", '/TASKS=""', "/LOG=`"$setupLog`"")
+        if ($proc.ExitCode -ne 0) { Die "The GStreamer installer failed (exit $($proc.ExitCode)); log: $setupLog" }
     } finally {
         Remove-Item -LiteralPath $setup -Force -ErrorAction SilentlyContinue
     }
-    if (-not (Get-GstreamerVersion $root)) { Die "GStreamer is not in $root after its installer finished." }
+    $root = Get-GstreamerRoot
+    if (-not (Get-GstreamerVersion $root)) {
+        # Where the installer says it went is the one fact worth showing.
+        $where = @(Select-String -LiteralPath $setupLog -Pattern 'install mode|Dest filename: .*gstreamer-1\.0-0\.dll' -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Line.Substring([Math]::Min(24, $_.Line.Length)) }) -join '; '
+        Die "GStreamer is not in $root after its installer finished ($where). Log: $setupLog"
+    }
+    Remove-Item -LiteralPath $setupLog -Force -ErrorAction SilentlyContinue
     Ok "GStreamer $($want.version) runtime installed in $root"
     return $root
 }
@@ -311,6 +320,11 @@ function Publish-Version($releaseDir) {
     New-Item -ItemType Directory -Force -Path (Join-Path $Prefix 'versions') | Out-Null
     if (Test-Path -LiteralPath $versionDir) { Remove-Item -LiteralPath $versionDir -Recurse -Force }
     Move-Item -LiteralPath $releaseDir -Destination $versionDir
+    # A move keeps the access rules of %TEMP% in the installing admin's
+    # profile, which the service account cannot read ("Access is denied" at
+    # start). Reset makes the tree inherit what Program Files grants.
+    & icacls $versionDir /reset /T /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { Die "Could not reset the access rules of $versionDir (icacls exit $LASTEXITCODE)." }
 
     # Windows cannot rename a directory entry over another, so the junction is
     # exchanged by two renames (the same as `tentaflow update`), with the old
