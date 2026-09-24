@@ -53,6 +53,18 @@ function Ok($msg)   { Write-Host "  ok $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "  !! $msg" -ForegroundColor Yellow }
 function Die($msg)  { Write-Host "  xx $msg" -ForegroundColor Red; throw $msg }
 
+# Windows PowerShell 5.1 turns every stderr line of a native command whose
+# stderr is redirected into an error record, and $ErrorActionPreference='Stop'
+# makes that fatal even when the tool exits 0 - net.exe alone complains about a
+# group the account is already in. These tools answer through their exit code
+# ($LASTEXITCODE survives), so their stderr is dropped with the preference
+# relaxed for the call.
+function Invoke-Native([string]$File, [string[]]$Arguments) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $File @Arguments 2>$null } finally { $ErrorActionPreference = $saved }
+}
+
 # =============================================================================
 # Preconditions
 # =============================================================================
@@ -81,8 +93,10 @@ function Assert-Supported {
 function Get-Proposal {
     $smi = Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue
     if ($smi) {
-        $line = & $smi.Source --query-gpu=name,compute_cap,driver_version --format=csv,noheader 2>$null |
-            Select-Object -First 1
+        # Collected before it is cut: Select-Object -First stops the pipeline
+        # upstream, and the exit code of a stopped call is not the tool's.
+        $rows = @(Invoke-Native $smi.Source @('--query-gpu=name,compute_cap,driver_version', '--format=csv,noheader'))
+        $line = $rows | Select-Object -First 1
         if ($LASTEXITCODE -eq 0 -and $line) {
             $parts = $line -split ',\s*'
             $cc = [double]::Parse($parts[1], [Globalization.CultureInfo]::InvariantCulture)
@@ -282,7 +296,7 @@ function Publish-Version($releaseDir) {
     # The version comes from the binary itself, so a local archive (CI,
     # offline) lands in a correctly named directory without trusting the file
     # name. The binary starts only once its runtime DLLs are reachable.
-    $versionLine = & (Join-Path $releaseDir 'tentaflow.exe') --version 2>$null
+    $versionLine = Invoke-Native (Join-Path $releaseDir 'tentaflow.exe') @('--version')
     if ($LASTEXITCODE -ne 0 -or -not $versionLine) {
         Die ("Cannot read the version from the binary (exit {0}; 0xC0000135 means a DLL it links is missing)." -f $LASTEXITCODE)
     }
@@ -400,6 +414,16 @@ function Protect-DataRoot($account) {
 # =============================================================================
 # Service
 # =============================================================================
+# A membership only widens what the service can see, so a refusal is reported
+# with its consequence instead of aborting an otherwise working installation.
+# The listing decides, not the exit code: net.exe exits 2 for every failure,
+# "already a member" on a reinstall included.
+function Add-GroupMember($group, $account, $consequence) {
+    Invoke-Native 'net.exe' @('localgroup', $group, $account, '/add') | Out-Null
+    $members = @(Invoke-Native 'net.exe' @('localgroup', $group))
+    if ($members -notcontains $account) { Warn "Could not add $account to '$group': $consequence." }
+}
+
 function Register-TentaflowService {
     $account = "NT SERVICE\$ServiceName"
     $binPath = "`"$Exe`" --windows-service --config `"$Config`" --home `"$HomeDir`""
@@ -421,10 +445,10 @@ function Register-TentaflowService {
     # GPU and disk counters (PDH) are readable by Performance Monitor Users;
     # the group is named by SID because its name is localized.
     $perfGroup = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-558')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
-    & net.exe localgroup $perfGroup $account /add 2>$null | Out-Null
+    Add-GroupMember $perfGroup $account 'GPU and disk metrics will be missing'
     # Docker Desktop hands its engine pipe to this group only.
     if (Get-LocalGroup -Name 'docker-users' -ErrorAction SilentlyContinue) {
-        & net.exe localgroup docker-users $account /add 2>$null | Out-Null
+        Add-GroupMember 'docker-users' $account 'Docker deployments will be refused'
     }
 
     # The Service Control Manager keeps the environment it read at boot, so the
@@ -443,7 +467,7 @@ function Wait-Healthy($port) {
     # First start generates the TLS identity and the database before the socket
     # opens. curl.exe ships with Windows and takes the self-signed certificate.
     for ($i = 0; $i -lt 90; $i++) {
-        & curl.exe -fsk "https://127.0.0.1:$port/health" *> $null
+        Invoke-Native 'curl.exe' @('-fsk', "https://127.0.0.1:$port/health") | Out-Null
         if ($LASTEXITCODE -eq 0) { Ok "The server answers on port $port"; return }
         if ((Get-Service -Name $ServiceName).Status -ne 'Running') { break }
         Start-Sleep -Seconds 2

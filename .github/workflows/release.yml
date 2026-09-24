@@ -30,6 +30,9 @@ on:
 
 permissions:
   contents: write
+  # build-windows.yml -> install-windows.yml; a called workflow cannot hold
+  # more than its caller.
+  actions: read
 
 env:
   CARGO_INCREMENTAL: 0

@@ -110,7 +110,10 @@ osobnym, aktywnym pakietem `tentaflow-teams-bot`.
   principals go by SID in scripts — their names are localized. `install.ps1` and
   `uninstall.ps1` are the exception to the BOM rule: they run as `irm … | iex`, and Windows
   PowerShell 5.1 reads a leading U+FEFF as part of the first command name, so they stay
-  ASCII-only WITHOUT a BOM (the CI `install` job runs them exactly that way).
+  ASCII-only WITHOUT a BOM (`install-windows.yml` runs them exactly that way, in 5.1).
+  Every native call whose stderr the scripts drop goes through `Invoke-Native`: 5.1 turns a
+  redirected stderr line into an error record, and `$ErrorActionPreference = 'Stop'` makes it
+  fatal even when the tool exits 0.
 
 **Host telemetry on Windows.** `tentaflow-core/src/gpu_telemetry/` is the ONE source of GPU
 numbers there (DXGI for adapters, VRAM totals and LUIDs; PDH for dedicated usage and engine

@@ -1,0 +1,151 @@
+# =============================================================================
+# File:        .github/workflows/install-windows.yml
+# Description: Installs every Windows release archive with
+#              scripts/install/install.ps1 on a runner that never ran
+#              setup.ps1 - no GStreamer, no toolchain - so the installer must
+#              bring the runtime itself, exactly as on a user's machine. The
+#              second run is an upgrade over the running service (stop, junction
+#              swap, kept config); the CLI then drives the service through the
+#              Service Control Manager, and uninstall.ps1 must leave nothing
+#              registered.
+#
+#              build-windows.yml calls it for the archives it just built. A
+#              change to the installer alone runs it against the newest archives
+#              already built, because rebuilding the binary for a script change
+#              would cost hours and prove nothing more.
+#
+#              A failure is reported as annotations (the error with its line,
+#              the service log, the SCM events): they are readable without the
+#              rights the job log needs.
+# =============================================================================
+name: install-windows
+
+on:
+  workflow_call:
+    inputs:
+      current_run:
+        description: Install the archives uploaded by the calling run
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - "scripts/install/*.ps1"
+      - ".github/workflows/install-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  install:
+    name: install (windows-x86_64, ${{ matrix.asset }})
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { asset: slim, edition: slim, variant: "" }
+          - { asset: full-vulkan, edition: full, variant: vulkan }
+          - { asset: full-cuda13, edition: full, variant: cuda13 }
+    env:
+      TENTAFLOW_EDITION: ${{ matrix.edition }}
+      TENTAFLOW_VARIANT: ${{ matrix.variant }}
+    defaults:
+      run:
+        # Windows PowerShell 5.1, the one every Windows ships and the one the
+        # documented `irm | iex` runs in; pwsh forgives things 5.1 does not.
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        if: inputs.current_run
+        with:
+          name: tentaflow-windows-x86_64-${{ matrix.asset }}
+          path: dist
+
+      - name: Newest archives already built
+        if: ${{ !inputs.current_run }}
+        id: newest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $id = gh api "repos/${{ github.repository }}/actions/artifacts?name=tentaflow-windows-x86_64-${{ matrix.asset }}&per_page=1" --jq '.artifacts[0].workflow_run.id'
+          if (-not $id -or $id -eq 'null') { Write-Host '::error::no Windows archive to install - run build-windows first'; exit 1 }
+          Write-Host "archives from run $id"
+          "run_id=$id" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.current_run }}
+        with:
+          name: tentaflow-windows-x86_64-${{ matrix.asset }}
+          path: dist
+          run-id: ${{ steps.newest.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Install the way the documented one-liner does
+        run: |
+          $env:TENTAFLOW_ASSET_FILE = (Get-ChildItem dist\*.zip | Select-Object -First 1).FullName
+          try {
+            # The raw bytes decoded as irm decodes them: a BOM would survive
+            # into the string and break iex on the first line.
+            Invoke-Expression ([Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes("$PWD\scripts\install\install.ps1")))
+          } catch {
+            Write-Host "::error title=install.ps1 line $($_.InvocationInfo.ScriptLineNumber)::$($_.Exception.Message) | $($_.InvocationInfo.Line.Trim())"
+            exit 1
+          }
+
+      - name: Install again over the running service
+        run: |
+          $env:TENTAFLOW_ASSET_FILE = (Get-ChildItem dist\*.zip | Select-Object -First 1).FullName
+          try { .\scripts\install\install.ps1 } catch {
+            Write-Host "::error title=install.ps1 line $($_.InvocationInfo.ScriptLineNumber)::$($_.Exception.Message) | $($_.InvocationInfo.Line.Trim())"
+            exit 1
+          }
+
+      - name: The service and the CLI agree
+        run: |
+          $service = Get-Service TentaFlow
+          if ($service.Status -ne 'Running' -or $service.StartType -ne 'Automatic') {
+            Write-Host "::error::service is $($service.Status)/$($service.StartType), expected Running/Automatic"; exit 1
+          }
+          $exe = Join-Path $env:ProgramFiles 'TentaFlow\current\tentaflow.exe'
+          $status = & $exe status | Out-String
+          Write-Host $status
+          if ($status -notmatch 'health:\s+OK') { Write-Host "::error::tentaflow status does not report a healthy server:%0A$($status -replace "`r?`n", '%0A')"; exit 1 }
+          & $exe stop
+          if ($LASTEXITCODE -ne 0 -or (Get-Service TentaFlow).Status -ne 'Stopped') { Write-Host '::error::tentaflow stop'; exit 1 }
+          & $exe start
+          if ($LASTEXITCODE -ne 0 -or (Get-Service TentaFlow).Status -ne 'Running') { Write-Host '::error::tentaflow start'; exit 1 }
+          $versions = @(Get-ChildItem (Join-Path $env:ProgramFiles 'TentaFlow\versions') -Directory)
+          if ($versions.Count -ne 1) { Write-Host "::error::expected one version directory, found $($versions.Count)"; exit 1 }
+
+      - name: Uninstall
+        run: |
+          .\scripts\install\uninstall.ps1 -Purge
+          if (Get-Service TentaFlow -ErrorAction SilentlyContinue) { Write-Host '::error::the service is still registered'; exit 1 }
+          if (Test-Path (Join-Path $env:ProgramFiles 'TentaFlow')) { Write-Host '::error::the prefix is still there'; exit 1 }
+          if (Get-NetFirewallRule -Group TentaFlow -ErrorAction SilentlyContinue) { Write-Host '::error::firewall rules left behind'; exit 1 }
+
+      - name: Service diagnostics
+        if: failure()
+        run: |
+          function Annotate($title, $lines) {
+            $text = (@($lines) -join "`n")
+            if ($text.Length -gt 6000) { $text = $text.Substring($text.Length - 6000) }
+            $text = $text -replace '%', '%25' -replace "`r", '' -replace "`n", '%0A'
+            Write-Host "::error title=$title::$text"
+          }
+          Annotate 'sc qc / query' ((& sc.exe qc TentaFlow) + (& sc.exe query TentaFlow))
+          $logs = Join-Path $env:ProgramData 'TentaFlow\data\logs'
+          Get-ChildItem $logs -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 |
+            ForEach-Object { Annotate "service log $($_.Name)" (Get-Content $_.FullName -Tail 60) }
+          $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 8 -ErrorAction SilentlyContinue |
+            ForEach-Object { "$($_.TimeCreated.ToString('HH:mm:ss')) $($_.Message)" }
+          Annotate 'SCM events' $events
+          $app = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 2 } -MaxEvents 5 -ErrorAction SilentlyContinue |
+            ForEach-Object { "$($_.TimeCreated.ToString('HH:mm:ss')) $($_.ProviderName): $($_.Message)" }
+          Annotate 'Application errors' $app
