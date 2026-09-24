@@ -120,7 +120,9 @@
   .tb-kpi { gap: 10px; }
   .tb-app-head { align-items: flex-start; }
   .tb-app-head .d-actions { width: 100%; flex-wrap: wrap; }
-  .tb-app-head .d-actions tf-select { flex: 1 1 180px; min-width: 0; }
+  /* The picker gets the whole row, so the caption and the instance name
+     never run into the chevron; "Odśwież" goes to the next line. */
+  .tb-app-head .d-actions tf-select { flex: 1 1 100%; min-width: 0; }
   .tb-root .section-card { padding: 14px; }
   .tb-root .topic-mini { grid-template-columns: 34px minmax(0, 1fr) 76px; }
   .tb-alert { grid-template-columns: minmax(0, 1fr); }

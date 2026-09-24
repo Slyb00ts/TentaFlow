@@ -160,6 +160,7 @@ const TAB_ICONS = { overview: 'gauge', topics: 'share', groups: 'users', dlq: 'i
 // table sort and focus intact across a tab switch.
 const VIEW_SLOTS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'detail', 'replication'];
 const DLQ_RETRY_ALL_MAX = 500;
+const COMMIT_MODES = ['auto_after_success', 'explicit', 'at_most_once'];
 // Rolling in-memory window for the "live" M01/M03 charts — there is no
 // history/time-series endpoint (module-doc gap #1), so this is the last
 // N polls kept only while the screen stays mounted, not real 24h history.
@@ -1542,6 +1543,7 @@ async function refreshStats() {
     updateLiveChartSeries('tb-chart-live', state.chartSeries);
     paintTopicsTable();
   }
+  if (state.tab === 'groups' && !state.view && state.groupsLoaded) paintGroupsTable();
   // M06 patches its own DOM in place on the same cadence while visible.
   if (state.tab === 'replication' && !state.view) {
     pollReplication();
@@ -1651,7 +1653,7 @@ function kpiStripHtml() {
   return `
     <div class="tb-kpi-grid">
       <tf-stat-card id="tb-kpi-topics" label="${escapeAttr(T('kpi_topics'))}" value="—" icon="database"></tf-stat-card>
-      <tf-stat-card id="tb-kpi-msgs-in" label="${escapeAttr(T('kpi_msgs_in'))}" value="—" suffix="msg/s" icon="zap"></tf-stat-card>
+      <tf-stat-card id="tb-kpi-msgs-in" label="${escapeAttr(T('kpi_msgs_in'))}" value="—" suffix="${escapeAttr(T('overview.rate_suffix'))}" icon="zap"></tf-stat-card>
       <tf-stat-card id="tb-kpi-lag" label="${escapeAttr(T('kpi_lag'))}" value="—" icon="trend"></tf-stat-card>
       <tf-stat-card id="tb-kpi-dlq-depth" label="${escapeAttr(T('kpi_dlq_depth'))}" value="—" icon="alert"></tf-stat-card>
       <tf-stat-card id="tb-kpi-disk" label="${escapeAttr(T('kpi_disk'))}" value="—" icon="cylinder"></tf-stat-card>
@@ -2920,7 +2922,7 @@ function detailPartitionsHtml(partitions, topicName) {
       <tr class="${p.unavailableReason ? 'tb-row-unavailable' : ''}">
         <td>${p.partition}</td>
         <td class="mono">${p.leaderNodeId ? escapeHtml(p.leaderNodeId) : '—'}</td>
-        <td class="mono">${p.leaderEpoch != null ? `e${p.leaderEpoch}` : '—'}</td>
+        <td class="mono">${p.leaderEpoch != null ? escapeHtml(T('replication.epoch_value', { n: p.leaderEpoch })) : '—'}</td>
         <td>${isrCount != null && replicaCount != null ? `${isrCount}/${replicaCount}` : '—'}${degraded ? ` <span class="tf-chip tf-chip--outline warn">${escapeHtml(T('detail_isr_degraded'))}</span>` : ''}</td>
         <td class="mono">${p.earliestOffset}</td>
         <td class="mono">${p.logEndOffset}</td>
@@ -3184,10 +3186,10 @@ function hasMoreForPartitionSelection(partitions, partition) {
 // breakdown only lists partitions the record budget actually reached
 // (N-3), which would hide partitions 1..N-1 from the picker itself on
 // exactly the topics where the filter matters most.
-function partitionFilterOptions(partitionCount, allLabel) {
+function partitionFilterOptions(partitionCount, allLabel, partitionLabel) {
   const n = Number(partitionCount) || 0;
   const options = [{ value: '', label: allLabel }];
-  for (let i = 0; i < n; i += 1) options.push({ value: String(i), label: `P${i}` });
+  for (let i = 0; i < n; i += 1) options.push({ value: String(i), label: partitionLabel(i) });
   return options;
 }
 
@@ -3213,7 +3215,7 @@ function openMessagePreview(topicName, partitionCount) {
 
   const previewState = { records: [], partitions: [], partition: null };
   const partitionSelect = modal.querySelector('#tb-preview-partition');
-  partitionSelect?.setOptions(partitionFilterOptions(partitionCount, T('preview_partition_all')), '');
+  partitionSelect?.setOptions(partitionFilterOptions(partitionCount, T('preview_partition_all'), (i) => T('partition_label', { n: i })), '');
   // Keyboard-accessible for free: `<tf-select>` wraps a native `<select>`
   // (tab-focusable, arrow-key/typeahead option cycling, Enter/Space commit —
   // see tf-select.js), no bespoke listbox needed for the mockup's dropdown.
@@ -3230,13 +3232,17 @@ function openMessagePreview(topicName, partitionCount) {
 // Per-partition summary chips (earliest offset / high watermark, tor U
 // task 1) shown above the record table in both M08 and M05 — the same
 // `BusBrowsePartitionInfoWire[]` shape both responses now carry.
+// One chip per partition: which message numbers it still keeps.
 function partitionSummaryHtml(partitions) {
   if (!partitions?.length) return '';
-  const chips = partitions.map((p) => `
-    <span class="tf-chip tf-chip--outline info" title="${escapeAttr(T('partitions_summary_chip_title', { partition: p.partition, earliest: p.earliestOffset, hwm: p.highWatermark }))}">
-      P${p.partition}: ${p.earliestOffset}–${p.highWatermark}
-    </span>
-  `).join('');
+  const chips = partitions.map((p) => {
+    const first = Number(p.earliestOffset) || 0;
+    const next = Number(p.highWatermark) || 0;
+    const label = next > first
+      ? T('partitions_summary_chip', { partition: p.partition, from: fmtCount(first), to: fmtCount(next - 1) })
+      : T('partitions_summary_chip_empty', { partition: p.partition });
+    return `<span class="tf-chip tf-chip--outline info" title="${escapeAttr(T('partitions_summary_chip_title', { partition: p.partition, next: fmtCount(next) }))}">${escapeHtml(label)}</span>`;
+  }).join('');
   return `<div class="tb-partition-summary">${chips}</div>`;
 }
 
@@ -3294,7 +3300,7 @@ async function loadPreviewPage(modal, topicName, previewState, isFirstPage) {
             <td>${msToDate(r.timestampMs)}</td>
             <td class="mono">${escapeHtml(r.key?.length ? bytesToPreviewText(r.key, 32) : '—')}</td>
             <td>
-              ${r.isBlobRef ? `<tf-chip variant="outline" status="info">BlobRef</tf-chip>` : ''}
+              ${r.isBlobRef ? `<tf-chip variant="outline" status="info">${escapeHtml(T('preview_blobref_chip'))}</tf-chip>` : ''}
               ${r.truncated ? `<tf-chip variant="outline" status="warn">${escapeHtml(T('preview_truncated'))}</tf-chip>` : ''}
               <tf-button variant="ghost" size="sm" icon="eye" class="tb-preview-view" data-idx="${idx}">${escapeHtml(T('preview_action_view'))}</tf-button>
             </td>
@@ -3378,6 +3384,7 @@ function groupsSkeletonHtml() {
           <tf-column key="topic" label="${escapeAttr(T('groups_col_topic'))}"></tf-column>
           <tf-column key="commitMode" label="${escapeAttr(T('groups_col_commit_mode'))}" hide-below="900"></tf-column>
           <tf-column key="state" label="${escapeAttr(T('groups_col_state'))}" renderer="chip"></tf-column>
+          <tf-column key="waiting" label="${escapeAttr(T('groups_col_waiting'))}" renderer="num"></tf-column>
         </tf-table>
         <div id="tb-groups-empty" hidden></div>
       </div>
@@ -3410,10 +3417,16 @@ function paintGroupsTable() {
   const table = byId('tb-groups-table');
   if (!table) return;
   const visibleGroups = filterVisibleGroups(state.groups);
+  const liveLag = new Map((state.stats?.groups || []).map((g) => [`${g.group}\u0000${g.topic}`, g.lagTotal]));
+  const fmtWaiting = (v) => (v == null ? '—' : fmtCount(v));
   const rows = visibleGroups.map((g) => ({
     group: g.group,
     topic: g.topic,
-    commitMode: g.commitMode,
+    // Chosen by the consumer's program when it connects: shown, never edited.
+    commitMode: COMMIT_MODES.includes(g.commitMode) ? T(`groups_commit_${g.commitMode}`) : String(g.commitMode || '—'),
+    // The live snapshot's figure (what Przegląd counts), else the list's own.
+    // Unknown (`null`) is not zero: a lag this node cannot measure prints "—".
+    waiting: fmtWaiting(liveLag.has(`${g.group}\u0000${g.topic}`) ? liveLag.get(`${g.group}\u0000${g.topic}`) : g.lagTotal),
     state: { status: g.paused ? 'warn' : 'ok', variant: 'outline', label: T(g.paused ? 'groups_state_paused' : 'groups_state_active') },
     paused: g.paused,
   }));
@@ -3742,74 +3755,84 @@ function paintDlqTable() {
     return;
   }
   const admin = canAdmin();
+  // One tf-table: on a phone it turns into cards, so every row's actions stay
+  // reachable; the error text and the attempts give way first.
   const rows = state.dlqRecords.map((r, idx) => {
     const reason = headerText(r.headers, 'dlq.reason') || 'unknown';
-    const attempts = headerText(r.headers, 'dlq.attempts') || '—';
     const errorMsg = headerText(r.headers, 'dlq.error_message') || '';
-    return `
-      <tr>
-        <td>${r.partition}</td>
-        <td>${r.offset}</td>
-        <td>${msToDate(r.timestampMs)}</td>
-        <td><tf-chip variant="outline" status="${DLQ_REASON_TONE[reason] || 'info'}">${escapeHtml(T(`dlq_reason_${reason}`) || reason)}</tf-chip></td>
-        <td>${escapeHtml(attempts)}</td>
-        <td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeAttr(errorMsg)}">${escapeHtml(errorMsg)}</td>
-        <td>
-          <tf-button variant="ghost" size="sm" icon="eye" class="tb-dlq-view" data-idx="${idx}">${escapeHtml(T('preview_action_view'))}</tf-button>
-          ${admin ? `
-            <tf-button variant="ghost" size="sm" icon="rotate" class="tb-dlq-retry" data-idx="${idx}">${escapeHtml(T('dlq_action_retry'))}</tf-button>
-            <tf-button variant="ghost" size="sm" icon="close" class="tb-dlq-discard" data-idx="${idx}">${escapeHtml(T('dlq_action_discard'))}</tf-button>
-          ` : ''}
-        </td>
-      </tr>
-      <tr class="tb-dlq-expand" id="tb-dlq-expand-${idx}" hidden><td colspan="7"></td></tr>
-    `;
-  }).join('');
+    return {
+      when: msToDate(r.timestampMs),
+      source: T('dlq_source_cell', { partition: r.partition, number: fmtCount(r.offset) }),
+      reason: { status: DLQ_REASON_TONE[reason] || 'info', variant: 'outline', label: T(`dlq_reason_${reason}`) },
+      attempts: headerText(r.headers, 'dlq.attempts') || '—',
+      error: errorMsg,
+      _idx: idx,
+      _key: `${r.partition}:${r.offset}`,
+    };
+  });
   host.innerHTML = `
     ${admin ? '' : `<div class="tb-gap-note">${sprite('info')}${escapeHtml(T('dlq_admin_required'))}</div>`}
     ${partitionSummaryHtml(state.dlqPartitions)}
-    <table style="width:100%;border-collapse:collapse;font-size:12px">
-      <thead><tr>
-        <th style="text-align:left;padding:6px 4px">${escapeHtml(T('dlq_col_partition'))}</th>
-        <th style="text-align:left;padding:6px 4px">${escapeHtml(T('dlq_col_offset'))}</th>
-        <th style="text-align:left;padding:6px 4px">${escapeHtml(T('dlq_col_timestamp'))}</th>
-        <th style="text-align:left;padding:6px 4px">${escapeHtml(T('dlq_col_reason'))}</th>
-        <th style="text-align:left;padding:6px 4px">${escapeHtml(T('dlq_col_attempts'))}</th>
-        <th style="text-align:left;padding:6px 4px">${escapeHtml(T('dlq_col_error'))}</th>
-        <th></th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
+    <tf-table id="tb-dlq-table">
+      <tf-column key="when" label="${escapeAttr(T('dlq_col_timestamp'))}" nowrap></tf-column>
+      <tf-column key="source" label="${escapeAttr(T('dlq_col_source'))}" nowrap></tf-column>
+      <tf-column key="reason" label="${escapeAttr(T('dlq_col_reason'))}" renderer="chip"></tf-column>
+      <tf-column key="attempts" label="${escapeAttr(T('dlq_col_attempts'))}" hide-below="900"></tf-column>
+      <tf-column key="error" label="${escapeAttr(T('dlq_col_error'))}" hide-below="1200" fill></tf-column>
+    </tf-table>
+    <div id="tb-dlq-detail"></div>
     ${state.dlqHasMore ? `<tf-button variant="secondary" id="tb-dlq-more" style="margin-top:10px">${escapeHtml(T('preview_load_more'))}</tf-button>` : ''}
   `;
-  host.querySelectorAll('.tb-dlq-view').forEach((btn) => {
-    btn.addEventListener('click', () => toggleDlqExpand(host, Number(btn.dataset.idx)));
-  });
-  if (admin) {
-    host.querySelectorAll('.tb-dlq-retry').forEach((btn) => {
-      btn.addEventListener('click', () => dlqRetry(state.dlqRecords[Number(btn.dataset.idx)]));
-    });
-    host.querySelectorAll('.tb-dlq-discard').forEach((btn) => {
-      btn.addEventListener('click', () => confirmDlqDiscard(state.dlqRecords[Number(btn.dataset.idx)]));
-    });
-  }
+  const table = host.querySelector('#tb-dlq-table');
+  table.rowActionsKey = (row) => `${row._key}:${row._idx}:${admin}`;
+  table.rowActions = (row) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'tf-table__row-actions';
+    const button = (icon, label, act) => {
+      const btn = document.createElement('tf-button');
+      btn.setAttribute('variant', 'ghost');
+      btn.setAttribute('size', 'sm');
+      btn.setAttribute('icon', icon);
+      btn.dataset.act = act;
+      btn.textContent = label;
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const record = state.dlqRecords[row._idx];
+        if (act === 'view') toggleDlqDetail(host, row._idx);
+        else if (act === 'retry') dlqRetry(record);
+        else confirmDlqDiscard(record);
+      });
+      wrap.appendChild(btn);
+    };
+    button('eye', T('preview_action_view'), 'view');
+    if (admin) {
+      button('rotate', T('dlq_action_retry'), 'retry');
+      button('close', T('dlq_action_discard'), 'discard');
+    }
+    return wrap;
+  };
+  table.rows = rows;
   host.querySelector('#tb-dlq-more')?.addEventListener('click', () => loadDlqRecords(false));
 }
 
-function toggleDlqExpand(host, idx) {
-  const row = host.querySelector(`#tb-dlq-expand-${idx}`);
-  if (!row) return;
-  const willShow = row.hidden;
-  host.querySelectorAll('.tb-dlq-expand').forEach((r) => { r.hidden = true; });
-  if (!willShow) return;
+// "Szczegóły" of one message: its envelope headers and the start of its
+// payload, under the table (a second click on the same row closes it).
+function toggleDlqDetail(host, idx) {
+  const panel = host.querySelector('#tb-dlq-detail');
+  if (!panel) return;
+  if (panel.dataset.idx === String(idx)) {
+    panel.dataset.idx = '';
+    panel.innerHTML = '';
+    return;
+  }
   const record = state.dlqRecords[idx];
-  const cell = row.querySelector('td');
   const allHeaders = (record.headers || [])
     .map((h) => [h.key, formatHeaderValue(h.key, bytesToPreviewText(h.value, 512))]);
-  cell.innerHTML = `
+  panel.dataset.idx = String(idx);
+  panel.innerHTML = `
     <div class="tb-dlq-detail">
       <div>
-        <strong>${escapeHtml(T('dlq_headers_title'))}</strong>
+        <strong>${escapeHtml(T('dlq_source_cell', { partition: record.partition, number: fmtCount(record.offset) }))}</strong>
         <dl class="tb-header-list">
           ${allHeaders.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}
         </dl>
@@ -3820,7 +3843,6 @@ function toggleDlqExpand(host, idx) {
       </div>
     </div>
   `;
-  row.hidden = false;
 }
 
 async function dlqRetry(record) {
@@ -3942,7 +3964,7 @@ function replicationSkeletonHtml() {
     </div>
     <div class="tb-repl-grid-2">
       <div class="tb-card">
-        <div class="tb-c-head"><h3>${escapeHtml(T('replication.lag_state_title'))}</h3></div>
+        <div class="tb-c-head"><h3>${escapeHtml(T('replication.lag_state_title'))}</h3><div class="tb-hint">${escapeHtml(T('replication.lag_state_hint'))}</div></div>
         <div class="tb-c-body" id="tb-repl-lag-state"></div>
       </div>
       <div class="tb-card">
@@ -4059,15 +4081,17 @@ function nodeCardRows(data) {
   });
 }
 
+// The node this screen runs on has no "last signal" worth printing — it is
+// the one answering.
 function nodeCardSubText(r) {
   if (!r.reachable) return T('replication.node_unreachable');
-  const heartbeat = T('replication.node_heartbeat', { ms: fmtCompact(Number(r.lastHeartbeatMsAgo) || 0) });
+  const heartbeat = r.isLocal ? '' : T('replication.node_heartbeat', { ms: fmtCompact(Number(r.lastHeartbeatMsAgo) || 0) });
   if (!r.degraded || r.degraded.kind !== 'lagging') return heartbeat;
   const lag = r.degraded.lag || {};
-  return `${heartbeat} · ${T('replication.node_lagging_note', {
+  return [heartbeat, T('replication.node_lagging_note', {
     partition: r.degraded.partition,
     reason: lag.reason || T('replication.node_lagging_reason_unknown'),
-  })}`;
+  })].filter(Boolean).join(' · ');
 }
 
 function nodeCardHtml(r) {
@@ -4149,11 +4173,11 @@ function roleMatrixRowHtml(row, nodes) {
   return `
     <tr class="${row.unavailableReason ? 'tb-row-unavailable' : ''}" id="tb-repl-row-${key}">
       <td>
-        P${row.partition}
+        ${escapeHtml(T('partition_label', { n: row.partition }))}
         ${reasonKey ? `<div class="tf-chip tf-chip--outline warn tb-role-unavailable-chip">${escapeHtml(T(reasonKey))}</div>` : ''}
       </td>
       ${cells}
-      <td class="mono" id="tb-repl-epoch-${key}">e${row.leaderEpoch}</td>
+      <td class="mono" id="tb-repl-epoch-${key}">${escapeHtml(T('replication.epoch_value', { n: row.leaderEpoch }))}</td>
       ${actions}
     </tr>
   `;
@@ -4183,7 +4207,7 @@ function patchRoleMatrixRow(body, row, nodeIds) {
     const cell = tr.querySelector(`#tb-repl-cell-${key}-${CSS.escape(id)}`);
     if (cell) cell.innerHTML = roleCellHtml(row.cells[id]);
   });
-  patchText(tr.querySelector(`#tb-repl-epoch-${key}`), `e${row.leaderEpoch}`);
+  patchText(tr.querySelector(`#tb-repl-epoch-${key}`), T('replication.epoch_value', { n: row.leaderEpoch }));
 }
 
 function wireRoleMatrixActions(body, topic) {
@@ -4195,6 +4219,11 @@ function wireRoleMatrixActions(body, topic) {
   });
 }
 
+// Without a chosen topic a card asks for one — unless there is none to choose.
+function replNoTopicKey(pickKey) {
+  return state.topicsLoaded && state.topics.length === 0 ? 'replication.no_topics' : pickKey;
+}
+
 function paintReplMatrix() {
   const titleEl = byId('tb-repl-matrix-title');
   const body = byId('tb-repl-matrix-body');
@@ -4202,7 +4231,7 @@ function paintReplMatrix() {
   const topic = state.repl.topic;
   if (!topic) {
     patchText(titleEl, T('replication.matrix_title_generic'));
-    body.innerHTML = `<div class="tb-state tb-empty">${escapeHtml(T('replication.matrix_select_topic'))}</div>`;
+    body.innerHTML = `<div class="tb-state tb-empty">${escapeHtml(T(replNoTopicKey('replication.matrix_select_topic')))}</div>`;
     state.dom.roleMatrix = null;
     return;
   }
@@ -4238,7 +4267,7 @@ function paintReplLagState() {
   if (!host) return;
   const topic = state.repl.topic;
   if (!topic) {
-    host.innerHTML = `<div class="tb-state tb-empty">${escapeHtml(T('replication.matrix_select_topic'))}</div>`;
+    host.innerHTML = `<div class="tb-state tb-empty">${escapeHtml(T(replNoTopicKey('replication.lag_state_select_topic')))}</div>`;
     return;
   }
   const nodes = state.repl.data?.nodes || [];
@@ -4255,7 +4284,7 @@ function paintReplLagState() {
   }
   const list = items.map((it) => `
     <div class="tb-lag-item">
-      <div class="tb-lag-item-head">P${it.partition} · ${escapeHtml(nodeLabelById(nodes, it.nodeId))}</div>
+      <div class="tb-lag-item-head">${escapeHtml(T('replication.partition_on_node', { partition: it.partition, node: nodeLabelById(nodes, it.nodeId) }))}</div>
       <div class="tb-lag-item-body">${escapeHtml(T('replication.lag_item_reason', {
         reason: it.reason || T('replication.node_lagging_reason_unknown'),
         bytes: formatBytes(it.lagBytes),
@@ -4273,8 +4302,8 @@ function failoverKey(e) {
 function failoverRowHtml(e) {
   return `
     <tr>
-      <td class="mono">${escapeHtml(e.topic)} / P${e.partition}</td>
-      <td><span class="tf-chip tf-chip--outline">e${e.fromEpoch} → e${e.toEpoch}</span></td>
+      <td class="mono">${escapeHtml(e.topic)} · ${escapeHtml(T('partition_label', { n: e.partition }))}</td>
+      <td><span class="tf-chip tf-chip--outline">${escapeHtml(T('replication.epoch_change', { from: e.fromEpoch, to: e.toEpoch }))}</span></td>
       <td class="mono">${escapeHtml(e.fromNode)} → ${escapeHtml(e.toNode)}</td>
       <td>${fmtCompact((Number(e.durationMs) || 0) / 1000)} s</td>
       <td>${escapeHtml(msToDate(e.atMs))}</td>

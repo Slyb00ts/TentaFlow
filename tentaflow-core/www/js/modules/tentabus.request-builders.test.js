@@ -519,17 +519,17 @@ test('hasMoreForPartitionSelection reads only the selected partition\'s own flag
 });
 
 test('partitionFilterOptions builds "all" plus one option per partition, 0-indexed', () => {
-  assert.deepEqual(helpers.partitionFilterOptions(3, 'All partitions'), [
+  assert.deepEqual(helpers.partitionFilterOptions(3, 'All partitions', (i) => `partition ${i}`), [
     { value: '', label: 'All partitions' },
-    { value: '0', label: 'P0' },
-    { value: '1', label: 'P1' },
-    { value: '2', label: 'P2' },
+    { value: '0', label: 'partition 0' },
+    { value: '1', label: 'partition 1' },
+    { value: '2', label: 'partition 2' },
   ]);
 });
 
 test('partitionFilterOptions degrades to just "all" for an unknown/zero partition count', () => {
-  assert.deepEqual(helpers.partitionFilterOptions(0, 'All'), [{ value: '', label: 'All' }]);
-  assert.deepEqual(helpers.partitionFilterOptions(undefined, 'All'), [{ value: '', label: 'All' }]);
+  assert.deepEqual(helpers.partitionFilterOptions(0, 'All', String), [{ value: '', label: 'All' }]);
+  assert.deepEqual(helpers.partitionFilterOptions(undefined, 'All', String), [{ value: '', label: 'All' }]);
 });
 
 // ---------------------------------------------------------------------------
@@ -916,20 +916,20 @@ for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], [
 // (the exact wording the fala brief specifies); every locale's own
 // translation is checked for the same substance: a "50" ms figure in the
 // standard hint, "no loss window" wording in the critical hint.
-test('pl.json\'s standard/critical durability hints state the loss-window consequence, not just the fsync mechanism', () => {
+test('pl.json\'s standard/critical durability hints state the loss-window consequence in plain words', () => {
   assert.equal(
     pl.tentabus.wizard_durability_class_standard_hint,
-    'fsync co ≤50 ms, ACK po zapisie — przy utracie zasilania bez repliki możliwa utrata do 50 ms potwierdzonych komunikatów.',
+    'Wiadomości trafiają na dysk co najwyżej co 50 ms. Przy nagłym braku zasilania i bez kopii na innym nodzie można stracić wiadomości z ostatnich 50 ms.',
   );
   assert.equal(
     pl.tentabus.wizard_durability_class_critical_hint,
-    'fsync przed każdym ACK — brak okna utraty, p99 ACK ok. 10–30 ms na jednym dysku, niższa przepustowość.',
+    'Każda wiadomość trafia na dysk, zanim wysyłający dostanie potwierdzenie. Nic nie ginie, ale zapis jest wolniejszy (zwykle 10–30 ms na wiadomość na jednym dysku).',
   );
 });
 
 const LOSS_WINDOW_CRITICAL_PHRASE = {
-  pl: 'brak okna utraty', en: 'no loss window', de: 'kein Verlustfenster',
-  es: 'sin ventana de pérdida', fr: 'aucune fenêtre de perte',
+  pl: 'Nic nie ginie', en: 'Nothing is lost', de: 'Nichts geht verloren',
+  es: 'No se pierde nada', fr: 'Rien ne se perd',
 };
 for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
   test(`tentabus.${locName}.json's standard durability hint names the 50 ms loss window`, () => {
@@ -1409,16 +1409,23 @@ test('no control in tentabus.js is gated on isSiteAdmin', () => {
 // The wording drifted behind the gate once already: the strings still named a
 // role the backend had stopped asking for, so a user who was refused knew the
 // wrong reason to go fix.
-test('the admin-required notes name bus.admin and the org Admin role in every locale', () => {
+// The double lock (the instance's admin permission AND the org admin role),
+// said in plain words rather than as a raw permission id.
+test('the admin-required notes name both roles the double lock needs, in every locale', () => {
   const keys = ['acl_admin_required', 'group_detail_admin_required'];
+  const words = {
+    pl: ['administrator instancji', 'administratorem organizacji'],
+    en: ['instance administrator', 'organisation administrator'],
+    de: ['Administrator der Instanz', 'Administrator der Organisation'],
+    es: ['administrador de la instancia', 'administrador de la organización'],
+    fr: ['administrateur de l’instance', 'administrateur de l’organisation'],
+  };
   for (const [name, loc] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
     for (const key of keys) {
       const value = loc.tentabus?.[key];
       assert.equal(typeof value, 'string', `${name}.${key}: key missing`);
-      assert.ok(
-        value.includes('bus.admin'),
-        `${name}.${key}: must name the permission actually required: ${value}`,
-      );
+      for (const w of words[name]) assert.ok(value.includes(w), `${name}.${key} must name "${w}": ${value}`);
+      assert.doesNotMatch(value, /\bbus\.[a-z_]+/, `${name}.${key}: no raw permission id`);
     }
   }
 });

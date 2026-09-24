@@ -63,6 +63,21 @@ const FORBIDDEN_PL = [
   /wkrótce/i,
   /heartbeat/i,
   /\bfollower/i,
+  // Broker jargon the screen says in plain words: "czeka", "numer
+  // wiadomości", "node prowadzący", "zgodne kopie", "zapis na dysk",
+  // "kiedy potwierdza", and never a raw permission id.
+  /\blag/i,
+  /offset/i,
+  /\bleader/i,
+  /\bISR\b/,
+  /fsync/i,
+  /\bcommit/i,
+  /\(in\)/,
+  /endpoint/i,
+  /\bbus\.[a-z_]+/,
+  /\backs\b/i,
+  /BlobRef/,
+  /watermark/i,
 ];
 
 test('no value says "DLQ", a milestone code or internal API talk in any locale', () => {

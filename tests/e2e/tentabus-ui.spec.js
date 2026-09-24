@@ -329,6 +329,30 @@ test('T01 at 390x844: one column, no horizontal scroll, the same content', async
   const clipped = await table.evaluate((host) => [...host.shadowRoot.querySelectorAll('td')].filter((td) => td.getBoundingClientRect().width > 0 && td.scrollWidth > td.clientWidth + 1).length);
   expect(clipped).toBe(0);
   await page.screenshot({ path: path.join(SHOTS, 't08-wzory-telefon.png'), fullPage: true });
+  // Nieprzetworzone on the phone: every row keeps its actions reachable.
+  await tab(page, 'dlq').click();
+  const dlqTable = page.locator('#tb-dlq-table');
+  await expect(dlqTable.locator('tbody tr').first()).toBeVisible({ timeout: 15000 });
+  const buttons = dlqTable.locator('tf-button');
+  const count = await buttons.count();
+  expect(count).toBeGreaterThanOrEqual(3);
+  for (let i = 0; i < count; i += 1) {
+    const b = buttons.nth(i);
+    await b.scrollIntoViewIfNeeded();
+    await expect(b).toBeVisible();
+    const box = await b.boundingBox();
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(PHONE.width);
+  }
+  await buttons.filter({ hasText: 'Szczegóły' }).first().click({ trial: true });
+  await buttons.filter({ hasText: 'Szczegóły' }).first().click();
+  await expect(page.locator('#tb-dlq-detail .tb-dlq-detail')).toBeVisible();
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 't06-nieprzetworzone-telefon.png'), fullPage: true });
+  // The instance picker gets the whole row: the name never runs into the chevron.
+  const pickerWidth = await page.locator('#tb-instance-select').evaluate((el) => el.getBoundingClientRect().width);
+  expect(pickerWidth).toBeGreaterThan(280);
+
   // Reached through the address (a deep link, then a reload), not a click:
   // the active tab still ends up centred, after the counters widened the tabs.
   const instance = hashParams(page).instance;
@@ -355,7 +379,15 @@ test('main tabs: each one shows its content, the address and the breadcrumb foll
       await expect(page.locator('#tb-kpi-topics')).toHaveAttribute('value', '3');
       await expect(page.locator('#tb-kpi-partitions')).toHaveAttribute('value', '8');
     },
-    groups: async () => expect(page.locator('#tb-groups-table tbody tr')).toHaveCount(4, { timeout: 15000 }),
+    groups: async () => {
+      const rows = page.locator('#tb-groups-table tbody tr');
+      await expect(rows).toHaveCount(4, { timeout: 15000 });
+      const text = (await rows.allTextContents()).join(' | ');
+      // "Czeka" per consumer — the same figures Przegląd counts (3 of 4 wait).
+      expect(norm(text)).toContain('2 237');
+      expect(norm(text)).toContain('400');
+      expect(text).toContain('program sam daje znać, że skończył');
+    },
     dlq: async () => expect(page.locator('#tb-dlq-source')).toBeVisible(),
     schemas: async () => {
       const slot = page.locator('#tb-panel > [data-tb-view-slot="schemas"]');
@@ -493,6 +525,9 @@ test('switching to the empty instance: T11 empty states, counters at zero, no al
   await expect(page.locator('#tb-dlq-retry-all')).toBeHidden();
   await assertNoInternalTopics(page);
   await tab(page, 'replication').click();
+  await expect(page.locator('#tb-repl-matrix-body')).toContainText('Ta instancja nie ma jeszcze topików.');
+  await expect(page.locator('#tb-repl-lag-state')).toContainText('Ta instancja nie ma jeszcze topików.');
+  await expect(page.locator('#tb-repl-nodes .tb-node-sub').first()).not.toContainText('ms temu');
   await assertNoInternalTopics(page);
   await tab(page, 'schemas').click();
   await expect(page.locator('#tb-panel > [data-tb-view-slot="schemas"] tf-empty-state')).toHaveAttribute('title', 'Nie ma jeszcze wzorów wiadomości');
